@@ -99,18 +99,23 @@ def main() -> int:
     fused_configs = [
         ("eager", {}, "clean reimplementation (byte-exact)"),
         ("cudagraph", {}, "manual CUDA-graph capture (byte-exact) *** WINNER ***"),
-        ("triton", {}, "triton elementwise kernels (byte-exact)"),
+        ("triton", {"_no_compile": True}, "triton elementwise kernels, no compile (byte-exact)"),
+        ("triton", {"compile_mode": "max-autotune-no-cudagraphs"},
+         "triton kernels + torch.compile (byte-exact)"),
         ("compile", {"compile_mode": "max-autotune-no-cudagraphs"},
          "torch.compile max-autotune (fp32 attn intermediates)"),
     ]
 
     for mode, kw, notes in fused_configs:
-        label = f"{mode}" + (f"({kw['compile_mode']})" if kw else "")
+        no_compile = kw.pop("_no_compile", False)
+        compile_tag = kw.get("compile_mode", "")
+        label = f"{mode}" + (f"({compile_tag})" if compile_tag else ("(no-compile)" if no_compile else ""))
         print(f"[bench] timing FusedEncoder mode={label} ...")
         try:
             fe = FusedEncoder(encoder, mode=mode, **kw).cuda()
+            if no_compile:
+                fe._compiled_forward = None  # pure triton, bypass torch.compile
             with torch.inference_mode():
-                # warmup (also triggers compile / cudagraph capture)
                 out = fe(feats)
                 torch.cuda.synchronize()
                 med, mn = cuda_timer(lambda: fe(feats))

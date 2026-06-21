@@ -1,1 +1,5 @@
-"""megapar: high-performance inference megakernel for nvidia/parakeet-tdt-0.6b-v3 on RTX 5090."""
+"""megapar: high-performance inference megakernel for granite-speech-4.1-2b on RTX 5090."""
+
+from .encoder_mega import FusedEncoder
+
+__all__ = ["FusedEncoder"]
