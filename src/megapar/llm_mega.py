@@ -49,6 +49,7 @@ import torch
 
 from .config import (
     LLM_ATTENTION_MULTIPLIER,
+    LLM_EMBEDDING_MULTIPLIER,
     LLM_EOS_TOKEN_ID,
     LLM_HEAD_DIM,
     LLM_LOGITS_SCALING,
@@ -282,6 +283,14 @@ class LLMMega:
                 f"{max_safe} new tokens fit). Increase max_cache_len or reduce "
                 f"max_new_tokens."
             )
+        if inputs_embeds.shape[0] != 1:
+            raise ValueError(
+                f"LLMMega only supports batch=1 (static buffers + _repeat_kv reshape "
+                f"are hard-coded for B=1), got batch={inputs_embeds.shape[0]}."
+            )
+        if max_new_tokens <= 0:
+            # HF generate() returns zero new tokens in this case; match that.
+            return self._finalize([], 0.0, tokenizer)
         # (1) prefill -> first token
         next_token = self.prefill(inputs_embeds)  # (1, 1)
         gen_ids = [int(next_token.item())]
@@ -438,7 +447,7 @@ class LLMMega:
 # glue with single-launch Triton kernels.  GEMMs stay as cuBLAS bf16 matmuls.
 
 # Pre-extract constants to avoid repeated attribute lookups in the hot path.
-_EMB_MULT = 12.0  # LLM_EMBEDDING_MULTIPLIER
+_EMB_MULT = LLM_EMBEDDING_MULTIPLIER  # 12.0 for granite-4.0-1b
 
 
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
