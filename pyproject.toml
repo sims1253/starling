@@ -5,8 +5,10 @@ description = "High-performance inference megakernel for nvidia/parakeet-tdt-0.6
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.11",
+    "torchaudio>=2.11",
     "triton>=3.6",
     "transformers",
+    "accelerate",
     "numpy",
     "soundfile",
     "librosa",
@@ -46,10 +48,12 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-# Pin torch to the cu130 index so resolution never falls back to PyPI's cu12 wheel.
+# Pin torch + torchaudio to the cu130 index so resolution never falls back to
+# PyPI's cu12 wheels (which will not run on Blackwell / sm_120).
 torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
 # transformers must come from git source because the released PyPI 5.8.0 does not
-# register the `parakeet_tdt` model type (needed for parakeet-tdt-0.6b-v3).
+# register the `granite_speech` model type (needed for ibm-granite/granite-speech-4.1-2b).
 transformers = { git = "https://github.com/huggingface/transformers" }
 
 [tool.pytest.ini_options]
