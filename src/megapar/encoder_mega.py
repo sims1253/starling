@@ -304,11 +304,21 @@ class FusedEncoder(nn.Module):
     def _block_triton(self, idx: int, x: torch.Tensor, tk) -> torch.Tensor:
         layer = self.layers[idx]
         ff = layer.ff1
-        # --- ff1: fused LN -> (cuBLAS up_proj) -> SiLU -> (cuBLAS down_proj)
+        # --- ff1: LayerNorm -> (cuBLAS up_proj) -> SiLU -> (cuBLAS down_proj)
         #         -> 0.5x scale -> residual add.
-        normed = tk.fused_layernorm(
-            x, ff.pre_norm.weight, ff.pre_norm.bias, ff.pre_norm.eps
-        )
+        #
+        # NOTE on numerics: the conv module's BatchNorm has running_var as small
+        # as 4e-10 (rstd up to 316x), which amplifies ANY difference in the
+        # residual stream (from ANY upstream op, not just the conv module's own
+        # LayerNorm) by 316x per block. Over 16 blocks this makes the encoder
+        # numerically fragile: every op must be byte-exact vs the stock path.
+        # We therefore use torch's native layer_norm + batch_norm (which ARE
+        # byte-exact vs stock) and reserve the triton kernels for the
+        # elementwise glue (SiLU, residual scale-add, add) that is provably
+        # byte-exact (verified 0.0 diff vs F.silu / torch.add). The triton
+        # fused_layernorm / fused_batchnorm_silu kernels remain available in
+        # triton_kernels.py for experimentation / non-amplified architectures.
+        normed = ff.pre_norm(x)
         up = ff.up_proj(normed)
         act = tk.fused_silu(up)
         down = ff.down_proj(act)
@@ -318,15 +328,9 @@ class FusedEncoder(nn.Module):
         attn_out = self._attn_forward(idx, layer.attn, x)
         x = tk.fused_add(x, attn_out)
 
-        # conv module (cuDNN convs stay; LN fused via triton).
-        # NOTE: the BatchNorm here has running_var as small as 4e-10 (rstd up to
-        # 316x), so even a 1-ULP difference in the rstd computation gets
-        # amplified to >1e-2 per element. We keep torch's native batch_norm +
-        # silu for the conv module (byte-exact); the triton fused_batchnorm_silu
-        # kernel is available but its accumulated numerical difference over 16
-        # layers exceeds ENCODER_ATOL due to this amplification.
+        # conv module (cuDNN convs stay; torch layernorm + batchnorm for exactness)
         conv = layer.conv
-        h = tk.fused_layernorm(x, conv.norm.weight, conv.norm.bias, conv.norm.eps)
+        h = conv.norm(x)
         h = conv.up_conv(h.permute(0, 2, 1))
         h = conv.glu(h)
         h = conv.depth_conv(h)
@@ -334,11 +338,9 @@ class FusedEncoder(nn.Module):
         h = conv.down_conv(h).permute(0, 2, 1)
         x = tk.fused_add(x, h)
 
-        # ff2 (same triton glue as ff1)
+        # ff2 (same byte-exact glue as ff1)
         ff = layer.ff2
-        normed = tk.fused_layernorm(
-            x, ff.pre_norm.weight, ff.pre_norm.bias, ff.pre_norm.eps
-        )
+        normed = ff.pre_norm(x)
         up = ff.up_proj(normed)
         act = tk.fused_silu(up)
         down = ff.down_proj(act)
