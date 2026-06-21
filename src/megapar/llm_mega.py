@@ -267,6 +267,21 @@ class LLMMega:
         served by CUDA-graph replay (after :meth:`capture`).
         """
         T = inputs_embeds.shape[1]
+        # Guard against cache overflow: the prefill fills K/V slots [0, T) and
+        # each decode step writes one additional slot, so the total cache
+        # footprint of ``max_new_tokens`` new tokens is ``T + max_new_tokens - 1``.
+        # Without this guard, requesting too many tokens triggers an
+        # ``index_copy_(): index out of bounds`` CUDA device-side assert that
+        # poisons the CUDA context and cascades into opaque errors on every
+        # subsequent CUDA call.
+        max_safe = self.max_cache_len - T + 1
+        if max_new_tokens > max_safe:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} would overflow the static KV cache "
+                f"(prompt T={T}, max_cache_len={self.max_cache_len}; at most "
+                f"{max_safe} new tokens fit). Increase max_cache_len or reduce "
+                f"max_new_tokens."
+            )
         # (1) prefill -> first token
         next_token = self.prefill(inputs_embeds)  # (1, 1)
         gen_ids = [int(next_token.item())]
