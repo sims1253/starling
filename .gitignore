@@ -1,8 +1,23 @@
+# Python / venv
 .venv/
 __pycache__/
 *.pyc
 *.egg-info/
+
+# uv cache / state
+.uv/
+
+# megapar artifacts
+models/
+outputs/
 traces/
 golden/
 *.trace.json
+
+# Audio samples (never check these in)
+*.wav
+*.flac
+*.mp3
+
+# notebooks / editor
 .ipynb_checkpoints/

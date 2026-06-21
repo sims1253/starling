@@ -1,18 +1,24 @@
 [project]
 name = "megapar"
 version = "0.1.0"
-description = "Megakernel for granite-speech-4.1-2b, optimized for RTX 5090 (Blackwell, sm_120)"
-requires-python = ">=3.10,<3.11"
+description = "High-performance inference megakernel for nvidia/parakeet-tdt-0.6b-v3 on RTX 5090 (Blackwell, sm_120, CUDA 13.0)"
+requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch==2.11.0",
-    "triton==3.6.0",
-    "torchaudio==2.11.0",
-    "transformers>=5.8,<6",
-    "accelerate>=1.0",
+    "torch>=2.11",
+    "triton>=3.6",
+    "transformers",
+    "numpy",
     "soundfile",
     "librosa",
-    "huggingface-hub",
-    "numpy",
+    "einops",
+    "einx",
+    "matplotlib",
+    "tabulate",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
 ]
 
 [build-system]
@@ -22,14 +28,29 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/megapar"]
 
+# ---- uv configuration ----
 [tool.uv]
-# Pull the CUDA 13.0 wheels from the PyTorch index; everything else from PyPI.
+# This machine is WSL2 on a filesystem that does NOT support reflinks, which
+# caused intermittent venv corruption (files silently missing after install).
+# Force plain copies so installs are deterministic and `uv run` is reliable.
+link-mode = "copy"
+
+# PyTorch CUDA 13.0 (Blackwell / sm_120) wheel index.
+# This is the ONLY index that ships torch builds which run on the RTX 5090;
+# the default PyPI torch wheel is cu12 / sm_90 and will NOT work on Blackwell.
+# `explicit = true` means this index is only used for packages that opt in
+# via [tool.uv.sources], so it never shadows PyPI for other deps.
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
+# Pin torch to the cu130 index so resolution never falls back to PyPI's cu12 wheel.
 torch = { index = "pytorch-cu130" }
-torchaudio = { index = "pytorch-cu130" }
-triton = { index = "pytorch-cu130" }
+# transformers must come from git source because the released PyPI 5.8.0 does not
+# register the `parakeet_tdt` model type (needed for parakeet-tdt-0.6b-v3).
+transformers = { git = "https://github.com/huggingface/transformers" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

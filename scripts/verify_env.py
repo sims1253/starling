@@ -91,14 +91,37 @@ def check_transformers() -> None:
         "n_layer",
     ]
 
-    print("\n--- extracted dims ---")
+    print("\n--- extracted dims (top-level config) ---")
     for key in keys:
         val = getattr(config, key, "<missing>")
         print(f"  {key:30s} = {val!r}")
 
-    # Also walk the raw config dict for any TDT-related subkeys so we don't miss
-    # nested fields (TDT models sometimes nest per-stage config).
+    # Parakeet-TDT nests the Conformer encoder config under `encoder_config`, so
+    # pull the kernel-sizing dims from there too. These drive tile/block sizing
+    # in the megakernel phase.
     raw = config.to_dict() if hasattr(config, "to_dict") else {}
+    encoder_cfg = raw.get("encoder_config", {}) if isinstance(raw, dict) else {}
+    if encoder_cfg:
+        enc_keys = [
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "intermediate_size",
+            "conv_kernel_size",
+            "subsampling_factor",
+            "subsampling_conv_channels",
+            "num_mel_bins",
+            "subsampling_conv_kernel_size",
+            "subsampling_conv_stride",
+            "max_position_embeddings",
+            "model_type",
+        ]
+        print("\n--- extracted dims (nested encoder_config / Conformer) ---")
+        for key in enc_keys:
+            print(f"  {key:30s} = {encoder_cfg.get(key, '<missing>')!r}")
+
+    # Also surface any TDT/duration-ish fields so we don't miss them.
     tdt_like = {k: v for k, v in raw.items() if "tdt" in str(k).lower() or "duration" in str(k).lower()}
     if tdt_like:
         print("\n--- raw TDT/duration-ish fields from config.to_dict() ---")
