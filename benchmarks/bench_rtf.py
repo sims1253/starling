@@ -176,11 +176,18 @@ def write_analysis(profile: dict, headline: dict) -> str:
     ctrl_pct = pct.get("control/reduction", 0.0)
     act_pct = pct.get("activation", 0.0)
 
-    # CUDA utilisation of the wall-clock decode region (the headline decode_ms is
-    # one pass; the profiled CUDA self-time is per-pass). This is the single most
-    # important number for the next phase.
+    # GPU-busy (CUDA utilisation) of the decode region. The profiled
+    # per_pass_cuda_ms is the WHOLE generate (encoder + decode); the decode
+    # wall is decode-only. To get a decode-only GPU-busy we subtract the
+    # encoder's CUDA time (the encoder is compute-bound, so its CUDA time
+    # ~= its wall time encoder_ms). We ALSO report the whole-generate
+    # GPU-busy (whole/whole, apples-to-apples) so both scopes are visible.
     decode_wall_ms = headline["decode_ms"]
-    cuda_util = (per_pass_cuda_ms / decode_wall_ms * 100.0) if decode_wall_ms > 0 else 0.0
+    gen_wall_ms = headline["gen_ms"]
+    enc_wall_ms = headline["encoder_ms"]
+    decode_cuda_ms = max(0.0, per_pass_cuda_ms - enc_wall_ms)
+    decode_gpu_busy = (decode_cuda_ms / decode_wall_ms * 100.0) if decode_wall_ms > 0 else 0.0
+    gen_gpu_busy = (per_pass_cuda_ms / gen_wall_ms * 100.0) if gen_wall_ms > 0 else 0.0
 
     lines: list[str] = []
     lines.append("# Profiler hotspot analysis (parakeet-tdt-0.6b-v3 baseline)\n")
@@ -197,8 +204,10 @@ def write_analysis(profile: dict, headline: dict) -> str:
     lines.append("## The headline finding: the decode loop is LAUNCH-BOUND\n")
     lines.append(
         f"The TDT decode region takes **{decode_wall_ms:.0f} ms** wall-clock per pass "
-        f"but only **{per_pass_cuda_ms:.0f} ms** of actual CUDA self-time "
-        f"(~{cuda_util:.0f}% GPU-busy). The remaining ~{100-cuda_util:.0f}% is CPU "
+        f"but only **~{decode_cuda_ms:.0f} ms** of decode-only CUDA self-time "
+        f"(~{decode_gpu_busy:.0f}% decode GPU-busy; whole-generate is ~{gen_gpu_busy:.0f}% "
+        f"= {per_pass_cuda_ms:.0f} ms CUDA over {gen_wall_ms:.0f} ms generate wall). "
+        f"The remaining ~{100-decode_gpu_busy:.0f}% of the decode region is CPU "
         f"launch / Python-loop / sync overhead -- the autoregressive transducer loop "
         f"dispatches thousands of tiny kernels (see `aten::copy_` x5958, "
         f"`aten::where` x2502, `aten::eq` x2631 in the op table) and the GPU sits "
