@@ -22,7 +22,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from megapar.config import LLM_EOS_TOKEN_ID, LLM_VOCAB_SIZE  # noqa: E402
 from megapar.golden import load_golden, load_golden_text  # noqa: E402
 from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.llm_mega import LLMMega  # noqa: E402
+from megapar.llm_mega import FusedLLMMega, LLMMega  # noqa: E402
 
 # Loading the speech model is expensive (~5s); cache across tests.
 _MODEL = None
@@ -110,6 +110,54 @@ def test_decode_is_faster_than_eager_baseline(mega):
     assert rep.decode_tok_per_s > 85.0, (
         f"decode too slow: {rep.decode_tok_per_s:.1f} tok/s (expected >85)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase C: fused Triton kernels correctness
+# --------------------------------------------------------------------------- #
+def test_fused_decode_exact_token_match():
+    """The fused-kernel decode path must also reproduce golden tokens exactly."""
+    model, proc = _get_model_and_processor()
+    comps = get_components(model)
+    decoder = FusedLLMMega(comps["language_model"], model.lm_head, max_cache_len=640)
+    inputs_embeds = _golden_inputs_embeds()
+    golden_gen = _golden_generated()
+
+    res = decoder.generate(
+        inputs_embeds,
+        max_new_tokens=100,
+        eos_token_id=LLM_EOS_TOKEN_ID,
+        tokenizer=proc.tokenizer,
+    )
+    assert res.n_tokens == 100, f"expected 100 tokens, got {res.n_tokens}"
+    assert (res.ids[0] == golden_gen).all(), "fused decode token mismatch"
+
+
+def test_fused_kernels_match_reference():
+    """Each fused Triton kernel must be bit-exact with the PyTorch reference."""
+    from megapar import llm_kernels as K
+
+    model, _ = _get_model_and_processor()
+    comps = get_components(model)
+    lm = comps["language_model"]
+    layer0 = lm.layers[0]
+
+    with torch.inference_mode():
+        inp = torch.tensor([[2520]], device="cuda")
+        h = lm.embed_tokens(inp) * 12.0
+
+        # RMSNorm
+        ref = layer0.input_layernorm(h)
+        fused = K.fused_rmsnorm(h, layer0.input_layernorm.weight, 1e-5)
+        assert (ref == fused).all(), "RMSNorm mismatch"
+
+        # SwiGLU
+        normed = ref
+        gate = layer0.mlp.gate_proj(normed)
+        up = layer0.mlp.up_proj(normed)
+        ref_silu = torch.nn.functional.silu(gate) * up
+        fused_silu = K.fused_silu_mul(gate, up)
+        assert (ref_silu == fused_silu).all(), "SwiGLU mismatch"
 
 
 if __name__ == "__main__":

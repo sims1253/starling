@@ -192,7 +192,9 @@ def _bn_silu_kernel(
     rv = tl.load(RV_ptr + c).to(tl.float32)
     w = tl.load(W_ptr + c).to(tl.float32)
     b = tl.load(B_ptr + c).to(tl.float32)
-    rstd = 1.0 / tl.sqrt(rv + eps)
+    # Use the hardware rsqrt (matches torch's native batch_norm, which uses
+    # rsqrt internally rather than 1.0/sqrt).
+    rstd = tl.rsqrt(rv + eps)
     x = tl.load(X_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     y = (x - rm) * rstd * w + b
     y = y * (1.0 / (1.0 + tl.exp(-y)))

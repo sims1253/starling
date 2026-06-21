@@ -161,68 +161,98 @@ def write_analysis(profile: dict, headline: dict) -> str:
     """Write a short hotspot analysis to profile_analysis.md and return it."""
     pct = profile["bucket_pct"]
     buckets = profile["buckets"]
-    # top 3 buckets by pct
     ranked = sorted(pct.items(), key=lambda kv: kv[1], reverse=True)
     top3 = ranked[:3]
-    total = profile["total_cuda_time_us"]
+    total_cuda_ms = profile["total_cuda_time_us"] / 1000.0
+    per_pass_cuda_ms = total_cuda_ms / 3.0  # profile ran 3 generate passes
 
-    lines: list[str] = []
-    lines.append("# Profiler hotspot analysis (parakeet-tdt-0.6b-v3 baseline)\n")
-    lines.append(
-        f"Profiled config: **batch=8, medium-length audio**, bf16, RTX 5090 (sm_120, cu130).  \n"
-        f"Total CUDA time in profiled window: {total/1000:.2f} ms "
-        f"(3 generate passes).\n"
-    )
-    lines.append("## Top-3 stage buckets (% of CUDA time)\n")
-    for name, p in top3:
-        lines.append(f"- **{name}**: {p:.1f}%")
-    lines.append("")
-    lines.append("## Findings (drives the next optimization phase)\n")
-    # Build the analysis bullets from the bucket data.
-    matmul_pct = pct.get("matmul", 0.0)
+    mm_pct = pct.get("matmul/gemm", 0.0)
     conv_pct = pct.get("conv", 0.0)
     attn_pct = pct.get("attention", 0.0)
     norm_pct = pct.get("norm", 0.0)
     mel_pct = pct.get("mel/feature", 0.0)
     decode_pct = pct.get("decoder/rnnt-tdt", 0.0)
-    act_pct = pct.get("activation/ffn", 0.0)
+    memops_pct = pct.get("memops", 0.0)
+    ctrl_pct = pct.get("control/reduction", 0.0)
+    act_pct = pct.get("activation", 0.0)
 
+    # CUDA utilisation of the wall-clock decode region (the headline decode_ms is
+    # one pass; the profiled CUDA self-time is per-pass). This is the single most
+    # important number for the next phase.
+    decode_wall_ms = headline["decode_ms"]
+    cuda_util = (per_pass_cuda_ms / decode_wall_ms * 100.0) if decode_wall_ms > 0 else 0.0
+
+    lines: list[str] = []
+    lines.append("# Profiler hotspot analysis (parakeet-tdt-0.6b-v3 baseline)\n")
     lines.append(
-        f"1. **GEMM/matmul dominates** ({matmul_pct:.1f}% of CUDA time). The 24 "
-        f"Conformer layers each contain an FFN (1024->4096->1024, two large "
-        f"matmuls) plus attention projections; in bf16 these dispatch as "
-        f"`addmm`/`_scaled_mm`. Fusing the FFN pair and/or moving to FP8 "
-        f"`_scaled_mm` is the single highest-leverage win."
+        f"Profiled config: **batch=8, medium-length audio** ({headline['audio_seconds']:.0f}s audio), "
+        f"bf16, RTX 5090 (sm_120, cu130).  \n"
+        f"Profiled CUDA self-time: {total_cuda_ms:.1f} ms over 3 generate passes "
+        f"({per_pass_cuda_ms:.1f} ms/pass).\n"
+    )
+    lines.append("## Top-3 CUDA-time buckets (% of CUDA self-time)\n")
+    for name, p in top3:
+        lines.append(f"- **{name}**: {p:.1f}%")
+    lines.append("")
+    lines.append("## The headline finding: the decode loop is LAUNCH-BOUND\n")
+    lines.append(
+        f"The TDT decode region takes **{decode_wall_ms:.0f} ms** wall-clock per pass "
+        f"but only **{per_pass_cuda_ms:.0f} ms** of actual CUDA self-time "
+        f"(~{cuda_util:.0f}% GPU-busy). The remaining ~{100-cuda_util:.0f}% is CPU "
+        f"launch / Python-loop / sync overhead -- the autoregressive transducer loop "
+        f"dispatches thousands of tiny kernels (see `aten::copy_` x5958, "
+        f"`aten::where` x2502, `aten::eq` x2631 in the op table) and the GPU sits "
+        f"idle between them. **Reducing launch overhead (CUDA-graph the decode loop, "
+        f"fuse the joint+decoder into a megakernel, batch decode steps) is the "
+        f"single highest-leverage optimization**, not faster GEMMs."
+    )
+    lines.append("\n## Per-stage CUDA breakdown\n")
+    lines.append(
+        f"1. **GEMM/matmul ({mm_pct:.1f}%)** -- the largest CUDA consumer. Dominated "
+        f"by the fused FFN matmuls in the 24 Conformer layers (`cutlass "
+        f"s16816gemm_relu`, i.e. Linear+SiLU/ReLU fused) plus the encoder "
+        f"projection/joint matmuls (`aten::mm`). On the ENCODER side this is "
+        f"compute-bound, so FP8 `_scaled_mm` + FFN fusion are the win there."
     )
     lines.append(
-        f"2. **1D depthwise conv module** ({conv_pct:.1f}%): each Conformer block "
-        f"has a kernel-9 conv (unfused im2col + conv). This is a classic fusion "
-        f"target (e.g. a custom triton conv or cudnn-channels-last path)."
+        f"2. **Conv ({conv_pct:.1f}%)** -- the kernel-9 depthwise conv module in "
+        f"every Conformer block (`cudnn_convolution` + `_conv_depthwise2d`). A "
+        f"custom Triton conv / channels-last path is a solid secondary target."
     )
     lines.append(
-        f"3. **Attention kernels** ({attn_pct:.1f}%): relative-position bias + "
-        f"the subsampled sequence length is short (T/8), so SDPA is already "
-        f"flash-backed; gains here are secondary to the FFN GEMMs."
+        f"3. **Attention ({attn_pct:.1f}%)** -- already flash/MemEff-backed "
+        f"(`_efficient_attention_forward`); the subsampled sequence is short (T/8), "
+        f"so attention is cheap. Low priority."
     )
     lines.append(
-        f"4. **Layernorm** ({norm_pct:.1f}%): three norms per block; a fused "
-        f"norm+activation or norm+linear kernel is a moderate win given 24 layers."
+        f"4. **Memops + control/reduction ({memops_pct:.1f}% + {ctrl_pct:.1f}%)** -- "
+        f"`copy_`, `fill_`, `argmax`, `where`, `eq`, `index`, `any`: these are the "
+        f"debris of the Python decode loop (masking, frame-pointer arithmetic, "
+        f"greedy argmax). They are individually tiny but collectively large because "
+        f"they run once per decode step. Fusing the decode step removes most of them."
     )
     lines.append(
-        f"5. **Feature extraction / mel** ({mel_pct:.1f}%): runs on CPU + H2D "
-        f"(see feat_ms in the stage table); not a CUDA hotspot but a latency one "
-        f"-- worth fusing onto GPU later."
+        f"5. **Decoder LSTM ({decode_pct:.1f}%)** -- `_cudnn_rnn`; cheap on CUDA but "
+        f"called 399x (per-step). Fuse with the joint into a single kernel."
     )
     lines.append(
-        f"6. **TDT decode loop** ({decode_pct:.1f}% CUDA, but see decode_ms in "
-        f"the timing table): the LSTM decoder + joint are autoregressive and "
-        f"launch-bound; a fused joint megakernel is the decode-side target."
+        f"6. **Norm ({norm_pct:.1f}%) / Activation ({act_pct:.1f}%)** -- three norms "
+        f"per block; a fused norm+activation kernel is a moderate win across 24 "
+        f"layers."
     )
     lines.append(
-        f"7. Headline RTF (batch=8 medium) = **{headline['rtf_median']:.2f}x** "
-        f"realtime (total {headline['total_ms']:.1f} ms; feat "
-        f"{headline['feat_ms']:.1f} / enc {headline['encoder_ms']:.1f} / decode "
-        f"{headline['decode_ms']:.1f} ms). Encoder is the wall-clock bulk."
+        f"7. **Feature extraction ({mel_pct:.1f}% CUDA)** -- runs on CPU + H2D "
+        f"(see feat_ms = {headline['feat_ms']:.0f} ms in the timing table); not a "
+        f"CUDA hotspot but a latency one -- move mel onto GPU later."
+    )
+    lines.append(
+        f"\n## Headline RTF (batch=8 medium)\n"
+        f"RTF(median) = **{headline['rtf_median']:.1f}x** realtime | total "
+        f"{headline['total_ms']:.0f} ms (feat {headline['feat_ms']:.0f} / encoder "
+        f"{headline['encoder_ms']:.0f} / decode {headline['decode_ms']:.0f}). The "
+        f"encoder is compute-bound (GEMM+conv); the decode is launch-bound. Next "
+        f"phase should attack the decode launch overhead first (biggest wall-clock "
+        f"piece) and the encoder GEMMs second."
     )
     text = "\n".join(lines) + "\n"
     (OUTPUTS / "profile_analysis.md").write_text(text)
@@ -257,7 +287,7 @@ def main() -> int:
             raise RuntimeError(f"oracle transcript EMPTY for {entry['name']} -- aborting")
 
     # ---- D/E. timing harness + bench ----
-    print("\n--- timing harness (median/p90, cuda events, warmup=5) ---")
+    print("\n--- timing harness (median/p90, cuda events, warmup=8) ---")
     stage_results, headline = run_bench(runner, fixtures)
 
     print("\n==================== RTF table ====================")
@@ -281,8 +311,9 @@ def main() -> int:
         "timing": {
             "method": "explicit split (feat=processor+H2D, encoder=get_audio_features, "
                       "decode=generate-encoder, total=end-to-end)",
-            "warmup": 5,
+            "warmup": 8,
             "repeats": 20,
+            "max_seconds": 12,
             "stat": "median + p90 (cuda.Event)",
         },
         "scenario_batches": stage_results,
