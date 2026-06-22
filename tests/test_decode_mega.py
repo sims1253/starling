@@ -94,9 +94,6 @@ def test_eager_decode_matches_oracle(name):
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_graphed_decode_matches_oracle(name):
     """CUDA-graph-captured greedy_decode_graphed must match the oracle too."""
-    # Steps in once decode_mega exists (added in Step 2). Until then this test
-    # skips so the full file is green after Step 1.
-    pytest.importorskip("megapar.parakeet.decode_mega")
     from megapar.parakeet.decode_mega import greedy_decode_graphed
 
     oracle = _oracle()
