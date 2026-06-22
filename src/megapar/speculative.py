@@ -406,6 +406,8 @@ class SpeculativeDecoder:
                 continue
 
             # --- VERIFY: accept more tokens from the run ---
+            # Start with a minimum chunk of 4 to reduce ramp-up rounds.
+            chunk_size = max(chunk_size, 4)
             remaining_budget = max_new_tokens - len(emitted)
             cache_headroom = llm.max_cache_len - cache_pos - 2
             k = min(chunk_size, draft_count - draft_pos,
