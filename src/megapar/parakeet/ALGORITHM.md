@@ -111,3 +111,16 @@ frame_idx = frame_idx + dur
 short/medium/long fixtures. Your decode, fed through
 `processor.batch_decode(..., skip_special_tokens=True)`, must equal the oracle
 text BYTE-FOR-BYTE. (Greedy TDT decode is deterministic.)
+
+## Bench note (orchestrator reconciliation, 2025-06-22)
+The decode megakernel worker reported a 5.07x decode speedup (stock_decode=1187ms
+→ graphed=234ms at B8 medium). ORCHESTRATOR RECONCILIATION found this inflated by
+GPU contention (an unrelated `flower.sweep` process at 87% GPU util during the
+bench). The baseline measured the SAME workload clean at gen_ms=560.5 (decode
+~505ms). The stock decode (thousands of tiny launches) is far more
+contention-sensitive than the graphed decode (1 replay/step). HONEST numbers:
+- stock_decode (B8 medium, clean): ~505ms
+- graphed_decode (B8 medium, contented ceiling): 234ms (clean-GPU value will be lower)
+- true decode speedup: ~2.2x+ (NOT 5x)
+- end-to-end RTF: 284x → 498x+ (valid improvement; 234ms is a ceiling)
+A definitive clean-GPU re-run is pending (GPU occupied by other project).
