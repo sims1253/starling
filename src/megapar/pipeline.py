@@ -167,6 +167,7 @@ class MegaPipeline:
         input_ids: torch.Tensor,
         input_features_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 200,
+        speculative: bool = False,
     ) -> tuple[str, torch.Tensor]:
         """End-to-end ASR: mel -> transcript text.
 
@@ -179,12 +180,20 @@ class MegaPipeline:
                 before scatter (matches the stock ``get_merged_audio_embeddings``
                 behaviour).
             max_new_tokens: greedy decode budget.
+            speculative: if True, use self-speculative decoding with the
+                encoder's BPE CTC head.  The output is **byte-identical** to
+                the non-speculative greedy path (greedy-verify guarantee).
 
         Returns:
             ``(transcript_text, generated_token_ids)`` where the ids are
             ``(1, n_new)`` int64 on CPU (the generated tokens only, excluding
             the prompt).
         """
+        if speculative:
+            return self._transcribe_speculative(
+                input_features, input_ids, input_features_mask, max_new_tokens
+            )
+
         # (1)+(2) fused encoder + eager projector
         _enc, audio_embeds = self.encode_audio(input_features)
 
@@ -201,6 +210,61 @@ class MegaPipeline:
         )
 
         # (5) decode generated ids to text
+        text = self.processor.tokenizer.batch_decode(
+            res.ids, skip_special_tokens=True
+        )[0]
+        return text, res.ids
+
+    # ------------------------------------------------------------------ #
+    # speculative decoding path
+    # ------------------------------------------------------------------ #
+    def _get_spec_components(self):
+        """Lazily initialize the CTC draft extractor + speculative decoder."""
+        if not hasattr(self, "_ctc_draft"):
+            from .speculative import CTCBPEDraft, SpeculativeDecoder, load_out_llm
+
+            out_llm = load_out_llm(device="cuda", dtype=self.dtype)
+            self._ctc_draft = CTCBPEDraft(
+                self.fused_encoder, out_llm,
+                device="cuda", dtype=self.dtype,
+            )
+            self._spec_decoder = SpeculativeDecoder(self.llm, self.embed_tokens)
+        return self._ctc_draft, self._spec_decoder
+
+    @torch.inference_mode()
+    def _transcribe_speculative(
+        self,
+        input_features: torch.Tensor,
+        input_ids: torch.Tensor,
+        input_features_mask: Optional[torch.Tensor],
+        max_new_tokens: int,
+    ) -> tuple[str, torch.Tensor]:
+        """Self-speculative greedy transcribe (byte-identical to greedy)."""
+        ctc_draft, spec_decoder = self._get_spec_components()
+
+        # (1) Run encoder eagerly ONCE, capturing mid-layer for the draft.
+        #     The resulting enc_hidden is reused for the projector -> audio_embeds.
+        mid_h, enc_hidden = ctc_draft.encode_with_mid(input_features)
+
+        # (2) Extract the BPE CTC draft (cheap, deterministic).
+        draft = ctc_draft.draft(enc_hidden, mid_h)
+
+        # (3) Project enc_hidden -> audio_embeds (same as non-spec path).
+        audio_embeds = self.projector(enc_hidden)
+
+        # (4) Merge into multimodal inputs_embeds (byte-exact vs stock).
+        inputs_embeds = self.build_inputs_embeds(
+            input_ids, audio_embeds, input_features_mask
+        )
+
+        # (5) Self-speculative greedy generate.
+        res = spec_decoder.generate(
+            inputs_embeds, draft,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=LLM_EOS_TOKEN_ID,
+        )
+
+        # (6) Decode generated ids to text.
         text = self.processor.tokenizer.batch_decode(
             res.ids, skip_special_tokens=True
         )[0]
