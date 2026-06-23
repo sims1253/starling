@@ -35,21 +35,38 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import make_fixtures as mkfx  # noqa: E402
 
-# Building a pipeline loads the model (~25 s); cache ONE pipeline + chunker
-# across the whole module so the suite is fast.
+# Building a pipeline loads the model (~25 s); cache ONE pipeline across the
+# whole module so the suite is fast. Chunker objects are cheap to build (they
+# only store params, no GPU work), so they are constructed per-test.
 _PIPE = None
-_CHUNKER = None
 
 
-def _get_chunker():
-    global _PIPE, _CHUNKER
-    if _CHUNKER is None:
+def _get_pipe():
+    global _PIPE
+    if _PIPE is None:
         from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
-        from megapar.parakeet.chunking import ChunkedTranscriber  # noqa: WPS433
 
         _PIPE = MegaParakeetPipeline(use_graphed_encoder=True)
-        _CHUNKER = ChunkedTranscriber(_PIPE, chunk_seconds=30.0, overlap_seconds=2.0)
-    return _PIPE, _CHUNKER
+    return _PIPE
+
+
+def _get_chunker(chunk_batch_size: int = 1):
+    """Build a fresh chunker over the cached pipeline.
+
+    Defaults to ``chunk_batch_size=1`` (the original sequential path) so the
+    existing correctness/memory tests are byte-for-byte unchanged; the batched
+    tests pass ``8`` explicitly. Returns ``(pipe, chunker)``.
+    """
+    from megapar.parakeet.chunking import ChunkedTranscriber  # noqa: WPS433
+
+    pipe = _get_pipe()
+    chunker = ChunkedTranscriber(
+        pipe,
+        chunk_seconds=30.0,
+        overlap_seconds=2.0,
+        chunk_batch_size=chunk_batch_size,
+    )
+    return pipe, chunker
 
 
 def _repeat_audio(base: np.ndarray, target_seconds: float, sr: int = 16000) -> np.ndarray:
@@ -177,4 +194,103 @@ def test_memory_bounded_5min():
     assert peak_gb < 4.0, (
         f"peak VRAM {peak_gb:.3f} GB during 5 min chunked run exceeded the 4 GB "
         f"budget -- chunking is not bounding memory as intended"
+    )
+
+
+# =========================================================================== #
+# BATCHED chunked decoding (chunk_batch_size=8)
+#
+# The batched path groups chunks into mini-batches of 8 and runs each through
+# one set of batched mel+encoder+decode forwards, recovering the megakernel
+# pipeline's batched throughput. These tests guard:
+#   5. single-chunk byte-exactness is preserved (1 chunk -> B=1 mini-batch ->
+#      byte-exact with the direct pipeline),
+#   6. batched 5 min transcribes to reasonable text (multi-chunk B=8 stitching),
+#   7. peak VRAM during a batched 5 min run stays < 16 GB (memory guard works).
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# 5. batched single-chunk byte-exactness (chunk_batch_size=8, 1 chunk -> B=1)
+# --------------------------------------------------------------------------- #
+def test_batched_single_chunk_byte_exact_medium():
+    """With chunk_batch_size=8, a <=-one-chunk clip (medium ~22.3 s) forms a
+    single B=1 mini-batch and must reproduce the direct pipeline output
+    byte-for-byte (same guarantee as the sequential single-chunk test, just
+    routed through the batched code path)."""
+    pipe, chunker = _get_chunker(chunk_batch_size=8)
+    fixtures = mkfx.load_fixtures()
+    medium = fixtures["medium"]
+
+    direct = pipe.transcribe([medium])[0]
+    batched = chunker.transcribe(medium)
+
+    assert batched == direct, (
+        "batched single-chunk path drifted from the direct pipeline output:\n"
+        f"  direct  : {direct!r}\n  batched : {batched!r}"
+    )
+
+
+def test_batched_single_chunk_byte_exact_short():
+    """Same byte-exactness guarantee for the short fixture (~7.4 s, B=1)."""
+    pipe, chunker = _get_chunker(chunk_batch_size=8)
+    fixtures = mkfx.load_fixtures()
+    short = fixtures["short"]
+
+    direct = pipe.transcribe([short])[0]
+    batched = chunker.transcribe(short)
+
+    assert batched == direct, (
+        "batched single-chunk (short) drifted:\n"
+        f"  direct  : {direct!r}\n  batched : {batched!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 6 + 7. batched 5 min: reasonable text + bounded memory (< 16 GB)
+# --------------------------------------------------------------------------- #
+def test_batched_5min_reasonable_and_memory():
+    """Batched (chunk_batch_size=8) 5 min transcription must:
+
+    * produce non-empty, reasonable English containing the expected substrings,
+    * actually batch (n_batches < n_chunks, batch_size up to 8),
+    * keep peak VRAM < 16 GB (the memory guard adapts B to free VRAM and never
+      OOMs -- at B=8 a batch of 30 s chunks is well under this budget).
+    """
+    _pipe, chunker = _get_chunker(chunk_batch_size=8)
+    base = mkfx.load_sample()
+    audio = _repeat_audio(base, target_seconds=300.0)  # 5 min
+
+    text, summary = chunker.transcribe_with_timing(audio)
+
+    # batching actually happened: fewer batches than chunks, each <= 8 chunks
+    assert summary["n_chunks"] >= 8, (
+        f"5 min should need >=8 chunks, got {summary['n_chunks']}"
+    )
+    assert summary["n_batches"] >= 1, "expected at least one batch"
+    assert summary["n_batches"] < summary["n_chunks"], (
+        f"expected fewer batches ({summary['n_batches']}) than chunks "
+        f"({summary['n_chunks']}) -- batching did not engage"
+    )
+    batch_sizes = [b["batch_size"] for b in summary["per_batch"]]
+    assert max(batch_sizes) > 1, (
+        f"expected at least one batch with >1 chunk, got batch sizes {batch_sizes}"
+    )
+    assert all(1 <= bs <= 8 for bs in batch_sizes), (
+        f"batch sizes out of [1, 8]: {batch_sizes}"
+    )
+
+    # reasonable, non-empty English text
+    assert len(text.strip()) > 0, "batched 5 min transcription is empty"
+    assert "Phoebe" in text, "expected 'Phoebe' in the batched transcription"
+    assert "portrait" in text, "expected 'portrait' in the batched transcription"
+    assert text.replace(" ", "").replace(".", "").isascii(), (
+        "batched transcription should be ASCII English"
+    )
+
+    # memory guard: peak VRAM bounded (< 16 GB); never OOMs.
+    peak_gb = summary["peak_vram_gb"]
+    assert peak_gb < 16.0, (
+        f"batched 5 min peak VRAM {peak_gb:.3f} GB exceeded the 16 GB budget -- "
+        f"the adaptive batch-size guard is not bounding memory (batch sizes "
+        f"{batch_sizes})"
     )
