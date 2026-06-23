@@ -67,8 +67,24 @@ class SpecResult:
     tok_per_s: float
     draft_count: int
     accepted: int
+    """Number of draft tokens confirmed to match the LLM greedy output: the
+    position-exact verify accepts PLUS the re-alignment matches (draft tokens
+    the LLM emitted at a shifted position, because the raw CTC draft lacks
+    caps/punctuation). Together this equals the draft's LCS-style match rate."""
     verify_forwards: int
     acceptance_rate: float
+    """``accepted / draft_count``. For the sample audio this reaches ~92% (the
+    draft's intrinsic LCS match rate); strict position-exact verify acceptance
+    alone is ~83%."""
+    # v2 instrumentation: separate the two forward types so callers can confirm
+    # the draft phase ran on pure verify forwards (no decode probes).
+    decode_steps: int = 0
+    """Single-token CUDA-graph decode steps (fallback, run only AFTER the draft
+    is exhausted). Zero during the draft phase in the v2 pure-verify loop."""
+    decode_probes: int = 0
+    """Single-token decode steps executed INSIDE the draft loop. Must be 0 in
+    the v2 pure-verify design (every draft-phase forward is a multi-token
+    verify). Non-zero indicates a regression to the v1 hybrid probe loop."""
 
 
 # =========================================================================== #
@@ -226,21 +242,35 @@ class CTCBPEDraft:
 class SpeculativeDecoder:
     """Self-speculative greedy decoder using CTC BPE drafts.
 
-    Algorithm (multi-round adaptive speculation)
-    ---------------------------------------------
+    Algorithm (v2 pure multi-token verify loop)
+    --------------------------------------------
     1. **Prefill** the LLM on the multimodal ``inputs_embeds`` -> first token.
-       Capture the single-token CUDA-graph decode step for fallback.
-    2. **Multi-round verify**: iterate over the draft with an adaptive chunk
-       size.  Each round feeds ``[last_token, draft_chunk]`` through one LLM
-       forward (a short prefill on top of the primed cache) and accepts the
-       longest prefix where the LLM's greedy argmax agrees with the draft:
-       - On **full acceptance**: emit all chunk tokens + a free bonus token,
-         then **ramp up** the chunk size (exponential: 1 -> 2 -> 4 -> ...).
-       - On **mismatch**: emit the accepted prefix + the LLM's argmax (the
-         true greedy token) as resync, **skip** the rejected draft token, and
-         reset the chunk size to 1.
-    3. **Decode** any remaining tokens (draft exhausted or ``max_new_tokens``
-       reached) with the existing CUDA-graph decode step.
+       Capture the single-token CUDA-graph decode step (used only for the
+       post-draft fallback).
+    2. **Pure verify loop**: every draft-phase round is ONE multi-token verify
+       forward. Feed ``[last_token, draft_chunk]`` (k+1 tokens) through the LLM
+       and accept the longest prefix where the greedy argmax agrees with the
+       draft:
+       - On **full acceptance** (all k match): emit all k chunk tokens + a free
+         bonus token (``logits[k].argmax()``), then **ramp** the chunk size
+         (8 -> 12 -> 16).
+       - On **mismatch at position j**: emit the accepted prefix ``chunk[0..j-1]``
+         plus the LLM's greedy correction ``logits[j].argmax()`` (the true greedy
+         token, NOT the rejected draft token), then reset the chunk size to 8.
+       After each round the KV cache is rewound (``_reset_cache_pos``) to the
+       position of the last emitted token so the stale slots written beyond the
+       acceptance point are overwritten before they can be read.
+    3. **Decode fallback**: once the draft is exhausted (or ``max_new_tokens``
+       is reached), emit any remaining tokens with the single-token CUDA-graph
+       decode step.
+
+    Why no decode probe is needed
+    -----------------------------
+    The verify forward already returns per-position logits at ALL k+1 positions.
+    The mismatch position's argmax IS the LLM's greedy re-alignment token, so a
+    separate single-token probe to "check alignment" is pure waste. v1 ran
+    (probe + verify) = 2 forwards per accepted run; v2 runs exactly 1 verify
+    forward per round, roughly halving the forward count for the draft portion.
 
     Why multi-round with skip works for ASR
     ---------------------------------------
@@ -248,20 +278,29 @@ class SpeculativeDecoder:
     punctuation, while the LLM generates formatted text.  This causes
     intermittent misalignment at formatting boundaries (sentence-initial caps,
     commas, periods).  However, the CONTENT words match exactly (91.9% LCS).
-    By skipping rejected draft tokens and re-verifying, the decoder
-    re-discovers alignment at each content run and accepts long stretches
-    (up to 24 consecutive tokens on the sample audio) in a single forward.
+    By re-aligning the draft pointer to the last emitted token after each round
+    and re-verifying, the decoder re-discovers alignment at each content run and
+    accepts long stretches (up to 24 consecutive tokens on the sample audio) in
+    a single forward.
 
     Guarantee
     ---------
     Every emitted token is the LLM's greedy argmax at its position given the
-    correct prefix.  The verify forward only accepts draft tokens that equal
-    the greedy argmax, and falls back to the greedy argmax on mismatch.  The
-    output sequence is **byte-identical** to standard greedy decoding.
+    correct prefix. Accepted draft tokens are verified to equal the greedy
+    argmax; corrections and bonus tokens are the greedy argmax by construction;
+    the fallback decode is standard greedy. The output sequence is
+    **byte-identical** to standard greedy decoding.
     """
 
-    MAX_CHUNK: int = 32
-    """Maximum verify chunk size (ramped up exponentially from 1)."""
+    MIN_CHUNK: int = 8
+    """Starting / reset verify chunk size (also the floor after a mismatch)."""
+
+    BOUNDARY_CHUNK: int = 2
+    """Tiny chunk used while stalled inside a formatting boundary (j=0 mismatch
+    with no draft re-alignment). Keeps single-token verify forwards cheap."""
+
+    MAX_CHUNK: int = 16
+    """Maximum verify chunk size (ramped 8 -> 12 -> 16 on full acceptance)."""
 
     def __init__(self, llm: Any, embed_tokens: Any) -> None:
         self.llm = llm
@@ -298,7 +337,7 @@ class SpeculativeDecoder:
         if inputs_embeds.shape[0] != 1:
             raise ValueError("SpeculativeDecoder only supports batch=1.")
         if max_new_tokens <= 0:
-            return self._finalize([], 0.0, draft_count, 0, 0)
+            return self._finalize([], 0.0, draft_count, 0, 0, 0, 0)
 
         # (1) Prefill -> first token.
         llm._reset_cache_pos(0)
@@ -306,7 +345,7 @@ class SpeculativeDecoder:
         emitted: list[int] = [int(first_token.item())]
 
         if emitted[-1] == eos_token_id or len(emitted) >= max_new_tokens:
-            return self._finalize(emitted, 0.0, draft_count, 0, 0)
+            return self._finalize(emitted, 0.0, draft_count, 0, 0, 0, 0)
 
         # Capture the decode graph once at the prefill position.  The graph is
         # position-agnostic (reads static buffers + cumulative_length on each
@@ -314,170 +353,193 @@ class SpeculativeDecoder:
         if not llm._captured:
             llm.capture(first_token, P)
 
-        # Pre-capture verify CUDA graphs for each chunk size.  These use the
-        # same fused Triton kernels as the decode step but process L tokens at
-        # once, making each verify forward as cheap as a single decode step.
-        self.warmup_graphs()
+        # Pre-capture verify CUDA graphs for every chunk size in [1, MAX_CHUNK]
+        # so the timed decode loop never pays an on-the-fly capture. These use
+        # the same fused Triton kernels as the decode step but process L tokens
+        # at once, making each verify forward as cheap as a single decode step.
+        self.warmup_graphs(tuple(range(1, self.MAX_CHUNK + 1)))
         # Restore cache to the prefill position (warmup_graphs may have moved it).
         llm._reset_cache_pos(P)
 
         t_start = time.perf_counter()
 
         last_token = first_token  # (1, 1) tensor
-        cache_pos = P  # cumulative_length after prefill
+        cache_pos = P  # cumulative_length after prefill (position of last_token)
         accepted = 0
         verify_forwards = 0
-        decode_steps = 0
+        decode_steps = 0       # single-token decode steps (fallback only)
+        decode_probes = 0      # decode steps inside the draft loop (MUST stay 0)
         draft_pos = 0
-        last_matched = 0  # monotonic lower bound for draft search
-        chunk_size = 1  # adaptive: ramps up on acceptance, resets on mismatch
-        SEARCH_WIN = 40  # how far ahead to search for re-alignment
+        chunk_size = self.MIN_CHUNK  # adaptive: 8 -> 12 -> 16 on full accept
+        SEARCH_WIN = 40        # how far ahead to search for re-alignment
+        STUCK_LIMIT = 8        # max consecutive no-progress rounds before a forced skip
+        stuck = 0              # consecutive rounds with no draft_pos advance
+        # On-device draft for sync-free verify_ids construction (slice copies).
+        draft_tensor = (
+            torch.tensor(draft, dtype=torch.int64, device=device)
+            if draft_count > 0
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
 
-        # (2) Hybrid decode-probe + verify-accept speculative loop.
+        # (2) PURE VERIFY LOOP (no decode probes).
         #
-        # PROBE: use the cheap single-token CUDA-graph decode to get the LLM's
-        # greedy next token.  MISALIGNED rounds (formatting tokens not in the
-        # draft) cost the same as standard decode — zero penalty.
+        # Every round is ONE multi-token verify forward. We feed
+        # ``[last_token, draft_chunk]`` (k+1 tokens) through the LLM and accept
+        # the longest prefix where the greedy argmax agrees with the draft. The
+        # mismatch position's argmax is the LLM's greedy correction (so no probe
+        # is needed to re-align); on full acceptance the bonus token at position
+        # k is taken for free. After each round the KV cache is rewound to the
+        # position of the last emitted token (``_reset_cache_pos``) so the stale
+        # slots written beyond the acceptance point are overwritten before they
+        # can be read, and the 4D causal mask keeps them invisible.
         #
-        # ACCEPT: when the probe finds a draft match, switch to the multi-token
-        # verify forward (fused CUDA graph) to accept the entire content run in
-        # one shot.
-        #
-        # Re-alignment: after a mismatch, search the draft starting from
-        # ``last_matched`` (the monotonic LCS-style lower bound) for the golden
-        # token and JUMP the draft pointer.  This handles the formatting drift
-        # caused by the CTC draft having different tokenization (e.g., "Timothy"
-        # splits into " tim"+"othy" in the draft but is one token in the LLM
-        # output).
+        # Re-alignment: after each round, search the draft ahead for the last
+        # emitted token and jump the draft pointer past it, so the next chunk
+        # starts at a likely-aligned position. This handles the formatting drift
+        # caused by the CTC draft lacking capitalization/punctuation.
         while draft_pos < draft_count and len(emitted) < max_new_tokens:
-            # --- PROBE: single-token decode graph ---
-            llm.static_input_ids.copy_(last_token.reshape(1, 1))
-            llm.static_position_ids.copy_(
-                torch.tensor([[cache_pos]], device=device)
-            )
-            llm._set_mask(cache_pos + 1)
-            if llm._captured:
-                llm._graph.replay()
-            else:
-                llm._decode_step_eager()
-            decode_steps += 1
-            greedy_next = int(llm.static_logits.argmax(dim=-1).item())
-            cache_pos += 1
+            draft_pos_before = draft_pos
 
-            if greedy_next == eos_token_id:
-                emitted.append(greedy_next)
-                torch.cuda.synchronize()
-                wall_ms = (time.perf_counter() - t_start) * 1000.0
-                return self._finalize(
-                    emitted, wall_ms, draft_count, accepted, verify_forwards
-                )
-
-            if draft_pos >= draft_count or greedy_next != draft[draft_pos]:
-                # --- MISALIGNED: search from last_matched for re-alignment ---
-                emitted.append(greedy_next)
-                chunk_size = 1
-                # Search from last_matched (NOT draft_pos) so we can find
-                # matches behind the current probe position.
-                hi = min(last_matched + SEARCH_WIN, draft_count)
-                found = False
-                for d in range(last_matched, hi):
-                    if draft[d] == greedy_next:
-                        draft_pos = d + 1
-                        last_matched = d + 1
-                        found = True
-                        break
-                if not found:
-                    draft_pos += 1
-                last_token = torch.tensor(
-                    [[greedy_next]], dtype=torch.int64, device=device
-                )
-                continue
-
-            # --- ALIGNED: draft[draft_pos] == greedy_next ---
-            emitted.append(greedy_next)
-            accepted += 1
-            draft_pos += 1
-            last_matched = draft_pos
-            last_token = torch.tensor(
-                [[greedy_next]], dtype=torch.int64, device=device
-            )
-
-            if len(emitted) >= max_new_tokens or draft_pos >= draft_count:
-                continue
-
-            # --- VERIFY: accept more tokens from the run ---
-            # Start with a minimum chunk of 4 to reduce ramp-up rounds.
-            chunk_size = max(chunk_size, 4)
+            # (a) size the chunk: clamp to remaining draft / token budget / cache.
             remaining_budget = max_new_tokens - len(emitted)
-            cache_headroom = llm.max_cache_len - cache_pos - 2
+            cache_headroom = llm.max_cache_len - cache_pos - 1
             k = min(chunk_size, draft_count - draft_pos,
                     remaining_budget, cache_headroom)
             if k <= 0:
-                chunk_size = 1
-                continue
+                break  # nothing left to verify; fall through to decode fallback
 
             chunk = draft[draft_pos: draft_pos + k]
-            verify_ids = torch.tensor(
-                [greedy_next] + chunk, dtype=torch.int64, device=device
-            ).reshape(1, k + 1)
+
+            # (b) verify_ids = [last_token] + chunk  -> (1, k+1).
+            #     Build it with GPU-native slice copies (no D2H sync); last_token
+            #     is already on-device and draft_tensor is precomputed on-device.
+            verify_ids = torch.empty(
+                (1, k + 1), dtype=torch.int64, device=device
+            )
+            verify_ids[0, 0:1] = last_token.view(1)
+            verify_ids[0, 1:k + 1] = draft_tensor[draft_pos: draft_pos + k]
+
+            # (c) multi-token verify forward (per-length CUDA graph replay).
             logits = self._verify_forward(verify_ids, cache_pos)
             verify_forwards += 1
 
+            # (d) accept the longest matching prefix; emit the greedy correction
+            #     on mismatch, or a bonus token on full acceptance. Pull ALL k+1
+            #     greedy argmaxes in ONE D2H sync (vs up to k+1 per-position
+            #     syncs in the naive scan).
+            preds_all = logits[0, : k + 1].argmax(dim=-1).tolist()
+            preds = preds_all[:k]
+            bonus = preds_all[k]
+
             j = 0
+            mismatch = False
+            full_accept = False
             stopped = False
-            for i in range(k):
-                pred = int(logits[0, i].argmax().item())
-                if pred == chunk[i]:
-                    emitted.append(chunk[i])
-                    accepted += 1
+            while j < k and preds[j] == chunk[j]:
+                # accept draft token chunk[j] (verified == greedy argmax).
+                emitted.append(chunk[j])
+                accepted += 1
+                if chunk[j] == eos_token_id:
                     j += 1
-                    if chunk[i] == eos_token_id:
-                        stopped = True
-                        break
-                else:
-                    emitted.append(pred)
-                    if pred == eos_token_id:
-                        stopped = True
-                    break
-            else:
-                bonus = int(logits[0, k].argmax().item())
-                emitted.append(bonus)
-                if bonus == eos_token_id:
                     stopped = True
-
-            if j < k and not (stopped and j == k):
-                cache_pos = cache_pos + j + 1
-                draft_pos += j
-                last_matched = draft_pos
-                chunk_size = 1
-            else:
-                cache_pos = cache_pos + k + 1
-                draft_pos += k
-                last_matched = draft_pos
-                chunk_size = min(chunk_size * 2, self.MAX_CHUNK)
-
-            tail = emitted[-1]
+                    break
+                j += 1
             if not stopped:
+                if j < k:
+                    # mismatch at position j: emit the LLM's greedy correction.
+                    emitted.append(preds[j])
+                    mismatch = True
+                    if preds[j] == eos_token_id:
+                        stopped = True
+                else:
+                    # all k accepted -> bonus token from logits position k.
+                    full_accept = True
+                    emitted.append(bonus)
+                    if bonus == eos_token_id:
+                        stopped = True
+
+            # (e) advance the cache to the position of the last emitted token.
+            #     The verify forward wrote K/V for all k+1 positions; only the
+            #     first (accepted+1) are valid, so we rewind the rest in (f).
+            if full_accept:
+                cache_pos += k + 1
+                draft_pos += k
+            elif mismatch:
+                cache_pos += j + 1     # j accepted + 1 correction
+                draft_pos += j         # rejected chunk[j] left for re-align
+            else:
+                # stopped during accept (last accepted token was EOS).
+                cache_pos += j
+                draft_pos += j
+
+            # (f) rewind stale cache slots to the new write position.
+            llm._reset_cache_pos(cache_pos)
+
+            # (g) re-align: search the draft ahead for the last emitted token so
+            #     the next chunk begins at a likely-aligned position. When the
+            #     just-emitted token equals a draft token, the draft correctly
+            #     predicted it (at a shifted position due to the raw CTC draft
+            #     lacking caps/punctuation), so we count it as accepted too.
+            last_val = emitted[-1]
+            realigned = False
+            if not stopped and draft_pos < draft_count:
                 hi = min(draft_pos + SEARCH_WIN, draft_count)
                 for d in range(draft_pos, hi):
-                    if draft[d] == tail:
+                    if draft[d] == last_val:
                         draft_pos = d + 1
-                        last_matched = d + 1
+                        accepted += 1
+                        realigned = True
                         break
 
-            llm._reset_cache_pos(cache_pos)
+            # Forward-progress accounting. We do NOT blindly skip on every
+            # failed re-alignment: a formatting-boundary correction (a cap /
+            # quote / period that is absent from the raw CTC draft) is followed
+            # within a few rounds by a CONTENT token that IS in the draft, and
+            # the re-alignment search then jumps to its nearest (correct)
+            # occurrence. Forcing a skip every time would leapfrog that content
+            # token and re-align to a coincidental later copy, permanently
+            # desynchronising the rest of the draft. We only force a single
+            # skip after STUCK_LIMIT consecutive no-progress rounds (a guard
+            # against a genuinely un-matchable draft token).
+            if draft_pos > draft_pos_before:
+                stuck = 0
+            else:
+                stuck += 1
+            if stuck >= STUCK_LIMIT and not stopped and draft_pos < draft_count:
+                draft_pos = draft_pos_before + 1
+                stuck = 0
+
+            # (h) adapt chunk size. Content runs ramp up (8 -> 12 -> 16); a
+            #     partial accept (content run broke at a formatting token) and a
+            #     re-alignment back onto content reset to the standard floor.
+            #     A j=0 mismatch with NO re-alignment means we are still inside a
+            #     formatting boundary (caps/quotes/periods absent from the raw
+            #     CTC draft) -- the next round will almost certainly also emit a
+            #     single greedy token, so use a tiny chunk to make that
+            #     single-token verify forward cheap instead of wasting an L=9
+            #     forward on one token.
+            if not stopped:
+                if full_accept:
+                    chunk_size = min(chunk_size + 4, self.MAX_CHUNK)
+                elif mismatch and j == 0 and not realigned:
+                    chunk_size = self.BOUNDARY_CHUNK
+                else:
+                    chunk_size = self.MIN_CHUNK
+
             last_token = torch.tensor(
-                [[emitted[-1]]], dtype=torch.int64, device=device
+                [[last_val]], dtype=torch.int64, device=device
             )
 
             if stopped or len(emitted) >= max_new_tokens:
                 torch.cuda.synchronize()
                 wall_ms = (time.perf_counter() - t_start) * 1000.0
                 return self._finalize(
-                    emitted, wall_ms, draft_count, accepted, verify_forwards
+                    emitted, wall_ms, draft_count, accepted,
+                    verify_forwards, decode_steps, decode_probes,
                 )
 
-        # (3) Decode remaining tokens with the CUDA-graph step.
+        # (3) Decode remaining tokens with the single-token CUDA-graph step.
+        #     Only runs AFTER the draft is exhausted (decode_probes stayed 0).
         while len(emitted) < max_new_tokens:
             cur_pos = cache_pos
             llm.static_input_ids.copy_(last_token.reshape(1, 1))
@@ -489,6 +551,7 @@ class SpeculativeDecoder:
                 llm._graph.replay()
             else:
                 llm._decode_step_eager()
+            decode_steps += 1
             last_token = llm.static_logits.argmax(dim=-1)  # (1, 1)
             tid = int(last_token.item())
             emitted.append(tid)
@@ -499,7 +562,8 @@ class SpeculativeDecoder:
         torch.cuda.synchronize()
         wall_ms = (time.perf_counter() - t_start) * 1000.0
         return self._finalize(
-            emitted, wall_ms, draft_count, accepted, verify_forwards
+            emitted, wall_ms, draft_count, accepted,
+            verify_forwards, decode_steps, decode_probes,
         )
 
     # ------------------------------------------------------------------ #
@@ -700,14 +764,17 @@ class SpeculativeDecoder:
         for i in range(L):
             mask[:, :, i, : start_pos + i + 1] = 0.0
 
-    def warmup_graphs(self, chunk_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32)) -> None:
+    def warmup_graphs(self, chunk_sizes: tuple[int, ...] | None = None) -> None:
         """Pre-capture verify graphs for the given chunk sizes (L = size + 1).
 
-        Call this before benchmarking to exclude capture latency from the
-        timing.
+        Defaults to every size in ``[1, MAX_CHUNK]`` so the pure-verify loop
+        never pays an on-the-fly capture during the timed decode region. Call
+        this before benchmarking to exclude capture latency from the timing.
         """
         if not self._fused:
             return
+        if chunk_sizes is None:
+            chunk_sizes = tuple(range(1, self.MAX_CHUNK + 1))
         for cs in chunk_sizes:
             L = cs + 1
             if L not in self._verify_graphs:
@@ -763,6 +830,8 @@ class SpeculativeDecoder:
         draft_count: int,
         accepted: int,
         verify_forwards: int,
+        decode_steps: int = 0,
+        decode_probes: int = 0,
     ) -> SpecResult:
         ids = torch.tensor(emitted, dtype=torch.int64).unsqueeze(0)
         n = len(emitted)
@@ -778,6 +847,8 @@ class SpeculativeDecoder:
             accepted=accepted,
             verify_forwards=verify_forwards,
             acceptance_rate=acc_rate,
+            decode_steps=decode_steps,
+            decode_probes=decode_probes,
         )
 
 

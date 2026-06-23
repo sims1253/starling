@@ -20,9 +20,14 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
+from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
 from megapar.golden import load_golden, load_golden_text  # noqa: E402
 from megapar.pipeline import MegaPipeline  # noqa: E402
-from megapar.speculative import CTCBPEDraft, load_out_llm  # noqa: E402
+from megapar.speculative import (  # noqa: E402
+    CTCBPEDraft,
+    SpecResult,
+    load_out_llm,
+)
 
 # Reuse the model cached by test_pipeline.py.
 _MODEL = None
@@ -145,6 +150,74 @@ def test_speculative_matches_greedy(pipeline):
     assert text_spec.strip() == golden_resp, (
         f"speculative transcript mismatch:\n  golden: {golden_resp[:100]!r}\n"
         f"  spec:   {text_spec.strip()[:100]!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# v2 instrumentation helpers
+# --------------------------------------------------------------------------- #
+def _run_spec_decoder(pipeline, max_new_tokens: int = 100) -> SpecResult:
+    """Drive the SpeculativeDecoder directly to read its v2 counters."""
+    inputs = _get_inputs()
+    feats = inputs["input_features"]
+    input_ids = inputs["input_ids"]
+    ifm = inputs.get("input_features_mask")
+
+    out_llm = load_out_llm(device="cuda", dtype=torch.bfloat16)
+    ctc = CTCBPEDraft(pipeline.fused_encoder, out_llm)
+    with torch.inference_mode():
+        mid_h, enc_hidden = ctc.encode_with_mid(feats)
+        draft = ctc.draft(enc_hidden, mid_h)
+        audio_embeds = pipeline.projector(enc_hidden)
+        ie = pipeline.build_inputs_embeds(input_ids, audio_embeds, ifm)
+        _ctc, sd = pipeline._get_spec_components()
+        return sd.generate(
+            ie, draft, max_new_tokens=max_new_tokens, eos_token_id=LLM_EOS_TOKEN_ID
+        )
+
+
+# --------------------------------------------------------------------------- #
+# v2 acceptance gate (target > 85%, up from v1's 82.6%)
+# --------------------------------------------------------------------------- #
+def test_speculative_acceptance(pipeline):
+    """The pure-verify loop must achieve > 85% draft acceptance.
+
+    Larger adaptive chunks (8 -> 12 -> 16) plus draft re-alignment should
+    accept a higher fraction of the draft than the v1 probe loop.
+    """
+    res = _run_spec_decoder(pipeline, max_new_tokens=100)
+    print(
+        f"[acceptance] rate={res.acceptance_rate:.1%} "
+        f"accepted={res.accepted}/{res.draft_count} "
+        f"verify_forwards={res.verify_forwards} decode_steps={res.decode_steps} "
+        f"decode_probes={res.decode_probes}"
+    )
+    assert res.acceptance_rate > 0.85, (
+        f"acceptance rate {res.acceptance_rate:.1%} below 85% target "
+        f"(accepted={res.accepted}, draft_count={res.draft_count})"
+    )
+
+
+def test_speculative_no_decode_probes(pipeline):
+    """The draft phase must run entirely on multi-token verify forwards.
+
+    decode_probes counts single-token decode steps executed INSIDE the draft
+    loop; it must be 0 in the v2 pure-verify design. verify_forwards must be > 0
+    to prove the verify path actually ran.
+    """
+    res = _run_spec_decoder(pipeline, max_new_tokens=100)
+    assert res.decode_probes == 0, (
+        f"decode_probes={res.decode_probes} > 0: the draft loop regressed to the "
+        f"v1 hybrid probe path (expected pure verify only)."
+    )
+    assert res.verify_forwards > 0, "verify_forwards == 0: verify loop did not run."
+    total_forwards = res.verify_forwards + res.decode_steps
+    assert total_forwards > 0
+    print(
+        f"[no-probes] decode_probes={res.decode_probes} "
+        f"verify_forwards={res.verify_forwards} "
+        f"decode_steps(fallback)={res.decode_steps} "
+        f"total_forwards={total_forwards} n_tokens={res.n_tokens}"
     )
 
 
