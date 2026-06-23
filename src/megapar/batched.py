@@ -654,13 +654,25 @@ class BatchedPipeline:
         # BatchedFusedLLMMega (fused Triton elementwise kernels) is the default
         # for maximum throughput; BatchedLLMMega (model's own forward) is the
         # simpler fallback.  Both are byte-exact per stream vs batch=1.
-        llm_cls = BatchedFusedLLMMega if use_fused_llm else BatchedLLMMega
-        self.llm = llm_cls(
-            comps["language_model"],
-            model.lm_head,
-            max_cache_len=max_cache_len,
-            max_batch_size=self.max_batch_size,
-        )
+        # ``quantized_weights`` (tolerance mode) selects the weight-only INT8
+        # decoder (:class:`megapar.quant.BatchedQuantLLMMega`).
+        if flags.quantized_weights:
+            from .quant import BatchedQuantLLMMega
+
+            self.llm = BatchedQuantLLMMega(
+                comps["language_model"],
+                model.lm_head,
+                max_cache_len=max_cache_len,
+                max_batch_size=self.max_batch_size,
+            )
+        else:
+            llm_cls = BatchedFusedLLMMega if use_fused_llm else BatchedLLMMega
+            self.llm = llm_cls(
+                comps["language_model"],
+                model.lm_head,
+                max_cache_len=max_cache_len,
+                max_batch_size=self.max_batch_size,
+            )
         self.use_fused_llm = use_fused_llm
 
     # ------------------------------------------------------------------ #
