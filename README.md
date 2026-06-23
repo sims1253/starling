@@ -41,6 +41,9 @@ For context against other engines on the same parakeet weights, this is roughly
 1.4-3.7x faster than parakeet.cpp and 38-68x faster than CrispASR, with
 identical transcripts.
 
+On the granite-speech-4.1-2b model, starling is ~7x faster than CrispASR (the
+ggml/whisper.cpp engine) on identical weights.
+
 ## What did not work
 
 Kept here because they are the more interesting findings:
@@ -55,9 +58,10 @@ Kept here because they are the more interesting findings:
 
 ## Requirements
 
-- RTX 5090 / Blackwell (sm_120). The torch wheels are pinned to the CUDA 13.0
-  (cu130) index in `pyproject.toml`; the default PyPI torch wheel is cu12 / sm_90
-  and will not run on this card.
+- Tuned on an RTX 5090 (Blackwell, sm_120). Runs on any Ampere+ NVIDIA GPU
+  (RTX 30/40/50, A100, H100); bf16 required. The torch wheels are pinned to the
+  CUDA 13.0 (cu130) index in `pyproject.toml`; the default PyPI torch wheel is
+  cu12 / sm_90 and will not run on Blackwell.
 - CUDA 13.0, Python 3.10-3.12, and [uv](https://github.com/astral-sh/uv).
 
 ## Layout
@@ -77,8 +81,3 @@ benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
 ```
-
-## Note on the name
-
-This repository is being renamed from `starling` to `starling`. The Python
-package is still imported as `starling`; the source-tree rename is pending.
