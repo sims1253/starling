@@ -7,7 +7,7 @@ __pycache__/
 # uv cache / state
 .uv/
 
-# megapar artifacts
+# runtime artifacts
 models/
 outputs/
 traces/
@@ -18,6 +18,14 @@ golden/
 *.wav
 *.flac
 *.mp3
+
+# internal coordination / runtime locks (not for publication)
+comms.md
+.gpu.lock
+
+# test/lint caches
+.pytest_cache/
+.ruff_cache/
 
 # notebooks / editor
 .ipynb_checkpoints/
