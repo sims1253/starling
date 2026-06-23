@@ -122,11 +122,16 @@ def test_triton_matches_golden(encoder, input_features):
     _check_against_golden(out, "triton")
 
 
+@pytest.mark.compile
 def test_compile_numerically_close(encoder, input_features):
     """torch.compile changes attention precision (fp32 intermediates).
 
     This mode is numerically close but NOT byte-exact; we assert it stays
     within a relaxed tolerance and print the actual diff for visibility.
+
+    Gated behind the ``compile`` marker: ``torch.compile(mode="max-autotune-
+    no-cudagraphs")`` benchmarks candidate kernels on the GPU and takes minutes.
+    Run with ``pytest --runcompile``.
     """
     fe = FusedEncoder(
         encoder, mode="compile", compile_mode="max-autotune-no-cudagraphs"

@@ -134,9 +134,15 @@ def _encoder_pooler(pipe, audio):
     return pooler
 
 
+@pytest.mark.compile
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_compiled_transcript_matches_oracle(name):
-    """compiled encoder: transcript must match the oracle (text-level)."""
+    """compiled encoder: transcript must match the oracle (text-level).
+
+    Gated behind the ``compile`` marker: the compiled pipeline uses
+    ``torch.compile`` (max-autotune) which benchmarks kernels on the GPU and is
+    slow. Run with ``pytest --runcompile``.
+    """
     oracle = _oracle()
     pipe = _get_pipeline_mode("compiled")
     fixtures = mkfx.load_fixtures()
@@ -148,8 +154,13 @@ def test_compiled_transcript_matches_oracle(name):
     )
 
 
+@pytest.mark.compile
 def test_compiled_batch8_uniform_medium():
-    """compiled encoder: batch=8 uniform-medium all match the oracle transcript."""
+    """compiled encoder: batch=8 uniform-medium all match the oracle transcript.
+
+    Gated behind the ``compile`` marker (slow ``torch.compile``). Run with
+    ``pytest --runcompile``.
+    """
     oracle = _oracle()
     pipe = _get_pipeline_mode("compiled")
     fixtures = mkfx.load_fixtures()
@@ -164,6 +175,7 @@ def test_compiled_batch8_uniform_medium():
         )
 
 
+@pytest.mark.compile
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_compiled_pooler_near_exact_vs_graphed(name):
     """compiled encoder pooler must be near the graphed (reference) pooler.
@@ -172,6 +184,9 @@ def test_compiled_pooler_near_exact_vs_graphed(name):
     but must stay within a sane max_abs bound of the byte-exact graphed path so
     the transcript cannot drift. If the compiled pooler is byte-exact
     (max_abs == 0.0) this test still passes (the bound is an upper limit).
+
+    Gated behind the ``compile`` marker (slow ``torch.compile``). Run with
+    ``pytest --runcompile``.
     """
     g_pipe = _get_pipeline_mode("graphed")
     c_pipe = _get_pipeline_mode("compiled")
