@@ -387,43 +387,54 @@ class GraphedDecoder:
             elem_done = [bool(finished[b].item()) for b in range(B)]
 
         if self._captured and not bool(finished.all()):
-            valid_lengths_cpu = self.valid_lengths.cpu()
-            pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)
+            valid_lengths_cpu = self.valid_lengths.cpu()              # (B,)
+            pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)  # (B,)
             step = out_step
-            stopped = False
             while step < self.max_out:
-                # one K-step replay: output_ring / frame_ring are filled, and
+                # one K-step replay: output_ring / frame_ring are filled and
                 # last_token is chained in-graph for the next replay.
                 self.graph.replay()
                 # ONE device->host sync for the whole K-step batch (the (2,B,K)
                 # stack of [tokens, post-step cumulative frame_idx]).
                 info = torch.stack(
                     [self.output_ring, self.frame_ring], dim=0
-                ).cpu()                                      # (2, B, K)
-                ring_cpu = info[0]                           # (B, K) tokens
-                fring_cpu = info[1]                          # (B, K) frame_idx
-                for j in range(K):
-                    pos = step + j
-                    if pos >= self.max_out:
-                        stopped = True
-                        break
-                    tok_j = ring_cpu[:, j]
-                    fi_j = fring_cpu[:, j]
-                    fin = fi_j >= valid_lengths_cpu
-                    self.output[:, pos] = torch.where(fin, pad_cpu, tok_j)
-                    if collect_meta:
+                ).cpu()                                          # (2, B, K)
+                ring_cpu = info[0]                               # (B, K) tokens
+                fring_cpu = info[1]                              # (B, K) frame_idx
+                kk = min(K, self.max_out - step)
+                if kk <= 0:
+                    break
+                # finished mask for the kept columns -- vectorised over the
+                # whole K-step batch so the hot path has NO per-step Python
+                # loop and only ONE output H2D copy (the per-step scatter was
+                # the remaining host-overhead source at large K).
+                fin = fring_cpu[:, :kk] >= valid_lengths_cpu[:, None]   # (B, kk)
+                self.output[:, step:step + kk] = torch.where(
+                    fin, pad_cpu[:, None], ring_cpu[:, :kk]
+                )
+                # per-step metadata for the frame-aligned chunking path
+                # (B=1 in practice; not perf-critical, so a small loop is fine;
+                # elem_done gating makes columns past the all-done point no-ops,
+                # matching the per-step reference exactly).
+                if collect_meta:
+                    for j in range(kk):
+                        tok_j = ring_cpu[:, j]
+                        fi_j = fring_cpu[:, j]
+                        fin_j = fin[:, j]
                         for b in range(B):
                             if not elem_done[b]:
                                 meta_tokens[b].append(int(tok_j[b].item()))
                                 meta_frames[b].append(int(fi_j[b].item()))
-                                if bool(fin[b].item()):
+                                if bool(fin_j[b].item()):
                                     elem_done[b] = True
-                    out_step = pos + 1
-                    if bool(fin.all()):
-                        stopped = True
-                        break
-                if stopped:
+                # stop once EVERY batch element is finished (first such column).
+                col_all_done = fin.all(dim=0)                    # (kk,)
+                done_idx = col_all_done.nonzero(as_tuple=False).flatten()
+                if done_idx.numel() > 0:
+                    j_break = int(done_idx[0].item())
+                    out_step = step + j_break + 1
                     break
+                out_step = step + kk
                 step += K
         if collect_meta:
             return out_step, meta_tokens, meta_frames
