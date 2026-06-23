@@ -21,10 +21,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
+from megapar.config import MODEL_ID  # noqa: E402
 from megapar.encoder_mega import FusedEncoder  # noqa: E402
 from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-
-SNAPSHOT = "***REMOVED***"
 
 
 def main() -> int:
@@ -37,9 +36,10 @@ def main() -> int:
     # Build FusedEncoder (eager mode is fine; we call _block_eager directly)
     fused = FusedEncoder(enc_module, mode="eager")
 
-    # Load out_llm head
+    # Load out_llm head from the model repo
+    from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
-    sd = load_file(f"{SNAPSHOT}/out_llm.safetensors")
+    sd = load_file(hf_hub_download(repo_id=MODEL_ID, filename="out_llm.safetensors"))
     out_llm = nn.Linear(1024, 100353, bias=True)
     with torch.no_grad():
         out_llm.weight.copy_(sd["weight"])
