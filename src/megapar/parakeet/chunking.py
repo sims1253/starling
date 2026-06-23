@@ -63,11 +63,25 @@ positions needed for stitching) instead of the text-only
 
 Memory safety
 -------------
-Before every chunk's forward pass we probe ``torch.cuda.mem_get_info``; if free
-VRAM drops below ``min_free_vram_gb`` (default 24 GB on this 32 GB card) the
-chunk is **aborted with a clear error** rather than risk an OOM. Between chunks
-``torch.cuda.empty_cache()`` releases the per-chunk intermediates, so peak VRAM
-tracks a single chunk (~1.5 GB) no matter how long the audio is.
+Before every mini-batch's forward pass we probe ``torch.cuda.mem_get_info``;
+:meth:`_effective_batch_size` shrinks the batch so that
+``per_chunk_vram_gb * B + vram_headroom_gb <= free`` (reducing ``B`` rather than
+aborting), and a hard ``min_free_vram_gb`` floor aborts only when truly starved.
+Between mini-batches ``torch.cuda.empty_cache()`` releases the per-batch
+intermediates, so peak VRAM tracks ONE mini-batch
+(``~per_chunk_vram_gb * chunk_batch_size``) no matter how long the audio is.
+
+Batching
+--------
+The mel extractor, Conformer encoder and graphed TDT decoder are all already
+batched, so :class:`ChunkedTranscriber` groups the planned chunks into
+mini-batches of up to ``chunk_batch_size`` (default ``8``) and runs each through
+one set of batched mel+encoder+decode forwards -- turning ~121 sequential B=1
+iterations for 1 h of audio into ~16 B=8 iterations, recovering most of the
+megakernel pipeline's batched throughput. Per-chunk token+durations streams are
+split out of the batched result and stitched exactly as in the sequential path.
+A single chunk (audio <= one window) forms a mini-batch of ``B=1`` and is
+byte-exact with the direct pipeline path.
 """
 
 from __future__ import annotations
@@ -95,11 +109,52 @@ class ChunkedTranscriber:
         overlap_seconds: the right-context overlap in seconds (default ``2.0``).
             Adjacent chunks overlap by this much; this region is dedup'd.
         sr: audio sample rate (default ``16000``).
-        min_free_vram_gb: memory-safety guard. Before each chunk's forward pass,
-            if free VRAM (``torch.cuda.mem_get_info``) is below this, the chunk
-            is aborted with :class:`MemoryError` instead of risking an OOM.
-            Default ``24.0`` GB (the 32 GB card is shared; we cap our own use at
-            ~8 GB and leave headroom for other processes).
+        min_free_vram_gb: hard memory floor. Before each batch's forward pass,
+            if free VRAM (``torch.cuda.mem_get_info``) is below this, the batch
+            is aborted with :class:`MemoryError`. Default ``8.0`` GB (only abort
+            when genuinely unable to proceed; the adaptive batch-size guard
+            :meth:`_effective_batch_size` is the primary OOM defence and reduces
+            B before this floor is ever reached).
+        chunk_batch_size: number of chunks processed simultaneously per
+            mini-batch through mel+encoder+decode (default ``8``). The mel
+            extractor, Conformer encoder and graphed TDT decoder are all already
+            batched (they take ``(B, ...)`` inputs), so grouping ``B`` chunks
+            into one forward recovers the megakernel pipeline's batched
+            throughput: ~16 sequential B=8 iterations for 1 h of audio instead
+            of ~121 sequential B=1 iterations. The last mini-batch may contain
+            fewer than ``chunk_batch_size`` chunks (it runs at its natural
+            ``B = remainder``; no dummy padding, see Memory safety / batching).
+            ``1`` reproduces the original one-chunk-at-a-time behaviour exactly.
+        per_chunk_vram_gb: estimated peak VRAM cost of ONE ~32 s chunk through
+            mel+encoder+decode, used by :meth:`_effective_batch_size` to size
+            each mini-batch from the live free-VRAM reading (default ``2.0``).
+        vram_headroom_gb: headroom (GB) reserved for the resident model + any
+            other GPU processes when sizing a mini-batch (default ``4.0``).
+
+    Batching & memory safety
+    ------------------------
+    Chunks are grouped left-to-right into mini-batches of up to
+    ``chunk_batch_size`` (the last group may be smaller -- its natural ``B``).
+    Each mini-batch is run through ``pipe.mel(batch)`` -> ``_run_encoder`` ->
+    ``GraphedDecoder.decode_with_durations`` in ONE set of batched forwards, so
+    ``B`` chunks pay one (amortised) graph capture + one set of per-stage launches
+    instead of ``B`` separate ones. The per-chunk token+durations streams are
+    then split back out of the batched result and stitched exactly as in the
+    sequential path (frame-aligned left-biased dedup by global sample position).
+
+    The mel extractor pads the mini-batch's audio to the longest chunk and emits
+    a correct per-element attention mask; the encoder masks padded frames out of
+    self-attention; and the decoder's per-element ``valid_lengths`` stop each
+    chunk's decode at its own boundary. So a shorter chunk padded within a batch
+    decodes identically to its natural length (the decoder never reads past
+    ``valid_lengths``). A single chunk (audio <= one window) therefore forms a
+    mini-batch of ``B=1`` and is byte-exact with the direct pipeline path.
+
+    Before each mini-batch, :meth:`_effective_batch_size` reads free VRAM and
+    shrinks ``B`` so that ``per_chunk_vram_gb * B + vram_headroom_gb <= free``;
+    between mini-batches ``torch.cuda.empty_cache()`` releases intermediates so
+    peak VRAM tracks ONE mini-batch (``~per_chunk_vram_gb * chunk_batch_size``),
+    independent of total audio length.
     """
 
     def __init__(
@@ -108,7 +163,10 @@ class ChunkedTranscriber:
         chunk_seconds: float = 30.0,
         overlap_seconds: float = 2.0,
         sr: int = 16000,
-        min_free_vram_gb: float = 24.0,
+        min_free_vram_gb: float = 8.0,
+        chunk_batch_size: int = 8,
+        per_chunk_vram_gb: float = 2.0,
+        vram_headroom_gb: float = 4.0,
     ) -> None:
         if overlap_seconds >= chunk_seconds:
             raise ValueError(
@@ -120,6 +178,9 @@ class ChunkedTranscriber:
         self.overlap_seconds = float(overlap_seconds)
         self.sr = int(sr)
         self.min_free_vram_gb = float(min_free_vram_gb)
+        self.chunk_batch_size = max(1, int(chunk_batch_size))
+        self.per_chunk_vram_gb = float(per_chunk_vram_gb)
+        self.vram_headroom_gb = float(vram_headroom_gb)
 
         # Derive samples-per-encoder-frame from the live pipeline so this is
         # robust to a different mel hop / subsampling factor (rather than
@@ -173,30 +234,55 @@ class ChunkedTranscriber:
         free, _total = torch.cuda.mem_get_info()
         return free / (1024.0 ** 3)
 
+    def _effective_batch_size(self, desired_b: int) -> int:
+        """Largest mini-batch size ``<= desired_b`` that fits current free VRAM.
+
+        Each ~32 s chunk costs ~``per_chunk_vram_gb`` at peak; we reserve
+        ``vram_headroom_gb`` for the resident model + other GPU processes. This
+        is the primary OOM defence for the batched path: it *reduces* ``B``
+        (rather than aborting) when free VRAM is low. With the defaults
+        (``per_chunk_vram_gb=2.0``, ``vram_headroom_gb=4.0``) the full
+        ``chunk_batch_size=8`` is used while free VRAM >= ~20 GB and shrinks
+        below that, never OOM'ing. At least ``1`` is always returned (the hard
+        :attr:`min_free_vram_gb` floor in :meth:`_decode_batch` catches the
+        truly-starved case).
+        """
+        free_gb = self._free_vram_gb()
+        max_safe = int((free_gb - self.vram_headroom_gb) / self.per_chunk_vram_gb)
+        return max(1, min(int(desired_b), max_safe))
+
     # ------------------------------------------------------------------ #
-    # per-chunk decode (drives the pipeline sub-stages directly)
+    # batched decode (drives the pipeline sub-stages on B chunks at once)
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
-    def _decode_chunk(
-        self, chunk_audio: np.ndarray
-    ) -> Tuple[str, List[int], List[int], int, dict]:
-        """Run mel -> encoder -> graphed decode (B=1) for one chunk.
+    def _decode_batch(
+        self, batch_audio: List[np.ndarray]
+    ) -> Tuple[List[str], List[List[int]], List[List[int]], List[int], dict]:
+        """Run mel -> encoder -> graphed decode for ``B`` chunks at once.
 
-        Returns ``(text, tokens, local_frames, valid_enc_frames, timing)`` where
-        ``tokens`` / ``local_frames`` are the per-token ids and cumulative local
-        encoder-frame indices (see :class:`GraphedDecoder.decode_with_durations`),
-        and ``timing`` has per-stage ms (mel/encoder/decode/total) from cuda
-        events. Raises :class:`MemoryError` if the VRAM guard trips.
+        The mel extractor, Conformer encoder and graphed TDT decoder are all
+        already batched (they take ``(B, ...)`` inputs), so this feeds the whole
+        mini-batch through one set of forwards. ``B = len(batch_audio)``; the
+        mel extractor pads to the longest chunk in the batch and emits a correct
+        per-element attention mask, the encoder masks padded frames, and the
+        decoder stops each chunk at its own ``valid_lengths``.
+
+        Returns ``(texts, meta_tokens, meta_frames, valid_enc_list, timing)``
+        where each list has ``B`` entries (one per chunk, in input order) and
+        ``timing`` carries batch-level ``mel_ms``/``encoder_ms``/``decode_ms``/
+        ``total_ms``/``batch_size`` from cuda events. Raises :class:`MemoryError`
+        if the VRAM hard floor (:attr:`min_free_vram_gb`) is breached.
         """
         free_gb = self._free_vram_gb()
         if free_gb < self.min_free_vram_gb:
             raise MemoryError(
-                f"chunked: free VRAM {free_gb:.2f} GB < "
-                f"{self.min_free_vram_gb:.2f} GB guard; aborting chunk "
-                f"(reduce chunk_seconds or free GPU memory)"
+                f"chunked: free VRAM {free_gb:.2f} GB < hard floor "
+                f"{self.min_free_vram_gb:.2f} GB; aborting batch "
+                f"(free GPU memory or reduce chunk_batch_size)"
             )
 
         pipe = self.pipeline
+        B = len(batch_audio)
 
         def _timed(fn):
             start = torch.cuda.Event(enable_timing=True)
@@ -207,7 +293,9 @@ class ChunkedTranscriber:
             torch.cuda.synchronize()
             return start.elapsed_time(end), out
 
-        mel_ms, (input_features, attention_mask) = _timed(lambda: pipe.mel([chunk_audio]))
+        mel_ms, (input_features, attention_mask) = _timed(
+            lambda: pipe.mel(batch_audio)
+        )
         input_features = input_features.to(pipe.dtype)
 
         encoder_ms, (pooler, valid_lengths) = _timed(
@@ -221,14 +309,31 @@ class ChunkedTranscriber:
             )
         )
 
+        valid_enc_list = [int(valid_lengths[b].item()) for b in range(B)]
         timing = {
             "mel_ms": float(mel_ms),
             "encoder_ms": float(encoder_ms),
             "decode_ms": float(decode_ms),
             "total_ms": float(mel_ms + encoder_ms + decode_ms),
+            "batch_size": int(B),
         }
-        valid_enc = int(valid_lengths[0].item())
-        return texts[0], meta_tokens[0], meta_frames[0], valid_enc, timing
+        return texts, meta_tokens, meta_frames, valid_enc_list, timing
+
+    @torch.inference_mode()
+    def _decode_chunk(
+        self, chunk_audio: np.ndarray
+    ) -> Tuple[str, List[int], List[int], int, dict]:
+        """Single-chunk decode (``B=1``) -- thin wrapper over :meth:`_decode_batch`.
+
+        Kept for backward compatibility; returns ``(text, tokens, local_frames,
+        valid_enc_frames, timing)``. At ``B=1`` this is byte-exact with the
+        direct ``MegaParakeetPipeline.transcribe`` path (identical mel / encoder
+        / decode_with_durations calls on the same single chunk).
+        """
+        texts, meta_tokens, meta_frames, valid_enc_list, timing = self._decode_batch(
+            [chunk_audio]
+        )
+        return texts[0], meta_tokens[0], meta_frames[0], valid_enc_list[0], timing
 
     # ------------------------------------------------------------------ #
     # public API
@@ -244,28 +349,40 @@ class ChunkedTranscriber:
     ) -> Tuple[str, dict]:
         """Transcribe and return ``(text, summary)``.
 
+        Chunks are grouped left-to-right into mini-batches of up to
+        :attr:`chunk_batch_size` (sized down by :meth:`_effective_batch_size`
+        when free VRAM is low). Each mini-batch is run through the batched
+        mel+encoder+decode in one set of forwards; the per-chunk token+durations
+        streams are split back out and stitched exactly as in the sequential
+        path (frame-aligned left-biased dedup by global sample position).
+
         ``summary`` contains: ``total_ms`` (wall, cuda-event bracketed over the
-        whole multi-chunk run), ``audio_seconds``, ``n_chunks``,
-        ``n_tokens_surviving``, ``n_stitches`` (overlap-region tokens dropped),
-        ``peak_vram_gb`` (``torch.cuda.max_memory_allocated`` over the whole run,
-        reset at the start -- this is the key bounded-memory metric), and
-        ``per_chunk`` (per-chunk ms + token counts).
+        whole run), ``audio_seconds``, ``n_chunks``, ``n_batches``,
+        ``chunk_batch_size``, ``n_tokens_surviving``, ``n_stitches`` (overlap-
+        region tokens dropped), ``peak_vram_gb``
+        (``torch.cuda.max_memory_allocated`` over the whole run, reset at the
+        start -- tracks ONE mini-batch, independent of total length), and both
+        ``per_batch`` (batch-level per-stage ms + batch size) and ``per_chunk``
+        (per-chunk token counts + an evenly-distributed per-stage ms estimate,
+        kept for backward compatibility with the sequential summary shape).
         """
         if int(sr) != self.sr:
             raise ValueError(f"sr={sr} != pipeline sr {self.sr}")
         audio = np.ascontiguousarray(audio, dtype=np.float32)
         chunks, starts = self._plan_chunks(audio)
         assert len(chunks) >= 1, "must produce at least one chunk"
+        n_chunks = len(chunks)
 
         surviving_tokens: List[int] = []
         # furthest global sample position covered by any KEPT token so far.
         # left-biased dedup: drop any token whose global_sample <= this.
         furthest_global_sample = -1
+        per_batch: List[dict] = []
         per_chunk: List[dict] = []
         n_stitches = 0
 
-        # Peak-VRAM is measured over the whole run (one chunk's worth because
-        # we empty_cache() between chunks); reset so it reflects this call only.
+        # Peak-VRAM is measured over the whole run (one mini-batch's worth
+        # because we empty_cache() between batches); reset to this call only.
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
@@ -273,43 +390,80 @@ class ChunkedTranscriber:
         t_end = torch.cuda.Event(enable_timing=True)
         t_start.record()
 
-        for ci, (chunk_audio, start_sample) in enumerate(zip(chunks, starts)):
-            _text, tokens_c, frames_c, valid_enc, timing = self._decode_chunk(chunk_audio)
+        # Group chunks into mini-batches of up to chunk_batch_size (sized down
+        # adaptively by _effective_batch_size when free VRAM is low). The last
+        # group may contain fewer than chunk_batch_size chunks; it runs at its
+        # natural B (no dummy padding -- see the class docstring).
+        batch_idx = 0
+        ci = 0
+        while ci < n_chunks:
+            eff_b = self._effective_batch_size(self.chunk_batch_size)
+            end_ci = min(ci + eff_b, n_chunks)
+            batch_audio = chunks[ci:end_ci]
+            batch_starts = starts[ci:end_ci]
+            actual_b = len(batch_audio)
 
-            # Frame-aligned left-biased dedup. tokens_c / frames_c are in
-            # emission order (non-decreasing frame). Convert each to a global
-            # sample position; keep those beyond the previously-covered furthest
-            # position, drop the (overlap) prefix. Because frames are
-            # non-decreasing within a chunk, the kept tokens form a contiguous
-            # suffix of the chunk's emission.
-            kept_here = 0
-            chunk_furthest = furthest_global_sample
-            for tok, lf in zip(tokens_c, frames_c):
-                g_sample = start_sample + int(lf) * self.samples_per_enc_frame
-                if g_sample > furthest_global_sample:
-                    surviving_tokens.append(int(tok))
-                    kept_here += 1
-                    if g_sample > chunk_furthest:
-                        chunk_furthest = g_sample
-                else:
-                    n_stitches += 1
-            furthest_global_sample = chunk_furthest
+            _texts_b, tokens_b, frames_b, valid_enc_b, timing = self._decode_batch(
+                batch_audio
+            )
 
-            per_chunk.append(
+            # Stitch each chunk in the batch (in order), using the same
+            # frame-aligned left-biased dedup as the sequential path.
+            for k in range(actual_b):
+                gci = ci + k
+                start_sample = batch_starts[k]
+                tokens_c = tokens_b[k]
+                frames_c = frames_b[k]
+                chunk_audio_k = batch_audio[k]
+
+                kept_here = 0
+                chunk_furthest = furthest_global_sample
+                for tok, lf in zip(tokens_c, frames_c):
+                    g_sample = start_sample + int(lf) * self.samples_per_enc_frame
+                    if g_sample > furthest_global_sample:
+                        surviving_tokens.append(int(tok))
+                        kept_here += 1
+                        if g_sample > chunk_furthest:
+                            chunk_furthest = g_sample
+                    else:
+                        n_stitches += 1
+                furthest_global_sample = chunk_furthest
+
+                # Per-chunk record: token counts are exact; the per-stage ms are
+                # the batch's totals distributed evenly across its chunks (an
+                # approximation kept for backward-compat with the sequential
+                # summary shape -- use ``per_batch`` for exact batch timings).
+                per_chunk.append(
+                    {
+                        "chunk_idx": int(gci),
+                        "batch_idx": int(batch_idx),
+                        "start_sample": int(start_sample),
+                        "start_s": start_sample / self.sr,
+                        "n_samples": int(chunk_audio_k.shape[0]),
+                        "duration_s": chunk_audio_k.shape[0] / self.sr,
+                        "valid_enc_frames": int(valid_enc_b[k]),
+                        "tokens_emitted": int(len(tokens_c)),
+                        "tokens_kept": int(kept_here),
+                        "mel_ms": timing["mel_ms"] / actual_b,
+                        "encoder_ms": timing["encoder_ms"] / actual_b,
+                        "decode_ms": timing["decode_ms"] / actual_b,
+                        "total_ms": timing["total_ms"] / actual_b,
+                    }
+                )
+
+            per_batch.append(
                 {
-                    "chunk_idx": ci,
-                    "start_sample": int(start_sample),
-                    "start_s": start_sample / self.sr,
-                    "n_samples": int(chunk_audio.shape[0]),
-                    "duration_s": chunk_audio.shape[0] / self.sr,
-                    "valid_enc_frames": int(valid_enc),
-                    "tokens_emitted": int(len(tokens_c)),
-                    "tokens_kept": int(kept_here),
+                    "batch_idx": int(batch_idx),
+                    "batch_size": int(actual_b),
+                    "chunk_start_idx": int(ci),
+                    "chunk_end_idx": int(end_ci),
                     **timing,
                 }
             )
 
-            # Release per-chunk intermediates so peak VRAM tracks a single chunk.
+            ci = end_ci
+            batch_idx += 1
+            # Release per-batch intermediates so peak VRAM tracks one batch.
             torch.cuda.empty_cache()
 
         t_end.record()
@@ -324,13 +478,16 @@ class ChunkedTranscriber:
         summary = {
             "total_ms": total_ms,
             "audio_seconds": audio.shape[0] / self.sr,
-            "n_chunks": len(chunks),
+            "n_chunks": n_chunks,
+            "n_batches": int(batch_idx),
+            "chunk_batch_size": int(self.chunk_batch_size),
             "n_tokens_surviving": int(len(surviving_tokens)),
             "n_stitches": int(n_stitches),
             "peak_vram_gb": float(peak_vram_gb),
             "chunk_seconds": self.chunk_seconds,
             "overlap_seconds": self.overlap_seconds,
             "samples_per_enc_frame": self.samples_per_enc_frame,
+            "per_batch": per_batch,
             "per_chunk": per_chunk,
         }
         return text, summary
