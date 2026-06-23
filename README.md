@@ -34,15 +34,20 @@ to `transformers`.
 | ---------------------- | -------------------------- | --------- | -------------- |
 | granite-speech-4.1-2b  | single stream              | ~11x      | ~45x RTF       |
 | granite-speech-4.1-2b  | single stream, speculative | ~17x      | ~70x RTF       |
+| granite-speech-4.1-2b  | long audio, batched (B=16) | ~4x vs sequential chunking | ~124x RTF @ 5min, ~174x @ 10min |
 | parakeet-tdt-0.6b-v3   | batch 8, offline           | ~10x      | ~3100x RTF     |
 | parakeet-tdt-0.6b-v3   | 1h audio, chunked          | n/a       | ~293x RTF, ~1.5 GB VRAM |
 
 For context against other engines on the same parakeet weights, this is roughly
-1.4-3.7x faster than parakeet.cpp and 38-68x faster than CrispASR, with
+1.4-4.4x faster than parakeet.cpp and 31-67x faster than CrispASR, with
 identical transcripts.
 
 On the granite-speech-4.1-2b model, starling is ~7x faster than CrispASR (the
 ggml/whisper.cpp engine) on identical weights.
+
+For long audio on granite-speech, batching the chunked decode (B=16) gives
+about 4x over the sequential chunking path (~124x RTF at 5 min). The encoder
+stays per-stream (byte-exact); only the LLM decode is batched.
 
 ## What did not work
 
@@ -70,7 +75,10 @@ Kept here because they are the more interesting findings:
 src/starling/            granite-speech megakernel
   encoder_mega.py       fused (cudagraph) conformer encoder
   llm_mega.py           graphed greedy decode over a static KV cache
+  multistep.py          K-step graphed decode (multi-step per replay)
   pipeline.py           encoder + projector + LLM wiring
+  batched.py            batched (B>1) LLM decode + pipeline
+  long_audio.py         chunked long-audio transcription (sequential + batched)
   speculative.py        self-speculative decoding via the CTC draft head
   parakeet/             parakeet-tdt megakernel
     decode_mega.py      multi-step graphed TDT decode

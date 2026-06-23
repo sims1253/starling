@@ -31,6 +31,7 @@ Public API
 ``synthesize_long_audio(target_seconds) -> (wav, sr)``
 ``chunk_audio(wav, sr, chunk_seconds) -> iterator``
 ``transcribe_long(pipe, processor, wav, sr, ...) -> LongTranscribeResult``
+``transcribe_long_batched(batched_pipe, processor, wav, sr, ...) -> LongTranscribeResult``
 ``transcribe_long_stock(model, processor, wav, sr, ...) -> LongTranscribeResult``
 """
 
@@ -251,6 +252,99 @@ def transcribe_long(
         audio_seconds=audio_seconds,
         rtfx=audio_seconds / max(total_ms / 1000.0, 1e-9),
         speculative=speculative,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batched chunked transcription (B chunks decoded in lock-step)
+# ---------------------------------------------------------------------------
+@torch.inference_mode()
+def transcribe_long_batched(
+    batched_pipe: Any,
+    processor: Any,
+    wav: torch.Tensor,
+    sr: int,
+    *,
+    chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    max_new_tokens: int = 200,
+    dtype: torch.dtype = torch.bfloat16,
+    task_prompt: str = DEFAULT_TASK_PROMPT,
+) -> LongTranscribeResult:
+    """Batched chunked transcription of arbitrary-length audio.
+
+    Like :func:`transcribe_long` but groups ``B = batched_pipe.max_batch_size``
+    chunks into a mini-batch and decodes them in lock-step via
+    :class:`~starling.batched.BatchedPipeline`. The encoder + projector run
+    per-stream (byte-exact with the batch=1 path); only the LLM decode is
+    batched, turning the launch-bound batch=1 GEMVs into saturating B-wide
+    GEMMs that read the 4.4 GB of weights once for B tokens.
+
+    Chunks are non-overlapping (matching :func:`transcribe_long`); the last
+    chunk is zero-padded to ``chunk_seconds`` so every chunk shares an
+    identical mel-feature shape and prompt length (the no-padding fast path in
+    :meth:`BatchedPipeline.run_batch`).
+    """
+    from .audio import build_inputs
+
+    B = batched_pipe.max_batch_size
+    max_cache_len = int(getattr(batched_pipe.llm, "max_cache_len", 640))
+
+    # Collect all chunks (zero-padded to chunk_seconds -> identical mel shape).
+    all_chunks = list(chunk_audio(wav, sr, chunk_seconds))
+    n_chunks = len(all_chunks)
+
+    chunks: list[ChunkResult] = []
+    texts: list[str] = []
+    total_tokens = 0
+    t0 = time.perf_counter()
+    for batch_start in range(0, n_chunks, B):
+        batch_end = min(batch_start + B, n_chunks)
+
+        # Build per-stream inputs for this mini-batch.
+        feats_list: list[torch.Tensor] = []
+        ids_list: list[torch.Tensor] = []
+        mask_list: list[Optional[torch.Tensor]] = []
+        for idx in range(batch_start, batch_end):
+            chunk_wav = all_chunks[idx][0]
+            inputs = build_inputs(processor, chunk_wav, task_prompt=task_prompt)
+            feats_list.append(inputs["input_features"].to(dtype))
+            ids_list.append(inputs["input_ids"])
+            mask_list.append(inputs.get("input_features_mask"))
+
+        prompt_len = int(ids_list[0].shape[1])
+        budget = max(1, min(max_new_tokens, max_cache_len - prompt_len - 1))
+
+        c0 = time.perf_counter()
+        res = batched_pipe.run_batch(
+            feats_list, ids_list, mask_list, max_new_tokens=budget
+        )
+        torch.cuda.synchronize()
+        batch_ms = (time.perf_counter() - c0) * 1000.0
+
+        tok = processor.tokenizer
+        per_ms = batch_ms / len(res.ids_list)
+        for i, ids in enumerate(res.ids_list):
+            idx = batch_start + i
+            text = tok.decode(ids, skip_special_tokens=True)
+            n_tok = len(ids)
+            chunks.append(
+                ChunkResult(idx, all_chunks[idx][1], all_chunks[idx][2], text, n_tok, per_ms)
+            )
+            texts.append(text)
+            total_tokens += n_tok
+    torch.cuda.synchronize()
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    audio_seconds = wav.shape[1] / sr
+    full_text = _join_chunk_texts(texts)
+    return LongTranscribeResult(
+        text=full_text,
+        chunks=chunks,
+        total_ms=total_ms,
+        n_chunks=n_chunks,
+        total_tokens=total_tokens,
+        audio_seconds=audio_seconds,
+        rtfx=audio_seconds / max(total_ms / 1000.0, 1e-9),
+        speculative=False,
     )
 
 
