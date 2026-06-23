@@ -32,8 +32,13 @@ import numpy as np
 import torch
 
 from .decode_mega import GraphedDecoder
-from .encoder_graph import GraphedEncoder
+from .encoder_graph import CompiledEncoder, GraphedEncoder
 from .mel_gpu import GpuMelExtractor
+
+
+# Valid encoder backends. ``encoder_mode`` takes precedence over the legacy
+# boolean ``use_graphed_encoder`` flag (kept for backward compatibility).
+ENCODER_MODES = ("eager", "graphed", "compiled")
 
 
 class MegaParakeetPipeline:
@@ -50,13 +55,22 @@ class MegaParakeetPipeline:
         dtype: encoder/decoder dtype (default ``torch.bfloat16``). The GPU mel
             extractor runs in float32 internally; its output is cast to ``dtype``
             for the encoder (matching the baseline numerics and the oracle path).
-        use_graphed_encoder: if True (default), run the 24-layer Conformer
-            encoder through :class:`GraphedEncoder` -- a CUDA-graph capture of
-            ``model.get_audio_features`` that removes the per-layer launch
-            overhead (~1.36x faster at B8 medium, byte-exact). One graph per
-            ``(B, T_mel)`` shape is cached, so capture is amortised across
-            same-shape calls. If False, run the encoder eagerly (the stock
-            path) -- kept for byte-exactness A/B testing.
+        use_graphed_encoder: legacy bool flag. If ``encoder_mode`` is None, True
+            selects the CUDA-graphed encoder (default), False selects the eager
+            encoder. Ignored when ``encoder_mode`` is given.
+        encoder_mode: encoder backend, one of ``ENCODER_MODES``:
+            * ``"graphed"`` (default): :class:`GraphedEncoder` -- a CUDA-graph
+              capture of ``model.get_audio_features`` that removes per-layer
+              launch overhead (~1.36x faster at B8 medium, **byte-exact**).
+            * ``"eager"``: the stock ``model.get_audio_features`` path (kept for
+              byte-exactness A/B testing).
+            * ``"compiled"``: :class:`CompiledEncoder` -- torch.compile
+              (``reduce-overhead``) + BatchNorm1d fold. Fuses the elementwise /
+              memop glue for extra speed but is **NOT guaranteed byte-exact**
+              with eager/graphed; the correctness gate is a text-level
+              transcript match vs the oracle. The encoder folds the conv-module
+              BatchNorm1d into the depthwise conv (a fresh model is loaded for
+              this mode, so the graphed/eager stock path is preserved for A/B).
     """
 
     def __init__(
@@ -65,6 +79,7 @@ class MegaParakeetPipeline:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         use_graphed_encoder: bool = True,
+        encoder_mode: str | None = None,
     ) -> None:
         # Local import: constructing the pipeline pays the HF import cost; keep
         # it out of module import time so `import pipeline` is cheap.
@@ -73,7 +88,17 @@ class MegaParakeetPipeline:
         self.model_id = model_id
         self.device = torch.device(device)
         self.dtype = dtype
-        self.use_graphed_encoder = bool(use_graphed_encoder)
+
+        # Resolve the encoder backend. `encoder_mode` (explicit) wins over the
+        # legacy `use_graphed_encoder` bool.
+        if encoder_mode is None:
+            encoder_mode = "graphed" if use_graphed_encoder else "eager"
+        if encoder_mode not in ENCODER_MODES:
+            raise ValueError(
+                f"encoder_mode={encoder_mode!r} not in {ENCODER_MODES}"
+            )
+        self.encoder_mode = encoder_mode
+        self.use_graphed_encoder = encoder_mode == "graphed"
 
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForTDT.from_pretrained(
@@ -84,12 +109,13 @@ class MegaParakeetPipeline:
         # (1) GPU mel extractor (float32 internally; cast to dtype in transcribe)
         self.mel = GpuMelExtractor(self.processor, device=str(self.device))
 
-        # (2) graphed encoder (optional): CUDA-graph capture of
-        # model.get_audio_features; one graph per (B, T_mel) shape is cached
-        # internally so capture is amortised across same-shape calls. Built (not
-        # captured) here so __init__ has no shape-dependent GPU work.
-        if self.use_graphed_encoder:
+        # (2) encoder backend: "graphed" -> GraphedEncoder (CUDA-graph capture,
+        # byte-exact), "compiled" -> CompiledEncoder (torch.compile + BN fold,
+        # not guaranteed byte-exact), "eager" -> None (stock path).
+        if encoder_mode == "graphed":
             self._graphed_encoder = GraphedEncoder(self.model)
+        elif encoder_mode == "compiled":
+            self._graphed_encoder = CompiledEncoder(self.model)
         else:
             self._graphed_encoder = None
 
@@ -125,7 +151,7 @@ class MegaParakeetPipeline:
         return dec
 
     # ------------------------------------------------------------------ #
-    # encoder dispatch (graphed vs eager)
+    # encoder dispatch (graphed / compiled / eager)
     # ------------------------------------------------------------------ #
     def _run_encoder(
         self,
@@ -134,10 +160,12 @@ class MegaParakeetPipeline:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the 24-layer Conformer encoder + projector; return pooler + lengths.
 
-        Dispatches on ``self.use_graphed_encoder``: the graphed path replays a
+        Dispatches on ``self.encoder_mode``: the graphed path replays a
         cached CUDA graph (byte-exact with eager; one capture per
-        ``(B, T_mel)`` shape, amortised); the eager path is the stock
-        ``model.get_audio_features``. Both return the projector pooler output
+        ``(B, T_mel)`` shape, amortised); the compiled path runs
+        torch.compile + BN fold (NOT guaranteed byte-exact; one compile
+        warmup per shape, amortised); the eager path is the stock
+        ``model.get_audio_features``. All return the projector pooler output
         ``(B, T_enc, 640)`` as a contiguous tensor and the per-element valid
         encoder-frame lengths from ``attention_mask.sum(-1)``.
         """
