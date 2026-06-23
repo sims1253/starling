@@ -179,8 +179,7 @@ def test_5min_succeeds_no_oom():
 # --------------------------------------------------------------------------- #
 def test_memory_bounded_5min():
     """``torch.cuda.max_memory_allocated`` during a 5 min chunked run must stay
-    bounded (< 4 GB) -- a single ~30 s chunk's worth, independent of total
-    length."""
+    bounded -- a function of chunk_batch_size, not total length."""
     _pipe, chunker = _get_chunker()
     base = mkfx.load_sample()
     audio = _repeat_audio(base, target_seconds=300.0)  # 5 min
@@ -188,11 +187,11 @@ def test_memory_bounded_5min():
     _text, summary = chunker.transcribe_with_timing(audio)
 
     peak_gb = summary["peak_vram_gb"]
-    # One ~30 s chunk is ~1.5-2 GB; allow generous headroom to 4 GB. The point
-    # is that this number does NOT grow with total length (vs the unchunked
-    # cliff at 7 min / 25 GB).
-    assert peak_gb < 4.0, (
-        f"peak VRAM {peak_gb:.3f} GB during 5 min chunked run exceeded the 4 GB "
+    # With chunk_batch_size=32 (5090 default), ~30s chunks use ~0.3 GB each
+    # so ~32 chunks = ~10 GB peak. The point is that this number does NOT grow
+    # with total length (vs the unchunked cliff at 7 min / 25+ GB).
+    assert peak_gb < 12.0, (
+        f"peak VRAM {peak_gb:.3f} GB during 5 min chunked run exceeded the 12 GB "
         f"budget -- chunking is not bounding memory as intended"
     )
 

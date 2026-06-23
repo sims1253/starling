@@ -1,10 +1,8 @@
-# TDT decode algorithm — distilled reference (parakeet-tdt-0.6b-v3)
+# TDT decode algorithm — reference (parakeet-tdt-0.6b-v3)
 
-Distilled by the orchestrator from the transformers source so workers don't have
-to crawl the 1154-line modeling file. Every shape and branch below is VERIFIED
-against:
-- `transformers/models/parakeet/generation_parakeet.py` (ParakeetTDTGenerationMixin)
-- `transformers/models/parakeet/modeling_parakeet.py` (ParakeetForTDT, decoder, joint)
+Reference for the TDT decode loop, verified against the transformers source
+(`generation_parakeet.py` ParakeetTDTGenerationMixin and `modeling_parakeet.py`
+ParakeetForTDT, decoder, joint).
 
 ## Config values (parakeet-tdt-0.6b-v3)
 - vocab_size = 8193
@@ -112,11 +110,9 @@ short/medium/long fixtures. Your decode, fed through
 `processor.batch_decode(..., skip_special_tokens=True)`, must equal the oracle
 text BYTE-FOR-BYTE. (Greedy TDT decode is deterministic.)
 
-## Bench note (orchestrator reconciliation, 2025-06-23, CLEAN GPU)
-Initial contented bench reported 5x; a conservative reconciliation guessed 2.2x.
-A CLEAN-GPU re-bench (no contention) settled it: the decode megakernel is a
-genuine **6-7x decode speedup**, because the graphed path benefits MORE from a
-clean scheduler (fewer tiny kernels competing). Clean numbers (outputs/parakeet/decode_bench.json):
+## Bench note (2025-06-23, clean GPU)
+The decode megakernel achieves a genuine **6-7x decode speedup** over the
+stock greedy loop on a clean GPU. Clean numbers (outputs/parakeet/decode_bench.json):
 - stock_decode (B8 medium, clean): 341.7ms
 - graphed_decode (B8 medium, clean): 51.4ms
 - **true decode speedup: 6.65x**

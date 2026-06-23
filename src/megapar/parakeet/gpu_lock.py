@@ -1,18 +1,15 @@
-"""File-based GPU lock for the shared single-GPU (RTX 5090) project.
+"""File-based GPU lock for benchmark isolation.
 
-The parakeet and granite sessions share one GPU; concurrent timed benchmarks
-corrupt each other's numbers. This module implements the `.gpu.lock` protocol
-described in comms.md §4. It is parakeet-namespaced but model-agnostic — the
-granite session is welcome to import the same helpers.
+Concurrent timed benchmarks on the same GPU corrupt each other's numbers.
+This module provides a `.gpu.lock` file-protocol so only one benchmark runs
+at a time: acquire before a timed region, release after. Stale locks
+(older than ``STALE_SEC``) are considered crashed and may be stolen.
 
 Usage:
     from megapar.parakeet.gpu_lock import with_gpu_lock
-    with with_gpu_lock(session="parakeet-mega", model="parakeet-tdt-0.6b-v3",
+    with with_gpu_lock(session="bench", model="parakeet-tdt-0.6b-v3",
                        eta_min=5, note="decode benchmark"):
         ...  # timed benchmark here
-
-Stale locks (>= STALE_SEC) are considered crashed and may be stolen; the takeover
-is recorded so the other session can see it in the lock file's note.
 """
 
 from __future__ import annotations

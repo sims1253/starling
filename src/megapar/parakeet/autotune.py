@@ -35,13 +35,13 @@ Pure ``argmin`` is fragile: on the RTX 5090 the K=8/16/32 band is flat within
 choice between near-equal values. We instead pick the GPU-tier default K
 (:func:`detect_gpu`) whenever it is within ``margin`` (default 10%) of the
 measured fastest -- i.e. "trust the documented sweet spot unless the sweep finds
-something *meaningfully* faster". This keeps the 5090 on K=16 (no regression)
-while still allowing a real win on a card whose default is wrong.
+something *meaningfully* faster". This keeps a GPU on its tier default unless the
+sweep finds a real win.
 
 GPU lock
 --------
 The timed sweep is a GPU-exclusive operation. By default :func:`autotune`
-acquires the shared ``.gpu.lock`` (session ``parakeet-mega``) before sweeping,
+acquires the shared ``.gpu.lock`` before sweeping,
 unless it is already held by this session (so benchmarks that already hold the
 lock can call it with ``acquire_lock=False`` without self-deadlock). Loading a
 cached config never touches the GPU and never acquires the lock.
@@ -77,6 +77,7 @@ _DEFAULT_MARGIN = 0.10
 
 _REPRESENTATIVE_BATCH = 8        # B for the sweep (medium fixture, 22.3 s each)
 _REPRESENTATIVE_DURATION_S = 22.3  # fallback synthetic length if no fixture
+_AUTOTUNE_SESSION = "autotune"   # session label for the GPU lock during sweeps
 
 
 @dataclass
@@ -420,8 +421,8 @@ def _run_sweep(
         return times
 
 
-def _parakeet_holds_lock() -> bool:
-    """True if the shared ``.gpu.lock`` is currently held by ``parakeet-mega``.
+def _autotune_holds_lock() -> bool:
+    """True if the shared ``.gpu.lock`` is currently held by the autotune sweep.
 
     Prevents self-deadlock when a caller that already holds the lock invokes the
     sweep (benchmarks do this with ``acquire_lock=False``, but this is a safety
@@ -429,7 +430,7 @@ def _parakeet_holds_lock() -> bool:
     """
     try:
         data = json.loads(LOCK_PATH.read_text())
-        return data.get("session") == "parakeet-mega"
+        return data.get("session") == _AUTOTUNE_SESSION
     except Exception:
         return False
 
@@ -502,10 +503,10 @@ def autotune(
         save_cache(cfg, cache_dir=cache_dir)
         return cfg
 
-    need_lock = acquire_lock and not _parakeet_holds_lock()
+    need_lock = acquire_lock and not _autotune_holds_lock()
     if need_lock:
         with with_gpu_lock(
-            session="parakeet-mega", model="parakeet-tdt-0.6b-v3",
+            session=_AUTOTUNE_SESSION, model="parakeet-tdt-0.6b-v3",
             eta_min=8, note="autotune sweep",
         ):
             return _do()

@@ -1,6 +1,7 @@
-# GPU mel feature extraction — distilled pipeline (parakeet-tdt-0.6b-v3)
+# GPU mel feature extraction — pipeline reference (parakeet-tdt-0.6b-v3)
 
-Distilled from `transformers/models/parakeet/feature_extraction_parakeet.py` (285 lines).
+Reference for the mel feature extraction pipeline, verified against the
+transformers `feature_extraction_parakeet.py` implementation.
 The stock `processor(audio)` runs this ENTIRELY on CPU and returns CPU tensors,
 which is why feat_ms goes from 68ms (B8) to 974ms (B16) — a CPU throughput cliff.
 Moving the pipeline to GPU torch ops eliminates the cliff. Triton fusion is

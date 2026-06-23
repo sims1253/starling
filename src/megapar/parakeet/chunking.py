@@ -4,8 +4,8 @@ The integrated :class:`~megapar.parakeet.pipeline.MegaParakeetPipeline` encodes
 the *entire* utterance with one full-attention Conformer pass, so VRAM is
 O(N^2) in the number of encoder frames (and the encoder clifs at
 ``max_position_embeddings = 5000`` frames, ~6.5 min). On an RTX 5090 a single
-clip is feasible only to ~5 min at batch=1 (~2 GB) before VRAM explodes; the
-prior worker OOM'd trying 10-15 min clips.
+clip is feasible only to ~5 min at batch=1 (~2 GB) before VRAM scales
+super-linearly. This module bounds VRAM regardless of total length.
 
 This module bounds VRAM *regardless of total length* by processing long audio
 in bounded ~30 s windows and stitching the per-chunk token streams by
