@@ -31,6 +31,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
+from .autotune import KernelConfig, detect_gpu as _detect_gpu, autotune as _autotune_kernel
 from .decode_mega import GraphedDecoder
 from .encoder_graph import CompiledEncoder, GraphedEncoder
 from .mel_gpu import GpuMelExtractor
@@ -71,6 +72,19 @@ class MegaParakeetPipeline:
               transcript match vs the oracle. The encoder folds the conv-module
               BatchNorm1d into the depthwise conv (a fresh model is loaded for
               this mode, so the graphed/eager stock path is preserved for A/B).
+        config: an explicit :class:`~megapar.parakeet.autotune.KernelConfig`
+            (``steps_per_replay`` + ``chunk_batch_size``). If given, used
+            directly with no GPU detection/sweep. Takes precedence over
+            ``autotune``.
+        autotune: if True (default) and no ``config`` is given, resolve the
+            config via :func:`~megapar.parakeet.autotune.autotune` -- the first
+            run for a new GPU sweeps ``steps_per_replay`` (~30 s) and caches the
+            result to ``~/.cache/megapar/``; every later run loads the cache
+            instantly. If False, use :func:`~megapar.parakeet.autotune.detect_gpu`
+            fallback defaults (instant, no sweep). On the RTX 5090 both paths
+            yield K=16, so existing callers see no regression. The resolved
+            config is exposed as ``self.config`` (with ``self.steps_per_replay``
+            and ``self.chunk_batch_size`` convenience aliases).
     """
 
     def __init__(
@@ -80,6 +94,8 @@ class MegaParakeetPipeline:
         dtype: torch.dtype = torch.bfloat16,
         use_graphed_encoder: bool = True,
         encoder_mode: str | None = None,
+        config: KernelConfig | None = None,
+        autotune: bool = True,
     ) -> None:
         # Local import: constructing the pipeline pays the HF import cost; keep
         # it out of module import time so `import pipeline` is cheap.
@@ -105,6 +121,26 @@ class MegaParakeetPipeline:
             model_id, dtype=dtype, device_map=str(self.device)
         )
         self.model.eval()
+
+        # Resolve the megakernel config (steps_per_replay K + chunk_batch_size B):
+        #   * explicit ``config``  -> use it directly (no GPU work);
+        #   * ``autotune=True``    -> autotune() (loads cache instantly, sweeps
+        #     only on the very first run for this GPU, then caches);
+        #   * ``autotune=False``   -> detect_gpu() fallback defaults (instant, no
+        #     sweep). On the RTX 5090 both autotune and the fallback yield K=16,
+        #     so existing callers see no regression.
+        if config is not None:
+            self.config = config
+        elif autotune:
+            self.config = _autotune_kernel(self.model, self.processor)
+        else:
+            self.config = _detect_gpu()
+        # Convenience alias for the chunker's chunk_batch_size (the pipeline does
+        # not itself construct a ChunkedTranscriber; callers read this when
+        # building one, e.g. ``ChunkedTranscriber(pipe,
+        # chunk_batch_size=pipe.chunk_batch_size)``).
+        self.steps_per_replay = self.config.steps_per_replay
+        self.chunk_batch_size = self.config.chunk_batch_size
 
         # (1) GPU mel extractor (float32 internally; cast to dtype in transcribe)
         self.mel = GpuMelExtractor(self.processor, device=str(self.device))
@@ -144,9 +180,11 @@ class MegaParakeetPipeline:
         key = (int(B), int(T_enc))
         dec = self._decoders.get(key)
         if dec is None:
-            dec = GraphedDecoder(self.model).capture(
-                pooler, valid_lengths, self.pad_id
-            )
+            # steps_per_replay (K) comes from the autotuned/fallback config; the
+            # captured graph replays K decode steps per host sync.
+            dec = GraphedDecoder(
+                self.model, steps_per_replay=self.config.steps_per_replay
+            ).capture(pooler, valid_lengths, self.pad_id)
             self._decoders[key] = dec
         return dec
 
