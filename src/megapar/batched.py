@@ -624,7 +624,16 @@ class BatchedPipeline:
         encoder_mode: str = "cudagraph",
         max_cache_len: int = 640,
         use_fused_llm: bool = True,
+        flags: Any = None,
     ) -> None:
+        from .flags import OptFlags, get_default_flags
+
+        if flags is None:
+            flags = get_default_flags()
+        elif isinstance(flags, dict):
+            flags = OptFlags(**flags)
+        self.flags = flags
+
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
@@ -633,6 +642,9 @@ class BatchedPipeline:
         comps = get_components(model)
         # (1) fused encoder (per-stream, batch=1, byte-exact).
         self.fused_encoder = FusedEncoder(comps["encoder"], mode=encoder_mode)
+        # Raw encoder for the batched-encoder fast path (tolerance mode only --
+        # a batched conformer forward is NOT byte-exact due to BatchNorm).
+        self._raw_encoder = comps["encoder"]
         # (2) stock eager BLIP2 projector (per-stream).
         self.projector = comps["projector"]
         # embed_tokens used by the merge step.
@@ -697,6 +709,45 @@ class BatchedPipeline:
         audio_embeds = self.projector(enc_hidden)
         return self.build_inputs_embeds(input_ids, audio_embeds, input_features_mask)
 
+    @torch.inference_mode()
+    def _encode_batched_encoder(
+        self,
+        feats_list: list[torch.Tensor],
+        ids_list: list[torch.Tensor],
+        mask_list: list[Optional[torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        """Batched-encoder fast path (tolerance mode only, NOT byte-exact).
+
+        Runs all B streams through the conformer encoder in ONE batched forward
+        (``(B, T, 160)``) instead of B per-stream forwards.  The projector +
+        merge still run per-stream (they are byte-exact at any batch).  This
+        trades ~5.2 max-abs encoder-hidden divergence (BatchNorm
+        ``running_var ~4e-10`` amplifies batch-dependent reduction diffs
+        ~316x/block) for a roughly B x encoder-launch reduction.
+
+        Returns a list of B ``(1, T, 2048)`` merged ``inputs_embeds``.
+        """
+        B = len(feats_list)
+        # Stack features into (B, T, 160). All streams must share the same T
+        # for a batched encoder forward (the caller pads to max_batch_size with
+        # copies, so this holds in the common uniform-length case).
+        feats = torch.cat(
+            [f.to(self.dtype) if f.dtype != self.dtype else f for f in feats_list],
+            dim=0,
+        )  # (B, T, 160)
+        enc_out = self._raw_encoder(feats, return_dict=True)  # (B, T, 1024)
+        enc_hidden = enc_out.last_hidden_state
+        ies = []
+        for b in range(B):
+            eh = enc_hidden[b : b + 1]  # (1, T, 1024)
+            audio_embeds = self.projector(eh)
+            ies.append(
+                self.build_inputs_embeds(
+                    ids_list[b], audio_embeds, mask_list[b]
+                )
+            )
+        return ies
+
     # ------------------------------------------------------------------ #
     # full batched transcribe
     # ------------------------------------------------------------------ #
@@ -756,11 +807,17 @@ class BatchedPipeline:
                 ids_list.append(list_of_input_ids[0])
                 mask_list.append(list_of_input_features_mask[0])
 
-        # (1) per-stream encode (byte-exact) -> list of (1, T_b, 2048).
-        ies = [
-            self.encode_stream(f, i, m)
-            for f, i, m in zip(feats_list, ids_list, mask_list)
-        ]
+        # (1) encode.  Per-stream (byte-exact) by default; batched-encoder fast
+        #     path (tolerance mode) when the flag is set.
+        if getattr(self.flags, "batched_encoder", False):
+            ies = self._encode_batched_encoder(
+                feats_list, ids_list, mask_list
+            )
+        else:
+            ies = [
+                self.encode_stream(f, i, m)
+                for f, i, m in zip(feats_list, ids_list, mask_list)
+            ]
         Ts = [int(ie.shape[1]) for ie in ies]
         T_max = max(Ts)
 

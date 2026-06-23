@@ -61,6 +61,12 @@ class MegaPipeline:
     use_fused_llm : bool
         If True (default) use :class:`FusedLLMMega` (fused Triton elementwise
         kernels); else fall back to :class:`LLMMega` (model's own layers).
+        Ignored when ``flags.multistep_graph`` is True (the K-step decoder is
+        always fused).
+    flags : OptFlags or dict or None
+        Runtime feature flags (see :mod:`megapar.flags`).  ``None`` uses the
+        process-global default.  ``multistep_graph=True`` (default) selects
+        :class:`MultiStepLLMMega` for lower per-token sync overhead.
     """
 
     def __init__(
@@ -70,7 +76,16 @@ class MegaPipeline:
         *,
         encoder_mode: str = "cudagraph",
         use_fused_llm: bool = True,
+        flags: Any = None,
     ) -> None:
+        from .flags import OptFlags, get_default_flags
+
+        if flags is None:
+            flags = get_default_flags()
+        elif isinstance(flags, dict):
+            flags = OptFlags(**flags)
+        self.flags = flags
+
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
@@ -83,13 +98,25 @@ class MegaPipeline:
         # embed_tokens used by the merge step (== language_model.embed_tokens).
         self.embed_tokens = comps["language_model"].get_input_embeddings()
 
-        # (3) fused LLM decoder trunk + lm_head from the TOP-LEVEL model.
-        llm_cls = FusedLLMMega if use_fused_llm else LLMMega
-        self.llm = llm_cls(
-            comps["language_model"],
-            model.lm_head,
-            max_cache_len=640,
-        )
+        # (3) LLM decoder trunk + lm_head from the TOP-LEVEL model.
+        #     ``multistep_graph`` (byte-exact, default on) selects the K-step
+        #     CUDA-graph decoder for lower per-token sync overhead; otherwise
+        #     fall back to the single-step fused/model-forward decoder.
+        if flags.multistep_graph:
+            from .multistep import MultiStepLLMMega
+
+            self.llm = MultiStepLLMMega(
+                comps["language_model"],
+                model.lm_head,
+                max_cache_len=640,
+            )
+        else:
+            llm_cls = FusedLLMMega if use_fused_llm else LLMMega
+            self.llm = llm_cls(
+                comps["language_model"],
+                model.lm_head,
+                max_cache_len=640,
+            )
         self.use_fused_llm = use_fused_llm
 
     # ------------------------------------------------------------------ #
@@ -104,6 +131,7 @@ class MegaPipeline:
         attn_impl: str = "eager",
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
+        flags: Any = None,
     ) -> "MegaPipeline":
         """Load the model + processor and wrap them in a MegaPipeline."""
         model, processor = load_model_and_processor(
@@ -114,6 +142,7 @@ class MegaPipeline:
             processor,
             encoder_mode=encoder_mode,
             use_fused_llm=use_fused_llm,
+            flags=flags,
         )
 
     # ------------------------------------------------------------------ #
