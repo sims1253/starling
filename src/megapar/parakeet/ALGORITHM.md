@@ -112,15 +112,13 @@ short/medium/long fixtures. Your decode, fed through
 `processor.batch_decode(..., skip_special_tokens=True)`, must equal the oracle
 text BYTE-FOR-BYTE. (Greedy TDT decode is deterministic.)
 
-## Bench note (orchestrator reconciliation, 2025-06-22)
-The decode megakernel worker reported a 5.07x decode speedup (stock_decode=1187ms
-→ graphed=234ms at B8 medium). ORCHESTRATOR RECONCILIATION found this inflated by
-GPU contention (an unrelated `flower.sweep` process at 87% GPU util during the
-bench). The baseline measured the SAME workload clean at gen_ms=560.5 (decode
-~505ms). The stock decode (thousands of tiny launches) is far more
-contention-sensitive than the graphed decode (1 replay/step). HONEST numbers:
-- stock_decode (B8 medium, clean): ~505ms
-- graphed_decode (B8 medium, contented ceiling): 234ms (clean-GPU value will be lower)
-- true decode speedup: ~2.2x+ (NOT 5x)
-- end-to-end RTF: 284x → 498x+ (valid improvement; 234ms is a ceiling)
-A definitive clean-GPU re-run is pending (GPU occupied by other project).
+## Bench note (orchestrator reconciliation, 2025-06-23, CLEAN GPU)
+Initial contented bench reported 5x; a conservative reconciliation guessed 2.2x.
+A CLEAN-GPU re-bench (no contention) settled it: the decode megakernel is a
+genuine **6-7x decode speedup**, because the graphed path benefits MORE from a
+clean scheduler (fewer tiny kernels competing). Clean numbers (outputs/parakeet/decode_bench.json):
+- stock_decode (B8 medium, clean): 341.7ms
+- graphed_decode (B8 medium, clean): 51.4ms
+- **true decode speedup: 6.65x**
+- end-to-end RTF (B8 medium): 295x -> **1019x** realtime (using baseline feat+encoder)
+- With GPU mel (3.58ms instead of 56.6ms at B8): integrated total = 3.58 + 56 + 51.4 = 111ms for 178s audio = **~1604x realtime**

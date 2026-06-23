@@ -211,8 +211,8 @@ def main() -> int:
     rows = [
         [
             r["batch_size"], r["audio_seconds"],
-            f"{r['stock_ms']:.2f}", f"{r['stock_p90']:.2f}",
-            f"{r['gpu_ms']:.2f}", f"{r['gpu_p90']:.2f}",
+            f"{r['stock_ms']:.2f}", f"{r['stock_p90_ms']:.2f}",
+            f"{r['gpu_ms']:.2f}", f"{r['gpu_p90_ms']:.2f}",
             f"{r['speedup']:.2f}x",
         ]
         for r in results
