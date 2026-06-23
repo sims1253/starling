@@ -333,6 +333,7 @@ class GraphedDecoder:
         valid_lengths: torch.Tensor,
         *,
         collect_meta: bool = False,
+        meta_as_tensors: bool = False,
     ):
         """Reset state, run step 0 + the replay loop; return ``out_step``.
 
@@ -345,15 +346,25 @@ class GraphedDecoder:
         With ``K=1`` this degenerates to the original one-step-per-replay loop
         with byte-identical output / ``out_step``.
 
-        When ``collect_meta=True``, additionally returns two per-batch-element
-        lists ``meta_tokens`` and ``meta_frames``: for each emitted token (in
-        emission order, including the leading blank start token), the token id
-        and the **cumulative local encoder-frame index** of the decoder pointer
-        *after* emitting that token (i.e. the sum of that token's and all prior
-        tokens' durations). This frame position is what frame-aligned chunk
-        stitching needs (see :mod:`chunking`). The emitted token sequence and
-        ``out_step`` are byte-identical to the ``collect_meta=False`` path -- the
-        only difference is the extra bookkeeping.
+        When ``collect_meta=True``, additionally returns the per-token metadata
+        needed for frame-aligned chunk stitching (see :mod:`chunking`): for each
+        emitted token (in emission order, including the leading blank start
+        token), the token id and the **cumulative local encoder-frame index** of
+        the decoder pointer *after* emitting that token. The emitted token
+        sequence and ``out_step`` are byte-identical to the
+        ``collect_meta=False`` path -- the only difference is the extra metadata.
+
+        The metadata is collected with **vectorized** tensor scatters (no
+        per-token ``.item()`` Python loop): the ``(B, K)`` ring data from each
+        replay is scattered in one shot into pre-allocated ``(B, max_out)`` CPU
+        buffers, and the per-element done-points are computed vectorized at the
+        end. With ``meta_as_tensors=False`` (default, for the byte-exactness
+        tests) this returns ``(out_step, meta_tokens, meta_frames)`` as
+        ``list[list[int]]`` (built via a single ``.tolist()`` per element -- the
+        SAME values the old per-token loop produced). With
+        ``meta_as_tensors=True`` (for the vectorized chunker) it returns
+        ``(out_step, meta_tok, meta_frm, meta_len)`` as CPU ``long`` tensors,
+        deferring all scalar extraction to the caller's vectorized stitch.
         """
         K = self.K
         self.pooler.copy_(pooler)
@@ -375,19 +386,32 @@ class GraphedDecoder:
 
         # meta bookkeeping: leading blank start token (frame 0) + step-0 token
         # (frame = decoder pointer after step 0's duration advance).
+        #
+        # VECTORIZED: instead of building ``list[list[int]]`` token-by-token with
+        # per-token ``.item()`` calls (the 6508 ``aten::select`` + 5785
+        # ``aten::item`` overhead in the chunked profile), pre-allocate ONE
+        # ``(B, max_out)`` CPU buffer per field and fill it with vectorized
+        # scatters. The per-element done-point (where to trim each row) is
+        # computed vectorized at the end. ``valid_lengths_cpu`` is reused by the
+        # replay loop's ``fin`` mask too, so it is hoisted here.
         if collect_meta:
-            fi_step0 = self.frame_idx.cpu()                # (B,)
-            tok0_cpu = tok0.cpu()                           # (B,)
-            meta_tokens = [
-                [int(self.blank_id), int(tok0_cpu[b].item())] for b in range(B)
-            ]
-            meta_frames = [
-                [0, int(fi_step0[b].item())] for b in range(B)
-            ]
-            elem_done = [bool(finished[b].item()) for b in range(B)]
+            valid_lengths_cpu = self.valid_lengths.cpu()          # (B,)
+            meta_tok_buf = torch.full(
+                (B, self.max_out), self.pad_id, dtype=torch.long
+            )
+            meta_frm_buf = torch.zeros((B, self.max_out), dtype=torch.long)
+            # emission 0 = leading blank (frame 0); emission 1 = step-0 token
+            # (frame = cumulative pointer after step 0's duration advance).
+            meta_tok_buf[:, 0] = self.blank_id
+            meta_frm_buf[:, 0] = 0
+            meta_tok_buf[:, 1] = tok0.cpu()
+            meta_frm_buf[:, 1] = self.frame_idx.cpu()
 
         if self._captured and not bool(finished.all()):
-            valid_lengths_cpu = self.valid_lengths.cpu()              # (B,)
+            # valid_lengths_cpu already hoisted when collect_meta; compute it
+            # here only for the plain (non-meta) decode path.
+            if not collect_meta:
+                valid_lengths_cpu = self.valid_lengths.cpu()          # (B,)
             pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)  # (B,)
             step = out_step
             while step < self.max_out:
@@ -412,21 +436,14 @@ class GraphedDecoder:
                 self.output[:, step:step + kk] = torch.where(
                     fin, pad_cpu[:, None], ring_cpu[:, :kk]
                 )
-                # per-step metadata for the frame-aligned chunking path
-                # (B=1 in practice; not perf-critical, so a small loop is fine;
-                # elem_done gating makes columns past the all-done point no-ops,
-                # matching the per-step reference exactly).
+                # VECTORIZED meta scatter: write the whole K-step ring into the
+                # pre-allocated (B, max_out) buffers in one shot (no per-token
+                # loop / .item()). The per-element done-point trim is computed
+                # once, after the loop, from the cumulative frame positions --
+                # this is what removes the 6508 select / 5785 item calls.
                 if collect_meta:
-                    for j in range(kk):
-                        tok_j = ring_cpu[:, j]
-                        fi_j = fring_cpu[:, j]
-                        fin_j = fin[:, j]
-                        for b in range(B):
-                            if not elem_done[b]:
-                                meta_tokens[b].append(int(tok_j[b].item()))
-                                meta_frames[b].append(int(fi_j[b].item()))
-                                if bool(fin_j[b].item()):
-                                    elem_done[b] = True
+                    meta_tok_buf[:, step:step + kk] = ring_cpu[:, :kk]
+                    meta_frm_buf[:, step:step + kk] = fring_cpu[:, :kk]
                 # stop once EVERY batch element is finished (first such column).
                 col_all_done = fin.all(dim=0)                    # (kk,)
                 done_idx = col_all_done.nonzero(as_tuple=False).flatten()
@@ -436,7 +453,34 @@ class GraphedDecoder:
                     break
                 out_step = step + kk
                 step += K
+
         if collect_meta:
+            # Per-element done-point (vectorized): the first emission index
+            # whose cumulative frame >= valid_length, +1 (the done column IS
+            # included, matching the original ``elem_done`` bookkeeping: the
+            # token at the finishing column was appended before the done flag
+            # was set). Frames are non-decreasing per element, so the first
+            # frame >= valid_length is the trim point. The leading blank at
+            # frame 0 is never a done point for real audio (valid_length >= 1);
+            # we force column 0 to False so even a pathological valid_length==0
+            # input keeps the [blank, tok0] pair the reference always emitted.
+            done_mask = meta_frm_buf[:, :out_step] >= valid_lengths_cpu[:, None]
+            done_mask[:, 0] = False
+            has_done = done_mask.any(dim=1)
+            first_done = torch.where(
+                has_done,
+                done_mask.long().argmax(dim=1),
+                torch.full((B,), out_step - 1, dtype=torch.long),
+            )
+            meta_lengths = (first_done + 1).clamp(max=out_step)        # (B,)
+            if meta_as_tensors:
+                return out_step, meta_tok_buf, meta_frm_buf, meta_lengths
+            meta_tokens = [
+                meta_tok_buf[b, :int(meta_lengths[b])].tolist() for b in range(B)
+            ]
+            meta_frames = [
+                meta_frm_buf[b, :int(meta_lengths[b])].tolist() for b in range(B)
+            ]
             return out_step, meta_tokens, meta_frames
         return out_step
 
@@ -501,6 +545,47 @@ class GraphedDecoder:
         out_lists = [self.output[b, :out_step].tolist() for b in range(B)]
         texts = processor.batch_decode(out_lists, skip_special_tokens=True)
         return texts, meta_tokens, meta_frames
+
+    @torch.inference_mode()
+    def decode_meta_tensors(
+        self,
+        pooler: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        processor,
+    ) -> tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode one batch and return per-token metadata as CPU tensors.
+
+        Identical decode to :meth:`decode_with_durations` (same emitted token
+        ids, same ``out_step``, byte-identical text) but returns the per-token
+        metadata as **CPU ``long`` tensors** instead of ``list[list[int]]``,
+        so the frame-aligned chunker can stitch with fully vectorized ops (no
+        per-token ``.item()`` / Python loop). This is the optimization-target
+        entry point used by :class:`~megapar.parakeet.chunking.ChunkedTranscriber`.
+
+        Returns ``(texts, meta_tok, meta_frm, meta_len)`` where:
+
+        * ``meta_tok`` -- ``(B, L)`` long CPU tensor; ``meta_tok[b, :meta_len[b]]``
+          is the emitted token id sequence for element ``b`` (in emission order,
+          including the leading blank start token and mid-sequence blanks), the
+          SAME values ``decode_with_durations`` returns as ``meta_tokens[b]``.
+        * ``meta_frm`` -- ``(B, L)`` long CPU tensor; ``meta_frm[b, :meta_len[b]]``
+          is the matching cumulative local encoder-frame index per token.
+        * ``meta_len`` -- ``(B,)`` long CPU tensor; the valid row length per
+          element (trim point = first emission whose frame >= valid_length, +1,
+          with the done column included -- identical to the list path).
+        """
+        B = self._B
+        T_enc = self._T_enc
+        assert pooler.shape == (B, T_enc, self.hid), (
+            f"pooler {tuple(pooler.shape)} != captured {(B, T_enc, self.hid)}; "
+            "re-capture for this shape"
+        )
+        out_step, meta_tok, meta_frm, meta_len = self._run_loop(
+            pooler, valid_lengths, collect_meta=True, meta_as_tensors=True
+        )
+        out_lists = [self.output[b, :out_step].tolist() for b in range(B)]
+        texts = processor.batch_decode(out_lists, skip_special_tokens=True)
+        return texts, meta_tok, meta_frm, meta_len
 
 
 def greedy_decode_graphed(

@@ -257,7 +257,7 @@ class ChunkedTranscriber:
     @torch.inference_mode()
     def _decode_batch(
         self, batch_audio: List[np.ndarray]
-    ) -> Tuple[List[str], List[List[int]], List[List[int]], List[int], dict]:
+    ) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Run mel -> encoder -> graphed decode for ``B`` chunks at once.
 
         The mel extractor, Conformer encoder and graphed TDT decoder are all
@@ -267,11 +267,15 @@ class ChunkedTranscriber:
         per-element attention mask, the encoder masks padded frames, and the
         decoder stops each chunk at its own ``valid_lengths``.
 
-        Returns ``(texts, meta_tokens, meta_frames, valid_enc_list, timing)``
-        where each list has ``B`` entries (one per chunk, in input order) and
-        ``timing`` carries batch-level ``mel_ms``/``encoder_ms``/``decode_ms``/
-        ``total_ms``/``batch_size`` from cuda events. Raises :class:`MemoryError`
-        if the VRAM hard floor (:attr:`min_free_vram_gb`) is breached.
+        Returns ``(texts, meta_tok, meta_frm, meta_len, valid_lengths_cpu,
+        timing)`` where ``meta_tok``/``meta_frm`` are ``(B, L)`` CPU long
+        tensors (only ``[:meta_len[b]]`` valid per row), ``meta_len`` is ``(B,)``
+        CPU long, and ``valid_lengths_cpu`` is the per-chunk valid encoder-frame
+        count ``(B,)`` CPU long (returned as a tensor so the caller needs no
+        per-element ``.item()``). ``timing`` carries batch-level
+        ``mel_ms``/``encoder_ms``/``decode_ms``/``total_ms``/``batch_size`` from
+        cuda events. Raises :class:`MemoryError` if the VRAM hard floor
+        (:attr:`min_free_vram_gb`) is breached.
         """
         free_gb = self._free_vram_gb()
         if free_gb < self.min_free_vram_gb:
@@ -293,6 +297,11 @@ class ChunkedTranscriber:
             torch.cuda.synchronize()
             return start.elapsed_time(end), out
 
+        # Audio H2D: use the mel extractor directly. (A consolidated single-H2D
+        # ``_mel_batched`` path was benchmarked and measured ~1.7ms SLOWER per
+        # batch than the extractor's default per-chunk GPU-side scatters -- the
+        # CPU numpy fill + one big transfer does not overlap as well as B small
+        # scatters that pipeline with GPU work. Kept on the fast path.)
         mel_ms, (input_features, attention_mask) = _timed(
             lambda: pipe.mel(batch_audio)
         )
@@ -303,13 +312,15 @@ class ChunkedTranscriber:
         )
 
         decoder = pipe._get_decoder(pooler, valid_lengths)
-        decode_ms, (texts, meta_tokens, meta_frames) = _timed(
-            lambda: decoder.decode_with_durations(
+        # Tensor metadata (no per-token .item() in the decode loop); the
+        # vectorized stitch consumes these tensors directly.
+        decode_ms, (texts, meta_tok, meta_frm, meta_len) = _timed(
+            lambda: decoder.decode_meta_tensors(
                 pooler, valid_lengths, pipe.processor
             )
         )
 
-        valid_enc_list = [int(valid_lengths[b].item()) for b in range(B)]
+        valid_lengths_cpu = valid_lengths.cpu()
         timing = {
             "mel_ms": float(mel_ms),
             "encoder_ms": float(encoder_ms),
@@ -317,7 +328,7 @@ class ChunkedTranscriber:
             "total_ms": float(mel_ms + encoder_ms + decode_ms),
             "batch_size": int(B),
         }
-        return texts, meta_tokens, meta_frames, valid_enc_list, timing
+        return texts, meta_tok, meta_frm, meta_len, valid_lengths_cpu, timing
 
     @torch.inference_mode()
     def _decode_chunk(
@@ -328,12 +339,19 @@ class ChunkedTranscriber:
         Kept for backward compatibility; returns ``(text, tokens, local_frames,
         valid_enc_frames, timing)``. At ``B=1`` this is byte-exact with the
         direct ``MegaParakeetPipeline.transcribe`` path (identical mel / encoder
-        / decode_with_durations calls on the same single chunk).
+        / decode_meta_tensors calls on the same single chunk).
         """
-        texts, meta_tokens, meta_frames, valid_enc_list, timing = self._decode_batch(
-            [chunk_audio]
+        texts, meta_tok, meta_frm, meta_len, valid_lengths_cpu, timing = (
+            self._decode_batch([chunk_audio])
         )
-        return texts[0], meta_tokens[0], meta_frames[0], valid_enc_list[0], timing
+        n = int(meta_len[0].item())
+        return (
+            texts[0],
+            meta_tok[0, :n].tolist(),
+            meta_frm[0, :n].tolist(),
+            int(valid_lengths_cpu[0].item()),
+            timing,
+        )
 
     # ------------------------------------------------------------------ #
     # public API
@@ -403,31 +421,48 @@ class ChunkedTranscriber:
             batch_starts = starts[ci:end_ci]
             actual_b = len(batch_audio)
 
-            _texts_b, tokens_b, frames_b, valid_enc_b, timing = self._decode_batch(
-                batch_audio
+            _texts_b, meta_tok, meta_frm, meta_len, valid_enc_cpu, timing = (
+                self._decode_batch(batch_audio)
             )
 
-            # Stitch each chunk in the batch (in order), using the same
-            # frame-aligned left-biased dedup as the sequential path.
+            # VECTORIZED STITCH: process each chunk's per-token frame positions
+            # with one vectorized comparison instead of a Python loop over
+            # individual token positions. This eliminates the 6508 ``select`` +
+            # 5785 ``item`` calls (9.3ms) that dominated the per-batch overhead.
+            #
+            # Left-biased dedup semantics (preserved EXACTLY): walk chunks
+            # left-to-right; within each chunk, keep every token whose GLOBAL
+            # sample position is strictly greater than ``furthest_global_sample``
+            # (carried across chunks; the chunk-local compare uses the value from
+            # BEFORE this chunk, so multiple tokens at the same new position are
+            # all kept). Because the TDT cumulative frame index is non-decreasing
+            # within a chunk, ``g_samples`` is non-decreasing and the kept set is
+            # a suffix; ``chunk_furthest`` therefore equals the last kept
+            # ``g_sample`` (or is unchanged if nothing was kept).
             for k in range(actual_b):
                 gci = ci + k
                 start_sample = batch_starts[k]
-                tokens_c = tokens_b[k]
-                frames_c = frames_b[k]
+                len_k = int(meta_len[k].item())
                 chunk_audio_k = batch_audio[k]
 
-                kept_here = 0
-                chunk_furthest = furthest_global_sample
-                for tok, lf in zip(tokens_c, frames_c):
-                    g_sample = start_sample + int(lf) * self.samples_per_enc_frame
-                    if g_sample > furthest_global_sample:
-                        surviving_tokens.append(int(tok))
-                        kept_here += 1
-                        if g_sample > chunk_furthest:
-                            chunk_furthest = g_sample
-                    else:
-                        n_stitches += 1
-                furthest_global_sample = chunk_furthest
+                if len_k > 0:
+                    frames_k = meta_frm[k, :len_k]            # (len_k,) CPU long
+                    toks_k = meta_tok[k, :len_k]              # (len_k,) CPU long
+                    # global sample positions, non-decreasing within the chunk
+                    g_samples = start_sample + frames_k * self.samples_per_enc_frame
+                    # left-biased mask: keep strictly past the running furthest
+                    mask = g_samples > furthest_global_sample
+                    kept_here = int(mask.sum().item())
+                    n_stitches += len_k - kept_here
+                    if kept_here > 0:
+                        # gather surviving tokens in one shot (suffix of mask)
+                        surviving_tokens.extend(toks_k[mask].tolist())
+                        # furthest = last kept g_sample (== g_samples[-1] since
+                        # non-decreasing + suffix mask; one scalar extraction,
+                        # not per-token)
+                        furthest_global_sample = int(g_samples[-1])
+                else:
+                    kept_here = 0
 
                 # Per-chunk record: token counts are exact; the per-stage ms are
                 # the batch's totals distributed evenly across its chunks (an
@@ -441,8 +476,8 @@ class ChunkedTranscriber:
                         "start_s": start_sample / self.sr,
                         "n_samples": int(chunk_audio_k.shape[0]),
                         "duration_s": chunk_audio_k.shape[0] / self.sr,
-                        "valid_enc_frames": int(valid_enc_b[k]),
-                        "tokens_emitted": int(len(tokens_c)),
+                        "valid_enc_frames": int(valid_enc_cpu[k]),
+                        "tokens_emitted": int(len_k),
                         "tokens_kept": int(kept_here),
                         "mel_ms": timing["mel_ms"] / actual_b,
                         "encoder_ms": timing["encoder_ms"] / actual_b,
