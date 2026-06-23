@@ -27,9 +27,56 @@ is zero wasted work and minimal launch overhead.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+
+# =========================================================================== #
+# Autotune toggle (Deliverable 1: "autotuned Triton" baseline).
+#
+# When ``AUTOTUNE`` is True the three decode-critical elementwise kernels
+# (RMSNorm, SwiGLU silu*mul, residual scale-add) are wrapped in
+# ``@triton.autotune`` over ``(num_warps, num_stages)`` so the CUDA-graph-
+# captured decode picks the fastest launch config per feature dim on the RTX
+# 5090. When False the kernels use Triton's default config -- this is the
+# byte-exact fallback (identical to the pre-autotune path) used to measure the
+# autotune delta.
+#
+# ``BLOCK_N`` stays launcher-computed (= ``next_power_of_2(N)``) so reduction
+# coverage is always exact; ONLY ``num_warps``/``num_stages`` are swept, which
+# never changes the elementwise arithmetic. For RMSNorm the ``tl.sum`` reduction
+# order can in principle depend on ``num_warps``, but the resulting fp32 rstd
+# delta is far below bf16 truncation granularity for the Granite hidden-state
+# magnitudes -- verified bit-exact against the PyTorch reference (see
+# ``test_fused_kernels_match_reference``). The OFF path (``.fn``) is exactly
+# the original default-config launch, so it is guaranteed byte-exact.
+# =========================================================================== #
+AUTOTUNE: bool = os.environ.get("MEGAPAR_LLM_AUTOTUNE", "1") not in (
+    "0", "", "false", "False",
+)
+
+# Config sweep: num_warps x num_stages. These kernels are single-program
+# (grid=(M,) with M=1 at decode), so the sweep targets per-block parallelism /
+# pipelining. 12 configs per (kernel, N); tuned once and cached.
+_AT_CONFIGS = [
+    triton.Config({}, num_warps=w, num_stages=s)
+    for w in (1, 2, 4, 8)
+    for s in (1, 2, 3)
+]
+
+
+def set_autotune(enabled: bool) -> None:
+    """Enable/disable LLM-kernel autotuning at runtime (process-global)."""
+    global AUTOTUNE
+    AUTOTUNE = bool(enabled)
+
+
+def autotune_enabled() -> bool:
+    """Return whether LLM-kernel autotuning is active."""
+    return AUTOTUNE
 
 
 # =========================================================================== #
@@ -41,6 +88,7 @@ import triton.language as tl
 #   x_normed = x * rsqrt(variance + eps)
 #   output   = weight * x_normed
 # =========================================================================== #
+@triton.autotune(_AT_CONFIGS, key=["N"])
 @triton.jit
 def _rmsnorm_kernel(
     X_ptr, W_ptr, Y_ptr,
@@ -68,6 +116,11 @@ def _rmsnorm_kernel(
     tl.store(Y_ptr + offs, y, mask=mask)
 
 
+# OFF path: the raw JIT function under the autotuner (default config == the
+# original pre-autotune launch). Guaranteed byte-exact fallback.
+_rmsnorm_kernel_raw = _rmsnorm_kernel.fn
+
+
 def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm over the last dim, fp32 internally, bf16 in/out.
 
@@ -81,7 +134,8 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
         x2 = x2.contiguous()
     y = torch.empty_like(x2)
     BLOCK_N = triton.next_power_of_2(N)
-    _rmsnorm_kernel[(M,)](x2, weight, y, eps, N=N, BLOCK_N=BLOCK_N)
+    kern = _rmsnorm_kernel if AUTOTUNE else _rmsnorm_kernel_raw
+    kern[(M,)](x2, weight, y, eps, N=N, BLOCK_N=BLOCK_N)
     return y.view_as(x)
 
 
@@ -182,6 +236,7 @@ def fused_rope(
 # gate, up: (M, N)  with N = intermediate_size (4096).  For decode M = 1.
 # out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
 # =========================================================================== #
+@triton.autotune(_AT_CONFIGS, key=["N"])
 @triton.jit
 def _silu_mul_kernel(
     GATE_ptr, UP_ptr, OUT_ptr,
@@ -205,6 +260,10 @@ def _silu_mul_kernel(
     tl.store(OUT_ptr + offs, out, mask=mask)
 
 
+# OFF path: raw JIT (default config) -- original byte-exact launch.
+_silu_mul_kernel_raw = _silu_mul_kernel.fn
+
+
 def fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """SiLU(gate) * up fused into one kernel, fp32 internally.
 
@@ -221,7 +280,8 @@ def fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         u2 = u2.contiguous()
     out = torch.empty_like(g2)
     BLOCK_N = triton.next_power_of_2(N)
-    _silu_mul_kernel[(M,)](g2, u2, out, N=N, BLOCK_N=BLOCK_N)
+    kern = _silu_mul_kernel if AUTOTUNE else _silu_mul_kernel_raw
+    kern[(M,)](g2, u2, out, N=N, BLOCK_N=BLOCK_N)
     return out.view_as(gate)
 
 
@@ -230,6 +290,7 @@ def fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 #
 # x, y: (M, N)  with N = hidden_size (2048).  alpha = residual_multiplier.
 # =========================================================================== #
+@triton.autotune(_AT_CONFIGS, key=["N"])
 @triton.jit
 def _residual_scale_kernel(
     X_ptr, Y_ptr, Z_ptr, ALPHA,
@@ -252,6 +313,10 @@ def _residual_scale_kernel(
     tl.store(Z_ptr + offs, z, mask=mask)
 
 
+# OFF path: raw JIT (default config) -- original byte-exact launch.
+_residual_scale_kernel_raw = _residual_scale_kernel.fn
+
+
 def fused_residual_scale(
     x: torch.Tensor, y: torch.Tensor, alpha: float
 ) -> torch.Tensor:
@@ -266,5 +331,6 @@ def fused_residual_scale(
         y2 = y2.contiguous()
     z = torch.empty_like(x2)
     BLOCK_N = triton.next_power_of_2(N)
-    _residual_scale_kernel[(M,)](x2, y2, z, alpha, N=N, BLOCK_N=BLOCK_N)
+    kern = _residual_scale_kernel if AUTOTUNE else _residual_scale_kernel_raw
+    kern[(M,)](x2, y2, z, alpha, N=N, BLOCK_N=BLOCK_N)
     return z.view_as(x)
