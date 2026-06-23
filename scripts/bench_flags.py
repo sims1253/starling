@@ -13,7 +13,7 @@ the tolerance-mode batched encoder (Deliverable 2) on:
    diff (max/mean abs vs per-stream encode) AND whether the decoded transcript
    still matches (greedy-chaos may or may not flip).
 
-All timed runs acquire the GPU lock (comms.md P1).
+All timed runs acquire the GPU lock.
 
 Run:  .venv/bin/python scripts/bench_flags.py
 """
@@ -268,7 +268,7 @@ def bench_tolerance_encoder(model, proc, comps, feats, ids, mask, audio_seconds)
 # =========================================================================== #
 def main() -> int:
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=10,
         note="bench_flags: multi-step + tolerance-mode benchmark",

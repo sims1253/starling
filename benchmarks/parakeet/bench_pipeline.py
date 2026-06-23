@@ -4,7 +4,7 @@ Times the fully integrated ``MegaParakeetPipeline.transcribe`` (audio -> text,
 no CPU roundtrip) for uniform-medium batches [1, 4, 8, 16] and reports the
 integrated realtime factor (RTF) plus a per-stage breakdown.
 
-Method (under the shared-GPU lock, per comms.md §P1):
+Method (under the benchmark GPU lock):
   * ``total_ms`` -- end-to-end ``pipeline.transcribe(audio_list)`` timed with a
     single cuda-event pair (mel + encoder + decode + batch_decode). This is the
     authoritative RTF number.
@@ -17,7 +17,7 @@ Method (under the shared-GPU lock, per comms.md §P1):
     production-realistic shape).
 
 GPU-contention guard: samples ``nvidia-smi`` before and inside the lock; REFUSES
-to run if util > 30% (comms.md §P1) and exits non-zero so the orchestrator knows
+to run if util > 30% and exits non-zero so the caller knows
 the bench was deferred.
 
 Writes ``outputs/parakeet/pipeline_bench.json`` and prints a summary table.
@@ -57,7 +57,7 @@ BASELINE = _REPO_ROOT / "outputs" / "baseline_bench.json"
 WARMUP = 8
 REPEATS = 15
 MAX_SECONDS = 8.0
-GPU_UTIL_THRESHOLD_PCT = 30   # comms.md: defer if util > 30%
+GPU_UTIL_THRESHOLD_PCT = 30   # defer if util > 30%
 BATCH_SIZES = [1, 4, 8, 16]
 
 
@@ -98,7 +98,7 @@ def assert_gpu_idle(*, where: str) -> None:
     if util is not None and util > GPU_UTIL_THRESHOLD_PCT:
         raise SystemExit(
             f"[bench_pipeline] GPU util={util}% (> {GPU_UTIL_THRESHOLD_PCT}% "
-            f"threshold) at {where}; deferring benchmark per comms.md §P1. "
+            f"threshold) at {where}; deferring benchmark. "
             f"Re-run when the GPU is idle."
         )
 
@@ -174,7 +174,7 @@ def main() -> int:
     results = []
     print("[bench_pipeline] acquiring GPU lock ...")
     with with_gpu_lock(
-        session="parakeet-mega", model=MODEL_ID,
+        session="parakeet", model=MODEL_ID,
         eta_min=5, note="pipeline bench",
     ):
         assert_gpu_idle(where="inside GPU lock")

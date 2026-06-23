@@ -357,7 +357,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     with with_gpu_lock(
-        session="parakeet-mega",
+        session="parakeet",
         model="parakeet-tdt-0.6b-v3",
         eta_min=4,
         note="chunked opt bench",

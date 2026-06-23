@@ -132,7 +132,7 @@ def main() -> int:
 
     results = []
     print("\n[bench] acquiring GPU lock ...")
-    with with_gpu_lock(session="parakeet-mega", model=MODEL_ID,
+    with with_gpu_lock(session="parakeet", model=MODEL_ID,
                        eta_min=5, note="decode bench (stock vs graphed)"):
         # re-check GPU state inside the lock
         free, total = torch.cuda.mem_get_info()

@@ -16,7 +16,7 @@ warms up, and times the full K-step decode loop (``_run_loop``) via cuda events
 writes the result to ``~/.cache/starling/autotune_<gpu>.json``.
 
 GPU-contention guard: samples GPU util before/inside the lock; defers if util >
-30% (comms.md §P1).
+30%.
 
 Writes ``outputs/parakeet/autotune_bench.json`` and prints tables.
 
@@ -50,7 +50,7 @@ OUTPUTS = _REPO_ROOT / "outputs" / "parakeet"
 K_VALUES = list(at.DEFAULT_K_VALUES)
 WARMUP = 3
 REPEATS = 10
-GPU_UTIL_THRESHOLD_PCT = 30  # comms.md: defer if util > 30%
+GPU_UTIL_THRESHOLD_PCT = 30  # defer if util > 30%
 
 
 def _suppress() -> None:
@@ -84,7 +84,7 @@ def assert_gpu_idle(*, where: str) -> None:
     if util is not None and util > GPU_UTIL_THRESHOLD_PCT:
         raise SystemExit(
             f"[bench_autotune] GPU util={util}% (> {GPU_UTIL_THRESHOLD_PCT}% "
-            f"threshold) at {where}; deferring benchmark per comms.md §P1. "
+            f"threshold) at {where}; deferring benchmark. "
             f"Re-run when the GPU is idle."
         )
 
@@ -128,7 +128,7 @@ def main() -> int:
 
     print("[bench_autotune] acquiring GPU lock ...")
     with with_gpu_lock(
-        session="parakeet-mega", model=MODEL_ID,
+        session="parakeet", model=MODEL_ID,
         eta_min=8, note="autotune sweep",
     ):
         assert_gpu_idle(where="inside GPU lock")

@@ -154,7 +154,7 @@ def main() -> int:
     all_configs = []
     print("\n[bench] acquiring GPU lock ...")
     with with_gpu_lock(
-        session="parakeet-mega", model=MODEL_ID,
+        session="parakeet", model=MODEL_ID,
         eta_min=3, note="multistep bench",
     ):
         free, total = torch.cuda.mem_get_info()

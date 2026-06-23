@@ -5,7 +5,7 @@ audio tiled from the canonical fixture sample) but through
 ``ChunkedTranscriber(chunk_batch_size=8)``, which groups chunks into mini-batches
 of 8 and runs each through one set of batched mel+encoder+decode forwards.
 
-Runs under the shared GPU lock (comms.md P1) with the adaptive memory guard
+Runs under the benchmark GPU lock with the adaptive memory guard
 (ChunkedTranscriber shrinks B from live free VRAM and aborts only on the hard
 floor). The HEADLINE result this prints is:
 
@@ -92,7 +92,7 @@ def load_sequential_comparison() -> dict:
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Defer if the GPU is busy (comms.md): a contended card corrupts timings.
+    # Defer if the GPU is busy: a contended card corrupts timings.
     util = gpu_util_pct()
     if util > 30.0:
         print(f"[bench] GPU util {util:.0f}% > 30%; deferring 30s...", flush=True)
@@ -270,7 +270,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     with with_gpu_lock(
-        session="parakeet-mega",
+        session="parakeet",
         model="parakeet-tdt-0.6b-v3",
         eta_min=5,
         note="batched chunked bench",

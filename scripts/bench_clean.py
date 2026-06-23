@@ -22,7 +22,7 @@ def wall_ms(fn, warm=3, iters=8):
         ts.append((time.perf_counter()-t0)*1000)
     return statistics.median(ts), min(ts)
 
-with with_gpu_lock(session="granite-mega", model="granite-speech-4.1-2b",
+with with_gpu_lock(session="granite", model="granite-speech-4.1-2b",
                    eta_min=5, note="clean uncontended baseline"):
     print("loading...", flush=True)
     model, proc = load_model_and_processor("eager")

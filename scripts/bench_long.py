@@ -77,7 +77,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=12,
         note="long-audio + VRAM benchmark (1min-1h chunked)",

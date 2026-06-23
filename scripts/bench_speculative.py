@@ -27,7 +27,7 @@ from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 from starling.pipeline import MegaPipeline  # noqa: E402
 from starling.speculative import CTCBPEDraft, load_out_llm  # noqa: E402
 
-# Reference numbers from comms.md (uncontended, byte-exact, 24.9s audio):
+# Reference numbers (uncontended, byte-exact, 24.9s audio):
 V1_TOK_S = 269.0       # v1 spec mega
 V1_MS = 372.0
 NONSPEC_TOK_S = 182.0  # non-spec mega
@@ -50,7 +50,7 @@ def wall_ms(fn, *, warm: int = 3, iters: int = 8):
 
 def main() -> int:
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=10,
         note="v2 pure-verify speculative benchmark",

@@ -39,7 +39,7 @@ def wer_simple(ref: str, hyp: str) -> float:
 
 def main() -> int:
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=5,
         note="probe_quant_correctness: INT8 decode vs golden",

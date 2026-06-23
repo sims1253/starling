@@ -16,7 +16,7 @@ Sections
    pattern for bf16, FP8 ``_scaled_mm`` and the INT8 dequant-GEMM, to confirm
    WHY quantisation does (or does not) help -- the BW-bound diagnosis check.
 
-All timed runs acquire the GPU lock (comms.md P1).
+All timed runs acquire the GPU lock.
 
 Run:  .venv/bin/python scripts/bench_quant.py
 """
@@ -274,7 +274,7 @@ def main() -> int:
     __eos__ = LLM_EOS_TOKEN_ID
 
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=10,
         note="bench_quant: weight-only INT8 quantisation benchmark",

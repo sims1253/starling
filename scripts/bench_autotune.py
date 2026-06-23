@@ -69,7 +69,7 @@ def _cuda_ms(fn, warm=WARMUP, iters=ITERS):
 
 def main() -> int:
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=10,
         note="bench_autotune: autotune ON vs OFF decode benchmark",

@@ -6,12 +6,10 @@ components are individually byte-exact, so the integrated transcript must match
 batch=8 uniform-medium batch must reproduce 8x the medium transcript (the shape
 cache reuses one captured decoder for the (8, 279) shape).
 
-NOTE on filename: this file is deliberately ``test_parakeet_pipeline.py`` rather
-than ``tests/test_pipeline.py`` because the latter is **granite-owned** per
-comms.md §P2 and already contains the granite-speech correctness gate
-(``starling.pipeline.MegaPipeline``). Overwriting it would corrupt the shared
-repo. The parent task asked for ``tests/test_pipeline.py``; the filename
-collision is reported back to the orchestrator.
+NOTE on filename: this file is deliberately ``test_parakeet_pipeline.py``
+rather than ``tests/test_pipeline.py``; the latter holds the granite-speech
+correctness gate (``starling.pipeline.MegaPipeline``), while this file holds
+the parakeet pipeline correctness gate.
 
 Both encoder modes are exercised: the stock eager
 ``model.get_audio_features`` path (``use_graphed_encoder=False``) and the

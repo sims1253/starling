@@ -151,7 +151,7 @@ def main() -> int:
     print("=" * 78)
 
     with with_gpu_lock(
-        session="granite-mega",
+        session="granite",
         model="granite-speech-4.1-2b",
         eta_min=15,
         note="batched inference benchmark B=1..16",

@@ -21,8 +21,8 @@ Derived: ``speedup = stock_ms / gpu_ms``.
 Writes ``outputs/parakeet/mel_bench.json`` and prints a table.
 
 GPU-contention guard: the script samples ``nvidia-smi`` GPU utilization before
-and inside the lock; if util > 30% it REFUSES to run (per comms.md §P1) and
-exits non-zero so the orchestrator knows the bench was deferred. Re-run when
+and inside the lock; if util > 30% it REFUSES to run and
+exits non-zero so the caller knows the bench was deferred. Re-run when
 the GPU is idle.
 
 Run:  uv run python benchmarks/parakeet/bench_mel.py
@@ -58,7 +58,7 @@ OUTPUTS = _REPO_ROOT / "outputs" / "parakeet"
 WARMUP = 8
 REPEATS = 15
 MAX_SECONDS = 5.0
-GPU_UTIL_THRESHOLD_PCT = 30   # comms.md: defer if util > 30%
+GPU_UTIL_THRESHOLD_PCT = 30   # defer if util > 30%
 BATCH_SIZES = [1, 4, 8, 16]
 
 
@@ -91,7 +91,7 @@ def assert_gpu_idle(*, where: str) -> None:
     if util is not None and util > GPU_UTIL_THRESHOLD_PCT:
         raise SystemExit(
             f"[bench_mel] GPU util={util}% (> {GPU_UTIL_THRESHOLD_PCT}% threshold) "
-            f"at {where}; deferring benchmark per comms.md §P1. Re-run when the "
+            f"at {where}; deferring benchmark. Re-run when the "
             f"GPU is idle."
         )
 
@@ -159,7 +159,7 @@ def main() -> int:
 
     results = []
     print("[bench_mel] acquiring GPU lock ...")
-    with with_gpu_lock(session="parakeet-mega", model=MODEL_ID,
+    with with_gpu_lock(session="parakeet", model=MODEL_ID,
                        eta_min=3, note="mel bench"):
         assert_gpu_idle(where="inside GPU lock")
         free, total = torch.cuda.mem_get_info()

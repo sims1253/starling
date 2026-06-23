@@ -29,7 +29,7 @@ B8-real-varied, longest-feasible-single-clip): RTF, per-utterance first/last
 token latency (mean+p90), max single-clip length, decode steps + tokens per
 audio-second.
 
-Method (under the shared-GPU lock, per comms.md §P1):
+Method (under the benchmark GPU lock):
   * cuda.Event + synchronize, warmup>=3 (fewer for long clips), >=5 samples
     (30 s cap), median.
   * peak VRAM = torch.cuda.max_memory_allocated() reset before each config.
@@ -88,7 +88,7 @@ MAX_SAMPLES = 5
 SAMPLE_WALL_CAP_S = 30.0     # cap on the sampling loop per config
 SINGLE_PASS_CAP_S = 60.0     # >this -> compute ceiling, stop escalating length
 
-GPU_UTIL_THRESHOLD_PCT = 30   # comms.md: defer if util > 30 %
+GPU_UTIL_THRESHOLD_PCT = 30   # defer if util > 30 %
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +125,7 @@ def assert_gpu_idle(*, where: str) -> None:
     if util is not None and util > GPU_UTIL_THRESHOLD_PCT:
         raise SystemExit(
             f"[bench_robust] GPU util={util}% (> {GPU_UTIL_THRESHOLD_PCT}% "
-            f"threshold) at {where}; deferring per comms.md §P1. Re-run when idle."
+            f"threshold) at {where}; deferring. Re-run when idle."
         )
 
 
@@ -406,7 +406,7 @@ def main() -> int:
     longest_single_clip = None  # (length_min, measured_dict, counts)
 
     print("[bench_robust] acquiring GPU lock ...")
-    with with_gpu_lock(session="parakeet-mega", model=MODEL_ID,
+    with with_gpu_lock(session="parakeet", model=MODEL_ID,
                        eta_min=10, note="robust bench sweep"):
         assert_gpu_idle(where="inside GPU lock")
         free, total = torch.cuda.mem_get_info()

@@ -1,6 +1,6 @@
 """Memory + RTF benchmark for the chunked (long-audio) parakeet transcriber.
 
-Runs under the shared GPU lock (comms.md P1) with a hard memory-safety guard
+Runs under the benchmark GPU lock with a hard memory-safety guard
 (abort a config if free VRAM < ``MIN_FREE_VRAM_GB``). The HEADLINE result this
 prints is: **chunked RTF at 1 h + peak VRAM at 1 h**, proving VRAM is bounded by
 chunk size and not by total length (vs the unchunked ``vram_cliff`` at 7 min in
@@ -40,7 +40,7 @@ OUT_DIR = _REPO_ROOT / "outputs" / "parakeet"
 ROBUST_PATH = OUT_DIR / "robust_bench.json"
 OUT_PATH = OUT_DIR / "chunked_bench.json"
 
-# Memory-safety guard (comms.md / task): 32 GB card is shared; cap our own use
+# Memory-safety guard: 32 GB card is shared; cap our own use
 # at ~8 GB and abort a config if free VRAM drops below this.
 MIN_FREE_VRAM_GB = 24.0
 
@@ -91,7 +91,7 @@ def load_unchunked_comparison() -> dict:
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Defer if the GPU is busy (comms.md): a contended card corrupts timings.
+    # Defer if the GPU is busy: a contended card corrupts timings.
     util = gpu_util_pct()
     if util > 30.0:
         print(f"[bench] GPU util {util:.0f}% > 30%; deferring 30s...", flush=True)
@@ -243,7 +243,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     with with_gpu_lock(
-        session="parakeet-mega",
+        session="parakeet",
         model="parakeet-tdt-0.6b-v3",
         eta_min=10,
         note="chunked bench",
