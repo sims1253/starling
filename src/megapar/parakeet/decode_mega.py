@@ -256,11 +256,27 @@ class GraphedDecoder:
         return self
 
     @torch.inference_mode()
-    def _run_loop(self, pooler: torch.Tensor, valid_lengths: torch.Tensor) -> int:
+    def _run_loop(
+        self,
+        pooler: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        *,
+        collect_meta: bool = False,
+    ):
         """Reset state, run step 0 + the replay loop; return ``out_step``.
 
         Excludes ``processor.batch_decode`` so callers (and the benchmark) can
         time the GPU decode loop only, matching the baseline's decode split.
+
+        When ``collect_meta=True``, additionally returns two per-batch-element
+        lists ``meta_tokens`` and ``meta_frames``: for each emitted token (in
+        emission order, including the leading blank start token), the token id
+        and the **cumulative local encoder-frame index** of the decoder pointer
+        *after* emitting that token (i.e. the sum of that token's and all prior
+        tokens' durations). This frame position is what frame-aligned chunk
+        stitching needs (see :mod:`chunking`). The emitted token sequence and
+        ``out_step`` are byte-identical to the ``collect_meta=False`` path -- the
+        only difference is the extra bookkeeping.
         """
         self.pooler.copy_(pooler)
         self.valid_lengths.copy_(valid_lengths)
@@ -272,11 +288,25 @@ class GraphedDecoder:
         self.output.fill_(self.pad_id)
         self.output[:, 0] = self.blank_id
 
+        B = self._B
         tok0 = self._step0_eager()
         self.output[:, 1] = tok0
         self.last_token.copy_(tok0)
         out_step = 2
         finished = (self.frame_idx >= self.valid_lengths)
+
+        # meta bookkeeping: leading blank start token (frame 0) + step-0 token
+        # (frame = decoder pointer after step 0's duration advance).
+        if collect_meta:
+            fi_step0 = self.frame_idx.cpu()                # (B,)
+            tok0_cpu = tok0.cpu()                           # (B,)
+            meta_tokens = [
+                [int(self.blank_id), int(tok0_cpu[b].item())] for b in range(B)
+            ]
+            meta_frames = [
+                [0, int(fi_step0[b].item())] for b in range(B)
+            ]
+            elem_done = [bool(finished[b].item()) for b in range(B)]
 
         if self._captured and not bool(finished.all()):
             valid_lengths_cpu = self.valid_lengths.cpu()
@@ -296,9 +326,18 @@ class GraphedDecoder:
                         self.static_token,
                     )
                 )
+                if collect_meta:
+                    for b in range(B):
+                        if not elem_done[b]:
+                            meta_tokens[b].append(int(tok_cpu[b].item()))
+                            meta_frames[b].append(int(fi_cpu[b].item()))
+                            if bool(fin[b].item()):
+                                elem_done[b] = True
                 out_step = step + 1
                 if bool(fin.all()):
                     break
+        if collect_meta:
+            return out_step, meta_tokens, meta_frames
         return out_step
 
     @torch.inference_mode()
@@ -314,6 +353,54 @@ class GraphedDecoder:
         out_step = self._run_loop(pooler, valid_lengths)
         out_lists = [self.output[b, :out_step].tolist() for b in range(B)]
         return processor.batch_decode(out_lists, skip_special_tokens=True)
+
+    @torch.inference_mode()
+    def decode_with_durations(
+        self,
+        pooler: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        processor,
+    ) -> tuple[list[str], list[list[int]], list[list[int]]]:
+        """Decode one batch AND return per-token cumulative encoder-frame positions.
+
+        Identical to :meth:`decode` (same emitted token ids, same ``out_step``,
+        byte-identical text via ``processor.batch_decode``), but additionally
+        returns the raw per-step metadata needed for frame-aligned chunk
+        stitching (see :mod:`chunking`):
+
+        Returns ``(texts, meta_tokens, meta_frames)`` where for each batch
+        element ``b``:
+
+        * ``meta_tokens[b]`` -- the emitted token ids **in emission order**,
+          including the leading blank start token and any mid-sequence blanks.
+          (Pad padding and trailing special tokens are NOT included; they are
+          irrelevant for stitching. ``processor.batch_decode`` with
+          ``skip_special_tokens=True`` strips blanks, so the decoded ``text`` is
+          unaffected by their presence.)
+        * ``meta_frames[b]`` -- the matching **cumulative local encoder-frame
+          index** of the decoder pointer *after* emitting each token (i.e. the
+          running sum of that token's and all prior tokens' TDT durations). The
+          first entry (leading blank) is ``0``; subsequent entries are
+          non-decreasing (TDT durations are in ``[0, 1, 2, 3, 4]`` with a forced
+          ``>=1`` advance on blank-with-duration-0).
+
+        Because the encoder-frame index is the absolute position of each token
+        *within the chunk*, a caller that knows the chunk's audio start sample
+        can convert these to global positions and dedup overlap regions between
+        adjacent chunks. ``texts`` is byte-identical to :meth:`decode`.
+        """
+        B = self._B
+        T_enc = self._T_enc
+        assert pooler.shape == (B, T_enc, self.hid), (
+            f"pooler {tuple(pooler.shape)} != captured {(B, T_enc, self.hid)}; "
+            "re-capture for this shape"
+        )
+        out_step, meta_tokens, meta_frames = self._run_loop(
+            pooler, valid_lengths, collect_meta=True
+        )
+        out_lists = [self.output[b, :out_step].tolist() for b in range(B)]
+        texts = processor.batch_decode(out_lists, skip_special_tokens=True)
+        return texts, meta_tokens, meta_frames
 
 
 def greedy_decode_graphed(
