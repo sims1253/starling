@@ -81,11 +81,16 @@ def acquire_gpu_lock(
                 )
             time.sleep(poll_sec)
             continue
-        # try to create atomically
+        # try to create atomically; if a stale lock file is on disk, remove it first
+        if existing is not None and _is_stale(existing, now):
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
         try:
             fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            # someone created it between our read and create; loop and re-check
+            # someone created it between our unlink and create; loop and re-check
             continue
         payload = {
             "session": session,
