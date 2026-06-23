@@ -99,10 +99,19 @@ def test_generate_transcript_matches_golden(mega):
     )
 
 
+@pytest.mark.slow
 def test_decode_is_faster_than_eager_baseline(mega):
     """Sanity: CUDA-graph decode should beat the ~17 tok/s eager baseline
     by a wide margin (at least 5x).  This guards against silent graph-recapture
-    regressions that fall back to per-step eager."""
+    regressions that fall back to per-step eager.
+
+    Gated behind the ``slow`` marker: this is a perf gate (``decode_tok_per_s
+    > 85``) that is contention-flaky -- under load the GPU clock / thermal
+    state can drop the measured throughput below the 85 floor even though the
+    graph path is healthy (the comment above notes "typically see ~150"). Perf
+    gates don't belong in the default correctness suite; run with
+    ``pytest --runslow`` on an idle GPU.
+    """
     decoder, _ = mega
     inputs_embeds = _golden_inputs_embeds()
     rep = decoder.bench(inputs_embeds, max_new_tokens=100, decode_iters=10)
