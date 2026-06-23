@@ -25,16 +25,33 @@ keeps referencing them across replays:
 * ``pooler`` (B, T_enc, 640)         -- encoder output, read by gather each step
 * ``frame_idx`` (B,)                 -- per-element encoder frame pointer (advances in place)
 * ``last_token`` (B,)                -- decoder input token for this step
-* ``static_token`` (B,)              -- graph writes the chosen token here
 * ``h_buf`` / ``c_buf`` (2,B,640)    -- LSTM hidden / cell state (advanced in place)
 * ``cc_buf`` (B,1,640)               -- frozen decoder-output cache (blank-skip)
-* ``arange_B``, ``dur_table``, ``ones_b``, ``valid_lengths``, ``output`` -- constants / sink
+* ``output_ring`` / ``frame_ring`` (B,K) -- the K-step graph writes step ``j``'s
+  emitted token and post-step cumulative frame_idx into column ``j``
+* ``arange_B``, ``dur_table``, ``ones_b``, ``blank_const``, ``valid_lengths``,
+  ``output`` -- constants / sink
 
-The host loop replays the graph, then does ONE device->host sync per step of a
-small ``(2, B)`` stack ``[static_token, frame_idx]``: the host reads the emitted
-tokens, writes them into ``output`` (padding finished elements with ``pad_id``),
-updates ``last_token`` (``finished -> blank`` so a finished element's decoder
-state freezes), and stops when ``all(frame_idx >= valid_lengths)``.
+Multi-step capture (K steps per replay)
+---------------------------------------
+Instead of capturing ONE decode step and replaying it N times (N host syncs), the
+graph captures ``K = steps_per_replay`` consecutive decode steps into a single
+``torch.cuda.CUDAGraph``. This is sound because every step's state
+(``last_token`` / ``frame_idx`` / ``h_buf`` / ``c_buf`` / ``cc_buf``) lives in
+static buffers mutated IN PLACE, so step ``j+1`` of one replay reads step ``j``'s
+in-place mutations from the same fixed addresses. ``last_token`` is chained IN
+GRAPH (``finished -> blank``) so no host sync is needed between captured steps;
+each step writes its token + post-step frame_idx into ``output_ring[:, j]`` /
+``frame_ring[:, j]``.
+
+The host loop replays the K-step graph ``ceil(max_out / K)`` times and does ONE
+device->host sync per replay of the stacked ``(2, B, K)`` ring
+``[output_ring, frame_ring]``: it scatters the K tokens into ``output`` (padding
+finished elements with ``pad_id``), records per-step metadata for the chunking
+path, and stops when ``all(frame_idx >= valid_lengths)``. At B8 medium (147
+steps) K=16 collapses ~147 serial syncs to ~9, cutting the per-replay host-sync
+tax that dominated wall time. ``steps_per_replay=1`` reproduces the original
+one-step-per-replay behaviour with byte-identical output.
 
 Why the decoder is replicated manually (the blank-skip + graph interaction)
 -------------------------------------------------------------------------
@@ -93,9 +110,15 @@ class GraphedDecoder:
     Args:
         model: a loaded ``ParakeetForTDT`` on cuda (eval mode, bf16).
         warmup_iters: side-stream warmup iterations before graph capture.
+        steps_per_replay: number of consecutive decode steps captured into ONE
+            graph replay (default ``16``). The host then syncs once per K steps
+            instead of once per step, removing the per-step host-sync overhead
+            that dominates the launch-bound decode loop. ``1`` reproduces the
+            original one-step-per-replay behaviour exactly (byte-identical).
     """
 
-    def __init__(self, model, *, warmup_iters: int = 4) -> None:
+    def __init__(self, model, *, warmup_iters: int = 4,
+                 steps_per_replay: int = 16) -> None:
         cfg = model.config
         self.model = model
         self.dec = model.decoder
@@ -107,6 +130,7 @@ class GraphedDecoder:
         self.nl = int(cfg.num_decoder_layers)     # 2
         self.durations = list(cfg.durations)
         self.warmup_iters = int(warmup_iters)
+        self.steps_per_replay = max(1, int(steps_per_replay))
 
         self._captured = False
         self._B: int | None = None
@@ -116,8 +140,10 @@ class GraphedDecoder:
     # buffer allocation + the captured step
     # ------------------------------------------------------------------ #
     def _alloc(self, B: int, T_enc: int, device) -> None:
+        K = self.steps_per_replay
         self._B = B
         self._T_enc = T_enc
+        self.K = K
         self.device = device
         max_out = self.max_symbols * T_enc + 16
         self.max_out = max_out
@@ -125,7 +151,6 @@ class GraphedDecoder:
         self.valid_lengths = torch.zeros((B,), dtype=torch.long, device=device)
         self.frame_idx = torch.zeros((B,), dtype=torch.long, device=device)
         self.last_token = torch.full((B,), self.blank_id, dtype=torch.long, device=device)
-        self.static_token = torch.zeros((B,), dtype=torch.long, device=device)
         self.arange_B = torch.arange(B, device=device)
         self.h_buf = torch.zeros((self.nl, B, self.hid), dtype=torch.bfloat16, device=device)
         self.c_buf = torch.zeros((self.nl, B, self.hid), dtype=torch.bfloat16, device=device)
@@ -133,14 +158,39 @@ class GraphedDecoder:
         self.ones_b = torch.ones((B,), dtype=torch.long, device=device)
         self.dur_table = torch.tensor(self.durations, device=device, dtype=torch.long)
         self.output = torch.full((B, max_out), self.pad_id, dtype=torch.long, device=device)
+        # K-step ring buffers: the captured graph writes one (token, post-step
+        # cumulative frame_idx) pair per captured step into columns 0..K-1.
+        # After each K-step replay the host does a SINGLE device->host sync of
+        # both rings (stacked) and scatters the K tokens into self.output,
+        # instead of syncing once per step.
+        self.output_ring = torch.zeros((B, K), dtype=torch.long, device=device)
+        self.frame_ring = torch.zeros((B, K), dtype=torch.long, device=device)
+        # in-graph last_token chaining needs a device-side blank constant
+        # (finished elements freeze: last_token <- blank). Pre-allocated + static
+        # so the captured graph references a fixed address.
+        self.blank_const = torch.full(
+            (B,), self.blank_id, dtype=torch.long, device=device
+        )
         _mark_many([
             self.pooler, self.valid_lengths, self.frame_idx, self.last_token,
-            self.static_token, self.arange_B, self.h_buf, self.c_buf, self.cc_buf,
+            self.arange_B, self.h_buf, self.c_buf, self.cc_buf,
             self.ones_b, self.dur_table, self.output,
+            self.output_ring, self.frame_ring, self.blank_const,
         ])
 
-    def _step_fn(self) -> None:
-        """The captured per-step compute (manual decoder; no host branch)."""
+    def _step_fn(self, ring_col: int = 0) -> None:
+        """The captured per-step compute; writes its outputs to ring column ``ring_col``.
+
+        The K-step graph calls this K times with ``ring_col`` in ``0..K-1``; each
+        call reads the in-place-mutated static buffers (``last_token`` /
+        ``frame_idx`` / ``h_buf`` / ``c_buf`` / ``cc_buf``) left by the previous
+        call, computes one TDT decode step, and writes the emitted token + the
+        post-step cumulative frame_idx into ``output_ring[:, ring_col]`` /
+        ``frame_ring[:, ring_col]``. ``last_token`` is chained IN GRAPH
+        (``finished -> blank``) so the next in-graph step reads the correct input
+        token without a host sync -- for ``K=1`` this is equivalent to the prior
+        host-side ``last_token`` update (same value, byte-identical output).
+        """
         B = self._B
         T_enc = self._T_enc
         # decoder: embedding -> lstm -> projector + device-side blank-skip freeze
@@ -171,7 +221,15 @@ class GraphedDecoder:
         self.h_buf.copy_(h_new)
         self.c_buf.copy_(c_new)
         self.cc_buf.copy_(decoder_out)
-        self.static_token.copy_(tok)
+        # write this step's (token, post-step cumulative frame_idx) into the
+        # K-step ring buffers so the host can read all K at once after a replay.
+        self.output_ring[:, ring_col].copy_(tok)
+        self.frame_ring[:, ring_col].copy_(self.frame_idx)
+        # chain last_token IN GRAPH for the next captured step (device-side
+        # finished freeze: a finished element feeds blank -> blank-skip ->
+        # frozen state -> emits blank, masked to pad_id on the host side).
+        finished_now = self.frame_idx >= self.valid_lengths
+        self.last_token.copy_(torch.where(finished_now, self.blank_const, tok))
 
     def _step0_eager(self) -> torch.Tensor:
         """Eager step 0 (init path: zero cache, NO blank-skip freeze).
@@ -199,7 +257,6 @@ class GraphedDecoder:
         self.h_buf.copy_(hn)
         self.c_buf.copy_(cn)
         self.cc_buf.copy_(decoder_out)
-        self.static_token.copy_(tok)
         return tok
 
     # ------------------------------------------------------------------ #
@@ -207,13 +264,21 @@ class GraphedDecoder:
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
     def capture(self, pooler: torch.Tensor, valid_lengths: torch.Tensor,
-                pad_id: int) -> "GraphedDecoder":
+                pad_id: int, *, steps_per_replay: int | None = None) -> "GraphedDecoder":
         """Allocate buffers for this ``(B, T_enc)`` shape and capture the graph.
 
         ``pooler`` / ``valid_lengths`` are a representative encoder output of the
         target shape (used to drive warmup + capture); the graph itself is
         shape-only and is reused by :meth:`decode` for any same-shape input.
+
+        Args:
+            steps_per_replay: if given, override the ``steps_per_replay`` set at
+                construction (number of decode steps captured into one graph
+                replay). When ``None`` (default) the constructor value is used.
         """
+        if steps_per_replay is not None:
+            self.steps_per_replay = max(1, int(steps_per_replay))
+        K = self.steps_per_replay
         B, T_enc, _ = pooler.shape
         self.pad_id = pad_id
         device = pooler.device
@@ -237,20 +302,26 @@ class GraphedDecoder:
             self.h_buf.copy_(h_s); self.c_buf.copy_(c_s); self.cc_buf.copy_(cc_s)
             self.frame_idx.copy_(fi_s); self.last_token.copy_(lt_s)
 
-        # warmup on a side stream (stabilises cudnn/cublas autotune)
+        # warmup on a side stream (stabilises cudnn/cublas autotune). Run the
+        # full K-step block each warmup iter so the side stream exercises the
+        # exact in-graph chained sequence that capture will record.
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(self.warmup_iters):
-                self._step_fn()
+                for j in range(K):
+                    self._step_fn(j)
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         _reset()
 
-        # capture the per-step graph
+        # capture K consecutive decode steps into one graph. Each step reads the
+        # in-place-mutated static buffers left by the previous step (the ring
+        # columns and last_token chain are what make one replay == K steps).
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self._step_fn()
+            for j in range(K):
+                self._step_fn(j)
         _reset()  # capture mutated the buffers; restore for real decodes
         self._captured = True
         return self
@@ -268,6 +339,12 @@ class GraphedDecoder:
         Excludes ``processor.batch_decode`` so callers (and the benchmark) can
         time the GPU decode loop only, matching the baseline's decode split.
 
+        The captured graph encodes ``K = steps_per_replay`` consecutive steps;
+        each replay fills the ``(B, K)`` ring buffers and the host syncs ONCE per
+        replay (not once per step), then scatters the K tokens into ``output``.
+        With ``K=1`` this degenerates to the original one-step-per-replay loop
+        with byte-identical output / ``out_step``.
+
         When ``collect_meta=True``, additionally returns two per-batch-element
         lists ``meta_tokens`` and ``meta_frames``: for each emitted token (in
         emission order, including the leading blank start token), the token id
@@ -278,6 +355,7 @@ class GraphedDecoder:
         ``out_step`` are byte-identical to the ``collect_meta=False`` path -- the
         only difference is the extra bookkeeping.
         """
+        K = self.K
         self.pooler.copy_(pooler)
         self.valid_lengths.copy_(valid_lengths)
         self.frame_idx.zero_()
@@ -310,32 +388,43 @@ class GraphedDecoder:
 
         if self._captured and not bool(finished.all()):
             valid_lengths_cpu = self.valid_lengths.cpu()
-            for step in range(out_step, self.max_out):
+            pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)
+            step = out_step
+            stopped = False
+            while step < self.max_out:
+                # one K-step replay: output_ring / frame_ring are filled, and
+                # last_token is chained in-graph for the next replay.
                 self.graph.replay()
-                info = torch.stack([self.static_token, self.frame_idx], dim=0).cpu()
-                tok_cpu = info[0]
-                fi_cpu = info[1]
-                fin = fi_cpu >= valid_lengths_cpu
-                self.output[:, step] = torch.where(
-                    fin, torch.full_like(tok_cpu, self.pad_id), tok_cpu
-                )
-                self.last_token.copy_(
-                    torch.where(
-                        self.frame_idx >= self.valid_lengths,
-                        torch.full_like(self.static_token, self.blank_id),
-                        self.static_token,
-                    )
-                )
-                if collect_meta:
-                    for b in range(B):
-                        if not elem_done[b]:
-                            meta_tokens[b].append(int(tok_cpu[b].item()))
-                            meta_frames[b].append(int(fi_cpu[b].item()))
-                            if bool(fin[b].item()):
-                                elem_done[b] = True
-                out_step = step + 1
-                if bool(fin.all()):
+                # ONE device->host sync for the whole K-step batch (the (2,B,K)
+                # stack of [tokens, post-step cumulative frame_idx]).
+                info = torch.stack(
+                    [self.output_ring, self.frame_ring], dim=0
+                ).cpu()                                      # (2, B, K)
+                ring_cpu = info[0]                           # (B, K) tokens
+                fring_cpu = info[1]                          # (B, K) frame_idx
+                for j in range(K):
+                    pos = step + j
+                    if pos >= self.max_out:
+                        stopped = True
+                        break
+                    tok_j = ring_cpu[:, j]
+                    fi_j = fring_cpu[:, j]
+                    fin = fi_j >= valid_lengths_cpu
+                    self.output[:, pos] = torch.where(fin, pad_cpu, tok_j)
+                    if collect_meta:
+                        for b in range(B):
+                            if not elem_done[b]:
+                                meta_tokens[b].append(int(tok_j[b].item()))
+                                meta_frames[b].append(int(fi_j[b].item()))
+                                if bool(fin[b].item()):
+                                    elem_done[b] = True
+                    out_step = pos + 1
+                    if bool(fin.all()):
+                        stopped = True
+                        break
+                if stopped:
                     break
+                step += K
         if collect_meta:
             return out_step, meta_tokens, meta_frames
         return out_step
@@ -410,6 +499,7 @@ def greedy_decode_graphed(
     processor,
     *,
     warmup_iters: int = 4,
+    steps_per_replay: int = 16,
 ) -> list[str]:
     """CUDA-graph-captured greedy TDT decode (byte-exact with eager / stock).
 
@@ -423,6 +513,8 @@ def greedy_decode_graphed(
         attention_mask: ``(B, T_mel)`` feature attention mask on cuda.
         processor: the matching ``AutoProcessor`` (for ``batch_decode``).
         warmup_iters: side-stream warmup iterations before graph capture.
+        steps_per_replay: number of decode steps captured into one graph replay
+            (default ``16``); ``1`` reproduces the original behaviour.
 
     Returns:
         list of ``B`` decoded text strings (``skip_special_tokens=True``).
@@ -434,6 +526,7 @@ def greedy_decode_graphed(
         )
         pooler = enc.pooler_output.contiguous()
         valid_lengths = enc.attention_mask.to(torch.long).sum(-1).contiguous()
-    gd = GraphedDecoder(model, warmup_iters=warmup_iters)
+    gd = GraphedDecoder(model, warmup_iters=warmup_iters,
+                        steps_per_replay=steps_per_replay)
     gd.capture(pooler, valid_lengths, pad_id)
     return gd.decode(pooler, valid_lengths, processor)
