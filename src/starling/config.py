@@ -1,4 +1,4 @@
-"""Module-level constants for the megapar foundation layer.
+"""Module-level constants for the starling foundation layer.
 
 Everything later phases (Triton kernels, fused pipelines) need to size tiles,
 check shapes, or compare against reference outputs lives here so there is a

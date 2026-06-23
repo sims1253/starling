@@ -1,7 +1,7 @@
 [project]
-name = "megapar"
+name = "starling"
 version = "0.1.0"
-description = "High-performance inference megakernel for nvidia/parakeet-tdt-0.6b-v3 on RTX 5090 (Blackwell, sm_120, CUDA 13.0)"
+description = "Hand-tuned Triton megakernels for fast on-device ASR (granite-speech-4.1-2b + parakeet-tdt-0.6b-v3) on modern NVIDIA GPUs"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.11",
@@ -28,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/megapar"]
+packages = ["src/starling"]
 
 # ---- uv configuration ----
 [tool.uv]

@@ -10,11 +10,11 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.golden import load_golden, load_golden_text  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.pipeline import MegaPipeline  # noqa: E402
-from megapar.speculative import CTCBPEDraft, SpeculativeDecoder, load_out_llm  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.golden import load_golden, load_golden_text  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.pipeline import MegaPipeline  # noqa: E402
+from starling.speculative import CTCBPEDraft, SpeculativeDecoder, load_out_llm  # noqa: E402
 
 
 def main() -> int:

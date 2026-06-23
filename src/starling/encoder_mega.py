@@ -27,7 +27,7 @@ as a tight, fusion-friendly Python fast path that reuses the stock weights
 The output is numerically faithful to the eager golden reference
 (``golden/encoder_last_hidden.pt``). The ``eager`` and ``cudagraph`` modes are
 byte-exact (0.0 diff); ``compile``/``triton`` stay within
-:data:`megapar.config.ENCODER_ATOL`.
+:data:`starling.config.ENCODER_ATOL`.
 
 Public API
 ----------

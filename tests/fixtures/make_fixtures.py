@@ -1,4 +1,4 @@
-"""Deterministic fixture generator for the megapar baseline harness.
+"""Deterministic fixture generator for the starling baseline harness.
 
 The correctness oracle and the RTF benchmark must be reproducible across runs and
 machines, so this module builds the test utterances from a SINGLE downloaded sample

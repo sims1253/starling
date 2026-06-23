@@ -19,10 +19,10 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.config import LLM_EOS_TOKEN_ID, LLM_VOCAB_SIZE  # noqa: E402
-from megapar.golden import load_golden, load_golden_text  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.llm_mega import FusedLLMMega, LLMMega  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID, LLM_VOCAB_SIZE  # noqa: E402
+from starling.golden import load_golden, load_golden_text  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.llm_mega import FusedLLMMega, LLMMega  # noqa: E402
 
 # Loading the speech model is expensive (~5s); cache across tests.
 _MODEL = None
@@ -135,7 +135,7 @@ def test_fused_decode_exact_token_match():
 
 def test_fused_kernels_match_reference():
     """Each fused Triton kernel must be bit-exact with the PyTorch reference."""
-    from megapar import llm_kernels as K
+    from starling import llm_kernels as K
 
     model, _ = _get_model_and_processor()
     comps = get_components(model)

@@ -25,11 +25,11 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.config import ENCODER_ATOL  # noqa: E402
-from megapar.encoder_mega import FusedEncoder  # noqa: E402
-from megapar.golden import load_golden  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import ENCODER_ATOL  # noqa: E402
+from starling.encoder_mega import FusedEncoder  # noqa: E402
+from starling.golden import load_golden  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
 
 _MEAN_TOL = 5e-3
 _COMPILE_RELAXED_ATOL = 5.0  # compile changes attention precision; report, don't fail

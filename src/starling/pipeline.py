@@ -64,7 +64,7 @@ class MegaPipeline:
         Ignored when ``flags.multistep_graph`` is True (the K-step decoder is
         always fused).
     flags : OptFlags or dict or None
-        Runtime feature flags (see :mod:`megapar.flags`).  ``None`` uses the
+        Runtime feature flags (see :mod:`starling.flags`).  ``None`` uses the
         process-global default.  ``multistep_graph=True`` (default) selects
         :class:`MultiStepLLMMega` for lower per-token sync overhead.
     """
@@ -103,7 +103,7 @@ class MegaPipeline:
         #     CUDA-graph decoder for lower per-token sync overhead; otherwise
         #     fall back to the single-step fused/model-forward decoder.
         #     ``quantized_weights`` (tolerance mode only) selects the weight-only
-        #     INT8 decoder (:class:`megapar.quant.QuantLLMMega`).
+        #     INT8 decoder (:class:`starling.quant.QuantLLMMega`).
         if flags.quantized_weights:
             from .quant import QuantLLMMega
 

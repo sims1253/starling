@@ -3,9 +3,9 @@
 The golden artefacts under ``golden/`` (gitignored) are produced by the
 **eager** stock transformers pipeline on the sample audio. Later Triton-based
 phases compare their outputs against these references with the tolerances
-declared in :mod:`megapar.config`.
+declared in :mod:`starling.config`.
 
-Run ``python -m megapar.golden`` to (re)capture.
+Run ``python -m starling.golden`` to (re)capture.
 """
 
 from __future__ import annotations

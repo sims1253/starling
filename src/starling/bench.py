@@ -10,7 +10,7 @@ This module provides:
   stage on (a) the eager GOLDEN model and (b) the "stock-optimized" model
   where the LLM uses SDPA. Prints a comparison table.
 
-Run: ``python -m megapar.bench``.
+Run: ``python -m starling.bench``.
 """
 
 from __future__ import annotations
@@ -276,7 +276,7 @@ def main() -> int:
     # Persist results.
     TRACES_DIR.mkdir(parents=True, exist_ok=True)
     bench.save(TRACES_DIR / "bench_results.json")
-    bench.print(title="megapar stage benchmarks (median ms)")
+    bench.print(title="starling stage benchmarks (median ms)")
     return 0
 
 

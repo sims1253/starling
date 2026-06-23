@@ -1,4 +1,4 @@
-"""Correctness tests for the GPU mel extractor (``megapar.parakeet.mel_gpu``).
+"""Correctness tests for the GPU mel extractor (``starling.parakeet.mel_gpu``).
 
 Two layers of checks:
 
@@ -51,7 +51,7 @@ def _get_model_and_processor():
         _STATE["model"] = model
         _STATE["processor"] = processor
         # build the GPU extractor once and cache it too
-        from megapar.parakeet.mel_gpu import GpuMelExtractor  # noqa: WPS433
+        from starling.parakeet.mel_gpu import GpuMelExtractor  # noqa: WPS433
         _STATE["extractor"] = GpuMelExtractor(processor, device="cuda")
     return _STATE["model"], _STATE["processor"], _STATE["extractor"]
 
@@ -174,7 +174,7 @@ def test_extractor_extract_from_tensor():
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_full_pipeline_oracle_transcript(name):
     """GPU mel -> encoder -> graphed TDT decode must match the oracle text."""
-    from megapar.parakeet.decode_mega import greedy_decode_graphed  # noqa: WPS433
+    from starling.parakeet.decode_mega import greedy_decode_graphed  # noqa: WPS433
 
     oracle = _oracle()
     model, processor, extractor = _get_model_and_processor()

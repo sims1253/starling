@@ -1,4 +1,4 @@
-"""Environment verification for the megapar bootstrap.
+"""Environment verification for the starling bootstrap.
 
 Checks: python version, torch + cuda + arch + device, FP8 capabilities, and that
 transformers (from git source) can load the nvidia/parakeet-tdt-0.6b-v3 config

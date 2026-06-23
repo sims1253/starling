@@ -20,7 +20,7 @@ Flags
   enable with ``tolerance_mode=True``.
 * ``quantized_weights`` (default **False**) -- enable weight-only INT8
   quantisation of the Granite LLM decoder weights (per-output-row channelwise
-  scales) with a fused Triton dequant-GEMM, via :class:`megapar.quant.QuantLLMMega`
+  scales) with a fused Triton dequant-GEMM, via :class:`starling.quant.QuantLLMMega`
   / :class:`BatchedQuantLLMMega`.  **Breaks byte-exactness** (INT8 weight
   rounding).  Empirically this is currently **slower** than the bf16 cuBLAS path
   on the RTX 5090 (the dequant overhead + Triton's lower per-shape bandwidth
@@ -35,7 +35,7 @@ Usage
 -----
 ::
 
-    from megapar.flags import OptFlags, flags, get_default_flags
+    from starling.flags import OptFlags, flags, get_default_flags
 
     # Use the process default (multistep on, byte-exact).
     pipe = MegaPipeline(model, proc)
@@ -74,7 +74,7 @@ class OptFlags:
 
     quantized_weights: bool = False
     """Enable weight-only INT8 quantisation of the LLM decoder weights
-    (:mod:`megapar.quant`).  **Breaks byte-exactness** (INT8 weight rounding).
+    (:mod:`starling.quant`).  **Breaks byte-exactness** (INT8 weight rounding).
     Currently slower than bf16 on the RTX 5090 -- shipped for completeness.
     Requires ``tolerance_mode=True``."""
 

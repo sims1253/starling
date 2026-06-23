@@ -42,11 +42,11 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import make_fixtures as mkfx  # noqa: E402
-from megapar.parakeet.encoder_graph import (  # noqa: E402
+from starling.parakeet.encoder_graph import (  # noqa: E402
     CompiledEncoder,
     GraphedEncoder,
 )
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 SAMPLE_RATE = 16000
@@ -205,7 +205,7 @@ def main() -> int:
                 # run the compiled encoder -> graphed decode for a text check.
                 # (encoder is the only thing that differs; the decode graph is
                 # shape-cached and reuses the existing GraphedDecoder.)
-                from megapar.parakeet.decode_mega import GraphedDecoder
+                from starling.parakeet.decode_mega import GraphedDecoder
 
                 valid_lengths = comp_out.attention_mask.to(torch.long).sum(-1).contiguous()
                 dec = GraphedDecoder(model).capture(

@@ -35,9 +35,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
-from megapar.parakeet.chunking import ChunkedTranscriber  # noqa: E402
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: E402
+from starling.parakeet.chunking import ChunkedTranscriber  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.parakeet.pipeline import MegaParakeetPipeline  # noqa: E402
 import make_fixtures as mkfx  # noqa: E402
 
 OUT_DIR = _REPO_ROOT / "outputs" / "parakeet"

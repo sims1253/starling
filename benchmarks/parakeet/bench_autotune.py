@@ -11,9 +11,9 @@ For each ``K in {1, 4, 8, 16, 32, 64}`` it captures a fresh
 :class:`GraphedDecoder(K=K)` on a representative B=8 medium batch (22.3 s each),
 warms up, and times the full K-step decode loop (``_run_loop``) via cuda events
 (median of 10). It then picks the best K with the noise-robust
-:func:`megapar.parakeet.autotune.pick_best_k` (prefer the GPU-tier default within
+:func:`starling.parakeet.autotune.pick_best_k` (prefer the GPU-tier default within
 10% of the fastest), computes ``chunk_batch_size`` from live free VRAM, and
-writes the result to ``~/.cache/megapar/autotune_<gpu>.json``.
+writes the result to ``~/.cache/starling/autotune_<gpu>.json``.
 
 GPU-contention guard: samples GPU util before/inside the lock; defers if util >
 30% (comms.md §P1).
@@ -41,8 +41,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.parakeet import autotune as at  # noqa: E402
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.parakeet import autotune as at  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 SAMPLE_RATE = 16000
@@ -174,7 +174,7 @@ def main() -> int:
     )
 
     # ---- pipeline picks up the cached config ----
-    from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
+    from starling.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
 
     print("[bench_autotune] constructing MegaParakeetPipeline(autotune=True) "
           "to confirm it loads the cache ...")

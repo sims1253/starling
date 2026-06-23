@@ -2,7 +2,7 @@
 
 Measures the headline single-stream decode throughput and the batched
 throughput for the weight-only INT8 quantised decoder
-(:class:`megapar.quant.QuantLLMMega` / :class:`BatchedQuantLLMMega`) against the
+(:class:`starling.quant.QuantLLMMega` / :class:`BatchedQuantLLMMega`) against the
 bf16 baseline (:class:`MultiStepLLMMega` / :class:`BatchedFusedLLMMega`), plus
 the transcript-quality cost (token match %, WER) of each.
 
@@ -31,15 +31,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from megapar.audio import build_inputs, load_sample_audio
-from megapar.batched import BatchedPipeline
-from megapar.flags import OptFlags
-from megapar.golden import load_golden, load_golden_text
-from megapar.loader import get_components, load_model_and_processor
-from megapar.llm_mega import FusedLLMMega
-from megapar.multistep import MultiStepLLMMega
-from megapar.parakeet.gpu_lock import with_gpu_lock
-from megapar.quant import QuantLLMMega, quantize_linear, w8_linear
+from starling.audio import build_inputs, load_sample_audio
+from starling.batched import BatchedPipeline
+from starling.flags import OptFlags
+from starling.golden import load_golden, load_golden_text
+from starling.loader import get_components, load_model_and_processor
+from starling.llm_mega import FusedLLMMega
+from starling.multistep import MultiStepLLMMega
+from starling.parakeet.gpu_lock import with_gpu_lock
+from starling.quant import QuantLLMMega, quantize_linear, w8_linear
 
 MAX_NEW_TOKENS = 100
 ITERS = 8
@@ -270,7 +270,7 @@ def bench_gemv_diagnosis():
 # =========================================================================== #
 def main() -> int:
     global __eos__
-    from megapar.config import LLM_EOS_TOKEN_ID
+    from starling.config import LLM_EOS_TOKEN_ID
     __eos__ = LLM_EOS_TOKEN_ID
 
     with with_gpu_lock(

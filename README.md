@@ -63,7 +63,7 @@ Kept here because they are the more interesting findings:
 ## Layout
 
 ```
-src/megapar/            granite-speech megakernel
+src/starling/            granite-speech megakernel
   encoder_mega.py       fused (cudagraph) conformer encoder
   llm_mega.py           graphed greedy decode over a static KV cache
   pipeline.py           encoder + projector + LLM wiring
@@ -80,5 +80,5 @@ tests/                  correctness checks vs. golden references
 
 ## Note on the name
 
-This repository is being renamed from `megapar` to `starling`. The Python
-package is still imported as `megapar`; the source-tree rename is pending.
+This repository is being renamed from `starling` to `starling`. The Python
+package is still imported as `starling`; the source-tree rename is pending.

@@ -28,7 +28,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import make_fixtures as mkfx  # noqa: E402
-from megapar.baseline import (  # noqa: E402
+from starling.baseline import (  # noqa: E402
     ARCH_DIMS,
     MODEL_ID,
     SAMPLE_RATE,
@@ -271,7 +271,7 @@ def write_analysis(profile: dict, headline: dict) -> str:
 def main() -> int:
     _suppress_noisy_warnings()
     print("=" * 72)
-    print("megapar baseline: oracle + RTF bench + profiler")
+    print("starling baseline: oracle + RTF bench + profiler")
     print("=" * 72)
 
     fixtures = mkfx.load_fixtures()

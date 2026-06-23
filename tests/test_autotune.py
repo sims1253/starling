@@ -1,4 +1,4 @@
-"""Tests for the runtime autotuner (:mod:`megapar.parakeet.autotune`).
+"""Tests for the runtime autotuner (:mod:`starling.parakeet.autotune`).
 
 Covers:
   1. pure GPU-tier classification (no GPU needed) -- every documented tier.
@@ -29,8 +29,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.parakeet import autotune as at  # noqa: E402
-from megapar.parakeet.autotune import (  # noqa: E402
+from starling.parakeet import autotune as at  # noqa: E402
+from starling.parakeet.autotune import (  # noqa: E402
     KernelConfig,
     chunk_batch_size_from_vram,
     detect_gpu,
@@ -230,7 +230,7 @@ _PIPES: dict[str, "object"] = {}
 def _get_pipe(mode: str):
     """mode in {"fallback", "custom"} -> a cached MegaParakeetPipeline."""
     if mode not in _PIPES:
-        from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
+        from starling.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
 
         if mode == "fallback":
             _PIPES[mode] = MegaParakeetPipeline(autotune=False, encoder_mode="graphed")

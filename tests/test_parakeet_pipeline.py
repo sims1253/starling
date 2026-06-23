@@ -9,7 +9,7 @@ cache reuses one captured decoder for the (8, 279) shape).
 NOTE on filename: this file is deliberately ``test_parakeet_pipeline.py`` rather
 than ``tests/test_pipeline.py`` because the latter is **granite-owned** per
 comms.md §P2 and already contains the granite-speech correctness gate
-(``megapar.pipeline.MegaPipeline``). Overwriting it would corrupt the shared
+(``starling.pipeline.MegaPipeline``). Overwriting it would corrupt the shared
 repo. The parent task asked for ``tests/test_pipeline.py``; the filename
 collision is reported back to the orchestrator.
 
@@ -57,7 +57,7 @@ def _get_pipeline(use_graphed_encoder: bool):
 def _get_pipeline_mode(encoder_mode: str):
     """Return a cached pipeline for the given ``encoder_mode`` string."""
     if encoder_mode not in _PIPELINES:
-        from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
+        from starling.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
 
         _PIPELINES[encoder_mode] = MegaParakeetPipeline(encoder_mode=encoder_mode)
     return _PIPELINES[encoder_mode]

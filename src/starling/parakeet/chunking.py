@@ -1,6 +1,6 @@
 """Memory-bounded chunked transcription for ``nvidia/parakeet-tdt-0.6b-v3``.
 
-The integrated :class:`~megapar.parakeet.pipeline.MegaParakeetPipeline` encodes
+The integrated :class:`~starling.parakeet.pipeline.MegaParakeetPipeline` encodes
 the *entire* utterance with one full-attention Conformer pass, so VRAM is
 O(N^2) in the number of encoder frames (and the encoder clifs at
 ``max_position_embeddings = 5000`` frames, ~6.5 min). On an RTX 5090 a single

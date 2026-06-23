@@ -44,7 +44,7 @@ _PIPE = None
 def _get_pipe():
     global _PIPE
     if _PIPE is None:
-        from megapar.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
+        from starling.parakeet.pipeline import MegaParakeetPipeline  # noqa: WPS433
 
         _PIPE = MegaParakeetPipeline(use_graphed_encoder=True)
     return _PIPE
@@ -57,7 +57,7 @@ def _get_chunker(chunk_batch_size: int = 1):
     existing correctness/memory tests are byte-for-byte unchanged; the batched
     tests pass ``8`` explicitly. Returns ``(pipe, chunker)``.
     """
-    from megapar.parakeet.chunking import ChunkedTranscriber  # noqa: WPS433
+    from starling.parakeet.chunking import ChunkedTranscriber  # noqa: WPS433
 
     pipe = _get_pipe()
     chunker = ChunkedTranscriber(

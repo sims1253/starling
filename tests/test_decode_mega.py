@@ -72,7 +72,7 @@ K_VALUES = [1, 4, 16, 64]
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_eager_decode_matches_oracle(name):
     """Eager greedy_decode must reproduce the oracle transcript byte-for-byte."""
-    from megapar.parakeet.decode_eager import greedy_decode
+    from starling.parakeet.decode_eager import greedy_decode
 
     oracle = _oracle()
     model, processor = _get_model_and_processor()
@@ -99,7 +99,7 @@ def test_eager_decode_matches_oracle(name):
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_graphed_decode_matches_oracle(name):
     """CUDA-graph-captured greedy_decode_graphed must match the oracle too."""
-    from megapar.parakeet.decode_mega import greedy_decode_graphed
+    from starling.parakeet.decode_mega import greedy_decode_graphed
 
     oracle = _oracle()
     model, processor = _get_model_and_processor()
@@ -143,7 +143,7 @@ def test_graphed_multistep_byte_exact(name, K):
     """
     import torch  # noqa: WPS433
 
-    from megapar.parakeet.decode_mega import GraphedDecoder  # noqa: WPS433
+    from starling.parakeet.decode_mega import GraphedDecoder  # noqa: WPS433
 
     oracle = _oracle()
     model, processor = _get_model_and_processor()

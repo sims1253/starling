@@ -6,7 +6,7 @@ at a time: acquire before a timed region, release after. Stale locks
 (older than ``STALE_SEC``) are considered crashed and may be stolen.
 
 Usage:
-    from megapar.parakeet.gpu_lock import with_gpu_lock
+    from starling.parakeet.gpu_lock import with_gpu_lock
     with with_gpu_lock(session="bench", model="parakeet-tdt-0.6b-v3",
                        eta_min=5, note="decode benchmark"):
         ...  # timed benchmark here

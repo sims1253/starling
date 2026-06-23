@@ -79,7 +79,7 @@ def set_llm_attn_implementation(model: Any, impl: str) -> str:
 
 
 def get_components(model: Any) -> dict[str, Any]:
-    """Return the three megapar-relevant submodules.
+    """Return the three starling-relevant submodules.
 
     The Granite-Speech top-level model is a CausalLM wrapper around an inner
     :class:`GraniteSpeechModel`. The encoder / projector / language_model live

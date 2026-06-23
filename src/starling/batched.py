@@ -1,6 +1,6 @@
 """Batched (B > 1) inference pipeline for Granite-Speech-4.1-2b.
 
-The batch=1 pipeline (:class:`megapar.pipeline.MegaPipeline`) keeps the RTX 5090
+The batch=1 pipeline (:class:`starling.pipeline.MegaPipeline`) keeps the RTX 5090
 ~10% busy during LLM decode: each of the ~280 GEMVs per token is launch-latency
 bound, not bandwidth bound, so the tensor cores sit idle.  Batching ``B``
 independent audio streams turns those tiny GEMVs into real GEMMs that saturate
@@ -103,7 +103,7 @@ class BatchedLLMMega:
 
     Processes ``B = max_batch_size`` independent streams in lock-step.  The
     decode step is the model's own forward (``language_model(...)``) captured
-    into a single CUDA graph, mirroring :class:`megapar.llm_mega.LLMMega` but
+    into a single CUDA graph, mirroring :class:`starling.llm_mega.LLMMega` but
     with a batch dimension.  Output is byte-exact per stream vs the batch=1
     decoder (verified 80/80 tokens on identical inputs).
 
@@ -471,11 +471,11 @@ class BatchedLLMMega:
 class BatchedFusedLLMMega(BatchedLLMMega):
     """Batched decoder that swaps the model's own forward for a manual
     per-layer loop using the fused Triton elementwise kernels
-    (:mod:`megapar.llm_kernels`).
+    (:mod:`starling.llm_kernels`).
 
     Inherits all graph-capture / generate / prefill machinery from
     :class:`BatchedLLMMega` and overrides only :meth:`_decode_step_eager` with a
-    custom forward that mirrors :class:`megapar.llm_mega.FusedLLMMega` but with a
+    custom forward that mirrors :class:`starling.llm_mega.FusedLLMMega` but with a
     batch dimension ``B``.  The fused kernels (RMSNorm, SwiGLU, residual
     scale-add) reshape to ``(M, N)`` where ``M = B`` for single-token decode, so
     they are batch-agnostic; GEMMs (q/k/v/o, gate/up/down, lm_head) stay as
@@ -483,7 +483,7 @@ class BatchedFusedLLMMega(BatchedLLMMega):
 
     Correctness is byte-exact with :class:`BatchedLLMMega` (and therefore with
     batch=1) because the fused kernels match the model's own bf16 arithmetic
-    bit-for-bit (verified 0.0 diff in :mod:`megapar.llm_kernels`).
+    bit-for-bit (verified 0.0 diff in :mod:`starling.llm_kernels`).
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -655,7 +655,7 @@ class BatchedPipeline:
         # for maximum throughput; BatchedLLMMega (model's own forward) is the
         # simpler fallback.  Both are byte-exact per stream vs batch=1.
         # ``quantized_weights`` (tolerance mode) selects the weight-only INT8
-        # decoder (:class:`megapar.quant.BatchedQuantLLMMega`).
+        # decoder (:class:`starling.quant.BatchedQuantLLMMega`).
         if flags.quantized_weights:
             from .quant import BatchedQuantLLMMega
 

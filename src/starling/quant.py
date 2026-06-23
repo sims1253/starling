@@ -237,7 +237,7 @@ def quantize_model(language_model: Any, lm_head: Any) -> dict[str, dict[str, tor
 # Single-stream quantised decoder
 # =========================================================================== #
 # NOTE: :class:`QuantLLMMega` subclasses :class:`FusedLLMMega` (imported above
-# from :mod:`megapar.llm_mega`).  The batched sibling subclassing
+# from :mod:`starling.llm_mega`).  The batched sibling subclassing
 # :class:`BatchedFusedLLMMega` is defined at the bottom of this module to keep
 # the top-level import block free of a circular dependency (``batched`` wires
 # the batched quant decoder via a *local* import, so it must not top-import

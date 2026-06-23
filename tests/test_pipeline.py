@@ -19,10 +19,10 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from megapar.golden import load_golden, load_golden_text  # noqa: E402
-from megapar.pipeline import MegaPipeline  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.golden import load_golden, load_golden_text  # noqa: E402
+from starling.pipeline import MegaPipeline  # noqa: E402
 
 # Loading the speech model is expensive (~5s); cache across tests.
 _MODEL = None
@@ -33,7 +33,7 @@ _INPUTS: dict | None = None
 def _get_model_and_processor():
     global _MODEL, _PROC
     if _MODEL is None:
-        from megapar.loader import load_model_and_processor
+        from starling.loader import load_model_and_processor
 
         _MODEL, _PROC = load_model_and_processor(attn_impl="eager")
     return _MODEL, _PROC

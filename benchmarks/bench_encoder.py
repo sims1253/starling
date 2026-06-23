@@ -25,11 +25,11 @@ warnings.filterwarnings("ignore")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.config import ENCODER_ATOL, TRACES_DIR  # noqa: E402
-from megapar.encoder_mega import FusedEncoder  # noqa: E402
-from megapar.golden import load_golden  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import ENCODER_ATOL, TRACES_DIR  # noqa: E402
+from starling.encoder_mega import FusedEncoder  # noqa: E402
+from starling.golden import load_golden  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
 
 OUTPUTS = _REPO_ROOT / "outputs"
 OUTPUTS.mkdir(exist_ok=True)
@@ -61,7 +61,7 @@ def diff_vs_golden(out: torch.Tensor, golden: torch.Tensor) -> tuple[float, floa
 
 def main() -> int:
     print("=" * 72)
-    print("megapar encoder megakernel benchmark")
+    print("starling encoder megakernel benchmark")
     print("=" * 72)
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(f"tolerance: ENCODER_ATOL={ENCODER_ATOL} (max), 5e-3 (mean)")

@@ -25,11 +25,11 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from megapar.flags import OptFlags  # noqa: E402
-from megapar.golden import load_golden, load_golden_text  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.quant import QuantLLMMega, quantize_linear, w8_linear  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.flags import OptFlags  # noqa: E402
+from starling.golden import load_golden, load_golden_text  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.quant import QuantLLMMega, quantize_linear, w8_linear  # noqa: E402
 
 _MODEL = None
 _PROC = None
@@ -92,7 +92,7 @@ def test_quantized_weights_with_tolerance_ok():
 # --------------------------------------------------------------------------- #
 def test_pipeline_quantized_wiring():
     """quantized_weights=True -> QuantLLMMega (single-stream MegaPipeline)."""
-    from megapar.pipeline import MegaPipeline
+    from starling.pipeline import MegaPipeline
 
     model, proc = _get_model_and_processor()
     pipe = MegaPipeline(
@@ -105,8 +105,8 @@ def test_pipeline_quantized_wiring():
 
 def test_batched_pipeline_quantized_wiring():
     """quantized_weights=True -> BatchedQuantLLMMega (batched pipeline)."""
-    from megapar.batched import BatchedPipeline
-    from megapar.quant import BatchedQuantLLMMega
+    from starling.batched import BatchedPipeline
+    from starling.quant import BatchedQuantLLMMega
 
     model, proc = _get_model_and_processor()
     pipe = BatchedPipeline(
@@ -188,7 +188,7 @@ def test_quant_decode_lm_head_logit_diff_small():
         # Compare the SCALED logits (post /LLM_LOGITS_SCALING) -- those are what
         # the greedy argmax actually sees.  INT8 lm_head rounding is a few
         # percent of the logit magnitude; argmax is robust (100% token match).
-        from megapar.config import LLM_LOGITS_SCALING
+        from starling.config import LLM_LOGITS_SCALING
         lg_bf = lm_head(hidden) / LLM_LOGITS_SCALING
         lg_q = w8_linear(hidden, qdec._lm_head_int8, qdec._lm_head_scales) / LLM_LOGITS_SCALING
         diff = (lg_q.float() - lg_bf.float()).abs()

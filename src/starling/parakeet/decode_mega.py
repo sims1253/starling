@@ -560,7 +560,7 @@ class GraphedDecoder:
         metadata as **CPU ``long`` tensors** instead of ``list[list[int]]``,
         so the frame-aligned chunker can stitch with fully vectorized ops (no
         per-token ``.item()`` / Python loop). This is the optimization-target
-        entry point used by :class:`~megapar.parakeet.chunking.ChunkedTranscriber`.
+        entry point used by :class:`~starling.parakeet.chunking.ChunkedTranscriber`.
 
         Returns ``(texts, meta_tok, meta_frm, meta_len)`` where:
 

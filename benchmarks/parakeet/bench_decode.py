@@ -44,8 +44,8 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import make_fixtures as mkfx  # noqa: E402
-from megapar.parakeet.decode_mega import GraphedDecoder  # noqa: E402
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.parakeet.decode_mega import GraphedDecoder  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
 MODEL_ID = "nvidia/parakeet-tdt-0.6b-v3"
 SAMPLE_RATE = 16000

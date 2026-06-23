@@ -28,10 +28,10 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
-from megapar.pipeline import MegaPipeline  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.pipeline import MegaPipeline  # noqa: E402
 
 
 def cuda_time_ms(fn, *, warmup: int = 3, iters: int = 10) -> float:
@@ -68,7 +68,7 @@ def wall_time_ms(fn, *, warmup: int = 1, iters: int = 3) -> float:
 
 def main() -> int:
     print("=" * 78)
-    print(" megapar end-to-end benchmark: stock transformers vs MegaPipeline")
+    print(" starling end-to-end benchmark: stock transformers vs MegaPipeline")
     print("=" * 78)
 
     print("\n[load] model + processor (eager) ...")

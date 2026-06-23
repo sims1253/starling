@@ -72,15 +72,15 @@ class MegaParakeetPipeline:
               transcript match vs the oracle. The encoder folds the conv-module
               BatchNorm1d into the depthwise conv (a fresh model is loaded for
               this mode, so the graphed/eager stock path is preserved for A/B).
-        config: an explicit :class:`~megapar.parakeet.autotune.KernelConfig`
+        config: an explicit :class:`~starling.parakeet.autotune.KernelConfig`
             (``steps_per_replay`` + ``chunk_batch_size``). If given, used
             directly with no GPU detection/sweep. Takes precedence over
             ``autotune``.
         autotune: if True (default) and no ``config`` is given, resolve the
-            config via :func:`~megapar.parakeet.autotune.autotune` -- the first
+            config via :func:`~starling.parakeet.autotune.autotune` -- the first
             run for a new GPU sweeps ``steps_per_replay`` (~30 s) and caches the
-            result to ``~/.cache/megapar/``; every later run loads the cache
-            instantly. If False, use :func:`~megapar.parakeet.autotune.detect_gpu`
+            result to ``~/.cache/starling/``; every later run loads the cache
+            instantly. If False, use :func:`~starling.parakeet.autotune.detect_gpu`
             fallback defaults (instant, no sweep). On the RTX 5090 both paths
             yield K=16, so existing callers see no regression. The resolved
             config is exposed as ``self.config`` (with ``self.steps_per_replay``

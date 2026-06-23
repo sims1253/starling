@@ -28,13 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from megapar.audio import build_inputs, load_sample_audio
-from megapar.batched import BatchedPipeline
-from megapar.flags import OptFlags
-from megapar.loader import get_components, load_model_and_processor
-from megapar.llm_mega import FusedLLMMega
-from megapar.multistep import MultiStepLLMMega
-from megapar.parakeet.gpu_lock import with_gpu_lock
+from starling.audio import build_inputs, load_sample_audio
+from starling.batched import BatchedPipeline
+from starling.flags import OptFlags
+from starling.loader import get_components, load_model_and_processor
+from starling.llm_mega import FusedLLMMega
+from starling.multistep import MultiStepLLMMega
+from starling.parakeet.gpu_lock import with_gpu_lock
 
 MAX_NEW_TOKENS = 100
 ITERS = 8
@@ -286,7 +286,7 @@ def main() -> int:
 
         # Precompute golden inputs_embeds for the single-stream LLM benchmarks
         # (avoids re-running the encoder each time).
-        from megapar.golden import load_golden
+        from starling.golden import load_golden
         inputs_embeds = load_golden("inputs_embeds.pt").to("cuda", torch.bfloat16)
 
         print(f"audio {audio_seconds:.1f}s, prompt {ids.shape[1]} tokens, "

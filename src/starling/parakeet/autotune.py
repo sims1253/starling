@@ -14,7 +14,7 @@ other cards" **with zero user configuration**:
 * :func:`autotune` -- one-time (~30 s) sweep of ``steps_per_replay`` on a
   representative batch, picks the fastest, computes ``chunk_batch_size`` from the
   live free VRAM, and caches the result to
-  ``~/.cache/megapar/autotune_<gpu>.json`` so every subsequent run is instant.
+  ``~/.cache/starling/autotune_<gpu>.json`` so every subsequent run is instant.
 
 What is autotuned
 -----------------
@@ -269,8 +269,8 @@ def pick_best_k(
 # on-disk cache
 # ====================================================================== #
 def default_cache_dir() -> Path:
-    """Default cache location: ``~/.cache/megapar``."""
-    return Path.home() / ".cache" / "megapar"
+    """Default cache location: ``~/.cache/starling``."""
+    return Path.home() / ".cache" / "starling"
 
 
 def sanitize_gpu_name(name: str) -> str:
@@ -306,7 +306,7 @@ def load_cache(gpu_name: str, *, cache_dir: Path | None = None) -> KernelConfig 
 # the sweep
 # ====================================================================== #
 def _repo_root() -> Path:
-    # src/megapar/parakeet/autotune.py -> parents[3] is the repo root (matches
+    # src/starling/parakeet/autotune.py -> parents[3] is the repo root (matches
     # gpu_lock.LOCK_PATH's parents[3] derivation).
     return Path(__file__).resolve().parents[3]
 
@@ -466,7 +466,7 @@ def autotune(
         acquire_lock: if True (default) acquire the shared GPU lock before the
             timed sweep (unless this session already holds it). Set False when
             the caller already holds the lock (e.g. a benchmark).
-        cache_dir: override the cache directory (default ``~/.cache/megapar``);
+        cache_dir: override the cache directory (default ``~/.cache/starling``);
             tests pass a tmp dir for hermetic isolation.
         warmup / repeats: warmup iterations and timed samples per K for the
             median.

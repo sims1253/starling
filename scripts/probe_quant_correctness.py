@@ -13,11 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from megapar.config import LLM_EOS_TOKEN_ID
-from megapar.golden import load_golden, load_golden_text
-from megapar.loader import get_components, load_model_and_processor
-from megapar.parakeet.gpu_lock import with_gpu_lock
-from megapar.quant import QuantLLMMega
+from starling.config import LLM_EOS_TOKEN_ID
+from starling.golden import load_golden, load_golden_text
+from starling.loader import get_components, load_model_and_processor
+from starling.parakeet.gpu_lock import with_gpu_lock
+from starling.quant import QuantLLMMega
 
 
 def wer_simple(ref: str, hyp: str) -> float:

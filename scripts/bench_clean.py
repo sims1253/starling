@@ -8,10 +8,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
-from megapar.parakeet.gpu_lock import with_gpu_lock
-from megapar.audio import build_inputs, load_sample_audio
-from megapar.loader import load_model_and_processor
-from megapar.pipeline import MegaPipeline
+from starling.parakeet.gpu_lock import with_gpu_lock
+from starling.audio import build_inputs, load_sample_audio
+from starling.loader import load_model_and_processor
+from starling.pipeline import MegaPipeline
 
 def wall_ms(fn, warm=3, iters=8):
     for _ in range(warm): fn()

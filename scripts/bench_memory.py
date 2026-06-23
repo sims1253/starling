@@ -29,19 +29,19 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.config import (  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import (  # noqa: E402
     LLM_HEAD_DIM,
     LLM_NUM_KV_HEADS,
     LLM_NUM_LAYERS,
 )
-from megapar.long_audio import (  # noqa: E402
+from starling.long_audio import (  # noqa: E402
     synthesize_long_audio,
     transcribe_long,
 )
-from megapar.loader import load_model_and_processor  # noqa: E402
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from megapar.pipeline import MegaPipeline  # noqa: E402
+from starling.loader import load_model_and_processor  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.pipeline import MegaPipeline  # noqa: E402
 
 N_TOKENS = 100  # generation budget on the 24.9s sample (comparable to bench_clean)
 MAX_CACHE_LEN = 640  # hardcoded StaticCache length

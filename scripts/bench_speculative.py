@@ -20,12 +20,12 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.audio import build_inputs, load_sample_audio  # noqa: E402
-from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from megapar.loader import load_model_and_processor  # noqa: E402
-from megapar.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from megapar.pipeline import MegaPipeline  # noqa: E402
-from megapar.speculative import CTCBPEDraft, load_out_llm  # noqa: E402
+from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.loader import load_model_and_processor  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.pipeline import MegaPipeline  # noqa: E402
+from starling.speculative import CTCBPEDraft, load_out_llm  # noqa: E402
 
 # Reference numbers from comms.md (uncontended, byte-exact, 24.9s audio):
 V1_TOK_S = 269.0       # v1 spec mega
@@ -103,7 +103,7 @@ def main() -> int:
             )
 
             # ---- correctness ----
-            from megapar.golden import load_golden, load_golden_text
+            from starling.golden import load_golden, load_golden_text
             golden_gen = load_golden("greedy_ids.pt")[0, 271:]
             golden_text = load_golden_text().strip().split("ASSISTANT:", 1)[1].strip()
             nn = min(spec_ids.shape[1], golden_gen.shape[0])

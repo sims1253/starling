@@ -23,10 +23,10 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from megapar.flags import OptFlags, flags, get_default_flags, set_default_flags  # noqa: E402
-from megapar.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from megapar.golden import load_golden  # noqa: E402
-from megapar.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.flags import OptFlags, flags, get_default_flags, set_default_flags  # noqa: E402
+from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.golden import load_golden  # noqa: E402
+from starling.loader import get_components, load_model_and_processor  # noqa: E402
 
 _MODEL = None
 _PROC = None
@@ -110,9 +110,9 @@ def test_flags_context_restores_on_exception():
 # --------------------------------------------------------------------------- #
 def test_pipeline_multistep_graph_wiring():
     """multistep_graph=True -> MultiStepLLMMega; False -> FusedLLMMega."""
-    from megapar.pipeline import MegaPipeline
-    from megapar.multistep import MultiStepLLMMega
-    from megapar.llm_mega import FusedLLMMega
+    from starling.pipeline import MegaPipeline
+    from starling.multistep import MultiStepLLMMega
+    from starling.llm_mega import FusedLLMMega
 
     model, proc = _get_model_and_processor()
 
@@ -136,8 +136,8 @@ def test_pipeline_multistep_graph_wiring():
 # --------------------------------------------------------------------------- #
 def test_default_flags_end_to_end_byte_exact():
     """A default-flags MegaPipeline (multistep on) must match golden exactly."""
-    from megapar.pipeline import MegaPipeline
-    from megapar.audio import build_inputs, load_sample_audio
+    from starling.pipeline import MegaPipeline
+    from starling.audio import build_inputs, load_sample_audio
 
     model, proc = _get_model_and_processor()
     pipe = MegaPipeline(model, proc, encoder_mode="cudagraph")

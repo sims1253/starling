@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproducible environment rebuild for megapar.
+# Reproducible environment rebuild for starling.
 # The venv is pinned to CUDA 13.0 wheels (RTX 5090 / sm_120).
 set -euo pipefail
 cd "$(dirname "$0")/.."

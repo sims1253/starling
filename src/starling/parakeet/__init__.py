@@ -1,4 +1,4 @@
-"""megapar.parakeet — megakernel components for nvidia/parakeet-tdt-0.6b-v3.
+"""starling.parakeet — megakernel components for nvidia/parakeet-tdt-0.6b-v3.
 
 High-performance inference pipeline for the parakeet-tdt-0.6b-v3
 (FastConformer-TDT) speech-to-text model: GPU mel extraction, CUDA-graphed
