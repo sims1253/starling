@@ -5,7 +5,8 @@ path that never leaves the GPU except for the final text decode:
 
     audio_list (list[np.ndarray])
         -> GpuMelExtractor          (GPU mel, 15.8x faster at B8) -> (B,T,128) bf16
-        -> model.get_audio_features (24-layer Conformer encoder) -> pooler (B,T_enc,640)
+        -> GraphedEncoder / model.get_audio_features (24-layer Conformer encoder)
+                                    -> pooler (B,T_enc,640)
         -> GraphedDecoder.decode    (CUDA-graph TDT decode, 6.65x) -> list[str]
 
 The :class:`GraphedDecoder` is shape-specific: capture allocates static buffers
@@ -31,6 +32,7 @@ import numpy as np
 import torch
 
 from .decode_mega import GraphedDecoder
+from .encoder_graph import GraphedEncoder
 from .mel_gpu import GpuMelExtractor
 
 
@@ -48,6 +50,13 @@ class MegaParakeetPipeline:
         dtype: encoder/decoder dtype (default ``torch.bfloat16``). The GPU mel
             extractor runs in float32 internally; its output is cast to ``dtype``
             for the encoder (matching the baseline numerics and the oracle path).
+        use_graphed_encoder: if True (default), run the 24-layer Conformer
+            encoder through :class:`GraphedEncoder` -- a CUDA-graph capture of
+            ``model.get_audio_features`` that removes the per-layer launch
+            overhead (~1.36x faster at B8 medium, byte-exact). One graph per
+            ``(B, T_mel)`` shape is cached, so capture is amortised across
+            same-shape calls. If False, run the encoder eagerly (the stock
+            path) -- kept for byte-exactness A/B testing.
     """
 
     def __init__(
@@ -55,6 +64,7 @@ class MegaParakeetPipeline:
         model_id: str = "nvidia/parakeet-tdt-0.6b-v3",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        use_graphed_encoder: bool = True,
     ) -> None:
         # Local import: constructing the pipeline pays the HF import cost; keep
         # it out of module import time so `import pipeline` is cheap.
@@ -63,6 +73,7 @@ class MegaParakeetPipeline:
         self.model_id = model_id
         self.device = torch.device(device)
         self.dtype = dtype
+        self.use_graphed_encoder = bool(use_graphed_encoder)
 
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForTDT.from_pretrained(
@@ -73,7 +84,16 @@ class MegaParakeetPipeline:
         # (1) GPU mel extractor (float32 internally; cast to dtype in transcribe)
         self.mel = GpuMelExtractor(self.processor, device=str(self.device))
 
-        # (2) graphed decoder template; capture is shape-specific and is cached
+        # (2) graphed encoder (optional): CUDA-graph capture of
+        # model.get_audio_features; one graph per (B, T_mel) shape is cached
+        # internally so capture is amortised across same-shape calls. Built (not
+        # captured) here so __init__ has no shape-dependent GPU work.
+        if self.use_graphed_encoder:
+            self._graphed_encoder = GraphedEncoder(self.model)
+        else:
+            self._graphed_encoder = None
+
+        # (3) graphed decoder template; capture is shape-specific and is cached
         # per (B, T_enc) so the one-off capture cost is amortised across calls.
         # Pre-build (don't capture) so __init__ has no shape-dependent GPU work.
         self._decoders: Dict[Tuple[int, int], GraphedDecoder] = {}
@@ -105,6 +125,33 @@ class MegaParakeetPipeline:
         return dec
 
     # ------------------------------------------------------------------ #
+    # encoder dispatch (graphed vs eager)
+    # ------------------------------------------------------------------ #
+    def _run_encoder(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the 24-layer Conformer encoder + projector; return pooler + lengths.
+
+        Dispatches on ``self.use_graphed_encoder``: the graphed path replays a
+        cached CUDA graph (byte-exact with eager; one capture per
+        ``(B, T_mel)`` shape, amortised); the eager path is the stock
+        ``model.get_audio_features``. Both return the projector pooler output
+        ``(B, T_enc, 640)`` as a contiguous tensor and the per-element valid
+        encoder-frame lengths from ``attention_mask.sum(-1)``.
+        """
+        if self._graphed_encoder is not None:
+            enc = self._graphed_encoder(input_features, attention_mask)
+        else:
+            enc = self.model.get_audio_features(
+                input_features=input_features, attention_mask=attention_mask
+            )
+        pooler = enc.pooler_output.contiguous()
+        valid_lengths = enc.attention_mask.to(torch.long).sum(-1).contiguous()
+        return pooler, valid_lengths
+
+    # ------------------------------------------------------------------ #
     # end-to-end transcription
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
@@ -125,12 +172,9 @@ class MegaParakeetPipeline:
         input_features, attention_mask = self.mel(audio_list)
         input_features = input_features.to(self.dtype)
 
-        # (2) 24-layer Conformer encoder -> projector pooler output.
-        enc = self.model.get_audio_features(
-            input_features=input_features, attention_mask=attention_mask
-        )
-        pooler = enc.pooler_output.contiguous()
-        valid_lengths = enc.attention_mask.to(torch.long).sum(-1).contiguous()
+        # (2) 24-layer Conformer encoder -> projector pooler output (graphed or
+        # eager; both byte-exact). Graph capture is shape-keyed and amortised.
+        pooler, valid_lengths = self._run_encoder(input_features, attention_mask)
 
         # (3) CUDA-graph TDT decode (shape-cached; capture amortised).
         decoder = self._get_decoder(pooler, valid_lengths)
@@ -151,7 +195,8 @@ class MegaParakeetPipeline:
         not overlap; ``total_ms`` is their sum. ``decode_ms`` includes
         ``processor.batch_decode`` (it is part of the integrated path). The
         graph capture (first call for a new shape) happens in ``_get_decoder``
-        and is NOT counted in ``decode_ms`` -- it is amortised across calls.
+        (decode) and inside ``GraphedEncoder`` (encoder) and is NOT counted in
+        ``encoder_ms``/``decode_ms`` -- it is amortised across calls.
         """
         device = self.device
 
@@ -170,16 +215,11 @@ class MegaParakeetPipeline:
         )
         input_features = input_features.to(self.dtype)
 
-        # (2) encoder
-        def _encode():
-            enc = self.model.get_audio_features(
-                input_features=input_features, attention_mask=attention_mask
-            )
-            pooler = enc.pooler_output.contiguous()
-            valid_lengths = enc.attention_mask.to(torch.long).sum(-1).contiguous()
-            return pooler, valid_lengths
-
-        encoder_ms, (pooler, valid_lengths) = _timed(_encode)
+        # (2) encoder (graphed or eager; graph capture is shape-keyed + amortised,
+        # so after warmup _run_encoder is a dict lookup + graph replay)
+        encoder_ms, (pooler, valid_lengths) = _timed(
+            lambda: self._run_encoder(input_features, attention_mask)
+        )
 
         # (3) decode (capture amortised -- _get_decoder is a dict hit after warmup)
         decoder = self._get_decoder(pooler, valid_lengths)
