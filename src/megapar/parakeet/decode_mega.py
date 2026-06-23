@@ -118,7 +118,7 @@ class GraphedDecoder:
     """
 
     def __init__(self, model, *, warmup_iters: int = 4,
-                 steps_per_replay: int = 16) -> None:
+                 steps_per_replay: int = 32) -> None:
         cfg = model.config
         self.model = model
         self.dec = model.decoder
@@ -595,7 +595,7 @@ def greedy_decode_graphed(
     processor,
     *,
     warmup_iters: int = 4,
-    steps_per_replay: int = 16,
+    steps_per_replay: int = 32,
 ) -> list[str]:
     """CUDA-graph-captured greedy TDT decode (byte-exact with eager / stock).
 

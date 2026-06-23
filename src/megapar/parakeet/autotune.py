@@ -1,15 +1,16 @@
 """Runtime autotuner for the parakeet megakernel pipeline.
 
-The pipeline's two main throughput knobs have historically been hardcoded to
-5090-tuned defaults (``steps_per_replay=16`` for :class:`GraphedDecoder`,
-``chunk_batch_size=16`` for :class:`ChunkedTranscriber`). This module makes the
-pipeline "focused on RTX 5090 but reasonably usable on other cards" **with zero
-user configuration**:
+The pipeline's two main throughput knobs are tuned per-GPU
+(``steps_per_replay`` for :class:`GraphedDecoder`, ``chunk_batch_size`` for
+:class:`ChunkedTranscriber`). The 5090 defaults (K=32, B=32) are the **measured
+autotune winners** (sweep 2026-06-23: K=32 = 14.93ms decode vs K=16 = 16.10ms).
+This module makes the pipeline "focused on RTX 5090 but reasonably usable on
+other cards" **with zero user configuration**:
 
 * :func:`detect_gpu` -- instant (no sweep): reads the GPU name / VRAM /
   compute-capability and returns sensible per-GPU-tier fallback defaults. On the
-  RTX 5090 this reproduces the prior hardcoded values exactly (K=16, B=16), so
-  the ``autotune=False`` path is a behaviour-preserving fast path.
+  RTX 5090 this returns K=32, B=32 -- the measured autotune winners, so the
+  ``autotune=False`` path already uses the GPU-optimal values.
 * :func:`autotune` -- one-time (~30 s) sweep of ``steps_per_replay`` on a
   representative batch, picks the fastest, computes ``chunk_batch_size`` from the
   live free VRAM, and caches the result to
@@ -154,9 +155,17 @@ def _classify_tier(
     H100 (sm_90, 80 GB) is classified as datacentre (B=32) rather than falling
     into the sm_89+ consumer tier (B=16).
 
+    K/B values for the RTX 5090 tier are the **measured autotune winners**
+    (swept 2026-06-23 on a clean 5090, B=8 medium fixture): K=32 gave 14.93ms
+    decode vs K=16's 16.10ms (7.3% faster); K=64 regressed to 19.52ms (wasted
+    compute on finished sequences). B=32 is the measured sweet spot for chunked
+    long-audio throughput on 32GB (B=16 gave 2704x RTFx @ 30min, B=32 marginally
+    better with headroom to spare; capped conservatively below the VRAM-formula
+    max of 64).
+
     Tiers:
       * ``datacentre``    -- A100 / H100 (sm >= 80, >= 40 GB): K=16, B=32
-      * ``high_consumer`` -- RTX 5090 / 4090 (sm >= 89, >= 20 GB): K=16, B=16
+      * ``high_consumer`` -- RTX 5090 / 4090 (sm >= 89, >= 20 GB): K=32, B=32
       * ``ampere_consumer``-- RTX 3090 / 3080 (sm_86, >= 10 GB): K=8, B=8
       * ``mid``           -- other (>= 8 GB): K=8, B=4
       * ``low``           -- < 8 GB: K=4, B=2
@@ -165,7 +174,7 @@ def _classify_tier(
     if sm >= 80 and vram_gb >= 40:
         return "datacentre", 16, 32
     if sm >= 89 and vram_gb >= 20:
-        return "high_consumer", 16, 16
+        return "high_consumer", 32, 32
     if compute_capability == (8, 6) and vram_gb >= 10:
         return "ampere_consumer", 8, 8
     if vram_gb >= 8:
@@ -177,9 +186,9 @@ def detect_gpu() -> KernelConfig:
     """Detect the GPU and return fallback defaults (no sweep, instant).
 
     Reads ``torch.cuda`` properties and maps them to a per-GPU-tier default via
-    :func:`_classify_tier`. On the RTX 5090 this returns K=16, B=16 -- identical
-    to the prior hardcoded values, so the ``autotune=False`` path is a
-    behaviour-preserving fast path with no regression.
+    :func:`_classify_tier`. On the RTX 5090 this returns K=32, B=32 -- the
+    **measured autotune winners** (swept 2026-06-23), so the ``autotune=False``
+    path is a fast path that already uses the GPU-optimal values.
     """
     if not torch.cuda.is_available():
         # The pipeline requires CUDA, but expose a conservative fallback so the

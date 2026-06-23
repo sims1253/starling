@@ -46,8 +46,8 @@ HAS_CUDA = torch.cuda.is_available()
 @pytest.mark.parametrize(
     "cc,vram,exp_k,exp_b,tier",
     [
-        ((12, 0), 34.0, 16, 16, "high_consumer"),   # RTX 5090 (Blackwell)
-        ((8, 9), 24.0, 16, 16, "high_consumer"),    # RTX 4090
+        ((12, 0), 34.0, 32, 32, "high_consumer"),   # RTX 5090 (Blackwell) - autotuned
+        ((8, 9), 24.0, 32, 32, "high_consumer"),    # RTX 4090 - same tier
         ((8, 0), 40.0, 16, 32, "datacentre"),       # A100 40GB
         ((8, 0), 80.0, 16, 32, "datacentre"),       # A100 80GB
         ((9, 0), 80.0, 16, 32, "datacentre"),       # H100 80GB
@@ -81,8 +81,8 @@ def test_detect_gpu_current():
     cfg = detect_gpu()
     assert "5090" in cfg.gpu_name, f"unexpected gpu_name {cfg.gpu_name!r}"
     assert cfg.compute_capability == (12, 0)
-    assert cfg.steps_per_replay == 16          # 5090 fallback == prior hardcoded
-    assert cfg.chunk_batch_size == 16           # 5090 fallback == prior hardcoded
+    assert cfg.steps_per_replay == 32          # 5090 fallback = measured autotune winner
+    assert cfg.chunk_batch_size == 32           # 5090 fallback = measured autotune winner
     assert cfg.autotuned is False               # detect_gpu never sweeps
     assert cfg.sweep_results == {}
     assert cfg.gpu_vram_gb > 20.0               # 5090 has ~32GB
@@ -247,14 +247,14 @@ def _get_pipe(mode: str):
 @pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA")
 def test_pipeline_autotune_false_uses_fallback():
     """MegaParakeetPipeline(autotune=False) -> detect_gpu() fallback defaults,
-    no sweep. On the RTX 5090 this is K=16, B=16 (== prior hardcoded values)."""
+    no sweep. On the RTX 5090 this is K=32, B=32 (measured autotune winners)."""
     pipe = _get_pipe("fallback")
     assert pipe.config.autotuned is False
-    assert pipe.config.steps_per_replay == 16
-    assert pipe.config.chunk_batch_size == 16
+    assert pipe.config.steps_per_replay == 32
+    assert pipe.config.chunk_batch_size == 32
     # convenience aliases are wired
-    assert pipe.steps_per_replay == 16
-    assert pipe.chunk_batch_size == 16
+    assert pipe.steps_per_replay == 32
+    assert pipe.chunk_batch_size == 32
 
 
 @pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA")

@@ -164,7 +164,7 @@ class ChunkedTranscriber:
         overlap_seconds: float = 2.0,
         sr: int = 16000,
         min_free_vram_gb: float = 8.0,
-        chunk_batch_size: int = 16,
+        chunk_batch_size: int = 32,
         per_chunk_vram_gb: float = 2.0,
         vram_headroom_gb: float = 4.0,
     ) -> None:
