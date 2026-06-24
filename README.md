@@ -63,11 +63,13 @@ encoder + stock TDT decode).
 
 ### Long audio
 
-For audio longer than the KV cache (granite) or encoder attention window
-(parakeet), both models support chunked transcription. On granite-speech,
-batching the chunked decode (B=16) is about 4x faster than sequential chunking
-(~124x RTFx on 5 min audio, ~174x on 10 min). On parakeet, 1h of audio
-transcribes at ~293x RTFx using ~1.5 GB VRAM via bounded-VRAM chunking.
+Both models also support chunked transcription for audio that exceeds the KV
+cache (granite) or encoder attention window (parakeet). These are different
+code paths with different batch sizes and audio lengths, so the numbers are not
+directly comparable across models -- they just show that each model can handle
+arbitrarily long input with bounded VRAM. Granite-speech with batched chunking
+(B=16) reaches ~124x RTFx on 5 min audio; parakeet's chunked path (B=32)
+reaches ~293x on 1h audio at ~1.5 GB VRAM.
 
 ## What did not work
 
