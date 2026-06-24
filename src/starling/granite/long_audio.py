@@ -43,7 +43,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 
-from .config import DEFAULT_TASK_PROMPT
+from ..config import DEFAULT_TASK_PROMPT
 
 SAMPLE_SR: int = 16000
 """Sample rate of the Granite-Speech feature extractor (16 kHz)."""
@@ -274,7 +274,7 @@ def transcribe_long_batched(
 
     Like :func:`transcribe_long` but groups ``B = batched_pipe.max_batch_size``
     chunks into a mini-batch and decodes them in lock-step via
-    :class:`~starling.batched.BatchedPipeline`. The encoder + projector run
+    :class:`~starling.granite.batched.BatchedPipeline`. The encoder + projector run
     per-stream (byte-exact with the batch=1 path); only the LLM decode is
     batched, turning the launch-bound batch=1 GEMVs into saturating B-wide
     GEMMs that read the 4.4 GB of weights once for B tokens.

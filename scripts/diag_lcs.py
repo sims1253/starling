@@ -8,11 +8,11 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.audio import build_inputs, load_sample_audio
-from starling.golden import load_golden
-from starling.loader import get_components, load_model_and_processor
-from starling.pipeline import MegaPipeline
-from starling.speculative import CTCBPEDraft, load_out_llm
+from starling.granite.audio import build_inputs, load_sample_audio
+from starling.granite.golden import load_golden
+from starling.granite.loader import get_components, load_model_and_processor
+from starling.granite.pipeline import MegaPipeline
+from starling.granite.speculative import CTCBPEDraft, load_out_llm
 
 
 def main():

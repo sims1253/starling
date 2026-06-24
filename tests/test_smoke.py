@@ -21,7 +21,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 import make_fixtures as mkfx  # noqa: E402
-from starling.baseline import BaselineRunner  # noqa: E402
+from starling.granite.baseline import BaselineRunner  # noqa: E402
 
 ORACLE_PATH = _REPO_ROOT / "outputs" / "oracle.json"
 

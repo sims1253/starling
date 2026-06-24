@@ -1,7 +1,7 @@
 """Batched-inference benchmark for Granite-Speech-4.1-2b.
 
 Measures aggregate throughput (RTFx = sum(audio_seconds) / wall_time) of the
-batched pipeline (:class:`starling.batched.BatchedPipeline`) at
+batched pipeline (:class:`starling.granite.batched.BatchedPipeline`) at
 B = {1, 2, 4, 8, 16} on 30 s audio chunks (B independent copies).
 
 For each B it reports:
@@ -29,12 +29,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from starling.audio import build_inputs, load_sample_audio
-from starling.batched import BatchedPipeline
-from starling.long_audio import synthesize_long_audio
-from starling.loader import load_model_and_processor
+from starling.granite.audio import build_inputs, load_sample_audio
+from starling.granite.batched import BatchedPipeline
+from starling.granite.long_audio import synthesize_long_audio
+from starling.granite.loader import load_model_and_processor
 from starling.parakeet.gpu_lock import with_gpu_lock
-from starling.pipeline import MegaPipeline
+from starling.granite.pipeline import MegaPipeline
 
 LEADERBOARD_RTFX = 231.0
 """Open ASR Leaderboard RTFx for this model (achieved via batching)."""

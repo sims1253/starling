@@ -47,7 +47,7 @@ from typing import Any, Optional
 
 import torch
 
-from .config import (
+from ..config import (
     LLM_EMBEDDING_MULTIPLIER,
     LLM_EOS_TOKEN_ID,
     LLM_LOGITS_SCALING,
@@ -86,7 +86,7 @@ class LLMMega:
     """CUDA-graph-captured greedy decoder for the Granite LLM.
 
     Wraps a loaded ``GraniteModel`` (the ``language_model`` component from
-    :func:`starling.loader.get_components`) plus the parent model's ``lm_head``.
+    :func:`starling.granite.loader.get_components`) plus the parent model's ``lm_head``.
     The LLM's own layers are used unchanged so decode output is bit-exact with
     the eager golden reference.
 

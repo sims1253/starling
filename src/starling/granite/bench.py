@@ -10,7 +10,7 @@ This module provides:
   stage on (a) the eager GOLDEN model and (b) the "stock-optimized" model
   where the LLM uses SDPA. Prints a comparison table.
 
-Run: ``python -m starling.bench``.
+Run: ``python -m starling.granite.bench``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from .audio import build_inputs, load_sample_audio
-from .config import GOLDEN_DIR, MODEL_ID, TRACES_DIR
+from ..config import GOLDEN_DIR, MODEL_ID, TRACES_DIR
 from .golden import capture_golden
 from .loader import get_components, load_model_and_processor, set_llm_attn_implementation
 

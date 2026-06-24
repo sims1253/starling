@@ -80,15 +80,18 @@ transcribes at ~293x RTFx using ~1.5 GB VRAM via bounded-VRAM chunking.
 ## Layout
 
 ```
-src/starling/            granite-speech megakernel
-  encoder_mega.py       fused (cudagraph) conformer encoder
-  llm_mega.py           graphed greedy decode over a static KV cache
-  multistep.py          K-step graphed decode (multi-step per replay)
-  pipeline.py           encoder + projector + LLM wiring
-  batched.py            batched (B>1) LLM decode + pipeline
-  long_audio.py         chunked long-audio transcription (sequential + batched)
-  speculative.py        self-speculative decoding via the CTC draft head
-  parakeet/             parakeet-tdt megakernel
+src/starling/           shared toolkit (config dims, optimisation flags)
+  config.py             Granite-Speech architecture constants (single source of truth)
+  flags.py              runtime optimisation flags (byte-exact vs tolerance mode)
+  granite/              granite-speech-4.1-2b megakernel
+    encoder_mega.py     fused (cudagraph) conformer encoder
+    llm_mega.py         graphed greedy decode over a static KV cache
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         encoder + projector + LLM wiring
+    batched.py          batched (B>1) LLM decode + pipeline
+    long_audio.py       chunked long-audio transcription (sequential + batched)
+    speculative.py      self-speculative decoding via the CTC draft head
+  parakeet/             parakeet-tdt-0.6b-v3 megakernel
     decode_mega.py      multi-step graphed TDT decode
     encoder_graph.py    graphed FastConformer encoder
     mel_gpu.py          GPU-side mel filterbank

@@ -23,10 +23,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from starling.config import ENCODER_ATOL  # noqa: E402
-from starling.encoder_mega import FusedEncoder  # noqa: E402
-from starling.golden import load_golden  # noqa: E402
-from starling.loader import get_components, load_model_and_processor  # noqa: E402
-from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.granite.encoder_mega import FusedEncoder  # noqa: E402
+from starling.granite.golden import load_golden  # noqa: E402
+from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.granite.audio import build_inputs, load_sample_audio  # noqa: E402
 
 _MEAN_TOL = 5e-3
 

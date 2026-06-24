@@ -3,7 +3,7 @@
 
 Measures total wall time, RTFx, tokens generated, and peak VRAM for durations
 {60 s, 5 min, 30 min, 60 min} using the chunked transcription path
-(``starling.long_audio``).
+(``starling.granite.long_audio``).
 
 * **Mega** (speculative + non-speculative) is run *end-to-end* for every
   duration to verify RTFx stays flat as audio gets longer (no prefill
@@ -36,17 +36,17 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.audio import build_inputs, load_sample_audio  # noqa: E402
-from starling.long_audio import (  # noqa: E402
+from starling.granite.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.granite.long_audio import (  # noqa: E402
     DEFAULT_CHUNK_SECONDS,
     extrapolate_from_chunk,
     synthesize_long_audio,
     transcribe_long,
     transcribe_long_stock,
 )
-from starling.loader import load_model_and_processor  # noqa: E402
+from starling.granite.loader import load_model_and_processor  # noqa: E402
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from starling.pipeline import MegaPipeline  # noqa: E402
+from starling.granite.pipeline import MegaPipeline  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration

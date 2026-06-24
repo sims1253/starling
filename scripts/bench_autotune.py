@@ -25,11 +25,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from starling import llm_kernels as K
-from starling.audio import build_inputs, load_sample_audio
-from starling.golden import load_golden
-from starling.llm_mega import FusedLLMMega
-from starling.loader import get_components, load_model_and_processor
+from starling.granite import llm_kernels as K
+from starling.granite.audio import build_inputs, load_sample_audio
+from starling.granite.golden import load_golden
+from starling.granite.llm_mega import FusedLLMMega
+from starling.granite.loader import get_components, load_model_and_processor
 from starling.parakeet.gpu_lock import with_gpu_lock
 
 MAX_NEW_TOKENS = 100
@@ -133,7 +133,7 @@ def main() -> int:
 
         # Batched B=16 (fused batched decode path uses the same kernels).
         print("\n--- batched B=16 ---", flush=True)
-        from starling.batched import BatchedPipeline
+        from starling.granite.batched import BatchedPipeline
 
         for label, autotune_on in [("autotune-OFF", False), ("autotune-ON", True)]:
             K.set_autotune(autotune_on)

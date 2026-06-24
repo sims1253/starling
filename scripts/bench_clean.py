@@ -9,9 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 from starling.parakeet.gpu_lock import with_gpu_lock
-from starling.audio import build_inputs, load_sample_audio
-from starling.loader import load_model_and_processor
-from starling.pipeline import MegaPipeline
+from starling.granite.audio import build_inputs, load_sample_audio
+from starling.granite.loader import load_model_and_processor
+from starling.granite.pipeline import MegaPipeline
 
 def wall_ms(fn, warm=3, iters=8):
     for _ in range(warm): fn()

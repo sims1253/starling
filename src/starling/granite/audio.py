@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from .config import DEFAULT_TASK_PROMPT, MODEL_ID, SAMPLE_AUDIO_FILENAME
+from ..config import DEFAULT_TASK_PROMPT, MODEL_ID, SAMPLE_AUDIO_FILENAME
 
 
 def load_sample_audio() -> tuple[torch.Tensor, int]:

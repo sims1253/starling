@@ -1,7 +1,7 @@
 """Benchmark + tune ``steps_per_replay`` (K) for the multi-step graphed Granite LLM.
 
 Mirrors ``benchmarks/parakeet/bench_multistep.py`` but for the granite-speech
-LLM decoder (:class:`starling.multistep.MultiStepLLMMega`). The decoder captures
+LLM decoder (:class:`starling.granite.multistep.MultiStepLLMMega`). The decoder captures
 ``K`` consecutive greedy decode steps into ONE CUDA graph and replays it
 ``ceil(n_decode / K)`` times, syncing the host ONCE per K tokens instead of once
 per token. With K=1 the per-token ``.item()`` host sync dominates wall time;
@@ -45,9 +45,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from starling.golden import load_golden  # noqa: E402
-from starling.loader import get_components, load_model_and_processor  # noqa: E402
-from starling.multistep import MultiStepLLMMega  # noqa: E402
+from starling.granite.golden import load_golden  # noqa: E402
+from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.granite.multistep import MultiStepLLMMega  # noqa: E402
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
 OUTPUTS = _REPO_ROOT / "outputs"

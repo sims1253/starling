@@ -1,8 +1,8 @@
 """Benchmark: sequential vs batched long-audio transcription for granite-speech.
 
-Compares :func:`starling.long_audio.transcribe_long` (sequential, B=1 per chunk)
-against :func:`starling.long_audio.transcribe_long_batched` (B chunks decoded in
-lock-step via :class:`starling.batched.BatchedPipeline`) across audio lengths
+Compares :func:`starling.granite.long_audio.transcribe_long` (sequential, B=1 per chunk)
+against :func:`starling.granite.long_audio.transcribe_long_batched` (B chunks decoded in
+lock-step via :class:`starling.granite.batched.BatchedPipeline`) across audio lengths
 (1 min, 5 min, 10 min) and batch sizes (4, 8).
 
 The headline metric is aggregate RTFx (``audio_seconds / wall_seconds``) --
@@ -28,15 +28,15 @@ from tabulate import tabulate
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.batched import BatchedPipeline  # noqa: E402
-from starling.loader import load_model_and_processor  # noqa: E402
-from starling.long_audio import (  # noqa: E402
+from starling.granite.batched import BatchedPipeline  # noqa: E402
+from starling.granite.loader import load_model_and_processor  # noqa: E402
+from starling.granite.long_audio import (  # noqa: E402
     synthesize_long_audio,
     transcribe_long,
     transcribe_long_batched,
 )
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from starling.pipeline import MegaPipeline  # noqa: E402
+from starling.granite.pipeline import MegaPipeline  # noqa: E402
 
 AUDIO_LENGTHS = [60, 300, 600]  # 1 min, 5 min, 10 min
 BATCH_SIZES = [4, 8]

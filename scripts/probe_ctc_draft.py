@@ -20,10 +20,10 @@ import torch.nn.functional as F
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.granite.audio import build_inputs, load_sample_audio  # noqa: E402
 from starling.config import MODEL_ID  # noqa: E402
-from starling.encoder_mega import FusedEncoder  # noqa: E402
-from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.granite.encoder_mega import FusedEncoder  # noqa: E402
+from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
 
 
 def main() -> int:
@@ -109,7 +109,7 @@ def main() -> int:
         print(f"\n[probe] DRAFT TRANSCRIPT:\n{draft_text}\n")
 
         # also print golden for comparison
-        from starling.golden import load_golden_text
+        from starling.granite.golden import load_golden_text
         golden = load_golden_text()
         golden_resp = golden.split("ASSISTANT:", 1)[1].strip()
         print(f"[probe] GOLDEN RESPONSE:\n{golden_resp}\n")

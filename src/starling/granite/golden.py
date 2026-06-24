@@ -5,7 +5,7 @@ The golden artefacts under ``golden/`` (gitignored) are produced by the
 phases compare their outputs against these references with the tolerances
 declared in :mod:`starling.config`.
 
-Run ``python -m starling.golden`` to (re)capture.
+Run ``python -m starling.granite.golden`` to (re)capture.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any
 import torch
 
 from .audio import build_inputs, load_sample_audio
-from .config import GOLDEN_DIR, MODEL_ID
+from ..config import GOLDEN_DIR, MODEL_ID
 from .loader import get_components, load_model_and_processor
 
 

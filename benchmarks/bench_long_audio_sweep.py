@@ -30,15 +30,15 @@ from tabulate import tabulate
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.batched import BatchedPipeline  # noqa: E402
-from starling.loader import load_model_and_processor  # noqa: E402
-from starling.long_audio import (  # noqa: E402
+from starling.granite.batched import BatchedPipeline  # noqa: E402
+from starling.granite.loader import load_model_and_processor  # noqa: E402
+from starling.granite.long_audio import (  # noqa: E402
     synthesize_long_audio,
     transcribe_long,
     transcribe_long_batched,
 )
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
-from starling.pipeline import MegaPipeline  # noqa: E402
+from starling.granite.pipeline import MegaPipeline  # noqa: E402
 
 AUDIO_LENGTHS = [300, 600]
 CHUNK_SECONDS_SET = [15.0, 30.0]

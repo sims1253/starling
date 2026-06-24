@@ -41,7 +41,7 @@ from typing import Any, Optional
 
 import torch
 
-from .config import AUDIO_TOKEN_ID, LLM_EOS_TOKEN_ID
+from ..config import AUDIO_TOKEN_ID, LLM_EOS_TOKEN_ID
 from .encoder_mega import FusedEncoder
 from .loader import get_components, load_model_and_processor
 from .llm_mega import FusedLLMMega, LLMMega
@@ -78,7 +78,7 @@ class MegaPipeline:
         use_fused_llm: bool = True,
         flags: Any = None,
     ) -> None:
-        from .flags import OptFlags, get_default_flags
+        from ..flags import OptFlags, get_default_flags
 
         if flags is None:
             flags = get_default_flags()

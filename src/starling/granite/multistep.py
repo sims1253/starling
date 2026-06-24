@@ -1,7 +1,7 @@
 """Multi-step CUDA-graph capture for the Granite-4.0-1b LLM decoder.
 
-The single-step graph decoder (:class:`starling.llm_mega.LLMMega` /
-:class:`starling.llm_mega.FusedLLMMega`) captures ONE decode step per graph and
+The single-step graph decoder (:class:`starling.granite.llm_mega.LLMMega` /
+:class:`starling.granite.llm_mega.FusedLLMMega`) captures ONE decode step per graph and
 replays it once per emitted token.  Each replay is followed by **two
 host<->device synchronisations** (``.item()`` for append + EOS check) plus
 **four host-launched copies** (input-ids, position-ids, mask fill, mask set).
@@ -52,7 +52,7 @@ Public API
 ----------
 ``MultiStepLLMMega(language_model, lm_head, max_cache_len=640, steps_per_replay=16)``
 ``MultiStepLLMMega.generate(inputs_embeds, max_new_tokens=100, eos_token_id=...)``
-    -> :class:`starling.llm_mega.GenerateResult`
+    -> :class:`starling.granite.llm_mega.GenerateResult`
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from typing import Any, Optional
 
 import torch
 
-from .config import LLM_EOS_TOKEN_ID
+from ..config import LLM_EOS_TOKEN_ID
 from .llm_mega import FusedLLMMega, GenerateResult
 
 
@@ -205,7 +205,7 @@ class MultiStepLLMMega(FusedLLMMega):
         produced by the prefill (the input to the first decode step).
 
         Also captures the parent's single-step ``_graph`` so that
-        :class:`starling.speculative.SpeculativeDecoder` (which uses
+        :class:`starling.granite.speculative.SpeculativeDecoder` (which uses
         ``llm._graph.replay()`` for single-token verify fallbacks) works with a
         :class:`MultiStepLLMMega` instance unchanged.
         """

@@ -50,7 +50,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import LLM_EOS_TOKEN_ID, LLM_LOGITS_SCALING, MODEL_ID
+from ..config import LLM_EOS_TOKEN_ID, LLM_LOGITS_SCALING, MODEL_ID
 
 
 # =========================================================================== #

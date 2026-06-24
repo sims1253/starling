@@ -8,7 +8,7 @@ cache reuses one captured decoder for the (8, 279) shape).
 
 NOTE on filename: this file is deliberately ``test_parakeet_pipeline.py``
 rather than ``tests/test_pipeline.py``; the latter holds the granite-speech
-correctness gate (``starling.pipeline.MegaPipeline``), while this file holds
+correctness gate (``starling.granite.pipeline.MegaPipeline``), while this file holds
 the parakeet pipeline correctness gate.
 
 Both encoder modes are exercised: the stock eager

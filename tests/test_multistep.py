@@ -30,10 +30,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from starling.golden import load_golden  # noqa: E402
-from starling.loader import get_components, load_model_and_processor  # noqa: E402
-from starling.llm_mega import FusedLLMMega  # noqa: E402
-from starling.multistep import MultiStepLLMMega  # noqa: E402
+from starling.granite.golden import load_golden  # noqa: E402
+from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.granite.llm_mega import FusedLLMMega  # noqa: E402
+from starling.granite.multistep import MultiStepLLMMega  # noqa: E402
 
 # Loading the speech model is expensive (~5s); cache across tests.
 _MODEL = None

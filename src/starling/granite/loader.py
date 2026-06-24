@@ -12,7 +12,7 @@ from typing import Any, Iterator
 
 import torch
 
-from .config import MODEL_ID
+from ..config import MODEL_ID
 
 
 def load_model_and_processor(
