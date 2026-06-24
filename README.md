@@ -21,34 +21,47 @@ Both do speech-to-text.
 
 ## Numbers
 
-Single RTX 5090, bf16, model load excluded, B=1 single-stream unless noted.
+Single RTX 5090, bf16, model load excluded. RTFx (realtime factor) means
+audio_seconds / transcribe_seconds, so 100x means 100 seconds of audio
+transcribed in 1 second. Higher is faster. These are absolute numbers, not
+comparisons to stock `transformers`.
 
-### Cross-engine comparison
+Both models were benchmarked on the same audio-length tiers (short ~7s, medium
+~22s, long ~45-74s), same weights, producing identical transcripts.
 
-Both models benchmarked on the same audio-length tiers (short ~7s, medium ~22s, long ~45-74s), same weights, identical transcripts. RTFx = audio seconds / transcribe seconds.
+### granite-speech-4.1-2b (2.3B params)
 
-**granite-speech-4.1-2b** (2.3B params)
+B=1 single-stream. "starling" is standard greedy decode. "starling (spec)" adds
+self-speculative decoding (drafts tokens from the encoder's CTC head, verifies
+them with the LLM). Spec is slower on short audio because the draft extraction
+has fixed overhead, but pulls ahead on longer audio where the accepted drafts
+save more LLM forward passes.
 
-| fixture | starling (spec) | starling | CrispASR |
-| ------- | --------------- | -------- | -------- |
-| short   | 245ms (30x)     | 212ms (35x) | 1185ms (6x) |
-| medium  | 326ms (77x)     | 570ms (44x) | 2290ms (11x) |
-| long    | 334ms (135x)    | 569ms (79x) | 4060ms (11x) |
+| audio | starling | starling (spec) | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | -------- | --------------- | -------- |
+| 7s    | 212ms (35x)  | 245ms (30x) | 1185ms (6x) |
+| 25s   | 570ms (44x)  | 326ms (77x) | 2290ms (11x) |
+| 45s   | 569ms (79x)  | 334ms (135x) | 4060ms (11x) |
 
-**parakeet-tdt-0.6b-v3** (0.6B params)
+### parakeet-tdt-0.6b-v3 (0.6B params)
 
-| fixture | starling B=1 | starling B=8 | [parakeet.cpp](https://github.com/mudler/parakeet.cpp) B=1 | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
-| ------- | ------------ | ------------- | -------------------------- | -------- |
-| short   | 17ms (446x)  | 27ms (2184x)  | 30ms (251x)               | 580ms (13x) |
-| medium  | 26ms (863x)  | 57ms (3119x)  | 76ms (294x)               | 1440ms (16x) |
-| long    | 67ms (1111x) | 174ms (3416x) | 223ms (333x)              | 4505ms (16x) |
+B=1 is single-stream latency (one clip at a time). B=8 processes 8 clips at
+once: total time goes up, but throughput goes up much more because the GPU does
+8x the work in only ~1.6x the time.
 
-### Additional modes
+| audio | starling B=1 | starling B=8 | [parakeet.cpp](https://github.com/mudler/parakeet.cpp) B=1 | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | ------------ | ------------- | -------------------------- | -------- |
+| 7s    | 17ms (446x)  | 27ms (2184x)  | 30ms (251x)               | 580ms (13x) |
+| 22s   | 26ms (863x)  | 57ms (3119x)  | 76ms (294x)               | 1440ms (16x) |
+| 74s   | 67ms (1111x) | 174ms (3416x) | 223ms (333x)              | 4505ms (16x) |
 
-| model | mode | realtime |
-| ----- | ---- | -------- |
-| granite-speech-4.1-2b | long audio, batched (B=16) | ~124x RTF @ 5min, ~174x @ 10min |
-| parakeet-tdt-0.6b-v3 | 1h audio, chunked | ~293x RTF, ~1.5 GB VRAM |
+### Long audio
+
+For audio longer than the KV cache (granite) or encoder attention window
+(parakeet), both models support chunked transcription. On granite-speech,
+batching the chunked decode (B=16) is about 4x faster than sequential chunking
+(~124x RTFx on 5 min audio, ~174x on 10 min). On parakeet, 1h of audio
+transcribes at ~293x RTFx using ~1.5 GB VRAM via bounded-VRAM chunking.
 
 ## What did not work
 
