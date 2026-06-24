@@ -64,14 +64,14 @@ encoder + stock TDT decode).
 ### Long audio (10 min, comparable)
 
 Both models transcribing the same 10-minute clip, each using their best chunked
-+ batched path. Granite uses B=16 batched chunked decode (30s chunks); parakeet
-uses B=32 chunked decode (30s chunks with 2s overlap, frame-aligned stitching).
-Parakeet is faster here because it's a smaller model (0.6B TDT transducer vs
-2.3B autoregressive LLM) with much cheaper per-token decode.
++ batched path. Both use B=32 batched chunked decode (granite: 30s chunks;
+parakeet: 30s chunks with 2s overlap, frame-aligned stitching). Parakeet is
+faster because it's a smaller model (0.6B TDT transducer vs 2.3B autoregressive
+LLM) with much cheaper per-token decode.
 
 | model | mode | wall | RTFx | VRAM |
 | ----- | ---- | ---- | ---- | ---- |
-| granite-speech-4.1-2b | batched B=16, 30s chunks | 10.3s | 58x | 6.5 GB |
+| granite-speech-4.1-2b | batched B=32, 30s chunks | 3.4s | 176x | 8.1 GB |
 | parakeet-tdt-0.6b-v3 | batched B=32, 30s+2s overlap | 1.3s | 446x | 2.6 GB |
 
 ## What did not work

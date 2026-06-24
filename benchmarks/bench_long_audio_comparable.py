@@ -77,7 +77,7 @@ def main() -> int:
         eta_min=10, note="comparable long-audio bench",
     ):
         # ---- granite ---- #
-        print("\n========== granite-speech (B=16, 30s chunks) ==========")
+        print("\n========== granite-speech (B=32, 30s chunks) ==========")
         from starling.granite.audio import load_sample_audio as _lsa
         from starling.granite.batched import BatchedPipeline
         from starling.granite.long_audio import transcribe_long_batched
@@ -85,7 +85,7 @@ def main() -> int:
 
         gran_wav = tile_granite_audio(AUDIO_SECONDS)
         model, proc = load_model_and_processor(attn_impl="eager")
-        pipe = BatchedPipeline(model, proc, max_batch_size=16, encoder_mode="cudagraph")
+        pipe = BatchedPipeline(model, proc, max_batch_size=32, encoder_mode="cudagraph")
 
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
@@ -101,7 +101,7 @@ def main() -> int:
               f"chunks={gran_res.n_chunks}  tokens={gran_res.total_tokens}  "
               f"VRAM={gran_vram:.2f}GB")
         results["models"]["granite_speech"] = {
-            "mode": "batched B=16, 30s chunks",
+            "mode": "batched B=32, 30s chunks",
             "wall_s": round(gran_wall, 2),
             "rtfx": round(gran_rtfx, 1),
             "n_chunks": gran_res.n_chunks,
