@@ -23,23 +23,19 @@ Both do speech-to-text.
 
 Single RTX 5090, bf16, model load excluded. RTFx (realtime factor) means
 audio_seconds / transcribe_seconds, so 100x means 100 seconds of audio
-transcribed in 1 second. Higher is faster. Every RTFx number is absolute
-(audio seconds per second of compute, not a speedup over another engine); the
-`stock transformers` column is the unmodified HuggingFace `generate()` reference
-the others replace.
+transcribed in 1 second. Higher is faster. The `stock transformers` column is
+the unmodified HuggingFace `generate()` reference.
 
 Both models were benchmarked on the same audio-length tiers (short ~7s, medium
 ~22s, long ~45-74s), same weights, producing identical transcripts.
 
 ### granite-speech-4.1-2b (2.3B params)
 
-B=1 single-stream. "starling" is standard greedy decode. "starling (spec)" adds
+B=1 single-stream. `starling` is standard greedy decode. `starling (spec)` adds
 self-speculative decoding (drafts tokens from the encoder's CTC head, verifies
 them with the LLM). Spec is slower on short audio because the draft extraction
 has fixed overhead, but pulls ahead on longer audio where the accepted drafts
-save more LLM forward passes. "stock transformers" is the unmodified HuggingFace
-eager `model.generate()` path (no CUDA graphs), the slow reference these kernels
-replace.
+save more LLM forward passes.
 
 | audio | starling | starling (spec) | [stock transformers](https://github.com/huggingface/transformers) | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
 | ----- | -------- | --------------- | ------------------ | -------- |
@@ -49,11 +45,8 @@ replace.
 
 ### parakeet-tdt-0.6b-v3 (0.6B params)
 
-B=1 is single-stream latency (one clip at a time). B=8 processes 8 clips at
-once: total time goes up, but throughput goes up much more because the GPU does
-8x the work in only ~1.6x the time. "stock transformers" is the unmodified
-HuggingFace `AutoModelForTDT.generate()` path (CPU mel extraction + eager
-encoder + stock TDT decode).
+B=1 is single-stream. B=8 processes 8 clips at
+once.
 
 | audio | starling B=1 | starling B=8 | [stock transformers](https://github.com/huggingface/transformers) | [parakeet.cpp](https://github.com/mudler/parakeet.cpp) B=1 | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
 | ----- | ------------ | ------------- | ------------------ | -------------------------- | -------- |
@@ -61,13 +54,10 @@ encoder + stock TDT decode).
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
 
-### Long audio (10 min, comparable)
+### Long audio (10 min)
 
 Both models transcribing the same 10-minute clip, each using their best chunked
-+ batched path. Both use B=32 batched chunked decode (granite: 30s chunks;
-parakeet: 30s chunks with 2s overlap, frame-aligned stitching). Parakeet is
-faster because it's a smaller model (0.6B TDT transducer vs 2.3B autoregressive
-LLM) with much cheaper per-token decode.
++ batched path. Both use B=32 batched chunked decode.
 
 | model | mode | wall | RTFx | VRAM |
 | ----- | ---- | ---- | ---- | ---- |
@@ -83,8 +73,8 @@ LLM) with much cheaper per-token decode.
 ## Requirements
 
 - Tuned on an RTX 5090 (Blackwell, sm_120). Runs on any Ampere+ NVIDIA GPU
-  (RTX 30/40/50, A100, H100); bf16 required. The torch wheels are pinned to the
-  CUDA 13.0 (cu130) index in `pyproject.toml`; the default PyPI torch wheel is
+  (RTX 30/40/50, A100, H100) as bf16 is required. The torch wheels are pinned to the
+  CUDA 13.0 (cu130) index in `pyproject.toml`. The default PyPI torch wheel is
   cu12 / sm_90 and will not run on Blackwell.
 - CUDA 13.0, Python 3.10-3.12, and [uv](https://github.com/astral-sh/uv).
 
