@@ -54,15 +54,16 @@ once.
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
 
-### Long audio (10 min)
+### Long audio (1 hour, comparable)
 
-Both models transcribing the same 10-minute clip, each using their best chunked
-+ batched path. Both use B=32 batched chunked decode.
+Both models transcribing the same 1-hour clip, each using B=32 batched chunked
+decode with 30s chunks and 2s overlap. Granite uses text-level overlap dedup;
+parakeet uses frame-aligned TDT-duration stitching.
 
-| model | mode | wall | RTFx | VRAM |
-| ----- | ---- | ---- | ---- | ---- |
-| granite-speech-4.1-2b | batched B=32, 30s chunks | 3.4s | 176x | 8.1 GB |
-| parakeet-tdt-0.6b-v3 | batched B=32, 30s+2s overlap | 1.3s | 446x | 2.6 GB |
+| model | wall | RTFx | VRAM |
+| ----- | ---- | ---- | ---- |
+| granite-speech-4.1-2b | 21.3s | 169x | 8.1 GB |
+| parakeet-tdt-0.6b-v3 | 2.8s | 1307x | 4.8 GB |
 
 ## What did not work
 

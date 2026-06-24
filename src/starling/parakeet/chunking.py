@@ -165,7 +165,7 @@ class ChunkedTranscriber:
         sr: int = 16000,
         min_free_vram_gb: float = 8.0,
         chunk_batch_size: int = 32,
-        per_chunk_vram_gb: float = 2.0,
+        per_chunk_vram_gb: float = 0.15,
         vram_headroom_gb: float = 4.0,
     ) -> None:
         if overlap_seconds >= chunk_seconds:
@@ -241,7 +241,7 @@ class ChunkedTranscriber:
         ``vram_headroom_gb`` for the resident model + other GPU processes. This
         is the primary OOM defence for the batched path: it *reduces* ``B``
         (rather than aborting) when free VRAM is low. With the defaults
-        (``per_chunk_vram_gb=2.0``, ``vram_headroom_gb=4.0``) the full
+        (``per_chunk_vram_gb=0.15``, ``vram_headroom_gb=4.0``) the full
         ``chunk_batch_size=8`` is used while free VRAM >= ~20 GB and shrinks
         below that, never OOM'ing. At least ``1`` is always returned (the hard
         :attr:`min_free_vram_gb` floor in :meth:`_decode_batch` catches the

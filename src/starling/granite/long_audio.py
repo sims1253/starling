@@ -29,7 +29,7 @@ Design notes
 Public API
 ----------
 ``synthesize_long_audio(target_seconds) -> (wav, sr)``
-``chunk_audio(wav, sr, chunk_seconds) -> iterator``
+``chunk_audio(wav, sr, chunk_seconds, overlap_seconds) -> iterator``
 ``transcribe_long(pipe, processor, wav, sr, ...) -> LongTranscribeResult``
 ``transcribe_long_batched(batched_pipe, processor, wav, sr, ...) -> LongTranscribeResult``
 ``transcribe_long_stock(model, processor, wav, sr, ...) -> LongTranscribeResult``
@@ -149,6 +149,7 @@ def chunk_audio(
     wav: torch.Tensor,
     sr: int,
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    overlap_seconds: float = 0.0,
     *,
     pad_last: bool = True,
 ) -> Iterator[tuple[torch.Tensor, float, float, int]]:
@@ -158,8 +159,17 @@ def chunk_audio(
     ``chunk_seconds`` so every chunk has an identical mel-feature shape.  This
     is REQUIRED for the non-speculative path (the fused encoder is a CUDA graph
     captured for one static shape).
+
+    With ``overlap_seconds > 0`` adjacent chunks overlap by that many seconds.
+    Each chunk is still ``chunk_seconds`` long, but consecutive chunks start
+    ``chunk_seconds - overlap_seconds`` apart. The overlap region gives the
+    model boundary continuity so words straddling a chunk edge are not split.
+    The caller is responsible for deduplicating the overlap in the output text.
     """
     chunk_samples = int(round(chunk_seconds * sr))
+    step_samples = chunk_samples - int(round(overlap_seconds * sr))
+    if step_samples <= 0:
+        raise ValueError("overlap_seconds must be < chunk_seconds")
     total = int(wav.shape[1])
     pos = 0
     idx = 0
@@ -172,7 +182,9 @@ def chunk_audio(
                 chunk, (0, chunk_samples - chunk.shape[1])
             )
         yield chunk.contiguous(), pos / sr, real_end_s, idx
-        pos = end
+        if end >= total:
+            break
+        pos += step_samples
         idx += 1
 
 
@@ -181,10 +193,45 @@ def n_chunks_for(total_seconds: float, chunk_seconds: float) -> int:
     return max(1, int(-(-int(round(total_seconds)) // int(round(chunk_seconds)))))
 
 
-def _join_chunk_texts(texts: list[str]) -> str:
-    """Concatenate per-chunk transcripts, collapsing whitespace."""
-    joined = " ".join(t.strip() for t in texts if t and t.strip())
-    return " ".join(joined.split())
+def _join_chunk_texts(texts: list[str], overlap_seconds: float = 0.0) -> str:
+    """Concatenate per-chunk transcripts, deduplicating overlap regions.
+
+    Without overlap (``overlap_seconds=0``), texts are simply concatenated with
+    whitespace collapsed.
+
+    With overlap, the end of each chunk's text should partially match the
+    beginning of the next chunk's text (because the audio overlapped). We find
+    the longest matching suffix/prefix word sequence and keep only one copy.
+    This is a heuristic (not frame-accurate like parakeet's TDT-duration
+    stitching) but works well for ASR transcripts where the overlap is small
+    relative to the chunk.
+    """
+    if overlap_seconds <= 0 or len(texts) <= 1:
+        joined = " ".join(t.strip() for t in texts if t and t.strip())
+        return " ".join(joined.split())
+
+    def _words(s: str) -> list[str]:
+        return s.strip().split()
+
+    result_words: list[str] = []
+    for i, text in enumerate(texts):
+        if not text or not text.strip():
+            continue
+        words = _words(text)
+        if i == 0:
+            result_words.extend(words)
+            continue
+        # Find the longest suffix of result_words that matches a prefix of words.
+        # Limit the search to avoid O(n^2) on long transcripts.
+        max_match = min(len(result_words), len(words), 50)
+        best = 0
+        for m in range(max_match, 0, -1):
+            if result_words[-m:] == words[:m]:
+                best = m
+                break
+        result_words.extend(words[best:])
+
+    return " ".join(result_words)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +245,7 @@ def transcribe_long(
     sr: int,
     *,
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    overlap_seconds: float = 0.0,
     max_new_tokens: int = 200,
     speculative: bool = True,
     dtype: torch.dtype = torch.bfloat16,
@@ -216,7 +264,7 @@ def transcribe_long(
     texts: list[str] = []
     total_tokens = 0
     t0 = time.perf_counter()
-    for chunk_wav, start_s, end_s, idx in chunk_audio(wav, sr, chunk_seconds):
+    for chunk_wav, start_s, end_s, idx in chunk_audio(wav, sr, chunk_seconds, overlap_seconds):
         inputs = build_inputs(processor, chunk_wav, task_prompt=task_prompt)
         feats = inputs["input_features"].to(dtype)
         ids = inputs["input_ids"]
@@ -242,7 +290,7 @@ def transcribe_long(
     torch.cuda.synchronize()
     total_ms = (time.perf_counter() - t0) * 1000.0
     audio_seconds = wav.shape[1] / sr
-    full_text = _join_chunk_texts(texts)
+    full_text = _join_chunk_texts(texts, overlap_seconds)
     return LongTranscribeResult(
         text=full_text,
         chunks=chunks,
@@ -266,6 +314,7 @@ def transcribe_long_batched(
     sr: int,
     *,
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    overlap_seconds: float = 0.0,
     max_new_tokens: int = 200,
     dtype: torch.dtype = torch.bfloat16,
     task_prompt: str = DEFAULT_TASK_PROMPT,
@@ -290,7 +339,7 @@ def transcribe_long_batched(
     max_cache_len = int(getattr(batched_pipe.llm, "max_cache_len", 640))
 
     # Collect all chunks (zero-padded to chunk_seconds -> identical mel shape).
-    all_chunks = list(chunk_audio(wav, sr, chunk_seconds))
+    all_chunks = list(chunk_audio(wav, sr, chunk_seconds, overlap_seconds))
     n_chunks = len(all_chunks)
 
     chunks: list[ChunkResult] = []
@@ -335,7 +384,7 @@ def transcribe_long_batched(
     torch.cuda.synchronize()
     total_ms = (time.perf_counter() - t0) * 1000.0
     audio_seconds = wav.shape[1] / sr
-    full_text = _join_chunk_texts(texts)
+    full_text = _join_chunk_texts(texts, overlap_seconds)
     return LongTranscribeResult(
         text=full_text,
         chunks=chunks,
@@ -359,6 +408,7 @@ def transcribe_long_stock(
     sr: int,
     *,
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    overlap_seconds: float = 0.0,
     max_new_tokens: int = 200,
     dtype: torch.dtype = torch.bfloat16,
     task_prompt: str = DEFAULT_TASK_PROMPT,
@@ -376,7 +426,7 @@ def transcribe_long_stock(
     texts: list[str] = []
     total_tokens = 0
     t0 = time.perf_counter()
-    for chunk_wav, start_s, end_s, idx in chunk_audio(wav, sr, chunk_seconds):
+    for chunk_wav, start_s, end_s, idx in chunk_audio(wav, sr, chunk_seconds, overlap_seconds):
         inputs = build_inputs(processor, chunk_wav, task_prompt=task_prompt)
         feats = inputs["input_features"].to(dtype)
         ids = inputs["input_ids"]
@@ -403,7 +453,7 @@ def transcribe_long_stock(
     torch.cuda.synchronize()
     total_ms = (time.perf_counter() - t0) * 1000.0
     audio_seconds = wav.shape[1] / sr
-    full_text = _join_chunk_texts(texts)
+    full_text = _join_chunk_texts(texts, overlap_seconds)
     return LongTranscribeResult(
         text=full_text,
         chunks=chunks,

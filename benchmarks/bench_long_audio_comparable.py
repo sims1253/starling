@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "tests" / "fixtures"))
 
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
-AUDIO_SECONDS = 600  # 10 minutes
+AUDIO_SECONDS = 3600  # 1 hour
 SR = 16000
 OUTPUTS = REPO / "outputs"
 
@@ -77,7 +77,7 @@ def main() -> int:
         eta_min=10, note="comparable long-audio bench",
     ):
         # ---- granite ---- #
-        print("\n========== granite-speech (B=32, 30s chunks) ==========")
+        print("\n========== granite-speech (B=32, 30s+2s overlap) ==========")
         from starling.granite.audio import load_sample_audio as _lsa
         from starling.granite.batched import BatchedPipeline
         from starling.granite.long_audio import transcribe_long_batched
@@ -91,7 +91,7 @@ def main() -> int:
         torch.cuda.synchronize()
         import time
         t0 = time.perf_counter()
-        gran_res = transcribe_long_batched(pipe, proc, gran_wav, SR, chunk_seconds=30.0)
+        gran_res = transcribe_long_batched(pipe, proc, gran_wav, SR, chunk_seconds=30.0, overlap_seconds=2.0)
         torch.cuda.synchronize()
         gran_wall = time.perf_counter() - t0
         gran_vram = torch.cuda.max_memory_allocated() / 1e9
@@ -101,7 +101,7 @@ def main() -> int:
               f"chunks={gran_res.n_chunks}  tokens={gran_res.total_tokens}  "
               f"VRAM={gran_vram:.2f}GB")
         results["models"]["granite_speech"] = {
-            "mode": "batched B=32, 30s chunks",
+            "mode": "batched B=32, 30s+2s overlap",
             "wall_s": round(gran_wall, 2),
             "rtfx": round(gran_rtfx, 1),
             "n_chunks": gran_res.n_chunks,
