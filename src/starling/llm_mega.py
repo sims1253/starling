@@ -42,22 +42,15 @@ is masked out by the 4D mask and overwritten before it is ever read.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
 from .config import (
-    LLM_ATTENTION_MULTIPLIER,
     LLM_EMBEDDING_MULTIPLIER,
     LLM_EOS_TOKEN_ID,
-    LLM_HEAD_DIM,
     LLM_LOGITS_SCALING,
-    LLM_NUM_ATTN_HEADS,
-    LLM_NUM_KV_HEADS,
-    LLM_NUM_LAYERS,
-    LLM_RMS_NORM_EPS,
-    LLM_RESIDUAL_MULTIPLIER,
 )
 
 # ---------------------------------------------------------------------------

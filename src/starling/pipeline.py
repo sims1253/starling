@@ -102,17 +102,7 @@ class MegaPipeline:
         #     ``multistep_graph`` (byte-exact, default on) selects the K-step
         #     CUDA-graph decoder for lower per-token sync overhead; otherwise
         #     fall back to the single-step fused/model-forward decoder.
-        #     ``quantized_weights`` (tolerance mode only) selects the weight-only
-        #     INT8 decoder (:class:`starling.quant.QuantLLMMega`).
-        if flags.quantized_weights:
-            from .quant import QuantLLMMega
-
-            self.llm = QuantLLMMega(
-                comps["language_model"],
-                model.lm_head,
-                max_cache_len=640,
-            )
-        elif flags.multistep_graph:
+        if flags.multistep_graph:
             from .multistep import MultiStepLLMMega
 
             self.llm = MultiStepLLMMega(

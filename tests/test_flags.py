@@ -23,10 +23,9 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from starling.flags import OptFlags, flags, get_default_flags, set_default_flags  # noqa: E402
-from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
+from starling.flags import OptFlags, flags, get_default_flags  # noqa: E402
 from starling.golden import load_golden  # noqa: E402
-from starling.loader import get_components, load_model_and_processor  # noqa: E402
+from starling.loader import load_model_and_processor  # noqa: E402
 
 _MODEL = None
 _PROC = None

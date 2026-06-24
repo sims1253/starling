@@ -28,7 +28,6 @@ Run:  uv run python benchmarks/parakeet/bench_decode.py
 from __future__ import annotations
 
 import json
-import statistics
 import sys
 import time
 import warnings

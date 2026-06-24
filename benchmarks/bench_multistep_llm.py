@@ -32,7 +32,6 @@ Run:  uv run python benchmarks/bench_multistep_llm.py
 from __future__ import annotations
 
 import json
-import statistics
 import sys
 import time
 import warnings
@@ -132,7 +131,6 @@ def main() -> int:
     T = inputs_embeds.shape[1]
     n_decode = MAX_NEW_TOKENS - 1  # 99 decode steps after the prefill token
 
-    all_configs = []
     print("\n[bench] acquiring GPU lock ...")
     with with_gpu_lock(
         session="llm-multistep", model="granite-speech-4.1-2b",
@@ -185,11 +183,11 @@ def main() -> int:
 
                 # time the full decode loop (prefill excluded): all n_chunks
                 # K-step replays, each with one host sync (.tolist()).
-                def _full_loop():
-                    decoder._reset_to_chunk_start(T, first_tok)
-                    for _c in range(n_chunks):
-                        decoder._ms_graph.replay()
-                        _ = decoder.output_ids.tolist()
+                def _full_loop(d=decoder, T_=T, ft=first_tok, nc=n_chunks):
+                    d._reset_to_chunk_start(T_, ft)
+                    for _c in range(nc):
+                        d._ms_graph.replay()
+                        _ = d.output_ids.tolist()
 
                 loop_ms, loop_p90, _ = _time_cuda(_full_loop)
                 single_gpu = _time_single_replay(decoder)

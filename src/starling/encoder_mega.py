@@ -3,7 +3,7 @@
 This module reimplements the forward path of
 :class:`transformers.models.granite_speech.modeling_granite_speech.GraniteSpeechCTCEncoder`
 as a tight, fusion-friendly Python fast path that reuses the stock weights
-(inference only) and exposes four acceleration strategies:
+(inference only) and exposes two acceleration strategies:
 
 * ``mode="eager"``     -- a clean reimplementation that drops the transformers
   decorator overhead (``@capture_outputs`` / ``@merge_with_config_defaults``),
@@ -13,25 +13,11 @@ as a tight, fusion-friendly Python fast path that reuses the stock weights
   ``torch.cuda.CUDAGraph`` (after a side-stream warmup). Every per-layer kernel
   launch (LayerNorm, GEMM, conv, SiLU, residual add, attention) collapses into
   a single ``graph.replay()``. **Byte-exact** vs stock, zero Python overhead.
-  This is the recommended default and the fastest byte-faithful path.
-* ``mode="compile"``   -- wraps the eager forward in ``torch.compile``. Inductor
-  fuses the elementwise glue aggressively but upcasts some attention intermediates
-  to fp32, so the output is numerically close but NOT bitwise identical to the
-  bf16 golden reference (see benchmark / test output for the actual diff).
-* ``mode="triton"``    -- additionally swaps the conformer FFN half-residual
-  glue (LayerNorm + SiLU + 0.5-scale + residual-add) and the conv-module
-  BatchNorm+SiLU for hand-written :mod:`triton` kernels. GEMMs and cuDNN convs
-  stay as torch ops (they are already optimal). Stride-aware so it handles the
-  conv module's non-contiguous ``permute`` output without an extra copy.
-
-The output is numerically faithful to the eager golden reference
-(``golden/encoder_last_hidden.pt``). The ``eager`` and ``cudagraph`` modes are
-byte-exact (0.0 diff); ``compile``/``triton`` stay within
-:data:`starling.config.ENCODER_ATOL`.
+  This is the recommended default and the fastest path.
 
 Public API
 ----------
-``FusedEncoder(encoder, mode=..., compile_mode=..., compile_fullgraph=...)``
+``FusedEncoder(encoder, mode="cudagraph")``
 ``FusedEncoder.forward(input_features) -> last_hidden_state``  (1, T, 1024) bf16
 """
 
@@ -54,29 +40,21 @@ class FusedEncoder(nn.Module):
         The stock transformers encoder module. All weights/buffers are
         referenced (not copied) from its submodules, so this module shares
         parameters with the original.
-    mode : {"eager", "cudagraph", "compile", "triton"}
+    mode : {"eager", "cudagraph"}
         Acceleration strategy (see module docstring). ``"cudagraph"`` is the
         recommended default (byte-exact + zero launch overhead).
-    compile_mode : str
-        ``torch.compile`` mode (only used when ``mode`` is ``"compile"`` or
-        ``"triton"``). Use ``"reduce-overhead"`` for CUDA-graph capture or
-        ``"max-autotune"`` for aggressive kernel autotuning.
-    compile_fullgraph : bool
-        Whether to require a single compiled graph (no graph breaks).
     """
 
     def __init__(
         self,
         encoder,
         mode: str = "cudagraph",
-        compile_mode: str = "max-autotune",
-        compile_fullgraph: bool = True,
     ) -> None:
         super().__init__()
 
-        if mode not in ("eager", "cudagraph", "compile", "triton"):
+        if mode not in ("eager", "cudagraph"):
             raise ValueError(
-                f"unknown mode {mode!r}; expected eager/cudagraph/compile/triton"
+                f"unknown mode {mode!r}; expected eager/cudagraph"
             )
 
         # --- pull submodules (shared weights, no copy) ---------------------- #
@@ -135,31 +113,11 @@ class FusedEncoder(nn.Module):
 
         # --- dispatch config ------------------------------------------------- #
         self.mode = mode
-        self.compile_mode = compile_mode
-        self.compile_fullgraph = compile_fullgraph
-        self._compiled_forward = None
-        if mode == "compile":
-            self._compiled_forward = torch.compile(
-                self._forward_impl,
-                mode=compile_mode,
-                fullgraph=compile_fullgraph,
-                dynamic=False,
-            )
-        elif mode == "triton":
-            self._compiled_forward = torch.compile(
-                self._forward_triton,
-                mode=compile_mode,
-                fullgraph=compile_fullgraph,
-                dynamic=False,
-            )
 
         # --- CUDA graph capture state (mode="cudagraph") --------------------- #
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._static_input: Optional[torch.Tensor] = None
         self._static_output: Optional[torch.Tensor] = None
-
-        # Triton kernels are loaded lazily (only needed for mode="triton").
-        self._tk = None
 
     # ----------------------------------------------------------------------- #
     # block-mask preparation (called OUTSIDE compiled/captured regions)
@@ -208,10 +166,6 @@ class FusedEncoder(nn.Module):
 
         if self.mode == "cudagraph":
             return self._forward_cudagraph(input_features)
-        if self._compiled_forward is not None:
-            return self._compiled_forward(input_features)
-        if self.mode == "triton":
-            return self._forward_triton(input_features)
         return self._forward_impl(input_features)
 
     # ----------------------------------------------------------------------- #
@@ -278,74 +232,6 @@ class FusedEncoder(nn.Module):
         x = x + _conv_forward(layer.conv, x)
         # ff2 half-step
         x = x + 0.5 * _ff_forward(layer.ff2, x)
-        # post norm
-        x = layer.post_norm(x)
-        return x
-
-    # ----------------------------------------------------------------------- #
-    # triton fast path (swaps FFN glue + residual-adds for triton kernels)
-    # ----------------------------------------------------------------------- #
-    def _ensure_triton(self):
-        if self._tk is None:
-            from . import triton_kernels as _tk
-            self._tk = _tk
-
-    def _forward_triton(self, input_features: torch.Tensor) -> torch.Tensor:
-        self._ensure_triton()
-        tk = self._tk
-        x = self.input_linear(input_features)
-        for idx in range(self.num_layers):
-            x = self._block_triton(idx, x, tk)
-            if (idx + 1) == self.mid_idx:
-                mid = self.out(x)
-                x = x + self.out_mid(_softmax_last_dim(mid))
-        return x
-
-    def _block_triton(self, idx: int, x: torch.Tensor, tk) -> torch.Tensor:
-        layer = self.layers[idx]
-        ff = layer.ff1
-        # --- ff1: LayerNorm -> (cuBLAS up_proj) -> SiLU -> (cuBLAS down_proj)
-        #         -> 0.5x scale -> residual add.
-        #
-        # NOTE on numerics: the conv module's BatchNorm has running_var as small
-        # as 4e-10 (rstd up to 316x), which amplifies ANY difference in the
-        # residual stream (from ANY upstream op, not just the conv module's own
-        # LayerNorm) by 316x per block. Over 16 blocks this makes the encoder
-        # numerically fragile: every op must be byte-exact vs the stock path.
-        # We therefore use torch's native layer_norm + batch_norm (which ARE
-        # byte-exact vs stock) and reserve the triton kernels for the
-        # elementwise glue (SiLU, residual scale-add, add) that is provably
-        # byte-exact (verified 0.0 diff vs F.silu / torch.add). The triton
-        # fused_layernorm / fused_batchnorm_silu kernels remain available in
-        # triton_kernels.py for experimentation / non-amplified architectures.
-        normed = ff.pre_norm(x)
-        up = ff.up_proj(normed)
-        act = tk.fused_silu(up)
-        down = ff.down_proj(act)
-        x = tk.fused_residual_scale_add(x, down, 0.5)
-
-        # attention (same as eager -- SDPA is already one launch)
-        attn_out = self._attn_forward(idx, layer.attn, x)
-        x = tk.fused_add(x, attn_out)
-
-        # conv module (cuDNN convs stay; torch layernorm + batchnorm for exactness)
-        conv = layer.conv
-        h = conv.norm(x)
-        h = conv.up_conv(h.permute(0, 2, 1))
-        h = conv.glu(h)
-        h = conv.depth_conv(h)
-        h = F.silu(conv.batch_norm(h))
-        h = conv.down_conv(h).permute(0, 2, 1)
-        x = tk.fused_add(x, h)
-
-        # ff2 (same byte-exact glue as ff1)
-        ff = layer.ff2
-        normed = ff.pre_norm(x)
-        up = ff.up_proj(normed)
-        act = tk.fused_silu(up)
-        down = ff.down_proj(act)
-        x = tk.fused_residual_scale_add(x, down, 0.5)
-
         # post norm
         x = layer.post_norm(x)
         return x

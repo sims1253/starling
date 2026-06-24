@@ -6,10 +6,7 @@ asserts:
   * max(abs(out - golden)) < ENCODER_ATOL  (2e-2)
   * mean(abs(out - golden)) < 5e-3
 
-The ``eager``, ``cudagraph``, and ``triton`` modes are byte-exact (0.0 diff)
-and must pass. The ``compile`` mode uses fp32 attention intermediates (inductor)
-and is numerically close but not bitwise identical; it is tested separately
-with a relaxed assertion + a printed diff.
+The ``eager`` and ``cudagraph`` modes are byte-exact (0.0 diff) and must pass.
 
 Run with:  uv run pytest tests/test_encoder_mega.py -q
 """
@@ -32,7 +29,6 @@ from starling.loader import get_components, load_model_and_processor  # noqa: E4
 from starling.audio import build_inputs, load_sample_audio  # noqa: E402
 
 _MEAN_TOL = 5e-3
-_COMPILE_RELAXED_ATOL = 5.0  # compile changes attention precision; report, don't fail
 
 # Cached across tests (model load is ~25s).
 _MODEL_CACHE: dict = {}
@@ -113,44 +109,6 @@ def test_cudagraph_matches_golden(encoder, input_features):
     _check_against_golden(out2, "cudagraph(run2)")
 
 
-def test_triton_matches_golden(encoder, input_features):
-    """Triton mode uses byte-exact elementwise kernels — byte-exact."""
-    fe = FusedEncoder(encoder, mode="triton").cuda()
-    fe._compiled_forward = None  # pure triton (no torch.compile wrapper)
-    with torch.inference_mode():
-        out = fe(input_features)
-    _check_against_golden(out, "triton")
-
-
-@pytest.mark.compile
-def test_compile_numerically_close(encoder, input_features):
-    """torch.compile changes attention precision (fp32 intermediates).
-
-    This mode is numerically close but NOT byte-exact; we assert it stays
-    within a relaxed tolerance and print the actual diff for visibility.
-
-    Gated behind the ``compile`` marker: ``torch.compile(mode="max-autotune-
-    no-cudagraphs")`` benchmarks candidate kernels on the GPU and takes minutes.
-    Run with ``pytest --runcompile``.
-    """
-    fe = FusedEncoder(
-        encoder, mode="compile", compile_mode="max-autotune-no-cudagraphs"
-    ).cuda()
-    with torch.inference_mode():
-        _ = fe(input_features)  # compile
-        torch.cuda.synchronize()
-        out = fe(input_features)
-    golden = _get_golden()
-    diff = (out.float() - golden.float()).abs()
-    max_d = diff.max().item()
-    mean_d = diff.mean().item()
-    print(f"[compile(max-autotune)] max abs diff = {max_d:.6e}  mean abs diff = {mean_d:.6e}")
-    # Relaxed: just ensure it's not producing NaNs / garbage.
-    assert max_d < _COMPILE_RELAXED_ATOL, (
-        f"compile: max abs diff {max_d:.4e} >= relaxed {_COMPILE_RELAXED_ATOL}"
-    )
-
-
 def test_cudagraph_shape_validation(encoder, input_features):
     """CUDA graph mode rejects inputs of a different shape than captured."""
     fe = FusedEncoder(encoder, mode="cudagraph").cuda()
@@ -167,22 +125,14 @@ if __name__ == "__main__":
     # Quick numeric report when run as a script.
     enc = _get_encoder()
     feats = _get_input_features()
-    for mode, kw in [
-        ("eager", {}),
-        ("cudagraph", {}),
-        ("triton", {}),
-        ("compile", {"compile_mode": "max-autotune-no-cudagraphs"}),
-    ]:
-        tag = f"{mode}" + (f"/{kw.get('compile_mode', '')}" if kw else "")
+    for mode in ["eager", "cudagraph"]:
         try:
-            fe = FusedEncoder(enc, mode=mode, **kw).cuda()
-            if mode == "triton":
-                fe._compiled_forward = None
+            fe = FusedEncoder(enc, mode=mode).cuda()
             with torch.inference_mode():
                 _ = fe(feats)
                 torch.cuda.synchronize()
                 out = fe(feats)
-            _check_against_golden(out, tag)
-            print(f"  -> {tag}: PASS")
+            _check_against_golden(out, mode)
+            print(f"  -> {mode}: PASS")
         except Exception as e:  # noqa: BLE001
-            print(f"  -> {tag}: FAIL ({e!r})")
+            print(f"  -> {mode}: FAIL ({e!r})")

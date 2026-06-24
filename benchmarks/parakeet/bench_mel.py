@@ -31,7 +31,6 @@ Run:  uv run python benchmarks/parakeet/bench_mel.py
 from __future__ import annotations
 
 import json
-import statistics
 import subprocess
 import sys
 import time

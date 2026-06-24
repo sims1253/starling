@@ -32,7 +32,6 @@ import time
 import warnings
 from pathlib import Path
 
-import numpy as np
 import torch
 from tabulate import tabulate
 from transformers import AutoModelForTDT, AutoProcessor

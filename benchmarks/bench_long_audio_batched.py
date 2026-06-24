@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 import warnings
 from pathlib import Path
 
@@ -30,7 +29,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from starling.batched import BatchedPipeline  # noqa: E402
-from starling.config import DEFAULT_TASK_PROMPT  # noqa: E402
 from starling.loader import load_model_and_processor  # noqa: E402
 from starling.long_audio import (  # noqa: E402
     synthesize_long_audio,

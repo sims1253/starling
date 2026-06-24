@@ -44,7 +44,7 @@ Public API
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -654,25 +654,13 @@ class BatchedPipeline:
         # BatchedFusedLLMMega (fused Triton elementwise kernels) is the default
         # for maximum throughput; BatchedLLMMega (model's own forward) is the
         # simpler fallback.  Both are byte-exact per stream vs batch=1.
-        # ``quantized_weights`` (tolerance mode) selects the weight-only INT8
-        # decoder (:class:`starling.quant.BatchedQuantLLMMega`).
-        if flags.quantized_weights:
-            from .quant import BatchedQuantLLMMega
-
-            self.llm = BatchedQuantLLMMega(
-                comps["language_model"],
-                model.lm_head,
-                max_cache_len=max_cache_len,
-                max_batch_size=self.max_batch_size,
-            )
-        else:
-            llm_cls = BatchedFusedLLMMega if use_fused_llm else BatchedLLMMega
-            self.llm = llm_cls(
-                comps["language_model"],
-                model.lm_head,
-                max_cache_len=max_cache_len,
-                max_batch_size=self.max_batch_size,
-            )
+        llm_cls = BatchedFusedLLMMega if use_fused_llm else BatchedLLMMega
+        self.llm = llm_cls(
+            comps["language_model"],
+            model.lm_head,
+            max_cache_len=max_cache_len,
+            max_batch_size=self.max_batch_size,
+        )
         self.use_fused_llm = use_fused_llm
 
     # ------------------------------------------------------------------ #
@@ -875,7 +863,7 @@ def main() -> int:
     import time
 
     from .audio import build_inputs, load_sample_audio
-    from .golden import load_golden, load_golden_text
+    from .golden import load_golden_text
     from .loader import load_model_and_processor
 
     B = 4
@@ -905,7 +893,6 @@ def main() -> int:
     # correctness vs golden
     golden_text = load_golden_text().strip()
     golden_resp = golden_text.split("ASSISTANT:", 1)[1].strip()
-    golden_gen = load_golden("greedy_ids.pt")[0, 271:]
     print(f"\n[batched] golden response (first 120): {golden_resp[:120]!r}")
     print(f"[batched] all streams match golden text: "
           f"{all(t.strip() == golden_resp for t in texts)}")

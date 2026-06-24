@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 import warnings
 from pathlib import Path
 
@@ -108,14 +107,12 @@ def main() -> int:
                 )
                 for seconds in AUDIO_LENGTHS:
                     wav, sr = synthesize_long_audio(seconds)
-                    t0 = time.perf_counter()
                     res = transcribe_long_batched(
                         batched_pipe, proc, wav, sr,
                         chunk_seconds=chunk_s,
                         max_new_tokens=MAX_NEW_TOKENS,
                     )
                     torch.cuda.synchronize()
-                    wall = time.perf_counter() - t0
                     print(f"[bat B={B:<2}] {seconds}s chunk={chunk_s:.0f}s  "
                           f"RTFx={res.rtfx:.1f}x  wall={res.total_ms:.0f}ms  "
                           f"tok={res.total_tokens}")

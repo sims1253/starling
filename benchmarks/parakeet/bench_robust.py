@@ -665,7 +665,7 @@ def main() -> int:
                 try:
                     T_enc, dec_steps, per_utt_tok, _txt = count_decode(
                         pipe, audio_list)
-                except Exception as e:
+                except Exception:
                     T_enc, dec_steps, per_utt_tok = -1, -1, []
                 audio_secs_list = [len(a)/SAMPLE_RATE for a in audio_list]
                 row = {

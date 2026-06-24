@@ -26,7 +26,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from starling.audio import build_inputs, load_sample_audio  # noqa: E402
-from starling.config import ENCODER_ATOL, TRACES_DIR  # noqa: E402
+from starling.config import ENCODER_ATOL  # noqa: E402
 from starling.encoder_mega import FusedEncoder  # noqa: E402
 from starling.golden import load_golden  # noqa: E402
 from starling.loader import get_components, load_model_and_processor  # noqa: E402
@@ -98,27 +98,18 @@ def main() -> int:
     # ---- fused modes ----
     fused_configs = [
         ("eager", {}, "clean reimplementation (byte-exact)"),
-        ("cudagraph", {}, "manual CUDA-graph capture (byte-exact) *** WINNER ***"),
-        ("triton", {"_no_compile": True}, "triton elementwise kernels, no compile (byte-exact)"),
-        ("triton", {"compile_mode": "max-autotune-no-cudagraphs"},
-         "triton kernels + torch.compile (byte-exact)"),
-        ("compile", {"compile_mode": "max-autotune-no-cudagraphs"},
-         "torch.compile max-autotune (fp32 attn intermediates)"),
+        ("cudagraph", {}, "manual CUDA-graph capture (byte-exact)"),
     ]
 
     for mode, kw, notes in fused_configs:
-        no_compile = kw.pop("_no_compile", False)
-        compile_tag = kw.get("compile_mode", "")
-        label = f"{mode}" + (f"({compile_tag})" if compile_tag else ("(no-compile)" if no_compile else ""))
+        label = mode
         print(f"[bench] timing FusedEncoder mode={label} ...")
         try:
             fe = FusedEncoder(encoder, mode=mode, **kw).cuda()
-            if no_compile:
-                fe._compiled_forward = None  # pure triton, bypass torch.compile
             with torch.inference_mode():
                 out = fe(feats)
                 torch.cuda.synchronize()
-                med, mn = cuda_timer(lambda: fe(feats))
+                med, mn = cuda_timer(lambda f=fe: f(feats))
                 d = diff_vs_golden(out, golden)
             results.append({
                 "name": f"fused:{label}",

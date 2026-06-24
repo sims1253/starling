@@ -27,7 +27,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
