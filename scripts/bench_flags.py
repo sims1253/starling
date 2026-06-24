@@ -117,8 +117,8 @@ def bench_single_stream(model, proc, comps, inputs_embeds, audio_seconds):
         print(f"{label:<30}{gpu_ms_pt:>12.3f}{wall_med:>12.1f}{tps:>12.1f}"
               f"{audio_seconds / (wall_med / 1000.0):>10.2f}x{speedup:>10.2f}x")
 
-    print(f"\n  GPU ms/tok = pure CUDA-graph replay / token (excludes host sync).")
-    print(f"  wall ms    = full generate() loop (includes all host<->device syncs).")
+    print("\n  GPU ms/tok = pure CUDA-graph replay / token (excludes host sync).")
+    print("  wall ms    = full generate() loop (includes all host<->device syncs).")
 
 
 # =========================================================================== #

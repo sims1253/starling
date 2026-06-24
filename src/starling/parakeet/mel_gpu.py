@@ -193,7 +193,6 @@ class GpuMelExtractor:
         B, L_max = waveform.shape
         device = waveform.device
         hop = self.hop_length
-        n_fft = self.n_fft
 
         # ---- Step 2: pre-emphasis IIR (per-utterance, then mask padding) ----
         #   y[:, 0] = x[:, 0]

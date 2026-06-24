@@ -160,7 +160,7 @@ def fmt_table(rows: list[dict]) -> str:
 def write_analysis(profile: dict, headline: dict) -> str:
     """Write a short hotspot analysis to profile_analysis.md and return it."""
     pct = profile["bucket_pct"]
-    buckets = profile["buckets"]
+    profile["buckets"]
     ranked = sorted(pct.items(), key=lambda kv: kv[1], reverse=True)
     top3 = ranked[:3]
     total_cuda_ms = profile["total_cuda_time_us"] / 1000.0

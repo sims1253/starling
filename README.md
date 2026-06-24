@@ -12,6 +12,8 @@ RMSNorm/SwiGLU, the attention mask, and (for the LLM model) whole multi-step
 token loops. Output is byte-identical to the eager `transformers` reference, so
 there is no accuracy trade-off, just fewer round trips to the GPU.
 
+Most props go to GLM 5.2
+
 ## Models
 
 Both do speech-to-text.
@@ -54,26 +56,38 @@ once.
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
 
-### Long audio (1 hour)
+### Long audio (30-90 min)
 
-Both models transcribing the same 1-hour clip, each using B=32 batched chunked
-decode with 30s chunks and 2s overlap. Granite uses text-level overlap dedup;
-parakeet uses frame-aligned TDT-duration stitching.
+Both models transcribing the same tiled audio at each duration, using their
+strongest batched config (found via a B-size sweep). 5 repeats per cell, mean
+reported. Granite uses text-level overlap dedup; parakeet uses frame-aligned
+TDT-duration stitching. 30s chunks, 2s overlap.
 
-| model | wall | RTFx | VRAM |
-| ----- | ---- | ---- | ---- |
-| granite-speech-4.1-2b | 21.3s | 169x | 8.1 GB |
-| parakeet-tdt-0.6b-v3 | 2.8s | 1307x | 4.8 GB |
+Granite peaks at B=48 (batch sweep winner: B=16 216x, B=32 248x, B=48 275x,
+B=64 241x at 60min). Parakeet peaks at B=32 (B=48 is 10% slower, B=64 OOMs).
 
-## Planned features
+| model | config | 30 min | 60 min | 90 min | VRAM |
+| ----- | ------ | ------ | ------ | ------ | ---- |
+| granite-speech-4.1-2b | B=48 | 8.98s (200x) | 13.4s (268x) | 21.3s (253x) | 9.7 GB |
+| parakeet-tdt-0.6b-v3 | B=32 | 0.47s (3742x) | 0.95s (3808x) | 1.42s (3817x) | 2.9 GB |
 
-- Batched spec version for granite
+Parakeet steady-state numbers (graph warmup excluded). Parakeet is ~14x faster
+than granite on long-form while using 3.3x less VRAM.
+
+### Speculative decoding
+
+Granite's self-speculative path drafts tokens from the encoder's CTC head and
+verifies them with the LLM in multi-token forwards. At B=1 it gives a 1.65x
+speedup over non-spec greedy (292 vs 177 tok/s). At B>=16 the GEMMs are large
+enough that speculation wastes more compute than it saves (measured 0.76x
+regression at B=32), so batched decoding always uses the non-spec path.
 
 ## What did not work
 
 - INT8 weight-only quant is slower. Decode is launch-bound, not bandwidth-bound, so halving weight traffic does not help.
 - FP8 `_scaled_mm` is also slower, for the same reason.
 - `torch.compile` on the encoder is not byte-exact: inductor upcasts attention to fp32 and the conformer's BatchNorm amplifies the difference.
+- Batched spec decoding at B>=16 is slower than non-spec (0.76x). The lock-step cache rewind wastes verify work when streams have differing acceptance.
 
 ## Requirements
 

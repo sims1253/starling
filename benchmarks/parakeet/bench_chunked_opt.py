@@ -200,12 +200,16 @@ def main() -> int:
 
     def cuda_med(fn, iters=15):
         for _ in range(3):
-            fn(); torch.cuda.synchronize()
+            fn()
+            torch.cuda.synchronize()
         ts = []
         for _ in range(iters):
             s = torch.cuda.Event(enable_timing=True)
             e = torch.cuda.Event(enable_timing=True)
-            s.record(); fn(); e.record(); torch.cuda.synchronize()
+            s.record()
+            fn()
+            e.record()
+            torch.cuda.synchronize()
             ts.append(s.elapsed_time(e))
         return statistics.median(ts)
 

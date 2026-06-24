@@ -12,7 +12,7 @@ Parakeet uses ChunkedTranscriber (B=32, 30s+2s overlap, frame-aligned stitch).
 Both run on the same tiled audio so the workload is identical. The only
 difference is the model architecture and chunking strategy.
 
-Run:  cd /home/m0hawk/Documents/megapar && .venv/bin/python benchmarks/bench_long_audio_comparable.py
+Run:  cd /home/m0hawk/Documents/starling && uv run benchmarks/bench_long_audio_comparable.py
 """
 
 from __future__ import annotations
@@ -78,7 +78,6 @@ def main() -> int:
     ):
         # ---- granite ---- #
         print("\n========== granite-speech (B=32, 30s+2s overlap) ==========")
-        from starling.granite.audio import load_sample_audio as _lsa
         from starling.granite.batched import BatchedPipeline
         from starling.granite.long_audio import transcribe_long_batched
         from starling.granite.loader import load_model_and_processor

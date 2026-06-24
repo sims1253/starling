@@ -857,7 +857,6 @@ class BatchedPipeline:
             res.n_streams = n
         return res
 
-
 def main() -> int:
     """Quick CLI smoke: batched-transcribe 4 copies of the sample audio."""
     import time

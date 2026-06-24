@@ -253,12 +253,10 @@ def measure_config(
 
     # ---- warmup (captures the per-shape graphs on first call; allowed to be
     # slow because capture is amortised setup, not steady state) ----
-    last_texts = None
     for w in range(warmup):
         torch.cuda.synchronize()
         texts, _t = pipe.transcribe_with_timing(audio_list)
         torch.cuda.synchronize()
-        last_texts = texts
 
     # ---- timed samples (median); steady-state compute-ceiling check here ----
     mel_s, enc_s, dec_s, tot_s, vram_s = [], [], [], [], []
@@ -271,8 +269,10 @@ def measure_config(
         _texts, t = pipe.transcribe_with_timing(audio_list)
         torch.cuda.synchronize()
         pass_wall = time.perf_counter() - pass_t0
-        mel_s.append(t["mel_ms"]); enc_s.append(t["encoder_ms"])
-        dec_s.append(t["decode_ms"]); tot_s.append(t["total_ms"])
+        mel_s.append(t["mel_ms"])
+        enc_s.append(t["encoder_ms"])
+        dec_s.append(t["decode_ms"])
+        tot_s.append(t["total_ms"])
         vram_s.append(torch.cuda.max_memory_allocated() / 1e9)
         n += 1
         # steady-state per-pass > cap -> compute ceiling (after >=1 real sample)
@@ -295,8 +295,10 @@ def measure_config(
             torch.cuda.reset_peak_memory_stats()
             _texts, t = pipe.transcribe_with_timing(audio_list)
             torch.cuda.synchronize()
-            mel_s.append(t["mel_ms"]); enc_s.append(t["encoder_ms"])
-            dec_s.append(t["decode_ms"]); tot_s.append(t["total_ms"])
+            mel_s.append(t["mel_ms"])
+            enc_s.append(t["encoder_ms"])
+            dec_s.append(t["decode_ms"])
+            tot_s.append(t["total_ms"])
             vram_s.append(torch.cuda.max_memory_allocated() / 1e9)
             n += 1
 
@@ -401,8 +403,6 @@ def main() -> int:
         "comprehensive_metrics": {},
         "real_vs_synthetic": {},
     }
-    headline_synth_b8 = None   # filled from sweep B8 at 22.3s? no -> re-measure medium
-    real_b8_measured = None
     longest_single_clip = None  # (length_min, measured_dict, counts)
 
     print("[bench_robust] acquiring GPU lock ...")
@@ -436,7 +436,6 @@ def main() -> int:
                                       long_clip=False)
         sT_enc, s_steps, s_per_utt_tok, _ = count_decode(pipe, [medium] * 8)
         synth_b8.update({"T_enc": sT_enc, "decode_steps": s_steps})
-        headline_synth_b8 = synth_b8
         print(f"  [synth B8 medium] total={synth_b8['total_ms']:7.1f}ms "
               f"enc={synth_b8['encoder_ms']:6.1f} dec={synth_b8['decode_ms']:6.1f} "
               f"rtf={synth_b8['rtf']:8.1f}x T_enc={sT_enc} steps={s_steps}")
@@ -449,7 +448,6 @@ def main() -> int:
               f"enc={real_measured['encoder_ms']:6.1f} "
               f"dec={real_measured['decode_ms']:6.1f} "
               f"rtf={real_measured['rtf']:8.1f}x T_enc={rT_enc} steps={r_steps}")
-        real_b8_measured = real_measured
 
         # real per-utterance B=1 latency distribution (true per-utterance)
         per_utt_b1 = []

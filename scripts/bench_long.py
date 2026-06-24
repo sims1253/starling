@@ -26,7 +26,6 @@ Usage:
 from __future__ import annotations
 
 import json
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -341,8 +340,8 @@ def _print_table(rows: list[dict], sample_dur: float) -> None:
     extrap = [r for r in rows if r["stock_extrapolated"]]
     if extrap:
         print("Note: stock ms/RTFx for durations > 60s are LINEAR EXTRAPOLATIONS")
-        print(f"      from the real stock 60s run "
-              f"(per-chunk constant; each chunk is independent).")
+        print("      from the real stock 60s run "
+              "(per-chunk constant; each chunk is independent).")
     print("=" * 104)
 
 

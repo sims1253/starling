@@ -244,6 +244,26 @@ class MegaPipeline:
         )[0]
         return text, res.ids
 
+    def prewarm(self, speculative: bool = True) -> None:
+        """Pre-capture CUDA graphs and lazy-init spec components.
+
+        The encoder graph, LLM decode graph, and (if spec) CTC draft extractor
+        are lazily initialized on first call.  This method runs a short dummy
+        transcribe to pay all capture/init costs upfront, eliminating
+        first-utterance latency for live/streaming use.
+        """
+        from .audio import build_inputs, load_sample_audio
+        wav, sr = load_sample_audio()
+        wi = build_inputs(self.processor, wav[:, : int(5.0 * sr)])
+        self.transcribe(
+            wi["input_features"].bfloat16(),
+            wi["input_ids"],
+            wi.get("input_features_mask"),
+            max_new_tokens=10,
+            speculative=speculative,
+        )
+        torch.cuda.synchronize()
+
     # ------------------------------------------------------------------ #
     # speculative decoding path
     # ------------------------------------------------------------------ #

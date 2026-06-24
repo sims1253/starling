@@ -206,7 +206,7 @@ def main() -> int:
 
                     # full decode-loop wall time (the headline replay_ms)
                     replay_ms, replay_p90, _ = _time_cuda(
-                        lambda: gd._run_loop(pooler, valid_lengths)
+                        lambda g=gd: g._run_loop(pooler, valid_lengths)
                     )
                     # pure GPU time of one K-step replay (no host sync)
                     single_gpu = _time_single_replay(gd)

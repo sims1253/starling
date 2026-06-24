@@ -295,12 +295,18 @@ class GraphedDecoder:
             return self
 
         # save the post-step-0 reset point
-        h_s = self.h_buf.clone(); c_s = self.c_buf.clone(); cc_s = self.cc_buf.clone()
-        fi_s = self.frame_idx.clone(); lt_s = self.last_token.clone()
+        h_s = self.h_buf.clone()
+        c_s = self.c_buf.clone()
+        cc_s = self.cc_buf.clone()
+        fi_s = self.frame_idx.clone()
+        lt_s = self.last_token.clone()
 
         def _reset():
-            self.h_buf.copy_(h_s); self.c_buf.copy_(c_s); self.cc_buf.copy_(cc_s)
-            self.frame_idx.copy_(fi_s); self.last_token.copy_(lt_s)
+            self.h_buf.copy_(h_s)
+            self.c_buf.copy_(c_s)
+            self.cc_buf.copy_(cc_s)
+            self.frame_idx.copy_(fi_s)
+            self.last_token.copy_(lt_s)
 
         # warmup on a side stream (stabilises cudnn/cublas autotune). Run the
         # full K-step block each warmup iter so the side stream exercises the

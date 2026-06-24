@@ -264,7 +264,6 @@ class MegaParakeetPipeline:
         (decode) and inside ``GraphedEncoder`` (encoder) and is NOT counted in
         ``encoder_ms``/``decode_ms`` -- it is amortised across calls.
         """
-        device = self.device
 
         def _timed(fn):
             start = torch.cuda.Event(enable_timing=True)
@@ -300,3 +299,24 @@ class MegaParakeetPipeline:
             "total_ms": mel_ms + encoder_ms + decode_ms,
         }
         return texts, timing
+
+    @torch.inference_mode()
+    def prewarm(self, durations_s: List[float] | None = None) -> None:
+        """Pre-capture CUDA graphs for common audio durations.
+
+        The encoder and decoder graphs are shape-keyed and captured on first
+        use (200-500 ms per shape).  Calling this at startup eliminates the
+        first-utterance latency penalty for live/streaming use.
+
+        Args:
+            durations_s: list of durations (seconds) to pre-capture.  Default
+                covers common live utterance lengths: [5, 10, 30].
+        """
+        if durations_s is None:
+            durations_s = [5.0, 10.0, 30.0]
+        sr = 16000
+        for dur in durations_s:
+            n = int(dur * sr)
+            dummy = np.zeros(n, dtype=np.float32)
+            self.transcribe([dummy])
+        torch.cuda.synchronize()

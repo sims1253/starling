@@ -108,7 +108,6 @@ class MultiStepLLMMega(FusedLLMMega):
         self.K = self.steps_per_replay
 
         # ---- multi-step static buffers (fixed addresses for the graph) -----
-        M = self.max_cache_len
         # Ring buffer for the K tokens emitted by one replay (harvested by the
         # host with a single .tolist() sync).
         self.output_ids = torch.zeros(self.K, dtype=torch.int64, device=device)

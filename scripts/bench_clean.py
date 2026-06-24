@@ -3,22 +3,27 @@
 Resolves the earlier measurement ambiguity (532ms warm vs 1082ms contended).
 Reports median + min for stock / non-spec mega / spec mega, RTFx, tok/s.
 """
-import sys, statistics, time
+import sys
+import statistics
+import time
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # noqa: E402
 
-import torch
-from starling.parakeet.gpu_lock import with_gpu_lock
-from starling.granite.audio import build_inputs, load_sample_audio
-from starling.granite.loader import load_model_and_processor
-from starling.granite.pipeline import MegaPipeline
+import torch  # noqa: E402
+from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
+from starling.granite.audio import build_inputs, load_sample_audio  # noqa: E402
+from starling.granite.loader import load_model_and_processor  # noqa: E402
+from starling.granite.pipeline import MegaPipeline  # noqa: E402
 
 def wall_ms(fn, warm=3, iters=8):
-    for _ in range(warm): fn()
+    for _ in range(warm):
+        fn()
     torch.cuda.synchronize()
     ts = []
     for _ in range(iters):
-        t0 = time.perf_counter(); fn(); torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
         ts.append((time.perf_counter()-t0)*1000)
     return statistics.median(ts), min(ts)
 
