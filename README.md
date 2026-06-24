@@ -23,8 +23,10 @@ Both do speech-to-text.
 
 Single RTX 5090, bf16, model load excluded. RTFx (realtime factor) means
 audio_seconds / transcribe_seconds, so 100x means 100 seconds of audio
-transcribed in 1 second. Higher is faster. These are absolute numbers, not
-comparisons to stock `transformers`.
+transcribed in 1 second. Higher is faster. Every RTFx number is absolute
+(audio seconds per second of compute, not a speedup over another engine); the
+`stock transformers` column is the unmodified HuggingFace `generate()` reference
+the others replace.
 
 Both models were benchmarked on the same audio-length tiers (short ~7s, medium
 ~22s, long ~45-74s), same weights, producing identical transcripts.
@@ -35,25 +37,29 @@ B=1 single-stream. "starling" is standard greedy decode. "starling (spec)" adds
 self-speculative decoding (drafts tokens from the encoder's CTC head, verifies
 them with the LLM). Spec is slower on short audio because the draft extraction
 has fixed overhead, but pulls ahead on longer audio where the accepted drafts
-save more LLM forward passes.
+save more LLM forward passes. "stock transformers" is the unmodified HuggingFace
+eager `model.generate()` path (no CUDA graphs), the slow reference these kernels
+replace.
 
-| audio | starling | starling (spec) | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
-| ----- | -------- | --------------- | -------- |
-| 7s    | 212ms (35x)  | 245ms (30x) | 1185ms (6x) |
-| 25s   | 570ms (44x)  | 326ms (77x) | 2290ms (11x) |
-| 45s   | 569ms (79x)  | 334ms (135x) | 4060ms (11x) |
+| audio | starling | starling (spec) | [stock transformers](https://github.com/huggingface/transformers) | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | -------- | --------------- | ------------------ | -------- |
+| 7s    | 212ms (35x) | 245ms (30x) | 1363ms (5x) | 1185ms (6x) |
+| 25s   | 570ms (44x) | 326ms (77x) | 6329ms (4x) | 2290ms (11x) |
+| 45s   | 569ms (79x) | 334ms (135x) | 7026ms (6x) | 4060ms (11x) |
 
 ### parakeet-tdt-0.6b-v3 (0.6B params)
 
 B=1 is single-stream latency (one clip at a time). B=8 processes 8 clips at
 once: total time goes up, but throughput goes up much more because the GPU does
-8x the work in only ~1.6x the time.
+8x the work in only ~1.6x the time. "stock transformers" is the unmodified
+HuggingFace `AutoModelForTDT.generate()` path (CPU mel extraction + eager
+encoder + stock TDT decode).
 
-| audio | starling B=1 | starling B=8 | [parakeet.cpp](https://github.com/mudler/parakeet.cpp) B=1 | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
-| ----- | ------------ | ------------- | -------------------------- | -------- |
-| 7s    | 17ms (446x)  | 27ms (2184x)  | 30ms (251x)               | 580ms (13x) |
-| 22s   | 26ms (863x)  | 57ms (3119x)  | 76ms (294x)               | 1440ms (16x) |
-| 74s   | 67ms (1111x) | 174ms (3416x) | 223ms (333x)              | 4505ms (16x) |
+| audio | starling B=1 | starling B=8 | [stock transformers](https://github.com/huggingface/transformers) | [parakeet.cpp](https://github.com/mudler/parakeet.cpp) B=1 | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | ------------ | ------------- | ------------------ | -------------------------- | -------- |
+| 7s    | 17ms (446x)  | 27ms (2184x)  | 214ms (35x)        | 30ms (251x)               | 580ms (13x) |
+| 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
+| 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
 
 ### Long audio
 
