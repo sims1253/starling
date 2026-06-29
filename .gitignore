@@ -29,3 +29,6 @@ comms.md
 
 # notebooks / editor
 .ipynb_checkpoints/
+
+# higgs isolated venv (transformers 4.51 for the model's own code)
+.venv-higgs/
