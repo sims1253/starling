@@ -18,11 +18,17 @@ from typing import Any, Optional
 import torch
 
 from .config import LLM_EOS_TOKEN_ID
+from .fused_decode import FusedMossLLMMega
 from .llm_mega import BenchReport, GenerateResult, MossLLMMega
 
 
 class MossMultiStepMega(MossLLMMega):
-    """K-step CUDA-graph-captured greedy decoder for the MOSS Qwen3 LLM."""
+    """K-step CUDA-graph-captured greedy decoder for the MOSS Qwen3 LLM.
+
+    Subclasses the single-step decoder (:class:`MossLLMMega`, the model's own
+    layers).  For the ~2x faster fused-Triton path use
+    :class:`FusedMossMultiStepMega`.
+    """
 
     def __init__(
         self,
@@ -244,3 +250,15 @@ class MossMultiStepMega(MossLLMMega):
             total_tok_per_s=res.tok_per_s,
             notes=f"decoded {res.n_tokens} tokens; K={self.K}; cache_len={self.max_cache_len}",
         )
+
+
+class FusedMossMultiStepMega(FusedMossLLMMega, MossMultiStepMega):
+    """K-step graphed decoder built on the fused-Triton single-step path.
+
+    Inherits ``_decode_step_eager`` (the fused hand-iterated layer loop) from
+    :class:`FusedMossLLMMega` and all multi-step machinery (capture / generate
+    / bench, K-step replay with argmax-in-graph) from :class:`MossMultiStepMega`.
+    ~2x faster than the model-forward multistep path, byte-exact.
+    """
+
+    pass

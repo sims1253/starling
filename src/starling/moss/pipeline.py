@@ -53,15 +53,17 @@ class MossMegaPipeline:
         self.lm_head = comps["lm_head"]
         self.language_model = comps["language_model"]
 
+        from .fused_decode import FusedMossLLMMega
         from .llm_mega import MossLLMMega
+        from .multistep import FusedMossMultiStepMega
 
         if use_multistep:
-            self.llm = MossMultiStepMega(
+            self.llm = FusedMossMultiStepMega(
                 comps["language_model"], comps["lm_head"],
                 max_cache_len=max_cache_len, steps_per_replay=steps_per_replay,
             )
         else:
-            self.llm = MossLLMMega(
+            self.llm = FusedMossLLMMega(
                 comps["language_model"], comps["lm_head"], max_cache_len=max_cache_len
             )
 
