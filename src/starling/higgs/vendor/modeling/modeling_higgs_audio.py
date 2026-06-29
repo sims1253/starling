@@ -639,29 +639,34 @@ class HiggsAudio3Model(HiggsAudioPreTrainedModel, GenerationMixin):
             audio_feature_attention_mask.sum(-1)
         )
         batch_size, _, max_mel_seq_len = audio_features.shape
-        # transformers 5.x dropped the Whisper encoder's attention-mask plumbing
-        # (it now hard-ignores ``attention_mask`` and forwards a 4D mask straight
-        # into the layer attention, which crashes on a non-matching shape). We
-        # instead run the tower mask-free and zero the padded *output* positions
-        # afterwards. The vendored ``HiggsAudioEncoder`` runs the two Whisper
-        # convs (3000 mel -> 1500) **and** an ``AvgPool1d(2)`` (1500 -> 750), so
-        # ``last_hidden_state`` has the full post-avg-pool length (750) while
-        # each chunk's valid span is only ``audio_feat_out_lengths`` (e.g. 186).
-        # Build the zeroing mask over the FULL output length so it lines up with
-        # ``selected_audio_feature``; only the valid ``[0, audio_feat_out_lengths)``
-        # span is scattered into the LLM input downstream, so the zeroed tail
-        # never reaches the decoder.
-        audio_outputs = self.audio_tower(audio_features, attention_mask=None)
-        selected_audio_feature = audio_outputs.last_hidden_state  # (B, full_len, D)
-        full_len = selected_audio_feature.size(1)
+        # Post-conv (pre-avgpool) sequence length: the two Whisper conv1d layers
+        # halve 3000 mel frames -> 1500. The vendored HiggsAudioEncoder runs its
+        # 32 WhisperEncoderLayers at THIS resolution, then avg-pools 2x at the end.
+        max_seq_len = (max_mel_seq_len - 1) // 2 + 1  # 1500
         seq_range = (
-            torch.arange(0, full_len, dtype=audio_feat_out_lengths.dtype, device=audio_feat_out_lengths.device)
+            torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
             .unsqueeze(0)
-            .expand(batch_size, full_len)
+            .expand(batch_size, max_seq_len)
         )
-        lengths_expand = audio_feat_out_lengths.unsqueeze(1).expand(batch_size, full_len)
-        padding_mask = (seq_range < lengths_expand).unsqueeze(-1).to(selected_audio_feature.dtype)
-        selected_audio_feature = selected_audio_feature * padding_mask
+        lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
+        padding_mask = seq_range < lengths_expand  # (B, 1500) True for valid keys
+        # transformers 5.x: tf4.51 accepted a bool mask and converted it inside the
+        # whisper attention; tf5's ``eager_attention_forward`` does a raw
+        # ``attn_weights + attention_mask`` add, so we must pass an ADDITIVE float
+        # mask (0.0 for valid keys, -inf for padded keys) shaped (B,1,q,k) for
+        # broadcasting. This keeps padded mel frames from corrupting the valid
+        # span via self-attention -- byte-exact with the reference encoder.
+        min_dtype = torch.finfo(self.audio_tower.conv1.weight.dtype).min
+        if self.config._attn_implementation != "flash_attention_2":
+            add_mask = torch.where(
+                padding_mask.view(batch_size, 1, 1, max_seq_len).expand(batch_size, 1, max_seq_len, max_seq_len),
+                0.0,
+                min_dtype,
+            ).to(self.audio_tower.conv1.weight.dtype)
+        else:
+            add_mask = padding_mask  # flash path takes bool
+        audio_outputs = self.audio_tower(audio_features, attention_mask=add_mask)
+        selected_audio_feature = audio_outputs.last_hidden_state
         audio_features_embed = self.audio_encoder_proj(selected_audio_feature)
 
         if is_deepspeed_ulysses_enabled():
