@@ -20,6 +20,7 @@ Both do speech-to-text.
 
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) (encoder + 1B LLM decoder). The LLM decode is the bottleneck. Includes an optional self-speculative path that drafts tokens from the encoder's CTC head.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer + TDT transducer, no LLM). Tuned for batched offline throughput, with GPU-side mel extraction and chunking for hour-long audio.
+- [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) (Whisper encoder + MLP adapter + Qwen2.5 decoder). Same encoder+LLM-decoder pattern as granite. The Whisper+adapter forward and the prefill are each captured into shape-keyed CUDA graphs, and the Qwen2.5 decode loop runs as a K-step graph with fused Triton elementwise glue reused from the granite kernels. Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -55,6 +56,20 @@ once.
 | 7s    | 17ms (446x)  | 27ms (2184x)  | 214ms (35x)        | 30ms (251x)               | 580ms (13x) |
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
+
+### ark-asr-3b (3B params)
+
+B=1 single-stream, fused Triton decode (K=8 multistep graph) with a shape-keyed
+graphed prefill and graphed Whisper+adapter encoder. `starling` is byte-identical
+to the eager `transformers` reference. The Qwen2.5 decode loop is the bottleneck
+(~7.2ms/tok GPU, 138 tok/s); the encoder is ~7-21ms and the prefill is captured
+so it adds only tens of ms regardless of prompt length.
+
+| audio | starling | stock transformers |
+| ----- | -------- | ------------------ |
+| 7s    | 285ms (26x) | 1657ms (4x) |
+| 22s   | 698ms (32x) | 5467ms (4x) |
+| 74s   | 772ms (96x) | 4661ms (16x) |
 
 ### Long audio (30-90 min)
 
@@ -116,6 +131,11 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     encoder_graph.py    graphed FastConformer encoder
     mel_gpu.py          GPU-side mel filterbank
     chunking.py         bounded-VRAM long-audio chunking
+  ark/                  ARK-ASR-3B megakernel
+    encoder_mega.py     graphed Whisper+MLP-adapter audio encoder
+    llm_mega.py         graphed greedy decode over a static KV cache + graphed prefill
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         encoder + audio-embedding injection + LLM wiring
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
