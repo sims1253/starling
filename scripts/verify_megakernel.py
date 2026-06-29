@@ -46,7 +46,7 @@ def main() -> int:
     mega = LLMMega(model, max_cache_len=1024)
 
     all_ok = True
-    for name in ("short",):  # start with short for fast iteration
+    for name in ("short", "medium", "long"):
         path = FIXTURES_DIR / f"{name}.wav"
         audio_np, sr = sf.read(str(path))
         if audio_np.ndim > 1:

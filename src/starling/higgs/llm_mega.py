@@ -142,9 +142,24 @@ class LLMMega:
         passed to each layer's ``update`` (which we control via
         ``static_cache_position``).  Pre-warmup garbage writes are overwritten
         by the real decode steps and masked out by the 4D attention mask, so no
-        explicit reset is needed.  Kept as a no-op to match granite's API.
+        explicit position reset is needed.  Kept as a no-op to match granite's API.
         """
         return
+
+    def _clear_cache(self) -> None:
+        """Zero all K/V cache tensors so a fresh generate starts clean.
+
+        Because the 4.51 StaticCache has no position counter, stale K/V from a
+        previous generate (longer prompt / different fixture) would otherwise
+        leak into a subsequent run's attention if its mask ever permitted those
+        slots. Zeroing guarantees idempotent repeated generates.
+        """
+        for k in getattr(self.cache, "key_cache", []):
+            if k is not None:
+                k.zero_()
+        for v in getattr(self.cache, "value_cache", []):
+            if v is not None:
+                v.zero_()
 
     def _set_mask(self, valid_len: int) -> None:
         """Unmask positions ``[0, valid_len)``; mask the rest to ``-inf``."""
@@ -213,8 +228,10 @@ class LLMMega:
         assert T < self.max_cache_len, (
             f"prompt {T} >= max_cache_len {self.max_cache_len}"
         )
-        # Always start from a clean cache so prefill/generate are idempotent.
-        self._reset_cache_pos(0)
+        # Always start from a clean cache so prefill/generate are idempotent
+        # and safe to call repeatedly (zeroing removes any stale K/V from a
+        # previous fixture's longer prompt).
+        self._clear_cache()
         out = self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
