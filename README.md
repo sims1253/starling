@@ -61,15 +61,20 @@ once.
 
 B=1 single-stream, fused Triton decode (K=8 multistep graph) with a shape-keyed
 graphed prefill and graphed Whisper+adapter encoder. `starling` is byte-identical
-to the eager `transformers` reference. The Qwen2.5 decode loop is the bottleneck
-(~7.2ms/tok GPU, 138 tok/s); the encoder is ~7-21ms and the prefill is captured
-so it adds only tens of ms regardless of prompt length.
+to the eager `transformers` reference. The Qwen2.5 decode loop is the bottleneck;
+the per-layer QKV and gate+up GEMVs are each fused into one GEMM and RoPE runs as
+one Triton kernel, so decode hits ~6.2ms/tok (161 tok/s). The encoder is ~7-21ms
+and the prefill is captured so it adds only tens of ms regardless of prompt length.
+
+No external C++ engine runs ARK-ASR-3B yet (CrispASR/whisper.cpp have no arkasr
+backend and no GGUF conversion exists), so the only comparison is stock
+`transformers`.
 
 | audio | starling | stock transformers |
 | ----- | -------- | ------------------ |
-| 7s    | 285ms (26x) | 1657ms (4x) |
-| 22s   | 698ms (32x) | 5467ms (4x) |
-| 74s   | 772ms (96x) | 4661ms (16x) |
+| 7s    | 248ms (30x) | 1657ms (4x) |
+| 22s   | 608ms (37x) | 5467ms (4x) |
+| 74s   | 680ms (109x) | 4661ms (16x) |
 
 ### Long audio (30-90 min)
 
