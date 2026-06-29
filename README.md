@@ -20,6 +20,7 @@ Both do speech-to-text.
 
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) (encoder + 1B LLM decoder). The LLM decode is the bottleneck. Includes an optional self-speculative path that drafts tokens from the encoder's CTC head.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer + TDT transducer, no LLM). Tuned for batched offline throughput, with GPU-side mel extraction and chunking for hour-long audio.
+- [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) (Qwen3-omni MoE audio encoder + Qwen3 LLM decoder). The same encoder+LLM-decoder pattern as granite: the decode loop is the bottleneck, so a hand-iterated layer loop with fused Triton elementwise kernels (RMSNorm, SwiGLU, residual) is captured into a K-step CUDA graph. Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -55,6 +56,21 @@ once.
 | 7s    | 17ms (446x)  | 27ms (2184x)  | 214ms (35x)        | 30ms (251x)               | 580ms (13x) |
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
+
+### moss-transcribe-preview-2b (2B params)
+
+B=1 single-stream, fused Triton decode (K=16 multistep graph). `starling` is
+byte-identical to the eager `transformers` reference. The audio encoder
+(Qwen3-omni MoE, 32 layers) runs eager once per utterance (~25-40ms steady,
+not the bottleneck); the Qwen3 LLM decode (28 layers, GQA) is captured into a
+K-step CUDA graph with a hand-iterated layer loop replacing the model's own
+forward (~2x over the model-forward path, 4.85ms/tok / 206 tok/s steady).
+
+| audio | starling | stock transformers |
+| ----- | -------- | ------------------ |
+| 7s    | 248ms (30x) | ~3300ms (2x) |
+| 22s   | 618ms (36x) | ~6400ms (3x) |
+| 74s   | 1151ms (65x) | ~13500ms (6x) |
 
 ### Long audio (30-90 min)
 
@@ -116,6 +132,12 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     encoder_graph.py    graphed FastConformer encoder
     mel_gpu.py          GPU-side mel filterbank
     chunking.py         bounded-VRAM long-audio chunking
+  moss/                 moss-transcribe-preview-2b megakernel
+    llm_mega.py         graphed greedy Qwen3 decode over a static KV cache
+    fused_decode.py     hand-iterated layer loop + fused Triton elementwise kernels
+    multistep.py        K-step graphed decode (multi-step per replay)
+    encoder_graph.py    eager Qwen3-omni MoE audio encoder + adapter
+    pipeline.py         encoder + adapter + LLM wiring
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
