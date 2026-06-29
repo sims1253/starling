@@ -40,6 +40,7 @@ class MossMegaPipeline:
         steps_per_replay: int = 16,
         use_multistep: bool = True,
         encoder_mode: str = "eager",
+        compile_decode: bool = True,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -61,10 +62,12 @@ class MossMegaPipeline:
             self.llm = FusedMossMultiStepMega(
                 comps["language_model"], comps["lm_head"],
                 max_cache_len=max_cache_len, steps_per_replay=steps_per_replay,
+                compile_decode=compile_decode,
             )
         else:
             self.llm = FusedMossLLMMega(
-                comps["language_model"], comps["lm_head"], max_cache_len=max_cache_len
+                comps["language_model"], comps["lm_head"],
+                max_cache_len=max_cache_len, compile_decode=compile_decode,
             )
 
     @classmethod

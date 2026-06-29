@@ -140,3 +140,63 @@ def fused_residual(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     kern = _residual_kernel if AUTOTUNE else _residual_kernel_raw
     kern[(M,)](x2, y2, z, N=N, BLOCK_N=BLOCK_N)
     return z.view_as(x)
+
+
+# =========================================================================== #
+# Fused RoPE (apply rotary embedding to Q and K in one kernel).
+#
+# NOTE: this is provided for experimentation.  For Qwen3 the post-k_norm K
+# values are very large (±400), and Triton's bf16 multiply rounds differently
+# than ATen for these magnitudes -- the fused kernel diverges from the PyTorch
+# reference (K max-abs diff ~1.0) and that compounds over 28 layers.  So the
+# fused decode path keeps RoPE in PyTorch.  Kept here for byte-exactness probes.
+# =========================================================================== #
+@triton.jit
+def _rope_kernel(
+    Q_ptr, K_ptr, QO_ptr, KO_ptr, COS_ptr, SIN_ptr,
+    n_q_heads,
+    head_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < head_dim
+    half = head_dim // 2
+    dtype = QO_ptr.dtype.element_ty
+    cos = tl.load(COS_ptr + cols, mask=mask, other=0.0)
+    sin = tl.load(SIN_ptr + cols, mask=mask, other=0.0)
+    if pid < n_q_heads:
+        src_ptr = Q_ptr + pid * head_dim
+        dst_ptr = QO_ptr + pid * head_dim
+    else:
+        kid = pid - n_q_heads
+        src_ptr = K_ptr + kid * head_dim
+        dst_ptr = KO_ptr + kid * head_dim
+    x = tl.load(src_ptr + cols, mask=mask, other=0.0)
+    lo = cols < half
+    rot_idx = tl.where(lo, cols + half, cols - half)
+    x_rot = tl.load(src_ptr + rot_idx, mask=mask, other=0.0)
+    x_rot = tl.where(lo, -x_rot, x_rot)
+    prod1 = (x * cos).to(dtype)
+    prod2 = (x_rot * sin).to(dtype)
+    out = prod1 + prod2
+    tl.store(dst_ptr + cols, out, mask=mask)
+
+
+def fused_rope(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embedding to Q and K in one kernel launch (see NOTE above)."""
+    B, n_q, _, hd = q.shape
+    n_kv = k.shape[1]
+    q_flat = q.reshape(B * n_q, hd)
+    k_flat = k.reshape(B * n_kv, hd)
+    cos_flat = cos.reshape(-1, hd)[0:1].reshape(hd)
+    sin_flat = sin.reshape(-1, hd)[0:1].reshape(hd)
+    q_out = torch.empty_like(q_flat)
+    k_out = torch.empty_like(k_flat)
+    _rope_kernel[(n_q + n_kv,)](
+        q_flat, k_flat, q_out, k_out, cos_flat, sin_flat,
+        n_q, head_dim=hd, BLOCK_D=triton.next_power_of_2(hd),
+    )
+    return q_out.view_as(q), k_out.view_as(k)

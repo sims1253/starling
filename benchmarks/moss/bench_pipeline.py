@@ -95,12 +95,11 @@ def main() -> int:
             )
 
         # ---- per-stage steady-state timing (CUDA events) ----
-        # NOTE: use a SEPARATE decoder for stage probing so the pipeline's own
-        # decoder (used for the timed transcribe below) is not left in a
-        # captured/warmed state that perturbs its numbers.
+        # Use a SEPARATE compiled decoder for stage probing so the pipeline's
+        # own decoder (used for the timed transcribe below) is undisturbed.
         probe = FusedMossMultiStepMega(
             inner.language_model, model.lm_head, max_cache_len=2048,
-            steps_per_replay=args.K,
+            steps_per_replay=args.K, compile_decode=True,
         )
         with torch.inference_mode():
             enc_ms = _cuda_timer(
