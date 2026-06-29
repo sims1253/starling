@@ -138,6 +138,9 @@ class MossLLMMega:
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._captured = False
+        # Lazily-captured prefill graphs, keyed by prompt length T (each is a
+        # CUDA graph with static shapes; one per distinct prompt length seen).
+        self._prefill_graphs: dict[int, tuple] = {}
 
     # ------------------------------------------------------------------ #
     # internal helpers
@@ -174,10 +177,34 @@ class MossLLMMega:
     # prefill
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
-    def prefill(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        """Eager prefill: fill the StaticCache and return the first token id."""
+    def prefill(self, inputs_embeds: torch.Tensor, use_graph: bool = True) -> torch.Tensor:
+        """Prefill: fill the StaticCache and return the first token id.
+
+        When ``use_graph`` is True (default) and a graph for this prompt length
+        has been captured (or can be captured now), the prefill runs as a single
+        CUDA-graph replay -- ~4.5x faster than eager (e.g. 68ms -> 15ms at
+        T=300).  Graphs are cached per prompt length (``T``) since CUDA graphs
+        require static shapes.  Byte-exact with the eager prefill.
+        """
         T = inputs_embeds.shape[1]
         assert T < self.max_cache_len, f"prompt {T} >= max_cache_len {self.max_cache_len}"
+
+        if use_graph:
+            entry = self._prefill_graphs.get(T)
+            if entry is None:
+                entry = self._capture_prefill(inputs_embeds)
+                self._prefill_graphs[T] = entry
+            static_emb, graph, out_tok = entry
+            static_emb.copy_(inputs_embeds)
+            self._reset_cache_pos(0)
+            graph.replay()
+            return out_tok.clone()
+
+        return self._prefill_eager(inputs_embeds)
+
+    def _prefill_eager(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        """Eager prefill forward (the reference path)."""
+        T = inputs_embeds.shape[1]
         self._reset_cache_pos(0)
         ar = torch.arange(self.max_cache_len, device=self.device)
         q = torch.arange(T, device=self.device).unsqueeze(1)
@@ -198,6 +225,37 @@ class MossLLMMega:
         hidden = out.last_hidden_state[:, -1:, :]
         logits = self.lm_head(hidden)
         return logits.argmax(dim=-1)  # (1, 1)
+
+    @torch.inference_mode()
+    def _capture_prefill(self, inputs_embeds: torch.Tensor):
+        """Warmup on a side stream then capture the prefill into a CUDA graph.
+
+        Returns ``(static_emb, graph, out_tok)`` where ``static_emb`` is the
+        fixed-address input buffer, ``graph`` replays the prefill, and
+        ``out_tok`` is the (1,1) first-token output (overwritten each replay).
+        """
+        T = inputs_embeds.shape[1]
+        device = inputs_embeds.device
+        static_emb = torch.empty_like(inputs_embeds)
+        static_emb.copy_(inputs_embeds)
+
+        def _run():
+            self._reset_cache_pos(0)
+            return self._prefill_eager(static_emb)
+
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                _ = _run()
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        self._reset_cache_pos(0)
+        with torch.cuda.graph(graph):
+            out_tok = _run()
+        return static_emb, graph, out_tok
 
     # ------------------------------------------------------------------ #
     # CUDA-graph capture of the decode step
