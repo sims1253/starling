@@ -596,37 +596,83 @@ class FusedLLMMega(LLMMega):
         self._rms_eps = LLM_RMS_NORM_EPS
         self._intermediate = int(cfg.intermediate_size)
 
+        # ---- weight fusion: collapse per-layer GEMV launches ----
+        # The decode is launch-bound: each token runs ~108 attention GEMVs
+        # (q/k/v/o × 36 layers) + 108 MLP GEMVs (gate/up/down × 36), each a
+        # 12-55 us cuBLAS launch doing almost no compute. Concatenating the
+        # independent projections that share an input into one GEMM cuts the
+        # launch count roughly in half with no arithmetic change (concatenating
+        # weights/biases is associative over the matmul+add).
+        #   * QKV fusion: 3 GEMVs -> 1 ([Wq;Wk;Wv]@x + [bq;bk;bv]).
+        #   * gate+up fusion: 2 GEMVs -> 1 ([Wg;Wu]@x).
+        # The model's own layer weights are left untouched; the fused tensors
+        # are additive copies used only by the fused decode path.
+        self._fused = self._fuse_layer_weights()
+
+    def _fuse_layer_weights(self) -> list[dict]:
+        """Pre-concatenate QKV and gate/up weights per layer (additive copies).
+
+        Returns one dict per layer with keys ``qkv_w``, ``qkv_b`` (or None),
+        ``gu_w``, ``o_proj``, ``down_proj``. The original modules are not
+        modified; the fused tensors are byte-exact equivalents.
+        """
+        fused = []
+        n_qd = self._n_q_heads * self._head_dim      # 2048
+        n_kvd = self._n_kv_heads * self._head_dim    # 256
+        for layer in self._layers:
+            sa = layer.self_attn
+            mlp = layer.mlp
+            # QKV: weight rows laid out [q(2048); k(256); v(256)] -> (2560, 2048).
+            qkv_w = torch.cat([sa.q_proj.weight, sa.k_proj.weight, sa.v_proj.weight], dim=0)
+            if sa.q_proj.bias is not None:
+                qkv_b = torch.cat([sa.q_proj.bias, sa.k_proj.bias, sa.v_proj.bias], dim=0)
+            else:
+                qkv_b = None
+            # gate+up: rows [gate(11008); up(11008)] -> (22016, 2048). No bias.
+            gu_w = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0)
+            fused.append({
+                "qkv_w": qkv_w.contiguous(),
+                "qkv_b": qkv_b.contiguous() if qkv_b is not None else None,
+                "gu_w": gu_w.contiguous(),
+                "o_proj": sa.o_proj,
+                "down_proj": mlp.down_proj,
+            })
+        return fused
+
     def _decode_step_eager(self) -> None:
         """Custom single-token decode forward with fused Triton kernels.
 
         Replicates Qwen2Model.forward + Qwen2DecoderLayer.forward exactly but
-        replaces elementwise glue with fused kernels. Writes the final logits
-        (post lm_head; Qwen2.5 applies no logits scaling) into
+        replaces elementwise glue with fused kernels and collapses the
+        independent QKV and gate/up GEMVs into one GEMM each. Writes the final
+        logits (post lm_head; Qwen2.5 applies no logits scaling) into
         ``self.static_logits``.
 
         Fused (Triton, exact match): RMSNorm, SwiGLU ``silu(gate)*up``,
-        residual scale-add ``x + alpha*y`` (alpha = 1.0 for Qwen2.5).
-        Kept as PyTorch ops: all GEMMs (cuBLAS), the attention softmax/matmul,
-        and RoPE.
+        residual scale-add ``x + alpha*y`` (alpha = 1.0 for Qwen2.5), and RoPE
+        (Q and K rotated in one launch).
+        Fused GEMMs (cuBLAS, exact): QKV projection, gate+up projection.
+        Kept as separate cuBLAS bf16 GEMVs: o_proj and down_proj (their inputs
+        differ from any sibling, so they cannot be merged).
         """
         k = self._k
         hd = self._head_dim
         n_q = self._n_q_heads
         n_kv = self._n_kv_heads
+        qkv_split = [n_q * hd, n_kv * hd, n_kv * hd]  # [2048, 256, 256]
+        inter = self._intermediate
 
         # (1) embedding lookup (Qwen2.5 has no embedding multiplier).
         hidden = self._embed(self.static_input_ids) * _EMB_MULT  # (1, 1, 2048)
 
-        # (2) rotary cos/sin for this position
+        # (2) rotary cos/sin for this position (single head_dim, shared by Q/K).
         cos, sin = self._rotary(hidden, position_ids=self.static_position_ids)
-        # cos/sin: (1, 1, head_dim) -> unsqueeze for broadcast with (B, H, 1, D)
-        cos4 = cos.unsqueeze(1)  # (1, 1, 1, hd)
-        sin4 = sin.unsqueeze(1)
 
         # (3) iterate layers
         for idx, layer in enumerate(self._layers):
-            sa = layer.self_attn
-            mlp = layer.mlp
+            f = self._fused[idx]
+            o_proj = f["o_proj"]
+            down_proj = f["down_proj"]
 
             # --- attention block ---
             residual = hidden  # (1, 1, 2048)
@@ -634,17 +680,17 @@ class FusedLLMMega(LLMMega):
             # fused input RMSNorm (Qwen2RMSNorm: no mean subtraction, eps=1e-6)
             normed = k.fused_rmsnorm(hidden, layer.input_layernorm.weight, self._rms_eps)
 
-            # Q/K/V projections (cuBLAS bf16 GEMM)
-            q = sa.q_proj(normed).view(1, 1, n_q, hd).transpose(1, 2)    # (1, n_q, 1, hd)
-            kv = sa.k_proj(normed).view(1, 1, n_kv, hd).transpose(1, 2)  # (1, n_kv, 1, hd)
-            v = sa.v_proj(normed).view(1, 1, n_kv, hd).transpose(1, 2)   # (1, n_kv, 1, hd)
+            # FUSED QKV projection: one cuBLAS GEMV instead of three.
+            # qkv: (1, 1, 2560) -> split into q(1,n_q,1,hd), k(1,n_kv,1,hd), v(1,n_kv,1,hd)
+            x2 = normed.view(1, -1)  # (1, 2048)
+            qkv = torch.nn.functional.linear(x2, f["qkv_w"], f["qkv_b"])  # (1, 2560)
+            q, kv, v = qkv.view(-1).split(qkv_split, dim=0)
+            q = q.view(1, n_q, 1, hd)
+            kv = kv.view(1, n_kv, 1, hd)
+            v = v.view(1, n_kv, 1, hd)
 
-            # RoPE (PyTorch, matching the reference's bf16 arithmetic exactly)
-            half = hd // 2
-            q_rot = torch.cat((-q[..., half:], q[..., :half]), dim=-1)
-            kv_rot = torch.cat((-kv[..., half:], kv[..., :half]), dim=-1)
-            q = q * cos4 + q_rot * sin4
-            kv = kv * cos4 + kv_rot * sin4
+            # FUSED RoPE: rotate Q and K in one Triton kernel launch.
+            q, kv = k.fused_rope(q, kv, cos, sin)
 
             # cache update (in-place on static-address K/V tensors)
             kv, v = self.cache.update(kv, v, idx)
@@ -661,7 +707,7 @@ class FusedLLMMega(LLMMega):
 
             # reshape + output projection
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, n_q * hd)
-            attn_out = sa.o_proj(attn_out)  # (1, 1, 2048)
+            attn_out = o_proj(attn_out)  # (1, 1, 2048)
 
             # fused residual scale-add (alpha = 1.0 for Qwen2.5)
             hidden = k.fused_residual_scale(residual, attn_out, self._res_mult)
@@ -672,15 +718,19 @@ class FusedLLMMega(LLMMega):
             # fused post-attention RMSNorm
             normed = k.fused_rmsnorm(hidden, layer.post_attention_layernorm.weight, self._rms_eps)
 
-            # gate/up projections (cuBLAS bf16 GEMM)
-            gate = mlp.gate_proj(normed)  # (1, 1, 11008)
-            up = mlp.up_proj(normed)      # (1, 1, 11008)
+            # FUSED gate+up projection: one cuBLAS GEMV instead of two.
+            x3 = normed.view(1, -1)  # (1, 2048)
+            gu = torch.nn.functional.linear(x3, f["gu_w"], None)  # (1, 22016)
+            gate, up = gu.view(-1).split([inter, inter], dim=0)
+            gate = gate.view(1, 1, inter)
+            up = up.view(1, 1, inter)
 
             # fused SwiGLU: silu(gate) * up
-            act = k.fused_silu_mul(gate, up)  # (1, 1, 11008)
+            act = k.fused_silu_mul(gate, up)  # (1, 1, inter)
 
-            # down projection (cuBLAS bf16 GEMM)
-            mlp_out = mlp.down_proj(act)  # (1, 1, 2048)
+            # down projection (cuBLAS bf16 GEMV)
+            mlp_out = down_proj(act)  # (1, 1, 2048)
+
 
             # fused residual scale-add (alpha = 1.0 for Qwen2.5)
             hidden = k.fused_residual_scale(residual, mlp_out, self._res_mult)
