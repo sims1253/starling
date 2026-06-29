@@ -20,6 +20,7 @@ Both do speech-to-text.
 
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) (encoder + 1B LLM decoder). The LLM decode is the bottleneck. Includes an optional self-speculative path that drafts tokens from the encoder's CTC head.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer + TDT transducer, no LLM). Tuned for batched offline throughput, with GPU-side mel extraction and chunking for hour-long audio.
+- [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) (Whisper-large-v3 mel encoder + MLP projector + Qwen3-1.7B decoder). Same encoder+LLM-decoder pattern as granite: the Qwen3 decode loop is the bottleneck, so the model's own layers are captured into a CUDA graph over a static KV cache (single- and K-step variants); the Whisper tower + projector prefill run eager. Output is byte-identical to the eager reference. Runs under its own isolated venv (`.venv-higgs`, transformers 4.51) because the model's `trust_remote_code` modeling breaks under the repo's transformers 5.13.
 
 ## Numbers
 
@@ -55,6 +56,22 @@ once.
 | 7s    | 17ms (446x)  | 27ms (2184x)  | 214ms (35x)        | 30ms (251x)               | 580ms (13x) |
 | 22s   | 26ms (863x)  | 57ms (3119x)  | 465ms (48x)        | 76ms (294x)               | 1440ms (16x) |
 | 74s   | 67ms (1111x) | 174ms (3416x) | 1325ms (56x)       | 223ms (333x)              | 4505ms (16x) |
+
+### higgs-audio-v3-stt (2.68B params)
+
+B=1 single-stream. `starling` is a K=8 multi-step CUDA-graph decode over a static
+KV cache (the model's own Qwen3-1.7B layers; no custom elementwise kernels
+needed — cuBLAS bf16 GEMMs + the stock layer ops capture cleanly). The
+Whisper-large-v3 audio tower (32 layers) + MLP projector run eager once per clip
+(the prefill); the Qwen3 decode loop is the launch-bound bottleneck and is where
+the graph-capture win lives. Identical transcripts to stock. Multi-step K=16
+pulls further ahead on longer audio (130 tok/s vs 82 tok/s single-step on 74s).
+
+| audio | starling | stock transformers |
+| ----- | -------- | ------------------ |
+| 7s    | 225ms (33x) | 5321ms (1.4x) |
+| 22s   | 549ms (41x) | 8422ms (2.7x) |
+| 74s   | 1009ms (74x) | 13451ms (5.5x) |
 
 ### Long audio (30-90 min)
 
@@ -116,6 +133,12 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     encoder_graph.py    graphed FastConformer encoder
     mel_gpu.py          GPU-side mel filterbank
     chunking.py         bounded-VRAM long-audio chunking
+  higgs/                higgs-audio-v3-stt megakernel (runs under .venv-higgs, tf 4.51)
+    llm_mega.py         graphed greedy Qwen3 decode over a static KV cache
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         collator + eager prefill + graphed decode wiring
+    loader.py           model/tokenizer/collator loading (isolated venv notes)
+    vendor/             vendored modeling + collator (tf-version-independent)
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
