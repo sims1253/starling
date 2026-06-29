@@ -916,10 +916,23 @@ class HiggsAudio3Model(HiggsAudioPreTrainedModel, GenerationMixin):
                     position_embeddings=position_embeddings,
                 )
 
+            # transformers >=5.0: ``Qwen3DecoderLayer.forward`` returns a bare
+            # ``hidden_states`` tensor instead of the historical
+            # ``(hidden_states, attn_weights)`` tuple, and no longer surfaces
+            # attention weights. ``layer_outputs[0]`` below would otherwise slice
+            # the batch axis off the tensor (collapsing it to 2D, which then
+            # mis-reshapes the next layer's attention). Normalize to a tuple so
+            # the legacy unpacking works on both tf4.51 (tuple) and tf5.x (bare
+            # tensor); pad the attentions slot with ``None``. (Same fix pattern
+            # as the Whisper encoder layers above.)
+            if torch.is_tensor(layer_outputs):
+                layer_outputs = (layer_outputs, None)
+
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                attn = layer_outputs[1] if len(layer_outputs) > 1 else None
+                all_self_attns += ((attn,) if attn is not None else ())
 
         return hidden_states, all_hidden_states, all_self_attns
 
