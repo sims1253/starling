@@ -29,6 +29,7 @@ parakeet is a transducer and the NAR model is a single bidirectional pass.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) (non-autoregressive ASR). Unlike every other model here, there is **no decode loop**: ASR is one bidirectional forward pass — a CTC conformer encoder produces a rough token draft, blank "edit slots" are interleaved, and a *bidirectional* granite-4.0-1b LLM editor refines the whole sequence in a single forward. The win is CUDA-graph capture of the encoder trunk plus a `torch.compile`d (then graph-captured) LLM editor forward, removing host launch overhead across the 16 encoder + 40 LLM layers. Output is byte-identical to the eager reference.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) (Whisper encoder + MLP adapter + Qwen2.5 decoder). Same encoder+LLM-decoder pattern as granite. The Whisper+adapter forward and the prefill are each captured into shape-keyed CUDA graphs, and the Qwen2.5 decode loop runs as a K-step graph with fused Triton elementwise glue reused from the granite kernels. Output is byte-identical to the eager reference.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (~2B params, the repo's first **seq2seq encoder-decoder**, Whisper-style). A Parakeet FastConformer encoder (48 layers) + an 8-layer Transformer decoder with **self-attention AND cross-attention**. A graphed encoder + a K-step graphed greedy decode over an `EncoderDecoderCache` (StaticCache for both halves, so the K/V tensors are fixed-shape and capture-safe). The decode step has two attention blocks per layer; the self-attn causal mask is built dynamically in-graph from an advancing position counter (no per-step baked masks). Output is byte-identical to the eager reference.
+- [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) (Whisper-large-v3 mel encoder + MLP projector + Qwen3-1.7B decoder). Same encoder+LLM-decoder pattern as granite: the Qwen3 decode loop is the bottleneck, so the model's own layers are captured into a CUDA graph over a static KV cache (single- and K-step variants); the Whisper tower + projector prefill run eager. Output is byte-identical to the eager reference. Runs under its own isolated venv (`.venv-higgs`, transformers 4.51) because the model's `trust_remote_code` modeling breaks under the repo's transformers 5.13.
 
 ## Numbers
 
@@ -137,6 +138,37 @@ independently (long tier is B=3).
 | 7s    | 54ms (139x)  | 992ms (7x) |
 | 22s   | 376ms (59x)  | 2560ms (9x) |
 | 74s   | 610ms (122x) | 3567ms (21x) |
+
+### higgs-audio-v3-stt (2.68B params)
+
+B=1 single-stream. `starling` is a CUDA-graph-captured Qwen3-1.7B decode over a
+static KV cache. Three byte-exact layers stack: (1) graph-capture of the model's
+own layers over `StaticCache` (removes launch overhead), (2) **fused Triton
+elementwise kernels** (RMSNorm, SwiGLU, residual add, per-head QK-norm) replacing
+the layer glue — unlike granite, higgs benefits substantially (the decode is
+compute/memory-bound at the glue once launch overhead is gone, not
+pure-GEMV-launch-bound like granite), and (3) **`torch.compile(mode="max-autotune-
+no-cudagraphs")`** on the fused decode so inductor fuses the remaining PyTorch
+elementwise glue (RoPE cat+mul+add, attention softmax prep, GQA repeats).
+Steady-state decode: **3.05ms/tok / 327 tok/s** (byte-exact — the "compile not
+byte-exact" finding was the *encoder*'s BatchNorm, not the LLM decode). A K-step
+multi-step variant (subclassing the fused path) stacks for host-sync
+amortisation. The Whisper-large-v3 audio tower (32 layers) + MLP projector run
+eager once per clip (the prefill); the Qwen3 decode loop is the bottleneck.
+Identical transcripts to stock. Runs under its own isolated venv (`.venv-higgs`,
+transformers 4.51) because the model's `trust_remote_code` modeling breaks under
+the repo's transformers 5.13.
+
+| audio | starling | stock transformers | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | -------- | ------------------ | -------- |
+| 7s    | 98ms (76x)  | 5321ms (1.4x)  | 4043ms (1.8x) |
+| 22s   | 304ms (73x) | 8422ms (2.7x)  | 13197ms (1.7x) |
+| 74s   | 496ms (150x)| 13451ms (5.5x) | — |
+
+starling is **~54–111x faster than stock `generate()` and ~25–130x faster than
+CrispASR's q4_k ggml path** on the same model. (CrispASR wall includes model load;
+its `higgs-stt` backend loads the real higgs weights via a whisper-tiny VAD
+front-end. Long-audio CrispASR timed out the harness.)
 
 ### Long audio (30-90 min)
 
@@ -318,6 +350,13 @@ src/starling/           shared toolkit (config dims, optimisation flags)
                          (StaticCache self-attn + cross-attn; dynamic in-graph mask)
     reference.py        eager golden greedy decode (byte-exact vs HF generate)
     pipeline.py         graphed encoder + graphed decode wiring
+  higgs/                higgs-audio-v3-stt megakernel (runs under .venv-higgs, tf 4.51)
+    llm_mega.py         graphed greedy Qwen3 decode over a static KV cache
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         collator + eager prefill + graphed decode wiring
+    loader.py           model/tokenizer/collator loading (isolated venv notes)
+    UV_NOTES.md         how to run higgs via uv (isolated .venv-higgs, tf 4.51)
+    vendor/             vendored modeling + collator (tf-version-independent)
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
