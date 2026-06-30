@@ -44,7 +44,7 @@ class FusedLLMMega(LLMMega):
     and overrides only :meth:`_decode_step_eager` with a custom Qwen3 forward.
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, compile_decode: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._k = _k
         # Pre-extract per-layer references + Qwen3 dims for the hot decode loop.
@@ -54,6 +54,19 @@ class FusedLLMMega(LLMMega):
         self._head_dim = int(getattr(cfg, "head_dim", cfg.hidden_size // self._n_q_heads))
         self._n_kv_groups = self._n_q_heads // self._n_kv_heads
         self._rms_eps = float(cfg.rms_norm_eps)
+        self._compile_decode = bool(compile_decode)
+        if compile_decode:
+            # Wrap the fused decode forward in inductor. ``max-autotune-no-cudagraphs``
+            # fuses the PyTorch elementwise glue the hand loop still emits (RoPE
+            # cat+mul+add, attention softmax prep, GQA repeats) while leaving
+            # cudagraph capture to us. Byte-exact for the LLM decode (granite's
+            # "compile not byte-exact" finding was the *encoder*'s BatchNorm, not
+            # the LLM). Method-assign (not a self-calling wrapper) to avoid dynamo
+            # recursion. Credit: Instance D (moss) validated this on the same
+            # Qwen3-decode pattern.
+            self._decode_step_eager = torch.compile(  # type: ignore[method-assign]
+                self._decode_step_eager, mode="max-autotune-no-cudagraphs", dynamic=False
+            )
 
     def _decode_step_eager(self) -> None:
         """Custom single-token Qwen3 decode forward with fused Triton kernels.

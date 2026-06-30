@@ -94,6 +94,7 @@ class HiggsMega:
         decoder: str = "multi",
         max_cache_len: int = 2048,
         steps_per_replay: int = 8,
+        compile_decode: bool = True,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -103,11 +104,12 @@ class HiggsMega:
         if decoder == "multi":
             from .multistep import MultiStepLLMMega
             self.llm: LLMMega = MultiStepLLMMega(
-                model, max_cache_len=max_cache_len, steps_per_replay=steps_per_replay
+                model, max_cache_len=max_cache_len, steps_per_replay=steps_per_replay,
+                compile_decode=compile_decode,
             )
         elif decoder == "single":
             from .fused_decode import FusedLLMMega
-            self.llm = FusedLLMMega(model, max_cache_len=max_cache_len)
+            self.llm = FusedLLMMega(model, max_cache_len=max_cache_len, compile_decode=compile_decode)
         else:
             raise ValueError(f"unknown decoder {decoder!r}; use 'single' or 'multi'")
 

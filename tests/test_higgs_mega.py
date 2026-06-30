@@ -144,3 +144,26 @@ def test_transcribe_matches_golden_text() -> None:
     assert text.strip() == golden["text"].strip(), (
         f"transcribed text mismatch:\n got: {text!r}\n ref: {golden['text']!r}"
     )
+
+
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_fused_compiled_byte_exact(name: str) -> None:
+    """FusedLLMMega with torch.compile(mode='max-autotune-no-cudagraphs') is byte-exact.
+
+    inductor fuses the elementwise glue the hand loop still emits (RoPE,
+    attention softmax prep, GQA repeats); byte-exact for the LLM decode (the
+    "compile not byte-exact" finding was the encoder's BatchNorm, not the LLM).
+    """
+    from starling.higgs.fused_decode import FusedLLMMega
+
+    model, tok, coll = _load()
+    golden = _golden()["fixtures"][name]
+    batch = _build_batch(coll, tok, _fixture_audio(name))
+    llm = FusedLLMMega(model, max_cache_len=2048, compile_decode=True)
+    res = llm.generate(
+        batch, max_new_tokens=len(golden["gen_ids"]) + 2,
+        eos_token_ids=EOS_TOKEN_IDS, tokenizer=tok,
+    )
+    assert res.ids[0].tolist() == golden["gen_ids"], (
+        f"{name}: compiled fused decode diverged from golden"
+    )
