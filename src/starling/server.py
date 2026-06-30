@@ -1,7 +1,7 @@
 """Unified HTTP/WebSocket ASR server for every starling model.
 
 This replaces the former granite-only ``starling.granite.server``. One process
-serves ONE model at a time, selected by ``--model {granite,parakeet,moss,qwen3}``
+serves ONE model at a time, selected by ``--model {granite,parakeet,moss,qwen3,ark,cohere,higgs}``
 (default ``granite``). The model is kept resident in VRAM and exposed via a
 parakeet-server-compatible interface:
 
@@ -85,7 +85,7 @@ WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "moss", "qwen3")
+MODEL_SLUGS = ("granite", "parakeet", "moss", "qwen3", "ark", "cohere", "higgs")
 
 
 def _gpu_lock_model(slug: str) -> str:
@@ -94,6 +94,9 @@ def _gpu_lock_model(slug: str) -> str:
         "parakeet": "parakeet-tdt-0.6b-v3",
         "moss": "moss-transcribe-preview-2b",
         "qwen3": "qwen3-asr-1.7b",
+        "ark": "ark-asr-3b",
+        "cohere": "cohere-transcribe-03-2026",
+        "higgs": "higgs-audio-v3-stt",
     }.get(slug, slug)
 
 
@@ -313,11 +316,108 @@ class Qwen3Backend(ModelBackend):
         )
 
 
+class ArkBackend(ModelBackend):
+    """ark-asr-3b: Whisper+adapter encoder + Qwen2.5 decoder megakernel.
+
+    The pipeline's ``transcribe`` takes a 1-D float32 waveform directly (no
+    processor-built input dict), so this backend is the thinnest of the LLM
+    backends. Single-shot (no chunker): bounded by the 4096-token static KV
+    cache, like qwen3.
+    """
+
+    slug = "ark"
+
+    def load(self) -> None:
+        from .ark.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        wav = np.ascontiguousarray(samples, dtype=np.float32)
+        audio_seconds = wav.shape[0] / SAMPLE_RATE
+        text, _ids = self.pipe.transcribe(
+            wav, max_new_tokens=self.config.max_new_tokens,
+        )
+        return TranscribeResult(
+            text=text,
+            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+            duration_s=audio_seconds,
+        )
+
+
+class CohereBackend(ModelBackend):
+    """cohere-transcribe-03-2026: seq2seq enc-dec megakernel.
+
+    ``CohereMegaPipeline.transcribe`` accepts a 1-D waveform and returns a
+    list of transcripts (one per processor chunk); we join them for the
+    single-clip server path. Single-shot per chunk.
+    """
+
+    slug = "cohere"
+
+    def load(self) -> None:
+        from .cohere.pipeline import CohereMegaPipeline
+
+        self.pipe = CohereMegaPipeline.from_pretrained()
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        wav = np.ascontiguousarray(samples, dtype=np.float32)
+        audio_seconds = wav.shape[0] / SAMPLE_RATE
+        texts, _ids = self.pipe.transcribe(
+            wav, max_new_tokens=self.config.max_new_tokens,
+        )
+        text = " ".join(t.strip() for t in texts if t.strip())
+        return TranscribeResult(
+            text=text,
+            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+            duration_s=audio_seconds,
+        )
+
+
+class HiggsBackend(ModelBackend):
+    """higgs-audio-v3-stt: Whisper-large-v3 mel + Qwen3-1.7B decoder megakernel.
+
+    NOTE: like the benchmark adapter, this only loads under the isolated
+    ``.venv-higgs`` (``transformers==4.51``); see ``higgs/UV_NOTES.md``.
+    """
+
+    slug = "higgs"
+
+    def load(self) -> None:
+        from .higgs.pipeline import HiggsMega
+
+        self.pipe = HiggsMega.from_pretrained()
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        wav = np.ascontiguousarray(samples, dtype=np.float32)
+        audio_seconds = wav.shape[0] / SAMPLE_RATE
+        text = self.pipe.transcribe(
+            wav, sample_rate=SAMPLE_RATE, max_new_tokens=self.config.max_new_tokens,
+        )
+        return TranscribeResult(
+            text=text,
+            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+            duration_s=audio_seconds,
+        )
+
+
 _BACKENDS: dict[str, type[ModelBackend]] = {
     "granite": GraniteBackend,
     "parakeet": ParakeetBackend,
     "moss": MossBackend,
     "qwen3": Qwen3Backend,
+    "ark": ArkBackend,
+    "cohere": CohereBackend,
+    "higgs": HiggsBackend,
 }
 
 
@@ -1196,7 +1296,7 @@ def _run_stdlib_server(server: StarlingServer, host: str, port: int) -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m starling.server",
-        description="Unified starling ASR server (granite/parakeet/moss/qwen3).",
+        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/cohere/higgs).",
     )
     p.add_argument(
         "--model",

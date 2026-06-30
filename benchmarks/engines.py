@@ -524,6 +524,190 @@ class Qwen3Stock(Engine):
 
 
 # ====================================================================== #
+# ARK-ASR-3B
+# ====================================================================== #
+class ArkStarling(Engine):
+    """starling fused pipeline for ARK-ASR-3B (graphed Whisper+adapter encoder
+    + K-step graphed Qwen2.5 decode). Byte-identical to eager."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "ark", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.ark.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        text, _ids = self.pipe.transcribe(audio, max_new_tokens=200)
+        return text
+
+
+class ArkStock(Engine):
+    """Stock eager ``model.generate`` reference for ARK-ASR-3B.
+
+    Drives the chat-template prompt the processor builds (audio block +
+    instruction) through ``AutoModelForCausalLM.generate`` — the same path
+    ``scripts/make_ark_golden.py`` captures the golden reference with.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "ark", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.ark.config import DEFAULT_INSTRUCTION
+        from starling.ark.loader import load_model_and_processor
+
+        self._instr = DEFAULT_INSTRUCTION
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        conv = [{"role": "user", "content": [
+            {"type": "audio", "array": wav},
+            {"type": "text", "text": self._instr},
+        ]}]
+        data = self.processor.apply_chat_template(
+            conv, audio_torch_dtype=torch.bfloat16, tokenize=True,
+            return_tensors="pt", add_generation_prompt=True,
+        )
+        data = {k: v.to("cuda") for k, v in data.items()}
+        prompt_len = data["input_ids"].shape[1]
+        out = self.model.generate(**data, max_new_tokens=200, do_sample=False)
+        gen = out[0][prompt_len:]
+        return self.processor.tokenizer.decode(gen, skip_special_tokens=True)
+
+
+# ====================================================================== #
+# cohere-transcribe-03-2026  (seq2seq encoder-decoder)
+# ====================================================================== #
+class CohereStarling(Engine):
+    """starling fused pipeline for cohere-transcribe (graphed FastConformer
+    encoder + K-step graphed seq2seq decode over an EncoderDecoderCache)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "cohere", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.cohere.pipeline import CohereMegaPipeline
+
+        self.pipe = CohereMegaPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        texts, _ids = self.pipe.transcribe(audio, max_new_tokens=300)
+        return texts[0]
+
+
+class CohereStock(Engine):
+    """Stock ``model.generate`` reference for cohere-transcribe.
+
+    Seq2seq: passes the processor's ``input_features`` / ``attention_mask`` /
+    ``decoder_input_ids`` through ``CohereAsrForConditionalGeneration.generate``
+    (verified byte-exact against the manual eager reference in
+    ``tests/test_cohere.py::test_reference_matches_generate``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "cohere", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.cohere.config import SAMPLE_RATE
+        from starling.cohere.loader import load_model_and_processor
+
+        self._sr = SAMPLE_RATE
+        self.model, self.processor = load_model_and_processor()
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        inp = self.processor(
+            audio, sampling_rate=self._sr, language="en", return_tensors="pt"
+        )
+        feat = inp["input_features"].to(self.model.dtype).cuda()
+        amask = inp["attention_mask"].cuda()
+        dec_in = inp["decoder_input_ids"].cuda()
+        prompt_len = dec_in.shape[1]
+        gen = self.model.generate(
+            input_features=feat, attention_mask=amask,
+            decoder_input_ids=dec_in, max_length=prompt_len + 300,
+        )
+        gen_new = gen[:, prompt_len:]
+        return self.processor.batch_decode(gen_new, skip_special_tokens=True)[0]
+
+
+# ====================================================================== #
+# higgs-audio-v3-stt  (runs under the isolated .venv-higgs, transformers 4.51)
+# ====================================================================== #
+class HiggsStarling(Engine):
+    """starling fused pipeline for higgs-audio-v3-stt (Whisper-large-v3 mel
+    encoder + MLP projector + Qwen3-1.7B decoder, graph-captured decode).
+
+    NOTE: higgs-audio runs under its own isolated venv ``.venv-higgs``
+    (``transformers==4.51.3``) because the model's ``trust_remote_code``
+    modeling breaks under the repo's transformers 5.13. The package imports
+    cleanly here, but ``_load`` only succeeds if launched with
+    ``uv run --no-project --python .venv-higgs/bin/python``. See
+    ``src/starling/higgs/UV_NOTES.md``. Gated by :func:`_higgs_keys` so the
+    main-venv ``bench_all`` grid silently skips it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling", "higgs", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.higgs.pipeline import HiggsMega
+
+        self.pipe = HiggsMega.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.pipe.transcribe(audio, sample_rate=16000, max_new_tokens=512)
+
+
+class HiggsStock(Engine):
+    """Stock reference for higgs-audio-v3-stt.
+
+    Uses the vendored upstream ``transcribe()`` (``scripts/ref/transcribe.py``,
+    run under ``.venv-higgs``) as the byte-exact oracle — the same path the
+    golden reference is captured with. Like :class:`HiggsStarling`, this only
+    loads under the isolated ``.venv-higgs``; gated by :func:`_higgs_keys`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "higgs", supports_batch=False)
+
+    def _load(self) -> None:
+        import sys
+
+        sys.path.insert(0, str(REPO_ROOT / "scripts" / "ref"))
+        import transcribe as ref  # noqa: F401  (upstream transcribe())
+
+        self._ref = ref
+        from starling.higgs.loader import load_model_and_tokenizer
+
+        self.model, self.tokenizer = load_model_and_tokenizer(attn_impl="eager")
+
+    def _release(self) -> None:
+        self.model = self.tokenizer = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        return self._ref.transcribe(self.model, self.tokenizer, wav)
+
+
+# ====================================================================== #
 # CrispASR  (external ggml binary; granite + qwen3 backends only)
 # ====================================================================== #
 class CrispASR(Engine):
@@ -666,8 +850,20 @@ def _qwen3_on_master() -> bool:
         return False
 
 
+def _higgs_available() -> bool:
+    """True iff the isolated ``.venv-higgs`` is present.
+
+    ``starling.higgs`` imports cleanly in the main venv (heavy modelling is
+    lazy), but its ``trust_remote_code`` modelling only *runs* under
+    ``transformers==4.51`` (the isolated ``.venv-higgs``). Gate the engine keys
+    on the venv existing so a main-venv ``bench_all`` sweep silently skips
+    higgs instead of crashing inside ``_load``.
+    """
+    return (REPO_ROOT / ".venv-higgs" / "bin" / "python").exists()
+
+
 # (engine_key, factory, requires_extra)
-# starling/stock factories are cheap wrappers; CrispASR/Qwen3 are conditional.
+# starling/stock factories are cheap wrappers; CrispASR/Qwen3/Higgs are conditional.
 ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "starling-granite": GraniteStarling,
     "stock-granite": GraniteStock,
@@ -675,6 +871,10 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "stock-parakeet": ParakeetStock,
     "starling-moss": MossStarling,
     "stock-moss": MossStock,
+    "starling-ark": ArkStarling,
+    "stock-ark": ArkStock,
+    "starling-cohere": CohereStarling,
+    "stock-cohere": CohereStock,
 }
 
 
@@ -701,9 +901,15 @@ def _qwen3_keys() -> list[str]:
     return ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
 
 
+def _higgs_keys() -> list[str]:
+    if not _higgs_available():
+        return []
+    return ["starling-higgs", "stock-higgs"]
+
+
 def available_keys() -> list[str]:
-    """All engine keys usable in this checkout (qwen3/CrispASR/parakeet.cpp gated)."""
-    return (list(ENGINE_REGISTRY) + _qwen3_keys()
+    """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
+    return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys())
 
@@ -745,6 +951,9 @@ def build_engines(
             chosen[mdl].append(GraniteStarlingSpec())
         elif key.startswith("qwen3") or mdl == "qwen3":
             cls = Qwen3Starling if fam == "starling" else Qwen3Stock
+            chosen[mdl].append(cls())
+        elif mdl == "higgs":
+            cls = HiggsStarling if fam == "starling" else HiggsStock
             chosen[mdl].append(cls())
         else:
             chosen[mdl].append(ENGINE_REGISTRY[key]())

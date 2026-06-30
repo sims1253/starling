@@ -22,7 +22,7 @@ Cells
 -----
   --lengths   short,medium,long   (the deterministic LibriSpeech fixtures)
   --batches   1,8                 (batch sizes; non-batched engines loop Bx1)
-  --models    granite,parakeet,moss[,qwen3]
+  --models    granite,parakeet,moss,ark,cohere[,qwen3,higgs]
   --engines   starling,stock[,crispasr,parakeet.cpp,starling-batched,starling-spec]
 
 Timing
@@ -396,8 +396,10 @@ def _parse_csv_int(s: str) -> list[int]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--models", default="granite,parakeet,moss",
-                    help="comma list of model slugs")
+    ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
+                    help="comma list of model slugs "
+                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs; "
+                         "qwen3/higgs are auto-gated on availability)")
     ap.add_argument("--engines", default="starling,stock",
                     help="comma list of engine families: starling,stock,crispasr")
     ap.add_argument("--lengths", default="short,medium,long",

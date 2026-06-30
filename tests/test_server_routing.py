@@ -24,7 +24,10 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
 
 from starling.server import (  # noqa: E402
     MODEL_SLUGS,
+    ArkBackend,
+    CohereBackend,
     GraniteBackend,
+    HiggsBackend,
     MossBackend,
     ParakeetBackend,
     Qwen3Backend,
@@ -34,8 +37,10 @@ from starling.server import (  # noqa: E402
 )
 
 
-def test_model_slugs_are_the_four_supported_models() -> None:
-    assert set(MODEL_SLUGS) == {"granite", "parakeet", "moss", "qwen3"}
+def test_model_slugs_are_the_supported_set() -> None:
+    assert set(MODEL_SLUGS) == {
+        "granite", "parakeet", "moss", "qwen3", "ark", "cohere", "higgs",
+    }
 
 
 def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
@@ -44,6 +49,9 @@ def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
     assert isinstance(get_backend("parakeet", cfg), ParakeetBackend)
     assert isinstance(get_backend("moss", cfg), MossBackend)
     assert isinstance(get_backend("qwen3", cfg), Qwen3Backend)
+    assert isinstance(get_backend("ark", cfg), ArkBackend)
+    assert isinstance(get_backend("cohere", cfg), CohereBackend)
+    assert isinstance(get_backend("higgs", cfg), HiggsBackend)
 
 
 def test_get_backend_unknown_slug_raises() -> None:
