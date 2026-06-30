@@ -27,6 +27,7 @@ parakeet is a transducer and the NAR model is a single bidirectional pass.
 - [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) (Qwen3-omni MoE audio encoder + Qwen3 LLM decoder). The same encoder+LLM-decoder pattern as granite: the decode loop is the bottleneck, so a `torch.compile`d hand-iterated layer loop with fused Triton elementwise kernels is captured into a K-step CUDA graph, plus a per-prompt-length graphed prefill. Output is byte-identical to the eager reference.
 - [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Whisper-style windowed-attention audio encoder + Qwen3 LLM decoder). Three byte-exact CUDA-graph layers: a graphed encoder (custom static-shape windowed-attention kernel, since the stock layer does host ops on `cu_seqlens`), a graphed greedy Qwen3 decode over a static KV cache with fused Triton RMSNorm/SwiGLU/residual/QK-norm kernels, and a K-step (K=8) multi-step decode graph. Output is byte-identical to the eager reference.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) (non-autoregressive ASR). Unlike every other model here, there is **no decode loop**: ASR is one bidirectional forward pass — a CTC conformer encoder produces a rough token draft, blank "edit slots" are interleaved, and a *bidirectional* granite-4.0-1b LLM editor refines the whole sequence in a single forward. The win is CUDA-graph capture of the encoder trunk plus a `torch.compile`d (then graph-captured) LLM editor forward, removing host launch overhead across the 16 encoder + 40 LLM layers. Output is byte-identical to the eager reference.
+- [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) (Whisper encoder + MLP adapter + Qwen2.5 decoder). Same encoder+LLM-decoder pattern as granite. The Whisper+adapter forward and the prefill are each captured into shape-keyed CUDA graphs, and the Qwen2.5 decode loop runs as a K-step graph with fused Triton elementwise glue reused from the granite kernels. Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -82,8 +83,31 @@ Two re-runnable scripts, each a single source of truth for its slice:
   byte-exact gate. This is the degradation detector: a real WER budget lets
   future non-byte-exact optimizations land safely.
 
+```
   uv run python benchmarks/bench_leaderboard.py                  # capped, fast
   uv run python benchmarks/bench_leaderboard.py --num-samples 0   # full splits
+```
+
+### ark-asr-3b (3B params)
+
+B=1 single-stream, fused Triton decode (K=8 multistep graph) with a shape-keyed
+graphed prefill and graphed Whisper+adapter encoder. `starling` is byte-identical
+to the eager `transformers` reference. The Qwen2.5 decode loop is the bottleneck;
+the per-layer QKV and gate+up GEMVs are each fused into one GEMM and RoPE runs as
+one Triton kernel, so decode hits ~6.2ms/tok (161 tok/s). The encoder is ~7-21ms
+and the prefill is captured so it adds only tens of ms regardless of prompt length.
+
+No external C++ engine runs ARK-ASR-3B yet (CrispASR/whisper.cpp have no arkasr
+backend and no GGUF conversion exists), so the only comparison is stock
+`transformers`.
+
+| audio | starling | stock transformers |
+| ----- | -------- | ------------------ |
+| 7s    | 248ms (30x) | 1657ms (4x) |
+| 22s   | 608ms (37x) | 5467ms (4x) |
+| 74s   | 680ms (109x) | 4661ms (16x) |
+
+### Long audio (30-90 min)
 
 Run either any time; `--update-readme` splices its tables into the
 sentinel-wrapped blocks here. Scope is tunable (`--models`, `--engines`,
@@ -252,6 +276,11 @@ src/starling/           shared toolkit (config dims, optimisation flags)
                          torch.compiled + graphed bidirectional LLM editor
     fused_llm.py        hand-iterated LLM forward (documented negative result —
                          diverges from stock cuBLAS on long packed sequences)
+  ark/                  ARK-ASR-3B megakernel
+    encoder_mega.py     graphed Whisper+MLP-adapter audio encoder
+    llm_mega.py         graphed greedy decode over a static KV cache + graphed prefill
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         encoder + audio-embedding injection + LLM wiring
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
