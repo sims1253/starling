@@ -1,0 +1,521 @@
+"""Engine adapters for the unified benchmark.
+
+Each adapter wraps one transcription path (a starling megakernel pipeline, the
+stock ``transformers`` reference, or the external CrispASR binary) behind one
+uniform interface so :mod:`bench_all` can drive every model x engine x length x
+batch cell of the grid with the same code.
+
+The interface is intentionally tiny:
+
+    name            -- display label (e.g. "stock transformers")
+    supports_batch  -- True if ``transcribe`` honours B>1 in one fused call
+    transcribe(audio, *, B) -> list[str]
+                    -- transcribe ``audio`` (1-D float32 @16kHz) ``B`` times and
+                       return ``B`` decoded strings. Batched engines do it in one
+                       call; non-batched engines loop B times (the harness labels
+                       that "Bx1 sequential").
+    close()         -- free the model + empty the GPU cache
+
+The adapters are LAZY: importing this module costs nothing; the heavy ``torch``
+/ ``transformers`` imports happen inside :meth:`load`.
+
+Adapter families live under :data:`ENGINE_REGISTRY`, keyed by
+``"{family}-{model}"`` (e.g. ``"starling-granite"``, ``"stock-parakeet"``,
+``"crispasr-granite"``). :func:`build_engines` resolves a list of
+``--engines``/``--models`` filters into the concrete adapter objects.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import numpy as np
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
+
+
+class SkipCell(Exception):
+    """Raised when a (model, engine, length, batch) cell is infeasible.
+
+    The harness catches it, records the cell as skipped with the reason, and
+    continues the sweep -- so one infeasible cell (e.g. granite single-shot on
+    audio longer than its static KV cache) never aborts the whole grid.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+# CrispASR install (absent -> crispasr-* engines are silently skipped).
+ASR_BENCH = Path("/home/m0hawk/asr-bench")
+CRISPASR_BIN = ASR_BENCH / "bin" / "crispasr-linux-x86_64-cuda13" / "crispasr"
+CRISPASR_MODELS = ASR_BENCH / "models"
+_CRISPASR_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": str(Path.home()),
+    "LD_LIBRARY_PATH": (
+        f"{ASR_BENCH}/libs/usr/lib/x86_64-linux-gnu/openblas-pthread"
+        f":{ASR_BENCH}/bin/parakeet-v0.3.2-bin-linux-cuda-x64"
+    ),
+    "CRISPASR_N_GPU_LAYERS": "999",  # full GPU offload
+}
+
+
+class Engine:
+    """Base adapter. Subclasses override :meth:`load` / :meth:`_run_one`."""
+
+    def __init__(self, name: str, model: str, *, supports_batch: bool = False) -> None:
+        self.name = name          # display label
+        self.model = model        # model slug (granite/parakeet/moss/qwen3)
+        self.supports_batch = supports_batch
+        self._loaded = False
+
+    # -- lifecycle ---------------------------------------------------------
+    def load(self) -> None:
+        """Load the model/processor (heavy). Idempotent."""
+        if self._loaded:
+            return
+        self._load()
+        self._loaded = True
+
+    def _load(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Release the model + drop the GPU cache. Safe to call repeatedly."""
+        self._release()
+        self._loaded = False
+        torch.cuda.empty_cache()
+
+    def _release(self) -> None:
+        pass
+
+    # -- inference ---------------------------------------------------------
+    @torch.inference_mode()
+    def transcribe(self, audio: np.ndarray, *, B: int = 1) -> list[str]:
+        """Transcribe ``audio`` ``B`` times; return ``B`` decoded strings."""
+        self.load()
+        if self.supports_batch and B > 1:
+            return self._run_batch([audio] * B)
+        return [self._run_one(audio) for _ in range(B)]
+
+    def _run_one(self, audio: np.ndarray) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        # Default: loop (engines that truly batch override this).
+        return [self._run_one(a) for a in audio_list]
+
+
+# ====================================================================== #
+# Granite-Speech-4.1-2b
+# ====================================================================== #
+class GraniteStarling(Engine):
+    """starling fused megakernel pipeline (cudagraph encoder + K-step LLM).
+
+    Uses the chunked ``transcribe_long`` path (the production path the README
+    numbers use): it resets the static KV cache per chunk so peak VRAM is
+    constant and any audio length is transcribable. Short audio = 1 chunk;
+    longer audio = several chunks concatenated.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling", "granite", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.granite.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        from starling.granite.long_audio import transcribe_long
+
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        res = transcribe_long(
+            self.pipe, self.pipe.processor, wav, 16000,
+            speculative=False,  # greedy, matching the non-spec "starling" column
+        )
+        return res.text
+
+
+class GraniteStock(Engine):
+    """Unmodified HuggingFace ``model.generate`` reference (chunked long path).
+
+    Chunked like the starling path so it is comparable on every tier (single-shot
+    stock on medium/long audio is both wrong -- RoPE positions -- and slow). To
+    keep WER byte-comparable with starling we decode the GENERATED tokens only
+    (slicing past the prompt), mirroring ``transcribe_long`` -- the repo's own
+    ``transcribe_long_stock`` decodes prompt+generated, which would leak the
+    task-prompt words into the transcript.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "granite", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.granite.audio import build_inputs
+        from starling.granite.loader import load_model_and_processor
+
+        self._build_inputs = build_inputs
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        from starling.granite.long_audio import chunk_audio
+
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        texts: list[str] = []
+        for chunk_wav, _start, _end, _idx in chunk_audio(wav, 16000):
+            inp = self._build_inputs(self.processor, chunk_wav)
+            prompt_len = int(inp["input_ids"].shape[1])
+            gen = self.model.generate(
+                input_ids=inp["input_ids"],
+                input_features=inp["input_features"].bfloat16(),
+                attention_mask=inp["attention_mask"],
+                input_features_mask=inp.get("input_features_mask"),
+                max_new_tokens=200,
+                do_sample=False,
+                num_beams=1,
+            )
+            gen_new = gen[:, prompt_len:]
+            texts.append(
+                self.processor.tokenizer.batch_decode(
+                    gen_new, skip_special_tokens=True
+                )[0]
+            )
+        return " ".join(t.strip() for t in texts if t.strip())
+
+
+# ====================================================================== #
+# Parakeet-tdt-0.6b-v3
+# ====================================================================== #
+class ParakeetStarling(Engine):
+    """starling GPU megakernel pipeline (GPU mel + graphed encoder + graphed TDT)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "parakeet", supports_batch=True)
+
+    def _load(self) -> None:
+        from starling.parakeet.pipeline import MegaParakeetPipeline
+
+        self.pipe = MegaParakeetPipeline()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.pipe.transcribe([audio])[0]
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        return self.pipe.transcribe(audio_list)
+
+
+class ParakeetStock(Engine):
+    """Stock ``AutoModelForTDT.generate`` reference (BaselineRunner)."""
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "parakeet", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.granite.baseline import BaselineRunner
+
+        self.runner = BaselineRunner()
+
+    def _release(self) -> None:
+        self.runner = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.runner.transcribe_batch([audio])[0]
+
+
+# ====================================================================== #
+# MOSS-Transcribe-preview-2b
+# ====================================================================== #
+class MossStarling(Engine):
+    """starling fused pipeline (graphed encoder + K-step graphed LLM decode)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "moss", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.moss.pipeline import MossMegaPipeline
+
+        # max_cache_len=2048 (like benchmarks/moss/bench_pipeline.py) so the long
+        # fixture (~470 generated tokens) fits the static KV cache.
+        self.pipe = MossMegaPipeline.from_pretrained(max_cache_len=2048)
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        from starling.moss.loader import load_model_and_processor
+
+        inp = self.pipe.processor(audio.astype("float32"))
+        inp = {
+            k: (v.cuda() if isinstance(v, torch.Tensor) else v)
+            for k, v in inp.items()
+        }
+        text, _ = self.pipe.transcribe(
+            inp["audio_data"], inp["audio_data_seqlens"], inp["input_ids"],
+            inp["audio_input_mask"], max_new_tokens=400,
+        )
+        return text
+
+
+class MossStock(Engine):
+    """Stock eager greedy reference.
+
+    MOSS's HF ``generate`` is broken on this transformers build's strict kwarg
+    validation, so the byte-exact stock reference is the hand-written eager
+    greedy loop in ``starling.moss.reference`` (it calls the identical model
+    modules). See that module's docstring.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "moss", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.moss.loader import load_model_and_processor
+        from starling.moss.reference import (
+            audio_features,
+            build_inputs_embeds,
+            greedy_generate,
+        )
+
+        self.model, self.processor = load_model_and_processor()
+        self._audio_features = audio_features
+        self._build_inputs_embeds = build_inputs_embeds
+        self._greedy_generate = greedy_generate
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        inp = self.processor(audio.astype("float32"))
+        inp = {
+            k: (v.cuda() if isinstance(v, torch.Tensor) else v)
+            for k, v in inp.items()
+        }
+        feats = self._audio_features(
+            self.model, inp["audio_data"], inp["audio_data_seqlens"]
+        )
+        emb = self._build_inputs_embeds(
+            self.model, inp["input_ids"], feats, inp["audio_input_mask"]
+        )
+        ids = self._greedy_generate(self.model, emb, max_new_tokens=400, max_cache_len=2048)
+        return self.processor.tokenizer.decode(ids[0], skip_special_tokens=True)
+
+
+# ====================================================================== #
+# Qwen3-ASR-1.7b  (auto-enabled once the branch is merged onto master)
+# ====================================================================== #
+class Qwen3Starling(Engine):
+    """starling fused pipeline for Qwen3-ASR. Lives on the qwen3-asr branch."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "qwen3", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.qwen3.audio import build_inputs, load_wav  # noqa: F401
+        from starling.qwen3.pipeline import MegaPipeline
+
+        self._build_inputs = build_inputs
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        import torchaudio
+
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        inp = self._build_inputs(self.pipe.processor, wav, sr=16000)
+        text, _ = self.pipe.transcribe(
+            inp["input_features"], inp["input_ids"],
+            inp.get("input_features_mask"), max_new_tokens=400,
+        )
+        return text
+
+
+class Qwen3Stock(Engine):
+    """Stock ``model.generate`` reference for Qwen3-ASR (branch qwen3-asr)."""
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "qwen3", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.qwen3.audio import build_inputs
+        from starling.qwen3.loader import load_model_and_processor
+
+        self._build_inputs = build_inputs
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        inp = self._build_inputs(self.processor, wav, sr=16000)
+        prompt_len = inp["input_ids"].shape[1]
+        gen = self.model.generate(
+            input_ids=inp["input_ids"],
+            input_features=inp["input_features"],
+            input_features_mask=inp.get("input_features_mask"),
+            max_new_tokens=400,
+            do_sample=False,
+            num_beams=1,
+        )
+        gen_new = gen[:, prompt_len:]
+        try:
+            return self.processor.decode(gen_new, return_format="transcription_only")[0]
+        except Exception:  # noqa: BLE001 -- older processor API
+            return self.processor.batch_decode(gen_new, skip_special_tokens=True)[0]
+
+
+# ====================================================================== #
+# CrispASR  (external ggml binary; granite + qwen3 backends only)
+# ====================================================================== #
+class CrispASR(Engine):
+    """External CrispASR (ggml) binary subprocess. No batching; B loops on host."""
+
+    def __init__(self, backend: str, gguf: str) -> None:
+        super().__init__("CrispASR", "granite" if backend == "granite" else "qwen3",
+                         supports_batch=False)
+        self.backend = backend
+        self.gguf = gguf
+        self._wav_path: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return CRISPASR_BIN.exists() and (CRISPASR_MODELS / self.gguf).exists()
+
+    def _load(self) -> None:
+        # No resident model; the binary loads it per-invocation. Write the
+        # (varying) hypothesis audio to a temp wav the first time only.
+        import tempfile
+
+        self._tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, dir=str(REPO_ROOT)
+        )
+        self._tmp.close()
+        self._wav_path = self._tmp.name
+
+    def _release(self) -> None:
+        if self._wav_path and os.path.exists(self._wav_path):
+            try:
+                os.unlink(self._wav_path)
+            except OSError:
+                pass
+        self._wav_path = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        import soundfile as sf
+
+        sf.write(self._wav_path, audio, 16000, subtype="PCM_16")
+        cmd = [
+            str(CRISPASR_BIN),
+            "--backend", self.backend,
+            "-m", str(CRISPASR_MODELS / self.gguf),
+            "-f", self._wav_path,
+            "-n", "512",
+            "--gpu-backend", "cuda",
+            "-nt",  # no timestamps -> clean transcript lines
+        ]
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, env=_CRISPASR_ENV,
+            cwd=str(ASR_BENCH), timeout=180,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"CrispASR failed (rc={p.returncode}):\n{p.stderr[-1000:]}"
+            )
+        # The transcript is the last non-empty stdout line (the binary prints
+        # progress/timing to stderr with -nt; stdout holds just the text).
+        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+
+# ====================================================================== #
+# Registry + filter resolution
+# ====================================================================== #
+def _qwen3_on_master() -> bool:
+    try:
+        import starling.qwen3  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# (engine_key, factory, requires_extra)
+# starling/stock factories are cheap wrappers; CrispASR/Qwen3 are conditional.
+ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
+    "starling-granite": GraniteStarling,
+    "stock-granite": GraniteStock,
+    "starling-parakeet": ParakeetStarling,
+    "stock-parakeet": ParakeetStock,
+    "starling-moss": MossStarling,
+    "stock-moss": MossStock,
+}
+
+
+def _crispasr_keys() -> list[str]:
+    keys = []
+    if CrispASR("granite", "granite-speech-4.1-2b-f16.gguf").available:
+        keys.append("crispasr-granite")
+    if CrispASR("qwen3-1.7b", "qwen3-asr-1.7b-f16.gguf").available:
+        keys.append("crispasr-qwen3")
+    return keys
+
+
+def _qwen3_keys() -> list[str]:
+    if not _qwen3_on_master():
+        return []
+    return ["starling-qwen3", "stock-qwen3"]
+
+
+def available_keys() -> list[str]:
+    """All engine keys usable in this checkout (qwen3/CrispASR gated)."""
+    return list(ENGINE_REGISTRY) + _qwen3_keys() + _crispasr_keys()
+
+
+def build_engines(
+    models: list[str], engines: list[str]
+) -> dict[str, list[Engine]]:
+    """Resolve ``--models``/``--engines`` filters into ``{model: [engine, ...]}``.
+
+    ``engines`` is a list of family names (``starling``, ``stock``,
+    ``crispasr``); ``models`` is a list of model slugs. The cross product of
+    available (engine, model) keys is built and instantiated (lazy: ``load()``
+    is called later by the harness).
+    """
+    avail = available_keys()
+    chosen: dict[str, list[Engine]] = {m: [] for m in models}
+    for key in avail:
+        fam, mdl = key.split("-", 1)
+        if mdl not in chosen:
+            continue
+        if engines and fam not in engines:
+            continue
+        if key.startswith("crispasr-"):
+            backend = "granite" if mdl == "granite" else "qwen3-1.7b"
+            gguf = {
+                "granite": "granite-speech-4.1-2b-f16.gguf",
+                "qwen3": "qwen3-asr-1.7b-f16.gguf",
+            }[mdl]
+            chosen[mdl].append(CrispASR(backend, gguf))
+        elif key.startswith("qwen3") or mdl == "qwen3":
+            cls = Qwen3Starling if fam == "starling" else Qwen3Stock
+            chosen[mdl].append(cls())
+        else:
+            chosen[mdl].append(ENGINE_REGISTRY[key]())
+    return {m: es for m, es in chosen.items() if es}

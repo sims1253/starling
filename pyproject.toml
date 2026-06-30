@@ -16,6 +16,7 @@ dependencies = [
     "einx",
     "matplotlib",
     "tabulate",
+    "jiwer",
 ]
 
 [project.optional-dependencies]

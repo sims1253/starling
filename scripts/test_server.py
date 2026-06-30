@@ -1,4 +1,4 @@
-"""Stdlib-only test client for the Granite-Speech streaming ASR server.
+"""Stdlib-only test client for the starling streaming ASR server.
 
 Exercises both interfaces:
 
@@ -41,7 +41,7 @@ import numpy as np
 # Add src/ to sys.path so `import starling...` works when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from starling.granite.server import (  # noqa: E402
+from starling.server import (  # noqa: E402
     DEFAULT_HOST,
     DEFAULT_PORT,
     SAMPLE_RATE,
@@ -377,7 +377,7 @@ def _print_ws_msg(msg: dict, t0: float) -> bool:
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Stdlib test client for the Granite-Speech streaming ASR server."
+        description="Stdlib test client for the starling streaming ASR server."
     )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)

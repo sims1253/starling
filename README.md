@@ -4,13 +4,15 @@ CUDA-graph inference kernels for speech-recognition models, tuned to run as
 fast as possible on a single RTX 5090 (Blackwell, sm_120). Can probably be 
 adapted to other GPUs pretty easy.
 
-The core idea is the same for both models. The stock `transformers` decode loop
-emits a few hundred tiny kernels per output token and spends most of its wall
-time on CPU launch overhead, with the GPU sitting around 10% busy. Everything
-that can be captured into a CUDA-graph replay gets captured: decode steps, fused
-RMSNorm/SwiGLU, the attention mask, and (for the LLM model) whole multi-step
-token loops. Output is byte-identical to the eager `transformers` reference, so
-there is no accuracy trade-off, just fewer round trips to the GPU.
+The core idea is the same across the models. The stock `transformers` decode
+loop emits a few hundred tiny kernels per output token and spends most of its
+wall time on CPU launch overhead, with the GPU sitting around 10% busy.
+Everything that can be captured into a CUDA-graph replay gets captured: decode
+steps, fused RMSNorm/SwiGLU, the attention mask, whole multi-step token loops
+(autoregressive models), or the single bidirectional editor forward
+(granite-speech-4.1-2b-nar). Output is byte-identical to the eager
+`transformers` reference, so there is no accuracy trade-off, just fewer round
+trips to the GPU.
 
 Most props go to GLM 5.2
 
@@ -22,6 +24,7 @@ Both do speech-to-text.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer + TDT transducer, no LLM). Tuned for batched offline throughput, with GPU-side mel extraction and chunking for hour-long audio.
 - [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) (Qwen3-omni MoE audio encoder + Qwen3 LLM decoder). The same encoder+LLM-decoder pattern as granite: the decode loop is the bottleneck, so a `torch.compile`d hand-iterated layer loop with fused Triton elementwise kernels is captured into a K-step CUDA graph, plus a per-prompt-length graphed prefill. Output is byte-identical to the eager reference.
 - [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Whisper-style windowed-attention audio encoder + Qwen3 LLM decoder). Three byte-exact CUDA-graph layers: a graphed encoder (custom static-shape windowed-attention kernel, since the stock layer does host ops on `cu_seqlens`), a graphed greedy Qwen3 decode over a static KV cache with fused Triton RMSNorm/SwiGLU/residual/QK-norm kernels, and a K-step (K=8) multi-step decode graph. Output is byte-identical to the eager reference.
+- [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) (non-autoregressive ASR). Unlike every other model here, there is **no decode loop**: ASR is one bidirectional forward pass — a CTC conformer encoder produces a rough token draft, blank "edit slots" are interleaved, and a *bidirectional* granite-4.0-1b LLM editor refines the whole sequence in a single forward. The win is CUDA-graph capture of the encoder trunk plus a `torch.compile`d (then graph-captured) LLM editor forward, removing host launch overhead across the 16 encoder + 40 LLM layers. Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -110,6 +113,37 @@ Batched offline throughput (medium ~22s clip tiled B times, same transcript):
 | 8 | 2332ms (8 streams) | 76x |
 | 16 | 3920ms (16 streams) | 91x |
 
+### granite-speech-4.1-2b-nar (2.3B params)
+
+Non-autoregressive: a single bidirectional forward, no token-by-token decode.
+`starling` is byte-identical to the eager `transformers` reference. Two layers
+of CUDA-graph capture, both byte-exact:
+
+- **Graphed encoder + projector** — the graph-safe conformer stack (input → 16
+  blocks with self-conditioning) *plus* the multilayer-cat + Q-Former projector
+  + BPE CTC head are captured together in one graph per mel-frame count. The
+  host-side lengths (`audio_lengths`, `bpe_lengths`) are input-shape constants
+  for batch=1, so they are computed once at capture time and cached — the hot
+  path never does a `.cpu()` sync. (The BPE head's `lengths.tolist()` would
+  break capture, but with cached lengths we slice statically.)
+- **Compiled + graphed LLM editor** — the `torch.compile`d stock bidirectional
+  granite-4.0-1b forward is captured per edit-sequence length. Compiling in
+  eager first makes Inductor emit deterministic Triton kernels, so graph
+  capture doesn't perturb the numerics the way capturing raw cuBLAS does.
+
+B=1 single-stream. NAR is already extremely fast eager (it does one forward, no
+loop), so the speedups are smaller than the autoregressive tracks — the win is
+removing host launch overhead across the 16 encoder + 40 LLM layers. The encoder
+trunk + projector + BPE head are captured in one graph (the projector alone was
+~6ms eager); the host-side lengths are cached per input shape so the hot path
+never does a `.cpu()` sync.
+
+| audio | starling | [stock transformers](https://github.com/huggingface/transformers) |
+| ----- | -------- | ------------------ |
+| 7s    | 15ms (487x) | 87ms (84x) |
+| 22s   | 28ms (796x) | 77ms (289x) |
+| 74s   | 67ms (1110x) | 103ms (722x) |
+
 ### Long audio (30-90 min)
 
 Both models transcribing the same tiled audio at each duration, using their
@@ -136,6 +170,98 @@ speedup over non-spec greedy (292 vs 177 tok/s). At B>=16 the GEMMs are large
 enough that speculation wastes more compute than it saves (measured 0.76x
 regression at B=32), so batched decoding always uses the non-spec path.
 
+## Benchmark
+
+A single re-runnable script sweeps every supported model × engine × audio
+length × batch size on the same fixtures and the same ground-truth transcript,
+so RTFx (speed) and WER (accuracy) are directly comparable across engines.
+
+Engines:
+
+- `starling` — the fused megakernel pipeline in this repo.
+- `stock transformers` — the unmodified HuggingFace `generate()` reference.
+  (MOSS's HF `generate()` is broken on this transformers build, so its stock
+  reference is the documented byte-exact eager greedy loop over the same model
+  modules.)
+- `CrispASR` — the external ggml binary. Only granite and qwen3 have a CrispASR
+  backend; moss and parakeet have no column there.
+
+Fixtures are deterministic: a single LibriSpeech sample (2086-149220-0033)
+tiled 1×/3×/10× into `short` (~7s) / `medium` (~22s) / `long` (~74s). RTFx and
+VRAM are medians with model load + CUDA-graph capture excluded. `starling` is
+byte-exact with `stock transformers`, so the two report the same WER; any drift
+is a bug and the bench prints a warning. WER is computed with `jiwer` against
+the tiled LibriSpeech transcript, with identical case/punctuation normalization
+applied to every engine (so CrispASR's lowercased output is not penalized).
+
+Re-run it any time:
+
+```
+uv run python benchmarks/bench_all.py --update-readme
+```
+
+That regenerates `outputs/bench_all.json` and splices the two tables below into
+this README between the `BENCH:START`/`BENCH:END` sentinels. Scope is tunable
+(`--models`, `--engines`, `--lengths`, `--batches`, `--reps`). `qwen3` rows
+appear automatically once that model lands on `master`; until then it lives on
+the `qwen3-asr` branch.
+
+<!-- BENCH:START -->
+**granite-speech-4.1-2b** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling     | stock transformers   | CrispASR     |
+|----------|---------|--------------|----------------------|--------------|
+| short    |       1 | 377ms (20x)  | 2783ms (3x)          | 6609ms (1x)  |
+| medium   |       1 | 724ms (31x)  | 5126ms (4x)          | 6930ms (3x)  |
+| long     |       1 | 2447ms (30x) | 21787ms (3x)         | 17674ms (4x) |
+
+**granite-speech-4.1-2b** — WER % vs LibriSpeech reference
+
+| length   |   batch | starling   | stock transformers   | CrispASR   |
+|----------|---------|------------|----------------------|------------|
+| short    |       1 | 0.00%      | 0.00%                | 0.00%      |
+| medium   |       1 | 33.33%     | 33.33%               | 33.33%     |
+| long     |       1 | 21.30%     | 21.30%               | 41.74%     |
+
+**parakeet-tdt-0.6b-v3** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling     | stock transformers   |
+|----------|---------|--------------|----------------------|
+| short    |       1 | 31ms (239x)  | 430ms (17x)          |
+| short    |       8 | 48ms (155x)  | —                    |
+| medium   |       1 | 58ms (382x)  | 1455ms (15x)         |
+| medium   |       8 | 96ms (233x)  | —                    |
+| long     |       1 | 152ms (489x) | 2503ms (30x)         |
+| long     |       8 | 327ms (228x) | —                    |
+
+**parakeet-tdt-0.6b-v3** — WER % vs LibriSpeech reference
+
+| length   |   batch | starling   | stock transformers   |
+|----------|---------|------------|----------------------|
+| short    |       1 | 0.00%      | 0.00%                |
+| short    |       8 | 0.00%      | —                    |
+| medium   |       1 | 0.00%      | 0.00%                |
+| medium   |       8 | 0.00%      | —                    |
+| long     |       1 | 0.00%      | 0.00%                |
+| long     |       8 | 0.00%      | —                    |
+
+**moss-transcribe-preview-2b** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling     | stock transformers   |
+|----------|---------|--------------|----------------------|
+| short    |       1 | 227ms (33x)  | 10563ms (1x)         |
+| medium   |       1 | 634ms (35x)  | 31538ms (1x)         |
+| long     |       1 | 1292ms (58x) | 49861ms (2x)         |
+
+**moss-transcribe-preview-2b** — WER % vs LibriSpeech reference
+
+| length   |   batch | starling   | stock transformers   |
+|----------|---------|------------|----------------------|
+| short    |       1 | 0.00%      | 0.00%                |
+| medium   |       1 | 0.00%      | 0.00%                |
+| long     |       1 | 40.00%     | 33.48%               |
+<!-- BENCH:END -->
+
 ## What did not work
 
 - INT8 weight-only quant is slower. Decode is launch-bound, not bandwidth-bound, so halving weight traffic does not help.
@@ -157,6 +283,7 @@ regression at B=32), so batched decoding always uses the non-spec path.
 src/starling/           shared toolkit (config dims, optimisation flags)
   config.py             Granite-Speech architecture constants (single source of truth)
   flags.py              runtime optimisation flags (byte-exact vs tolerance mode)
+  server.py             unified HTTP/WebSocket ASR sidecar (all models; --model flag)
   granite/              granite-speech-4.1-2b megakernel
     encoder_mega.py     fused (cudagraph) conformer encoder
     llm_mega.py         graphed greedy decode over a static KV cache
@@ -165,7 +292,6 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     batched.py          batched (B>1) LLM decode + pipeline
     long_audio.py       chunked long-audio transcription (sequential + batched)
     speculative.py      self-speculative decoding via the CTC draft head
-    server.py           local HTTP/WebSocket ASR sidecar (kept resident in VRAM)
   parakeet/             parakeet-tdt-0.6b-v3 megakernel
     decode_mega.py      multi-step graphed TDT decode
     encoder_graph.py    graphed FastConformer encoder
@@ -179,6 +305,16 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     multistep.py        K-step graphed decode (multi-step per replay)
     encoder_graph.py    eager Qwen3-omni MoE audio encoder + adapter
     pipeline.py         encoder + adapter + LLM wiring
+  qwen3/                qwen3-asr-1.7b megakernel
+    encoder_mega.py     graphed windowed-attention audio encoder
+    llm_mega.py         graphed greedy Qwen3 decode over a static KV cache
+    multistep.py        K-step graphed decode (multi-step per replay)
+    pipeline.py         encoder + projector + LLM wiring
+  nar/                  granite-speech-4.1-2b-nar megakernel (non-autoregressive)
+    mega.py             single-pass pipeline: graphed encoder trunk +
+                         torch.compiled + graphed bidirectional LLM editor
+    fused_llm.py        hand-iterated LLM forward (documented negative result —
+                         diverges from stock cuBLAS on long packed sequences)
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
@@ -186,14 +322,16 @@ tests/                  correctness checks vs. golden references
 
 ## Server
 
-`src/starling/granite/server.py` is a long-lived local HTTP/WebSocket sidecar
-that keeps Granite-Speech resident in VRAM. It is the integration surface for
-external clients (e.g. the freestyle Electron app's overlapping-window STT
-provider). Run it with:
+`src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps
+one model resident in VRAM. It serves every supported model behind a `--model`
+flag (`granite` | `parakeet` | `moss` | `qwen3`, default `granite`); one process
+runs one model at a time, and `/health` reports which model is loaded so clients
+can match per-row readiness. It is the integration surface for external clients
+(e.g. the freestyle Electron app's overlapping-window STT provider). Run it with:
 
 ```bash
-python -m starling.granite.server --port 8181 --max-chunk-seconds 30
-python -m starling.granite.server --warmup   # pre-capture CUDA graphs
+python -m starling.server --model granite --port 8181 --max-chunk-seconds 30
+python -m starling.server --model parakeet --warmup   # pre-capture CUDA graphs
 ```
 
 Endpoints (FastAPI when available, else a stdlib fallback):
@@ -208,11 +346,12 @@ Endpoints (FastAPI when available, else a stdlib fallback):
 | `WS   /stream`            | real-time streaming dictation |
 
 **Timestamps.** `/inference` returns chunk-level segment timestamps
-(`segments: [{text, start_s, end_s}]`). Granite-Speech has no per-token audio
-alignment (the LLM decodes text with no duration head), so segments are at
-`--max-chunk-seconds` granularity — one per chunk window — rather than
-per-word. Shrink `--max-chunk-seconds` for finer segments at the cost of more
-decode passes.
+(`segments: [{text, start_s, end_s}]`). The LLM-decoder models (granite, moss,
+qwen3) have no per-token audio alignment (the LLM decodes text with no duration
+head), so for those models segments are at `--max-chunk-seconds` granularity —
+one per chunk window — rather than per-word; shrink `--max-chunk-seconds` for
+finer segments at the cost of more decode passes. Parakeet handles long audio
+and alignment internally, so it returns a single whole-utterance segment.
 
 **Queueing.** A single GPU worker serves one request at a time; concurrent
 requests queue (up to `MAX_WAITERS`) instead of being rejected, and only get
