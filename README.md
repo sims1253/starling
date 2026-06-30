@@ -60,26 +60,31 @@ once.
 ### higgs-audio-v3-stt (2.68B params)
 
 B=1 single-stream. `starling` is a CUDA-graph-captured Qwen3-1.7B decode over a
-static KV cache with **fused Triton elementwise kernels** (RMSNorm, SwiGLU,
-residual add, per-head QK-norm) replacing the layer glue — unlike granite, higgs
-benefits substantially from this (the decode is compute/memory-bound at the
-elementwise glue once launch overhead is removed, not pure-GEMV-launch-bound like
-granite): 4.3ms/tok / 233 tok/s steady-state, ~1.8x over the model's-own-layers
-path. The Whisper-large-v3 audio tower (32 layers) + MLP projector run eager once
-per clip (the prefill); the Qwen3 decode loop is the bottleneck and is where the
-graph-capture + fusion win lives. A K-step multi-step variant (subclassing the
-fused path) stacks for further host-sync amortisation. Identical transcripts to
-stock. Runs under its own isolated venv (`.venv-higgs`, transformers 4.51) because
-the model's `trust_remote_code` modeling breaks under the repo's transformers 5.13.
+static KV cache. Three byte-exact layers stack: (1) graph-capture of the model's
+own layers over `StaticCache` (removes launch overhead), (2) **fused Triton
+elementwise kernels** (RMSNorm, SwiGLU, residual add, per-head QK-norm) replacing
+the layer glue — unlike granite, higgs benefits substantially (the decode is
+compute/memory-bound at the glue once launch overhead is gone, not
+pure-GEMV-launch-bound like granite), and (3) **`torch.compile(mode="max-autotune-
+no-cudagraphs")`** on the fused decode so inductor fuses the remaining PyTorch
+elementwise glue (RoPE cat+mul+add, attention softmax prep, GQA repeats).
+Steady-state decode: **3.05ms/tok / 327 tok/s** (byte-exact — the "compile not
+byte-exact" finding was the *encoder*'s BatchNorm, not the LLM decode). A K-step
+multi-step variant (subclassing the fused path) stacks for host-sync
+amortisation. The Whisper-large-v3 audio tower (32 layers) + MLP projector run
+eager once per clip (the prefill); the Qwen3 decode loop is the bottleneck.
+Identical transcripts to stock. Runs under its own isolated venv (`.venv-higgs`,
+transformers 4.51) because the model's `trust_remote_code` modeling breaks under
+the repo's transformers 5.13.
 
 | audio | starling | stock transformers | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
 | ----- | -------- | ------------------ | -------- |
-| 7s    | 162ms (46x) | 5321ms (1.4x) | 4043ms (1.8x) |
-| 22s   | 540ms (41x) | 8422ms (2.7x) | 13197ms (1.7x) |
-| 74s   | 841ms (88x) | 13451ms (5.5x) | — |
+| 7s    | 98ms (76x)  | 5321ms (1.4x)  | 4043ms (1.8x) |
+| 22s   | 304ms (73x) | 8422ms (2.7x)  | 13197ms (1.7x) |
+| 74s   | 496ms (150x)| 13451ms (5.5x) | — |
 
-starling is ~25-33x faster than stock `generate()` and ~25-80x faster than
-CrispASR's q4_k ggml path on the same model. (CrispASR wall includes model load;
+starling is **~54–111x faster than stock `generate()` and ~25–130x faster than
+CrispASR's q4_k ggml path** on the same model. (CrispASR wall includes model load;
 its `higgs-stt` backend loads the real higgs weights via a whisper-tiny VAD
 front-end. Long-audio CrispASR timed out the harness.)
 
