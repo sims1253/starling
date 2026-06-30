@@ -28,6 +28,7 @@ parakeet is a transducer and the NAR model is a single bidirectional pass.
 - [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Whisper-style windowed-attention audio encoder + Qwen3 LLM decoder). Three byte-exact CUDA-graph layers: a graphed encoder (custom static-shape windowed-attention kernel, since the stock layer does host ops on `cu_seqlens`), a graphed greedy Qwen3 decode over a static KV cache with fused Triton RMSNorm/SwiGLU/residual/QK-norm kernels, and a K-step (K=8) multi-step decode graph. Output is byte-identical to the eager reference.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) (non-autoregressive ASR). Unlike every other model here, there is **no decode loop**: ASR is one bidirectional forward pass — a CTC conformer encoder produces a rough token draft, blank "edit slots" are interleaved, and a *bidirectional* granite-4.0-1b LLM editor refines the whole sequence in a single forward. The win is CUDA-graph capture of the encoder trunk plus a `torch.compile`d (then graph-captured) LLM editor forward, removing host launch overhead across the 16 encoder + 40 LLM layers. Output is byte-identical to the eager reference.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) (Whisper encoder + MLP adapter + Qwen2.5 decoder). Same encoder+LLM-decoder pattern as granite. The Whisper+adapter forward and the prefill are each captured into shape-keyed CUDA graphs, and the Qwen2.5 decode loop runs as a K-step graph with fused Triton elementwise glue reused from the granite kernels. Output is byte-identical to the eager reference.
+- [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (~2B params, the repo's first **seq2seq encoder-decoder**, Whisper-style). A Parakeet FastConformer encoder (48 layers) + an 8-layer Transformer decoder with **self-attention AND cross-attention**. A graphed encoder + a K-step graphed greedy decode over an `EncoderDecoderCache` (StaticCache for both halves, so the K/V tensors are fixed-shape and capture-safe). The decode step has two attention blocks per layer; the self-attn causal mask is built dynamically in-graph from an advancing position counter (no per-step baked masks). Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -106,6 +107,36 @@ backend and no GGUF conversion exists), so the only comparison is stock
 | 7s    | 248ms (30x) | 1657ms (4x) |
 | 22s   | 608ms (37x) | 5467ms (4x) |
 | 74s   | 680ms (109x) | 4661ms (16x) |
+
+### cohere-transcribe-03-2026 (2B params, seq2seq encoder-decoder)
+
+`starling` is byte-identical to the eager `transformers` reference. The repo's
+first **seq2seq encoder-decoder** (Whisper-style): a Parakeet FastConformer
+encoder (48 layers) + an 8-layer Transformer decoder with self-attention AND
+cross-attention. Two byte-exact CUDA-graph layers:
+
+- **Graphed encoder** — the 48-layer FastConformer forward captured per mel
+  shape (collapses hundreds of per-layer launches into one replay).
+- **K-step graphed decode** — K=16 consecutive decode steps captured into one
+  CUDA graph (argmax chained in-graph, 1 host sync per 16 tokens). The decode
+  drives the model's own decoder layers over an `EncoderDecoderCache` built on
+  two `StaticCache`s (self-attn + cross-attn), so the K/V tensors are
+  fixed-shape and capture-safe. The per-step self-attn causal mask is built
+  dynamically in-graph from an advancing position counter (the captured template
+  runs at any base position, so it serves the whole decode in K-step blocks). A
+  precomputed 4D additive bidirectional mask makes `create_bidirectional_mask`
+  early-exit (no CPU-scalar capture abortors). Prefill is eager (fills the
+  cross-attn cache once); steps 1+ are graphed.
+
+Decode steady-state is ~3.1ms/tok (318 tok/s) at B=1. Audio longer than
+`max_audio_clip_s` (35s) is auto-chunked by the processor; each chunk decodes
+independently (long tier is B=3).
+
+| audio | starling | stock transformers |
+| ----- | -------- | ------------------ |
+| 7s    | 54ms (139x)  | 992ms (7x) |
+| 22s   | 376ms (59x)  | 2560ms (9x) |
+| 74s   | 610ms (122x) | 3567ms (21x) |
 
 ### Long audio (30-90 min)
 
@@ -281,6 +312,12 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     llm_mega.py         graphed greedy decode over a static KV cache + graphed prefill
     multistep.py        K-step graphed decode (multi-step per replay)
     pipeline.py         encoder + audio-embedding injection + LLM wiring
+  cohere/               cohere-transcribe-03-2026 megakernel (seq2seq enc-dec)
+    encoder_graph.py    graphed FastConformer encoder (48 layers)
+    decode_mega.py      K-step graphed seq2seq decode over an EncoderDecoderCache
+                         (StaticCache self-attn + cross-attn; dynamic in-graph mask)
+    reference.py        eager golden greedy decode (byte-exact vs HF generate)
+    pipeline.py         graphed encoder + graphed decode wiring
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
