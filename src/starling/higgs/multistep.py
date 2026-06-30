@@ -40,14 +40,16 @@ from typing import Any, Optional
 import torch
 
 from .config import EOS_TOKEN_IDS
-from .llm_mega import GenerateResult, LLMMega
+from .fused_decode import FusedLLMMega
+from .llm_mega import GenerateResult
 
 
-class MultiStepLLMMega(LLMMega):
+class MultiStepLLMMega(FusedLLMMega):
     """K-step CUDA-graph-captured greedy decoder for the Higgs-Audio Qwen3 LLM.
 
-    Subclasses :class:`LLMMega` and overrides :meth:`capture` / :meth:`generate`
-    to capture **K** decode steps per graph replay instead of one.
+    Subclasses :class:`FusedLLMMega` (fused Triton elementwise kernels) and
+    overrides :meth:`capture` / :meth:`generate` to capture **K** decode steps
+    per graph replay instead of one.
 
     Args:
         model: the loaded ``HiggsAudio3Model``.

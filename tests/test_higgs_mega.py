@@ -111,6 +111,28 @@ def test_multi_step_byte_exact(name: str, k: int) -> None:
     )
 
 
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_fused_decode_byte_exact(name: str) -> None:
+    """FusedLLMMega (fused Triton elementwise kernels) reproduces golden exactly.
+
+    The fused path (RMSNorm / SwiGLU / residual / QK-norm as single-launch
+    Triton kernels) must still match the eager reference bit-for-bit.
+    """
+    from starling.higgs.fused_decode import FusedLLMMega
+
+    model, tok, coll = _load()
+    golden = _golden()["fixtures"][name]
+    batch = _build_batch(coll, tok, _fixture_audio(name))
+    llm = FusedLLMMega(model, max_cache_len=2048)
+    res = llm.generate(
+        batch, max_new_tokens=len(golden["gen_ids"]) + 2,
+        eos_token_ids=EOS_TOKEN_IDS, tokenizer=tok,
+    )
+    assert res.ids[0].tolist() == golden["gen_ids"], (
+        f"{name}: fused decode diverged from golden"
+    )
+
+
 def test_transcribe_matches_golden_text() -> None:
     """End-to-end pipeline text matches the golden transcript (short clip)."""
     from starling.higgs.pipeline import HiggsMega

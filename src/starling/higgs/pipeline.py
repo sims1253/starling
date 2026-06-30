@@ -106,7 +106,8 @@ class HiggsMega:
                 model, max_cache_len=max_cache_len, steps_per_replay=steps_per_replay
             )
         elif decoder == "single":
-            self.llm = LLMMega(model, max_cache_len=max_cache_len)
+            from .fused_decode import FusedLLMMega
+            self.llm = FusedLLMMega(model, max_cache_len=max_cache_len)
         else:
             raise ValueError(f"unknown decoder {decoder!r}; use 'single' or 'multi'")
 
