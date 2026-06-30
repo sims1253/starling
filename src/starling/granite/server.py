@@ -4,16 +4,36 @@ This server runs as a long-lived local sidecar (for the freestyle Electron app
 or any other client) that keeps the model resident in VRAM and exposes a
 parakeet-server-compatible interface:
 
-  * ``GET  /``            - health check (any status = alive)
-  * ``GET  /health``      - health check alias
-  * ``POST /inference``   - multipart WAV upload -> ``{"text": "..."}``
-  * ``POST /transcribe``  - raw WAV bytes body -> ``{"text": "..."}`` (alias)
-  * ``WS   /stream``      - real-time streaming dictation over WebSocket
+  * ``GET  /``                - health check (any status = alive)
+  * ``GET  /health``          - health check alias (also reports ``phase`` and
+                                ``queue_depth`` so clients can render load state)
+  * ``POST /inference``       - multipart/raw WAV upload -> ``{text, segments,
+                                duration_s, request_id}``
+  * ``POST /transcribe``      - raw WAV bytes body -> same shape as /inference
+  * ``POST /warmup``          - pre-capture CUDA graphs on a silent clip
+                                (idempotent; 202 Accepted while it runs)
+  * ``DELETE /inference/<id>``- cancel a queued request by its ``X-Request-Id``
+  * ``WS   /stream``          - real-time streaming dictation over WebSocket
 
-A single worker serves one request at a time. Inference is serialised through
-a ``threading.Lock`` and the GPU lock
-(:mod:`starling.parakeet.gpu_lock`) is taken during each pass to avoid
-contention with benchmarks. Concurrent requests are answered with HTTP 503.
+Response shape. ``POST /inference`` returns chunk-level segment timestamps:
+
+    {"text": "...", "duration_s": 12.3,
+     "segments": [{"text": "...", "start_s": 0.0, "end_s": 12.3}]}
+
+Granite-Speech has no per-token audio alignment (the LLM decodes text with no
+duration head), so segments are at ``max_chunk_seconds`` granularity — one per
+chunk window — rather than per-word. Shrink ``--max-chunk-seconds`` for finer
+segments at the cost of more decode passes.
+
+Request handling. A single GPU worker serves one request at a time. Inference
+is serialised through the process-wide GPU lock
+(:mod:`starling.parakeet.gpu_lock`); concurrent requests queue (up to
+``MAX_WAITERS``) instead of being rejected, and are rejected with HTTP 503 only
+once the queue is full. A client that supplies ``X-Request-Id`` on a POST may
+``DELETE /inference/<id>`` to drop it from the queue. Cancellation is
+best-effort for a request already on the GPU: CUDA-graph replays are not
+preemptible, so an in-flight request still finishes its current ~5-16ms decode
+step, but won't be returned (HTTP 499).
 
 Two transport backends are supported and chosen automatically at runtime:
 
@@ -83,6 +103,13 @@ DEFAULT_MAX_NEW_TOKENS: int = 200
 GPU_LOCK_SESSION: str = "granite-server"
 GPU_LOCK_MODEL: str = "granite-speech-4.1-2b"
 GPU_LOCK_ETA_MIN: int = 1
+
+MAX_WAITERS: int = 8
+"""Max requests waiting for the single GPU worker before we reject with HTTP
+503 backpressure. Past this depth the client must retry rather than pile up."""
+
+CANCEL_POLL_SECONDS: float = 0.1
+"""How often a queued request checks its cancel event while waiting for the GPU."""
 
 WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -178,8 +205,26 @@ class GraniteServer:
     pipe: Any = None
     processor: Any = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
-    _busy: bool = False
     _loaded: bool = False
+
+    # --- request queueing -------------------------------------------------
+    # The GPU can serve exactly one request at a time. Instead of answering
+    # concurrent requests with HTTP 503 and forcing the client to retry-storm,
+    # we serialise them here: at most one runs (guarded by the process-wide
+    # ``acquire_gpu_lock``) while up to ``MAX_WAITERS`` others block waiting for
+    # it. Each request carries a cancel event so a client abort
+    # (DELETE /inference/<id>) can pull it from the queue. ``_n_waiters`` counts
+    # everyone who has been admitted but not yet finished (including the
+    # running one) and drives backpressure.
+    _n_waiters: int = 0
+    _requests: dict[str, "RequestContext"] = field(default_factory=dict)
+
+    # --- lifecycle phase (reported by /health) ----------------------------
+    # Coarse progress hint while the server is not yet ready, so clients can
+    # render a meaningful status instead of a bare "not loaded". Transitions:
+    #   unloaded -> loading_weights -> warming_up -> ready
+    _phase: str = "unloaded"
+    """One of ``unloaded``/``loading_weights``/``warming_up``/``ready``."""
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -192,6 +237,7 @@ class GraniteServer:
         with self._lock:
             if self._loaded:
                 return
+            self._phase = "loading_weights"
             from .loader import load_model_and_processor
             from .pipeline import MegaPipeline
 
@@ -207,10 +253,13 @@ class GraniteServer:
             self.pipe = pipe
             self.processor = processor
             self._loaded = True
+            self._phase = "loaded"
             log.info("model loaded in %.1fs", time.perf_counter() - t0)
 
         if self.config.warmup:
             self.warmup()
+        else:
+            self._phase = "ready"
 
     def warmup(self) -> None:
         """Capture CUDA graphs on a short silent clip (no-op if not loaded)."""
@@ -218,6 +267,7 @@ class GraniteServer:
             return
         from ..parakeet.gpu_lock import with_gpu_lock
 
+        self._phase = "warming_up"
         log.info("warming up CUDA graphs on %.1fs silent clip ...", WARMUP_SECONDS)
         n = int(WARMUP_SECONDS * SAMPLE_RATE)
         dummy = np.zeros(n, dtype=np.float32)
@@ -228,18 +278,24 @@ class GraniteServer:
             note="warmup",
         ):
             self._transcribe_np(dummy)
+        self._phase = "ready"
         log.info("warmup complete")
 
     # ------------------------------------------------------------------ #
     # inference core (callers acquire the GPU lock)
     # ------------------------------------------------------------------ #
-    def _transcribe_np(self, samples: np.ndarray) -> str:
-        """Transcribe a 1-D float32 mono numpy array -> transcript text.
+    def _transcribe_np(self, samples: np.ndarray) -> "TranscribeResult":
+        """Transcribe a 1-D float32 mono numpy array -> transcript result.
 
         Audio longer than ``max_chunk_seconds`` is split with
         :func:`starling.granite.long_audio.chunk_audio` and the per-chunk texts
         are concatenated. The GPU lock is NOT taken here; callers wrap the call
         so the lock scope stays tight.
+
+        Returns text plus chunk-level segment timestamps. The Granite-Speech
+        architecture has no per-token audio alignment (the LLM decodes text with
+        no duration head), so segments are at ``max_chunk_seconds`` granularity
+        — one per chunk window — rather than per-word.
         """
         import torch
 
@@ -265,13 +321,19 @@ class GraniteServer:
                 max_new_tokens=self.config.max_new_tokens,
                 speculative=self.config.speculative,
             )
-            return text
+            return TranscribeResult(
+                text=text,
+                segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+                duration_s=audio_seconds,
+            )
 
-        # Long audio: chunk it.
+        # Long audio: chunk it. Track per-chunk (start_s, end_s) so callers can
+        # align segment text against the source timeline.
         texts: list[str] = []
+        segments: list[dict[str, Any]] = []
         max_cache_len = int(getattr(self.pipe.llm, "max_cache_len", 640))
         dtype = self.pipe.dtype
-        for chunk_wav, _start, _end, _idx in chunk_audio(wav, sr, max_chunk):
+        for chunk_wav, start, end, _idx in chunk_audio(wav, sr, max_chunk):
             inputs = build_inputs(self.processor, chunk_wav)
             feats = inputs["input_features"].to(dtype)
             ids = inputs["input_ids"]
@@ -284,34 +346,69 @@ class GraniteServer:
                 speculative=self.config.speculative,
             )
             texts.append(text)
-        return _join_chunk_texts(texts, 0.0)
+            segments.append({"text": text, "start_s": start, "end_s": end})
+        joined = _join_chunk_texts(texts, 0.0)
+        return TranscribeResult(
+            text=joined,
+            segments=segments,
+            duration_s=audio_seconds,
+        )
 
     # ------------------------------------------------------------------ #
-    # public async-ish entry points (synchronous; offload by caller)
+    # public entry points (synchronous; offload by caller)
     # ------------------------------------------------------------------ #
-    def transcribe_bytes_sync(self, wav_bytes: bytes) -> str:
-        """Decode WAV bytes, acquire GPU + busy locks, and transcribe."""
+    def transcribe_bytes_sync(
+        self, wav_bytes: bytes, request_id: Optional[str] = None
+    ) -> "TranscribeResult":
+        """Decode WAV bytes, queue for the GPU worker, and transcribe."""
         self._ensure_loaded()
         samples, sr = _wav_bytes_to_float32(wav_bytes)
         if sr != SAMPLE_RATE:
             samples = _resample_linear(samples, sr, SAMPLE_RATE)
-        return self._run_locked_sync(samples)
+        return self._run_queued_sync(samples, request_id)
 
-    def transcribe_pcm_sync(self, pcm16_bytes: bytes) -> str:
+    def transcribe_pcm_sync(
+        self, pcm16_bytes: bytes, request_id: Optional[str] = None
+    ) -> "TranscribeResult":
         """Decode raw 16-bit PCM mono bytes and transcribe."""
         self._ensure_loaded()
         samples = _pcm16_bytes_to_float32(pcm16_bytes)
-        return self._run_locked_sync(samples)
+        return self._run_queued_sync(samples, request_id)
 
-    def _run_locked_sync(self, samples: np.ndarray) -> str:
-        """Acquire the per-server busy flag and the GPU lock, then run."""
+    def _run_queued_sync(
+        self, samples: np.ndarray, request_id: Optional[str]
+    ) -> "TranscribeResult":
+        """Admit to the bounded request queue, then run on the GPU worker.
+
+        Up to ``MAX_WAITERS`` requests may be admitted; beyond that we reject
+        with :class:`_Busy` so the client backs off rather than piling up. The
+        actual GPU serialisation happens in :meth:`_serial_run` via the
+        process-wide GPU lock; ``_n_waiters`` here is pure backpressure
+        accounting.
+        """
+        ctx = RequestContext(request_id)
+        with self._lock:
+            if self._n_waiters >= MAX_WAITERS:
+                raise _Busy()
+            self._n_waiters += 1
+            self._requests[ctx.id] = ctx
+        try:
+            return self._serial_run(ctx, samples)
+        finally:
+            with self._lock:
+                self._n_waiters = max(0, self._n_waiters - 1)
+                self._requests.pop(ctx.id, None)
+
+    def _serial_run(
+        self, ctx: "RequestContext", samples: np.ndarray
+    ) -> "TranscribeResult":
+        """Block until this is the sole GPU worker, then transcribe."""
         from ..parakeet.gpu_lock import GpuLockBusy, acquire_gpu_lock, release_gpu_lock
 
-        with self._lock:
-            if self._busy:
-                raise _Busy()
-            self._busy = True
-        try:
+        # Wait for the GPU lock, polling for cancellation while queued.
+        while True:
+            if ctx.cancel.is_set():
+                raise _Cancelled()
             try:
                 acquire_gpu_lock(
                     session=GPU_LOCK_SESSION,
@@ -320,19 +417,47 @@ class GraniteServer:
                     note="inference",
                     wait=False,
                 )
-            except GpuLockBusy as exc:
-                raise _Busy() from exc
-            try:
-                return self._transcribe_np(samples)
-            finally:
-                release_gpu_lock()
+                break
+            except GpuLockBusy:
+                if ctx.cancel.wait(CANCEL_POLL_SECONDS):
+                    raise _Cancelled()
+
+        ctx.state = "running"
+        try:
+            return self._transcribe_np(samples)
         finally:
-            with self._lock:
-                self._busy = False
+            release_gpu_lock()
+
+    # ------------------------------------------------------------------ #
+    # request registry (cancellation + introspection)
+    # ------------------------------------------------------------------ #
+    def cancel_request(self, request_id: str) -> bool:
+        """Signal cancellation of a queued or running request by id.
+
+        Returns True if a request with that id was found. A queued request is
+        dropped promptly; a running request cannot be preempted mid CUDA-graph
+        replay (graphs are not interruptible), so cancellation is best-effort
+        for the in-flight case and mainly saves queuing latency.
+        """
+        with self._lock:
+            ctx = self._requests.get(request_id)
+        if ctx is None:
+            return False
+        ctx.cancel.set()
+        return True
+
+    def queue_depth(self) -> int:
+        """Number of requests waiting for the GPU worker (excludes running)."""
+        with self._lock:
+            return max(0, self._n_waiters - 1)
 
     def is_busy(self) -> bool:
         with self._lock:
-            return self._busy
+            return self._n_waiters > 0
+
+    def phase(self) -> str:
+        with self._lock:
+            return self._phase
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:
@@ -340,7 +465,36 @@ class GraniteServer:
 
 
 class _Busy(Exception):
-    """Internal sentinel: server is busy with another request / GPU locked."""
+    """Internal sentinel: queue is full (backpressure) — client should retry."""
+
+
+class _Cancelled(Exception):
+    """Internal sentinel: request was cancelled via :meth:`cancel_request`."""
+
+
+@dataclass
+class TranscribeResult:
+    """Transcription output with optional chunk-level timestamps."""
+
+    text: str
+    segments: list[dict[str, Any]] = field(default_factory=list)
+    duration_s: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "segments": self.segments,
+            "duration_s": round(self.duration_s, 3),
+        }
+
+
+@dataclass
+class RequestContext:
+    """Per-request handle tracked in the server's registry for cancellation."""
+
+    id: str
+    cancel: threading.Event = field(default_factory=threading.Event)
+    state: str = "queued"
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +541,14 @@ class StreamSession:
         self.last_partial_text = ""
         self.last_partial_ts = 0.0
 
-    def transcribe_current_sync(self) -> str:
+    def transcribe_current_sync(self) -> "TranscribeResult":
         """Transcribe the entire rolling buffer now (one GPU pass).
 
         A copy of the samples is taken so a concurrently-arriving chunk cannot
         mutate the array mid-decode.
         """
         snapshot = self.samples.copy()
-        return self.server._run_locked_sync(snapshot)
+        return self.server._run_queued_sync(snapshot, None)
 
 
 # ===========================================================================
@@ -439,6 +593,11 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
             return _extract_multipart_payload(body, ctype)
         return body
 
+    def _request_id(request: "Request") -> Optional[str]:
+        """Client-supplied request id for cancellation, or None."""
+        rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id")
+        return rid or None
+
     # ---------------------------- health ---------------------------- #
     @app.get("/")
     async def health() -> JSONResponse:
@@ -448,6 +607,8 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
                 "model": "granite-speech-4.1-2b",
                 "loaded": server._loaded,
                 "busy": server.is_busy(),
+                "phase": server.phase(),
+                "queue_depth": server.queue_depth(),
             }
         )
 
@@ -455,27 +616,61 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
     async def health_alias() -> JSONResponse:
         return await health()
 
+    # --------------------------- POST /warmup ----------------------- #
+    @app.post("/warmup")
+    async def warmup_route() -> JSONResponse:
+        """Pre-capture CUDA graphs on a silent clip (idempotent, async)."""
+        await asyncio.to_thread(server.warmup)
+        return JSONResponse({"status": "ok", "phase": server.phase()})
+
     # ------------------------ POST /inference ----------------------- #
     async def _inference(request):  # noqa: ANN001 - annotation set below
         payload = await _decode_inference_body(request)
         if not payload:
             raise HTTPException(status_code=400, detail="empty upload")
+        rid = _request_id(request)
         try:
-            text = await asyncio.to_thread(server.transcribe_bytes_sync, payload)
+            result = await asyncio.to_thread(server.transcribe_bytes_sync, payload, rid)
         except _Busy:
-            return JSONResponse(status_code=503, content={"error": "server busy", "text": ""})
-        return JSONResponse({"text": text})
+            return JSONResponse(
+                status_code=503,
+                content={"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
+            )
+        except _Cancelled:
+            return JSONResponse(status_code=499, content={"error": "cancelled", "text": ""})
+        resp = result.to_dict()
+        resp["request_id"] = rid
+        return JSONResponse(resp)
 
     # ------------------------ POST /transcribe ---------------------- #
     async def _transcribe(request):  # noqa: ANN001 - annotation set below
         payload = await _decode_inference_body(request)
         if not payload:
             raise HTTPException(status_code=400, detail="empty request body")
+        rid = _request_id(request)
         try:
-            text = await asyncio.to_thread(server.transcribe_bytes_sync, payload)
+            result = await asyncio.to_thread(server.transcribe_bytes_sync, payload, rid)
         except _Busy:
-            return JSONResponse(status_code=503, content={"error": "server busy", "text": ""})
-        return JSONResponse({"text": text})
+            return JSONResponse(
+                status_code=503,
+                content={"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
+            )
+        except _Cancelled:
+            return JSONResponse(status_code=499, content={"error": "cancelled", "text": ""})
+        resp = result.to_dict()
+        resp["request_id"] = rid
+        return JSONResponse(resp)
+
+    # --------------------- DELETE /inference/{id} ------------------- #
+    async def _abort(request):  # noqa: ANN001 - annotation set below
+        rid = request.path_params.get("id")
+        if not rid:
+            return JSONResponse(status_code=400, content={"error": "missing request id"})
+        cancelled = await asyncio.to_thread(server.cancel_request, str(rid))
+        return JSONResponse(
+            {"status": "cancelled" if cancelled else "not_found", "request_id": rid},
+            status_code=200 if cancelled else 404,
+        )
 
     # `from __future__ import annotations` stringifies annotations and the
     # `Request` class is only a local import here, so FastAPI cannot resolve the
@@ -483,8 +678,10 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
     # dependency scanner treats the param as a request injection.
     _inference.__annotations__["request"] = Request
     _transcribe.__annotations__["request"] = Request
+    _abort.__annotations__["request"] = Request
     app.add_api_route("/inference", _inference, methods=["POST"])
     app.add_api_route("/transcribe", _transcribe, methods=["POST"])
+    app.add_api_route("/inference/{id}", _abort, methods=["DELETE"])
 
     # --------------------------- WS /stream ------------------------- #
     async def _stream(ws):  # noqa: ANN001 - annotation set below
@@ -506,14 +703,22 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
                     if mtype == "commit":
                         if sess.buffered_seconds > 0.0:
                             try:
-                                text = await asyncio.to_thread(sess.transcribe_current_sync)
+                                result = await asyncio.to_thread(sess.transcribe_current_sync)
                             except _Busy:
                                 await ws.send_json({"type": "error", "message": "server busy"})
                                 continue
+                            except _Cancelled:
+                                await ws.send_json({"type": "error", "message": "cancelled"})
+                                continue
                         else:
-                            text = ""
+                            result = TranscribeResult(text="")
                         await ws.send_json(
-                            {"type": "final", "text": text, "duration_s": sess.buffered_seconds}
+                            {
+                                "type": "final",
+                                "text": result.text,
+                                "segments": result.segments,
+                                "duration_s": round(sess.buffered_seconds, 3),
+                            }
                         )
                         sess.reset()
                         continue
@@ -540,15 +745,18 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
                 now = time.monotonic()
                 if sess.should_emit_partial(now):
                     try:
-                        text = await asyncio.to_thread(sess.transcribe_current_sync)
+                        result = await asyncio.to_thread(sess.transcribe_current_sync)
                     except _Busy:
                         continue
+                    except _Cancelled:
+                        continue
                     sess.last_partial_ts = now
-                    sess.last_partial_text = text
+                    sess.last_partial_text = result.text
                     await ws.send_json(
                         {
                             "type": "partial",
-                            "text": text,
+                            "text": result.text,
+                            "segments": result.segments,
                             "start_s": 0.0,
                             "end_s": sess.buffered_seconds,
                         }
@@ -718,15 +926,23 @@ def _serve_stream_session(
                 if mtype == "commit":
                     if sess.buffered_seconds > 0.0:
                         try:
-                            text = sess.transcribe_current_sync()
+                            result = sess.transcribe_current_sync()
                         except _Busy:
                             _ws_send_json(wfile, {"type": "error", "message": "server busy"})
                             continue
+                        except _Cancelled:
+                            _ws_send_json(wfile, {"type": "error", "message": "cancelled"})
+                            continue
                     else:
-                        text = ""
+                        result = TranscribeResult(text="")
                     _ws_send_json(
                         wfile,
-                        {"type": "final", "text": text, "duration_s": sess.buffered_seconds},
+                        {
+                            "type": "final",
+                            "text": result.text,
+                            "segments": result.segments,
+                            "duration_s": round(sess.buffered_seconds, 3),
+                        },
                     )
                     sess.reset()
                     continue
@@ -749,16 +965,19 @@ def _serve_stream_session(
             now = time.monotonic()
             if sess.should_emit_partial(now):
                 try:
-                    text = sess.transcribe_current_sync()
+                    result = sess.transcribe_current_sync()
                 except _Busy:
                     continue
+                except _Cancelled:
+                    continue
                 sess.last_partial_ts = now
-                sess.last_partial_text = text
+                sess.last_partial_text = result.text
                 _ws_send_json(
                     wfile,
                     {
                         "type": "partial",
-                        "text": text,
+                        "text": result.text,
+                        "segments": result.segments,
                         "start_s": 0.0,
                         "end_s": sess.buffered_seconds,
                     },
@@ -801,6 +1020,13 @@ def _build_stdlib_handler(server: GraniteServer):
                 length = 0
             body = self.rfile.read(length) if length > 0 else b""
 
+            if self.path == "/warmup":
+                threading.Thread(target=server.warmup, daemon=True).start()
+                self._send_json(202, {"status": "warmup started", "phase": server.phase()})
+                return
+
+            rid = self.headers.get("X-Request-Id") or self.headers.get("X-Correlation-Id")
+
             if self.path == "/inference":
                 ctype = self.headers.get("Content-Type", "")
                 if "multipart/form-data" in ctype:
@@ -812,11 +1038,19 @@ def _build_stdlib_handler(server: GraniteServer):
                     self._send_json(400, {"error": "empty upload", "text": ""})
                     return
                 try:
-                    text = server.transcribe_bytes_sync(payload)
+                    result = server.transcribe_bytes_sync(payload, rid)
                 except _Busy:
-                    self._send_json(503, {"error": "server busy", "text": ""})
+                    self._send_json(
+                        503,
+                        {"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
+                    )
                     return
-                self._send_json(200, {"text": text})
+                except _Cancelled:
+                    self._send_json(499, {"error": "cancelled", "text": ""})
+                    return
+                resp = result.to_dict()
+                resp["request_id"] = rid
+                self._send_json(200, resp)
                 return
 
             if self.path == "/transcribe":
@@ -824,13 +1058,33 @@ def _build_stdlib_handler(server: GraniteServer):
                     self._send_json(400, {"error": "empty body", "text": ""})
                     return
                 try:
-                    text = server.transcribe_bytes_sync(body)
+                    result = server.transcribe_bytes_sync(body, rid)
                 except _Busy:
-                    self._send_json(503, {"error": "server busy", "text": ""})
+                    self._send_json(
+                        503,
+                        {"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
+                    )
                     return
-                self._send_json(200, {"text": text})
+                except _Cancelled:
+                    self._send_json(499, {"error": "cancelled", "text": ""})
+                    return
+                resp = result.to_dict()
+                resp["request_id"] = rid
+                self._send_json(200, resp)
                 return
 
+            self._send_json(404, {"error": "not found"})
+
+        # -------- abort (DELETE /inference/<id>) --------
+        def do_DELETE(self) -> None:  # noqa: N802 - stdlib API
+            if self.path.startswith("/inference/"):
+                rid = self.path[len("/inference/"):]
+                cancelled = server.cancel_request(rid) if rid else False
+                self._send_json(
+                    200 if cancelled else 404,
+                    {"status": "cancelled" if cancelled else "not_found", "request_id": rid},
+                )
+                return
             self._send_json(404, {"error": "not found"})
 
         # -------- WebSocket upgrade (GET with Upgrade header) --------
@@ -866,6 +1120,8 @@ def _build_stdlib_handler(server: GraniteServer):
                         "model": "granite-speech-4.1-2b",
                         "loaded": server._loaded,
                         "busy": server.is_busy(),
+                        "phase": server.phase(),
+                        "queue_depth": server.queue_depth(),
                     },
                 )
                 return

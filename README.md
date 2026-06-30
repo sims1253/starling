@@ -165,6 +165,7 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     batched.py          batched (B>1) LLM decode + pipeline
     long_audio.py       chunked long-audio transcription (sequential + batched)
     speculative.py      self-speculative decoding via the CTC draft head
+    server.py           local HTTP/WebSocket ASR sidecar (kept resident in VRAM)
   parakeet/             parakeet-tdt-0.6b-v3 megakernel
     decode_mega.py      multi-step graphed TDT decode
     encoder_graph.py    graphed FastConformer encoder
@@ -182,3 +183,41 @@ benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts
 tests/                  correctness checks vs. golden references
 ```
+
+## Server
+
+`src/starling/granite/server.py` is a long-lived local HTTP/WebSocket sidecar
+that keeps Granite-Speech resident in VRAM. It is the integration surface for
+external clients (e.g. the freestyle Electron app's overlapping-window STT
+provider). Run it with:
+
+```bash
+python -m starling.granite.server --port 8181 --max-chunk-seconds 30
+python -m starling.granite.server --warmup   # pre-capture CUDA graphs
+```
+
+Endpoints (FastAPI when available, else a stdlib fallback):
+
+| Method + path             | Purpose |
+| ------------------------- | ------- |
+| `GET  /` `/health`        | liveness + `phase` (`loading_weights`/`warming_up`/`ready`) and `queue_depth` |
+| `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
+| `POST /transcribe`        | raw WAV bytes -> same shape as `/inference` |
+| `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202 Accepted) |
+| `DELETE /inference/<id>`  | cancel a queued request by its `X-Request-Id` |
+| `WS   /stream`            | real-time streaming dictation |
+
+**Timestamps.** `/inference` returns chunk-level segment timestamps
+(`segments: [{text, start_s, end_s}]`). Granite-Speech has no per-token audio
+alignment (the LLM decodes text with no duration head), so segments are at
+`--max-chunk-seconds` granularity — one per chunk window — rather than
+per-word. Shrink `--max-chunk-seconds` for finer segments at the cost of more
+decode passes.
+
+**Queueing.** A single GPU worker serves one request at a time; concurrent
+requests queue (up to `MAX_WAITERS`) instead of being rejected, and only get
+HTTP 503 once the queue is full. A client that supplies `X-Request-Id` on a
+POST may `DELETE /inference/<id>` to drop it from the queue. Cancellation is
+best-effort for a request already on the GPU: CUDA-graph replays are not
+preemptible, so an in-flight request still finishes its current decode step but
+is returned as HTTP 499.

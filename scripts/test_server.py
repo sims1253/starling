@@ -112,6 +112,13 @@ def test_health(host: str, port: int) -> None:
         res = conn.getresponse()
         body = res.read().decode(errors="replace").strip()
         print(f"[http] GET http://{host}:{port}/ -> {res.status} {res.reason} {body}")
+        # Surface phase/queue if present (added in the queue+phase server update).
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {}
+        if "phase" in data or "queue_depth" in data:
+            print(f"[http]   phase={data.get('phase')}  queue_depth={data.get('queue_depth')}")
     except Exception as exc:
         print(f"[http] health check failed: {exc}")
     finally:
@@ -140,10 +147,15 @@ def _build_multipart(filename: str, wav_bytes: bytes) -> tuple[bytes, str]:
 def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
     body, ctype = _build_multipart("audio.wav", wav_bytes)
     conn = http.client.HTTPConnection(host, port, timeout=120)
-    print(f"\n[http] POST http://{host}:{port}/inference  ({len(wav_bytes)} bytes)")
+    # Supply a request id so the new cancel endpoint can target this request.
+    rid = f"test-{int(time.time() * 1000)}"
+    print(f"\n[http] POST http://{host}:{port}/inference  ({len(wav_bytes)} bytes)  rid={rid}")
     t0 = time.perf_counter()
     try:
-        conn.request("POST", "/inference", body=body, headers={"Content-Type": ctype})
+        conn.request(
+            "POST", "/inference", body=body,
+            headers={"Content-Type": ctype, "X-Request-Id": rid},
+        )
         res = conn.getresponse()
         ms = (time.perf_counter() - t0) * 1000.0
         text = res.read().decode(errors="replace")
@@ -151,11 +163,21 @@ def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
         if res.status == 503:
             print(f"[http] server busy: {text}")
             return
+        if res.status == 499:
+            print(f"[http] cancelled: {text}")
+            return
         if res.status != 200:
             print(f"[http] error: {text}")
             return
         data = json.loads(text)
         print(f"[http] text: {data.get('text', '')!r}")
+        segs = data.get("segments") or []
+        if segs:
+            print(f"[http] segments ({len(segs)}):")
+            for s in segs:
+                print(f"[http]   [{s.get('start_s', 0):.2f}-{s.get('end_s', 0):.2f}s] {s.get('text', '')!r}")
+        if "duration_s" in data:
+            print(f"[http] duration_s={data['duration_s']}")
     finally:
         conn.close()
 
@@ -165,7 +187,7 @@ def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
 # ---------------------------------------------------------------------------
 def _ws_connect(host: str, port: int, path: str) -> socket.socket:
     """Perform the WebSocket handshake and return the upgraded socket."""
-    ws_handshake_nonce = ****************(os.urandom(16)).decode()
+    ws_handshake_nonce = base64.b64encode(os.urandom(16)).decode()
     sock = socket.create_connection((host, port), timeout=10)
     req = (
         f"GET {path} HTTP/1.1\r\n"
@@ -334,6 +356,12 @@ def _print_ws_msg(msg: dict, t0: float) -> bool:
     elif mtype == "final":
         ms = (time.perf_counter() - t0) * 1000.0
         print(f"[ws]   FINAL    ({ms:.1f}ms): {msg.get('text', '')!r}")
+        segs = msg.get("segments") or []
+        for s in segs:
+            print(
+                f"[ws]     [{s.get('start_s', 0):.2f}-{s.get('end_s', 0):.2f}s] "
+                f"{s.get('text', '')!r}"
+            )
         return True
     elif mtype == "error":
         print(f"[ws]   ERROR: {msg.get('message')}")
