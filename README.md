@@ -211,9 +211,9 @@ the `qwen3-asr` branch.
 
 | length   |   batch | starling     | stock transformers   | CrispASR     |
 |----------|---------|--------------|----------------------|--------------|
-| short    |       1 | 377ms (20x)  | 2783ms (3x)          | 6609ms (1x)  |
-| medium   |       1 | 724ms (31x)  | 5126ms (4x)          | 6930ms (3x)  |
-| long     |       1 | 2447ms (30x) | 21787ms (3x)         | 17674ms (4x) |
+| short    |       1 | 290ms (26x)  | 2497ms (3x)          | 3860ms (2x)  |
+| medium   |       1 | 513ms (44x)  | 4112ms (5x)          | 4422ms (5x)  |
+| long     |       1 | 1783ms (42x) | 17719ms (4x)         | 10450ms (7x) |
 
 **granite-speech-4.1-2b** — WER % vs LibriSpeech reference
 
@@ -227,12 +227,12 @@ the `qwen3-asr` branch.
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 31ms (239x)  | 430ms (17x)          |
-| short    |       8 | 48ms (155x)  | —                    |
-| medium   |       1 | 58ms (382x)  | 1455ms (15x)         |
-| medium   |       8 | 96ms (233x)  | —                    |
-| long     |       1 | 152ms (489x) | 2503ms (30x)         |
-| long     |       8 | 327ms (228x) | —                    |
+| short    |       1 | 15ms (493x)  | 249ms (30x)          |
+| short    |       8 | 24ms (307x)  | —                    |
+| medium   |       1 | 23ms (956x)  | 500ms (45x)          |
+| medium   |       8 | 51ms (437x)  | —                    |
+| long     |       1 | 56ms (1315x) | 1252ms (59x)         |
+| long     |       8 | 163ms (456x) | —                    |
 
 **parakeet-tdt-0.6b-v3** — WER % vs LibriSpeech reference
 
@@ -249,9 +249,9 @@ the `qwen3-asr` branch.
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 227ms (33x)  | 10563ms (1x)         |
-| medium   |       1 | 634ms (35x)  | 31538ms (1x)         |
-| long     |       1 | 1292ms (58x) | 49861ms (2x)         |
+| short    |       1 | 187ms (40x)  | 1745ms (4x)          |
+| medium   |       1 | 397ms (56x)  | 4648ms (5x)          |
+| long     |       1 | 1301ms (57x) | 21151ms (4x)         |
 
 **moss-transcribe-preview-2b** — WER % vs LibriSpeech reference
 
@@ -259,7 +259,23 @@ the `qwen3-asr` branch.
 |----------|---------|------------|----------------------|
 | short    |       1 | 0.00%      | 0.00%                |
 | medium   |       1 | 0.00%      | 0.00%                |
-| long     |       1 | 40.00%     | 33.48%               |
+| long     |       1 | 33.48%     | 33.48%               |
+
+**qwen3-asr-1.7b** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling     | stock transformers   | CrispASR     |
+|----------|---------|--------------|----------------------|--------------|
+| short    |       1 | 238ms (31x)  | 1780ms (4x)          | 3482ms (2x)  |
+| medium   |       1 | 399ms (56x)  | 5642ms (4x)          | 4698ms (5x)  |
+| long     |       1 | 1201ms (62x) | 18306ms (4x)         | 7863ms (10x) |
+
+**qwen3-asr-1.7b** — WER % vs LibriSpeech reference
+
+| length   |   batch | starling   | stock transformers   | CrispASR   |
+|----------|---------|------------|----------------------|------------|
+| short    |       1 | 0.00%      | 0.00%                | 0.00%      |
+| medium   |       1 | 0.00%      | 0.00%                | 0.00%      |
+| long     |       1 | 0.00%      | 0.00%                | 0.00%      |
 <!-- BENCH:END -->
 
 ## What did not work
