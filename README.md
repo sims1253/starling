@@ -21,6 +21,7 @@ Both do speech-to-text.
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) (encoder + 1B LLM decoder). The LLM decode is the bottleneck. Includes an optional self-speculative path that drafts tokens from the encoder's CTC head.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (FastConformer + TDT transducer, no LLM). Tuned for batched offline throughput, with GPU-side mel extraction and chunking for hour-long audio.
 - [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) (Qwen3-omni MoE audio encoder + Qwen3 LLM decoder). The same encoder+LLM-decoder pattern as granite: the decode loop is the bottleneck, so a `torch.compile`d hand-iterated layer loop with fused Triton elementwise kernels is captured into a K-step CUDA graph, plus a per-prompt-length graphed prefill. Output is byte-identical to the eager reference.
+- [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) (Whisper-style windowed-attention audio encoder + Qwen3 LLM decoder). Three byte-exact CUDA-graph layers: a graphed encoder (custom static-shape windowed-attention kernel, since the stock layer does host ops on `cu_seqlens`), a graphed greedy Qwen3 decode over a static KV cache with fused Triton RMSNorm/SwiGLU/residual/QK-norm kernels, and a K-step (K=8) multi-step decode graph. Output is byte-identical to the eager reference.
 
 ## Numbers
 
@@ -80,6 +81,34 @@ Mel extraction (Whisper log-mel, CPU) is excluded from these numbers; it adds
 | 7s    | 165ms (45x) | ~3300ms (2x) |
 | 22s   | 386ms (58x) | ~6400ms (3x) |
 | 74s   | 815ms (91x) | ~13500ms (6x) |
+
+### qwen3-asr-1.7b (1.7B params)
+
+`starling` is byte-identical to the eager `transformers` reference. Four
+layers of optimization, all producing byte-identical decoded tokens: a graphed
+audio encoder (custom static-shape windowed-attention kernel, since the stock
+layer does host ops on `cu_seqlens` that break capture), a graphed greedy
+Qwen3 decode over a static KV cache with fused Triton elementwise kernels
+(RMSNorm, SwiGLU, residual, QK-norm), a `torch.compile`d fused decode forward
+(Inductor fuses the RoPE/softmax-prep/GQA glue), and a K-step (K=8) multi-step
+decode graph that syncs with the host once per 8 tokens instead of once per
+token. Batched mode turns the launch-bound batch=1 GEMVs into saturating GEMMs.
+
+B=1 single-stream.
+
+| audio | starling | [stock transformers](https://github.com/huggingface/transformers) | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | -------- | ------------------ | -------- |
+| 7s    | 240ms (31x) | 2962ms (2.5x) | 4190ms (1.8x) |
+| 22s   | 437ms (51x) | 6030ms (3.7x) | 5445ms (4.1x) |
+| 74s   | 1382ms (54x) | 24993ms (3.0x) | 7812ms (9.5x) |
+
+Batched offline throughput (medium ~22s clip tiled B times, same transcript):
+
+| B | starling | RTFx |
+| - | -------- | ---- |
+| 1 | 825ms | 27x |
+| 8 | 2332ms (8 streams) | 76x |
+| 16 | 3920ms (16 streams) | 91x |
 
 ### Long audio (30-90 min)
 
