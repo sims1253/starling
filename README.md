@@ -153,6 +153,7 @@ src/starling/           shared toolkit (config dims, optimisation flags)
     multistep.py        K-step graphed decode (multi-step per replay)
     pipeline.py         collator + eager prefill + graphed decode wiring
     loader.py           model/tokenizer/collator loading (isolated venv notes)
+    UV_NOTES.md         how to run higgs via uv (isolated .venv-higgs, tf 4.51)
     vendor/             vendored modeling + collator (tf-version-independent)
 benchmarks/             RTF and cross-engine benchmarks
 scripts/                bench and probe scripts

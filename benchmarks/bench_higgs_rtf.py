@@ -5,8 +5,8 @@ are uncontended), and prints an RTFx table. ``stock`` = the model's own
 ``model.generate(do_sample=False)`` (the byte-exact reference); ``starling`` =
 the CUDA-graph-captured decode (single- or multi-step).
 
-Run under the isolated venv:
-    .venv-higgs/bin/python benchmarks/bench_higgs_rtf.py [--decoder single|multi]
+Run under the isolated venv via uv (see src/starling/higgs/UV_NOTES.md):
+    uv run --no-project --python .venv-higgs/bin/python python benchmarks/bench_higgs_rtf.py [--decoder single|multi]
 """
 
 from __future__ import annotations

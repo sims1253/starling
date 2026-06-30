@@ -8,10 +8,13 @@ NOTE ON ENVIRONMENT
 -------------------
 higgs-audio runs under its OWN isolated venv ``.venv-higgs`` (transformers 4.51)
 because the model's trust_remote_code modeling breaks under the repo's shared
-``transformers 5.13`` venv (see ``src/starling/higgs/loader.py``). These tests
-therefore run under that venv, not ``uv run pytest``:
+``transformers 5.13`` venv (see ``src/starling/higgs/loader.py`` and
+``src/starling/higgs/UV_NOTES.md``). Run via uv targeting that venv
+(``--no-project`` so uv does not sync to the project's pinned 5.13 env):
 
-    .venv-higgs/bin/python -m pytest tests/test_higgs_mega.py -q
+    uv run --no-project --python .venv-higgs/bin/python python -m pytest tests/test_higgs_mega.py -q
+
+Use ``uv run ... python -m pytest``, not bare ``uv run pytest``.
 
 The fixtures (``tests/fixtures/*.wav``) live in the main repo checkout; the test
 resolves them from either the worktree or the main repo.

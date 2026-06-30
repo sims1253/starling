@@ -5,8 +5,8 @@ the model's own ``transcribe()`` (which calls ``model.generate(do_sample=False)`
 -- the unmodified reference decode. This is the correctness oracle: every
 starling megakernel path must reproduce these token ids / text exactly.
 
-Run with the isolated venv:
-    .venv-higgs/bin/python scripts/capture_golden_ref.py
+Run with uv targeting the isolated venv (see src/starling/higgs/UV_NOTES.md):
+    uv run --no-project --python .venv-higgs/bin/python python scripts/capture_golden_ref.py
 """
 
 from __future__ import annotations
