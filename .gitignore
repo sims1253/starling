@@ -19,6 +19,9 @@ golden/
 *.flac
 *.mp3
 
+# regenerable benchmark corpora (downloaded + cached on first run)
+tests/fixtures/leaderboard_corpus/
+
 # internal coordination / runtime locks (not for publication)
 comms.md
 .gpu.lock

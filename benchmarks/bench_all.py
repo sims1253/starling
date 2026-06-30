@@ -13,14 +13,17 @@ Engines
 -------
   starling          the fused megakernel pipeline (this repo)
   stock             the unmodified HuggingFace ``generate`` reference
-  crispasr          the external ggml binary (granite + qwen3 only)
+  crispasr          the external ggml binary (granite + qwen3 + parakeet backends)
+  parakeet.cpp      mudler's C++/ggml parakeet-cli (parakeet only)
+  starling-batched  starling with batched LLM decode (granite + qwen3 only)
+  starling-spec     starling with self-speculative decode (granite only)
 
 Cells
 -----
   --lengths   short,medium,long   (the deterministic LibriSpeech fixtures)
   --batches   1,8                 (batch sizes; non-batched engines loop Bx1)
   --models    granite,parakeet,moss[,qwen3]
-  --engines   starling,stock[,crispasr]
+  --engines   starling,stock[,crispasr,parakeet.cpp,starling-batched,starling-spec]
 
 Timing
 ------

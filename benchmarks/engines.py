@@ -65,6 +65,17 @@ _CRISPASR_ENV = {
     "CRISPASR_N_GPU_LAYERS": "999",  # full GPU offload
 }
 
+# parakeet.cpp (mudler's C++/ggml parakeet-cli). The binary needs glibc 2.38
+# which the host lacks, so it runs through the ld-linux shim wrapper. Absent
+# install -> the parakeet_cpp engine is silently skipped.
+PARAKEET_CPP_WRAP = ASR_BENCH / "parakeet-cli-wrap"
+PARAKEET_CPP_MODEL = CRISPASR_MODELS / "tdt-0.6b-v3-f16.gguf"
+_PARAKEET_CPP_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": str(Path.home()),
+    "LD_LIBRARY_PATH": f"{ASR_BENCH}/bin/parakeet-v0.3.2-bin-linux-cuda-x64",
+}
+
 
 class Engine:
     """Base adapter. Subclasses override :meth:`load` / :meth:`_run_one`."""
@@ -144,6 +155,88 @@ class GraniteStarling(Engine):
             speculative=False,  # greedy, matching the non-spec "starling" column
         )
         return res.text
+
+
+class GraniteStarlingSpec(Engine):
+    """starling fused pipeline, **self-speculative** decode (granite only).
+
+    The speculative companion to :class:`GraniteStarling`: drafts tokens from
+    the encoder's CTC head and verifies them with the LLM in multi-token
+    forwards. Appears as the ``starling (spec)`` column so the latency table
+    carries the speculative-vs-greedy comparison the README describes (spec is
+    slower on short audio, faster on long).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling (spec)", "granite", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.granite.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        from starling.granite.long_audio import transcribe_long
+
+        wav = torch.from_numpy(audio).float().unsqueeze(0)
+        res = transcribe_long(
+            self.pipe, self.pipe.processor, wav, 16000, speculative=True,
+        )
+        return res.text
+
+
+class GraniteStarlingBatched(Engine):
+    """starling fused pipeline, **batched** LLM decode (B chunks in lock-step).
+
+    The companion to :class:`GraniteStarling`: same encoder/projector per
+    stream (byte-exact), but the K-step LLM decode is batched via
+    :class:`~starling.granite.batched.BatchedPipeline`, turning the launch-bound
+    batch=1 GEMVs into saturating B-wide GEMMs. Drives
+    :func:`transcribe_long_batched`, so it handles arbitrary-length audio
+    (chunks are grouped B-at-a-time; the last partial group is padded with
+    copies of chunk 0). Appears as the ``starling (batched)`` engine label so
+    the latency table shows a B>1 row for granite.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling (batched)", "granite", supports_batch=True)
+
+    def _load(self) -> None:
+        from starling.granite.batched import BatchedPipeline
+        from starling.granite.loader import load_model_and_processor
+
+        # BatchedPipeline needs the raw model + processor (not MegaPipeline).
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
+        self._max_B = 8  # rebuilt per batch in _run_batch via max_batch_size
+
+    def _release(self) -> None:
+        self.model = self.processor = None
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        from starling.granite.batched import BatchedPipeline
+        from starling.granite.long_audio import transcribe_long_batched
+
+        B = len(audio_list)
+        # BatchedPipeline is statically sized to max_batch_size; rebuild per B
+        # (capture is cheap relative to a timed run). Pad partial batches with
+        # copies of stream 0 so B == max_batch_size exactly.
+        pipe = BatchedPipeline(self.model, self.processor, max_batch_size=B)
+        wav = torch.from_numpy(audio_list[0]).float().unsqueeze(0)
+        # transcribe_long_batched decodes ONE clip; to time B independent clips
+        # we tile the input B times into one B-chunk "long" audio. All B chunks
+        # are identical (same transcript), so the per-stream RTFx is the batched
+        # throughput RTFx -- matching how the README batched numbers are derived.
+        tiled = wav.repeat(1, B) if B > 1 else wav
+        res = transcribe_long_batched(pipe, self.processor, tiled, 16000)
+        text = res.text.strip()
+        del pipe
+        torch.cuda.empty_cache()
+        # transcribe_long_batched concatenates chunk texts with spaces; the B
+        # identical chunks all produced `text` -> replicate it B times.
+        return [text] * B
 
 
 class GraniteStock(Engine):
@@ -347,6 +440,54 @@ class Qwen3Starling(Engine):
         return text
 
 
+class Qwen3StarlingBatched(Engine):
+    """starling fused pipeline for Qwen3-ASR, **batched** decode.
+
+    Single-shot (no chunker) batched decode via
+    :class:`~starling.qwen3.batched.BatchedPipeline`: each of the B clips is
+    encoded byte-exactly (batch=1), then all B are decoded in one lock-step
+    pass over a shared static KV cache. The pipeline is statically sized to
+    ``max_batch_size == B``, so partial batches are padded with copies of
+    stream 0. Bounded by the 4096-token cache, so batched cells only appear
+    on tiers whose prompt+output fits the cache (short/medium).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling (batched)", "qwen3", supports_batch=True)
+
+    def _load(self) -> None:
+        from starling.qwen3.audio import build_inputs
+        from starling.qwen3.loader import load_model_and_processor
+
+        self._build_inputs = build_inputs
+        self.model, self.processor = load_model_and_processor()
+        self._pipe = None
+
+    def _release(self) -> None:
+        self.model = self.processor = self._pipe = None
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        from starling.qwen3.batched import BatchedPipeline
+
+        B = len(audio_list)
+        # Pipeline is statically sized to B; rebuild per batch size (capture is
+        # cheap relative to a timed run). Pad short batches with stream-0 copies
+        # so len == max_batch_size exactly (transcribe_batch raises otherwise).
+        feats, ids, masks = [], [], []
+        for a in audio_list:
+            wav = torch.from_numpy(a).float().unsqueeze(0)
+            inp = self._build_inputs(self.processor, wav, sr=16000)
+            feats.append(inp["input_features"])
+            ids.append(inp["input_ids"])
+            masks.append(inp.get("input_features_mask"))
+        pipe = BatchedPipeline(self.model, self.processor,
+                               max_batch_size=B, max_cache_len=4096)
+        texts = pipe.transcribe_batch(feats, ids, masks, max_new_tokens=400)
+        del pipe
+        torch.cuda.empty_cache()
+        return texts
+
+
 class Qwen3Stock(Engine):
     """Stock ``model.generate`` reference for Qwen3-ASR (branch qwen3-asr)."""
 
@@ -386,11 +527,16 @@ class Qwen3Stock(Engine):
 # CrispASR  (external ggml binary; granite + qwen3 backends only)
 # ====================================================================== #
 class CrispASR(Engine):
-    """External CrispASR (ggml) binary subprocess. No batching; B loops on host."""
+    """External CrispASR (ggml) binary subprocess. No batching; B loops on host.
 
-    def __init__(self, backend: str, gguf: str) -> None:
-        super().__init__("CrispASR", "granite" if backend == "granite" else "qwen3",
-                         supports_batch=False)
+    Backends: ``granite``, ``qwen3-1.7b``, ``parakeet``. The model slug passed
+    to the base class is the bench model key (granite/qwen3/parakeet) so the
+    adapter lands under the right column; the ggml ``--backend`` flag is the
+    CrispASR-specific backend name.
+    """
+
+    def __init__(self, backend: str, gguf: str, model: str) -> None:
+        super().__init__("CrispASR", model, supports_batch=False)
         self.backend = backend
         self.gguf = gguf
         self._wav_path: Optional[str] = None
@@ -445,6 +591,70 @@ class CrispASR(Engine):
         return lines[-1] if lines else ""
 
 
+class ParakeetCpp(Engine):
+    """mudler's parakeet.cpp (C++/ggml) binary via the ld-linux shim wrapper.
+
+    Reads the ``tdt-0.6b-v3-f16.gguf`` f16 model with the TDT decoder. Not
+    batched; B loops on host (the binary is one-clip-per-process).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("parakeet.cpp", "parakeet", supports_batch=False)
+        self._wav_path: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return PARAKEET_CPP_WRAP.exists() and PARAKEET_CPP_MODEL.exists()
+
+    def _load(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, dir=str(REPO_ROOT)
+        )
+        self._tmp.close()
+        self._wav_path = self._tmp.name
+
+    def _release(self) -> None:
+        if self._wav_path and os.path.exists(self._wav_path):
+            try:
+                os.unlink(self._wav_path)
+            except OSError:
+                pass
+        self._wav_path = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        import json as _json
+        import soundfile as sf
+
+        sf.write(self._wav_path, audio, 16000, subtype="PCM_16")
+        cmd = [
+            str(PARAKEET_CPP_WRAP), "transcribe",
+            "--model", str(PARAKEET_CPP_MODEL),
+            "--input", self._wav_path,
+            "--decoder", "tdt",
+            "--json",
+        ]
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, env=_PARAKEET_CPP_ENV,
+            cwd=str(ASR_BENCH), timeout=180,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"parakeet.cpp failed (rc={p.returncode}):\n{p.stderr[-1000:]}"
+            )
+        # The CLI prints ggml init lines to stderr and one JSON object with a
+        # "text" field on stdout. Tolerate leading/trailing non-JSON noise.
+        blob = p.stdout
+        i, j = blob.find("{"), blob.rfind("}")
+        if i >= 0 and j > i:
+            try:
+                return _json.loads(blob[i:j + 1]).get("text", "").strip()
+            except _json.JSONDecodeError:
+                pass
+        return blob.strip()
+
+
 # ====================================================================== #
 # Registry + filter resolution
 # ====================================================================== #
@@ -470,22 +680,32 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
 
 def _crispasr_keys() -> list[str]:
     keys = []
-    if CrispASR("granite", "granite-speech-4.1-2b-f16.gguf").available:
+    if CrispASR("granite", "granite-speech-4.1-2b-f16.gguf", "granite").available:
         keys.append("crispasr-granite")
-    if CrispASR("qwen3-1.7b", "qwen3-asr-1.7b-f16.gguf").available:
+    if CrispASR("qwen3-1.7b", "qwen3-asr-1.7b-f16.gguf", "qwen3").available:
         keys.append("crispasr-qwen3")
+    if CrispASR("parakeet", "cstr-parakeet-tdt-0.6b-v3-f16.gguf", "parakeet").available:
+        keys.append("crispasr-parakeet")
     return keys
+
+
+def _parakeet_cpp_keys() -> list[str]:
+    if ParakeetCpp().available:
+        return ["parakeet.cpp-parakeet"]
+    return []
 
 
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
-    return ["starling-qwen3", "stock-qwen3"]
+    return ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
 
 
 def available_keys() -> list[str]:
-    """All engine keys usable in this checkout (qwen3/CrispASR gated)."""
-    return list(ENGINE_REGISTRY) + _qwen3_keys() + _crispasr_keys()
+    """All engine keys usable in this checkout (qwen3/CrispASR/parakeet.cpp gated)."""
+    return (list(ENGINE_REGISTRY) + _qwen3_keys()
+            + ["starling-batched-granite", "starling-spec-granite"]
+            + _crispasr_keys() + _parakeet_cpp_keys())
 
 
 def build_engines(
@@ -501,18 +721,28 @@ def build_engines(
     avail = available_keys()
     chosen: dict[str, list[Engine]] = {m: [] for m in models}
     for key in avail:
-        fam, mdl = key.split("-", 1)
+        # split off the trailing model slug (rsplit: family names like
+        # "starling-batched" / "parakeet.cpp" can contain '-'/'.').
+        fam, mdl = key.rsplit("-", 1)
         if mdl not in chosen:
             continue
         if engines and fam not in engines:
             continue
         if key.startswith("crispasr-"):
-            backend = "granite" if mdl == "granite" else "qwen3-1.7b"
-            gguf = {
-                "granite": "granite-speech-4.1-2b-f16.gguf",
-                "qwen3": "qwen3-asr-1.7b-f16.gguf",
+            backend_gguf = {
+                "granite": ("granite", "granite-speech-4.1-2b-f16.gguf"),
+                "qwen3": ("qwen3-1.7b", "qwen3-asr-1.7b-f16.gguf"),
+                "parakeet": ("parakeet", "cstr-parakeet-tdt-0.6b-v3-f16.gguf"),
             }[mdl]
-            chosen[mdl].append(CrispASR(backend, gguf))
+            chosen[mdl].append(CrispASR(backend_gguf[0], backend_gguf[1], mdl))
+        elif key.startswith("parakeet.cpp-"):
+            chosen[mdl].append(ParakeetCpp())
+        elif key.startswith("starling-batched-"):
+            # fam == "starling-batched"; mdl is the model slug
+            chosen[mdl].append({"granite": GraniteStarlingBatched,
+                                "qwen3": Qwen3StarlingBatched}[mdl]())
+        elif key == "starling-spec-granite":
+            chosen[mdl].append(GraniteStarlingSpec())
         elif key.startswith("qwen3") or mdl == "qwen3":
             cls = Qwen3Starling if fam == "starling" else Qwen3Stock
             chosen[mdl].append(cls())

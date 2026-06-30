@@ -17,6 +17,10 @@ dependencies = [
     "matplotlib",
     "tabulate",
     "jiwer",
+    "kaldialign>=0.12.0",
+    "whisper-normalizer>=0.1.12",
+    "datasets>=5.0.0",
+    "torchcodec>=0.14.0",
 ]
 
 [project.optional-dependencies]
