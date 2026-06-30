@@ -59,19 +59,29 @@ once.
 
 ### higgs-audio-v3-stt (2.68B params)
 
-B=1 single-stream. `starling` is a K=8 multi-step CUDA-graph decode over a static
-KV cache (the model's own Qwen3-1.7B layers; no custom elementwise kernels
-needed — cuBLAS bf16 GEMMs + the stock layer ops capture cleanly). The
-Whisper-large-v3 audio tower (32 layers) + MLP projector run eager once per clip
-(the prefill); the Qwen3 decode loop is the launch-bound bottleneck and is where
-the graph-capture win lives. Identical transcripts to stock. Multi-step K=16
-pulls further ahead on longer audio (130 tok/s vs 82 tok/s single-step on 74s).
+B=1 single-stream. `starling` is a CUDA-graph-captured Qwen3-1.7B decode over a
+static KV cache with **fused Triton elementwise kernels** (RMSNorm, SwiGLU,
+residual add, per-head QK-norm) replacing the layer glue — unlike granite, higgs
+benefits substantially from this (the decode is compute/memory-bound at the
+elementwise glue once launch overhead is removed, not pure-GEMV-launch-bound like
+granite): 4.3ms/tok / 233 tok/s steady-state, ~1.8x over the model's-own-layers
+path. The Whisper-large-v3 audio tower (32 layers) + MLP projector run eager once
+per clip (the prefill); the Qwen3 decode loop is the bottleneck and is where the
+graph-capture + fusion win lives. A K-step multi-step variant (subclassing the
+fused path) stacks for further host-sync amortisation. Identical transcripts to
+stock. Runs under its own isolated venv (`.venv-higgs`, transformers 4.51) because
+the model's `trust_remote_code` modeling breaks under the repo's transformers 5.13.
 
-| audio | starling | stock transformers |
-| ----- | -------- | ------------------ |
-| 7s    | 225ms (33x) | 5321ms (1.4x) |
-| 22s   | 549ms (41x) | 8422ms (2.7x) |
-| 74s   | 1009ms (74x) | 13451ms (5.5x) |
+| audio | starling | stock transformers | [CrispASR](https://github.com/CrispStrobe/CrispASR) |
+| ----- | -------- | ------------------ | -------- |
+| 7s    | 162ms (46x) | 5321ms (1.4x) | 4043ms (1.8x) |
+| 22s   | 540ms (41x) | 8422ms (2.7x) | 13197ms (1.7x) |
+| 74s   | 841ms (88x) | 13451ms (5.5x) | — |
+
+starling is ~25-33x faster than stock `generate()` and ~25-80x faster than
+CrispASR's q4_k ggml path on the same model. (CrispASR wall includes model load;
+its `higgs-stt` backend loads the real higgs weights via a whisper-tiny VAD
+front-end. Long-audio CrispASR timed out the harness.)
 
 ### Long audio (30-90 min)
 
