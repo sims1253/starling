@@ -191,9 +191,17 @@ class GraphedEncoder:
             24 conformer layers).
     """
 
-    def __init__(self, model, *, warmup_iters: int = 3) -> None:
+    def __init__(self, model, *, warmup_iters: int = 3,
+                 max_cached_shapes: int = 512,
+                 graph_pool=None) -> None:
         self.model = model
         self.warmup_iters = int(warmup_iters)
+        # Bound the per-shape graph cache so a sweep over many clip lengths
+        # doesn't accumulate unbounded graph pools. Safe eviction requires a
+        # SHARED graph pool (see pipeline.py): all captures share one pool, so
+        # evicting one graph frees only its blocks.
+        self.max_cached_shapes = int(max_cached_shapes)
+        self.graph_pool = graph_pool  # torch.cuda.graph_pool_handle() or None
         # (B, T_mel) -> bundle(dict): static_inp, static_mask, static_out, graph
         self._graphs: Dict[Tuple[int, int], dict] = {}
 
@@ -228,7 +236,9 @@ class GraphedEncoder:
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
 
-        # capture the encoder forward into a CUDAGraph
+        # Capture with a PRIVATE pool per graph. On eviction, ``graph.reset()``
+        # deterministically frees that pool's blocks. A shared pool + ``del``
+        # left freed-but-unrecycled blocks -> cudaErrorIllegalAddress.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             static_out = self.model.get_audio_features(
@@ -243,6 +253,18 @@ class GraphedEncoder:
             "static_out": static_out,
             "graph": graph,
         }
+        # Private-pool LRU eviction: reset() frees this graph's pool without
+        # affecting others. Re-capture of an evicted shape reproduces the
+        # identical graph (capture is shape-only; static buffers are rewritten).
+        if len(self._graphs) >= self.max_cached_shapes:
+            import gc
+            old = self._graphs.pop(next(iter(self._graphs)))
+            try:
+                old["graph"].reset()
+            except Exception:
+                pass
+            del old
+            gc.collect()
         self._graphs[(B, T_mel)] = bundle
         return bundle
 

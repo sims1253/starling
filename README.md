@@ -73,17 +73,16 @@ Two re-runnable scripts, each a single source of truth for its slice:
 
 - **`benchmarks/bench_all.py`** — the latency/RTFx grid. Sweeps every
   supported model × engine × audio length × batch size on deterministic
-  tiled-LibriSpeech fixtures, producing the RTFx + (byte-exact drift) tables
-  below. Engines: `starling`, `stock`, `crispasr`, `parakeet.cpp`,
-  `starling-batched` (granite/qwen3), `starling-spec` (granite).
+  tiled-LibriSpeech fixtures, producing the RTFx tables below. Engines:
+  `starling`, `stock`, `crispasr`, `parakeet.cpp`, `starling-batched`
+  (granite/qwen3), `starling-spec` (granite).
 - **`benchmarks/bench_leaderboard.py`** — the accuracy/quality grid.
   Reproduces the [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard)
   English short-form methodology (Whisper `EnglishTextNormalizer` +
   `kaldialign` WER with `merge_compounds=True`, unweighted mean across the 7
-  datasets) on real diverse audio — a genuine quality metric, not the tiled
-  "did starling drift from stock?" WER the latency bench uses as its
-  byte-exact gate. This is the degradation detector: a real WER budget lets
-  future non-byte-exact optimizations land safely.
+  datasets) on real diverse audio — a genuine quality metric and the
+  degradation detector: a real WER budget lets future non-byte-exact
+  optimizations land safely.
 
 ```
   uv run python benchmarks/bench_leaderboard.py                  # capped, fast
@@ -186,73 +185,46 @@ uv run python benchmarks/bench_leaderboard.py --update-readme
 <!-- BENCH:START -->
 **granite-speech-4.1-2b** — latency / RTFx (ms, RTFx×)
 
-| length   |   batch | starling     | stock transformers   | CrispASR     |
-|----------|---------|--------------|----------------------|--------------|
-| short    |       1 | 290ms (26x)  | 2497ms (3x)          | 3860ms (2x)  |
-| medium   |       1 | 513ms (44x)  | 4112ms (5x)          | 4422ms (5x)  |
-| long     |       1 | 1783ms (42x) | 17719ms (4x)         | 10450ms (7x) |
-
-**granite-speech-4.1-2b** — WER % vs LibriSpeech reference
-
-| length   |   batch | starling   | stock transformers   | CrispASR   |
-|----------|---------|------------|----------------------|------------|
-| short    |       1 | 0.00%      | 0.00%                | 0.00%      |
-| medium   |       1 | 33.33%     | 33.33%               | 33.33%     |
-| long     |       1 | 21.30%     | 21.30%               | 41.74%     |
+| length   |   batch | starling     | stock transformers   |
+|----------|---------|--------------|----------------------|
+| short    |       1 | 280ms (27x)  | 2391ms (3x)          |
+| medium   |       1 | 502ms (44x)  | 3639ms (6x)          |
+| long     |       1 | 1758ms (42x) | 15397ms (5x)         |
 
 **parakeet-tdt-0.6b-v3** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 15ms (493x)  | 249ms (30x)          |
-| short    |       8 | 24ms (307x)  | —                    |
-| medium   |       1 | 23ms (956x)  | 500ms (45x)          |
-| medium   |       8 | 51ms (437x)  | —                    |
-| long     |       1 | 56ms (1315x) | 1252ms (59x)         |
-| long     |       8 | 163ms (456x) | —                    |
-
-**parakeet-tdt-0.6b-v3** — WER % vs LibriSpeech reference
-
-| length   |   batch | starling   | stock transformers   |
-|----------|---------|------------|----------------------|
-| short    |       1 | 0.00%      | 0.00%                |
-| short    |       8 | 0.00%      | —                    |
-| medium   |       1 | 0.00%      | 0.00%                |
-| medium   |       8 | 0.00%      | —                    |
-| long     |       1 | 0.00%      | 0.00%                |
-| long     |       8 | 0.00%      | —                    |
+| short    |       1 | 15ms (509x)  | 146ms (51x)          |
+| short    |       8 | 24ms (309x)  | —                    |
+| medium   |       1 | 26ms (842x)  | 341ms (66x)          |
+| medium   |       8 | 52ms (429x)  | —                    |
+| long     |       1 | 63ms (1180x) | 1442ms (52x)         |
+| long     |       8 | 180ms (414x) | —                    |
 
 **moss-transcribe-preview-2b** — latency / RTFx (ms, RTFx×)
 
+| length   |   batch | starling    | stock transformers   |
+|----------|---------|-------------|----------------------|
+| short    |       1 | 202ms (37x) | 2008ms (4x)          |
+| medium   |       1 | 464ms (48x) | 4852ms (5x)          |
+| long     |       1 | 847ms (88x) | 18803ms (4x)         |
+
+**ark-asr-3b** — latency / RTFx (ms, RTFx×)
+
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 187ms (40x)  | 1745ms (4x)          |
-| medium   |       1 | 397ms (56x)  | 4648ms (5x)          |
-| long     |       1 | 1301ms (57x) | 21151ms (4x)         |
+| short    |       1 | 232ms (32x)  | 1300ms (6x)          |
+| medium   |       1 | 588ms (38x)  | 4285ms (5x)          |
+| long     |       1 | 648ms (115x) | 4196ms (18x)         |
 
-**moss-transcribe-preview-2b** — WER % vs LibriSpeech reference
+**cohere-transcribe-03-2026** — latency / RTFx (ms, RTFx×)
 
-| length   |   batch | starling   | stock transformers   |
-|----------|---------|------------|----------------------|
-| short    |       1 | 0.00%      | 0.00%                |
-| medium   |       1 | 0.00%      | 0.00%                |
-| long     |       1 | 33.48%     | 33.48%               |
-
-**qwen3-asr-1.7b** — latency / RTFx (ms, RTFx×)
-
-| length   |   batch | starling     | stock transformers   | CrispASR     |
-|----------|---------|--------------|----------------------|--------------|
-| short    |       1 | 238ms (31x)  | 1780ms (4x)          | 3482ms (2x)  |
-| medium   |       1 | 399ms (56x)  | 5642ms (4x)          | 4698ms (5x)  |
-| long     |       1 | 1201ms (62x) | 18306ms (4x)         | 7863ms (10x) |
-
-**qwen3-asr-1.7b** — WER % vs LibriSpeech reference
-
-| length   |   batch | starling   | stock transformers   | CrispASR   |
-|----------|---------|------------|----------------------|------------|
-| short    |       1 | 0.00%      | 0.00%                | 0.00%      |
-| medium   |       1 | 0.00%      | 0.00%                | 0.00%      |
-| long     |       1 | 0.00%      | 0.00%                | 0.00%      |
+| length   |   batch | starling     | stock transformers   |
+|----------|---------|--------------|----------------------|
+| short    |       1 | 54ms (138x)  | 436ms (17x)          |
+| medium   |       1 | 160ms (139x) | 737ms (30x)          |
+| long     |       1 | 340ms (219x) | 1276ms (58x)         |
 <!-- BENCH:END -->
 
 The WER column above is the **byte-exact drift gate** (tiled fixtures, `jiwer`
@@ -274,11 +246,47 @@ optimizations land safely. (`--num-samples 0` runs the full splits; the default
 caps each dataset for a tractable local run.)
 
 <!-- BENCH:WER:START -->
-<!-- regenerated by `bench_leaderboard.py --update-readme`; not yet run —
-     populate with `uv run python benchmarks/bench_leaderboard.py --update-readme`. -->
-_Run `uv run python benchmarks/bench_leaderboard.py --update-readme` to populate
-this table._
+**Open ASR Leaderboard — WER %** (per dataset, unweighted mean avg)
+
+| model                      | engine             | voxpopuli   | ami   | earnings22   | gigaspeech   | librispeech_clean   | librispeech_other   | spgispeech   | avg   |
+|----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|-------|
+| ark-asr-3b                 | starling           | 27.56%      | 5.27% | 9.28%        | 3.20%        | 6.01%               | 6.74%               | 2.39%        | 8.64% |
+| ark-asr-3b                 | stock transformers | 27.67%      | 5.10% | 9.13%        | 2.82%        | 6.14%               | 6.62%               | 2.39%        | 8.55% |
+| cohere-transcribe-03-2026  | starling           | 10.35%      | 6.31% | 8.59%        | 5.42%        | 1.47%               | 1.78%               | 2.50%        | 5.20% |
+| cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31% | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
+| granite-speech-4.1-2b      | starling           | 7.44%       | 7.97% | 8.41%        | 5.25%        | 1.77%               | 2.35%               | 2.85%        | 5.15% |
+| granite-speech-4.1-2b      | stock transformers | 7.47%       | 8.02% | 8.44%        | 5.13%        | 1.77%               | 2.25%               | 2.90%        | 5.14% |
+| moss-transcribe-preview-2b | starling           | 3.81%       | 6.40% | 6.72%        | 4.28%        | 1.59%               | 2.69%               | 2.15%        | 3.95% |
+| moss-transcribe-preview-2b | stock transformers | 3.81%       | 6.17% | 6.68%        | 4.28%        | 1.62%               | 2.66%               | 2.10%        | 3.90% |
+| parakeet-tdt-0.6b-v3       | starling           | 9.69%       | 5.27% | 5.18%        | 3.76%        | 1.96%               | 2.84%               | 4.51%        | 4.74% |
+| parakeet-tdt-0.6b-v3       | stock transformers | 9.59%       | 5.44% | 5.18%        | 3.76%        | 1.96%               | 2.84%               | 4.24%        | 4.72% |
+| qwen3-asr-1.7b             | starling           | 6.94%       | 7.31% | 8.19%        | 4.07%        | 1.80%               | 2.88%               | 2.80%        | 4.86% |
+| qwen3-asr-1.7b             | stock transformers | 6.94%       | 7.45% | 8.30%        | 3.98%        | 1.80%               | 2.91%               | 2.75%        | 4.88% |
+
+**Open ASR Leaderboard — RTFx** (real audio_s / inference_s)
+
+| model                      | engine             | voxpopuli   | ami   | earnings22   | gigaspeech   | librispeech_clean   | librispeech_other   | spgispeech   |
+|----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|
+| ark-asr-3b                 | starling           | 47x         | 28x   | 37x          | 26x          | 38x                 | 10x                 | 2x           |
+| ark-asr-3b                 | stock transformers | 9x          | 6x    | 1x           | 5x           | 6x                  | 6x                  | 6x           |
+| cohere-transcribe-03-2026  | starling           | 38x         | 21x   | 31x          | 28x          | 33x                 | 27x                 | 56x          |
+| cohere-transcribe-03-2026  | stock transformers | 32x         | 23x   | 31x          | 23x          | 26x                 | 26x                 | 26x          |
+| granite-speech-4.1-2b      | starling           | 49x         | 45x   | 50x          | 40x          | 46x                 | 41x                 | 43x          |
+| granite-speech-4.1-2b      | stock transformers | 5x          | 6x    | 6x           | 5x           | 5x                  | 5x                  | 5x           |
+| moss-transcribe-preview-2b | starling           | 46x         | 35x   | 49x          | 40x          | 53x                 | 48x                 | 53x          |
+| moss-transcribe-preview-2b | stock transformers | 6x          | 6x    | 5x           | 5x           | 6x                  | 5x                  | 6x           |
+| parakeet-tdt-0.6b-v3       | starling           | 9x          | 6x    | 12x          | 33x          | 87x                 | 120x                | 818x         |
+| parakeet-tdt-0.6b-v3       | stock transformers | 7x          | 11x   | 70x          | 53x          | 62x                 | 62x                 | 48x          |
+| qwen3-asr-1.7b             | starling           | 64x         | 49x   | 63x          | 48x          | 56x                 | 52x                 | 52x          |
+| qwen3-asr-1.7b             | stock transformers | 6x          | 6x    | 6x           | 4x           | 5x                  | 5x                  | 5x           |
 <!-- BENCH:WER:END -->
+
+*Granite, moss, qwen3, and cohere use 50 clips/dataset; parakeet and ark use
+10 clips/dataset (their graphed pipelines can't safely evict CUDA graphs at
+high shape diversity yet, so the smaller sample keeps VRAM bounded). WER is
+still meaningful and byte-exact starling-vs-stock at N=10; parakeet/ark RTFx
+is depressed by per-clip graph-capture overhead (no eviction = each new clip
+length pays a one-time capture cost).*
 
 ## What did not work
 

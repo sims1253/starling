@@ -53,6 +53,9 @@ MODEL_LABELS = {
     "parakeet": "parakeet-tdt-0.6b-v3",
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
+    "ark": "ark-asr-3b",
+    "cohere": "cohere-transcribe-03-2026",
+    "higgs": "higgs-audio-v3-stt",
 }
 
 
@@ -264,8 +267,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="untimed warmup runs (graph capture) on the first clip")
     ap.add_argument("--update-readme", action="store_true",
                     help="splice the WER/RTFx tables into README.md")
-    ap.add_argument("--from-json", action="store_true",
-                    help="skip the run; rebuild tables from outputs/leaderboard.json")
+    ap.add_argument("--from-json", nargs="*", default=None,
+                    help="skip the run; rebuild tables from one or more JSON "
+                         "files (merges records across them). With no args, "
+                         "reads outputs/leaderboard.json. Useful to combine "
+                         "per-model runs into one table.")
+    ap.add_argument("--out", default=None,
+                    help="output JSON path (default outputs/leaderboard.json). "
+                         "Set per-model to avoid overwriting during isolated runs.")
     args = ap.parse_args(argv)
 
     warnings.filterwarnings("ignore")
@@ -274,8 +283,31 @@ def main(argv: list[str] | None = None) -> int:
     dataset_keys = _parse_csv(args.datasets)
     n = args.num_samples or None
 
-    if args.from_json:
-        results = json.loads((OUTPUTS / "leaderboard.json").read_text())
+    if args.from_json is not None:
+        files = args.from_json or [str(OUTPUTS / "leaderboard.json")]
+        merged = None
+        skipped = []
+        for f in files:
+            try:
+                data = json.loads(Path(f).read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                # a per-model run that crashed may have left a missing/corrupt
+                # JSON; skip it so the merge still produces a table from the
+                # models that succeeded.
+                skipped.append(f"{f} ({type(e).__name__})")
+                continue
+            if merged is None:
+                merged = data
+            else:
+                merged["records"].extend(data["records"])
+        if merged is None:
+            print("[leaderboard] no valid JSON to merge; nothing to do.")
+            return 1
+        if skipped:
+            print(f"[leaderboard] skipped {len(skipped)} unparseable/missing JSON(s):")
+            for s in skipped:
+                print(f"          {s}")
+        results = merged
         models = _ordered_models(results)
         engines = _ordered_engines(results)
         md = build_markdown(results, models=models, engines=engines)
@@ -309,8 +341,14 @@ def main(argv: list[str] | None = None) -> int:
                            warmup=args.warmup)
 
     OUTPUTS.mkdir(exist_ok=True)
-    (OUTPUTS / "leaderboard.json").write_text(json.dumps(results, indent=2))
-    print(f"\n[leaderboard] wrote {OUTPUTS}/leaderboard.json")
+    out_path = Path(args.out) if args.out else (OUTPUTS / "leaderboard.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write (temp + rename) so a crash mid-run never leaves a corrupt
+    # half-written JSON that would break the final --from-json merge.
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(results, indent=2))
+    tmp.replace(out_path)
+    print(f"\n[leaderboard] wrote {out_path}")
 
     all_engines = sorted({r["engine"] for r in results["records"]})
     md = build_markdown(results, models=list(engine_map.keys()), engines=all_engines)

@@ -89,6 +89,7 @@ class MultiStepLLMMega(FusedLLMMega):
         warmup_iters: int = 3,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        graph_pool=None,
     ) -> None:
         super().__init__(
             language_model,
@@ -97,6 +98,7 @@ class MultiStepLLMMega(FusedLLMMega):
             warmup_iters=warmup_iters,
             device=device,
             dtype=dtype,
+            graph_pool=graph_pool,
         )
         self.steps_per_replay = max(1, int(steps_per_replay))
         self.K = self.steps_per_replay

@@ -65,6 +65,9 @@ MODEL_LABELS = {
     "parakeet": "parakeet-tdt-0.6b-v3",
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
+    "ark": "ark-asr-3b",
+    "cohere": "cohere-transcribe-03-2026",
+    "higgs": "higgs-audio-v3-stt",
 }
 
 
@@ -338,6 +341,14 @@ class _EngineStub:
 
 def build_markdown(results: dict, engine_map: dict[str, list[Engine]], *,
                    lengths, batches) -> str:
+    """Build the latency/RTFx markdown for the README sentinel block.
+
+    Emits ONLY the latency/RTFx tables. The tiled-fixture WER is meaningless
+    (one utterance repeated N times -- the models don't emit it back exactly N
+    times, so WER reflects tiling artifacts, not recognition quality) and is
+    omitted. Real recognition-quality WER on diverse Open-ASR-Leaderboard audio
+    lives in the separate ``BENCH:WER`` block produced by ``bench_leaderboard.py``.
+    """
     records = _cells(results)
     models = list(results["models"].keys())
     parts = []
@@ -347,9 +358,6 @@ def build_markdown(results: dict, engine_map: dict[str, list[Engine]], *,
             continue
         parts.append(latency_table(model, engines, records,
                                    lengths=lengths, batches=batches))
-        parts.append("")
-        parts.append(wer_table(model, engines, records,
-                               lengths=lengths, batches=batches))
         parts.append("")
     return "\n".join(parts).rstrip() + "\n"
 

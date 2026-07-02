@@ -98,9 +98,18 @@ class Engine:
         raise NotImplementedError
 
     def close(self) -> None:
-        """Release the model + drop the GPU cache. Safe to call repeatedly."""
+        """Release the model + drop the GPU cache. Safe to call repeatedly.
+
+        Forces a GC pass after dropping references so CUDA tensors backing the
+        model are actually freed before the next engine loads — without this,
+        two multi-GB models can coexist transiently and OOM the GPU/RAM when
+        the bench cycles through several models in one process.
+        """
+        import gc
+
         self._release()
         self._loaded = False
+        gc.collect()
         torch.cuda.empty_cache()
 
     def _release(self) -> None:

@@ -258,13 +258,21 @@ class GraphedEncoder:
         mode: ``"eager"`` or ``"cudagraph"``.
     """
 
-    def __init__(self, encoder, *, warmup_iters: int = 3, mode: str = "eager") -> None:
+    def __init__(self, encoder, *, warmup_iters: int = 3, mode: str = "eager",
+                 max_cached_shapes: int = 8) -> None:
         self.encoder = encoder
         self.n_window = int(encoder.n_window)
         self.chunk_len = self.n_window * 2
         self.warmup_iters = int(warmup_iters)
         self.mode = mode
         self._static = StaticEncoder(encoder) if mode == "cudagraph" else None
+        # Bound the per-shape graph cache. Each captured graph pins a private
+        # CUDA memory pool, so unbounded growth across many clip lengths (a
+        # 7-dataset x 50-clip leaderboard sweep has dozens of distinct shapes)
+        # saturates VRAM and spills to shared/unified memory -> OOM. Eviction is
+        # byte-exact-safe: capture is shape-only and static buffers are rewritten
+        # each call, so re-capturing an evicted shape reproduces the identical graph.
+        self.max_cached_shapes = int(max_cached_shapes)
         self._graphs: Dict[Tuple[int, int], dict] = {}
 
     # ------------------------------------------------------------------ #
@@ -312,13 +320,17 @@ class GraphedEncoder:
         with torch.cuda.graph(graph):
             static_out = _run()
 
-        key = (B, padded_feat_len, num_windows, window_size)
+        key = (B, padded_feat_len, num_windows, window_size, packed_len)
         bundle = {
             "B": B, "padded_feat_len": padded_feat_len, "packed_len": packed_len,
             "num_windows": num_windows, "window_size": window_size,
             "static_inp": static_inp, "static_valid": static_valid,
             "static_wmask": static_wmask, "static_out": static_out, "graph": graph,
         }
+        # Bound the cache before inserting (LRU by insertion order; re-capture
+        # of an evicted shape is byte-exact — see __init__ docstring).
+        if len(self._graphs) >= self.max_cached_shapes:
+            self._graphs.pop(next(iter(self._graphs)))
         self._graphs[key] = bundle
         return bundle
 
@@ -355,10 +367,14 @@ class GraphedEncoder:
             mask = _pad_mask(input_features_mask, target)
 
         # Compute the (mask-dependent) windowing shape to look up / capture a graph.
-        (_, _, _, _, num_windows, window_size, _, _) = self._static._compute_packing(
+        # packed_len MUST be in the key: static_valid has shape (packed_len,) and
+        # static_out's valid prefix is packed_len, so a graph captured at one
+        # packed_len cannot serve another (the .copy_ into static_valid would
+        # shape-mismatch, and the valid-region output length differs).
+        (_, packed_len, _, _, num_windows, window_size, _, _) = self._static._compute_packing(
             B, target, feats.device, mask
         )
-        key = (B, target, num_windows, window_size)
+        key = (B, target, num_windows, window_size, packed_len)
         bundle = self._graphs.get(key)
         if bundle is None:
             bundle = self._capture(feats, mask)

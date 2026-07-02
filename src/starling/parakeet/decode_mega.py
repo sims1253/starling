@@ -118,9 +118,10 @@ class GraphedDecoder:
     """
 
     def __init__(self, model, *, warmup_iters: int = 4,
-                 steps_per_replay: int = 32) -> None:
+                 steps_per_replay: int = 32, graph_pool=None) -> None:
         cfg = model.config
         self.model = model
+        self.graph_pool = graph_pool  # shared torch.cuda.graph_pool_handle() or None
         self.dec = model.decoder
         self.joint = model.joint
         self.blank_id = int(cfg.blank_token_id)

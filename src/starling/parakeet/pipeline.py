@@ -96,6 +96,7 @@ class MegaParakeetPipeline:
         encoder_mode: str | None = None,
         config: KernelConfig | None = None,
         autotune: bool = True,
+        max_cached_shapes: int = 512,
     ) -> None:
         # Local import: constructing the pipeline pays the HF import cost; keep
         # it out of module import time so `import pipeline` is cheap.
@@ -148,8 +149,22 @@ class MegaParakeetPipeline:
         # (2) encoder backend: "graphed" -> GraphedEncoder (CUDA-graph capture,
         # byte-exact), "compiled" -> CompiledEncoder (torch.compile + BN fold,
         # not guaranteed byte-exact), "eager" -> None (stock path).
+        # Bound the per-shape graph cache so a sweep over many clip lengths
+        # doesn't accumulate unbounded graph pools (which thrash the allocator
+        # and crater RTFx on later datasets — see the leaderboard RTFx anomaly).
+        self.max_cached_shapes = int(max_cached_shapes)
+        # ONE shared CUDA graph pool for ALL encoder + decoder captures in this
+        # pipeline. With a shared pool, evicting one graph (``del graph``) frees
+        # only that graph's blocks from the pool; the pool (and other graphs)
+        # stay valid. Without it, each capture gets its own private pool and
+        # evicting one corrupts the context (cudaErrorIllegalAddress). The shared
+        # pool makes LRU eviction safe -- see encoder_graph.py / decode_mega.py.
+        self._graph_pool = torch.cuda.graph_pool_handle()
         if encoder_mode == "graphed":
-            self._graphed_encoder = GraphedEncoder(self.model)
+            self._graphed_encoder = GraphedEncoder(
+                self.model, max_cached_shapes=self.max_cached_shapes,
+                graph_pool=self._graph_pool,
+            )
         elif encoder_mode == "compiled":
             self._graphed_encoder = CompiledEncoder(self.model)
         else:
@@ -180,10 +195,24 @@ class MegaParakeetPipeline:
         key = (int(B), int(T_enc))
         dec = self._decoders.get(key)
         if dec is None:
+            # NOTE: decoder graph eviction is unsafe (see encoder_graph.py) --
+            # evicting a captured graph corrupts the CUDA context. The cache is
+            # Private-pool LRU eviction: reset() frees the evicted graph's pool
+            # without affecting others. Re-capture reproduces the identical graph.
+            if len(self._decoders) >= self.max_cached_shapes:
+                import gc
+                old_dec = self._decoders.pop(next(iter(self._decoders)))
+                try:
+                    if getattr(old_dec, "graph", None) is not None:
+                        old_dec.graph.reset()
+                except Exception:
+                    pass
+                del old_dec
+                gc.collect()
             # steps_per_replay (K) comes from the autotuned/fallback config; the
             # captured graph replays K decode steps per host sync.
             dec = GraphedDecoder(
-                self.model, steps_per_replay=self.config.steps_per_replay
+                self.model, steps_per_replay=self.config.steps_per_replay,
             ).capture(pooler, valid_lengths, self.pad_id)
             self._decoders[key] = dec
         return dec

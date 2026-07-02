@@ -80,8 +80,12 @@ class MegaPipeline:
         self.encoder_mode = encoder_mode
 
         comps = get_components(model)
+        # ONE shared CUDA graph pool for encoder + LLM captures, so LRU eviction
+        # of a graph (``del graph``) frees only that graph's blocks without
+        # corrupting the context (the bug that caused cudaErrorIllegalAddress).
+        self._graph_pool = torch.cuda.graph_pool_handle()
         # (1) fused audio encoder (cudagraph = byte-exact + zero launch overhead).
-        self.fused_encoder = FusedEncoder(comps["audio_encoder"])
+        self.fused_encoder = FusedEncoder(comps["audio_encoder"], graph_pool=self._graph_pool)
         # embed_tokens used by the audio-embedding injection step.
         self.embed_tokens = comps["embed_tokens"]
 
@@ -91,6 +95,7 @@ class MegaPipeline:
             model.lm_head,
             max_cache_len=max_cache_len,
             steps_per_replay=steps_per_replay,
+            graph_pool=self._graph_pool,
         )
 
     # ------------------------------------------------------------------ #

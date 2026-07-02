@@ -121,7 +121,36 @@ class GraphedDecoder:
         )
 
     def _prefill(self, dec_in, enc_h, enc_mask, cache):
-        """Run the eager prefill into ``cache``; returns first token (B,1)."""
+        """Run the eager prefill into ``cache``; returns first token (B,1).
+
+        CRITICAL for multi-utterance correctness: the decoder's cross-attention
+        recomputes K/V from ``encoder_hidden_states`` ONLY when
+        ``cache.is_updated[layer]`` is False; otherwise it reuses stale cached K/V
+        (see CohereAsrCrossAttention.forward). The captured graph plus
+        ``_reset_cache`` leave ``is_updated`` True, so without resetting it here
+        the second-and-later utterances' prefill would silently reuse the
+        *capture-time* cross K/V and decode the wrong utterance (every clip after
+        the first returned clip 0's transcript). We also rewind the cross-cache
+        ``cumulative_length`` to 0 so ``StaticLayer.update``'s ``index_copy_``
+        overwrites slots [0, S) (after capture it sits at S, and max_cache_len ==
+        S, so a second write would be out-of-bounds). Both are no-ops on a fresh
+        cache (the capture path), so the first utterance is unaffected.
+        """
+        # force cross-attention to recompute K/V from THIS utterance's enc_h
+        if getattr(cache, "is_updated", None) is not None:
+            cache.is_updated = {i: False for i in range(self.n_layers)}
+        # rewind cross-cache write head so recomputed K/V land at [0, S)
+        cross_cache = cache.cross_attention_cache
+        zero = None
+        for layer in cross_cache.layers:
+            if getattr(layer, "is_initialized", False):
+                if zero is None:
+                    zero = torch.zeros(
+                        (1,), dtype=layer.cumulative_length.dtype,
+                        device=layer.cumulative_length.device,
+                    )
+                layer.cumulative_length.copy_(zero)
+
         B, T = dec_in.shape
         device = enc_h.device
         dtype = enc_h.dtype
@@ -171,25 +200,26 @@ class GraphedDecoder:
             layer.cumulative_length.copy_(fill)
 
     def _reset_cache(self, cache, first_token):
-        """Restore the FULL post-prefill cache snapshot + reset decoder input token.
+        """Restore the self-attn cache to the post-prefill snapshot + reset the
+        decoder input token. The cross-attn cache is left untouched: it holds
+        THIS utterance's encoder K/V (just written by :meth:`_prefill`), so
+        restoring the captured snapshot would make every decode reuse the first
+        utterance's cross-attention — a real bug that the leaderboard sweep
+        surfaces (every clip after the first returned clip 0's transcript).
 
-        Used once at capture time (to undo warmup/capture mutations) — NOT per
-        replay in :meth:`decode`.
+        The self-attn rewind IS correct: the captured K-step template runs at
+        positions [base, base+K), writing K/V into advancing slots, so before
+        each utterance we rewind the self-attn cumulative_length to T (the
+        first decode position) while keeping the prefill's slots [0, T).
         """
         self_cache = cache.self_attention_cache
-        cross_cache = cache.cross_attention_cache
         for l, k, v, c in zip(
             self_cache.layers, self._snap_self_keys, self._snap_self_vals, self._snap_self_cum
         ):
             l.keys.copy_(k)
             l.values.copy_(v)
             l.cumulative_length.copy_(c)
-        for l, k, v, c in zip(
-            cross_cache.layers, self._snap_cross_keys, self._snap_cross_vals, self._snap_cross_cum
-        ):
-            l.keys.copy_(k)
-            l.values.copy_(v)
-            l.cumulative_length.copy_(c)
+        # cross-attn: deliberately NOT restored — see docstring.
         cache.is_updated = {i: True for i in range(self.n_layers)}
         self.self_token.copy_(first_token)
         self.cur_pos.fill_(self._T)
@@ -197,10 +227,11 @@ class GraphedDecoder:
     # ------------------------------------------------------------------ #
     # the captured per-step compute
     # ------------------------------------------------------------------ #
-    def _alloc(self, B, T, device, dtype):
+    def _alloc(self, B, T, S, device, dtype):
         K = self.steps_per_replay
         self._B = B
         self._T = T
+        self._S = S
         self.K = K
         self.device = device
         self.dtype = dtype
@@ -215,15 +246,31 @@ class GraphedDecoder:
         # output ring: step j writes its emitted token into column j
         self.output_ring = torch.zeros(B, K, dtype=torch.long, device=device)
         self.pad_const = torch.full((B, 1), self.pad_token_id, dtype=torch.long, device=device)
-        _mark_many([self.output_ring, self.self_token, self.cur_pos])
+        # STATIC encoder input buffers. The captured graph reads encoder_hidden_states
+        # / encoder_attention_mask from these (NOT from call args, which a CUDA graph
+        # freezes at capture time). decode() copies each new utterance's enc_h /
+        # enc_mask into them before replay, so one captured graph serves many
+        # utterances of the same (B, T, S) shape. Without this, every replay re-reads
+        # the capture-time enc_h and every clip after the first decodes clip 0.
+        # NOTE: the encoder hidden dim (e.g. 1280) differs from the decoder's
+        # hidden_size (e.g. 1024) -- cross-attention projects between them -- so
+        # size from the actual enc_h, not the decoder config.
+        enc_hidden_dim = int(self._capture_enc_h_shape[-1])
+        self.static_enc_h = torch.zeros(B, S, enc_hidden_dim, dtype=dtype, device=device)
+        self.static_enc_mask = torch.zeros(B, 1, 1, S, dtype=dtype, device=device)
+        _mark_many([self.output_ring, self.self_token, self.cur_pos, self.static_enc_h, self.static_enc_mask])
 
-    def _step_fn(self, j, enc_h, enc_mask):
+    def _step_fn(self, j):
         """The captured per-step compute; writes its token to ``output_ring[:, j]``.
 
         Reads the in-place-advancing ``cur_pos`` to build this step's causal mask
         ``(B,1,1,max_cache)`` (key k valid iff k <= cur_pos) and position_ids, so
         the K captured steps advance correctly without per-step baked masks. After
         the forward, ``cur_pos`` is incremented by 1 in-graph for the next step.
+
+        Encoder hidden states / mask come from ``self.static_enc_h`` /
+        ``self.static_enc_mask`` (populated by decode() per utterance) — NEVER from
+        call args, which a captured graph would freeze.
         """
         cp = self.cur_pos  # (1,) scalar-long
         cm = torch.where(self._ar <= cp, 0.0, self._neg).to(self.dtype).view(
@@ -234,8 +281,8 @@ class GraphedDecoder:
             input_ids=self.self_token,
             attention_mask=cm,
             position_ids=p,
-            encoder_hidden_states=enc_h,
-            encoder_attention_mask=enc_mask,
+            encoder_hidden_states=self.static_enc_h,
+            encoder_attention_mask=self.static_enc_mask,
             past_key_values=self._cache,
             use_cache=True,
         )
@@ -273,12 +320,17 @@ class GraphedDecoder:
         self._cache = self._make_cache(S)
         nxt0 = self._prefill(dec_in, enc_h, enc_mask, self._cache)
         self._snapshot_cache(self._cache)
-        self._alloc(B, T, device, dtype)
+        self._capture_enc_h_shape = enc_h.shape
+        self._alloc(B, T, S, device, dtype)
+        # seed the static encoder buffers with the capture utterance so the
+        # captured graph reads valid enc_h/enc_mask during warmup + capture.
+        self.static_enc_h.copy_(enc_h)
+        self.static_enc_mask.copy_(enc_mask)
 
         def _warm_block():
             self._reset_cache(self._cache, nxt0)
             for j in range(K):
-                self._step_fn(j, enc_h, enc_mask)
+                self._step_fn(j)
 
         # warmup on a side stream (stabilises cudnn/cublas autotune)
         side = torch.cuda.Stream()
@@ -294,7 +346,7 @@ class GraphedDecoder:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             for j in range(K):
-                self._step_fn(j, enc_h, enc_mask)
+                self._step_fn(j)
         self._reset_cache(self._cache, nxt0)  # capture mutated state; restore
         self._captured = True
         self._captured_B = B
@@ -334,9 +386,15 @@ class GraphedDecoder:
 
         # prefill for THIS utterance into the SAME captured cache object
         nxt0 = self._prefill(dec_in, enc_h, enc_mask, self._cache)
-        # reset to post-prefill snapshot once (undo nothing here, but ensures
-        # clean state: self K/V at slots 0..T-1, cumulative_length=T, cross full)
+        # reset self-attn to post-prefill snapshot (rewinds the autoregressive
+        # position); cross-attn is left as THIS prefill wrote it (the snapshot
+        # restore deliberately skips cross-attn — see _reset_cache).
         self._reset_cache(self._cache, nxt0)
+        # bind THIS utterance's encoder hidden states / mask into the static
+        # buffers the captured graph reads. Without this, every replay re-reads
+        # the capture-time enc_h and decodes the wrong utterance.
+        self.static_enc_h.copy_(enc_h)
+        self.static_enc_mask.copy_(enc_mask)
         # bookkeeping on CPU (the ring is synced to CPU each replay)
         results = [nxt0.squeeze(1).cpu()]
         finished = (results[0] == self.eos_token_id)

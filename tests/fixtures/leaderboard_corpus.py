@@ -148,17 +148,29 @@ def load_dataset_split(
     from whisper_normalizer.english import EnglishTextNormalizer
 
     normalizer = EnglishTextNormalizer()
-    ds = load_dataset(DATASET_PATH, config, split=split, token=token)
-    # force 16kHz mono float32 decoding (the repo is already 16kHz, but be explicit)
-    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-    if num_samples and num_samples > 0:
-        ds = ds.select(range(min(num_samples, len(ds))))
+    # IMPORTANT: when capping (num_samples > 0), stream + .take(N) so only N
+    # examples are ever decoded into RAM. A non-streaming load_dataset
+    # materializes the WHOLE split (spgispeech = 39k clips, gigaspeech = 20k)
+    # before .select(N) -- tens of GB of decoded float32 audio that OOMs a
+    # 31GB WSL2 box. Streaming decodes lazily, one clip at a time. The full
+    # split (num_samples=0/None) stays non-streaming (it needs everything).
+    cap = num_samples if (num_samples and num_samples > 0) else None
+    if cap is not None:
+        ds = load_dataset(DATASET_PATH, config, split=split, streaming=True, token=token)
+        ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+        ds = ds.take(cap)
+        iterator = ds
+        total_read = cap  # upper bound (actual may be fewer after filtering)
+    else:
+        ds = load_dataset(DATASET_PATH, config, split=split, token=token)
+        ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+        iterator = ds
+        total_read = len(ds)
 
     ref_out: dict[int, str] = {}
     out: list[LeaderboardClip] = []
     drop = 0
-    for i in range(len(ds)):
-        ex = ds[i]
+    for ex in iterator:
         a = ex["audio"]["array"]
         if a.ndim != 1:
             a = a[:, 0]
@@ -166,7 +178,8 @@ def load_dataset_split(
         sr = int(ex["audio"].get("sampling_rate", SAMPLE_RATE)) if isinstance(ex["audio"], dict) else SAMPLE_RATE
         text = str(ex.get("text", "")).strip()
         # leaderboard filter: drop empty / placeholder refs AFTER normalization
-        if normalizer(text).strip() == "" or normalizer(text).strip() == _IGNORE:
+        norm = normalizer(text).strip()
+        if norm == "" or norm == _IGNORE:
             drop += 1
             continue
         idx = len(out)
@@ -175,7 +188,7 @@ def load_dataset_split(
         out.append(LeaderboardClip(a, sr, text))
     (d / "reference.json").write_text(json.dumps(ref_out, indent=2))
     print(f"[leaderboard_corpus] {key}: cached {len(out)} clips "
-          f"(read {len(ds)}, dropped {drop} empty/placeholder)", flush=True)
+          f"(read up to {total_read}, dropped {drop} empty/placeholder)", flush=True)
     return out
 
 

@@ -37,6 +37,7 @@ bypass it by feeding a pre-computed **4D** attention mask
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -50,6 +51,19 @@ from .config import (
     LLM_RESIDUAL_MULTIPLIER,
     LLM_RMS_NORM_EPS,
 )
+
+# Hard cap on the number of distinct prompt-length ``T`` prefill graphs retained
+# resident. The prefill graph cache is keyed on the prompt token length, so a
+# benchmark that feeds clips of many different lengths (each producing a
+# distinct prompt T) would otherwise capture one graph per length and never free
+# it, leaking the private CUDA-graph memory pool of each capture. The cache is
+# bounded by LRU eviction: when a new T arrives and the cache is full, the
+# least-recently-used prefill graph is dropped and its pool released
+# (``del graph; torch.cuda.empty_cache()``). This bounds memory without changing
+# numerics (each distinct T still gets its own exact graph; only old ones are
+# recycled once resident memory pressure rises).
+MAX_PREFILL_GRAPHS: int = 512
+
 
 # ---------------------------------------------------------------------------
 # Result containers
@@ -95,6 +109,8 @@ class LLMMega:
         max_cache_len: Fixed K/V cache length to pre-allocate.
         warmup_iters: CUDA-graph warmup iterations before capture.
         device/dtype: Must match the loaded weights (cuda / bfloat16).
+        max_prefill_graphs: Maximum number of distinct prompt-length prefill
+            graphs kept resident (LRU eviction beyond this).
     """
 
     def __init__(
@@ -105,6 +121,9 @@ class LLMMega:
         warmup_iters: int = 3,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        *,
+        max_prefill_graphs: int = MAX_PREFILL_GRAPHS,
+        graph_pool=None,
     ) -> None:
         self.lm = language_model
         self.lm_head = lm_head
@@ -113,6 +132,8 @@ class LLMMega:
         self.warmup_iters = int(warmup_iters)
         self.device = device
         self.dtype = dtype
+        self.graph_pool = graph_pool  # shared pool for safe eviction
+        self.max_prefill_graphs = max(1, int(max_prefill_graphs))
 
         self.vocab_size = int(self.config.vocab_size)
         self.num_layers = int(self.config.num_hidden_layers)
@@ -145,7 +166,18 @@ class LLMMega:
         # way the decode step does. The graph runs the model's own forward, so it
         # is byte-exact with eager prefill. One capture per T; amortised across
         # same-length calls.
-        self._prefill_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        #
+        # ``OrderedDict`` + LRU eviction: each distinct prompt length T captures
+        # its own graph with its own private CUDA-graph memory pool. A benchmark
+        # that feeds many different lengths would otherwise accumulate one pool
+        # per length forever. The cache is capped to ``max_prefill_graphs``; on
+        # overflow the LRU entry is dropped and its pool released
+        # (``del graph; torch.cuda.empty_cache()``) so resident memory stays
+        # bounded. The per-T ``_prefill_pos_ids["mask_<T>"]`` attention-mask
+        # cache is NOT bounded (those are small host-built tensors that do not
+        # own a graph pool) so it is left as a plain dict to preserve exact
+        # masks across eviction/re-capture.
+        self._prefill_graphs: OrderedDict[int, torch.cuda.CUDAGraph] = OrderedDict()
         self._prefill_static_in: dict[int, torch.Tensor] = {}
         self._prefill_static_out: dict[int, torch.Tensor] = {}
         self._prefill_pos_ids: dict[int, torch.Tensor] = {}
@@ -179,6 +211,36 @@ class LLMMega:
         )
         hidden = out.last_hidden_state[:, -1:, :]
         self.static_logits.copy_(self.lm_head(hidden) / LLM_LOGITS_SCALING)
+
+    # ------------------------------------------------------------------ #
+    # prefill graph cache eviction
+    # ------------------------------------------------------------------ #
+    def _free_prefill_graph(self, T: int) -> None:
+        """Release a captured prefill graph + its static buffers.
+
+        Each prefill graph has its OWN private pool, so ``graph.reset()``
+        deterministically frees its blocks. (The prefill output is cloned out
+        of the pool at capture time, so the stored ``_prefill_static_out`` ref
+        doesn't dangle after reset.)
+        """
+        graph = self._prefill_graphs.pop(T, None)
+        self._prefill_static_in.pop(T, None)
+        self._prefill_static_out.pop(T, None)
+        self._prefill_pos_ids.pop(T, None)
+        self._prefill_pos_ids.pop(f"mask_{T}", None)
+        if graph is not None:
+            try:
+                graph.reset()
+            except Exception:
+                pass
+            del graph
+
+    def _evict_prefill_if_needed(self) -> None:
+        """Evict the LRU prefill entry while the cache exceeds ``max_prefill_graphs``."""
+        while len(self._prefill_graphs) >= self.max_prefill_graphs:
+            # popitem(last=False) -> least-recently-used (head of the OrderedDict).
+            T, _ = self._prefill_graphs.popitem(last=False)
+            self._free_prefill_graph(T)
 
     # ------------------------------------------------------------------ #
     # prefill
@@ -264,9 +326,18 @@ class LLMMega:
 
     @torch.inference_mode()
     def _prefill_graphed(self, inputs_embeds: torch.Tensor, T: int) -> None:
-        """Capture (first call for ``T``) and replay the prefill graph."""
+        """Capture (first call for ``T``) and replay the prefill graph.
+
+        On a hit the entry is marked most-recently-used (``move_to_end``). On a
+        miss the LRU entry is evicted first (if the cache is full) so the
+        resident-graph count stays bounded; then a fresh graph is captured.
+        """
         graph = self._prefill_graphs.get(T)
         if graph is None:
+            # New prompt length: evict the LRU prefill graph + free its pool so
+            # the resident count never exceeds ``max_prefill_graphs``.
+            self._evict_prefill_if_needed()
+
             static_in = torch.zeros_like(inputs_embeds)
             self._prefill_static_in[T] = static_in
             pos_ids = torch.arange(T, device=self.device).unsqueeze(0)
@@ -298,10 +369,20 @@ class LLMMega:
                     past_key_values=self.cache,
                     use_cache=True,
                 )
-            self._prefill_static_out[T] = out.last_hidden_state
-            self._prefill_graphs[T] = graph
+            # Clone the prefill output OUT of the graph's private memory pool.
+            # ``out.last_hidden_state`` was allocated inside ``with
+            # torch.cuda.graph(graph)``, so it lives in the graph's private pool.
+            # When a later prompt length evicts this graph (``_free_prefill_graph``
+            # -> ``del graph; empty_cache()``), that pool is freed and any tensor
+            # still referencing it becomes a dangling pointer -> reading it raises
+            # ``cudaErrorIllegalAddress``. Cloning to a fresh tensor owned by the
+            # default allocator detaches it from the pool, so eviction is safe.
+            self._prefill_static_out[T] = out.last_hidden_state.clone()
+            self._prefill_graphs[T] = graph  # appended at the MRU tail
             # Reset so the first real replay starts from a clean cache.
             self._reset_cache_pos(0)
+        else:
+            self._prefill_graphs.move_to_end(T)  # mark most-recently-used
         self._prefill_static_in[T].copy_(inputs_embeds)
         self._reset_cache_pos(0)
         graph.replay()
