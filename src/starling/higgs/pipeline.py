@@ -83,7 +83,9 @@ class HiggsMega:
         new tokens (long audio expands to many whisper frames; use >= 2048 for
         ~75s clips).
     steps_per_replay : int
-        K for the multi-step decoder.
+        K for the multi-step decoder. RTX 5090 fixture sweep prefers K=2 for
+        short/medium clips; larger values add graph work without enough sync
+        savings for Higgs' token counts.
     """
 
     def __init__(
@@ -93,7 +95,7 @@ class HiggsMega:
         *,
         decoder: str = "multi",
         max_cache_len: int = 2048,
-        steps_per_replay: int = 8,
+        steps_per_replay: int = 2,
         compile_decode: bool = True,
     ) -> None:
         self.model = model

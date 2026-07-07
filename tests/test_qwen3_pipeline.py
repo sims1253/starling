@@ -83,6 +83,21 @@ def test_inputs_embeds_byte_exact_vs_golden():
     assert diff == 0.0, f"inputs_embeds max-abs diff {diff} != 0.0"
 
 
+def test_prefill_graph_matches_eager():
+    """Shape-keyed graphed prefill must produce the same first token as eager."""
+    from starling.qwen3.golden import INPUTS_EMBEDS, load_golden
+
+    inputs_embeds = load_golden(INPUTS_EMBEDS).to("cuda", torch.bfloat16)
+    llm = _pipe().llm
+
+    eager = llm.prefill(inputs_embeds, use_graph=False)
+    graphed = llm.prefill(inputs_embeds, use_graph=True)
+
+    assert torch.equal(eager, graphed), (
+        f"prefill token mismatch: eager={eager.item()} graphed={graphed.item()}"
+    )
+
+
 def test_transcript_exact_match_vs_golden():
     """End-to-end transcript matches the golden greedy decode exactly."""
     from starling.qwen3.golden import load_golden_text

@@ -237,6 +237,136 @@ def _join_chunk_texts(texts: list[str], overlap_seconds: float = 0.0) -> str:
 # ---------------------------------------------------------------------------
 # Mega (fused) chunked transcription
 # ---------------------------------------------------------------------------
+def _build_chunk_inputs(processor, chunk_wav, *, dtype, task_prompt, stream):
+    """Build one chunk's inputs and move features to GPU under ``stream``.
+
+    Producer-side work: HF processor STFT (releases the GIL) + chat template on
+    CPU, then ``.to(dtype)`` on the secondary stream so the H2D copy overlaps
+    with the consumer's decode on the default stream.
+    """
+    from .audio import build_inputs
+    inputs = build_inputs(processor, chunk_wav, task_prompt=task_prompt)
+    if stream is not None:
+        with torch.cuda.stream(stream):
+            feats = inputs["input_features"].to(dtype)
+    else:
+        feats = inputs["input_features"].to(dtype)
+    ids = inputs["input_ids"]
+    mask = inputs.get("input_features_mask")
+    return feats, ids, mask
+
+
+@torch.inference_mode()
+def _transcribe_long_overlap(
+    pipe: Any,
+    processor: Any,
+    wav: torch.Tensor,
+    sr: int,
+    *,
+    chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    overlap_seconds: float = 0.0,
+    max_new_tokens: int = 200,
+    speculative: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
+    task_prompt: str = DEFAULT_TASK_PROMPT,
+) -> LongTranscribeResult:
+    """Double-buffered producer/consumer chunked transcription.
+
+    Producer (background thread + secondary CUDA stream): builds chunk N+1's
+    inputs on CPU (HF STFT releases the GIL) and copies features to GPU on a
+    second stream. Consumer (main thread, default stream): runs ``pipe.transcribe``
+    on chunk N (encoder prefill + LLM decode). The producer's work is
+    compute/H2D-bound; the consumer's decode is bandwidth-bound -- they do not
+    contend for the same hardware, so they overlap.
+
+    Byte-exact with the serial path: identical per-chunk work, identical
+    ``_join_chunk_texts`` stitching, only the *timing* of work changes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    max_cache_len = int(getattr(pipe.llm, "max_cache_len", 640))
+    device = "cuda"
+    prefill_stream = torch.cuda.Stream(device=device)
+
+    chunks: list[ChunkResult] = []
+    texts: list[str] = []
+    total_tokens = 0
+    t0 = time.perf_counter()
+
+    def _produce(chunk_wav, start_s, end_s, idx):
+        feats, ids, mask = _build_chunk_inputs(
+            processor, chunk_wav,
+            dtype=dtype, task_prompt=task_prompt, stream=prefill_stream,
+        )
+        return feats, ids, mask, start_s, end_s, idx
+
+    pending = None
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        for chunk_wav, start_s, end_s, idx in chunk_audio(
+            wav, sr, chunk_seconds, overlap_seconds
+        ):
+            # Await the PREVIOUS chunk's inputs (steady state: this await is the
+            # consumer/producer handoff), then immediately launch THIS chunk's
+            # producer so it overlaps with the next decode.
+            if pending is not None:
+                feats, ids, mask, p_start, p_end, p_idx = pending.result()
+                torch.cuda.current_stream(device).wait_stream(prefill_stream)
+                prompt_len = int(ids.shape[1])
+                budget = max(1, min(max_new_tokens, max_cache_len - prompt_len - 1))
+                c0 = time.perf_counter()
+                text, gen_ids = pipe.transcribe(
+                    feats, ids, mask,
+                    max_new_tokens=budget, speculative=speculative,
+                )
+                # llm.generate synchronizes the default stream internally, so
+                # the explicit per-chunk cuda.synchronize() in the serial path
+                # is redundant for correctness; we drop it to widen the overlap
+                # window (the next iteration's producer runs on a separate stream).
+                cms = (time.perf_counter() - c0) * 1000.0
+                n_tok = int(gen_ids.shape[1])
+                chunks.append(ChunkResult(p_idx, p_start, p_end, text, n_tok, cms))
+                texts.append(text)
+                total_tokens += n_tok
+            # Launch THIS chunk's producer. Its decode happens on the NEXT
+            # iteration, after the next producer is launched -> overlap.
+            pending = executor.submit(_produce, chunk_wav, start_s, end_s, idx)
+
+        # Drain the final pending chunk (no further producer to launch).
+        if pending is not None:
+            feats, ids, mask, p_start, p_end, p_idx = pending.result()
+            torch.cuda.current_stream(device).wait_stream(prefill_stream)
+            prompt_len = int(ids.shape[1])
+            budget = max(1, min(max_new_tokens, max_cache_len - prompt_len - 1))
+            c0 = time.perf_counter()
+            text, gen_ids = pipe.transcribe(
+                feats, ids, mask,
+                max_new_tokens=budget, speculative=speculative,
+            )
+            cms = (time.perf_counter() - c0) * 1000.0
+            n_tok = int(gen_ids.shape[1])
+            chunks.append(ChunkResult(p_idx, p_start, p_end, text, n_tok, cms))
+            texts.append(text)
+            total_tokens += n_tok
+    finally:
+        executor.shutdown(wait=True)
+
+    torch.cuda.synchronize()
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    audio_seconds = wav.shape[1] / sr
+    full_text = _join_chunk_texts(texts, overlap_seconds)
+    return LongTranscribeResult(
+        text=full_text,
+        chunks=chunks,
+        total_ms=total_ms,
+        n_chunks=len(chunks),
+        total_tokens=total_tokens,
+        audio_seconds=audio_seconds,
+        rtfx=audio_seconds / max(total_ms / 1000.0, 1e-9),
+        speculative=speculative,
+    )
+
+
 @torch.inference_mode()
 def transcribe_long(
     pipe: Any,
@@ -256,7 +386,26 @@ def transcribe_long(
     Each chunk gets a fresh chat-template prompt and is transcribed
     independently; the KV cache is reset for every chunk so peak VRAM is
     constant regardless of total audio length.
+
+    When ``OptFlags.chunk_prefill_overlap`` is on (opt-in), chunk N+1's CPU
+    preprocessing (HF STFT) and H2D copy run on a background thread + secondary
+    CUDA stream while chunk N's encoder+decode runs on the default stream. The
+    two phases don't contend for the same hardware (preprocessing is
+    compute/H2D-bound; decode is weight-bandwidth-bound), so they overlap.
+    Byte-exact with the serial path -- identical per-chunk work, only the
+    *timing* of work changes.
     """
+    # Honor the opt-in flag from the pipe (preferred) or the process default.
+    from ..flags import get_default_flags
+    pipe_flags = getattr(pipe, "flags", None) or get_default_flags()
+    if getattr(pipe_flags, "chunk_prefill_overlap", False):
+        return _transcribe_long_overlap(
+            pipe, processor, wav, sr,
+            chunk_seconds=chunk_seconds, overlap_seconds=overlap_seconds,
+            max_new_tokens=max_new_tokens, speculative=speculative,
+            dtype=dtype, task_prompt=task_prompt,
+        )
+
     from .audio import build_inputs
 
     max_cache_len = int(getattr(pipe.llm, "max_cache_len", 640))

@@ -253,7 +253,7 @@ class SpeculativeDecoder:
        draft:
        - On **full acceptance** (all k match): emit all k chunk tokens + a free
          bonus token (``logits[k].argmax()``), then **ramp** the chunk size
-         (8 -> 12 -> 16).
+         (16 -> 20 -> 24 -> 28 -> 32).
        - On **mismatch at position j**: emit the accepted prefix ``chunk[0..j-1]``
          plus the LLM's greedy correction ``logits[j].argmax()`` (the true greedy
          token, NOT the rejected draft token), then reset the chunk size to 8.
@@ -292,15 +292,15 @@ class SpeculativeDecoder:
     **byte-identical** to standard greedy decoding.
     """
 
-    MIN_CHUNK: int = 8
+    MIN_CHUNK: int = 16
     """Starting / reset verify chunk size (also the floor after a mismatch)."""
 
     BOUNDARY_CHUNK: int = 2
     """Tiny chunk used while stalled inside a formatting boundary (j=0 mismatch
     with no draft re-alignment). Keeps single-token verify forwards cheap."""
 
-    MAX_CHUNK: int = 16
-    """Maximum verify chunk size (ramped 8 -> 12 -> 16 on full acceptance)."""
+    MAX_CHUNK: int = 32
+    """Maximum verify chunk size (ramped by 4 on full acceptance)."""
 
     def __init__(self, llm: Any, embed_tokens: Any) -> None:
         self.llm = llm
@@ -370,7 +370,7 @@ class SpeculativeDecoder:
         decode_steps = 0       # single-token decode steps (fallback only)
         decode_probes = 0      # decode steps inside the draft loop (MUST stay 0)
         draft_pos = 0
-        chunk_size = self.MIN_CHUNK  # adaptive: 8 -> 12 -> 16 on full accept
+        chunk_size = self.MIN_CHUNK  # adaptive: 16 -> ... -> 32 on full accept
         SEARCH_WIN = 40        # how far ahead to search for re-alignment
         STUCK_LIMIT = 8        # max consecutive no-progress rounds before a forced skip
         stuck = 0              # consecutive rounds with no draft_pos advance

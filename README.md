@@ -17,6 +17,7 @@ All do speech-to-text.
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) — encoder + 1B LLM decoder. Optional self-speculative path drafting from the encoder's CTC head.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) — non-autoregressive. One bidirectional forward: CTC conformer draft + blank slots + bidirectional granite-4.0-1b editor refinement. No decode loop.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — FastConformer + TDT transducer (no LLM). GPU-side mel + chunking for hour-long audio.
+- [`nvidia/parakeet-unified-en-0.6b`](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) — Unified FastConformer-RNN-T. NeMo-free port: the `.nemo` checkpoint is loaded directly (no `nemo_toolkit`), the encoder/prediction-net/joint are hand-built in PyTorch, and the encoder + greedy RNN-T decode are captured into CUDA graphs.
 - [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) — Qwen3-omni MoE encoder + Qwen3 decoder.
 - [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — Whisper-style windowed-attention encoder + Qwen3 decoder.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — Whisper encoder + MLP adapter + Qwen2.5 decoder.
@@ -58,44 +59,44 @@ excluded, single RTX 5090.
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 280ms (27x)  | 2391ms (3x)          |
-| medium   |       1 | 502ms (44x)  | 3639ms (6x)          |
-| long     |       1 | 1758ms (42x) | 15397ms (5x)         |
+| short    |       1 | 171ms (43x)  | 2543ms (3x)          |
+| medium   |       1 | 326ms (68x)  | 5238ms (4x)          |
+| long     |       1 | 1226ms (61x) | 18831ms (4x)         |
 
 **parakeet-tdt-0.6b-v3** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 15ms (509x)  | 146ms (51x)          |
-| short    |       8 | 24ms (309x)  | —                    |
-| medium   |       1 | 26ms (842x)  | 341ms (66x)          |
-| medium   |       8 | 52ms (429x)  | —                    |
-| long     |       1 | 63ms (1180x) | 1442ms (52x)         |
-| long     |       8 | 180ms (414x) | —                    |
+| short    |       1 | 14ms (531x)  | 167ms (45x)          |
+| short    |       8 | 24ms (313x)  | —                    |
+| medium   |       1 | 22ms (1004x) | 419ms (53x)          |
+| medium   |       8 | 49ms (458x)  | —                    |
+| long     |       1 | 56ms (1338x) | 1425ms (52x)         |
+| long     |       8 | 163ms (455x) | —                    |
 
 **moss-transcribe-preview-2b** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling    | stock transformers   |
 |----------|---------|-------------|----------------------|
-| short    |       1 | 202ms (37x) | 2008ms (4x)          |
-| medium   |       1 | 464ms (48x) | 4852ms (5x)          |
-| long     |       1 | 847ms (88x) | 18803ms (4x)         |
+| short    |       1 | 157ms (47x) | 1591ms (5x)          |
+| medium   |       1 | 380ms (59x) | 5224ms (4x)          |
+| long     |       1 | 756ms (98x) | 23719ms (3x)         |
 
 **ark-asr-3b** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 232ms (32x)  | 1300ms (6x)          |
-| medium   |       1 | 588ms (38x)  | 4285ms (5x)          |
-| long     |       1 | 648ms (115x) | 4196ms (18x)         |
+| short    |       1 | 189ms (39x)  | 2140ms (4x)          |
+| medium   |       1 | 547ms (41x)  | 4962ms (4x)          |
+| long     |       1 | 611ms (122x) | 4663ms (16x)         |
 
 **cohere-transcribe-03-2026** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 54ms (138x)  | 436ms (17x)          |
-| medium   |       1 | 160ms (139x) | 737ms (30x)          |
-| long     |       1 | 340ms (219x) | 1276ms (58x)         |
+| short    |       1 | 53ms (141x)  | 307ms (24x)          |
+| medium   |       1 | 157ms (142x) | 963ms (23x)          |
+| long     |       1 | 322ms (231x) | 1602ms (46x)         |
 <!-- BENCH:END -->
 
 ### Accuracy (Open ASR Leaderboard reproduction)
@@ -105,35 +106,35 @@ excluded, single RTX 5090.
 
 | model                      | engine             | voxpopuli   | ami   | earnings22   | gigaspeech   | librispeech_clean   | librispeech_other   | spgispeech   | avg   |
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|-------|
-| ark-asr-3b                 | starling           | 27.56%      | 5.27% | 9.28%        | 3.20%        | 6.01%               | 6.74%               | 2.39%        | 8.64% |
+| granite-speech-4.1-2b      | starling           | 7.47%       | 7.97% | 8.37%        | 5.21%        | 1.77%               | 2.35%               | 2.75%        | 5.13% |
+| granite-speech-4.1-2b      | stock transformers | 7.47%       | 8.02% | 8.44%        | 5.13%        | 1.77%               | 2.25%               | 2.90%        | 5.14% |
+| moss-transcribe-preview-2b | starling           | 3.81%       | 6.59% | 6.83%        | 4.36%        | 1.62%               | 2.72%               | 2.10%        | 4.00% |
+| moss-transcribe-preview-2b | stock transformers | 3.81%       | 6.17% | 6.68%        | 4.28%        | 1.62%               | 2.66%               | 2.10%        | 3.90% |
+| parakeet-tdt-0.6b-v3       | starling           | 9.69%       | 5.27% | 5.02%        | 3.76%        | 1.96%               | 2.84%               | 4.51%        | 4.72% |
+| parakeet-tdt-0.6b-v3       | stock transformers | 9.59%       | 5.44% | 5.02%        | 3.76%        | 1.96%               | 2.84%               | 4.24%        | 4.69% |
+| ark-asr-3b                 | starling           | 27.56%      | 5.27% | 8.98%        | 3.01%        | 6.14%               | 6.74%               | 2.39%        | 8.58% |
 | ark-asr-3b                 | stock transformers | 27.67%      | 5.10% | 9.13%        | 2.82%        | 6.14%               | 6.62%               | 2.39%        | 8.55% |
 | cohere-transcribe-03-2026  | starling           | 10.35%      | 6.31% | 8.59%        | 5.42%        | 1.47%               | 1.78%               | 2.50%        | 5.20% |
 | cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31% | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
-| granite-speech-4.1-2b      | starling           | 7.44%       | 7.97% | 8.41%        | 5.25%        | 1.77%               | 2.35%               | 2.85%        | 5.15% |
-| granite-speech-4.1-2b      | stock transformers | 7.47%       | 8.02% | 8.44%        | 5.13%        | 1.77%               | 2.25%               | 2.90%        | 5.14% |
-| moss-transcribe-preview-2b | starling           | 3.81%       | 6.40% | 6.72%        | 4.28%        | 1.59%               | 2.69%               | 2.15%        | 3.95% |
-| moss-transcribe-preview-2b | stock transformers | 3.81%       | 6.17% | 6.68%        | 4.28%        | 1.62%               | 2.66%               | 2.10%        | 3.90% |
-| parakeet-tdt-0.6b-v3       | starling           | 9.69%       | 5.27% | 5.18%        | 3.76%        | 1.96%               | 2.84%               | 4.51%        | 4.74% |
-| parakeet-tdt-0.6b-v3       | stock transformers | 9.59%       | 5.44% | 5.18%        | 3.76%        | 1.96%               | 2.84%               | 4.24%        | 4.72% |
-| qwen3-asr-1.7b             | starling           | 6.94%       | 7.31% | 8.19%        | 4.07%        | 1.80%               | 2.88%               | 2.80%        | 4.86% |
+| qwen3-asr-1.7b             | starling           | 6.94%       | 7.31% | 8.19%        | 4.07%        | 1.80%               | 2.85%               | 2.80%        | 4.85% |
 | qwen3-asr-1.7b             | stock transformers | 6.94%       | 7.45% | 8.30%        | 3.98%        | 1.80%               | 2.91%               | 2.75%        | 4.88% |
 
 **Open ASR Leaderboard — RTFx** (real audio_s / inference_s)
 
 | model                      | engine             | voxpopuli   | ami   | earnings22   | gigaspeech   | librispeech_clean   | librispeech_other   | spgispeech   |
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|
-| ark-asr-3b                 | starling           | 47x         | 28x   | 37x          | 26x          | 38x                 | 10x                 | 2x           |
-| ark-asr-3b                 | stock transformers | 9x          | 6x    | 1x           | 5x           | 6x                  | 6x                  | 6x           |
-| cohere-transcribe-03-2026  | starling           | 38x         | 21x   | 31x          | 28x          | 33x                 | 27x                 | 56x          |
-| cohere-transcribe-03-2026  | stock transformers | 32x         | 23x   | 31x          | 23x          | 26x                 | 26x                 | 26x          |
-| granite-speech-4.1-2b      | starling           | 49x         | 45x   | 50x          | 40x          | 46x                 | 41x                 | 43x          |
-| granite-speech-4.1-2b      | stock transformers | 5x          | 6x    | 6x           | 5x           | 5x                  | 5x                  | 5x           |
-| moss-transcribe-preview-2b | starling           | 46x         | 35x   | 49x          | 40x          | 53x                 | 48x                 | 53x          |
-| moss-transcribe-preview-2b | stock transformers | 6x          | 6x    | 5x           | 5x           | 6x                  | 5x                  | 6x           |
-| parakeet-tdt-0.6b-v3       | starling           | 9x          | 6x    | 12x          | 33x          | 87x                 | 120x                | 818x         |
-| parakeet-tdt-0.6b-v3       | stock transformers | 7x          | 11x   | 70x          | 53x          | 62x                 | 62x                 | 48x          |
-| qwen3-asr-1.7b             | starling           | 64x         | 49x   | 63x          | 48x          | 56x                 | 52x                 | 52x          |
-| qwen3-asr-1.7b             | stock transformers | 6x          | 6x    | 6x           | 4x           | 5x                  | 5x                  | 5x           |
+| granite-speech-4.1-2b      | starling           | 70x         | 67x   | 70x          | 58x          | 62x                 | 56x                 | 60x          |
+| granite-speech-4.1-2b      | stock transformers | 6x          | 6x    | 6x           | 5x           | 5x                  | 5x                  | 5x           |
+| moss-transcribe-preview-2b | starling           | 52x         | 38x   | 51x          | 41x          | 55x                 | 51x                 | 58x          |
+| moss-transcribe-preview-2b | stock transformers | 7x          | 6x    | 6x           | 6x           | 6x                  | 6x                  | 6x           |
+| parakeet-tdt-0.6b-v3       | starling           | 87x         | 46x   | 91x          | 51x          | 86x                 | 122x                | 750x         |
+| parakeet-tdt-0.6b-v3       | stock transformers | 56x         | 51x   | 72x          | 44x          | 60x                 | 46x                 | 45x          |
+| ark-asr-3b                 | starling           | 46x         | 29x   | 42x          | 28x          | 41x                 | 37x                 | 50x          |
+| ark-asr-3b                 | stock transformers | 9x          | 5x    | 6x           | 5x           | 6x                  | 5x                  | 5x           |
+| cohere-transcribe-03-2026  | starling           | 37x         | 24x   | 36x          | 27x          | 34x                 | 25x                 | 174x         |
+| cohere-transcribe-03-2026  | stock transformers | 31x         | 28x   | 31x          | 19x          | 29x                 | 22x                 | 26x          |
+| qwen3-asr-1.7b             | starling           | 46x         | 40x   | 54x          | 44x          | 51x                 | 48x                 | 75x          |
+| qwen3-asr-1.7b             | stock transformers | 6x          | 6x    | 6x           | 4x           | 5x                  | 4x                  | 4x           |
 <!-- BENCH:WER:END -->
 
 *Granite, moss, qwen3, cohere use 50 clips/dataset; parakeet and ark use 10

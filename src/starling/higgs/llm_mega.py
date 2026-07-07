@@ -29,12 +29,14 @@ Mirrors ``starling.granite.llm_mega``.  Key differences from granite:
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
 from .config import EOS_TOKEN_IDS
+from .vendor.modeling.utils import merge_input_ids_with_audio_features
 
 # ---------------------------------------------------------------------------
 # Result containers
@@ -130,6 +132,11 @@ class LLMMega:
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._captured = False
+        self._prefill_graphs: OrderedDict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph, torch.Tensor]
+        ] = OrderedDict()
+        self._prefill_masks: dict[int, torch.Tensor] = {}
+        self._max_prefill_graphs = 8
 
     # ------------------------------------------------------------------ #
     # internal helpers
@@ -202,35 +209,60 @@ class LLMMega:
         self.static_logits.copy_(logits)
 
     # ------------------------------------------------------------------ #
-    # prefill (eager -- runs the full model once to build the multimodal cache)
+    # prefill (eager audio/merge + graphed Qwen3 text prefill)
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
     def prefill(
         self,
         batch: dict[str, torch.Tensor],
+        *,
+        use_graph: bool = True,
     ) -> tuple[torch.Tensor, int]:
-        """Eager prefill: fill the StaticCache and return the first token id.
+        """Prefill the StaticCache and return the first token id.
 
-        Runs the full ``model.forward`` (encoder + projector + Qwen3 prefill) so
-        the audio features are injected and the cache is populated exactly as in
-        the reference ``generate``.  The StaticCache is used so the fixed-address
-        K/V tensors the graph will replay are the same ones prefill wrote.
+        The full upstream forward is not CUDA-graph-capturable because its
+        audio/text merge helper emits dynamic boolean-indexing kernels. We keep
+        the audio tower + merge eager, then graph only the Qwen3 prefill over the
+        merged ``inputs_embeds``. That is the launch-heavy part and is
+        token-equivalent to the full forward.
 
         Args:
             batch: the collated batch dict (input_ids, attention_mask,
                 audio_features, audio_feature_attention_mask) on cuda.
+            use_graph: use a shape-keyed CUDA graph for the Qwen3 prefill core.
 
         Returns:
             ``(first_token (1,1) int64, prefill_len)`` where ``prefill_len`` is
             the prompt length (the K/V cache fill level after prefill).
         """
-        T = batch["input_ids"].shape[1]
-        assert T < self.max_cache_len, (
-            f"prompt {T} >= max_cache_len {self.max_cache_len}"
-        )
-        # Always start from a clean cache so prefill/generate are idempotent
-        # and safe to call repeatedly (zeroing removes any stale K/V from a
-        # previous fixture's longer prompt).
+        if not use_graph:
+            return self._prefill_full_eager(batch)
+
+        inputs_embeds, position_ids = self._merge_batch_inputs(batch)
+        T = inputs_embeds.shape[1]
+        assert T < self.max_cache_len, f"prompt {T} >= max_cache_len {self.max_cache_len}"
+        entry = self._prefill_graphs.get(T)
+        if entry is None:
+            entry = self._capture_prefill(inputs_embeds, position_ids)
+            self._prefill_graphs[T] = entry
+            while len(self._prefill_graphs) > self._max_prefill_graphs:
+                _, old = self._prefill_graphs.popitem(last=False)
+                try:
+                    old[2].reset()
+                except Exception:
+                    pass
+        else:
+            self._prefill_graphs.move_to_end(T)
+        static_emb, static_pos, graph, out_tok = entry
+        static_emb.copy_(inputs_embeds)
+        static_pos.copy_(position_ids)
+        graph.replay()
+        return out_tok.clone(), T
+
+    def _prefill_full_eager(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, int]:
+        """Reference full-model prefill forward."""
         self._clear_cache()
         out = self.model(
             input_ids=batch["input_ids"],
@@ -246,6 +278,160 @@ class LLMMega:
         logits = out.logits[:, -1:, :]
         first_token = logits.float().argmax(dim=-1)  # (1, 1)
         return first_token, prefill_len
+
+    def _merge_batch_inputs(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the Higgs audio tower + text/audio merge eagerly."""
+        target_device = batch["input_ids"].device
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        inputs_embeds = self.model.embed_tokens(input_ids)
+
+        if self.model.config.skip_audio_tower:
+            audio_features_embed = audio_features_length = None
+        else:
+            audio_features = batch["audio_features"].to(target_device, dtype=torch.bfloat16)
+            audio_feature_attention_mask = batch["audio_feature_attention_mask"].to(target_device)
+            if self.model.encoder_backend == "whisper":
+                audio_features_embed, audio_features_length = self.model._apply_audio_tower_whisper(
+                    audio_features, audio_feature_attention_mask
+                )
+            elif self.model.encoder_backend == "xcodec":
+                audio_wv_lengths = batch.get("audio_wv_lengths")
+                audio_wv_lengths = (
+                    audio_wv_lengths.to(target_device) if audio_wv_lengths is not None else None
+                )
+                audio_features_embed, audio_features_length = self.model._apply_audio_tower_xcodec(
+                    audio_features, audio_wv_lengths
+                )
+            else:
+                raise ValueError(f"invalid encoder backend: {self.model.encoder_backend}")
+
+        if self.model.config.encode_audio_in_tokens:
+            audio_in_ids = batch.get("audio_in_ids")
+            if audio_in_ids is not None and audio_in_ids.shape[-1] > 0:
+                audio_in_ids = audio_in_ids.to(target_device)
+            else:
+                audio_in_ids = torch.zeros(
+                    (self.model.audio_num_codebooks, 0),
+                    device=target_device,
+                    dtype=torch.long,
+                )
+            audio_in_embed = self.model._embed_audio_ids(audio_in_ids)
+        else:
+            audio_in_embed = None
+
+        audio_out_ids = batch.get("audio_out_ids")
+        if audio_out_ids is not None and audio_out_ids.shape[-1] > 0:
+            audio_out_ids = audio_out_ids.to(target_device)
+        else:
+            audio_out_ids = torch.zeros(
+                (self.model.audio_num_codebooks, 0),
+                device=target_device,
+                dtype=torch.long,
+            )
+        audio_out_embed = self.model._embed_audio_ids(audio_out_ids)
+
+        empty_starts = torch.zeros((0,), device=target_device, dtype=torch.long)
+        audio_in_ids_start = batch.get("audio_in_ids_start")
+        if audio_in_ids_start is None:
+            audio_in_ids_start = empty_starts
+        else:
+            audio_in_ids_start = audio_in_ids_start.to(target_device)
+        audio_out_ids_start = batch.get("audio_out_ids_start")
+        if audio_out_ids_start is None:
+            audio_out_ids_start = empty_starts
+        else:
+            audio_out_ids_start = audio_out_ids_start.to(target_device)
+        label_ids = batch.get("label_ids")
+
+        merged = merge_input_ids_with_audio_features(
+            audio_features_embed,
+            audio_features_length,
+            audio_in_embed,
+            audio_in_ids_start,
+            audio_out_embed,
+            audio_out_ids_start,
+            self.model.audio_in_token_idx,
+            self.model.audio_out_token_idx,
+            inputs_embeds,
+            input_ids,
+            attention_mask,
+            label_ids,
+            pad_token_id=self.model.padding_idx,
+            round_to=1,
+            left_padding=True,
+        )
+        inputs_embeds, _attention_mask, _labels, position_ids = merged[:4]
+        return inputs_embeds, position_ids
+
+    def _prefill_mask(self, T: int) -> torch.Tensor:
+        """Graph-safe 4D causal mask for prefill over the StaticCache."""
+        m = self._prefill_masks.get(T)
+        if m is None:
+            ar = torch.arange(self.max_cache_len, device=self.device)
+            q = torch.arange(T, device=self.device).unsqueeze(1)
+            m = torch.where(
+                ar[None, None, None, :] <= q[None, None, :, :],
+                0.0,
+                self._neg_val,
+            ).to(self.dtype)
+            self._prefill_masks[T] = m
+        return m
+
+    def _prefill_core_eager(
+        self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Graph-safe Qwen3 prefill over already-merged embeddings."""
+        T = inputs_embeds.shape[1]
+        self._clear_cache()
+        hidden = inputs_embeds
+        causal_mask = self._prefill_mask(T)
+        cache_position = torch.arange(T, device=self.device)
+        position_embeddings = self._rotary(hidden, position_ids)
+        for layer in self._layers:
+            out = layer(
+                hidden,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=self.cache,
+                output_attentions=False,
+                use_cache=True,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            hidden = out[0] if isinstance(out, tuple) else out
+        hidden = self._final_norm(hidden)
+        logits = self._lm_head(hidden[:, -1:, :])
+        return logits.float().argmax(dim=-1)
+
+    @torch.inference_mode()
+    def _capture_prefill(
+        self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor
+    ):
+        """Capture a merged-prompt-length-specific Qwen3 prefill graph."""
+        device = inputs_embeds.device
+        static_emb = torch.empty_like(inputs_embeds)
+        static_pos = torch.empty_like(position_ids)
+        static_emb.copy_(inputs_embeds)
+        static_pos.copy_(position_ids)
+
+        def _run():
+            return self._prefill_core_eager(static_emb, static_pos)
+
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                _ = _run()
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out_tok = _run()
+        return static_emb, static_pos, graph, out_tok
 
     # ------------------------------------------------------------------ #
     # CUDA-graph capture of the decode step
@@ -304,11 +490,13 @@ class LLMMega:
         eos_token_ids=EOS_TOKEN_IDS,
         tokenizer: Any = None,
         capture: bool = True,
+        prefill_graph: bool = True,
     ) -> GenerateResult:
         """Greedy-generate ``max_new_tokens`` from a collated batch.
 
-        Prefill is eager (runs the full multimodal forward); the subsequent
-        ``max_new_tokens - 1`` decode steps are served by CUDA-graph replay.
+        Audio tower + merge are eager; the Qwen3 prefill core and the subsequent
+        ``max_new_tokens - 1`` decode steps are served by CUDA-graph replay when
+        ``prefill_graph``/``capture`` are enabled.
         """
         T = batch["input_ids"].shape[1]
         # The merged prompt can be longer than T (audio features expand the
@@ -318,7 +506,7 @@ class LLMMega:
             return self._finalize([], 0.0, tokenizer)
 
         # (1) prefill -> first token + real prompt length
-        first_token, T_eff = self.prefill(batch)
+        first_token, T_eff = self.prefill(batch, use_graph=prefill_graph)
         max_safe = self.max_cache_len - T_eff + 1
         if max_new_tokens > max_safe:
             raise ValueError(

@@ -245,6 +245,7 @@ class GraphedDecoder:
         self.cur_pos = torch.full((1,), T, dtype=torch.long, device=device)
         # output ring: step j writes its emitted token into column j
         self.output_ring = torch.zeros(B, K, dtype=torch.long, device=device)
+        self.output_ring_cpu = torch.empty(B, K, dtype=torch.long, pin_memory=True)
         self.pad_const = torch.full((B, 1), self.pad_token_id, dtype=torch.long, device=device)
         # STATIC encoder input buffers. The captured graph reads encoder_hidden_states
         # / encoder_attention_mask from these (NOT from call args, which a CUDA graph
@@ -413,7 +414,8 @@ class GraphedDecoder:
             self.cur_pos.fill_(base)
             self._set_self_cache_pos(base)
             self.graph.replay()
-            ring = self.output_ring.cpu()  # (B, K) — one sync per replay
+            self.output_ring_cpu.copy_(self.output_ring, non_blocking=False)
+            ring = self.output_ring_cpu  # (B, K) — one sync per replay
             for j in range(K):
                 col = ring[:, j]
                 emitted = torch.where(finished, self.pad_token_id, col)

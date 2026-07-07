@@ -89,8 +89,10 @@ class LeaderboardClip:
         return len(self.audio) / float(self.sample_rate)
 
 
-def _cache_dir(key: str, num_samples: Optional[int]) -> Path:
+def _cache_dir(key: str, num_samples: Optional[int], sample_offset: int = 0) -> Path:
     tag = "full" if not num_samples else f"n{num_samples}"
+    if sample_offset:
+        tag = f"{tag}_o{sample_offset}"
     return CACHE_DIR / f"{key}__{tag}"
 
 
@@ -116,14 +118,19 @@ def _serve_cached(d: Path) -> list[LeaderboardClip]:
 
 
 def load_dataset_split(
-    key: str, num_samples: Optional[int] = None, *, token: Optional[str] = None,
+    key: str,
+    num_samples: Optional[int] = None,
+    *,
+    token: Optional[str] = None,
+    sample_offset: int = 0,
 ) -> list[LeaderboardClip]:
     """Load (and cache) one dataset's clips.
 
     Args:
         key: short label in :data:`DATASETS` (e.g. ``"librispeech_clean"``).
-        num_samples: deterministic first-N cap (``0``/``None`` = full split).
+        num_samples: deterministic N cap (``0``/``None`` = full split).
         token: optional HF token for the (gated) dataset repo.
+        sample_offset: skip this many raw examples before taking ``num_samples``.
 
     Returns the cached/downloaded clips in dataset order. Empty-reference /
     ``ignore time segment`` clips are dropped *after* they are read, matching
@@ -139,7 +146,8 @@ def load_dataset_split(
         raise KeyError(f"unknown leaderboard dataset key {key!r}; "
                        f"choose from {[k for k, _, _ in DATASETS]}")
 
-    d = _cache_dir(key, num_samples)
+    sample_offset = max(0, int(sample_offset))
+    d = _cache_dir(key, num_samples, sample_offset)
     if _is_cached(d, num_samples):
         return _serve_cached(d)
 
@@ -158,12 +166,16 @@ def load_dataset_split(
     if cap is not None:
         ds = load_dataset(DATASET_PATH, config, split=split, streaming=True, token=token)
         ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+        if sample_offset:
+            ds = ds.skip(sample_offset)
         ds = ds.take(cap)
         iterator = ds
-        total_read = cap  # upper bound (actual may be fewer after filtering)
+        total_read = sample_offset + cap  # upper bound (actual may be fewer after filtering)
     else:
         ds = load_dataset(DATASET_PATH, config, split=split, token=token)
         ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+        if sample_offset:
+            ds = ds.select(range(sample_offset, len(ds)))
         iterator = ds
         total_read = len(ds)
 
@@ -197,6 +209,7 @@ def load_all(
     keys: Optional[list[str]] = None,
     *,
     token: Optional[str] = None,
+    sample_offset: int = 0,
 ) -> dict[str, list[LeaderboardClip]]:
     """Load every (or a subset of) dataset splits.
 
@@ -204,11 +217,17 @@ def load_all(
         num_samples: deterministic first-N cap per dataset (``0``/``None`` = full).
         keys: subset of :data:`DATASETS` keys; default = all 7.
         token: optional HF token.
+        sample_offset: skip this many raw examples before taking ``num_samples``.
 
     Returns ``{key: [LeaderboardClip, ...]}``.
     """
     keys = keys or [k for k, _, _ in DATASETS]
-    return {k: load_dataset_split(k, num_samples, token=token) for k in keys}
+    return {
+        k: load_dataset_split(
+            k, num_samples, token=token, sample_offset=sample_offset
+        )
+        for k in keys
+    }
 
 
 if __name__ == "__main__":

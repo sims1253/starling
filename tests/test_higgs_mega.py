@@ -31,6 +31,18 @@ import numpy as np
 import pytest
 import torch
 import soundfile as sf
+import transformers
+
+_TRANSFORMERS_VERSION = tuple(
+    int(part) for part in transformers.__version__.split("+", 1)[0].split(".")[:2]
+)
+if _TRANSFORMERS_VERSION != (4, 51):
+    pytest.skip(
+        "higgs tests require the isolated .venv-higgs transformers 4.51 env",
+        allow_module_level=True,
+    )
+if not torch.cuda.is_available():
+    pytest.skip("higgs tests require CUDA", allow_module_level=True)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MAIN_REPO = Path("/home/m0hawk/Documents/starling")
@@ -96,6 +108,17 @@ def test_single_step_byte_exact(name: str) -> None:
     assert res.ids[0].tolist() == golden["gen_ids"], (
         f"{name}: single-step decode diverged from golden"
     )
+
+
+def test_prefill_graph_matches_eager() -> None:
+    """The split graphed prefill returns the same first token/cache length."""
+    model, tok, coll = _load()
+    batch = _build_batch(coll, tok, _fixture_audio("short"))
+    llm = LLMMega(model, max_cache_len=2048)
+    eager_tok, eager_len = llm.prefill(batch, use_graph=False)
+    graph_tok, graph_len = llm.prefill(batch, use_graph=True)
+    assert graph_len == eager_len
+    assert torch.equal(graph_tok.cpu(), eager_tok.cpu())
 
 
 @pytest.mark.parametrize("name,k", [("short", 4), ("medium", 8), ("long", 16)])

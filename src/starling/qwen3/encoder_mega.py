@@ -88,6 +88,10 @@ class _WindowedAttn(nn.Module):
         self.scaling = float(stock_attn.scaling)
         self.num_windows = int(num_windows)
         self.window_size = int(window_size)
+        # Toggle the SDPA math-backend path (byte-exact same fp32 softmax over
+        # the same scores; fused into a single kernel instead of 4 launches +
+        # the (W, nh, ws, ws) scores/attn materialisation).
+        self.use_sdpa = False
 
     def forward(self, hidden_states: torch.Tensor, window_attn_mask: torch.Tensor) -> torch.Tensor:
         # hidden_states: (P, d_model) packed; reshape to (W, ws, d)
@@ -97,12 +101,29 @@ class _WindowedAttn(nn.Module):
         q = self.q_proj(h).view(W, ws, nh, hd).permute(0, 2, 1, 3)  # (W, nh, ws, hd)
         k = self.k_proj(h).view(W, ws, nh, hd).permute(0, 2, 1, 3)
         v = self.v_proj(h).view(W, ws, nh, hd).permute(0, 2, 1, 3)
-        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # (W, nh, ws, ws)
-        scores = scores + window_attn_mask  # (1, 1, ws, ws) or (W, nh, ws, ws) broadcast
-        attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
-        out = torch.matmul(attn, v)  # (W, nh, ws, hd)
+        if self.use_sdpa:
+            # window_attn_mask is additive (0 / finfo.min) and broadcasts over
+            # (W, nh, ws, ws); SDPA accepts the same additive float mask.
+            with torch.nn.attention.sdpa_kernel([
+                _sdpa_backend("MATH"),
+            ]):
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=window_attn_mask, is_causal=False,
+                    scale=self.scaling,
+                )  # (W, nh, ws, hd)
+        else:
+            scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling  # (W, nh, ws, ws)
+            scores = scores + window_attn_mask  # (1, 1, ws, ws) or (W, nh, ws, ws) broadcast
+            attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(v.dtype)
+            out = torch.matmul(attn, v)  # (W, nh, ws, hd)
         out = out.permute(0, 2, 1, 3).reshape(W * ws, nh * hd)
         return self.out_proj(out)
+
+
+def _sdpa_backend(name: str):
+    """Resolve an SDPBackend by name, tolerant to torch version drift."""
+    from torch.backends.cuda import SDPBackend
+    return getattr(SDPBackend, name)
 
 
 # =========================================================================== #
@@ -259,12 +280,16 @@ class GraphedEncoder:
     """
 
     def __init__(self, encoder, *, warmup_iters: int = 3, mode: str = "eager",
-                 max_cached_shapes: int = 8) -> None:
+                 max_cached_shapes: int = 8, sdpa_attention: bool = False) -> None:
         self.encoder = encoder
         self.n_window = int(encoder.n_window)
         self.chunk_len = self.n_window * 2
         self.warmup_iters = int(warmup_iters)
         self.mode = mode
+        # When True, captured WindowedAttention modules use SDPA's MATH backend
+        # (fused qk->softmax->sv) instead of the manual 4-launch recipe. Off by
+        # default; opt in for the A/B (see benchmarks/bench_qwen3_attn.py).
+        self.sdpa_attention = bool(sdpa_attention)
         self._static = StaticEncoder(encoder) if mode == "cudagraph" else None
         # Bound the per-shape graph cache. Each captured graph pins a private
         # CUDA memory pool, so unbounded growth across many clip lengths (a
@@ -291,6 +316,7 @@ class GraphedEncoder:
         windowed_layers = []
         for layer in self._static.layers:
             win_attn = _WindowedAttn(layer.self_attn, num_windows, window_size).to(device)
+            win_attn.use_sdpa = self.sdpa_attention
             windowed_layers.append((
                 layer.self_attn_layer_norm, layer.final_layer_norm, layer.self_attn,
                 layer.fc1, layer.fc2, layer.activation_fn, win_attn,

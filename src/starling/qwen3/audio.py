@@ -58,9 +58,19 @@ def build_inputs(
     """
     # apply_transcription_request accepts a raw 1-D numpy/tensor waveform.
     w = wav.squeeze(0).numpy() if wav.dim() == 2 else wav.numpy()
-    inputs = processor.apply_transcription_request(audio=w, language=language, sampling_rate=sr)
-    inputs = inputs.to("cuda")
-    # Mel features -> bf16 (model dtype). Token ids stay int64.
-    if "input_features" in inputs and inputs["input_features"].is_floating_point():
-        inputs["input_features"] = inputs["input_features"].bfloat16()
-    return inputs
+    inputs = processor.apply_transcription_request(
+        audio=w, language=language, processor_kwargs={"sampling_rate": sr}
+    )
+    # Move tensors field-by-field so mel features transfer as bf16 instead of
+    # first copying fp32 to CUDA and then casting on-device. Token ids/masks keep
+    # their original integer dtypes.
+    out = {}
+    for key, value in inputs.items():
+        if isinstance(value, torch.Tensor):
+            if key == "input_features" and value.is_floating_point():
+                out[key] = value.to(device="cuda", dtype=torch.bfloat16)
+            else:
+                out[key] = value.to(device="cuda")
+        else:
+            out[key] = value
+    return out

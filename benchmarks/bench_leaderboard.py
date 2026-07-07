@@ -51,6 +51,7 @@ START, END = "<!-- BENCH:WER:START -->", "<!-- BENCH:WER:END -->"
 MODEL_LABELS = {
     "granite": "granite-speech-4.1-2b",
     "parakeet": "parakeet-tdt-0.6b-v3",
+    "parakeet_unified": "parakeet-unified-en-0.6b",
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
     "ark": "ark-asr-3b",
@@ -227,6 +228,57 @@ def build_markdown(results: dict, *, models, engines) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
+def _aggregate_duplicate_records(results: dict) -> dict:
+    """Merge duplicate model/engine/dataset shards exactly from edit counts.
+
+    Per-dataset sharding is useful for CUDA-graph-heavy models whose shape cache
+    would otherwise accumulate across many clips. The shard JSONs carry
+    kaldialign edit counts plus total audio/inference seconds, so WER and RTFx
+    can be reconstructed exactly for duplicate cells.
+    """
+    buckets: dict[tuple[str, str, str], dict] = {}
+    passthrough: list[dict] = []
+    for rec in results["records"]:
+        key = (rec["model"], rec["engine"], rec["dataset"])
+        if {"ins", "dele", "sub", "ref_len", "audio_s", "infer_s"}.issubset(rec):
+            acc = buckets.setdefault(
+                key,
+                {
+                    "model": rec["model"],
+                    "engine": rec["engine"],
+                    "dataset": rec["dataset"],
+                    "n": 0,
+                    "ins": 0,
+                    "dele": 0,
+                    "sub": 0,
+                    "ref_len": 0,
+                    "audio_s": 0.0,
+                    "infer_s": 0.0,
+                },
+            )
+            acc["n"] += int(rec.get("n", 0))
+            acc["ins"] += int(rec["ins"])
+            acc["dele"] += int(rec["dele"])
+            acc["sub"] += int(rec["sub"])
+            acc["ref_len"] += int(rec["ref_len"])
+            acc["audio_s"] += float(rec["audio_s"])
+            acc["infer_s"] += float(rec["infer_s"])
+        else:
+            passthrough.append(rec)
+
+    merged_records = []
+    for rec in buckets.values():
+        edits = rec["ins"] + rec["dele"] + rec["sub"]
+        rec["wer_pct"] = round(100.0 * edits / rec["ref_len"], 2) if rec["ref_len"] else float("nan")
+        rec["rtfx"] = round(rec["audio_s"] / rec["infer_s"], 2) if rec["infer_s"] > 0 else float("inf")
+        rec["audio_s"] = round(rec["audio_s"], 1)
+        rec["infer_s"] = round(rec["infer_s"], 1)
+        merged_records.append(rec)
+    results = dict(results)
+    results["records"] = merged_records + passthrough
+    return results
+
+
 def splice_readme(md_body: str) -> bool:
     text = README.read_text()
     block = f"{START}\n{md_body}{END}"
@@ -263,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="comma list of dataset keys")
     ap.add_argument("--num-samples", type=int, default=50,
                     help="first-N clips per dataset (0 = full split)")
+    ap.add_argument("--sample-offset", type=int, default=0,
+                    help="skip this many raw clips before applying --num-samples")
     ap.add_argument("--warmup", type=int, default=2,
                     help="untimed warmup runs (graph capture) on the first clip")
     ap.add_argument("--update-readme", action="store_true",
@@ -303,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         if merged is None:
             print("[leaderboard] no valid JSON to merge; nothing to do.")
             return 1
+        merged = _aggregate_duplicate_records(merged)
         if skipped:
             print(f"[leaderboard] skipped {len(skipped)} unparseable/missing JSON(s):")
             for s in skipped:
@@ -319,8 +374,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     token = os.environ.get("HF_TOKEN")
-    print(f"[leaderboard] loading corpus (num_samples={n}) ...", flush=True)
-    corpus = lc.load_all(n, keys=dataset_keys, token=token)
+    sample_offset = max(0, int(args.sample_offset))
+    print(
+        f"[leaderboard] loading corpus (num_samples={n}, sample_offset={sample_offset}) ...",
+        flush=True,
+    )
+    corpus = lc.load_all(n, keys=dataset_keys, token=token, sample_offset=sample_offset)
     for k, clips in corpus.items():
         print(f"  {k:20s} {len(clips)} clips")
 

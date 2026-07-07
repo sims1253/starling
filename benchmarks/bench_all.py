@@ -17,13 +17,14 @@ Engines
   parakeet.cpp      mudler's C++/ggml parakeet-cli (parakeet only)
   starling-batched  starling with batched LLM decode (granite + qwen3 only)
   starling-spec     starling with self-speculative decode (granite only)
+  starling-compiled starling with non-byte-exact compiled encoder (parakeet only)
 
 Cells
 -----
   --lengths   short,medium,long   (the deterministic LibriSpeech fixtures)
   --batches   1,8                 (batch sizes; non-batched engines loop Bx1)
   --models    granite,parakeet,moss,ark,cohere[,qwen3,higgs]
-  --engines   starling,stock[,crispasr,parakeet.cpp,starling-batched,starling-spec]
+  --engines   starling,stock[,crispasr,parakeet.cpp,starling-batched,starling-spec,starling-compiled]
 
 Timing
 ------
@@ -63,6 +64,7 @@ START, END = "<!-- BENCH:START -->", "<!-- BENCH:END -->"
 MODEL_LABELS = {
     "granite": "granite-speech-4.1-2b",
     "parakeet": "parakeet-tdt-0.6b-v3",
+    "parakeet_unified": "parakeet-unified-en-0.6b",
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
     "ark": "ark-asr-3b",
@@ -409,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
                          "(granite,parakeet,moss,ark,cohere,qwen3,higgs; "
                          "qwen3/higgs are auto-gated on availability)")
     ap.add_argument("--engines", default="starling,stock",
-                    help="comma list of engine families: starling,stock,crispasr")
+                    help="comma list of engine families: starling,stock,crispasr,"
+                         "parakeet.cpp,starling-batched,starling-spec,"
+                         "starling-compiled")
     ap.add_argument("--lengths", default="short,medium,long",
                     help="comma list of fixture tiers")
     ap.add_argument("--batches", default="1,8", type=str,

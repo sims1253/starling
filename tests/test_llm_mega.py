@@ -99,6 +99,19 @@ def test_generate_transcript_matches_golden(mega):
     )
 
 
+def test_prefill_graph_matches_eager(mega):
+    """Shape-keyed graphed prefill must produce the same first token as eager."""
+    decoder, _ = mega
+    inputs_embeds = _golden_inputs_embeds()
+
+    eager = decoder.prefill(inputs_embeds, use_graph=False)
+    graphed = decoder.prefill(inputs_embeds, use_graph=True)
+
+    assert torch.equal(eager, graphed), (
+        f"prefill token mismatch: eager={eager.item()} graphed={graphed.item()}"
+    )
+
+
 @pytest.mark.slow
 def test_decode_is_faster_than_eager_baseline(mega):
     """Sanity: CUDA-graph decode should beat the ~17 tok/s eager baseline

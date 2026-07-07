@@ -37,7 +37,7 @@ class MossMegaPipeline:
         processor: Any,
         *,
         max_cache_len: int = 1024,
-        steps_per_replay: int = 16,
+        steps_per_replay: Optional[int] = None,
         use_multistep: bool = True,
         encoder_mode: str = "eager",
         compile_decode: bool = True,
@@ -45,6 +45,10 @@ class MossMegaPipeline:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
+        self.max_cache_len = int(max_cache_len)
+        self.steps_per_replay = steps_per_replay
+        self.use_multistep = bool(use_multistep)
+        self.compile_decode = bool(compile_decode)
 
         comps = get_components(model)
         self.fused_encoder = GraphedAudioEncoder(
@@ -55,27 +59,48 @@ class MossMegaPipeline:
         self.language_model = comps["language_model"]
 
         from .fused_decode import FusedMossLLMMega
-        from .llm_mega import MossLLMMega
         from .multistep import FusedMossMultiStepMega
 
+        self._multi_cls = FusedMossMultiStepMega
+        self._single_cls = FusedMossLLMMega
+        self._llms: dict[int, Any] = {}
         if use_multistep:
-            self.llm = FusedMossMultiStepMega(
-                comps["language_model"], comps["lm_head"],
-                max_cache_len=max_cache_len, steps_per_replay=steps_per_replay,
-                compile_decode=compile_decode,
-            )
+            self.llm = self._get_llm(0)
         else:
             self.llm = FusedMossLLMMega(
                 comps["language_model"], comps["lm_head"],
                 max_cache_len=max_cache_len, compile_decode=compile_decode,
             )
 
+    def _steps_for_shape(self, prompt_len: int) -> int:
+        """Select K from prompt length unless the caller forced it."""
+        if self.steps_per_replay is not None:
+            return max(1, int(self.steps_per_replay))
+        return 2 if prompt_len <= 160 else 4
+
+    def _get_llm(self, prompt_len: int):
+        if not self.use_multistep:
+            return self.llm
+        k = self._steps_for_shape(prompt_len)
+        llm = self._llms.get(k)
+        if llm is None:
+            llm = self._multi_cls(
+                self.language_model,
+                self.lm_head,
+                max_cache_len=self.max_cache_len,
+                steps_per_replay=k,
+                compile_decode=self.compile_decode,
+            )
+            self._llms[k] = llm
+        self.llm = llm
+        return llm
+
     @classmethod
     def from_pretrained(
         cls,
         *,
         max_cache_len: int = 1024,
-        steps_per_replay: int = 16,
+        steps_per_replay: Optional[int] = None,
         use_multistep: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
@@ -119,7 +144,8 @@ class MossMegaPipeline:
         # (2) merge into multimodal inputs_embeds (byte-exact vs stock)
         inputs_embeds = self.build_inputs_embeds(input_ids, audio_embeds, audio_input_mask)
         # (3) K-step graphed greedy generate
-        res = self.llm.generate(
+        llm = self._get_llm(int(inputs_embeds.shape[1]))
+        res = llm.generate(
             inputs_embeds, max_new_tokens=max_new_tokens, eos_token_id=LLM_EOS_TOKEN_ID
         )
         # (4) decode generated ids to text

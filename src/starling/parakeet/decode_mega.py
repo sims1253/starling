@@ -124,6 +124,7 @@ class GraphedDecoder:
         self.graph_pool = graph_pool  # shared torch.cuda.graph_pool_handle() or None
         self.dec = model.decoder
         self.joint = model.joint
+        self.dec.lstm.flatten_parameters()
         self.blank_id = int(cfg.blank_token_id)
         self.vocab_size = int(cfg.vocab_size)
         self.max_symbols = int(cfg.max_symbols_per_step)
@@ -158,14 +159,22 @@ class GraphedDecoder:
         self.cc_buf = torch.zeros((B, 1, self.hid), dtype=torch.bfloat16, device=device)
         self.ones_b = torch.ones((B,), dtype=torch.long, device=device)
         self.dur_table = torch.tensor(self.durations, device=device, dtype=torch.long)
-        self.output = torch.full((B, max_out), self.pad_id, dtype=torch.long, device=device)
+        # Host-side accumulation buffer. The CUDA graph writes only the K-step
+        # ring buffers; the host already syncs those rings to CPU after each
+        # replay for finish checks, so keeping the final output on CPU avoids a
+        # CPU->GPU scatter followed by another CPU copy for batch_decode.
+        self.output = torch.full((B, max_out), self.pad_id, dtype=torch.long)
         # K-step ring buffers: the captured graph writes one (token, post-step
         # cumulative frame_idx) pair per captured step into columns 0..K-1.
         # After each K-step replay the host does a SINGLE device->host sync of
         # both rings (stacked) and scatters the K tokens into self.output,
         # instead of syncing once per step.
-        self.output_ring = torch.zeros((B, K), dtype=torch.long, device=device)
-        self.frame_ring = torch.zeros((B, K), dtype=torch.long, device=device)
+        self.ring_pair = torch.zeros((2, B, K), dtype=torch.long, device=device)
+        self.output_ring = self.ring_pair[0]
+        self.frame_ring = self.ring_pair[1]
+        self.ring_pair_cpu = torch.empty((2, B, K), dtype=torch.long, pin_memory=True)
+        self.valid_lengths_cpu = torch.empty((B,), dtype=torch.long, pin_memory=True)
+        self.pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)
         # in-graph last_token chaining needs a device-side blank constant
         # (finished elements freeze: last_token <- blank). Pre-allocated + static
         # so the captured graph references a fixed address.
@@ -175,8 +184,8 @@ class GraphedDecoder:
         _mark_many([
             self.pooler, self.valid_lengths, self.frame_idx, self.last_token,
             self.arange_B, self.h_buf, self.c_buf, self.cc_buf,
-            self.ones_b, self.dur_table, self.output,
-            self.output_ring, self.frame_ring, self.blank_const,
+            self.ones_b, self.dur_table, self.ring_pair, self.output_ring,
+            self.frame_ring, self.blank_const,
         ])
 
     def _step_fn(self, ring_col: int = 0) -> None:
@@ -386,7 +395,7 @@ class GraphedDecoder:
 
         B = self._B
         tok0 = self._step0_eager()
-        self.output[:, 1] = tok0
+        self.output[:, 1] = tok0.cpu()
         self.last_token.copy_(tok0)
         out_step = 2
         finished = (self.frame_idx >= self.valid_lengths)
@@ -402,7 +411,8 @@ class GraphedDecoder:
         # computed vectorized at the end. ``valid_lengths_cpu`` is reused by the
         # replay loop's ``fin`` mask too, so it is hoisted here.
         if collect_meta:
-            valid_lengths_cpu = self.valid_lengths.cpu()          # (B,)
+            self.valid_lengths_cpu.copy_(self.valid_lengths, non_blocking=False)
+            valid_lengths_cpu = self.valid_lengths_cpu            # (B,)
             meta_tok_buf = torch.full(
                 (B, self.max_out), self.pad_id, dtype=torch.long
             )
@@ -418,8 +428,9 @@ class GraphedDecoder:
             # valid_lengths_cpu already hoisted when collect_meta; compute it
             # here only for the plain (non-meta) decode path.
             if not collect_meta:
-                valid_lengths_cpu = self.valid_lengths.cpu()          # (B,)
-            pad_cpu = torch.full((B,), self.pad_id, dtype=torch.long)  # (B,)
+                self.valid_lengths_cpu.copy_(self.valid_lengths, non_blocking=False)
+                valid_lengths_cpu = self.valid_lengths_cpu            # (B,)
+            pad_cpu = self.pad_cpu                                    # (B,)
             step = out_step
             while step < self.max_out:
                 # one K-step replay: output_ring / frame_ring are filled and
@@ -427,9 +438,8 @@ class GraphedDecoder:
                 self.graph.replay()
                 # ONE device->host sync for the whole K-step batch (the (2,B,K)
                 # stack of [tokens, post-step cumulative frame_idx]).
-                info = torch.stack(
-                    [self.output_ring, self.frame_ring], dim=0
-                ).cpu()                                          # (2, B, K)
+                self.ring_pair_cpu.copy_(self.ring_pair, non_blocking=False)
+                info = self.ring_pair_cpu                      # (2, B, K)
                 ring_cpu = info[0]                               # (B, K) tokens
                 fring_cpu = info[1]                              # (B, K) frame_idx
                 kk = min(K, self.max_out - step)

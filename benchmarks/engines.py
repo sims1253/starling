@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -322,6 +323,32 @@ class ParakeetStarling(Engine):
         return self.pipe.transcribe(audio_list)
 
 
+class ParakeetStarlingCompiled(Engine):
+    """starling pipeline with the non-byte-exact compiled Parakeet encoder.
+
+    This keeps the default ``starling`` engine on the byte-exact graphed encoder,
+    while exposing the faster BN-fold + torch.compile encoder mode to the unified
+    benchmark. Correctness is transcript/WER-gated by the benchmark harness.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling compiled", "parakeet", supports_batch=True)
+
+    def _load(self) -> None:
+        from starling.parakeet.pipeline import MegaParakeetPipeline
+
+        self.pipe = MegaParakeetPipeline(encoder_mode="compiled")
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.pipe.transcribe([audio])[0]
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        return self.pipe.transcribe(audio_list)
+
+
 class ParakeetStock(Engine):
     """Stock ``AutoModelForTDT.generate`` reference (BaselineRunner)."""
 
@@ -338,6 +365,58 @@ class ParakeetStock(Engine):
 
     def _run_one(self, audio: np.ndarray) -> str:
         return self.runner.transcribe_batch([audio])[0]
+
+
+# ====================================================================== #
+# parakeet-unified-en-0.6b (NeMo-free FastConformer-RNN-T port)
+# ====================================================================== #
+class ParakeetUnifiedStarling(Engine):
+    """starling GPU megakernel pipeline (GPU mel + graphed encoder + graphed RNNT)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "parakeet_unified", supports_batch=True)
+
+    def _load(self) -> None:
+        from starling.parakeet_unified.pipeline import MegaParakeetUnifiedPipeline
+
+        self.pipe = MegaParakeetUnifiedPipeline()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.pipe.transcribe([audio])[0]
+
+    def _run_batch(self, audio_list: list[np.ndarray]) -> list[str]:
+        return self.pipe.transcribe(audio_list)
+
+
+class ParakeetUnifiedStock(Engine):
+    """Eager reference (fp32 mel + eager Conformer + eager greedy RNN-T decode).
+
+    There is no upstream "stock" path for this model (NeMo is not installable
+    alongside the pinned torch; see ``scripts/parakeet_unified_golden.py``), so
+    the eager port itself is the baseline. Uses ``encoder_mode="eager"`` +
+    fp32 to isolate the megakernel's graphing + dtype wins.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("eager port", "parakeet_unified", supports_batch=False)
+
+    def _load(self) -> None:
+        import torch
+
+        from starling.parakeet_unified.pipeline import MegaParakeetUnifiedPipeline
+
+        self.pipe = MegaParakeetUnifiedPipeline(
+            dtype=torch.float32, encoder_mode="eager"
+        )
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self.pipe.transcribe([audio])[0]
 
 
 # ====================================================================== #
@@ -860,15 +939,18 @@ def _qwen3_on_master() -> bool:
 
 
 def _higgs_available() -> bool:
-    """True iff the isolated ``.venv-higgs`` is present.
+    """True iff the current process is running inside the Higgs venv.
 
     ``starling.higgs`` imports cleanly in the main venv (heavy modelling is
     lazy), but its ``trust_remote_code`` modelling only *runs* under
-    ``transformers==4.51`` (the isolated ``.venv-higgs``). Gate the engine keys
-    on the venv existing so a main-venv ``bench_all`` sweep silently skips
-    higgs instead of crashing inside ``_load``.
+    ``transformers==4.51`` (the isolated ``.venv-higgs``). The venv may exist
+    while ``bench_all`` is running under the main project environment, so gate
+    on the active interpreter rather than existence alone.
     """
-    return (REPO_ROOT / ".venv-higgs" / "bin" / "python").exists()
+    try:
+        return Path(sys.prefix).resolve() == (REPO_ROOT / ".venv-higgs").resolve()
+    except OSError:
+        return False
 
 
 # (engine_key, factory, requires_extra)
@@ -877,7 +959,10 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "starling-granite": GraniteStarling,
     "stock-granite": GraniteStock,
     "starling-parakeet": ParakeetStarling,
+    "starling-compiled-parakeet": ParakeetStarlingCompiled,
     "stock-parakeet": ParakeetStock,
+    "starling-parakeet_unified": ParakeetUnifiedStarling,
+    "stock-parakeet_unified": ParakeetUnifiedStock,
     "starling-moss": MossStarling,
     "stock-moss": MossStock,
     "starling-ark": ArkStarling,

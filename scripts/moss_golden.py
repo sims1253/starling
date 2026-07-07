@@ -58,7 +58,7 @@ def main() -> int:
             emb = build_inputs_embeds(
                 model, inp["input_ids"], feats, inp["audio_input_mask"]
             )
-            ids = greedy_generate(model, emb, max_new_tokens=200)
+            ids = greedy_generate(model, emb, max_new_tokens=200, max_cache_len=2048)
         torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) * 1000.0
         text = proc.tokenizer.decode(ids[0], skip_special_tokens=True)

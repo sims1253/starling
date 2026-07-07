@@ -34,6 +34,7 @@ Qwen3 vs Granite decode differences
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -131,6 +132,9 @@ class LLMMega:
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._captured = False
+        self._prefill_graphs: OrderedDict[int, tuple[torch.Tensor, torch.cuda.CUDAGraph, torch.Tensor]] = OrderedDict()
+        self._prefill_masks: dict[int, torch.Tensor] = {}
+        self._max_prefill_graphs = 8
 
     # ------------------------------------------------------------------ #
     # internal helpers
@@ -159,21 +163,87 @@ class LLMMega:
     # prefill
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
-    def prefill(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+    def prefill(self, inputs_embeds: torch.Tensor, *, use_graph: bool = True) -> torch.Tensor:
         """Eager prefill: fill the StaticCache, return the first token id."""
         T = inputs_embeds.shape[1]
         assert T < self.max_cache_len, f"prompt {T} >= max_cache_len {self.max_cache_len}"
+        if use_graph:
+            entry = self._prefill_graphs.get(T)
+            if entry is None:
+                entry = self._capture_prefill(inputs_embeds)
+                self._prefill_graphs[T] = entry
+                while len(self._prefill_graphs) > self._max_prefill_graphs:
+                    _, old = self._prefill_graphs.popitem(last=False)
+                    try:
+                        old[1].reset()
+                    except Exception:
+                        pass
+            else:
+                self._prefill_graphs.move_to_end(T)
+            static_emb, graph, out_tok = entry
+            static_emb.copy_(inputs_embeds)
+            self._reset_cache_pos(0)
+            graph.replay()
+            return out_tok.clone()
+
+        return self._prefill_eager(inputs_embeds)
+
+    def _prefill_eager(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        """Reference prefill forward."""
+        T = inputs_embeds.shape[1]
         self._reset_cache_pos(0)
         position_ids = torch.arange(T, device=self.device).unsqueeze(0)
         out = self.lm(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            attention_mask=self._prefill_mask(T),
             past_key_values=self.cache,
             use_cache=True,
         )
         hidden = out.last_hidden_state[:, -1:, :]
         logits = self.lm_head(hidden)
         return logits.argmax(dim=-1)  # (1, 1)
+
+    def _prefill_mask(self, T: int) -> torch.Tensor:
+        """Graph-safe 4D causal mask for prefill over a StaticCache."""
+        m = self._prefill_masks.get(T)
+        if m is None:
+            neg = self._neg_val
+            ar = torch.arange(self.max_cache_len, device=self.device)
+            q = torch.arange(T, device=self.device).unsqueeze(1)
+            m = torch.where(
+                ar[None, None, None, :] <= q[None, None, :, :],
+                0.0,
+                neg,
+            ).to(self.dtype)
+            self._prefill_masks[T] = m
+        return m
+
+    @torch.inference_mode()
+    def _capture_prefill(self, inputs_embeds: torch.Tensor):
+        """Capture a prompt-length-specific prefill CUDA graph."""
+        device = inputs_embeds.device
+        static_emb = torch.empty_like(inputs_embeds)
+        static_emb.copy_(inputs_embeds)
+
+        def _run():
+            self._reset_cache_pos(0)
+            return self._prefill_eager(static_emb)
+
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                _ = _run()
+        torch.cuda.current_stream(device).wait_stream(side)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        self._reset_cache_pos(0)
+        with torch.cuda.graph(graph):
+            out_tok = _run()
+        self._reset_cache_pos(0)
+        return static_emb, graph, out_tok
 
     # ------------------------------------------------------------------ #
     # CUDA-graph capture of the decode step
@@ -351,8 +421,11 @@ class FusedLLMMega(LLMMega):
         super().__init__(*args, **kwargs)
         # Reuse the shared, model-agnostic Triton kernels from the granite track.
         from ..granite import llm_kernels as _k
+        from ..attention import gqa_attention as _gqa_attention
+        from ..flags import get_default_flags
 
         self._k = _k
+        self._gqa_attention = _gqa_attention
         self._layers = list(self.lm.layers)
         self._embed = self.lm.embed_tokens
         self._final_norm = self.lm.norm
@@ -364,6 +437,29 @@ class FusedLLMMega(LLMMega):
         self._n_kv_groups = self._n_q_heads // self._n_kv_heads
         self._attn_scale = float(self._head_dim ** -0.5)
         self._rms_eps = float(getattr(cfg, "rms_norm_eps", LLM_RMS_NORM_EPS))
+        self._intermediate = int(cfg.intermediate_size)
+        self._flags = get_default_flags()
+        self._fused: Optional[list[dict]] = None
+        if self._flags.fused_qkv:
+            self._fused = self._fuse_layer_weights()
+
+    def _fuse_layer_weights(self) -> list[dict]:
+        """Pre-concatenate QKV and gate/up weights per layer (byte-exact)."""
+        fused = []
+        for layer in self._layers:
+            sa = layer.self_attn
+            mlp = layer.mlp
+            qkv_w = torch.cat(
+                [sa.q_proj.weight, sa.k_proj.weight, sa.v_proj.weight], dim=0
+            )
+            gu_w = torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0)
+            fused.append({
+                "qkv_w": qkv_w.contiguous(),
+                "gu_w": gu_w.contiguous(),
+                "o_proj": sa.o_proj,
+                "down_proj": mlp.down_proj,
+            })
+        return fused
 
     def _decode_step_eager(self) -> None:
         """Custom single-token decode forward with fused Triton kernels.
@@ -376,6 +472,10 @@ class FusedLLMMega(LLMMega):
         n_q = self._n_q_heads
         n_kv = self._n_kv_heads
         half = hd // 2
+        qkv_split = [n_q * hd, n_kv * hd, n_kv * hd]
+        inter = self._intermediate
+        flags = self._flags
+        fused = self._fused
 
         # (1) embedding lookup (NO multiplier for Qwen3)
         hidden = self._embed(self.static_input_ids)  # (1, 1, 2048)
@@ -386,7 +486,7 @@ class FusedLLMMega(LLMMega):
         sin4 = sin.unsqueeze(1)
 
         # (3) iterate layers
-        for layer in self._layers:
+        for idx, layer in enumerate(self._layers):
             sa = layer.self_attn
             mlp = layer.mlp
 
@@ -394,10 +494,23 @@ class FusedLLMMega(LLMMega):
             residual = hidden
             normed = k.fused_rmsnorm(hidden, layer.input_layernorm.weight, self._rms_eps)
 
-            # Qwen3 applies QK-norm (RMSNorm over head_dim) to q/k BEFORE RoPE.
-            q = sa.q_proj(normed).view(1, 1, n_q, hd)
-            kv = sa.k_proj(normed).view(1, 1, n_kv, hd)
-            v = sa.v_proj(normed).view(1, 1, n_kv, hd)
+            # Q/K/V projections: fused GEMM (byte-exact) or the model's own.
+            # Qwen3 applies QK-norm (RMSNorm over head_dim) to q/k BEFORE RoPE,
+            # so split then norm regardless of which projection path ran.
+            if fused is not None:
+                f = fused[idx]
+                x2 = normed.view(1, -1)
+                qkv = torch.nn.functional.linear(x2, f["qkv_w"], None).view(-1)
+                q, kv, v = qkv.split(qkv_split, dim=0)
+                q = q.view(1, 1, n_q, hd)
+                kv = kv.view(1, 1, n_kv, hd)
+                v = v.view(1, 1, n_kv, hd)
+                o_proj = f["o_proj"]
+            else:
+                q = sa.q_proj(normed).view(1, 1, n_q, hd)
+                kv = sa.k_proj(normed).view(1, 1, n_kv, hd)
+                v = sa.v_proj(normed).view(1, 1, n_kv, hd)
+                o_proj = sa.o_proj
             q = k.fused_rmsnorm(q, sa.q_norm.weight, self._rms_eps)
             kv = k.fused_rmsnorm(kv, sa.k_norm.weight, self._rms_eps)
             q = q.transpose(1, 2)    # (1, n_q, 1, hd)
@@ -412,16 +525,12 @@ class FusedLLMMega(LLMMega):
 
             kv, v = self.cache.update(kv, v, layer.self_attn.layer_idx)
 
-            kv_r = _repeat_kv(kv, self._n_kv_groups)
-            v_r = _repeat_kv(v, self._n_kv_groups)
-
-            scores = torch.matmul(q, kv_r.transpose(2, 3)) * self._attn_scale
-            scores = scores + self.static_attn_mask
-            attn = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(self.dtype)
-            attn_out = torch.matmul(attn, v_r)
+            attn_out = self._gqa_attention(
+                q, kv, v, self.static_attn_mask, self._attn_scale, self.dtype, flags
+            )
 
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, n_q * hd)
-            attn_out = sa.o_proj(attn_out)
+            attn_out = o_proj(attn_out)
 
             # fused residual add (alpha = 1.0 for Qwen3)
             hidden = k.fused_residual_scale(residual, attn_out, 1.0)
@@ -429,10 +538,19 @@ class FusedLLMMega(LLMMega):
             # --- MLP block ---
             residual = hidden
             normed = k.fused_rmsnorm(hidden, layer.post_attention_layernorm.weight, self._rms_eps)
-            gate = mlp.gate_proj(normed)
-            up = mlp.up_proj(normed)
+            if fused is not None:
+                x3 = normed.view(1, -1)
+                gu = torch.nn.functional.linear(x3, f["gu_w"], None).view(-1)
+                gate, up = gu.split([inter, inter], dim=0)
+                gate = gate.view(1, 1, inter)
+                up = up.view(1, 1, inter)
+                down_proj = f["down_proj"]
+            else:
+                gate = mlp.gate_proj(normed)
+                up = mlp.up_proj(normed)
+                down_proj = mlp.down_proj
             act = k.fused_silu_mul(gate, up)
-            mlp_out = mlp.down_proj(act)
+            mlp_out = down_proj(act)
             hidden = k.fused_residual_scale(residual, mlp_out, 1.0)
 
         # (4) final fused RMSNorm + lm_head (NO logits scaling for Qwen3)

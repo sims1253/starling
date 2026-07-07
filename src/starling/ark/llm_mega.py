@@ -369,15 +369,11 @@ class LLMMega:
                     past_key_values=self.cache,
                     use_cache=True,
                 )
-            # Clone the prefill output OUT of the graph's private memory pool.
-            # ``out.last_hidden_state`` was allocated inside ``with
-            # torch.cuda.graph(graph)``, so it lives in the graph's private pool.
-            # When a later prompt length evicts this graph (``_free_prefill_graph``
-            # -> ``del graph; empty_cache()``), that pool is freed and any tensor
-            # still referencing it becomes a dangling pointer -> reading it raises
-            # ``cudaErrorIllegalAddress``. Cloning to a fresh tensor owned by the
-            # default allocator detaches it from the pool, so eviction is safe.
-            self._prefill_static_out[T] = out.last_hidden_state.clone()
+            # Keep the graph-owned output tensor itself. CUDA graph replay
+            # mutates tensors allocated during capture in-place; cloning here
+            # would freeze the capture-time output and every later replay would
+            # read a stale hidden state.
+            self._prefill_static_out[T] = out.last_hidden_state
             self._prefill_graphs[T] = graph  # appended at the MRU tail
             # Reset so the first real replay starts from a clean cache.
             self._reset_cache_pos(0)
