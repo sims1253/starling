@@ -251,9 +251,9 @@ def merge_input_ids_with_audio_features(
 
     if audio_features_embed is not None:
         num_audios, max_audio_tokens, _ = audio_features_embed.shape
-        audio_in_features_mask = torch.arange(max_audio_tokens).expand(num_audios, max_audio_tokens).to(
-            audio_features_length.device
-        ) < audio_features_length.unsqueeze(1)
+        audio_in_features_mask = torch.arange(
+            max_audio_tokens, device=audio_features_length.device
+        ).expand(num_audios, max_audio_tokens) < audio_features_length.unsqueeze(1)
         masked_audio_in_features = audio_features_embed[audio_in_features_mask].view(-1, embed_dim)
         token_placeholder_num[audio_in_token_mask] = audio_features_length.long()
 
@@ -909,4 +909,3 @@ def log_grouped_lrs(accelerator, optimizer, step, plan):
     # overall weighted LR
     overall = sum(pg["lr"] * plan["group_numel"][i] for i, pg in enumerate(optimizer.param_groups)) / (plan["total"] or 1)
     accelerator.log({"train/lr_weighted": overall}, step=step)
-

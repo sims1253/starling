@@ -17,7 +17,8 @@ Public API
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from collections import OrderedDict
+from typing import Any
 
 import torch
 
@@ -35,34 +36,38 @@ class CohereMegaPipeline:
         processor: Any,
         *,
         max_cache_len: int = 1024,
-        steps_per_replay: int = 16,
+        steps_per_replay: int | None = None,
         warmup_iters: int = 4,
         encoder_warmup_iters: int = 3,
         use_graphed_encoder: bool = True,
+        max_cached_shapes: int = 8,
     ) -> None:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
+        self.max_cache_len = int(max_cache_len)
+        self.warmup_iters = int(warmup_iters)
+        self.max_cached_shapes = int(max_cached_shapes)
 
         self.encoder = GraphedEncoder(
             model.model.encoder, warmup_iters=encoder_warmup_iters
         ) if use_graphed_encoder else None
 
-        self.decoder = GraphedDecoder(
-            model,
-            max_cache_len=max_cache_len,
-            steps_per_replay=steps_per_replay,
-            warmup_iters=warmup_iters,
-        )
-        # captured graph is (B, prompt_len, S)-specific; re-capture on any change
-        self._captured_key: Optional[tuple] = None
+        self.steps_per_replay = steps_per_replay
+        # Captured decoder graphs are keyed by (B, prompt_len, encoder_len, K).
+        # Reusing them matters for mixed-shape serving and repeated short/medium
+        # alternation; the previous single decoder re-captured on every shape
+        # switch. ``self.decoder`` remains the most recently used decoder for
+        # compatibility with benchmark/debug callers.
+        self._decoders: OrderedDict[tuple[int, int, int, int], GraphedDecoder] = OrderedDict()
+        self.decoder = self._new_decoder(self._steps_for_shape(0))
 
     @classmethod
     def from_pretrained(
         cls,
         *,
         max_cache_len: int = 1024,
-        steps_per_replay: int = 8,
+        steps_per_replay: int | None = None,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         **kwargs: Any,
@@ -85,13 +90,47 @@ class CohereMegaPipeline:
                 input_features=input_features, attention_mask=attention_mask
             ).last_hidden_state
 
-    def _ensure_capture(self, dec_in: torch.Tensor, enc_h: torch.Tensor, enc_mask: torch.Tensor) -> None:
+    def _new_decoder(self, steps_per_replay: int) -> GraphedDecoder:
+        return GraphedDecoder(
+            self.model,
+            max_cache_len=self.max_cache_len,
+            steps_per_replay=steps_per_replay,
+            warmup_iters=self.warmup_iters,
+        )
+
+    def _get_decoder(self, dec_in: torch.Tensor, enc_h: torch.Tensor, enc_mask: torch.Tensor) -> GraphedDecoder:
         B, T = dec_in.shape
         S = enc_h.shape[1]
-        key = (B, T, S)
-        if self._captured_key != key:
-            self.decoder.capture(dec_in, enc_h, enc_mask)
-            self._captured_key = key
+        K = self._steps_for_shape(S)
+        key = (B, T, S, K)
+        decoder = self._decoders.get(key)
+        if decoder is None:
+            decoder = self._new_decoder(K)
+            decoder.capture(dec_in, enc_h, enc_mask)
+            self._decoders[key] = decoder
+            while len(self._decoders) > self.max_cached_shapes:
+                _, old = self._decoders.popitem(last=False)
+                graph = getattr(old, "graph", None)
+                if graph is not None:
+                    try:
+                        graph.reset()
+                    except Exception:
+                        pass
+        else:
+            self._decoders.move_to_end(key)
+        self.decoder = decoder
+        return decoder
+
+    def _steps_for_shape(self, encoder_len: int) -> int:
+        """Replay chunk size for this encoder length.
+
+        RTX 5090 sweep on 2026-07-06: short fixture (S=93) prefers K=32;
+        medium fixture (S=279) prefers K=8. Explicit constructor values still
+        override this auto policy.
+        """
+        if self.steps_per_replay is not None:
+            return max(1, int(self.steps_per_replay))
+        return 32 if int(encoder_len) and int(encoder_len) <= 128 else 8
 
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
@@ -130,8 +169,8 @@ class CohereMegaPipeline:
         neg = torch.finfo(self.dtype).min
         enc_mask = torch.zeros(B, 1, 1, S, device=enc_h.device, dtype=enc_h.dtype)
 
-        self._ensure_capture(dec_in, enc_h, enc_mask)
-        ids = self.decoder.decode(dec_in, enc_h, enc_mask, max_new_tokens=max_new_tokens)
+        decoder = self._get_decoder(dec_in, enc_h, enc_mask)
+        ids = decoder.decode(dec_in, enc_h, enc_mask, max_new_tokens=max_new_tokens)
 
         # decode text: full sequence = prompt + generated, per row
         full = torch.cat([dec_in.cpu().expand(ids.shape[0], -1), ids.cpu()], dim=1)

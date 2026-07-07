@@ -63,7 +63,12 @@ def main() -> int:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare-eager", action="store_true", help="also run stock eager")
-    ap.add_argument("--K", type=int, default=16, help="multistep steps per replay")
+    ap.add_argument(
+        "--K",
+        type=int,
+        default=None,
+        help="force multistep steps per replay; default auto-selects by prompt length",
+    )
     args = ap.parse_args()
 
     print("[bench] loading model ...")
@@ -97,10 +102,6 @@ def main() -> int:
         # ---- per-stage steady-state timing (CUDA events) ----
         # Use a SEPARATE compiled decoder for stage probing so the pipeline's
         # own decoder (used for the timed transcribe below) is undisturbed.
-        probe = FusedMossMultiStepMega(
-            inner.language_model, model.lm_head, max_cache_len=2048,
-            steps_per_replay=args.K, compile_decode=True,
-        )
         with torch.inference_mode():
             enc_ms = _cuda_timer(
                 lambda: enc(inp["audio_data"], inp["audio_data_seqlens"]), iters=8
@@ -116,6 +117,11 @@ def main() -> int:
                 model, inp["input_ids"], feats, inp["audio_input_mask"]
             )
             T = emb.shape[1]
+            k_for_shape = pipe._steps_for_shape(int(T))
+            probe = FusedMossMultiStepMega(
+                inner.language_model, model.lm_head, max_cache_len=2048,
+                steps_per_replay=k_for_shape, compile_decode=True,
+            )
             probe._reset_cache_pos(0)
             ft = probe.prefill(emb)
             probe.capture(ft, T)
@@ -128,6 +134,9 @@ def main() -> int:
             replay_ms = _cuda_timer(_k, iters=15)
             decode_ms_per_tok = replay_ms / probe.K
         del probe
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # ---- full wall-clock transcribe (capture excluded) ----
         torch.cuda.synchronize()
@@ -145,6 +154,7 @@ def main() -> int:
         row = {
             "seconds": round(seconds, 2),
             "tokens": r_n,
+            "K": int(k_for_shape),
             "total_ms": round(total_ms, 1),
             "rtfx": round(rtfx, 1),
             "ms_per_tok": round(total_ms / max(r_n, 1), 2),
@@ -173,7 +183,7 @@ def main() -> int:
             row["speedup_vs_eager"] = round(eager_ms / total_ms, 1)
 
         results[name] = row
-        print(f"\n[bench] {name}: {seconds:.1f}s, {r_n} tokens")
+        print(f"\n[bench] {name}: {seconds:.1f}s, {r_n} tokens, K={k_for_shape}")
         print(f"  total {total_ms:.0f}ms  RTFx {rtfx:.0f}x  ({total_ms/r_n:.2f}ms/tok)")
         print(f"  stages: encoder {enc_ms:.0f}ms  merge {merge_ms:.1f}ms  "
               f"decode {decode_ms_per_tok:.3f}ms/tok ({row['decode_tok_per_s']:.0f} tok/s)")

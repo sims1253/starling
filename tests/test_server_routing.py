@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,16 +31,20 @@ from starling.server import (  # noqa: E402
     HiggsBackend,
     MossBackend,
     ParakeetBackend,
+    ParakeetUnifiedBackend,
     Qwen3Backend,
+    SAMPLE_RATE,
     ServerConfig,
     StarlingServer,
+    create_app,
     get_backend,
 )
 
 
 def test_model_slugs_are_the_supported_set() -> None:
     assert set(MODEL_SLUGS) == {
-        "granite", "parakeet", "moss", "qwen3", "ark", "cohere", "higgs",
+        "granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark",
+        "cohere", "higgs",
     }
 
 
@@ -47,6 +52,7 @@ def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
     cfg = ServerConfig()
     assert isinstance(get_backend("granite", cfg), GraniteBackend)
     assert isinstance(get_backend("parakeet", cfg), ParakeetBackend)
+    assert isinstance(get_backend("parakeet_unified", cfg), ParakeetUnifiedBackend)
     assert isinstance(get_backend("moss", cfg), MossBackend)
     assert isinstance(get_backend("qwen3", cfg), Qwen3Backend)
     assert isinstance(get_backend("ark", cfg), ArkBackend)
@@ -92,3 +98,48 @@ def test_cli_arg_parser_rejects_unknown_model() -> None:
     parser = _build_arg_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["--model", "nope"])
+
+
+def test_parakeet_unified_long_audio_uses_chunker() -> None:
+    class _Pipe:
+        tokenizer = object()
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe(self, audio_list):  # noqa: ANN001
+            self.calls += 1
+            return ["one-shot"]
+
+    class _Chunker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe(self, audio, sr=SAMPLE_RATE):  # noqa: ANN001
+            self.calls += 1
+            assert sr == SAMPLE_RATE
+            return "chunked"
+
+    backend = ParakeetUnifiedBackend(ServerConfig(max_chunk_seconds=1.0))
+    pipe = _Pipe()
+    chunker = _Chunker()
+    backend.pipe = pipe
+    backend.chunker = chunker
+
+    short = backend.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32))
+    long = backend.transcribe(np.zeros(SAMPLE_RATE * 2, dtype=np.float32))
+
+    assert short.text == "one-shot"
+    assert long.text == "chunked"
+    assert pipe.calls == 1
+    assert chunker.calls == 1
+
+
+def test_create_app_reuses_existing_server_without_startup_load() -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("uvicorn")
+
+    server = StarlingServer(config=ServerConfig(model="granite"))
+    app = create_app(server=server, load_on_startup=False)
+
+    assert app.state.starling_server is server

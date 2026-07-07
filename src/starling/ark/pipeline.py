@@ -24,14 +24,14 @@ exactly.
 
 Public API
 ----------
-``MegaPipeline(model, processor, *, steps_per_replay=8, max_cache_len=4096)``
+``MegaPipeline(model, processor, *, steps_per_replay=None, max_cache_len=4096)``
 ``MegaPipeline.from_pretrained(...)``
 ``MegaPipeline.transcribe(audio_path_or_array, instruction=..., max_new_tokens=200) -> (text, token_ids)``
 """
 
 from __future__ import annotations
 
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -57,10 +57,9 @@ class MegaPipeline:
         Selects the CUDA-graphed encoder (``"cudagraph"``, the byte-exact,
         zero-launch-overhead default). Kept as an API hook for a future eager
         A/B path; currently only ``"cudagraph"`` is implemented.
-    steps_per_replay : int
-        K -- number of decode steps captured per CUDA-graph replay (forwarded to
-        :class:`MultiStepLLMMega`). K=8 is the balanced default (best on
-        medium/long; short audio is fastest at K=1).
+    steps_per_replay : int | None
+        K -- number of decode steps captured per CUDA-graph replay. ``None``
+        selects K from the prompt length (K=2 short, K=4 medium, K=16 long).
     max_cache_len : int
         Fixed K/V cache length (must fit prompt T + max_new_tokens).
     """
@@ -71,13 +70,15 @@ class MegaPipeline:
         processor: Any,
         *,
         encoder_mode: str = "cudagraph",
-        steps_per_replay: int = 8,
+        steps_per_replay: Optional[int] = None,
         max_cache_len: int = 4096,
     ) -> None:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
         self.encoder_mode = encoder_mode
+        self.steps_per_replay = steps_per_replay
+        self.max_cache_len = int(max_cache_len)
 
         comps = get_components(model)
         # ONE shared CUDA graph pool for encoder + LLM captures, so LRU eviction
@@ -88,15 +89,35 @@ class MegaPipeline:
         self.fused_encoder = FusedEncoder(comps["audio_encoder"], graph_pool=self._graph_pool)
         # embed_tokens used by the audio-embedding injection step.
         self.embed_tokens = comps["embed_tokens"]
+        self._language_model = comps["language_model"]
+        self._lm_head = model.lm_head
+        self._llms: dict[int, MultiStepLLMMega] = {}
+        self.llm = self._get_llm(0)
 
-        # (2) K-step CUDA-graph decoder trunk + lm_head from the TOP-LEVEL model.
-        self.llm = MultiStepLLMMega(
-            comps["language_model"],
-            model.lm_head,
-            max_cache_len=max_cache_len,
-            steps_per_replay=steps_per_replay,
-            graph_pool=self._graph_pool,
-        )
+    def _steps_for_shape(self, prompt_len: int) -> int:
+        """Choose a decode graph replay length from the prompt length."""
+        if self.steps_per_replay is not None:
+            return max(1, int(self.steps_per_replay))
+        if prompt_len <= 160:
+            return 2
+        if prompt_len <= 512:
+            return 4
+        return 16
+
+    def _get_llm(self, prompt_len: int) -> MultiStepLLMMega:
+        k = self._steps_for_shape(prompt_len)
+        llm = self._llms.get(k)
+        if llm is None:
+            llm = MultiStepLLMMega(
+                self._language_model,
+                self._lm_head,
+                max_cache_len=self.max_cache_len,
+                steps_per_replay=k,
+                graph_pool=self._graph_pool,
+            )
+            self._llms[k] = llm
+        self.llm = llm
+        return llm
 
     # ------------------------------------------------------------------ #
     # convenience constructor
@@ -106,7 +127,7 @@ class MegaPipeline:
         cls,
         *,
         encoder_mode: str = "cudagraph",
-        steps_per_replay: int = 8,
+        steps_per_replay: Optional[int] = None,
         max_cache_len: int = 4096,
         attn_impl: str = "eager",
         dtype: torch.dtype = torch.bfloat16,
@@ -179,7 +200,8 @@ class MegaPipeline:
         inputs_embeds = build_inputs_embeds(self.model, input_ids, audio_features)
 
         # (6) K-step CUDA-graph greedy generate.
-        res = self.llm.generate(
+        llm = self._get_llm(int(inputs_embeds.shape[1]))
+        res = llm.generate(
             inputs_embeds,
             max_new_tokens=max_new_tokens,
             eos_token_id=EOS_TOKEN_ID,

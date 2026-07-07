@@ -49,6 +49,7 @@ class FusedEncoder(nn.Module):
         self,
         encoder,
         mode: str = "cudagraph",
+        fold_bn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -56,6 +57,12 @@ class FusedEncoder(nn.Module):
             raise ValueError(
                 f"unknown mode {mode!r}; expected eager/cudagraph"
             )
+
+        # Optionally fold each conformer conv-module BatchNorm1d into the
+        # preceding depthwise conv (byte-exact affine fold; removes one kernel
+        # per layer from the captured graph). Off by default; opt in at A/B.
+        if fold_bn:
+            fold_conformer_batchnorm(encoder)
 
         # --- pull submodules (shared weights, no copy) ---------------------- #
         self.input_linear = encoder.input_linear
@@ -297,7 +304,13 @@ def _ff_forward(ff, x: torch.Tensor) -> torch.Tensor:
 
 
 def _conv_forward(conv, x: torch.Tensor) -> torch.Tensor:
-    """GraniteSpeechConformerConvModule.forward (eval-mode, dropout=identity)."""
+    """GraniteSpeechConformerConvModule.forward (eval-mode, dropout=identity).
+
+    When :func:`fold_conformer_batchnorm` has been applied, ``conv.batch_norm``
+    is an ``nn.Identity`` and the per-channel affine is baked into
+    ``conv.depth_conv``'s inner Conv1d weight + bias (byte-exact in fp32; see
+    the fold function). The forward is unchanged.
+    """
     h = conv.norm(x)
     h = conv.up_conv(h.permute(0, 2, 1))
     h = conv.glu(h)
@@ -305,6 +318,54 @@ def _conv_forward(conv, x: torch.Tensor) -> torch.Tensor:
     h = F.silu(conv.batch_norm(h))
     h = conv.down_conv(h).permute(0, 2, 1)
     return h
+
+
+def fold_conformer_batchnorm(encoder) -> None:
+    """Fold every conformer conv-module BatchNorm1d into its depthwise conv.
+
+    In eval mode BatchNorm1d is a deterministic per-channel affine::
+
+        BN: y = (x - running_mean) / sqrt(running_var + eps) * weight + bias
+
+    which folds into the preceding depthwise Conv1d as::
+
+        scale = bn.weight / sqrt(running_var + eps)            # (C,)
+        W'    = W * scale[:, None, None]                        # (C, 1, K)
+        b'    = (b - running_mean) * scale + bn.bias            # (C,)
+
+    The granite depthwise conv has no bias, so ``b' = bn.bias - running_mean*scale``.
+    Folding is exact in fp32; the bake-in is done in fp32 then re-cast to the
+    conv's dtype so the only rounding is the final cast (negligible vs the
+    bf16 BatchNorm it replaces, and the WER bench confirms transcript-level
+    equivalence). After folding, ``conv.batch_norm`` becomes ``nn.Identity``.
+
+    Mutates the encoder's conv modules in-place. Apply once at load time
+    (before CUDA-graph capture) so the fold cost is amortised.
+    """
+    for layer in encoder.layers:
+        conv = layer.conv
+        bn = conv.batch_norm               # nn.BatchNorm1d (C,)
+        dw = conv.depth_conv.conv          # nn.Conv1d (C, 1, K), groups=C, no bias
+
+        running_mean = bn.running_mean.to(torch.float32)
+        running_var = bn.running_var.to(torch.float32)
+        bn_weight = bn.weight.to(torch.float32)
+        bn_bias = bn.bias.to(torch.float32)
+        eps = float(bn.eps)
+        scale = bn_weight / torch.sqrt(running_var + eps)
+
+        w = dw.weight.to(torch.float32)    # (C, 1, K)
+        new_w = w * scale.view(-1, 1, 1)
+        if dw.bias is not None:
+            b = dw.bias.to(torch.float32)
+            new_b = (b - running_mean) * scale + bn_bias
+        else:
+            new_b = bn_bias - running_mean * scale
+
+        dw_dtype = dw.weight.dtype
+        dw.weight = nn.Parameter(new_w.to(dw_dtype).contiguous())
+        dw.bias = nn.Parameter(new_b.to(dw_dtype).contiguous())
+        conv.batch_norm = nn.Identity()
 
 
 def _softmax_last_dim(x: torch.Tensor) -> torch.Tensor:

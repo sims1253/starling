@@ -334,3 +334,190 @@ def fused_residual_scale(
     kern = _residual_scale_kernel if AUTOTUNE else _residual_scale_kernel_raw
     kern[(M,)](x2, y2, z, alpha, N=N, BLOCK_N=BLOCK_N)
     return z.view_as(x)
+
+
+# =========================================================================== #
+# GEMM-epilogue fusion (CODA Pattern 1): RMSNorm folded into the next GEMV.
+#
+# At decode (batch=1, seq=1) the QKV / gate-up projections are GEMVs (M=1).
+# The RMSNorm scale ``r = rsqrt(mean(x^2)+eps)`` commutes with the matmul, so
+#   rmsnorm(x) @ W^T  ==  (x @ (gamma .* W)^T) * r
+# We compute ``r`` with a one-program scalar kernel, prescale ``W`` by ``gamma``
+# once at load time (see FusedLLMMega._fuse_epilogue_weights), and fold the
+# ``* r`` into the GEMV accumulator. Eliminates the standalone _rmsnorm_kernel
+# launch before each of the two projections per layer (80 launches/step).
+#
+# Numerical note: the unfused path truncates the *normalized* hidden to bf16
+# before the GEMV; this path accumulates in fp32 and truncates once. Per-layer
+# max-abs diff ~0.25 (qkv) / ~0.5 (gate-up) on magnitude-70..97 projections,
+# i.e. ~1-3 bf16 ULP. NOT byte-exact; gated by OptFlags.gemm_epilogue_fusion.
+# =========================================================================== #
+@triton.jit
+def _rstd_kernel(X_ptr, RSTD_ptr, eps, N: tl.constexpr, BLOCK_N: tl.constexpr):
+    # Single-program scalar kernel: writes rstd = rsqrt(mean(x^2)+eps) for one row.
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+    x = tl.load(X_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / N
+    tl.store(RSTD_ptr, 1.0 / tl.sqrt(var + eps))
+
+
+def compute_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Row rstd = rsqrt(mean(x^2)+eps) as a (1,) fp32 scalar. x is (N,) or (1,N)."""
+    N = x.shape[-1]
+    x1 = x.reshape(-1).contiguous()
+    rstd = torch.empty((1,), dtype=torch.float32, device=x.device)
+    _rstd_kernel[(1,)](x1, rstd, eps, N=N, BLOCK_N=triton.next_power_of_2(N))
+    return rstd
+
+
+@triton.jit
+def _gemv_normscale_kernel(
+    X_ptr, W_ptr, RSTD_ptr, OUT_ptr, OUT: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """GEMV (M=1) with RMSNorm scale folded into the epilogue.
+
+    W is (OUT, K), already prescaled by gamma. Computes
+    ``out[i] = rstd * sum_k W[i,k]*x[k]``.
+    """
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    rmask = rows < OUT
+    rstd = tl.load(RSTD_ptr)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        cols = k0 + tl.arange(0, BLOCK_K)
+        cmask = cols < K
+        x = tl.load(X_ptr + cols, mask=cmask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + rows[:, None] * K + cols[None, :],
+                    mask=cmask[None, :] & rmask[:, None], other=0.0).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    acc = acc * rstd
+    tl.store(OUT_ptr + rows, acc.to(OUT_ptr.dtype.element_ty), mask=rmask)
+
+
+def fused_gemv_normscale(x: torch.Tensor, w_scaled: torch.Tensor,
+                         rstd: torch.Tensor) -> torch.Tensor:
+    """GEMV (M=1) of x @ w_scaled^T with the RMSNorm rstd folded into the epilogue.
+
+    x: (1, K) or (K,); w_scaled: (OUT, K) already *= gamma; rstd: (1,) fp32.
+    Returns (OUT,) bf16.
+    """
+    K = w_scaled.shape[1]
+    OUT = w_scaled.shape[0]
+    x1 = x.reshape(-1).contiguous()
+    out = torch.empty((OUT,), dtype=w_scaled.dtype, device=w_scaled.device)
+    BLOCK_M = 64
+    BLOCK_K = min(triton.next_power_of_2(K), 1024)
+    grid = (triton.cdiv(OUT, BLOCK_M),)
+    _gemv_normscale_kernel[grid](
+        x1, w_scaled, rstd, out, OUT=OUT, K=K, BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+    )
+    return out
+
+
+# =========================================================================== #
+# Fused NVFP4 dequant-GEMV (closes fp4.py TODO #1).
+#
+# Reads nibble-packed e2m1 codes (uint8, 2/byte) + fp8e4m3 block scales and
+# accumulates out[i] = sum_k dequant(code[i,k], scale[i,k//16]) * x[k] in fp32.
+# This is the bandwidth win that makes NVFP4 weights worth it on the decode
+# step (GEMVs are 51% of step time per bench_decode_profile.py).  Pattern
+# mirrors A4Q -- packed fp4 streams into the pipeline and dequantizes in
+# registers; here for a plain GEMV rather than a paged attention QK^T.
+#
+# Storage layout (see starling.granite.fp4.quantize_fp4_packed):
+#   codes  : (OUT, K // 2)  uint8 -- even k -> low nibble, odd k -> high nibble
+#   scales : (OUT, K // 16) float8_e4m3fn -- one per 16-element block
+# Reconstruction:  w ~= scale_fp8 * e2m1_level(code) / 6.0
+# =========================================================================== #
+_FP4_GEMV_CONFIGS = [
+    triton.Config({"BLOCK_M": bm}, num_warps=w, num_stages=s)
+    for bm in (16, 32, 64, 128)
+    for w in (4, 8, 16)
+    for s in (1, 2, 3, 4)
+]
+
+
+@triton.autotune(_FP4_GEMV_CONFIGS, key=["OUT_N", "K"])
+@triton.jit
+def _fp4_gemv_kernel(
+    X_ptr,          # (K,) bf16 input vector
+    CODES_ptr,      # (OUT, K // 2) uint8 nibble-packed codes
+    SCALES_ptr,     # (OUT, K // 16) fp8e4m3 block scales
+    OUT_ptr,        # (OUT,) bf16 output
+    K: tl.constexpr,
+    K_BYTES: tl.constexpr,
+    K_BLOCKS: tl.constexpr,
+    OUT_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,   # multiple of 32 (2 bytes -> 4 codes -> 2 scale blocks)
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)
+    rmask = rows < OUT_N
+
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    BLOCK_BYTES: tl.constexpr = BLOCK_K // 2
+
+    for kb in range(0, K_BYTES, BLOCK_BYTES):
+        byte_cols = kb + tl.arange(0, BLOCK_BYTES)
+        bmask = byte_cols < K_BYTES
+
+        # Load code bytes: (BLOCK_M, BLOCK_BYTES)
+        byte_off = rows[:, None] * K_BYTES + byte_cols[None, :]
+        bm = bmask[None, :] & rmask[:, None]
+        raw = tl.load(CODES_ptr + byte_off, mask=bm, other=0)
+
+        # Extract nibbles -> 2 codes per byte.
+        code_lo = raw & 0xF           # even k (low nibble)
+        code_hi = (raw >> 4) & 0xF    # odd  k (high nibble)
+
+        # --- e2m1 dequant (bit 3 = sign, bits[2:0] = magnitude level index) ---
+        # Levels: idx 0..7 -> (0, 0.5, 1, 1.5, 2, 3, 4, 6).
+        sign_lo = (code_lo >> 3) & 1
+        mag_lo = code_lo & 0x7
+        level_lo = tl.where(mag_lo == 0, 0.0,
+                  tl.where(mag_lo == 1, 0.5,
+                  tl.where(mag_lo == 2, 1.0,
+                  tl.where(mag_lo == 3, 1.5,
+                  tl.where(mag_lo == 4, 2.0,
+                  tl.where(mag_lo == 5, 3.0,
+                  tl.where(mag_lo == 6, 4.0, 6.0))))))).to(tl.float32)
+        level_lo = tl.where(sign_lo == 1, -level_lo, level_lo)
+
+        sign_hi = (code_hi >> 3) & 1
+        mag_hi = code_hi & 0x7
+        level_hi = tl.where(mag_hi == 0, 0.0,
+                  tl.where(mag_hi == 1, 0.5,
+                  tl.where(mag_hi == 2, 1.0,
+                  tl.where(mag_hi == 3, 1.5,
+                  tl.where(mag_hi == 4, 2.0,
+                  tl.where(mag_hi == 5, 3.0,
+                  tl.where(mag_hi == 6, 4.0, 6.0))))))).to(tl.float32)
+        level_hi = tl.where(sign_hi == 1, -level_hi, level_hi)
+
+        # Block scales: element 2*byte_cols[j] -> block (2*byte_cols[j])//16.
+        elem_lo = 2 * byte_cols
+        elem_hi = 2 * byte_cols + 1
+        blk_lo = elem_lo // 16
+        blk_hi = elem_hi // 16
+        scale_off_lo = rows[:, None] * K_BLOCKS + blk_lo[None, :]
+        scale_off_hi = rows[:, None] * K_BLOCKS + blk_hi[None, :]
+        scale_lo = tl.load(SCALES_ptr + scale_off_lo, mask=bm, other=0.0).to(tl.float32)
+        scale_hi = tl.load(SCALES_ptr + scale_off_hi, mask=bm, other=0.0).to(tl.float32)
+
+        w_lo = level_lo * scale_lo * (1.0 / 6.0)
+        w_hi = level_hi * scale_hi * (1.0 / 6.0)
+
+        x_lo = tl.load(X_ptr + elem_lo, mask=bmask, other=0.0).to(tl.float32)
+        x_hi = tl.load(X_ptr + elem_hi, mask=bmask, other=0.0).to(tl.float32)
+
+        acc += tl.sum(w_lo * x_lo[None, :], axis=1)
+        acc += tl.sum(w_hi * x_hi[None, :], axis=1)
+
+    tl.store(OUT_ptr + rows, acc.to(OUT_ptr.dtype.element_ty), mask=rmask)

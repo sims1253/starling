@@ -35,7 +35,7 @@ class MossMultiStepMega(MossLLMMega):
         language_model: Any,
         lm_head: Any,
         max_cache_len: int = 1024,
-        steps_per_replay: int = 16,
+        steps_per_replay: int = 4,
         warmup_iters: int = 3,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,

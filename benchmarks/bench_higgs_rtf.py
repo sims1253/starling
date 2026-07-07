@@ -68,7 +68,7 @@ def stock_transcribe(model, tok, audio_np, sr, max_new_tokens):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--decoder", default="multi", choices=["single", "multi"])
-    ap.add_argument("--k", type=int, default=8, help="steps_per_replay for multi")
+    ap.add_argument("--k", type=int, default=2, help="steps_per_replay for multi")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--repeats", type=int, default=1, help="repeats for starling (best-of)")
     args = ap.parse_args()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Any, Iterator
+import sys
 
 import torch
 
@@ -50,8 +51,27 @@ def load_model_and_tokenizer(
         attn_implementation=attn_impl,
     )
     model.eval()
+    _patch_graph_safe_remote_helpers(model)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     return model, tokenizer
+
+
+def _patch_graph_safe_remote_helpers(model: Any) -> None:
+    """Patch trust-remote-code helpers that allocate CPU tensors inside forward.
+
+    The upstream Higgs helper builds ``torch.arange(...).to(cuda)`` while merging
+    audio features into token embeddings. That is fine in eager mode but aborts
+    CUDA graph capture. Replace the function imported into the remote modeling
+    module with our vendored copy, which allocates directly on the target device.
+    """
+    try:
+        from .vendor.modeling.utils import merge_input_ids_with_audio_features
+    except Exception:
+        return
+
+    mod = sys.modules.get(model.__class__.__module__)
+    if mod is not None:
+        setattr(mod, "merge_input_ids_with_audio_features", merge_input_ids_with_audio_features)
 
 
 def get_components(model: Any) -> dict[str, Any]:

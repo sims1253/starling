@@ -45,6 +45,7 @@ class MegaPipeline:
         *,
         max_cache_len: int = 4096,
         use_fused_llm: bool = True,
+        steps_per_replay: int | None = None,
         encoder_warmup_iters: int = 3,
         encoder_mode: str = "cudagraph",
     ) -> None:
@@ -66,20 +67,20 @@ class MegaPipeline:
         # (3) LLM decoder trunk + lm_head from the TOP-LEVEL model.
         #     Use the K-step multi-step graph (byte-exact, fewer host syncs)
         #     for single-stream; fall back to the single-step fused decoder.
+        self._language_model = comps["language_model"]
+        self._lm_head = model.lm_head
+        self._max_cache_len = int(max_cache_len)
+        self.steps_per_replay = (
+            None if steps_per_replay is None else max(1, int(steps_per_replay))
+        )
+        self._llms_by_k: dict[int, MultiStepLLMMega] = {}
         if use_fused_llm:
-            from .multistep import MultiStepLLMMega
-
-            self.llm = MultiStepLLMMega(
-                comps["language_model"],
-                model.lm_head,
-                max_cache_len=max_cache_len,
-                eos_token_id=EOS_TOKEN_ID,
-            )
+            self.llm = self._get_multistep_llm(self._steps_for_prompt(0))
         else:
             self.llm = LLMMega(
-                comps["language_model"],
-                model.lm_head,
-                max_cache_len=max_cache_len,
+                self._language_model,
+                self._lm_head,
+                max_cache_len=self._max_cache_len,
                 eos_token_id=EOS_TOKEN_ID,
             )
         self.use_fused_llm = use_fused_llm
@@ -93,6 +94,7 @@ class MegaPipeline:
         device: str = "cuda",
         max_cache_len: int = 4096,
         use_fused_llm: bool = True,
+        steps_per_replay: int | None = None,
         encoder_mode: str = "cudagraph",
     ) -> "MegaPipeline":
         model, processor = load_model_and_processor(attn_impl=attn_impl, dtype=dtype, device=device)
@@ -101,8 +103,43 @@ class MegaPipeline:
             processor,
             max_cache_len=max_cache_len,
             use_fused_llm=use_fused_llm,
+            steps_per_replay=steps_per_replay,
             encoder_mode=encoder_mode,
         )
+
+    def _steps_for_prompt(self, prompt_len: int) -> int:
+        """Replay chunk size for this prompt length.
+
+        RTX 5090 sweep on 2026-07-06: the short fixture (prompt 112, 35 output
+        tokens) loses time to K-chunk overcompute, medium (prompt 305, 97
+        output tokens) benefits from K=8, and long (prompt 982, 314 output
+        tokens) is fastest at K=1. Explicit constructor values still override
+        this auto policy.
+        """
+        if self.steps_per_replay is not None:
+            return self.steps_per_replay
+        prompt_len = int(prompt_len)
+        if prompt_len <= 128:
+            return 1
+        if prompt_len <= 512:
+            return 8
+        return 1
+
+    def _get_multistep_llm(self, steps_per_replay: int):
+        from .multistep import MultiStepLLMMega
+
+        k = max(1, int(steps_per_replay))
+        llm = self._llms_by_k.get(k)
+        if llm is None:
+            llm = MultiStepLLMMega(
+                self._language_model,
+                self._lm_head,
+                max_cache_len=self._max_cache_len,
+                steps_per_replay=k,
+                eos_token_id=EOS_TOKEN_ID,
+            )
+            self._llms_by_k[k] = llm
+        return llm
 
     # ------------------------------------------------------------------ #
     # merge step (byte-exact replica of Qwen3ASRModel.forward scatter)
@@ -167,6 +204,10 @@ class MegaPipeline:
         inputs_embeds = self.build_inputs_embeds(input_ids, audio_embeds)
 
         # (4) greedy generate with the fused CUDA-graph decoder
+        if self.use_fused_llm:
+            self.llm = self._get_multistep_llm(
+                self._steps_for_prompt(inputs_embeds.shape[1])
+            )
         res = self.llm.generate(inputs_embeds, max_new_tokens=max_new_tokens)
 
         # (5) decode generated ids to text

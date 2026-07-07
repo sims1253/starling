@@ -2,7 +2,7 @@
 
 Covers:
   1. pure GPU-tier classification (no GPU needed) -- every documented tier.
-  2. :func:`detect_gpu` on the real card (RTX 5090 -> K=16, B=16, no sweep).
+  2. :func:`detect_gpu` on the real card (RTX 5090 -> K=32, B=32, no sweep).
   3. :func:`pick_best_k` noise-robust selection (prefer the hint within margin).
   4. cache write/read round-trip + miss handling.
   5. :func:`autotune` loads a cached config WITHOUT sweeping (no model/GPU work).
@@ -77,7 +77,7 @@ def test_classify_tier_ordering_datacentre_before_consumer():
 # ====================================================================== #
 @pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA")
 def test_detect_gpu_current():
-    """detect_gpu() on this box (RTX 5090) -> K=16, B=16 fallback, no sweep."""
+    """detect_gpu() on this box (RTX 5090) -> K=32, B=32 fallback, no sweep."""
     cfg = detect_gpu()
     assert "5090" in cfg.gpu_name, f"unexpected gpu_name {cfg.gpu_name!r}"
     assert cfg.compute_capability == (12, 0)

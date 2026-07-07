@@ -50,7 +50,7 @@ the host syncs, not the arithmetic.  Verified in
 
 Public API
 ----------
-``MultiStepLLMMega(language_model, lm_head, max_cache_len=640, steps_per_replay=16)``
+``MultiStepLLMMega(language_model, lm_head, max_cache_len=640, steps_per_replay=4)``
 ``MultiStepLLMMega.generate(inputs_embeds, max_new_tokens=100, eos_token_id=...)``
     -> :class:`starling.granite.llm_mega.GenerateResult`
 """
@@ -79,7 +79,9 @@ class MultiStepLLMMega(FusedLLMMega):
         lm_head: ``nn.Linear`` lm_head from the top-level speech model.
         max_cache_len: Fixed K/V cache length.
         steps_per_replay: Number of consecutive decode steps captured into one
-            graph replay (``K``).  Larger ``K`` amortises more syncs but
+            graph replay (``K``).  Default K=4 is the measured RTX 5090 winner
+            after prefill graphing (``benchmarks/bench_multistep_llm.py``,
+            2026-07-06). Larger ``K`` amortises more syncs but
             captures a bigger graph and needs more cache head-room (the last
             chunk always runs full ``K`` steps even if fewer are needed).
         warmup_iters: CUDA-graph warmup iterations before capture.
@@ -91,7 +93,7 @@ class MultiStepLLMMega(FusedLLMMega):
         language_model: Any,
         lm_head: Any,
         max_cache_len: int = 640,
-        steps_per_replay: int = 16,
+        steps_per_replay: int = 4,
         warmup_iters: int = 3,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
@@ -309,13 +311,15 @@ class MultiStepLLMMega(FusedLLMMega):
         #     all subsequent chunk boundaries automatically).
         self._reset_to_chunk_start(T, next_token)
 
-        # (4) chunked K-step replay loop.  ONE sync per chunk.
+        # (4) chunked K-step replay loop.  ONE device->host sync per chunk
+        #     (``output_ids.tolist()``); the host scans the K harvested tokens
+        #     for EOS / max_new_tokens between replays.  Byte-exact: greedy =
+        #     greedy, only the timing of the argmax and sync changes.
         t0 = time.perf_counter()
         done = False
         for _chunk in range(n_chunks):
             self._ms_graph.replay()
-            # ONE device->host sync for the whole K-step batch.
-            out = self.output_ids.tolist()  # list[int] of length K
+            out = self.output_ids.tolist()
             for tok in out:
                 if len(gen_ids) >= max_new_tokens:
                     done = True

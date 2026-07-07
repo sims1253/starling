@@ -51,12 +51,58 @@ def test_default_flags_preserve_byte_exactness():
     assert f.multistep_graph is True, "multistep_graph defaults True (byte-exact)"
     assert f.batched_encoder is False, "batched_encoder defaults False"
     assert f.tolerance_mode is False, "tolerance_mode defaults False"
+    # New decode-attention flags: fused_qkv is byte-exact (on by default); the
+    # attention-backend flags that break byte-exactness are off by default.
+    assert f.fused_qkv is True, "fused_qkv defaults True (byte-exact)"
+    assert f.sdpa_attention is False, "sdpa_attention defaults False"
+    assert f.flash_attention is False, "flash_attention defaults False"
+    assert f.fp8_attention is False, "fp8_attention defaults False"
+    # Ablation flags (wiki-driven). The two byte-exact decode folds default on;
+    # every other experimental flag defaults off so the baseline stays exact.
+    assert f.rope_alloc_free is True, "rope_alloc_free defaults True (byte-exact)"
+    assert f.lm_head_scale_fold is True, "lm_head_scale_fold defaults True (byte-exact)"
+    assert f.gemm_epilogue_fusion is False, "gemm_epilogue_fusion defaults False (experimental)"
+    assert f.chunk_prefill_overlap is True, "chunk_prefill_overlap defaults True (byte-exact)"
+    assert f.nvfp4_weights is False, "nvfp4_weights defaults False (requires tolerance)"
+    assert f.nvfp4_lm_head_only is False, "nvfp4_lm_head_only defaults False (requires tolerance)"
+    assert f.kv_cache_compression is False, "kv_cache_compression defaults False (experimental)"
+    assert f.slim_draft_head is False, "slim_draft_head defaults False"
+
+
+def test_nvfp4_weights_requires_tolerance():
+    """nvfp4_weights=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(nvfp4_weights=True, tolerance_mode=False)
+
+
+def test_nvfp4_lm_head_only_requires_tolerance():
+    """nvfp4_lm_head_only=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(nvfp4_lm_head_only=True, tolerance_mode=False)
 
 
 def test_batched_encoder_requires_tolerance():
     """batched_encoder=True without tolerance_mode must raise."""
     with pytest.raises(ValueError, match="tolerance_mode"):
         OptFlags(batched_encoder=True, tolerance_mode=False)
+
+
+def test_flash_attention_requires_tolerance():
+    """flash_attention=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(flash_attention=True, tolerance_mode=False)
+
+
+def test_fp8_attention_requires_tolerance():
+    """fp8_attention=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(fp8_attention=True, tolerance_mode=False)
+
+
+def test_fp8_attention_implies_flash():
+    """fp8_attention=True should force flash_attention on (shared SDPA path)."""
+    f = OptFlags(fp8_attention=True, tolerance_mode=True)
+    assert f.flash_attention is True, "fp8_attention must enable flash_attention"
 
 
 def test_batched_encoder_with_tolerance_ok():

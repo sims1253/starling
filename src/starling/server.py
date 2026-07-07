@@ -1,8 +1,8 @@
 """Unified HTTP/WebSocket ASR server for every starling model.
 
 This replaces the former granite-only ``starling.granite.server``. One process
-serves ONE model at a time, selected by ``--model {granite,parakeet,moss,qwen3,ark,cohere,higgs}``
-(default ``granite``). The model is kept resident in VRAM and exposed via a
+serves ONE model at a time, selected by ``--model`` (default ``granite``). The
+model is kept resident in VRAM and exposed via a
 parakeet-server-compatible interface:
 
   * ``GET  /``                - health check (reports ``model``, ``phase``, ``queue_depth``)
@@ -13,7 +13,7 @@ parakeet-server-compatible interface:
   * ``DELETE /inference/<id>``- cancel a queued request by ``X-Request-Id``
   * ``WS   /stream``          - real-time streaming dictation
 
-The four model pipelines have incompatible ``transcribe`` signatures, so the
+The model pipelines have incompatible ``transcribe`` signatures, so the
 per-model differences (input building, long-audio chunking, the granite-only
 speculative path) are isolated behind a :class:`ModelBackend` with one subclass
 per model. Everything else -- request queue, cancellation, lifecycle phase,
@@ -58,8 +58,12 @@ SAMPLE_RATE: int = 16000
 """Feature extractor sample rate (16 kHz mono) for every supported model."""
 
 DEFAULT_MAX_CHUNK_SECONDS: float = 30.0
-"""Largest chunk transcribed in one shot for chunked backends (granite/moss):
-bounded by granite's 640-token KV cache (30 s ~ 300 audio + 22 prompt tokens)."""
+"""Largest chunk transcribed in one shot for chunked backends.
+
+Granite is bounded by its 640-token KV cache (30 s ~ 300 audio + 22 prompt
+tokens). Parakeet-unified uses this to avoid O(N^2) full-attention encoder
+memory on long utterances.
+"""
 
 DEFAULT_MIN_CHUNK_SECONDS: float = 5.0
 """Minimum accumulated audio before the first streaming partial is emitted."""
@@ -85,13 +89,14 @@ WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "moss", "qwen3", "ark", "cohere", "higgs")
+MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "cohere", "higgs")
 
 
 def _gpu_lock_model(slug: str) -> str:
     return {
         "granite": "granite-speech-4.1-2b",
         "parakeet": "parakeet-tdt-0.6b-v3",
+        "parakeet_unified": "parakeet-unified-en-0.6b",
         "moss": "moss-transcribe-preview-2b",
         "qwen3": "qwen3-asr-1.7b",
         "ark": "ark-asr-3b",
@@ -119,6 +124,7 @@ class ModelBackend:
         self.config = config
         self.pipe: Any = None
         self.processor: Any = None
+        self.chunker: Any = None
 
     @property
     def loaded(self) -> bool:
@@ -229,6 +235,59 @@ class ParakeetBackend(ModelBackend):
         # Parakeet's TDT decoder has no chunk-window segment contract exposed
         # here, so we return a single whole-utterance segment (the server's
         # streaming partials still carve the timeline via the rolling buffer).
+        return TranscribeResult(
+            text=text,
+            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+            duration_s=audio_seconds,
+        )
+
+
+class ParakeetUnifiedBackend(ModelBackend):
+    """parakeet-unified-en-0.6b: NeMo-free megakernel (FastConformer-RNN-T)."""
+
+    slug = "parakeet_unified"
+
+    def load(self) -> None:
+        from .parakeet_unified.pipeline import MegaParakeetUnifiedPipeline
+
+        self.pipe = MegaParakeetUnifiedPipeline()
+        # No HF processor for this model (the .nemo ships only weights + the
+        # sentencepiece model inside the zip); the pipeline exposes its
+        # tokenizer directly.
+        self.processor = self.pipe.tokenizer
+        self.chunker = None
+
+    def _get_chunker(self):
+        assert self.pipe is not None
+        if self.chunker is None:
+            from .parakeet_unified.chunking import ChunkedTranscriber
+
+            chunk_seconds = max(
+                0.1,
+                float(self.config.max_chunk_seconds or DEFAULT_MAX_CHUNK_SECONDS),
+            )
+            overlap_seconds = min(2.0, chunk_seconds / 4.0)
+            self.chunker = ChunkedTranscriber(
+                self.pipe,
+                chunk_seconds=chunk_seconds,
+                overlap_seconds=overlap_seconds,
+            )
+        return self.chunker
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        audio = np.ascontiguousarray(samples, dtype=np.float32)
+        audio_seconds = len(audio) / SAMPLE_RATE
+        max_chunk_seconds = float(
+            self.config.max_chunk_seconds or DEFAULT_MAX_CHUNK_SECONDS
+        )
+        if audio_seconds > max_chunk_seconds:
+            text = self._get_chunker().transcribe(audio, sr=SAMPLE_RATE)
+        else:
+            texts = self.pipe.transcribe([audio])
+            text = texts[0] if texts else ""
         return TranscribeResult(
             text=text,
             segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
@@ -413,6 +472,7 @@ class HiggsBackend(ModelBackend):
 _BACKENDS: dict[str, type[ModelBackend]] = {
     "granite": GraniteBackend,
     "parakeet": ParakeetBackend,
+    "parakeet_unified": ParakeetUnifiedBackend,
     "moss": MossBackend,
     "qwen3": Qwen3Backend,
     "ark": ArkBackend,
@@ -755,7 +815,12 @@ class StreamSession:
 # ===========================================================================
 # BACKEND A: FastAPI + uvicorn (preferred, optional deps)
 # ===========================================================================
-def create_app(config: Optional[ServerConfig] = None) -> Any:
+def create_app(
+    config: Optional[ServerConfig] = None,
+    *,
+    server: Optional[StarlingServer] = None,
+    load_on_startup: bool = True,
+) -> Any:
     """Build the FastAPI application bound to a :class:`StarlingServer`."""
     from fastapi import (  # type: ignore
         FastAPI,
@@ -766,14 +831,16 @@ def create_app(config: Optional[ServerConfig] = None) -> Any:
     )
     from fastapi.responses import JSONResponse  # type: ignore
 
-    config = config or ServerConfig()
-    server = StarlingServer(config=config)
+    if server is not None and config is not None and server.config is not config:
+        raise ValueError("pass either config or server, not both")
+    server = server or StarlingServer(config=config or ServerConfig())
     app = FastAPI(title="starling-server", version="2.0.0")
     app.state.starling_server = server  # type: ignore[attr-defined]
 
     @app.on_event("startup")
     async def _on_startup() -> None:  # pragma: no cover - exercised by run()
-        await asyncio.to_thread(server.load)
+        if load_on_startup:
+            await asyncio.to_thread(server.load)
 
     async def _decode_inference_body(request: "Request") -> bytes:
         body = await request.body()
@@ -1422,8 +1489,7 @@ def run(argv: Optional[list[str]] = None) -> int:
     if use_fastapi:
         import uvicorn
 
-        app = create_app(config)
-        app.state.starling_server = server  # type: ignore[attr-defined]
+        app = create_app(server=server, load_on_startup=not args.no_eager_load)
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     else:
         _run_stdlib_server(server, args.host, args.port)
