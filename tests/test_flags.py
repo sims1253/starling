@@ -57,6 +57,7 @@ def test_default_flags_preserve_byte_exactness():
     assert f.sdpa_attention is False, "sdpa_attention defaults False"
     assert f.flash_attention is False, "flash_attention defaults False"
     assert f.fp8_attention is False, "fp8_attention defaults False"
+    assert f.fp8_weights is False, "fp8_weights defaults False (requires tolerance)"
     # Ablation flags (wiki-driven). The two byte-exact decode folds default on;
     # every other experimental flag defaults off so the baseline stays exact.
     assert f.rope_alloc_free is True, "rope_alloc_free defaults True (byte-exact)"
@@ -97,6 +98,18 @@ def test_fp8_attention_requires_tolerance():
     """fp8_attention=True without tolerance_mode must raise."""
     with pytest.raises(ValueError, match="tolerance_mode"):
         OptFlags(fp8_attention=True, tolerance_mode=False)
+
+
+def test_fp8_weights_requires_tolerance():
+    """fp8_weights=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(fp8_weights=True, tolerance_mode=False)
+
+
+def test_fp8_weights_implies_fused_qkv():
+    """fp8_weights=True should force fused_qkv on (reads pre-concatenated weights)."""
+    f = OptFlags(fp8_weights=True, tolerance_mode=True, fused_qkv=False)
+    assert f.fused_qkv is True, "fp8_weights must enable fused_qkv"
 
 
 def test_fp8_attention_implies_flash():

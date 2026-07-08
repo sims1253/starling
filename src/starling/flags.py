@@ -98,6 +98,25 @@ class OptFlags:
     (~1e-2 score diffs); requires ``tolerance_mode=True`` and re-validation
     against the WER bench."""
 
+    fp8_weights: bool = False
+    """Cast the decoder-layer projection weights (q/k/v/o, gate/up/down) to
+    fp8e4m3 with dynamic per-token activation scaling, via ``torch._scaled_mm``
+    (Blackwell fp8 tensor cores).  Halves the weight bandwidth that dominates
+    decode (~57% of the captured step is these GEMVs per the profiler).  The
+    **lm_head stays bf16** (its vocab-wide argmax has fp8-fragile near-ties).
+    **Breaks byte-exactness** (fp8 weight rounding); requires
+    ``tolerance_mode=True`` and forces ``fused_qkv`` (it reads the
+    pre-concatenated qkv/gate-up weights).
+
+    .. note::
+       The current ``torch._scaled_mm`` path is **correct but slower at
+       batch=1** decode (the cutlass GEMM + per-token activation quant overhead
+       outweighs the bandwidth win; measured 0.63x).  It pays off at larger M
+       (prefill / batched decode) and is the scaffolding for a future fused
+       fp8 dequant-GEMV Triton kernel (analogous to the fp4 one in
+       ``llm_kernels.py``) that would deliver the decode speedup.  See
+       ``starling.granite.fp8`` for the full measured breakdown."""
+
     # ------------------------------------------------------------------
     # Ablatable optimisations (wiki-driven).  Each defaults to off so the
     # baseline remains byte-exact; the ablation harness flips them on/off to
@@ -169,6 +188,15 @@ class OptFlags:
         if self.fp8_attention and not self.flash_attention:
             # fp8 attention reuses the flash backend's SDPA path; force it on.
             self.flash_attention = True
+        if self.fp8_weights and not self.fused_qkv:
+            # fp8 packing reads from the pre-concatenated qkv/gate-up weights
+            # built by _fuse_layer_weights; force fused_qkv on.
+            self.fused_qkv = True
+        if self.fp8_weights and not self.tolerance_mode:
+            raise ValueError(
+                "fp8_weights=True requires tolerance_mode=True (fp8 weights are "
+                "not bit-exact). Set tolerance_mode=True or fp8_weights=False."
+            )
         if self.nvfp4_weights and not self.fused_qkv:
             # NVFP4 packing reads from the pre-concatenated QKV/gate-up weights
             # built by _fuse_layer_weights; force fused_qkv on (mirrors the
@@ -228,6 +256,7 @@ def flags(**overrides):
         sdpa_attention=overrides.get("sdpa_attention", saved.sdpa_attention),
         flash_attention=overrides.get("flash_attention", saved.flash_attention),
         fp8_attention=overrides.get("fp8_attention", saved.fp8_attention),
+        fp8_weights=overrides.get("fp8_weights", saved.fp8_weights),
         rope_alloc_free=overrides.get("rope_alloc_free", saved.rope_alloc_free),
         lm_head_scale_fold=overrides.get("lm_head_scale_fold", saved.lm_head_scale_fold),
         gemm_epilogue_fusion=overrides.get("gemm_epilogue_fusion", saved.gemm_epilogue_fusion),
