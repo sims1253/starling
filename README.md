@@ -116,7 +116,7 @@ excluded, single RTX 5090.
 | moss-transcribe-preview-2b | stock transformers | 3.81%       | 6.17% | 6.68%        | 4.28%        | 1.62%               | 2.66%               | 2.10%        | 3.90% |
 | parakeet-tdt-0.6b-v3       | starling           | 6.35%       | 7.21% | 7.71%        | 4.36%        | 1.71%               | 3.28%               | 3.56%        | 4.88% |
 | parakeet-tdt-0.6b-v3       | stock transformers | 6.28%       | 7.21% | 7.71%        | 4.36%        | 1.68%               | 3.31%               | 3.56%        | 4.87% |
-| qwen3-asr-1.7b             | starling           | 6.94%       | 7.31% | 8.19%        | 4.07%        | 1.80%               | 2.88%               | 2.80%        | 4.86% |
+| qwen3-asr-1.7b             | starling           | 6.91%       | 7.31% | 8.19%        | 4.07%        | 1.80%               | 2.88%               | 2.80%        | 4.85% |
 | qwen3-asr-1.7b             | stock transformers | 6.94%       | 7.45% | 8.30%        | 3.98%        | 1.80%               | 2.91%               | 2.75%        | 4.88% |
 
 **Open ASR Leaderboard — RTFx** (real audio_s / inference_s)
@@ -133,21 +133,20 @@ excluded, single RTX 5090.
 | moss-transcribe-preview-2b | stock transformers | 6x          | 6x    | 6x           | 5x           | 6x                  | 5x                  | 5x           |
 | parakeet-tdt-0.6b-v3       | starling           | 600x        | 533x  | 1083x        | 841x         | 1104x               | 998x                | 833x         |
 | parakeet-tdt-0.6b-v3       | stock transformers | 54x         | 54x   | 66x          | 48x          | 56x                 | 52x                 | 48x          |
-| qwen3-asr-1.7b             | starling           | 64x         | 49x   | 62x          | 48x          | 56x                 | 52x                 | 52x          |
-| qwen3-asr-1.7b             | stock transformers | 6x          | 6x    | 6x           | 4x           | 5x                  | 5x                  | 5x           |
+| qwen3-asr-1.7b             | starling           | 55x         | 50x   | 65x          | 48x          | 59x                 | 53x                 | 57x          |
+| qwen3-asr-1.7b             | stock transformers | 6x          | 5x    | 6x           | 4x           | 5x                  | 4x                  | 5x           |
 <!-- BENCH:WER:END -->
 
-*Moss, granite, cohere, parakeet, and ark use 50 clips/dataset; qwen3 uses 10
-(its graphed pipeline can't yet evict CUDA graphs at high shape diversity — at
-50 clips it hits an illegal memory access, and the per-clip capture cost also
-depresses its RTFx). Parakeet and ark previously capped at 10 for the same
-reason. Both are now fixed by **shape-bucketing** — padding the mel up to a
-canonical frame count so diverse clip lengths share one captured encoder graph
-instead of accumulating one per length. Ark additionally runs its prompt
-**prefill eager** (the per-prompt-length prefill graph was its dominant memory
-accumulator); the decode loop stays graphed. Both now run the full 50 with flat
-VRAM and RTFx no longer capture-bound (parakeet 526–1104×, ark 40–53×). WER
-remains meaningful and byte-exact starling-vs-stock.*
+*All models use 50 clips/dataset. Parakeet, ark, and qwen3 previously capped at
+10 because their graphed pipelines accumulated one CUDA graph per distinct clip
+length at high shape diversity — saturating VRAM (ark OOM) or corrupting the
+graph allocator (qwen3 illegal memory access) a few datasets into the sweep.
+Two fixes, both byte-exact, cleared this: **shape-bucketing** the mel (pad up to
+a canonical frame count so diverse lengths share one captured encoder graph) and
+running the prompt **prefill eager** (the per-prompt-length prefill graph was
+the dominant accumulator; the decode loop stays graphed). All three now run the
+full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, ark
+40–53×, qwen3 47–65×). WER remains meaningful and byte-exact starling-vs-stock.*
 
 ## What did not work
 
