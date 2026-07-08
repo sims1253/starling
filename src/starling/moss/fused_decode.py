@@ -74,6 +74,28 @@ class FusedMossLLMMega(MossLLMMega):
         if self._flags.fused_qkv:
             self._fused_weights = self._fuse_layer_weights()
 
+        # fp8 weight-only quantization of the per-layer GEMMs (lm_head stays
+        # bf16).  Pre-quantize once; the decode step reads these instead of the
+        # bf16 fused weights.  See starling.moss.fp8.
+        self._fp8_weights: Optional[list[dict]] = None
+        if self._flags.fp8_weights:
+            self._fp8_weights = self._quantize_layer_weights_fp8()
+
+    def _quantize_layer_weights_fp8(self) -> list[dict]:
+        """Pre-quantize the fused qkv/gate-up + o/down weights to fp8e4m3."""
+        from .fp8 import quantize_weight_e4m3
+
+        assert self._fused_weights is not None, "fp8_weights requires fused_qkv"
+        out = []
+        for f in self._fused_weights:
+            out.append({
+                "qkv": quantize_weight_e4m3(f["qkv_w"]),
+                "gu": quantize_weight_e4m3(f["gu_w"]),
+                "o": quantize_weight_e4m3(f["o_proj"].weight),
+                "down": quantize_weight_e4m3(f["down_proj"].weight),
+            })
+        return out
+
     def _fuse_layer_weights(self) -> list[dict]:
         """Pre-concatenate QKV and gate/up weights per layer (byte-exact)."""
         fused = []
@@ -103,6 +125,9 @@ class FusedMossLLMMega(MossLLMMega):
         inter = self._intermediate
         flags = self._flags
         fused = self._fused_weights
+        fp8w = self._fp8_weights
+        if fp8w is not None:
+            from .fp8 import fp8_linear
 
         # (1) embedding lookup
         hidden = self._embed(self.static_input_ids)  # (1, 1, 2048)
@@ -121,8 +146,19 @@ class FusedMossLLMMega(MossLLMMega):
             residual = hidden
             normed = k.fused_rmsnorm(hidden, layer.input_layernorm.weight, self._rms_eps)
 
-            # Q/K/V projections: fused GEMM (byte-exact) or the model's own.
-            if fused is not None:
+            # Q/K/V projections: fp8 GEMM, fused bf16 GEMM (byte-exact), or the
+            # model's own per-proj linears.
+            if fp8w is not None:
+                f = fused[idx]
+                qf = fp8w[idx]
+                x2 = normed.view(1, -1)
+                qkv = fp8_linear(x2, qf["qkv"][0], qf["qkv"][1]).view(-1)
+                q, kv, v = qkv.split(qkv_split, dim=0)
+                q = q.view(1, 1, n_q, hd).transpose(1, 2)
+                kv = kv.view(1, 1, n_kv, hd).transpose(1, 2)
+                v = v.view(1, 1, n_kv, hd).transpose(1, 2)
+                o_proj = f["o_proj"]
+            elif fused is not None:
                 f = fused[idx]
                 x2 = normed.view(1, -1)
                 qkv = torch.nn.functional.linear(x2, f["qkv_w"], None).view(-1)
@@ -166,7 +202,13 @@ class FusedMossLLMMega(MossLLMMega):
             )  # (1, n_q, 1, hd)
 
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, n_q * hd)
-            attn_out = o_proj(attn_out)
+            if fp8w is not None:
+                qf = fp8w[idx]
+                attn_out = fp8_linear(
+                    attn_out.view(1, -1), qf["o"][0], qf["o"][1]
+                ).view(1, 1, -1)
+            else:
+                attn_out = o_proj(attn_out)
 
             hidden = k.fused_residual(residual, attn_out)
 
@@ -175,7 +217,14 @@ class FusedMossLLMMega(MossLLMMega):
             normed = k.fused_rmsnorm(
                 hidden, layer.post_attention_layernorm.weight, self._rms_eps
             )
-            if fused is not None:
+            if fp8w is not None:
+                qf = fp8w[idx]
+                x3 = normed.view(1, -1)
+                gu = fp8_linear(x3, qf["gu"][0], qf["gu"][1]).view(-1)
+                gate, up = gu.split([inter, inter], dim=0)
+                gate = gate.view(1, 1, inter)
+                up = up.view(1, 1, inter)
+            elif fused is not None:
                 x3 = normed.view(1, -1)
                 gu = torch.nn.functional.linear(x3, f["gu_w"], None).view(-1)
                 gate, up = gu.split([inter, inter], dim=0)
@@ -187,7 +236,12 @@ class FusedMossLLMMega(MossLLMMega):
                 up = mlp.up_proj(normed)
                 down_proj = mlp.down_proj
             act = k.fused_silu_mul(gate, up)
-            mlp_out = down_proj(act)
+            if fp8w is not None:
+                mlp_out = fp8_linear(
+                    act.view(1, -1), qf["down"][0], qf["down"][1]
+                ).view(1, 1, -1)
+            else:
+                mlp_out = down_proj(act)
             hidden = k.fused_residual(residual, mlp_out)
 
         # (4) final fused RMSNorm

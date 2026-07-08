@@ -64,6 +64,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare-eager", action="store_true", help="also run stock eager")
     ap.add_argument(
+        "--fp8", action="store_true",
+        help="fp8e4m3 decoder-layer weights (opt-in, tolerance_mode; ~+20%% decode, "
+             "~0%% WER cost). lm_head stays bf16.",
+    )
+    ap.add_argument(
+        "--eager-encoder", action="store_true",
+        help="disable the byte-exact CUDA-graph encoder (default on; ~3-12x faster "
+             "encoder in steady state). Use for cold single-pass variable-length audio.",
+    )
+    ap.add_argument(
         "--K",
         type=int,
         default=None,
@@ -71,13 +81,21 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    if args.fp8:
+        from starling.flags import OptFlags, set_default_flags
+        set_default_flags(OptFlags(tolerance_mode=True, fp8_weights=True))
+        print("[bench] fp8 decoder-layer weights ENABLED (lm_head bf16)")
+
     print("[bench] loading model ...")
     model, proc = load_model_and_processor()
     inner = model.model
 
     from starling.moss.pipeline import MossMegaPipeline
 
-    pipe = MossMegaPipeline(model, proc, max_cache_len=2048, steps_per_replay=args.K)
+    pipe = MossMegaPipeline(
+        model, proc, max_cache_len=2048, steps_per_replay=args.K,
+        encoder_mode="eager" if args.eager_encoder else "cudagraph",
+    )
     enc = pipe.fused_encoder
 
     results = {}

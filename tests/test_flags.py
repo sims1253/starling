@@ -105,6 +105,18 @@ def test_fp8_attention_implies_flash():
     assert f.flash_attention is True, "fp8_attention must enable flash_attention"
 
 
+def test_fp8_weights_requires_tolerance():
+    """fp8_weights=True without tolerance_mode must raise."""
+    with pytest.raises(ValueError, match="tolerance_mode"):
+        OptFlags(fp8_weights=True, tolerance_mode=False)
+
+
+def test_fp8_weights_implies_fused_qkv():
+    """fp8_weights reads the pre-concatenated qkv/gate-up weights -> forces fused_qkv."""
+    f = OptFlags(fp8_weights=True, tolerance_mode=True, fused_qkv=False)
+    assert f.fused_qkv is True, "fp8_weights must enable fused_qkv"
+
+
 def test_batched_encoder_with_tolerance_ok():
     """batched_encoder=True WITH tolerance_mode=True is valid."""
     f = OptFlags(batched_encoder=True, tolerance_mode=True)

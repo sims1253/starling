@@ -304,8 +304,22 @@ class MossBackend(ModelBackend):
         from .moss.loader import load_model_and_processor
         from .moss.pipeline import MossMegaPipeline
 
+        # Streaming uses the adaptive cudagraph encoder: in the /stream path the
+        # transcribed windows are bounded (fixed chunk + short tails, prompt
+        # T<=~150), so few graphs are captured and they replay in a narrow
+        # position range -- the regime where the graphs are robust (validated by
+        # the 27-cell streaming bench + 400-iter stress).  The pipeline default
+        # is eager because *batch* transcription of wildly varying clip lengths
+        # in one process can hit a graph-accumulation limit in the megakernel
+        # decode graph (bench_leaderboard shards per dataset to avoid it).
+        #
+        # fp8 decode (+20%%, ~0%% WER) is deliberately NOT enabled: torch._scaled_mm
+        # in a captured graph corrupts under sustained streaming churn.  It stays
+        # opt-in for one-off batch jobs, where it is stable.
         model, processor = load_model_and_processor()
-        self.pipe = MossMegaPipeline(model, processor, max_cache_len=2048)
+        self.pipe = MossMegaPipeline(
+            model, processor, max_cache_len=2048, encoder_mode="cudagraph",
+        )
         self.processor = processor
         self._proc_call = processor  # the MossProcessor is callable on a wav
 
@@ -537,6 +551,14 @@ class ServerConfig:
     max_chunk_seconds: float = DEFAULT_MAX_CHUNK_SECONDS
     min_chunk_seconds: float = DEFAULT_MIN_CHUNK_SECONDS
     partial_interval_seconds: float = DEFAULT_PARTIAL_INTERVAL_SECONDS
+    # Fixed-window overlapping-chunk streaming (see starling.stream_chunk).  When
+    # ``stream_chunk_seconds > 0``, the /stream buffer is finalized in constant
+    # ``stream_chunk_seconds`` windows overlapping by ``stream_overlap_seconds``:
+    # bounds the per-transcribe prompt (no long-dictation KV overflow), keeps
+    # work O(N), and -- being a constant mel length -- reuses the cudagraph
+    # encoder.  Set to 0 for the legacy re-transcribe-the-whole-buffer behavior.
+    stream_chunk_seconds: float = 12.0
+    stream_overlap_seconds: float = 3.0
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
     speculative: bool = True
     warmup: bool = False
@@ -770,12 +792,50 @@ def _resample_linear(samples: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray
 # ---------------------------------------------------------------------------
 @dataclass
 class StreamSession:
-    """Per-connection rolling audio buffer + streaming state."""
+    """Per-connection rolling audio buffer + streaming state.
+
+    With ``config.stream_chunk_seconds > 0`` the buffer is finalized in fixed
+    overlapping windows (:class:`starling.stream_chunk.ChunkStreamer`): bounded
+    per-transcribe prompt, O(N) work, and cudagraph-encoder reuse.  Otherwise the
+    legacy whole-buffer re-transcribe path is used.
+    """
 
     server: StarlingServer
     samples: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     last_partial_ts: float = 0.0
     last_partial_text: str = ""
+    chunker: Any = None
+
+    def __post_init__(self) -> None:
+        cfg = self.server.config
+        if getattr(cfg, "stream_chunk_seconds", 0.0) and cfg.stream_chunk_seconds > 0:
+            from .stream_chunk import ChunkStreamer
+
+            self.chunker = ChunkStreamer(
+                sample_rate=SAMPLE_RATE,
+                chunk_seconds=cfg.stream_chunk_seconds,
+                overlap_seconds=cfg.stream_overlap_seconds,
+                min_seconds=cfg.min_chunk_seconds,
+                partial_interval_seconds=cfg.partial_interval_seconds,
+            )
+
+    def _tx(self, window: np.ndarray) -> Optional[str]:
+        """Transcribe one window to text; ``None`` if the server is busy/cancelled."""
+        try:
+            res = self.server._run_queued_sync(
+                np.ascontiguousarray(window, dtype=np.float32), None
+            )
+        except (_Busy, _Cancelled):
+            return None
+        return res.text
+
+    def stream_step(self, now: float) -> Optional[str]:
+        """Advance the chunked stream; returns text to emit as a partial, or None."""
+        return self.chunker.step(self.samples, now, self._tx)
+
+    def stream_flush(self) -> str:
+        """Finalize all buffered audio (on commit) and return the full text."""
+        return self.chunker.flush(self.samples, self._tx)
 
     def append_pcm(self, pcm16_bytes: bytes) -> None:
         s = _pcm16_bytes_to_float32(pcm16_bytes)
@@ -806,6 +866,8 @@ class StreamSession:
         self.samples = np.zeros(0, dtype=np.float32)
         self.last_partial_text = ""
         self.last_partial_ts = 0.0
+        if self.chunker is not None:
+            self.chunker.reset()
 
     def transcribe_current_sync(self) -> TranscribeResult:
         snapshot = self.samples.copy()
@@ -949,7 +1011,16 @@ def create_app(
                     if mtype == "commit":
                         if sess.buffered_seconds > 0.0:
                             try:
-                                result = await asyncio.to_thread(sess.transcribe_current_sync)
+                                if sess.chunker is not None:
+                                    text = await asyncio.to_thread(sess.stream_flush)
+                                    result = TranscribeResult(
+                                        text=text,
+                                        segments=[{"text": text, "start_s": 0.0,
+                                                   "end_s": sess.buffered_seconds}],
+                                        duration_s=sess.buffered_seconds,
+                                    )
+                                else:
+                                    result = await asyncio.to_thread(sess.transcribe_current_sync)
                             except _Busy:
                                 await ws.send_json({"type": "error", "message": "server busy"})
                                 continue
@@ -988,7 +1059,24 @@ def create_app(
                     sess.append_pcm(bdata)
 
                 now = time.monotonic()
-                if sess.should_emit_partial(now):
+                if sess.chunker is not None:
+                    # Chunked path: finalize full windows + emit committed+tail.
+                    # ChunkStreamer handles throttling and busy (-> None) itself.
+                    text = await asyncio.to_thread(sess.stream_step, now)
+                    if text is not None:
+                        sess.last_partial_ts = now
+                        sess.last_partial_text = text
+                        await ws.send_json(
+                            {
+                                "type": "partial",
+                                "text": text,
+                                "segments": [{"text": text, "start_s": 0.0,
+                                              "end_s": sess.buffered_seconds}],
+                                "start_s": 0.0,
+                                "end_s": sess.buffered_seconds,
+                            }
+                        )
+                elif sess.should_emit_partial(now):
                     try:
                         result = await asyncio.to_thread(sess.transcribe_current_sync)
                     except _Busy:
@@ -1152,7 +1240,16 @@ def _serve_stream_session(
                 if mtype == "commit":
                     if sess.buffered_seconds > 0.0:
                         try:
-                            result = sess.transcribe_current_sync()
+                            if sess.chunker is not None:
+                                _t = sess.stream_flush()
+                                result = TranscribeResult(
+                                    text=_t,
+                                    segments=[{"text": _t, "start_s": 0.0,
+                                               "end_s": sess.buffered_seconds}],
+                                    duration_s=sess.buffered_seconds,
+                                )
+                            else:
+                                result = sess.transcribe_current_sync()
                         except _Busy:
                             _ws_send_json(wfile, {"type": "error", "message": "server busy"})
                             continue
@@ -1188,7 +1285,23 @@ def _serve_stream_session(
                 sess.append_pcm(payload)
 
             now = time.monotonic()
-            if sess.should_emit_partial(now):
+            if sess.chunker is not None:
+                text = sess.stream_step(now)
+                if text is not None:
+                    sess.last_partial_ts = now
+                    sess.last_partial_text = text
+                    _ws_send_json(
+                        wfile,
+                        {
+                            "type": "partial",
+                            "text": text,
+                            "segments": [{"text": text, "start_s": 0.0,
+                                          "end_s": sess.buffered_seconds}],
+                            "start_s": 0.0,
+                            "end_s": sess.buffered_seconds,
+                        },
+                    )
+            elif sess.should_emit_partial(now):
                 try:
                     result = sess.transcribe_current_sync()
                 except _Busy:

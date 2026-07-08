@@ -42,6 +42,8 @@ class MossMegaPipeline:
         encoder_mode: str = "eager",
         compile_decode: bool = True,
     ) -> None:
+        from ..flags import get_default_flags
+
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
@@ -49,6 +51,7 @@ class MossMegaPipeline:
         self.steps_per_replay = steps_per_replay
         self.use_multistep = bool(use_multistep)
         self.compile_decode = bool(compile_decode)
+        self._fp8_active = bool(get_default_flags().fp8_weights)
 
         comps = get_components(model)
         self.fused_encoder = GraphedAudioEncoder(
@@ -73,9 +76,18 @@ class MossMegaPipeline:
             )
 
     def _steps_for_shape(self, prompt_len: int) -> int:
-        """Select K from prompt length unless the caller forced it."""
+        """Select K from prompt length unless the caller forced it.
+
+        With fp8 decode, use a *fixed* K so only one fp8 decode graph is ever
+        captured: ``torch._scaled_mm``'s cuBLASLt workspace aliases across
+        coexisting CUDA graphs, so a second decoder instance (a different K for a
+        different prompt length -- common in variable-length streaming) can
+        corrupt memory.  One instance = one captured fp8 graph = safe.
+        """
         if self.steps_per_replay is not None:
             return max(1, int(self.steps_per_replay))
+        if self._fp8_active:
+            return 4
         return 2 if prompt_len <= 160 else 4
 
     def _get_llm(self, prompt_len: int):
