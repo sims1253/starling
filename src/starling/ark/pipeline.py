@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 from .audio import build_inputs_embeds, build_prompt_ids, extract_mel, read_wav
-from .config import DEFAULT_INSTRUCTION, EOS_TOKEN_ID
+from .config import DEFAULT_INSTRUCTION, ENCODER_MAX_SOURCE_POSITIONS, EOS_TOKEN_ID
 from .encoder_mega import FusedEncoder
 from .loader import get_components
 from .multistep import MultiStepLLMMega
@@ -62,6 +62,25 @@ class MegaPipeline:
         selects K from the prompt length (K=2 short, K=4 medium, K=16 long).
     max_cache_len : int
         Fixed K/V cache length (must fit prompt T + max_new_tokens).
+    shape_bucketing : bool
+        If True (default), right-pad the mel up to a canonical bucket ``mel_T``
+        (next multiple of ``mel_bucket_frames``, capped at the Whisper 3000-frame
+        limit) before the encoder. Diverse clip lengths then hit the SAME
+        captured encoder CUDA graph, so the one-off per-shape capture cost is
+        amortised instead of re-paid (and, crucially, the encoder graph pool
+        stops accumulating one ~GB-scale graph per distinct length -- the cause
+        of the n=50 leaderboard OOM). The padding is trailing zeros (silence,
+        which the Whisper encoder is trained on); the adapter's extra trailing
+        features are truncated back to the natural audio-token count by
+        ``build_inputs_embeds``, so the prompt is unchanged. **Text-byte-exact**
+        on the fixtures (the decoded transcript is identical; the mirror of the
+        parakeet ``shape_bucketing`` fix). Set False for strict per-shape
+        capture.
+    mel_bucket_frames : int
+        Bucket granularity in mel frames (default 512 = ~5.1 s). Clips pad up to
+        the next multiple, capped at 3000 (the encoder's max source positions),
+        collapsing the ~30-distinct-length leaderboard split to ~6 buckets.
+        ``1`` disables bucketing (equivalent to ``shape_bucketing=False``).
     """
 
     def __init__(
@@ -72,6 +91,9 @@ class MegaPipeline:
         encoder_mode: str = "cudagraph",
         steps_per_replay: Optional[int] = None,
         max_cache_len: int = 4096,
+        shape_bucketing: bool = True,
+        mel_bucket_frames: int = 512,
+        prefill_use_graph: bool = False,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -79,6 +101,18 @@ class MegaPipeline:
         self.encoder_mode = encoder_mode
         self.steps_per_replay = steps_per_replay
         self.max_cache_len = int(max_cache_len)
+        # Prefill eager by default: the per-prompt-length prefill graphs are the
+        # dominant memory accumulator on a diverse-length sweep (they overflow
+        # VRAM into WSL shared memory -> RTFx collapse). Eager prefill keeps
+        # memory flat at ~no speed cost; the decode loop stays graphed. Set True
+        # to restore graphed prefill (repeated-length / latency-critical use).
+        self.prefill_use_graph = bool(prefill_use_graph)
+        # Shape bucketing: pad mel up to the next multiple of mel_bucket_frames
+        # (capped at the 3000-frame Whisper limit) so clips of similar length hit
+        # the same captured encoder graph -- bounds the encoder graph pool and
+        # amortises capture. mel_bucket_frames=1 disables it. See class docstring.
+        self.shape_bucketing = bool(shape_bucketing) and int(mel_bucket_frames) > 1
+        self.mel_bucket_frames = max(1, int(mel_bucket_frames))
 
         comps = get_components(model)
         # ONE shared CUDA graph pool for encoder + LLM captures, so LRU eviction
@@ -113,11 +147,40 @@ class MegaPipeline:
                 self._lm_head,
                 max_cache_len=self.max_cache_len,
                 steps_per_replay=k,
+                prefill_use_graph=self.prefill_use_graph,
                 graph_pool=self._graph_pool,
             )
             self._llms[k] = llm
         self.llm = llm
         return llm
+
+    # ------------------------------------------------------------------ #
+    # shape bucketing (pad mel up so diverse lengths share one encoder graph)
+    # ------------------------------------------------------------------ #
+    def _bucket_mel(self, mel: torch.Tensor) -> torch.Tensor:
+        """Right-pad ``mel`` (B, 128, mel_T) up to a canonical bucket ``mel_T``.
+
+        Pads the time axis up to the next multiple of ``mel_bucket_frames``,
+        capped at ``2 * ENCODER_MAX_SOURCE_POSITIONS`` (the 3000-frame Whisper
+        limit -- exceeding it overruns the encoder's positional embeddings). The
+        padding is trailing zeros, so the adapter emits a few extra trailing
+        features that ``build_inputs_embeds`` truncates back to the natural
+        audio-token count -- the prompt and injected slots are unchanged. Returns
+        ``mel`` untouched (no copy) when bucketing is disabled or the length is
+        already on the grid (e.g. long audio already capped at 3000).
+        """
+        if not self.shape_bucketing:
+            return mel
+        mel_T = int(mel.shape[2])
+        g = self.mel_bucket_frames
+        max_T = 2 * ENCODER_MAX_SOURCE_POSITIONS  # 3000: encoder positional cap
+        bucket_T = min(((mel_T + g - 1) // g) * g, max_T)
+        if bucket_T <= mel_T:
+            return mel  # already on the grid / at the cap
+        B, C, _ = mel.shape
+        out = mel.new_zeros((B, C, bucket_T))
+        out[:, :, :mel_T].copy_(mel)
+        return out
 
     # ------------------------------------------------------------------ #
     # convenience constructor
@@ -132,6 +195,9 @@ class MegaPipeline:
         attn_impl: str = "eager",
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
+        shape_bucketing: bool = True,
+        mel_bucket_frames: int = 512,
+        prefill_use_graph: bool = False,
     ) -> "MegaPipeline":
         """Load the model + processor and wrap them in a MegaPipeline."""
         from .loader import load_model_and_processor
@@ -145,6 +211,9 @@ class MegaPipeline:
             encoder_mode=encoder_mode,
             steps_per_replay=steps_per_replay,
             max_cache_len=max_cache_len,
+            shape_bucketing=shape_bucketing,
+            mel_bucket_frames=mel_bucket_frames,
+            prefill_use_graph=prefill_use_graph,
         )
 
     # ------------------------------------------------------------------ #
@@ -192,6 +261,13 @@ class MegaPipeline:
         input_ids = build_prompt_ids(
             self.processor.tokenizer, instruction, n_mel_frames=n_mel_frames
         ).to("cuda")
+
+        # (3b) shape-bucket the mel so diverse clip lengths share ONE captured
+        # encoder graph (bounds the encoder graph pool; amortises capture). The
+        # audio-token count N above derives from the uncapped raw length, so it
+        # is unaffected; the extra trailing adapter features from the padding are
+        # truncated by build_inputs_embeds. Text-byte-exact (see class docstring).
+        mel = self._bucket_mel(mel)
 
         # (4) fused encoder -> audio features (1, N, 2048).
         audio_features = self.fused_encoder(mel)

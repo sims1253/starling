@@ -80,3 +80,55 @@ def test_transcribe_byte_identical_to_golden(pipeline, golden, fixture):
     # transcript text must also match (decoded from the same token ids)
     golden_text = golden[fixture]["text"]
     assert text.strip() == golden_text.strip(), f"{fixture}: transcript text mismatch"
+
+
+def test_bucket_mel_pads_to_grid_and_caps():
+    """`_bucket_mel` rounds mel_T up to the bucket grid, caps at 3000, no-ops
+    when already aligned/disabled. Pure tensor logic -- no model load."""
+    import torch
+
+    from starling.ark.pipeline import MegaPipeline
+
+    p = MegaPipeline.__new__(MegaPipeline)  # bypass __init__ (no model needed)
+    p.shape_bucketing = True
+    p.mel_bucket_frames = 512
+
+    mel = torch.zeros(1, 128, 700)
+    out = p._bucket_mel(mel)
+    assert out.shape[2] == 1024, "700 should pad up to the next 512-multiple (1024)"
+    assert torch.equal(out[:, :, :700], mel), "valid region must be preserved"
+    assert out[:, :, 700:].abs().sum().item() == 0.0, "padding must be zeros"
+
+    # capped at 3000 (2 * ENCODER_MAX_SOURCE_POSITIONS): 2900 -> 3072 -> 3000
+    assert p._bucket_mel(torch.zeros(1, 128, 2900)).shape[2] == 3000
+
+    # already on the grid -> returned unchanged (no copy)
+    on_grid = torch.zeros(1, 128, 1024)
+    assert p._bucket_mel(on_grid) is on_grid
+
+    # disabled -> unchanged
+    p.shape_bucketing = False
+    assert p._bucket_mel(mel) is mel
+
+
+@pytest.mark.parametrize("fixture", ["short", "medium", "long"])
+def test_bucketing_is_text_byte_exact(pipeline, fixture):
+    """Shape-bucketing must not change the decoded transcript.
+
+    Bucketing pads the mel with trailing silence (which the Whisper encoder is
+    trained on) and truncates the extra adapter features, so the emitted text is
+    identical to the strict per-shape (unbucketed) path -- the pipeline's
+    correctness gate, mirroring the parakeet bucketing standard.
+    """
+    wav = _wav(fixture)
+    prev = pipeline.shape_bucketing
+    try:
+        pipeline.shape_bucketing = False
+        ref_text, _ = pipeline.transcribe(wav, max_new_tokens=200)
+        pipeline.shape_bucketing = True
+        buck_text, _ = pipeline.transcribe(wav, max_new_tokens=200)
+    finally:
+        pipeline.shape_bucketing = prev
+    assert buck_text.strip() == ref_text.strip(), (
+        f"{fixture}: bucketed transcript differs from the unbucketed reference"
+    )
