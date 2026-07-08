@@ -11,7 +11,6 @@ CPU-bound stages (gap large => host is the bottleneck, not the GPU).
 from __future__ import annotations
 
 import time
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -38,12 +37,6 @@ def _wav(name: str) -> np.ndarray:
 
 def _evt_pair():
     return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-
-
-@contextmanager
-def _timed_block():
-    """Context manager yielding (dev_times, host_times) lists."""
-    pass
 
 
 def _timed(fn, warmup=3, iters=10):
