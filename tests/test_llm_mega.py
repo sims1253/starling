@@ -217,8 +217,9 @@ def test_fp8_weights_reproduces_golden():
     # fused GEMV's different accumulation order vs cuBLAS can flip a near-tie
     # argmax later in a 100-token decode -- that is expected, not a bug.
     n = min(res.ids[0].numel(), golden_gen.numel())
-    match_len = (res.ids[0][:n] == golden_gen[:n]).cumsum(dim=0).argmin().item() \
-        if not (res.ids[0][:n] == golden_gen[:n]).all() else n
+    eq = res.ids[0][:n] == golden_gen[:n]
+    # length of the leading matching prefix: first mismatch index, or n if none
+    match_len = n if bool(eq.all()) else int((~eq).nonzero()[0].item())
     assert match_len >= 30, (
         f"fp8 diverged too early ({match_len}/{n} tokens match); "
         f"expected >=30 token prefix match. golden={golden_gen[:12].tolist()} "
