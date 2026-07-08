@@ -307,6 +307,17 @@ class ChunkedTranscriber:
         )
         input_features = input_features.to(pipe.dtype)
 
+        # Shape-bucket the mel so chunks of similar length share captured
+        # encoder + decoder graphs (amortises per-shape capture across the
+        # chunk batch + across successive batches). valid_lengths derived from
+        # the bucketed mask are unchanged (padding positions are False); the
+        # decoder stops at the natural lengths, so frame positions used by the
+        # stitch below are byte-exact. See pipeline.MegaParakeetPipeline.
+        if pipe.shape_bucketing:
+            input_features, attention_mask = pipe._maybe_bucket(
+                input_features, attention_mask
+            )
+
         encoder_ms, (pooler, valid_lengths) = _timed(
             lambda: pipe._run_encoder(input_features, attention_mask)
         )
