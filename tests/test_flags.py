@@ -57,6 +57,7 @@ def test_default_flags_preserve_byte_exactness():
     assert f.sdpa_attention is False, "sdpa_attention defaults False"
     assert f.flash_attention is False, "flash_attention defaults False"
     assert f.fp8_attention is False, "fp8_attention defaults False"
+    assert f.fp8_weights is False, "fp8_weights defaults False (requires tolerance)"
     # Ablation flags (wiki-driven). The two byte-exact decode folds default on;
     # every other experimental flag defaults off so the baseline stays exact.
     assert f.rope_alloc_free is True, "rope_alloc_free defaults True (byte-exact)"

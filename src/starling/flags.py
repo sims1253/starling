@@ -135,7 +135,8 @@ class OptFlags:
     near-ties).  **Breaks byte-exactness** in principle (fp8 weight rounding),
     though it reproduces the golden transcript token-for-token on the fixtures;
     requires ``tolerance_mode=True`` and forces ``fused_qkv`` (it reads the
-    pre-concatenated qkv/gate-up weights).  See ``starling.moss.fp8``.
+    pre-concatenated qkv/gate-up weights).  See ``starling.moss.fp8`` /
+    ``starling.granite.fp8`` (shared flag, per-model quant helpers).
 
     **Batch / one-off use only.**  ``torch._scaled_mm`` captured in a CUDA graph
     corrupts intermittently under sustained streaming churn (hundreds of

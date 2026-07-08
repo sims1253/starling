@@ -594,6 +594,32 @@ class FusedLLMMega(LLMMega):
             self._fused = self._fuse_layer_weights()
 
         # ------------------------------------------------------------------
+        # FP8 weight-only quantization (flag-gated, additive). When
+        # ``fp8_weights`` is on we quantize the per-layer projection weights to
+        # fp8e4m3 at load time and replace the bf16 ``F.linear`` calls in
+        # :meth:`_decode_step_eager` with :func:`fp8_linear` (which dispatches
+        # ``torch._scaled_mm`` on Blackwell fp8 tensor cores).  Halves the
+        # weight bandwidth that dominates decode (~57% of the captured step per
+        # the profiler).  NOT byte-exact (fp8 weight rounding); gated by
+        # ``OptFlags.fp8_weights`` (which requires ``tolerance_mode=True`` and
+        # forces ``fused_qkv``).  The lm_head stays bf16.  See
+        # ``starling.granite.fp8``.
+        # ------------------------------------------------------------------
+        self._fp8: Optional[list[dict]] = None
+        if self._flags.fp8_weights:
+            from .fp8 import quantize_weight_e4m3
+            assert self._fused is not None, "fp8_weights requires fused_qkv"
+            self._fp8 = [
+                {
+                    "qkv_w":     quantize_weight_e4m3(f["qkv_w"].detach()),
+                    "gu_w":      quantize_weight_e4m3(f["gu_w"].detach()),
+                    "o_proj":    quantize_weight_e4m3(f["o_proj"].weight.detach()),
+                    "down_proj": quantize_weight_e4m3(f["down_proj"].weight.detach()),
+                }
+                for f in self._fused
+            ]
+
+        # ------------------------------------------------------------------
         # NVFP4 weight quantization (flag-gated, additive). When
         # ``nvfp4_weights`` is on we quantize every GEMM weight to NVFP4 at
         # load time and replace the bf16 ``F.linear`` calls in
@@ -700,8 +726,9 @@ class FusedLLMMega(LLMMega):
         flags = self._flags
         fused = self._fused
         fp4 = self._fp4  # None when nvfp4_weights is off -> default path unchanged
+        fp8 = self._fp8  # None when fp8_weights is off -> default path unchanged
         epi = self._fused_epilogue  # None when gemm_epilogue_fusion is off
-        use_epi = epi is not None and fp4 is None  # fp4 takes precedence
+        use_epi = epi is not None and fp4 is None and fp8 is None  # fp4/fp8 take precedence
 
         # (1) embedding lookup + multiplier
         hidden = self._embed(self.static_input_ids) * _EMB_MULT  # (1, 1, 2048)
@@ -740,8 +767,18 @@ class FusedLLMMega(LLMMega):
 
             if not use_epi:
                 # (use_epi already set qkv/kv/v/o_proj above; otherwise pick the
-                # nvfp4 reference, fused-cuBLAS, or stock-projection path.)
-                if fp4 is not None:
+                # fp8 / nvfp4 reference, fused-cuBLAS, or stock-projection path.)
+                if fp8 is not None:
+                    from .fp8 import fp8_linear
+                    f8 = fp8[idx]
+                    x2 = normed.view(1, -1)
+                    qkv = fp8_linear(x2, f8["qkv_w"][0], f8["qkv_w"][1]).view(-1)
+                    q, kv, v = qkv.split(qkv_split, dim=0)
+                    q = q.view(1, n_q, 1, hd)
+                    kv = kv.view(1, n_kv, 1, hd)
+                    v = v.view(1, n_kv, 1, hd)
+                    o_proj = None  # fp8 o-proj is dispatched at its call site
+                elif fp4 is not None:
                     from .fp4 import _fp4_linear_fused
                     f4 = fp4["layers"][idx] if fp4["layers"] else None
                     x2 = normed.view(1, -1)
@@ -795,7 +832,11 @@ class FusedLLMMega(LLMMega):
 
             # reshape + output projection
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, n_q * hd)
-            if fp4 is not None:
+            if fp8 is not None:
+                from .fp8 import fp8_linear
+                f8 = fp8[idx]
+                attn_out = fp8_linear(attn_out.view(1, -1), f8["o_proj"][0], f8["o_proj"][1]).view(1, 1, -1)
+            elif fp4 is not None:
                 from .fp4 import _fp4_linear_fused
                 f4 = fp4["layers"][idx] if fp4["layers"] else None
                 attn_out = _fp4_linear_fused(attn_out, f4["o_proj"]) if f4 is not None else o_proj(attn_out)
@@ -823,7 +864,16 @@ class FusedLLMMega(LLMMega):
                 normed = k.fused_rmsnorm(hidden, layer.post_attention_layernorm.weight, self._rms_eps)
 
             if not use_epi:
-                if fp4 is not None:
+                if fp8 is not None:
+                    from .fp8 import fp8_linear
+                    f8 = fp8[idx]
+                    x3 = normed.view(1, -1)
+                    gu = fp8_linear(x3, f8["gu_w"][0], f8["gu_w"][1]).view(-1)
+                    gate, up = gu.split([inter, inter], dim=0)
+                    gate = gate.view(1, 1, inter)
+                    up = up.view(1, 1, inter)
+                    down_proj = None  # fp8 down-proj is dispatched at its call site
+                elif fp4 is not None:
                     from .fp4 import _fp4_linear_fused
                     f4 = fp4["layers"][idx] if fp4["layers"] else None
                     x3 = normed.view(1, -1)
@@ -853,8 +903,12 @@ class FusedLLMMega(LLMMega):
             # fused SwiGLU: silu(gate) * up
             act = k.fused_silu_mul(gate, up)
 
-            # down projection (cuBLAS bf16 GEMM, or fused fp4 dequant-GEMV)
-            if fp4 is not None:
+            # down projection (fp8 / fp4 dequant-GEMV, or cuBLAS bf16 GEMM)
+            if fp8 is not None:
+                from .fp8 import fp8_linear
+                f8 = fp8[idx]
+                mlp_out = fp8_linear(act.view(1, -1), f8["down_proj"][0], f8["down_proj"][1]).view(1, 1, -1)
+            elif fp4 is not None:
                 from .fp4 import _fp4_linear_fused
                 f4 = fp4["layers"][idx] if fp4["layers"] else None
                 mlp_out = _fp4_linear_fused(act, f4["down_proj"]) if f4 is not None else down_proj(act)
