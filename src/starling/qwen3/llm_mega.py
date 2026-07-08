@@ -100,6 +100,7 @@ class LLMMega:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         eos_token_id: int = 151645,
+        prefill_use_graph: bool = True,
     ) -> None:
         self.lm = language_model
         self.lm_head = lm_head
@@ -109,6 +110,14 @@ class LLMMega:
         self.device = device
         self.dtype = dtype
         self.eos_token_id = int(eos_token_id)
+        # Prefill graphs are captured per prompt length T (cap 8, evict+reset).
+        # On a diverse-length sweep (~50 distinct T/dataset) that churn corrupts
+        # the CUDA-graph allocator and surfaces as an illegal memory access a few
+        # datasets in. Prefill is a one-shot compute-bound forward, so graphing
+        # it saves only launch overhead; run it eager to keep the allocator quiet.
+        # The decode loop stays graphed. Byte-exact either way (both run the
+        # model's own layers). See MegaPipeline.prefill_use_graph.
+        self.prefill_use_graph = bool(prefill_use_graph)
 
         self.vocab_size = int(self.config.vocab_size)
         self.num_layers = int(self.config.num_hidden_layers)
@@ -292,7 +301,7 @@ class LLMMega:
         if max_new_tokens <= 0:
             return self._finalize([], 0.0, tokenizer)
 
-        next_token = self.prefill(inputs_embeds)
+        next_token = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)
         gen_ids = [int(next_token.item())]
         if max_new_tokens <= 1:
             return self._finalize(gen_ids, 0.0, tokenizer)
@@ -351,7 +360,7 @@ class LLMMega:
         prefill_ms = self._cuda_timer(_prefill, warmup=3, iters=10)
 
         self._reset_cache_pos(0)
-        first_tok = self.prefill(inputs_embeds)
+        first_tok = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)
         self.capture(first_tok, T)
         self.static_input_ids.copy_(first_tok.reshape(1, 1))
         self.static_position_ids.copy_(torch.tensor([[T]], device=self.device))
