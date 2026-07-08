@@ -85,6 +85,43 @@ class MegaParakeetPipeline:
             yield K=16, so existing callers see no regression. The resolved
             config is exposed as ``self.config`` (with ``self.steps_per_replay``
             and ``self.chunk_batch_size`` convenience aliases).
+        shape_bucketing: if True (default), right-pad mel features up to a
+            canonical bucket ``T_mel`` (next multiple of ``mel_bucket_frames``)
+            before the encoder. Every clip in the same bucket then hits the SAME
+            captured encoder + decoder CUDA graphs, so the one-off per-shape
+            graph-capture cost (~165 ms encoder + ~170 ms decoder) is amortised
+            across clips instead of re-paid on every clip. This is the fix for
+            the leaderboard RTFx collapse: real audio has ~all-distinct lengths,
+            so without bucketing each clip re-captures (~20x slower than the
+            repeated-shape ``bench_all`` numbers). Bucketing collapses the
+            distinct shape count from N_clips to ~N_buckets.
+
+            **Correctness (measured on the worktree):** bucketing is
+            **text-byte-exact** on all fixtures -- the decoder still stops at the
+            NATURAL ``valid_lengths`` (never reads padded frames), so emitted
+            text is identical. The encoder output tensor for valid frames can
+            drift by up to ~0.5 in bf16 because padded frames participate in
+            full self-attention, and the raw emitted token-id stream may gain an
+            extra blank token that ``skip_special_tokens=True`` strips -- but the
+            decoded transcript is identical, which is the pipeline's correctness
+            gate (same standard as the ``compiled`` encoder mode). Set False to
+            disable bucketing (strict per-shape capture; byte-exact tensor
+            output, but ~20x slower on diverse-length workloads).
+        mel_bucket_frames: bucket granularity in mel frames. Clips are padded up
+            to the next multiple of this so diverse lengths share captured
+            graphs. Default ``1024`` (= 128 encoder frames at 8x subsampling):
+            measured optimal on the RTX 5090, collapsing the ~30-distinct-length
+            leaderboard split to ~4 buckets and recovering ~500x RTFx (vs ~20x
+            unbucketed). Smaller = more buckets (more captures); ``1`` disables.
+            Padding waste is bounded by one bucket-1 frames worst case (≤1.3s
+            audio equiv at 1024), so coarse buckets cost little extra compute.
+
+    Shape-bucketing and the chunker
+    -------------------------------
+    :class:`~starling.parakeet.chunking.ChunkedTranscriber` drives the pipeline's
+    sub-stages directly and passes whole chunks (already near ``chunk_seconds``
+    long, i.e. a small set of similar lengths). Bucketing applies there too and
+    recovers the same amortisation for long-audio transcription.
     """
 
     def __init__(
@@ -97,6 +134,8 @@ class MegaParakeetPipeline:
         config: KernelConfig | None = None,
         autotune: bool = True,
         max_cached_shapes: int = 512,
+        shape_bucketing: bool = True,
+        mel_bucket_frames: int = 1024,
     ) -> None:
         # Local import: constructing the pipeline pays the HF import cost; keep
         # it out of module import time so `import pipeline` is cheap.
@@ -153,6 +192,15 @@ class MegaParakeetPipeline:
         # doesn't accumulate unbounded graph pools (which thrash the allocator
         # and crater RTFx on later datasets — see the leaderboard RTFx anomaly).
         self.max_cached_shapes = int(max_cached_shapes)
+        # Shape bucketing: pad mel up to the next multiple of mel_bucket_frames
+        # so clips of similar length hit the SAME captured encoder + decoder
+        # graphs (amortising per-shape capture across the leaderboard sweep).
+        # mel_bucket_frames=1 disables bucketing. See __init__ docstring.
+        self.shape_bucketing = bool(shape_bucketing)
+        # The Conformer subsamples 8x; bucket on a mel granularity that keeps
+        # T_enc on a clean grid. 1024 mel frames -> 128 encoder frames; measured
+        # optimal on the RTX 5090 (~4 buckets for the leaderboard split).
+        self.mel_bucket_frames = max(1, int(mel_bucket_frames))
         # ONE shared CUDA graph pool for ALL encoder + decoder captures in this
         # pipeline. With a shared pool, evicting one graph (``del graph``) frees
         # only that graph's blocks from the pool; the pool (and other graphs)
@@ -218,6 +266,42 @@ class MegaParakeetPipeline:
         return dec
 
     # ------------------------------------------------------------------ #
+    # shape bucketing (pad mel up so diverse lengths share captured graphs)
+    # ------------------------------------------------------------------ #
+    def _maybe_bucket(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Right-pad mel features + mask up to a canonical bucket ``T_mel``.
+
+        Returns ``(bucketed_features, bucketed_mask)``. If bucketing is disabled
+        (``self.shape_bucketing is False``) or the input is already at a bucket
+        boundary, the inputs are returned unchanged (no copy). The padded mask
+        positions are ``False``, so the ``valid_lengths`` the encoder derives
+        from it are unchanged -- the decoder stops at the same place regardless
+        of padding. See the class docstring for the correctness argument.
+        """
+        if not self.shape_bucketing:
+            return input_features, attention_mask
+        T_mel = int(input_features.shape[1])
+        g = self.mel_bucket_frames
+        bucket_T = ((T_mel + g - 1) // g) * g
+        if bucket_T == T_mel:
+            return input_features, attention_mask  # already on the grid
+        B = int(input_features.shape[0])
+        F = int(input_features.shape[2])
+        feats_b = torch.zeros(
+            (B, bucket_T, F), dtype=input_features.dtype, device=input_features.device
+        )
+        feats_b[:, :T_mel].copy_(input_features)
+        mask_b = torch.zeros(
+            (B, bucket_T), dtype=attention_mask.dtype, device=attention_mask.device
+        )
+        mask_b[:, :T_mel].copy_(attention_mask)
+        return feats_b, mask_b
+
+    # ------------------------------------------------------------------ #
     # encoder dispatch (graphed / compiled / eager)
     # ------------------------------------------------------------------ #
     def _run_encoder(
@@ -267,6 +351,17 @@ class MegaParakeetPipeline:
         input_features, attention_mask = self.mel(audio_list)
         input_features = input_features.to(self.dtype)
 
+        # (1b) shape-bucket: pad mel up to a canonical T_mel so diverse clip
+        # lengths share captured encoder + decoder graphs (amortises per-shape
+        # capture across the leaderboard sweep). valid_lengths are derived from
+        # the bucketed mask, but padding positions are False so they sum to the
+        # natural per-element length -- the decoder stops at the same place,
+        # and text is byte-exact (see class docstring).
+        if self.shape_bucketing:
+            input_features, attention_mask = self._maybe_bucket(
+                input_features, attention_mask
+            )
+
         # (2) 24-layer Conformer encoder -> projector pooler output (graphed or
         # eager; both byte-exact). Graph capture is shape-keyed and amortised.
         pooler, valid_lengths = self._run_encoder(input_features, attention_mask)
@@ -308,6 +403,13 @@ class MegaParakeetPipeline:
             lambda: self.mel(audio_list)
         )
         input_features = input_features.to(self.dtype)
+
+        # (1b) shape-bucket (untimed: a cheap zero-pad, ~tens of us; counting
+        # it in mel_ms would conflate it with the real mel work).
+        if self.shape_bucketing:
+            input_features, attention_mask = self._maybe_bucket(
+                input_features, attention_mask
+            )
 
         # (2) encoder (graphed or eager; graph capture is shape-keyed + amortised,
         # so after warmup _run_encoder is a dict lookup + graph replay)

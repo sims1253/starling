@@ -127,7 +127,7 @@ excluded, single RTX 5090.
 | granite-speech-4.1-2b      | stock transformers | 6x          | 6x    | 6x           | 5x           | 5x                  | 5x                  | 5x           |
 | moss-transcribe-preview-2b | starling           | 52x         | 38x   | 51x          | 41x          | 55x                 | 51x                 | 58x          |
 | moss-transcribe-preview-2b | stock transformers | 7x          | 6x    | 6x           | 6x           | 6x                  | 6x                  | 6x           |
-| parakeet-tdt-0.6b-v3       | starling           | 87x         | 46x   | 91x          | 51x          | 86x                 | 122x                | 750x         |
+| parakeet-tdt-0.6b-v3       | starling           | 499x        | 300x  | 1265x        | 933x         | 1227x                | 1168x                | 913x         |
 | parakeet-tdt-0.6b-v3       | stock transformers | 56x         | 51x   | 72x          | 44x          | 60x                 | 46x                 | 45x          |
 | ark-asr-3b                 | starling           | 46x         | 29x   | 42x          | 28x          | 41x                 | 37x                 | 50x          |
 | ark-asr-3b                 | stock transformers | 9x          | 5x    | 6x           | 5x           | 6x                  | 5x                  | 5x           |
@@ -137,9 +137,12 @@ excluded, single RTX 5090.
 | qwen3-asr-1.7b             | stock transformers | 6x          | 6x    | 6x           | 4x           | 5x                  | 4x                  | 4x           |
 <!-- BENCH:WER:END -->
 
-*Granite, moss, qwen3, cohere use 50 clips/dataset; parakeet and ark use 10
-(their graphed pipelines can't yet evict CUDA graphs at high shape diversity,
-so per-clip capture cost depresses their RTFx). WER remains meaningful and
+*Granite, moss, qwen3, cohere use 50 clips/dataset; ark uses 10 (its graphed
+pipeline can't yet evict CUDA graphs at high shape diversity, so per-clip
+capture cost depresses its RTFx). Parakeet also uses 10 but its pipeline now
+**shape-buckets** the mel (pads up to a canonical frame count) so diverse clip
+lengths share captured encoder + decoder graphs — RTFx is no longer
+capture-bound (300–1265× across datasets). WER remains meaningful and
 byte-exact starling-vs-stock at N=10.*
 
 ## What did not work
