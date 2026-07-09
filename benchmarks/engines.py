@@ -676,16 +676,25 @@ class ArkStock(Engine):
 # cohere-transcribe-03-2026  (seq2seq encoder-decoder)
 # ====================================================================== #
 class CohereStarling(Engine):
-    """starling fused pipeline for cohere-transcribe (graphed FastConformer
-    encoder + K-step graphed seq2seq decode over an EncoderDecoderCache)."""
+    """starling fused pipeline for cohere-transcribe (FastConformer encoder +
+    K-step graphed seq2seq decode over an EncoderDecoderCache).
+
+    ``COHERE_SHAPE_BUCKETING=1`` additionally buckets the mel so the encoder graph
+    is shared across clip lengths. That is ~1.5-2.5x faster but not byte-exact (it
+    grows the post-subsampling length, retiling the conformer's bf16 reductions);
+    see ``CohereMegaPipeline``.
+    """
 
     def __init__(self) -> None:
         super().__init__("starling", "cohere", supports_batch=False)
 
     def _load(self) -> None:
+        import os
+
         from starling.cohere.pipeline import CohereMegaPipeline
 
-        self.pipe = CohereMegaPipeline.from_pretrained()
+        bucket = os.environ.get("COHERE_SHAPE_BUCKETING", "") not in ("", "0")
+        self.pipe = CohereMegaPipeline.from_pretrained(shape_bucketing=bucket)
 
     def _release(self) -> None:
         self.pipe = None
