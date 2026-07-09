@@ -120,6 +120,7 @@ class CohereMegaPipeline:
         # bug this class documents. Default to following ``shape_bucketing``.
         if use_graphed_encoder is None:
             use_graphed_encoder = self.shape_bucketing
+        self._encoder_warmup_iters = int(encoder_warmup_iters)
         self.encoder = GraphedEncoder(
             model.model.encoder, warmup_iters=encoder_warmup_iters
         ) if use_graphed_encoder else None
@@ -235,6 +236,23 @@ class CohereMegaPipeline:
             enc_mask[..., s_nat:] = torch.finfo(enc_h.dtype).min
             enc_h[:, s_nat:].zero_()
         return enc_h, enc_mask
+
+    def set_graphed_encoder(self, on: bool) -> None:
+        """Toggle the graphed (vs eager) encoder at runtime (byte-exact either way).
+
+        The 48-layer conformer encoder graph captures once per distinct mel
+        shape: a big win when the shape repeats (fixed-chunk streaming, or a long
+        file split into many same-size chunks) but a per-clip re-capture cost on
+        diverse/one-off audio. ``cross_attn_bucketing`` (the byte-exact decoder
+        graph share) stays on regardless. Idempotent -- only (re)builds/tears
+        down when the state actually changes.
+        """
+        if bool(on) == (self.encoder is not None):
+            return
+        self.encoder = (
+            GraphedEncoder(self.model.model.encoder, warmup_iters=self._encoder_warmup_iters)
+            if on else None
+        )
 
     # ------------------------------------------------------------------ #
     def _encode(self, input_features: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

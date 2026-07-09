@@ -152,6 +152,19 @@ class MegaPipeline:
             self._llms_by_k[k] = llm
         return llm
 
+    def set_prefill_use_graph(self, on: bool) -> None:
+        """Toggle graphed vs eager prefill at runtime (byte-exact either way).
+
+        Graphed prefill amortises across repeated prompt lengths (fixed-chunk
+        streaming) but re-captures (and churns the allocator) on diverse audio;
+        eager avoids it. The server flips this per request mode. Updates the flag
+        for future decoders and every already-cached one.
+        """
+        on = bool(on)
+        self.prefill_use_graph = on
+        for llm in self._llms_by_k.values():
+            llm.prefill_use_graph = on
+
     # ------------------------------------------------------------------ #
     # merge step (byte-exact replica of Qwen3ASRModel.forward scatter)
     # ------------------------------------------------------------------ #

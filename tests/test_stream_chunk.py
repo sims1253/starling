@@ -143,7 +143,8 @@ def test_streamsession_chunked_integration():
                 min_chunk_seconds=5, partial_interval_seconds=3,
             )
 
-        def _run_queued_sync(self, window, _rid):
+        def _run_queued_sync(self, window, _rid, *, streaming=False):
+            assert streaming is True, "chunked stream path should request streaming mode"
             start_s = float(window[0]) / SR
             end_s = start_s + len(window) / SR
             txt = " ".join(w for (w, t) in words if start_s <= t < end_s)

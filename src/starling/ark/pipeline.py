@@ -154,6 +154,20 @@ class MegaPipeline:
         self.llm = llm
         return llm
 
+    def set_prefill_use_graph(self, on: bool) -> None:
+        """Toggle graphed vs eager prefill at runtime (byte-exact either way).
+
+        Graphed prefill amortises across repeated prompt lengths (fixed-chunk
+        streaming) but re-captures per length on diverse audio; eager avoids the
+        capture. The server flips this per request mode. Updates the flag for
+        future decoders and every already-cached one, so the change takes effect
+        on the next transcribe.
+        """
+        on = bool(on)
+        self.prefill_use_graph = on
+        for llm in self._llms.values():
+            llm.prefill_use_graph = on
+
     # ------------------------------------------------------------------ #
     # shape bucketing (pad mel up so diverse lengths share one encoder graph)
     # ------------------------------------------------------------------ #

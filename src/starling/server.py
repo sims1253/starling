@@ -140,6 +140,23 @@ class ModelBackend:
         """Default warmup: one transcribe on a short silent clip."""
         self.transcribe(samples)
 
+    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
+        """Pick graphed vs eager for the coming transcribe. No-op by default;
+        backends whose pipelines expose the toggle (ark/qwen3/cohere) override."""
+
+    def _want_graphed(self, *, streaming: bool, duration_s: float, chunked: bool) -> bool:
+        """Resolve the adaptive graph policy (see ServerConfig.graph_mode)."""
+        mode = getattr(self.config, "graph_mode", "auto")
+        if mode == "graphed":
+            return True
+        if mode == "eager":
+            return False
+        if streaming:
+            return True  # fixed-window stream -> one recurring shape -> amortises
+        if chunked and duration_s >= float(getattr(self.config, "file_graph_min_seconds", 60.0)):
+            return True  # long file -> many same-size chunks -> amortises
+        return False     # one-shot / short file -> capture never amortises
+
 
 class GraniteBackend(ModelBackend):
     """granite-speech-4.1-2b: chunked transcribe + optional self-speculation."""
@@ -366,6 +383,12 @@ class Qwen3Backend(ModelBackend):
         self.processor = processor
         self._build_inputs = build_inputs
 
+    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
+        # Single-shot per request (like ark): graphed prefill only for streaming.
+        self.pipe.set_prefill_use_graph(
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=False)
+        )
+
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         import torch
 
@@ -405,6 +428,13 @@ class ArkBackend(ModelBackend):
 
         self.pipe = MegaPipeline.from_pretrained()
 
+    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
+        # Single-shot per request: graphed prefill only amortises across repeated
+        # stream chunks, so file requests stay eager regardless of length.
+        self.pipe.set_prefill_use_graph(
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=False)
+        )
+
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         assert self.pipe is not None
         if samples.ndim != 1:
@@ -435,6 +465,14 @@ class CohereBackend(ModelBackend):
         from .cohere.pipeline import CohereMegaPipeline
 
         self.pipe = CohereMegaPipeline.from_pretrained()
+
+    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
+        # Chunks internally, so a long file yields many same-size encoder shapes;
+        # graph the encoder for streaming or long files, eager otherwise. The
+        # byte-exact cross-attn (decoder-graph) bucketing stays on regardless.
+        self.pipe.set_graphed_encoder(
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
+        )
 
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         assert self.pipe is not None
@@ -565,6 +603,18 @@ class ServerConfig:
     encoder_mode: str = "cudagraph"
     use_fused_llm: bool = True
     attn_impl: str = "eager"
+    # Adaptive CUDA-graph policy (backends that support it: ark, qwen3, cohere).
+    # A graph capture only pays off when the same shape recurs enough to amortise
+    # it, so the server picks per request mode:
+    #   * ``/stream`` (fixed stream_chunk_seconds windows -> one recurring shape)
+    #     uses the graphed path.
+    #   * ``/inference`` / ``/transcribe`` (one-shot file) uses eager, unless the
+    #     file is long enough to be chunked into many same-size windows
+    #     (``duration >= file_graph_min_seconds``), in which case graphed wins.
+    # ``graph_mode`` overrides the auto policy: "auto" (default) | "graphed" |
+    # "eager". Both paths are byte-exact; this only trades capture cost vs reuse.
+    graph_mode: str = "auto"
+    file_graph_min_seconds: float = 60.0
 
 
 @dataclass
@@ -645,13 +695,18 @@ class StarlingServer:
     # ------------------------------------------------------------------ #
     # inference core (callers acquire the GPU lock)
     # ------------------------------------------------------------------ #
-    def _transcribe_np(self, samples: np.ndarray) -> TranscribeResult:
+    def _transcribe_np(self, samples: np.ndarray, *, streaming: bool = False) -> TranscribeResult:
         """Transcribe a 1-D float32 mono numpy array via the loaded backend.
 
         The GPU lock is NOT taken here; callers wrap the call so the lock scope
-        stays tight.
+        stays tight. ``streaming`` selects the backend's adaptive CUDA-graph
+        policy (fixed stream chunks -> graphed; one-shot file -> eager unless
+        long); a no-op for backends without the toggle.
         """
         assert self._loaded and self.backend is not None
+        self.backend.set_graph_mode(
+            streaming=streaming, duration_s=len(samples) / SAMPLE_RATE
+        )
         return self.backend.transcribe(samples)
 
     # ------------------------------------------------------------------ #
@@ -674,7 +729,7 @@ class StarlingServer:
         return self._run_queued_sync(samples, request_id)
 
     def _run_queued_sync(
-        self, samples: np.ndarray, request_id: Optional[str]
+        self, samples: np.ndarray, request_id: Optional[str], *, streaming: bool = False
     ) -> TranscribeResult:
         ctx = RequestContext(request_id)
         with self._lock:
@@ -683,14 +738,14 @@ class StarlingServer:
             self._n_waiters += 1
             self._requests[ctx.id] = ctx
         try:
-            return self._serial_run(ctx, samples)
+            return self._serial_run(ctx, samples, streaming=streaming)
         finally:
             with self._lock:
                 self._n_waiters = max(0, self._n_waiters - 1)
                 self._requests.pop(ctx.id, None)
 
     def _serial_run(
-        self, ctx: "RequestContext", samples: np.ndarray
+        self, ctx: "RequestContext", samples: np.ndarray, *, streaming: bool = False
     ) -> TranscribeResult:
         from .parakeet.gpu_lock import GpuLockBusy, acquire_gpu_lock, release_gpu_lock
 
@@ -712,7 +767,7 @@ class StarlingServer:
 
         ctx.state = "running"
         try:
-            return self._transcribe_np(samples)
+            return self._transcribe_np(samples, streaming=streaming)
         finally:
             release_gpu_lock()
 
@@ -823,7 +878,7 @@ class StreamSession:
         """Transcribe one window to text; ``None`` if the server is busy/cancelled."""
         try:
             res = self.server._run_queued_sync(
-                np.ascontiguousarray(window, dtype=np.float32), None
+                np.ascontiguousarray(window, dtype=np.float32), None, streaming=True
             )
         except (_Busy, _Cancelled):
             return None
