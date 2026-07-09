@@ -31,7 +31,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -53,7 +53,8 @@ class SkipCell(Exception):
         self.reason = reason
 
 # CrispASR install (absent -> crispasr-* engines are silently skipped).
-ASR_BENCH = Path("/home/m0hawk/asr-bench")
+# Override on other machines with ASR_BENCH_ROOT=/path/to/asr-bench.
+ASR_BENCH = Path(os.environ.get("ASR_BENCH_ROOT", Path.home() / "asr-bench")).expanduser()
 CRISPASR_BIN = ASR_BENCH / "bin" / "crispasr-linux-x86_64-cuda13" / "crispasr"
 CRISPASR_MODELS = ASR_BENCH / "models"
 _CRISPASR_ENV = {
@@ -215,7 +216,6 @@ class GraniteStarlingBatched(Engine):
         super().__init__("starling (batched)", "granite", supports_batch=True)
 
     def _load(self) -> None:
-        from starling.granite.batched import BatchedPipeline
         from starling.granite.loader import load_model_and_processor
 
         # BatchedPipeline needs the raw model + processor (not MegaPipeline).
@@ -439,8 +439,6 @@ class MossStarling(Engine):
         self.pipe = None
 
     def _run_one(self, audio: np.ndarray) -> str:
-        from starling.moss.loader import load_model_and_processor
-
         inp = self.pipe.processor(audio.astype("float32"))
         inp = {
             k: (v.cuda() if isinstance(v, torch.Tensor) else v)
@@ -517,8 +515,6 @@ class Qwen3Starling(Engine):
         self.pipe = None
 
     def _run_one(self, audio: np.ndarray) -> str:
-        import torchaudio
-
         wav = torch.from_numpy(audio).float().unsqueeze(0)
         inp = self._build_inputs(self.pipe.processor, wav, sr=16000)
         text, _ = self.pipe.transcribe(

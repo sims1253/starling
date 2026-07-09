@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import time
+import os
 from pathlib import Path
 
 import numpy as np
@@ -26,9 +27,9 @@ sys.path.insert(0, str(REPO / "src"))
 
 from starling.parakeet.gpu_lock import with_gpu_lock  # noqa: E402
 
-FX_ROOT = REPO if (REPO / "tests" / "fixtures" / "short.wav").exists() else Path(
-    "/home/m0hawk/Documents/starling"
-)
+FIXTURES = Path(
+    os.environ.get("STARLING_FIXTURES_DIR", REPO / "tests" / "fixtures")
+).expanduser()
 
 
 def _synth_clip(seconds: float, sr: int = 16000) -> np.ndarray:
@@ -41,7 +42,7 @@ def _synth_clip(seconds: float, sr: int = 16000) -> np.ndarray:
 def _load_wav(name: str):
     import soundfile as sf
 
-    wav, sr = sf.read(str(FX_ROOT / "tests" / "fixtures" / f"{name}.wav"))
+    wav, sr = sf.read(str(FIXTURES / f"{name}.wav"))
     if wav.ndim > 1:
         wav = wav.mean(1)
     return np.ascontiguousarray(wav.astype(np.float32)), sr

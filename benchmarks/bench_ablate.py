@@ -43,8 +43,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from starling.flags import OptFlags, flags, get_default_flags, set_default_flags  # noqa: E402
-from starling.granite.golden import load_golden, load_golden_text  # noqa: E402
+from starling.flags import OptFlags, get_default_flags, set_default_flags  # noqa: E402
+from starling.granite.golden import load_golden  # noqa: E402
 from starling.granite.llm_mega import FusedLLMMega  # noqa: E402
 from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
 
@@ -165,6 +165,19 @@ def main() -> int:
     ap.add_argument("--flag", default=None, help="ablate only this one flag")
     args = ap.parse_args()
 
+    from starling.parakeet.gpu_lock import with_gpu_lock
+
+    with with_gpu_lock(
+        session="bench-ablate",
+        model="granite-speech-4.1-2b",
+        eta_min=30,
+        note=f"ablation ({args.mode})",
+    ):
+        return _main_locked(args)
+
+
+def _main_locked(args) -> int:
+
     print("loading granite model + golden artefacts ...", flush=True)
     model = processor = inputs_embeds = golden_ids = None
     if args.mode == "decode_step":
@@ -268,7 +281,6 @@ def _bench_long_audio(combo: dict, wav: torch.Tensor, sr: int, trials: int = 3) 
 
 def _main_long_audio(args, flag_set) -> int:
     """End-to-end long-audio ablation. Times wall-clock transcription."""
-    import soundfile as sf
     from starling.granite.audio import load_sample_audio
 
     # Build a long fixture: tile the sample clip to ~5 min.

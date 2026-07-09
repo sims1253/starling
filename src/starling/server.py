@@ -35,11 +35,15 @@ import hashlib
 import io
 import json
 import logging
+import math
 import struct
 import threading
 import time
+import uuid
 import wave
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
@@ -85,6 +89,12 @@ MAX_WAITERS: int = 8
 
 CANCEL_POLL_SECONDS: float = 0.1
 
+DEFAULT_MAX_UPLOAD_BYTES: int = 256 * 1024 * 1024
+"""Maximum accepted HTTP request body (256 MiB, before multipart decoding)."""
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS: float = 10 * 60.0
+"""Wall-clock deadline covering both queueing and model execution."""
+
 WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
@@ -125,6 +135,8 @@ class ModelBackend:
         self.pipe: Any = None
         self.processor: Any = None
         self.chunker: Any = None
+        self._cancel_event: Optional[threading.Event] = None
+        self._deadline: float = float("inf")
 
     @property
     def loaded(self) -> bool:
@@ -157,6 +169,56 @@ class ModelBackend:
             return True  # long file -> many same-size chunks -> amortises
         return False     # one-shot / short file -> capture never amortises
 
+    def _check_stopped(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise _Cancelled()
+        if time.monotonic() >= self._deadline:
+            raise _DeadlineExceeded()
+
+    def _decode_budget(self, duration_s: float) -> int:
+        """Scale the decode cap down for short chunks without exceeding the CLI cap."""
+        estimated = max(1, math.ceil(duration_s * 5.0) + 32)
+        return min(max(1, int(self.config.max_new_tokens)), estimated)
+
+    def _effective_chunk_seconds(self, fallback: float = DEFAULT_MAX_CHUNK_SECONDS) -> float:
+        configured = max(0.1, float(self.config.max_chunk_seconds or fallback))
+        token_limited = max(0.1, (int(self.config.max_new_tokens) - 32) / 5.0)
+        return min(configured, token_limited)
+
+    def _configured_chunk_seconds(self) -> float:
+        return max(
+            0.1,
+            float(self.config.max_chunk_seconds or DEFAULT_MAX_CHUNK_SECONDS),
+        )
+
+    def _transcribe_chunked(
+        self,
+        samples: np.ndarray,
+        transcribe_chunk,
+    ) -> "TranscribeResult":
+        """Run a single-shot backend over bounded waveform chunks."""
+        audio = np.ascontiguousarray(samples.reshape(-1), dtype=np.float32)
+        audio_seconds = len(audio) / SAMPLE_RATE
+        # A user can raise --max-chunk-seconds, but the token cap must never
+        # make that silently truncate output. Split again when the estimated
+        # transcript would consume the configured decode budget.
+        chunk_seconds = self._effective_chunk_seconds()
+        chunk_size = max(1, int(round(chunk_seconds * SAMPLE_RATE)))
+        texts: list[str] = []
+        segments: list[dict[str, Any]] = []
+        for start in range(0, len(audio), chunk_size):
+            self._check_stopped()
+            end = min(start + chunk_size, len(audio))
+            chunk = np.ascontiguousarray(audio[start:end])
+            text = transcribe_chunk(chunk, self._decode_budget(len(chunk) / SAMPLE_RATE))
+            texts.append(text)
+            segments.append(
+                {"text": text, "start_s": start / SAMPLE_RATE, "end_s": end / SAMPLE_RATE}
+            )
+        self._check_stopped()
+        joined = " ".join(" ".join(texts).split())
+        return TranscribeResult(text=joined, segments=segments, duration_s=audio_seconds)
+
 
 class GraniteBackend(ModelBackend):
     """granite-speech-4.1-2b: chunked transcribe + optional self-speculation."""
@@ -187,16 +249,17 @@ class GraniteBackend(ModelBackend):
             samples = samples.reshape(-1)
         wav = torch.from_numpy(np.ascontiguousarray(samples)).float().unsqueeze(0).contiguous()
         sr = SAMPLE_RATE
-        max_chunk = self.config.max_chunk_seconds or DEFAULT_CHUNK_SECONDS
+        max_chunk = self._effective_chunk_seconds(DEFAULT_CHUNK_SECONDS)
         audio_seconds = wav.shape[1] / sr
 
         if audio_seconds <= max_chunk:
+            self._check_stopped()
             inputs = build_inputs(self.processor, wav)
             text, _ = self.pipe.transcribe(
                 inputs["input_features"],
                 inputs["input_ids"],
                 inputs.get("input_features_mask"),
-                max_new_tokens=self.config.max_new_tokens,
+                max_new_tokens=self._decode_budget(audio_seconds),
                 speculative=self.config.speculative,
             )
             return TranscribeResult(
@@ -210,12 +273,19 @@ class GraniteBackend(ModelBackend):
         max_cache_len = int(getattr(self.pipe.llm, "max_cache_len", 640))
         dtype = self.pipe.dtype
         for chunk_wav, start, end, _idx in chunk_audio(wav, sr, max_chunk):
+            self._check_stopped()
             inputs = build_inputs(self.processor, chunk_wav)
             feats = inputs["input_features"].to(dtype)
             ids = inputs["input_ids"]
             mask = inputs.get("input_features_mask")
             prompt_len = int(ids.shape[1])
-            budget = max(1, min(self.config.max_new_tokens, max_cache_len - prompt_len - 1))
+            budget = max(
+                1,
+                min(
+                    self._decode_budget(end - start),
+                    max_cache_len - prompt_len - 1,
+                ),
+            )
             text, _ = self.pipe.transcribe(
                 feats, ids, mask,
                 max_new_tokens=budget,
@@ -241,14 +311,34 @@ class ParakeetBackend(ModelBackend):
         self.pipe = MegaParakeetPipeline()
         self.processor = self.pipe.processor
 
+    def _get_chunker(self):
+        assert self.pipe is not None
+        if self.chunker is None:
+            from .parakeet.chunking import ChunkedTranscriber
+
+            chunk_seconds = self._configured_chunk_seconds()
+            self.chunker = ChunkedTranscriber(
+                self.pipe,
+                chunk_seconds=chunk_seconds,
+                overlap_seconds=min(2.0, chunk_seconds / 4.0),
+            )
+        return self.chunker
+
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         assert self.pipe is not None
         if samples.ndim != 1:
             samples = samples.reshape(-1)
         audio = np.ascontiguousarray(samples, dtype=np.float32)
         audio_seconds = len(audio) / SAMPLE_RATE
-        texts = self.pipe.transcribe([audio])
-        text = texts[0] if texts else ""
+        max_chunk_seconds = self._configured_chunk_seconds()
+        if audio_seconds > max_chunk_seconds:
+            text = self._get_chunker().transcribe(
+                audio, sr=SAMPLE_RATE, should_stop=self._check_stopped
+            )
+        else:
+            self._check_stopped()
+            texts = self.pipe.transcribe([audio])
+            text = texts[0] if texts else ""
         # Parakeet's TDT decoder has no chunk-window segment contract exposed
         # here, so we return a single whole-utterance segment (the server's
         # streaming partials still carve the timeline via the rolling buffer).
@@ -279,10 +369,7 @@ class ParakeetUnifiedBackend(ModelBackend):
         if self.chunker is None:
             from .parakeet_unified.chunking import ChunkedTranscriber
 
-            chunk_seconds = max(
-                0.1,
-                float(self.config.max_chunk_seconds or DEFAULT_MAX_CHUNK_SECONDS),
-            )
+            chunk_seconds = self._configured_chunk_seconds()
             overlap_seconds = min(2.0, chunk_seconds / 4.0)
             self.chunker = ChunkedTranscriber(
                 self.pipe,
@@ -297,12 +384,13 @@ class ParakeetUnifiedBackend(ModelBackend):
             samples = samples.reshape(-1)
         audio = np.ascontiguousarray(samples, dtype=np.float32)
         audio_seconds = len(audio) / SAMPLE_RATE
-        max_chunk_seconds = float(
-            self.config.max_chunk_seconds or DEFAULT_MAX_CHUNK_SECONDS
-        )
+        max_chunk_seconds = self._configured_chunk_seconds()
         if audio_seconds > max_chunk_seconds:
-            text = self._get_chunker().transcribe(audio, sr=SAMPLE_RATE)
+            text = self._get_chunker().transcribe(
+                audio, sr=SAMPLE_RATE, should_stop=self._check_stopped
+            )
         else:
+            self._check_stopped()
             texts = self.pipe.transcribe([audio])
             text = texts[0] if texts else ""
         return TranscribeResult(
@@ -349,23 +437,17 @@ class MossBackend(ModelBackend):
             for k, v in inp.items()
         }
 
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+    def _transcribe_chunk(self, audio: np.ndarray, budget: int) -> str:
         assert self.pipe is not None and self.processor is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        audio = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = len(audio) / SAMPLE_RATE
-
         inp = self._build(audio)
         text, _ = self.pipe.transcribe(
             inp["audio_data"], inp["audio_data_seqlens"], inp["input_ids"],
-            inp["audio_input_mask"], max_new_tokens=self.config.max_new_tokens,
+            inp["audio_input_mask"], max_new_tokens=budget,
         )
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
+        return text
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
 class Qwen3Backend(ModelBackend):
@@ -384,12 +466,13 @@ class Qwen3Backend(ModelBackend):
         self._build_inputs = build_inputs
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
-        # Single-shot per request (like ark): graphed prefill only for streaming.
+        # Long files are chunked into recurring shapes, so graph capture can
+        # amortise there as well as in the fixed-window streaming path.
         self.pipe.set_prefill_use_graph(
-            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=False)
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
         )
 
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
         import torch
 
         from .qwen3.audio import build_inputs
@@ -398,18 +481,16 @@ class Qwen3Backend(ModelBackend):
         if samples.ndim != 1:
             samples = samples.reshape(-1)
         wav = torch.from_numpy(np.ascontiguousarray(samples)).float().unsqueeze(0).contiguous()
-        audio_seconds = wav.shape[1] / SAMPLE_RATE
         inp = build_inputs(self.processor, wav, sr=SAMPLE_RATE)
         text, _ = self.pipe.transcribe(
             inp["input_features"], inp["input_ids"],
             inp.get("input_features_mask"),
-            max_new_tokens=self.config.max_new_tokens,
+            max_new_tokens=budget,
         )
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
+        return text
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
 class ArkBackend(ModelBackend):
@@ -417,7 +498,7 @@ class ArkBackend(ModelBackend):
 
     The pipeline's ``transcribe`` takes a 1-D float32 waveform directly (no
     processor-built input dict), so this backend is the thinnest of the LLM
-    backends. Single-shot (no chunker): bounded by the 4096-token static KV
+    backends. File input is waveform-chunked to bound the 4096-token static KV
     cache, like qwen3.
     """
 
@@ -429,26 +510,22 @@ class ArkBackend(ModelBackend):
         self.pipe = MegaPipeline.from_pretrained()
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
-        # Single-shot per request: graphed prefill only amortises across repeated
-        # stream chunks, so file requests stay eager regardless of length.
         self.pipe.set_prefill_use_graph(
-            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=False)
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
         )
 
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
         assert self.pipe is not None
         if samples.ndim != 1:
             samples = samples.reshape(-1)
         wav = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = wav.shape[0] / SAMPLE_RATE
         text, _ids = self.pipe.transcribe(
-            wav, max_new_tokens=self.config.max_new_tokens,
+            wav, max_new_tokens=budget,
         )
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
+        return text
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
 class CohereBackend(ModelBackend):
@@ -474,21 +551,18 @@ class CohereBackend(ModelBackend):
             self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
         )
 
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
         assert self.pipe is not None
         if samples.ndim != 1:
             samples = samples.reshape(-1)
         wav = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = wav.shape[0] / SAMPLE_RATE
         texts, _ids = self.pipe.transcribe(
-            wav, max_new_tokens=self.config.max_new_tokens,
+            wav, max_new_tokens=budget,
         )
-        text = " ".join(t.strip() for t in texts if t.strip())
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
+        return " ".join(t.strip() for t in texts if t.strip())
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
 class HiggsBackend(ModelBackend):
@@ -501,24 +575,28 @@ class HiggsBackend(ModelBackend):
     slug = "higgs"
 
     def load(self) -> None:
-        from .higgs.pipeline import HiggsMega
+        try:
+            from .higgs.pipeline import HiggsMega
+        except Exception as exc:
+            raise RuntimeError(
+                "the higgs backend requires the isolated .venv-higgs environment; "
+                "see src/starling/higgs/UV_NOTES.md"
+            ) from exc
 
         self.pipe = HiggsMega.from_pretrained()
 
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
         assert self.pipe is not None
         if samples.ndim != 1:
             samples = samples.reshape(-1)
         wav = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = wav.shape[0] / SAMPLE_RATE
         text = self.pipe.transcribe(
-            wav, sample_rate=SAMPLE_RATE, max_new_tokens=self.config.max_new_tokens,
+            wav, sample_rate=SAMPLE_RATE, max_new_tokens=budget,
         )
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
+        return text
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
 _BACKENDS: dict[str, type[ModelBackend]] = {
@@ -561,13 +639,19 @@ class TranscribeResult:
         }
 
 
+class RequestState(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+
+
 @dataclass
 class RequestContext:
     """Per-request handle tracked in the server's registry for cancellation."""
 
     id: str
     cancel: threading.Event = field(default_factory=threading.Event)
-    state: str = "queued"
+    state: RequestState = RequestState.QUEUED
+    deadline: float = float("inf")
 
 
 class _Busy(Exception):
@@ -576,6 +660,14 @@ class _Busy(Exception):
 
 class _Cancelled(Exception):
     """Internal sentinel: request was cancelled via :meth:`StarlingServer.cancel_request`."""
+
+
+class _DeadlineExceeded(Exception):
+    """Internal sentinel: the request exceeded its wall-clock deadline."""
+
+
+class _DuplicateRequest(Exception):
+    """Internal sentinel: a caller reused an active request id."""
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +707,9 @@ class ServerConfig:
     # "eager". Both paths are byte-exact; this only trades capture cost vs reuse.
     graph_mode: str = "auto"
     file_graph_min_seconds: float = 60.0
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    opt_flags: Any = None
 
 
 @dataclass
@@ -632,10 +727,15 @@ class StarlingServer:
     # --- request queueing -------------------------------------------------
     _n_waiters: int = 0
     _requests: dict[str, "RequestContext"] = field(default_factory=dict)
+    _request_order: list[str] = field(default_factory=list)
+    _queue_changed: threading.Condition = field(init=False, repr=False)
 
     # --- lifecycle phase (reported by /health) ----------------------------
     #   unloaded -> loading_weights -> warming_up -> ready
     _phase: str = "unloaded"
+
+    def __post_init__(self) -> None:
+        self._queue_changed = threading.Condition(self._lock)
 
     @property
     def model_slug(self) -> str:
@@ -644,7 +744,8 @@ class StarlingServer:
     @property
     def loaded(self) -> bool:
         """True once the model backend has been loaded into VRAM."""
-        return self._loaded
+        with self._lock:
+            return self._loaded
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -658,6 +759,10 @@ class StarlingServer:
             if self._loaded:
                 return
             self._phase = "loading_weights"
+            if self.config.opt_flags is not None:
+                from .flags import set_default_flags
+
+                set_default_flags(self.config.opt_flags)
             backend = get_backend(self.config.model, self.config)
             t0 = time.perf_counter()
             log.info("loading %s model ...", self.config.model)
@@ -718,7 +823,7 @@ class StarlingServer:
         self._ensure_loaded()
         samples, sr = _wav_bytes_to_float32(wav_bytes)
         if sr != SAMPLE_RATE:
-            samples = _resample_linear(samples, sr, SAMPLE_RATE)
+            samples = _resample_audio(samples, sr, SAMPLE_RATE)
         return self._run_queued_sync(samples, request_id)
 
     def transcribe_pcm_sync(
@@ -731,29 +836,46 @@ class StarlingServer:
     def _run_queued_sync(
         self, samples: np.ndarray, request_id: Optional[str], *, streaming: bool = False
     ) -> TranscribeResult:
-        ctx = RequestContext(request_id)
-        with self._lock:
+        rid = request_id or uuid.uuid4().hex
+        timeout = float(self.config.request_timeout_seconds)
+        deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
+        ctx = RequestContext(rid, deadline=deadline)
+        with self._queue_changed:
             if self._n_waiters >= MAX_WAITERS:
                 raise _Busy()
+            if ctx.id in self._requests:
+                raise _DuplicateRequest(ctx.id)
             self._n_waiters += 1
             self._requests[ctx.id] = ctx
+            self._request_order.append(ctx.id)
+            self._queue_changed.notify_all()
         try:
             return self._serial_run(ctx, samples, streaming=streaming)
         finally:
-            with self._lock:
+            with self._queue_changed:
                 self._n_waiters = max(0, self._n_waiters - 1)
                 self._requests.pop(ctx.id, None)
+                if ctx.id in self._request_order:
+                    self._request_order.remove(ctx.id)
+                self._queue_changed.notify_all()
 
     def _serial_run(
         self, ctx: "RequestContext", samples: np.ndarray, *, streaming: bool = False
     ) -> TranscribeResult:
         from .parakeet.gpu_lock import GpuLockBusy, acquire_gpu_lock, release_gpu_lock
 
+        # Preserve arrival order inside this server process. The head waiter is
+        # the only thread allowed to contend for the cross-process GPU lock.
+        with self._queue_changed:
+            while not self._request_order or self._request_order[0] != ctx.id:
+                self._raise_if_stopped(ctx)
+                wait_for = min(CANCEL_POLL_SECONDS, max(0.0, ctx.deadline - time.monotonic()))
+                self._queue_changed.wait(wait_for)
+
         while True:
-            if ctx.cancel.is_set():
-                raise _Cancelled()
+            self._raise_if_stopped(ctx)
             try:
-                acquire_gpu_lock(
+                lock_owner = acquire_gpu_lock(
                     session=GPU_LOCK_SESSION,
                     model=_gpu_lock_model(self.config.model),
                     eta_min=GPU_LOCK_ETA_MIN,
@@ -765,11 +887,25 @@ class StarlingServer:
                 if ctx.cancel.wait(CANCEL_POLL_SECONDS):
                     raise _Cancelled()
 
-        ctx.state = "running"
+        ctx.state = RequestState.RUNNING
         try:
-            return self._transcribe_np(samples, streaming=streaming)
+            self.backend._cancel_event = ctx.cancel
+            self.backend._deadline = ctx.deadline
+            result = self._transcribe_np(samples, streaming=streaming)
+            self._raise_if_stopped(ctx)
+            return result
         finally:
-            release_gpu_lock()
+            if self.backend is not None:
+                self.backend._cancel_event = None
+                self.backend._deadline = float("inf")
+            release_gpu_lock(lock_owner)
+
+    @staticmethod
+    def _raise_if_stopped(ctx: "RequestContext") -> None:
+        if ctx.cancel.is_set():
+            raise _Cancelled()
+        if time.monotonic() >= ctx.deadline:
+            raise _DeadlineExceeded()
 
     # ------------------------------------------------------------------ #
     # request registry (cancellation + introspection)
@@ -784,7 +920,7 @@ class StarlingServer:
 
     def queue_depth(self) -> int:
         with self._lock:
-            return max(0, self._n_waiters - 1)
+            return sum(ctx.state is RequestState.QUEUED for ctx in self._requests.values())
 
     def is_busy(self) -> bool:
         with self._lock:
@@ -797,6 +933,29 @@ class StarlingServer:
     def _ensure_loaded(self) -> None:
         if not self._loaded:
             self.load()
+
+
+def _transcribe_payload_sync(
+    server: StarlingServer, payload: bytes, request_id: str
+) -> tuple[int, dict[str, Any]]:
+    """Shared HTTP transport adapter for one WAV transcription request."""
+    try:
+        result = server.transcribe_bytes_sync(payload, request_id)
+    except _Busy:
+        return 503, {
+            "error": "server busy",
+            "text": "",
+            "queue_depth": server.queue_depth(),
+        }
+    except _Cancelled:
+        return 499, {"error": "cancelled", "text": ""}
+    except _DeadlineExceeded:
+        return 504, {"error": "request timed out", "text": ""}
+    except _DuplicateRequest:
+        return 409, {"error": "request id already active", "text": ""}
+    response = result.to_dict()
+    response["request_id"] = request_id
+    return 200, response
 
 
 # ---------------------------------------------------------------------------
@@ -832,14 +991,17 @@ def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:
     return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
 
-def _resample_linear(samples: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+def _resample_audio(samples: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Band-limited polyphase resampling, including anti-alias filtering."""
     if sr_in == sr_out or len(samples) == 0:
         return samples
-    n_out = int(round(len(samples) * sr_out / sr_in))
-    if n_out <= 0:
-        return np.zeros(0, dtype=np.float32)
-    idx = np.linspace(0, len(samples) - 1, n_out)
-    return np.interp(idx, np.arange(len(samples)), samples).astype(np.float32)
+    if sr_in <= 0 or sr_out <= 0:
+        raise ValueError("sample rates must be positive")
+    from scipy.signal import resample_poly
+
+    divisor = math.gcd(int(sr_in), int(sr_out))
+    out = resample_poly(samples, sr_out // divisor, sr_in // divisor)
+    return np.ascontiguousarray(out, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1025,10 @@ class StreamSession:
 
     def __post_init__(self) -> None:
         cfg = self.server.config
+        if getattr(getattr(cfg, "opt_flags", None), "fp8_weights", False):
+            raise ValueError(
+                "fp8_weights is restricted to batch/file requests and cannot be used with /stream"
+            )
         if getattr(cfg, "stream_chunk_seconds", 0.0) and cfg.stream_chunk_seconds > 0:
             from .stream_chunk import ChunkStreamer
 
@@ -899,10 +1065,12 @@ class StreamSession:
 
     def append_wav(self, wav_bytes: bytes) -> None:
         try:
-            s, _sr = _wav_bytes_to_float32(wav_bytes)
+            s, sr = _wav_bytes_to_float32(wav_bytes)
         except Exception:
             self.append_pcm(wav_bytes)
             return
+        if sr != SAMPLE_RATE:
+            s = _resample_audio(s, sr, SAMPLE_RATE)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
 
@@ -951,16 +1119,32 @@ def create_app(
     if server is not None and config is not None and server.config is not config:
         raise ValueError("pass either config or server, not both")
     server = server or StarlingServer(config=config or ServerConfig())
-    app = FastAPI(title="starling-server", version="2.0.0")
-    app.state.starling_server = server  # type: ignore[attr-defined]
 
-    @app.on_event("startup")
-    async def _on_startup() -> None:  # pragma: no cover - exercised by run()
+    @asynccontextmanager
+    async def _lifespan(_app):  # noqa: ANN001
         if load_on_startup:
             await asyncio.to_thread(server.load)
+        yield
+
+    app = FastAPI(title="starling-server", version="2.0.0", lifespan=_lifespan)
+    app.state.starling_server = server  # type: ignore[attr-defined]
 
     async def _decode_inference_body(request: "Request") -> bytes:
-        body = await request.body()
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > server.config.max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="request body too large")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="invalid Content-Length") from None
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > server.config.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="request body too large")
+            chunks.append(chunk)
+        body = b"".join(chunks)
         if not body:
             return b""
         ctype = request.headers.get("content-type", "")
@@ -968,15 +1152,15 @@ def create_app(
             return _extract_multipart_payload(body, ctype)
         return body
 
-    def _request_id(request: "Request") -> Optional[str]:
+    def _request_id(request: "Request") -> str:
         rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id")
-        return rid or None
+        return rid or uuid.uuid4().hex
 
     def _health_body() -> dict[str, Any]:
         return {
             "status": "ok",
             "model": server.model_slug,
-            "loaded": server._loaded,
+            "loaded": server.loaded,
             "busy": server.is_busy(),
             "phase": server.phase(),
             "queue_depth": server.queue_depth(),
@@ -992,44 +1176,30 @@ def create_app(
 
     @app.post("/warmup")
     async def warmup_route() -> JSONResponse:
-        await asyncio.to_thread(server.warmup)
-        return JSONResponse({"status": "ok", "phase": server.phase()})
+        asyncio.create_task(asyncio.to_thread(server.warmup))
+        return JSONResponse(
+            {"status": "warmup started", "phase": server.phase()}, status_code=202
+        )
 
     async def _inference(request):  # noqa: ANN001
         payload = await _decode_inference_body(request)
         if not payload:
             raise HTTPException(status_code=400, detail="empty upload")
         rid = _request_id(request)
-        try:
-            result = await asyncio.to_thread(server.transcribe_bytes_sync, payload, rid)
-        except _Busy:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
-            )
-        except _Cancelled:
-            return JSONResponse(status_code=499, content={"error": "cancelled", "text": ""})
-        resp = result.to_dict()
-        resp["request_id"] = rid
-        return JSONResponse(resp)
+        status, response = await asyncio.to_thread(
+            _transcribe_payload_sync, server, payload, rid
+        )
+        return JSONResponse(response, status_code=status)
 
     async def _transcribe(request):  # noqa: ANN001
         payload = await _decode_inference_body(request)
         if not payload:
             raise HTTPException(status_code=400, detail="empty request body")
         rid = _request_id(request)
-        try:
-            result = await asyncio.to_thread(server.transcribe_bytes_sync, payload, rid)
-        except _Busy:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
-            )
-        except _Cancelled:
-            return JSONResponse(status_code=499, content={"error": "cancelled", "text": ""})
-        resp = result.to_dict()
-        resp["request_id"] = rid
-        return JSONResponse(resp)
+        status, response = await asyncio.to_thread(
+            _transcribe_payload_sync, server, payload, rid
+        )
+        return JSONResponse(response, status_code=status)
 
     async def _abort(request):  # noqa: ANN001
         rid = request.path_params.get("id")
@@ -1405,15 +1575,26 @@ def _build_stdlib_handler(server: StarlingServer):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                length = 0
-            body = self.rfile.read(length) if length > 0 else b""
+                self._send_json(400, {"error": "invalid Content-Length", "text": ""})
+                return
+
+            if length > server.config.max_upload_bytes:
+                self.close_connection = True
+                self._send_json(413, {"error": "request body too large", "text": ""})
+                return
 
             if self.path == "/warmup":
                 threading.Thread(target=server.warmup, daemon=True).start()
                 self._send_json(202, {"status": "warmup started", "phase": server.phase()})
                 return
 
-            rid = self.headers.get("X-Request-Id") or self.headers.get("X-Correlation-Id")
+            body = self.rfile.read(length) if length > 0 else b""
+
+            rid = (
+                self.headers.get("X-Request-Id")
+                or self.headers.get("X-Correlation-Id")
+                or uuid.uuid4().hex
+            )
 
             if self.path == "/inference":
                 ctype = self.headers.get("Content-Type", "")
@@ -1424,40 +1605,16 @@ def _build_stdlib_handler(server: StarlingServer):
                 if not payload:
                     self._send_json(400, {"error": "empty upload", "text": ""})
                     return
-                try:
-                    result = server.transcribe_bytes_sync(payload, rid)
-                except _Busy:
-                    self._send_json(
-                        503,
-                        {"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
-                    )
-                    return
-                except _Cancelled:
-                    self._send_json(499, {"error": "cancelled", "text": ""})
-                    return
-                resp = result.to_dict()
-                resp["request_id"] = rid
-                self._send_json(200, resp)
+                status, response = _transcribe_payload_sync(server, payload, rid)
+                self._send_json(status, response)
                 return
 
             if self.path == "/transcribe":
                 if not body:
                     self._send_json(400, {"error": "empty body", "text": ""})
                     return
-                try:
-                    result = server.transcribe_bytes_sync(body, rid)
-                except _Busy:
-                    self._send_json(
-                        503,
-                        {"error": "server busy", "text": "", "queue_depth": server.queue_depth()},
-                    )
-                    return
-                except _Cancelled:
-                    self._send_json(499, {"error": "cancelled", "text": ""})
-                    return
-                resp = result.to_dict()
-                resp["request_id"] = rid
-                self._send_json(200, resp)
+                status, response = _transcribe_payload_sync(server, body, rid)
+                self._send_json(status, response)
                 return
 
             self._send_json(404, {"error": "not found"})
@@ -1500,7 +1657,7 @@ def _build_stdlib_handler(server: StarlingServer):
                     {
                         "status": "ok",
                         "model": server.model_slug,
-                        "loaded": server._loaded,
+                        "loaded": server.loaded,
                         "busy": server.is_busy(),
                         "phase": server.phase(),
                         "queue_depth": server.queue_depth(),
@@ -1542,6 +1699,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=DEFAULT_HOST, help=f"bind host (default {DEFAULT_HOST})")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"bind port (default {DEFAULT_PORT})")
     p.add_argument(
+        "--profile",
+        choices=["file", "realtime", "batch", "accuracy"],
+        default="file",
+        help="named serving profile (default file)",
+    )
+    p.add_argument(
         "--max-chunk-seconds",
         type=float,
         default=DEFAULT_MAX_CHUNK_SECONDS,
@@ -1559,6 +1722,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_PARTIAL_INTERVAL_SECONDS,
         help=f"minimum wall-clock gap between WS /stream partials (default {DEFAULT_PARTIAL_INTERVAL_SECONDS}s)",
+    )
+    p.add_argument(
+        "--stream-chunk-seconds", type=float, default=12.0,
+        help="fixed WS stream window in seconds; 0 restores whole-buffer mode",
+    )
+    p.add_argument(
+        "--stream-overlap-seconds", type=float, default=3.0,
+        help="overlap between fixed WS stream windows (default 3)",
     )
     p.add_argument(
         "--max-new-tokens",
@@ -1581,6 +1752,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--attn-impl",
         default="eager",
         help="global attention implementation (default eager; granite/qwen3 q-former requires eager)",
+    )
+    p.add_argument(
+        "--graph-mode", choices=["auto", "graphed", "eager"], default=None,
+        help="override adaptive CUDA graph selection",
+    )
+    p.add_argument(
+        "--file-graph-min-seconds", type=float, default=60.0,
+        help="minimum file duration for graph capture in auto mode",
+    )
+    p.add_argument(
+        "--sdpa-attention", action="store_true",
+        help="enable the nearly byte-exact shared SDPA attention path",
+    )
+    p.add_argument(
+        "--fp8-weights", action="store_true",
+        help="enable tolerance-mode fp8 decoder weights (batch/file only)",
+    )
+    p.add_argument(
+        "--tolerance-mode", action="store_true",
+        help="allow validated non-byte-exact optimizations",
+    )
+    p.add_argument(
+        "--max-upload-mb", type=float, default=DEFAULT_MAX_UPLOAD_BYTES / (1024 * 1024),
+        help="maximum HTTP request body in MiB (default 256)",
+    )
+    p.add_argument(
+        "--request-timeout-seconds", type=float, default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        help="wall-clock request deadline including queue time (default 600)",
     )
     p.add_argument(
         "--warmup",
@@ -1626,22 +1825,62 @@ def run(argv: Optional[list[str]] = None) -> int:
     if args.no_speculative and args.model != "granite":
         log.warning("--no-speculative is granite-only; ignored for model=%s", args.model)
 
+    from .flags import OptFlags
+
+    fp8_models = {"granite", "moss"}
+    if args.profile == "batch":
+        opt_flags = OptFlags(
+            tolerance_mode=True,
+            sdpa_attention=True,
+            fp8_weights=args.model in fp8_models,
+        )
+        profile_graph_mode = "graphed"
+    elif args.profile == "realtime":
+        opt_flags = OptFlags(sdpa_attention=True)
+        profile_graph_mode = "graphed"
+    else:
+        opt_flags = OptFlags()
+        profile_graph_mode = "auto"
+
+    if args.fp8_weights and not (args.tolerance_mode or opt_flags.tolerance_mode):
+        raise SystemExit("--fp8-weights requires --tolerance-mode (or --profile batch)")
+    if args.fp8_weights and args.model not in fp8_models:
+        raise SystemExit("--fp8-weights is currently implemented only for granite and moss")
+    if args.sdpa_attention:
+        opt_flags.sdpa_attention = True
+    if args.tolerance_mode:
+        opt_flags.tolerance_mode = True
+    if args.fp8_weights:
+        opt_flags.fp8_weights = True
+
     config = ServerConfig(
         model=args.model,
         max_chunk_seconds=args.max_chunk_seconds,
         min_chunk_seconds=args.min_chunk_seconds,
         partial_interval_seconds=args.partial_interval_seconds,
+        stream_chunk_seconds=args.stream_chunk_seconds,
+        stream_overlap_seconds=args.stream_overlap_seconds,
         max_new_tokens=args.max_new_tokens,
         speculative=not args.no_speculative,
         warmup=args.warmup,
         encoder_mode=args.encoder_mode,
         use_fused_llm=True,
         attn_impl=args.attn_impl,
+        graph_mode=args.graph_mode or profile_graph_mode,
+        file_graph_min_seconds=args.file_graph_min_seconds,
+        max_upload_bytes=max(1, int(args.max_upload_mb * 1024 * 1024)),
+        request_timeout_seconds=args.request_timeout_seconds,
+        opt_flags=opt_flags,
     )
 
     use_fastapi = (not args.stdlib) and _have_fastapi()
 
     server = StarlingServer(config=config)
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        log.warning(
+            "binding unauthenticated ASR endpoints to public/non-loopback host %s",
+            args.host,
+        )
     if not args.no_eager_load:
         server.load()
 

@@ -368,13 +368,13 @@ class ChunkedTranscriber:
     # public API
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
-    def transcribe(self, audio: np.ndarray, sr: int = 16000) -> str:
+    def transcribe(self, audio: np.ndarray, sr: int = 16000, should_stop=None) -> str:
         """Transcribe arbitrarily-long audio; returns the stitched text string."""
-        return self.transcribe_with_timing(audio, sr=sr)[0]
+        return self.transcribe_with_timing(audio, sr=sr, should_stop=should_stop)[0]
 
     @torch.inference_mode()
     def transcribe_with_timing(
-        self, audio: np.ndarray, sr: int = 16000
+        self, audio: np.ndarray, sr: int = 16000, should_stop=None
     ) -> Tuple[str, dict]:
         """Transcribe and return ``(text, summary)``.
 
@@ -426,6 +426,8 @@ class ChunkedTranscriber:
         batch_idx = 0
         ci = 0
         while ci < n_chunks:
+            if should_stop is not None:
+                should_stop()
             eff_b = self._effective_batch_size(self.chunk_batch_size)
             end_ci = min(ci + eff_b, n_chunks)
             batch_audio = chunks[ci:end_ci]

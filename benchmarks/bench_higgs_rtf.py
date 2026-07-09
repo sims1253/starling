@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import warnings
@@ -20,20 +21,21 @@ from dataclasses import asdict
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-MAIN_REPO = Path("/home/m0hawk/Documents/starling")
-FIXTURES_DIR = MAIN_REPO / "tests" / "fixtures"
+FIXTURES_DIR = Path(
+    os.environ.get("STARLING_FIXTURES_DIR", REPO / "tests" / "fixtures")
+).expanduser()
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "scripts" / "ref"))
 
-import numpy as np
-import torch
-import soundfile as sf
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import soundfile as sf  # noqa: E402
 
-from starling.higgs.config import EOS_TOKEN_IDS
-from starling.higgs.loader import load_model_and_tokenizer, make_collator
-from starling.higgs.llm_mega import LLMMega
-from starling.higgs.multistep import MultiStepLLMMega
-import transcribe as ref  # upstream reference transcribe()
+from starling.higgs.config import EOS_TOKEN_IDS  # noqa: E402
+from starling.higgs.loader import load_model_and_tokenizer, make_collator  # noqa: E402
+from starling.higgs.llm_mega import LLMMega  # noqa: E402
+from starling.higgs.multistep import MultiStepLLMMega  # noqa: E402
+import transcribe as ref  # noqa: E402  # upstream reference transcribe()
 
 FIXTURES = [
     ("short", FIXTURES_DIR / "short.wav"),

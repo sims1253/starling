@@ -52,7 +52,12 @@ uv run python benchmarks/bench_leaderboard.py --num-samples 0  # full splits
 RTFx = audio_seconds / transcribe_seconds (higher is faster). bf16, model load
 excluded, single RTX 5090.
 
-### Latency / RTFx
+### Synthetic fixture latency / RTFx
+
+These tiled single-utterance numbers are a deterministic regression gate, not
+a representative workload distribution. Use the real-corpus leaderboard RTFx
+table below for headline cross-model throughput. Newly generated tables report
+median ± standard deviation across repetitions.
 
 <!-- BENCH:START -->
 **granite-speech-4.1-2b** — latency / RTFx (ms, RTFx×)
@@ -165,12 +170,14 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 
 `src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps
 one model resident in VRAM. One process runs one model at a time (`--model
-granite|parakeet|moss|qwen3`, default `granite`); `/health` reports which is
-loaded.
+granite|parakeet|parakeet_unified|moss|qwen3|ark|cohere|higgs`, default
+`granite`); `/health` reports which is loaded. Higgs must be run from the
+isolated `.venv-higgs` environment documented in `src/starling/higgs/UV_NOTES.md`.
 
 ```bash
 python -m starling.server --model granite --port 8181 --max-chunk-seconds 30
-python -m starling.server --model parakeet --warmup   # pre-capture CUDA graphs
+python -m starling.server --model parakeet --profile realtime --warmup
+python -m starling.server --model moss --profile batch  # SDPA + fp8 file jobs
 ```
 
 Endpoints (FastAPI when available, stdlib fallback):
@@ -181,7 +188,7 @@ Endpoints (FastAPI when available, stdlib fallback):
 | `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
 | `POST /transcribe`        | raw WAV bytes -> same shape as `/inference` |
 | `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202 Accepted) |
-| `DELETE /inference/<id>`  | cancel a queued request by its `X-Request-Id` |
+| `DELETE /inference/<id>`  | cancel a queued or running request by its `X-Request-Id` |
 | `WS   /stream`            | real-time streaming dictation |
 
 A single GPU worker serves one request at a time; concurrent requests queue
@@ -190,8 +197,32 @@ enables `DELETE /inference/<id>` cancellation — best-effort once on the GPU
 (CUDA-graph replays aren't preemptible; an in-flight request finishes its
 current step then returns HTTP 499).
 
+Requests without an `X-Request-Id` receive a generated ID in the response.
+Uploads are capped at 256 MiB and requests have a 10-minute wall-clock deadline
+by default; tune these with `--max-upload-mb` and
+`--request-timeout-seconds`. The API has no authentication, so binding a
+non-loopback `--host` emits a warning and should only be done behind an
+authenticated proxy.
+
+Profiles provide supported defaults for the main workloads:
+
+| profile | intended workload | graph/optimization policy |
+| ------- | ----------------- | ------------------------- |
+| `file` (default) | one-shot files | adaptive graphs, strict flags |
+| `realtime` | low-latency dictation | graphed recurring windows + SDPA |
+| `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus fp8 weights on granite/moss; do not use for `/stream` |
+| `accuracy` | strict/reference output | adaptive graphs, strict byte-exact flags |
+
+Model selection is workload-dependent: parakeet has the lowest realtime
+latency, moss has the best measured leaderboard WER, qwen3 is a strong
+speed/accuracy compromise, and granite is useful when its self-speculative
+path is desired. The HTTP server intentionally serializes requests; the
+granite/qwen3 batched pipelines are exposed by `bench_all.py` for offline batch
+jobs rather than silently changing per-request latency semantics.
+
 **Timestamps.** `/inference` returns chunk-level segments
-(`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3) have no
+(`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3, ark,
+higgs) have no
 per-token audio alignment, so segments are at `--max-chunk-seconds` granularity;
 shrink it for finer segments at the cost of more decode passes. Parakeet
-aligns internally and returns a single whole-utterance segment.
+and cohere chunk internally and return a single whole-utterance segment.

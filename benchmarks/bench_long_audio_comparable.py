@@ -12,7 +12,7 @@ Parakeet uses ChunkedTranscriber (B=32, 30s+2s overlap, frame-aligned stitch).
 Both run on the same tiled audio so the workload is identical. The only
 difference is the model architecture and chunking strategy.
 
-Run:  cd /home/m0hawk/Documents/starling && uv run benchmarks/bench_long_audio_comparable.py
+Run:  uv run benchmarks/bench_long_audio_comparable.py
 """
 
 from __future__ import annotations

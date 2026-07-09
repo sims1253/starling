@@ -43,6 +43,8 @@ from typing import Any, Optional
 
 import torch
 
+from ..attention import gqa_attention
+
 from .config import (
     EOS_TOKEN_ID,
     LLM_ATTENTION_SCALE,
@@ -474,7 +476,7 @@ class LLMMega:
             )
         if inputs_embeds.shape[0] != 1:
             raise ValueError(
-                f"LLMMega only supports batch=1 (static buffers + _repeat_kv reshape "
+                f"LLMMega only supports batch=1 (static buffers + GQA cache layout "
                 f"are hard-coded for B=1), got batch={inputs_embeds.shape[0]}."
             )
         if max_new_tokens <= 0:
@@ -642,14 +644,6 @@ class LLMMega:
 _EMB_MULT = LLM_EMBEDDING_MULTIPLIER  # 1.0 for Qwen2.5 (no embedding multiplier)
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """GQA: repeat KV heads to match Q heads. x is (B, n_kv, S, D) -> (B, n_q, S, D)."""
-    if n_rep == 1:
-        return x
-    B, n_kv, S, D = x.shape
-    return x[:, :, None, :, :].expand(B, n_kv, n_rep, S, D).reshape(B, n_kv * n_rep, S, D)
-
-
 class FusedLLMMega(LLMMega):
     """CUDA-graph-captured greedy decoder with **fused Triton elementwise kernels**.
 
@@ -672,9 +666,11 @@ class FusedLLMMega(LLMMega):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        from ..flags import get_default_flags
         from ..granite import llm_kernels as _k  # reuse the proven granite kernels
 
         self._k = _k
+        self._flags = get_default_flags()
         # Pre-extract per-layer references for speed in the hot decode loop.
         self._layers = list(self.lm.layers)
         self._embed = self.lm.embed_tokens
@@ -712,8 +708,6 @@ class FusedLLMMega(LLMMega):
         modified; the fused tensors are byte-exact equivalents.
         """
         fused = []
-        n_qd = self._n_q_heads * self._head_dim      # 2048
-        n_kvd = self._n_kv_heads * self._head_dim    # 256
         for layer in self._layers:
             sa = layer.self_attn
             mlp = layer.mlp
@@ -790,15 +784,15 @@ class FusedLLMMega(LLMMega):
             # cache update (in-place on static-address K/V tensors)
             kv, v = self.cache.update(kv, v, idx)
 
-            # GQA: repeat KV heads to match Q heads
-            kv_r = _repeat_kv(kv, self._n_kv_groups)  # (1, n_q, max_len, hd)
-            v_r = _repeat_kv(v, self._n_kv_groups)
-
-            # attention: scores = Q @ K^T * scale + mask, softmax, @ V
-            scores = torch.matmul(q, kv_r.transpose(2, 3)) * self._attn_scale  # (1,n_q,1,max_len)
-            scores = scores + self.static_attn_mask  # broadcast (1,1,1,max_len)
-            attn = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(self.dtype)
-            attn_out = torch.matmul(attn, v_r)  # (1, n_q, 1, hd)
+            attn_out = gqa_attention(
+                q,
+                kv,
+                v,
+                self.static_attn_mask,
+                self._attn_scale,
+                self.dtype,
+                self._flags,
+            )
 
             # reshape + output projection
             attn_out = attn_out.transpose(1, 2).reshape(1, 1, n_q * hd)

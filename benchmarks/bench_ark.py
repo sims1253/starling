@@ -11,6 +11,7 @@ Usage (from the repo root):
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -23,14 +24,9 @@ from starling.ark.config import EOS_TOKEN_ID
 from starling.ark.pipeline import MegaPipeline
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Fixtures live in the main starling checkout (the worktree shares the index but
-# not the working-tree untracked files like tests/fixtures).
-MAIN_REPO = Path("/home/m0hawk/Documents/starling")
-FIXTURES = MAIN_REPO / "tests" / "fixtures"
-if not FIXTURES.exists():
-    FIXTURES = REPO_ROOT.parent / "tests" / "fixtures"
-if not FIXTURES.exists():
-    FIXTURES = REPO_ROOT / "tests" / "fixtures"
+FIXTURES = Path(
+    os.environ.get("STARLING_FIXTURES_DIR", REPO_ROOT / "tests" / "fixtures")
+).expanduser()
 GOLDEN_PATH = REPO_ROOT / "golden" / "ark_reference.json"
 
 

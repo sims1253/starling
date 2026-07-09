@@ -7,7 +7,7 @@ Phase 2: run 5 repeats at the winning B across 30/60/90min.
 Also tests a "max throughput" granite config: tolerance_mode batched encoder
 (NOT byte-exact, but shows the speed ceiling).
 
-Run:  cd /home/m0hawk/Documents/starling && uv run benchmarks/bench_sweep.py
+Run:  uv run benchmarks/bench_sweep.py
 """
 
 from __future__ import annotations
