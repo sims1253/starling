@@ -108,7 +108,7 @@ excluded, single RTX 5090.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|-------|
 | ark-asr-3b                 | starling           | 11.35%      | 6.31% | 8.04%        | 3.77%        | 2.60%               | 3.97%               | 2.35%        | 5.48% |
 | ark-asr-3b                 | stock transformers | 11.38%      | 6.21% | 8.15%        | 3.77%        | 2.63%               | 3.81%               | 2.25%        | 5.46% |
-| cohere-transcribe-03-2026  | starling           | 10.35%      | 6.31% | 8.59%        | 5.42%        | 1.47%               | 1.78%               | 2.50%        | 5.20% |
+| cohere-transcribe-03-2026  | starling           | 10.32%      | 6.31% | 8.59%        | 5.47%        | 1.47%               | 1.78%               | 2.45%        | 5.20% |
 | cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31% | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
 | granite-speech-4.1-2b      | starling           | 7.47%       | 8.02% | 8.48%        | 5.21%        | 1.77%               | 2.35%               | 2.80%        | 5.16% |
 | granite-speech-4.1-2b      | stock transformers | 7.47%       | 8.02% | 8.44%        | 5.13%        | 1.77%               | 2.25%               | 2.90%        | 5.14% |
@@ -125,8 +125,8 @@ excluded, single RTX 5090.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|
 | ark-asr-3b                 | starling           | 53x         | 46x   | 46x          | 40x          | 50x                 | 47x                 | 42x          |
 | ark-asr-3b                 | stock transformers | 7x          | 6x    | 6x           | 5x           | 6x                  | 6x                  | 5x           |
-| cohere-transcribe-03-2026  | starling           | 33x         | 22x   | 31x          | 26x          | 35x                 | 9x                  | 4x           |
-| cohere-transcribe-03-2026  | stock transformers | 29x         | 28x   | 31x          | 24x          | 26x                 | 24x                 | 25x          |
+| cohere-transcribe-03-2026  | starling           | 97x         | 83x   | 102x         | 75x          | 110x                | 97x                 | 82x          |
+| cohere-transcribe-03-2026  | stock transformers | 32x         | 29x   | 36x          | 29x          | 29x                 | 26x                 | 26x          |
 | granite-speech-4.1-2b      | starling           | 78x         | 74x   | 78x          | 64x          | 69x                 | 63x                 | 66x          |
 | granite-speech-4.1-2b      | stock transformers | 5x          | 5x    | 5x           | 4x           | 5x                  | 4x                  | 5x           |
 | moss-transcribe-preview-2b | starling           | 64x         | 54x   | 63x          | 51x          | 65x                 | 58x                 | 53x          |
