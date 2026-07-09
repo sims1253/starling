@@ -86,17 +86,17 @@ excluded, single RTX 5090.
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 189ms (39x)  | 2140ms (4x)          |
-| medium   |       1 | 547ms (41x)  | 4962ms (4x)          |
-| long     |       1 | 611ms (122x) | 4663ms (16x)         |
+| short    |       1 | 304ms (24x)  | 1703ms (4x)          |
+| medium   |       1 | 629ms (36x)  | 4570ms (5x)          |
+| long     |       1 | 627ms (118x) | 4377ms (17x)         |
 
 **cohere-transcribe-03-2026** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling     | stock transformers   |
 |----------|---------|--------------|----------------------|
-| short    |       1 | 53ms (141x)  | 307ms (24x)          |
-| medium   |       1 | 157ms (142x) | 963ms (23x)          |
-| long     |       1 | 322ms (231x) | 1602ms (46x)         |
+| short    |       1 | 178ms (42x)  | 351ms (21x)          |
+| medium   |       1 | 253ms (88x)  | 846ms (26x)          |
+| long     |       1 | 437ms (170x) | 2123ms (35x)         |
 <!-- BENCH:END -->
 
 ### Accuracy (Open ASR Leaderboard reproduction)
