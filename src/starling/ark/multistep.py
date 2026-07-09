@@ -89,6 +89,7 @@ class MultiStepLLMMega(FusedLLMMega):
         warmup_iters: int = 3,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        prefill_use_graph: bool = True,
         graph_pool=None,
     ) -> None:
         super().__init__(
@@ -98,6 +99,7 @@ class MultiStepLLMMega(FusedLLMMega):
             warmup_iters=warmup_iters,
             device=device,
             dtype=dtype,
+            prefill_use_graph=prefill_use_graph,
             graph_pool=graph_pool,
         )
         self.steps_per_replay = max(1, int(steps_per_replay))
@@ -277,7 +279,7 @@ class MultiStepLLMMega(FusedLLMMega):
         n_decode = max_new_tokens - 1  # decode steps after the prefill token
 
         # (1) prefill -> first token (position T).
-        next_token = self.prefill(inputs_embeds)  # (1, 1)
+        next_token = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)  # (1, 1)
         gen_ids = [int(next_token.item())]
 
         if max_new_tokens <= 1 or n_decode <= 0:
@@ -361,7 +363,7 @@ class MultiStepLLMMega(FusedLLMMega):
 
         # (b) capture + per-token decode time (K-step replay / K).
         self._reset_cache_pos(0)
-        first_tok = self.prefill(inputs_embeds)
+        first_tok = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)
         self.capture(first_tok, T)
         self._reset_to_chunk_start(T, first_tok)
 

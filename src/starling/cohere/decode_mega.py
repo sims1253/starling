@@ -45,9 +45,10 @@ syncs once per replay.
 
 Prefill is eager (the prefill builds the prompt KV + fills the cross-attn cache
 once); steps 1+ run graphed. This mirrors the parakeet "prefill eager, decode
-graphed" pattern. The captured decode state is fully resettable (the post-prefill
-cache snapshot is restored before each real decode), so one captured graph serves
-many utterances of the same ``(prompt_len)`` shape.
+graphed" pattern. Each real decode re-runs the eager prefill into the captured
+cache and rewinds the write heads to ``T`` (no cached state is carried over from
+the capture utterance), so one captured graph serves many utterances of the same
+``(B, prompt_len, S)`` shape.
 """
 
 from __future__ import annotations
@@ -135,21 +136,32 @@ class GraphedDecoder:
         overwrites slots [0, S) (after capture it sits at S, and max_cache_len ==
         S, so a second write would be out-of-bounds). Both are no-ops on a fresh
         cache (the capture path), so the first utterance is unaffected.
+
+        The SELF-attn cache needs the identical rewind, for the same reason.
+        ``CohereAsrSelfAttention`` calls ``past_key_values.update(k, v, layer_idx)``
+        without a ``cache_position``, so ``StaticLayer.update`` writes at the
+        layer's ``cumulative_length`` — which the previous decode left at
+        ``T + n_generated``. Without rewinding, this prefill scribbles the prompt
+        K/V into slots ``[T+n, T+n+T)`` while :meth:`_reset_cache` points the
+        decode back at slots ``[0, T)``, which still hold the *previous*
+        utterance's prompt. Only layer 0 survives that (its prompt K/V depend on
+        the token ids alone); layers ``i>0`` derive theirs from layer ``i-1``'s
+        cross-attention output and so carry the previous clip's encoder state.
         """
         # force cross-attention to recompute K/V from THIS utterance's enc_h
         if getattr(cache, "is_updated", None) is not None:
             cache.is_updated = {i: False for i in range(self.n_layers)}
-        # rewind cross-cache write head so recomputed K/V land at [0, S)
-        cross_cache = cache.cross_attention_cache
+        # rewind both write heads so this prefill lands at [0, T) / [0, S)
         zero = None
-        for layer in cross_cache.layers:
-            if getattr(layer, "is_initialized", False):
-                if zero is None:
-                    zero = torch.zeros(
-                        (1,), dtype=layer.cumulative_length.dtype,
-                        device=layer.cumulative_length.device,
-                    )
-                layer.cumulative_length.copy_(zero)
+        for cache_half in (cache.self_attention_cache, cache.cross_attention_cache):
+            for layer in cache_half.layers:
+                if getattr(layer, "is_initialized", False):
+                    if zero is None:
+                        zero = torch.zeros(
+                            (1,), dtype=layer.cumulative_length.dtype,
+                            device=layer.cumulative_length.device,
+                        )
+                    layer.cumulative_length.copy_(zero)
 
         B, T = dec_in.shape
         device = enc_h.device
@@ -176,17 +188,6 @@ class GraphedDecoder:
         nxt = self.proj_out(h).argmax(dim=-1)  # (B,1)
         return nxt
 
-    def _snapshot_cache(self, cache):
-        """Save the post-prefill cache state for later resets."""
-        self_cache = cache.self_attention_cache
-        cross_cache = cache.cross_attention_cache
-        self._snap_self_keys = [l.keys.clone() for l in self_cache.layers]
-        self._snap_self_vals = [l.values.clone() for l in self_cache.layers]
-        self._snap_self_cum = [l.cumulative_length.clone() for l in self_cache.layers]
-        self._snap_cross_keys = [l.keys.clone() for l in cross_cache.layers]
-        self._snap_cross_vals = [l.values.clone() for l in cross_cache.layers]
-        self._snap_cross_cum = [l.cumulative_length.clone() for l in cross_cache.layers]
-
     def _set_self_cache_pos(self, pos: int) -> None:
         """Set every self-attn StaticCache layer's cumulative_length to ``pos``.
 
@@ -200,26 +201,32 @@ class GraphedDecoder:
             layer.cumulative_length.copy_(fill)
 
     def _reset_cache(self, cache, first_token):
-        """Restore the self-attn cache to the post-prefill snapshot + reset the
-        decoder input token. The cross-attn cache is left untouched: it holds
-        THIS utterance's encoder K/V (just written by :meth:`_prefill`), so
-        restoring the captured snapshot would make every decode reuse the first
-        utterance's cross-attention — a real bug that the leaderboard sweep
-        surfaces (every clip after the first returned clip 0's transcript).
+        """Rewind the decode state to the post-prefill position for a new decode.
 
-        The self-attn rewind IS correct: the captured K-step template runs at
-        positions [base, base+K), writing K/V into advancing slots, so before
-        each utterance we rewind the self-attn cumulative_length to T (the
-        first decode position) while keeping the prefill's slots [0, T).
+        Rewinds the self-attn write head to ``T``, reseeds the decoder input
+        token, and marks the cross-attn cache populated (so the captured steps
+        reuse the K/V that :meth:`_prefill` just wrote rather than recomputing
+        them, which would not be capture-safe).
+
+        NOTHING in either cache is restored from a snapshot. Both halves hold
+        state that belongs to the CURRENT utterance:
+
+        * cross-attn K/V were just recomputed from this utterance's ``enc_h``.
+        * self-attn prompt slots ``[0, T)`` were just written by this utterance's
+          prefill — and they are utterance-specific, because layer ``i>0`` derives
+          its prompt K/V from layer ``i-1``'s cross-attention output. Restoring a
+          capture-time snapshot here made every clip that *reused* a captured
+          graph decode with the capture clip's prompt state. That stayed hidden
+          while each distinct clip length captured its own decoder; sharing one
+          graph across lengths (shape bucketing) exposed it.
+
+        Decode slots ``[T, ...)`` need no clearing: each captured step's causal
+        mask only admits keys ``<= cur_pos``, and every such slot was written by
+        this utterance's prefill or by an earlier step of this decode.
         """
-        self_cache = cache.self_attention_cache
-        for l, k, v, c in zip(
-            self_cache.layers, self._snap_self_keys, self._snap_self_vals, self._snap_self_cum
-        ):
-            l.keys.copy_(k)
-            l.values.copy_(v)
-            l.cumulative_length.copy_(c)
-        # cross-attn: deliberately NOT restored — see docstring.
+        fill = torch.full((1,), self._T, dtype=torch.long, device=self.device)
+        for layer in cache.self_attention_cache.layers:
+            layer.cumulative_length.copy_(fill)
         cache.is_updated = {i: True for i in range(self.n_layers)}
         self.self_token.copy_(first_token)
         self.cur_pos.fill_(self._T)
@@ -320,7 +327,6 @@ class GraphedDecoder:
         # ONE cache for the lifetime of this graph; prefill + graph reference it.
         self._cache = self._make_cache(S)
         nxt0 = self._prefill(dec_in, enc_h, enc_mask, self._cache)
-        self._snapshot_cache(self._cache)
         self._capture_enc_h_shape = enc_h.shape
         self._alloc(B, T, S, device, dtype)
         # seed the static encoder buffers with the capture utterance so the
@@ -387,9 +393,8 @@ class GraphedDecoder:
 
         # prefill for THIS utterance into the SAME captured cache object
         nxt0 = self._prefill(dec_in, enc_h, enc_mask, self._cache)
-        # reset self-attn to post-prefill snapshot (rewinds the autoregressive
-        # position); cross-attn is left as THIS prefill wrote it (the snapshot
-        # restore deliberately skips cross-attn — see _reset_cache).
+        # rewind the write heads to the post-prefill position. Both caches keep
+        # the state THIS prefill just wrote — see _reset_cache.
         self._reset_cache(self._cache, nxt0)
         # bind THIS utterance's encoder hidden states / mask into the static
         # buffers the captured graph reads. Without this, every replay re-reads

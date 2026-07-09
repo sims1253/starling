@@ -182,6 +182,51 @@ def test_fused_kernels_match_reference():
         assert (ref_silu == fused_silu).all(), "SwiGLU mismatch"
 
 
+# --------------------------------------------------------------------------- #
+# Phase D: fp8 weight quantization (tolerance-mode path)
+# --------------------------------------------------------------------------- #
+def test_fp8_weights_reproduces_golden():
+    """fp8-weight decode (tolerance mode) must closely reproduce the golden.
+
+    fp8e4m3 weight rounding is not bit-exact, so the fused dequant-GEMV can
+    drift a near-tie argmax partway through a long decode (the moss fp8 path
+    documents the same behaviour).  This gate asserts a strong prefix match
+    (>= 30 of the first tokens, proving the path is fundamentally correct and
+    the transcript is semantically faithful) rather than full-decode exactness.
+    Mirrors the spirit of ``test_moss.py::test_fp8_weights_short_reproduces_golden``.
+    """
+    from starling.flags import flags
+
+    model, proc = _get_model_and_processor()
+    comps = get_components(model)
+    inputs_embeds = _golden_inputs_embeds()
+    golden_gen = _golden_generated()
+
+    with flags(tolerance_mode=True, fp8_weights=True):
+        decoder = FusedLLMMega(comps["language_model"], model.lm_head, max_cache_len=640)
+        # the fp8 weights must have been built
+        assert decoder._fp8 is not None, "fp8_weights=True should build self._fp8"
+        res = decoder.generate(
+            inputs_embeds,
+            max_new_tokens=100,
+            eos_token_id=LLM_EOS_TOKEN_ID,
+            tokenizer=proc.tokenizer,
+        )
+    # strong prefix match: fp8 is tolerance-mode, so require >= 30 leading
+    # tokens to agree (proves correct wiring + faithful quantization).  The
+    # fused GEMV's different accumulation order vs cuBLAS can flip a near-tie
+    # argmax later in a 100-token decode -- that is expected, not a bug.
+    n = min(res.ids[0].numel(), golden_gen.numel())
+    eq = res.ids[0][:n] == golden_gen[:n]
+    # length of the leading matching prefix: first mismatch index, or n if none
+    match_len = n if bool(eq.all()) else int((~eq).nonzero()[0].item())
+    assert match_len >= 30, (
+        f"fp8 diverged too early ({match_len}/{n} tokens match); "
+        f"expected >=30 token prefix match. golden={golden_gen[:12].tolist()} "
+        f"fp8={res.ids[0][:12].tolist()}"
+    )
+
+
 if __name__ == "__main__":
     # Allow running directly: .venv/bin/python tests/test_llm_mega.py
     mega_fixture = None

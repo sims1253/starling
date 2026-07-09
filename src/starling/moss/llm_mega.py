@@ -140,7 +140,11 @@ class MossLLMMega:
         self._captured = False
         # Lazily-captured prefill graphs, keyed by prompt length T (each is a
         # CUDA graph with static shapes; one per distinct prompt length seen).
-        self._prefill_graphs: dict[int, tuple] = {}
+        # LRU-bounded so variable-length streaming can't accumulate unboundedly.
+        from collections import OrderedDict
+
+        self._prefill_graphs: "OrderedDict[int, tuple]" = OrderedDict()
+        self._max_prefill_graphs = 8
 
     # ------------------------------------------------------------------ #
     # internal helpers
@@ -192,6 +196,11 @@ class MossLLMMega:
         if use_graph:
             entry = self._prefill_graphs.get(T)
             if entry is None:
+                # Cap the cache; never evict (freeing a captured graph mid-session
+                # can corrupt the allocator under heavy multi-length churn).  Once
+                # full, novel prompt lengths use eager prefill.
+                if len(self._prefill_graphs) >= self._max_prefill_graphs:
+                    return self._prefill_eager(inputs_embeds)
                 entry = self._capture_prefill(inputs_embeds)
                 self._prefill_graphs[T] = entry
             static_emb, graph, out_tok = entry

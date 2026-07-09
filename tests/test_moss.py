@@ -160,6 +160,71 @@ def test_fused_decoder_byte_exact(require_fixtures):
     assert r.ids[0].tolist() == gold[0].tolist(), "fused decode != golden"
 
 
+def test_encoder_cudagraph_matches_eager(require_fixtures):
+    """Adaptive cudagraph encoder matches eager within ENCODER_ATOL across the
+    full lifecycle: first sighting (eager), the recurrence that captures, a
+    cache replay, and a replay with a *different* utterance of the same shape
+    (padded_feature is rebuilt in-graph, so a stale-capture bug would show here).
+
+    The captured residual (~1 bf16 ULP) is CUDA-graph GEMM-algorithm selection,
+    not a logic difference: ``_capture_forward`` run eagerly is bit-identical to
+    ``_forward_eager``.  The end-to-end transcript is unchanged (see the golden
+    pipeline tests)."""
+    import torch
+
+    from starling.moss.config import ENCODER_ATOL
+    from starling.moss.encoder_graph import GraphedAudioEncoder
+
+    model, _ = _load()
+    _, inp = _short_inputs()
+    audio, sl = inp["audio_data"], inp["audio_data_seqlens"]
+    eager = GraphedAudioEncoder(model.model.audio_model, model.model.audio_adapter, mode="eager")
+    cg = GraphedAudioEncoder(model.model.audio_model, model.model.audio_adapter, mode="cudagraph")
+    audio_b = (audio * 0.7 + 0.3).to(audio.dtype)
+    with torch.inference_mode():
+        ref = eager(audio, sl)
+        ref_b = eager(audio_b, sl)
+        # 1st sighting -> eager (byte-exact); 2nd -> captures + replays; 3rd -> cache replay
+        assert cg._graphs == {}, "should not capture on first sighting"
+        got1 = cg(audio, sl)
+        assert not cg._graphs, "still eager after one sighting"
+        got2 = cg(audio, sl)  # recurrence -> capture
+        assert int(audio.shape[1]) in cg._graphs, "should capture on recurrence"
+        got3 = cg(audio, sl)  # cache replay
+        got_b = cg(audio_b, sl)  # cache replay with different values, same shape
+        for tag, got, r in [("eager", got1, ref), ("capture", got2, ref),
+                             ("replay", got3, ref), ("new-values", got_b, ref_b)]:
+            assert (got.float() - r.float()).abs().max().item() < ENCODER_ATOL, f"cudagraph != eager ({tag})"
+
+
+def test_fp8_weights_short_reproduces_golden(require_fixtures):
+    """fp8 decoder-layer weights (opt-in) reproduce the golden short transcript.
+
+    fp8 is lossy in principle, but the per-layer RMSNorms normalise the weight
+    noise away over the residual stream, so on the short fixture the greedy
+    token sequence is unchanged.  lm_head stays bf16 (its argmax is fp8-fragile).
+    Longer decodes can diverge late (see the WER-gated bench); this test only
+    pins the byte-exact-on-short behaviour so a regression is visible.
+    """
+    import torch
+
+    from starling.flags import flags
+    from starling.moss.multistep import FusedMossMultiStepMega
+
+    model, _ = _load()
+    emb, _ = _short_inputs()
+    gold = _golden_ids("short")
+    with flags(tolerance_mode=True, fp8_weights=True):
+        dec = FusedMossMultiStepMega(
+            model.model.language_model, model.lm_head,
+            max_cache_len=1024, steps_per_replay=4,
+        )
+        assert dec._fp8_weights is not None, "fp8_weights flag did not quantize"
+        with torch.inference_mode():
+            r = dec.generate(emb, max_new_tokens=int(gold.shape[1]))
+    assert r.ids[0].tolist() == gold[0].tolist(), "fp8 decode != golden (short)"
+
+
 @pytest.mark.parametrize("K", [1, 8, 16])
 def test_multistep_decoder_byte_exact(K, require_fixtures):
     import torch

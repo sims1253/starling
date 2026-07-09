@@ -48,11 +48,18 @@ class MegaPipeline:
         steps_per_replay: int | None = None,
         encoder_warmup_iters: int = 3,
         encoder_mode: str = "cudagraph",
+        prefill_use_graph: bool = False,
     ) -> None:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
         self.audio_token_id = int(getattr(model.config, "audio_token_id", AUDIO_TOKEN_ID))
+        # Prefill eager by default: the per-prompt-length prefill graphs (cap 8,
+        # evict+reset) churn the CUDA-graph allocator on a diverse-length sweep
+        # and corrupt it into an illegal memory access. Eager prefill keeps the
+        # allocator quiet at ~no speed cost; the decode loop stays graphed. Set
+        # True to restore graphed prefill (repeated-length / latency-critical).
+        self.prefill_use_graph = bool(prefill_use_graph)
 
         comps = get_components(model)
         # (1) encoder: eager (byte-exact) by default; cudagraph mode captures
@@ -82,6 +89,7 @@ class MegaPipeline:
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
                 eos_token_id=EOS_TOKEN_ID,
+                prefill_use_graph=self.prefill_use_graph,
             )
         self.use_fused_llm = use_fused_llm
 
@@ -96,6 +104,7 @@ class MegaPipeline:
         use_fused_llm: bool = True,
         steps_per_replay: int | None = None,
         encoder_mode: str = "cudagraph",
+        prefill_use_graph: bool = False,
     ) -> "MegaPipeline":
         model, processor = load_model_and_processor(attn_impl=attn_impl, dtype=dtype, device=device)
         return cls(
@@ -105,6 +114,7 @@ class MegaPipeline:
             use_fused_llm=use_fused_llm,
             steps_per_replay=steps_per_replay,
             encoder_mode=encoder_mode,
+            prefill_use_graph=prefill_use_graph,
         )
 
     def _steps_for_prompt(self, prompt_len: int) -> int:
@@ -137,9 +147,23 @@ class MegaPipeline:
                 max_cache_len=self._max_cache_len,
                 steps_per_replay=k,
                 eos_token_id=EOS_TOKEN_ID,
+                prefill_use_graph=self.prefill_use_graph,
             )
             self._llms_by_k[k] = llm
         return llm
+
+    def set_prefill_use_graph(self, on: bool) -> None:
+        """Toggle graphed vs eager prefill at runtime (byte-exact either way).
+
+        Graphed prefill amortises across repeated prompt lengths (fixed-chunk
+        streaming) but re-captures (and churns the allocator) on diverse audio;
+        eager avoids it. The server flips this per request mode. Updates the flag
+        for future decoders and every already-cached one.
+        """
+        on = bool(on)
+        self.prefill_use_graph = on
+        for llm in self._llms_by_k.values():
+            llm.prefill_use_graph = on
 
     # ------------------------------------------------------------------ #
     # merge step (byte-exact replica of Qwen3ASRModel.forward scatter)

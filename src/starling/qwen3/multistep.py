@@ -52,6 +52,7 @@ class MultiStepLLMMega(FusedLLMMega):
         dtype: torch.dtype = torch.bfloat16,
         eos_token_id: int = EOS_TOKEN_ID,
         compile_decode: bool = True,
+        prefill_use_graph: bool = True,
     ) -> None:
         super().__init__(
             language_model,
@@ -61,6 +62,7 @@ class MultiStepLLMMega(FusedLLMMega):
             device=device,
             dtype=dtype,
             eos_token_id=eos_token_id,
+            prefill_use_graph=prefill_use_graph,
         )
         self.steps_per_replay = max(1, int(steps_per_replay))
         self.K = self.steps_per_replay
@@ -154,7 +156,7 @@ class MultiStepLLMMega(FusedLLMMega):
 
         K = self.K
         n_decode = max_new_tokens - 1
-        next_token = self.prefill(inputs_embeds)
+        next_token = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)
         gen_ids = [int(next_token.item())]
         if max_new_tokens <= 1 or n_decode <= 0:
             return self._finalize(gen_ids, 0.0, tokenizer)

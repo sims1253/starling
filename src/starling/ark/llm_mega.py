@@ -62,7 +62,16 @@ from .config import (
 # (``del graph; torch.cuda.empty_cache()``). This bounds memory without changing
 # numerics (each distinct T still gets its own exact graph; only old ones are
 # recycled once resident memory pressure rises).
-MAX_PREFILL_GRAPHS: int = 512
+#
+# 64 (not 512): the encoder graphs are now shape-bucketed (see
+# ``MegaPipeline.shape_bucketing``), so the prefill graphs are the *only*
+# per-clip accumulator left. At 512 they grow one-per-distinct-length across a
+# 350-clip leaderboard sweep (~50-70 GB of private pools) and overflow the 32 GB
+# card into WSL shared memory until it OOMs. A 64-graph ceiling caps that at a
+# few GB; because leaderboard prompt lengths are near-unique and processed
+# sequentially, evicted graphs are never revisited, so eviction costs ~no
+# re-capture (unlike a repeated-length workload).
+MAX_PREFILL_GRAPHS: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +132,7 @@ class LLMMega:
         dtype: torch.dtype = torch.bfloat16,
         *,
         max_prefill_graphs: int = MAX_PREFILL_GRAPHS,
+        prefill_use_graph: bool = True,
         graph_pool=None,
     ) -> None:
         self.lm = language_model
@@ -134,6 +144,14 @@ class LLMMega:
         self.dtype = dtype
         self.graph_pool = graph_pool  # shared pool for safe eviction
         self.max_prefill_graphs = max(1, int(max_prefill_graphs))
+        # Prefill is a one-shot, compute-bound forward over T tokens: CUDA-graph
+        # capture removes only its host launch overhead (a small fraction of the
+        # prefill compute) but costs a full per-T graph's private pool. On a
+        # diverse-length sweep those per-T graphs are the dominant memory
+        # accumulator (they overflow the 32 GB card into WSL shared memory ->
+        # RTFx collapse). Running prefill eager keeps the memory flat with ~no
+        # speed cost; the decode loop stays graphed. Byte-exact either way.
+        self.prefill_use_graph = bool(prefill_use_graph)
 
         self.vocab_size = int(self.config.vocab_size)
         self.num_layers = int(self.config.num_hidden_layers)
@@ -463,7 +481,7 @@ class LLMMega:
             # HF generate() returns zero new tokens in this case; match that.
             return self._finalize([], 0.0, tokenizer)
         # (1) prefill -> first token
-        next_token = self.prefill(inputs_embeds)  # (1, 1)
+        next_token = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)  # (1, 1)
         gen_ids = [int(next_token.item())]
 
         if max_new_tokens <= 1:
@@ -558,7 +576,7 @@ class LLMMega:
 
         # (b) capture the decode graph on a cleanly populated cache.
         self._reset_cache_pos(0)
-        first_tok = self.prefill(inputs_embeds)  # fills K/V [0, T), gives tok 1
+        first_tok = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)  # fills K/V [0, T), gives tok 1
         self.capture(first_tok, T)
 
         # Per-token decode time: replay at a fixed position so every iteration

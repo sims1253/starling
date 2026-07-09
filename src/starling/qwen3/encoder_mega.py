@@ -354,9 +354,17 @@ class GraphedEncoder:
             "static_wmask": static_wmask, "static_out": static_out, "graph": graph,
         }
         # Bound the cache before inserting (LRU by insertion order; re-capture
-        # of an evicted shape is byte-exact — see __init__ docstring).
+        # of an evicted shape is byte-exact — see __init__ docstring). Reset the
+        # evicted graph so its private CUDA-graph pool is freed deterministically
+        # instead of leaking until GC (the returned output is cloned, so nothing
+        # references the evicted graph's static buffers).
         if len(self._graphs) >= self.max_cached_shapes:
-            self._graphs.pop(next(iter(self._graphs)))
+            old_key = next(iter(self._graphs))
+            old = self._graphs.pop(old_key)
+            try:
+                old["graph"].reset()
+            except Exception:
+                pass
         self._graphs[key] = bundle
         return bundle
 
