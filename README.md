@@ -104,6 +104,14 @@ median ± standard deviation across repetitions.
 | long     |       1 | 324ms (230x) | 1825ms (41x)         |
 <!-- BENCH:END -->
 
+**granite-speech-4.1-2b-nar** — latency / RTFx (ms, RTFx×)
+
+| length | batch | starling | stock transformers |
+|--------|------:|----------|--------------------|
+| short  |     1 | 14ms (531x) | 75ms (99x) |
+| medium |     1 | 30ms (744x) | 95ms (235x) |
+| long   |     1 | 104ms (715x) | 139ms (535x) |
+
 ### Accuracy (Open ASR Leaderboard reproduction)
 
 <!-- BENCH:WER:START -->

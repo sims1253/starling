@@ -40,6 +40,7 @@ borderline argmax). The compiled-stock path is the byte-exact fast path.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Any, Optional
 
 import torch
@@ -184,16 +185,51 @@ def build_flat_inputs(
 # Shape-keyed CUDA-graph cache.
 # =========================================================================== #
 class _GraphCache:
-    """Holds a CUDA graph + its static input/output buffers for one shape key."""
+    """Bounded CUDA-graph cache with adaptive per-shape capture.
 
-    def __init__(self) -> None:
+    Captured graphs are retained for the pipeline lifetime. Freeing a graph
+    while other captures share allocator state can be unsafe, so once the
+    cache reaches its limit, unseen shapes stay eager instead of evicting and
+    recapturing.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_captures: int,
+        capture_after: int = 2,
+        max_seen: int = 4096,
+    ) -> None:
+        if max_captures < 0:
+            raise ValueError("max_captures must be non-negative")
+        if capture_after < 1:
+            raise ValueError("capture_after must be positive")
+        if max_seen < 1:
+            raise ValueError("max_seen must be positive")
+        self.max_captures = max_captures
+        self.capture_after = capture_after
+        self.max_seen = max_seen
         self._graphs: dict[Any, dict[str, Any]] = {}
+        self._seen: OrderedDict[Any, int] = OrderedDict()
 
     def get(self, key: Any) -> Optional[dict[str, Any]]:
         return self._graphs.get(key)
 
+    def should_capture(self, key: Any) -> bool:
+        if key in self._graphs:
+            return False
+        sightings = self._seen.pop(key, 0) + 1
+        self._seen[key] = sightings
+        while len(self._seen) > self.max_seen:
+            self._seen.popitem(last=False)
+        return sightings >= self.capture_after and len(self._graphs) < self.max_captures
+
     def put(self, key: Any, entry: dict[str, Any]) -> None:
+        if key not in self._graphs and len(self._graphs) >= self.max_captures:
+            raise RuntimeError("graph cache capacity exceeded")
         self._graphs[key] = entry
+        self._seen.pop(key, None)
+
 
 
 # =========================================================================== #
@@ -216,6 +252,12 @@ class NarMega:
         If True (default), capture the compiled LLM editor forward into a
         per-shape graph. Compiling first (so Inductor emits deterministic
         Triton kernels) keeps graph-capture byte-exact.
+    max_encoder_graphs, max_llm_graphs : int
+        Maximum captured shapes retained for each stage. Novel shapes remain
+        eager after the corresponding cache is full.
+    capture_after : int
+        Capture a shape on this sighting. The default avoids paying capture
+        cost or retaining graph-owned memory for one-off input lengths.
     """
 
     def __init__(
@@ -225,6 +267,9 @@ class NarMega:
         compile_llm: bool = True,
         capture_encoder: bool = True,
         capture_llm: bool = True,
+        max_encoder_graphs: int = 8,
+        max_llm_graphs: int = 8,
+        capture_after: int = 2,
     ) -> None:
         self.model = model
         self.config = model.config
@@ -251,9 +296,14 @@ class NarMega:
         # Compiled LLM forward (lazily, so construction doesn't pay the cost).
         self._llm_forward_compiled: Any = None
 
-        # Shape-keyed graph caches.
-        self._enc_graphs = _GraphCache()
-        self._llm_graphs = _GraphCache()
+        # Shape-keyed graph caches. Novel shapes run eager first, then recurring
+        # shapes are captured up to fixed limits to bound graph-owned VRAM.
+        self._enc_graphs = _GraphCache(
+            max_captures=max_encoder_graphs, capture_after=capture_after
+        )
+        self._llm_graphs = _GraphCache(
+            max_captures=max_llm_graphs, capture_after=capture_after
+        )
 
     # ------------------------------------------------------------------ #
     # LLM editor forward
@@ -303,19 +353,21 @@ class NarMega:
         entry = self._enc_graphs.get(key)
 
         if self.capture_encoder:
-            if entry is None:
+            if entry is None and self._enc_graphs.should_capture(key):
                 entry = self._capture_encoder(input_features, attention_mask)
                 self._enc_graphs.put(key, entry)
-            entry["input"].copy_(input_features)
-            entry["graph"].replay()
-            audio_embeds = entry["audio_embeds"]
-            bpe_logits = entry["bpe_logits"]
-            audio_lengths = entry["audio_lengths"]
-            bpe_lengths = entry["bpe_lengths"]
-        else:
-            audio_embeds, bpe_logits, audio_lengths, bpe_lengths = self._encproj_eager(
-                input_features, attention_mask
-            )
+            if entry is not None:
+                entry["input"].copy_(input_features)
+                entry["graph"].replay()
+                audio_embeds = entry["audio_embeds"]
+                bpe_logits = entry["bpe_logits"]
+                audio_lengths = entry["audio_lengths"]
+                bpe_lengths = entry["bpe_lengths"]
+                return audio_embeds, bpe_logits, audio_lengths, bpe_lengths
+
+        audio_embeds, bpe_logits, audio_lengths, bpe_lengths = self._encproj_eager(
+            input_features, attention_mask
+        )
 
         return audio_embeds, bpe_logits, audio_lengths, bpe_lengths
 
@@ -419,13 +471,17 @@ class NarMega:
         entry = self._llm_graphs.get(key)
 
         if self.capture_llm:
-            if entry is None:
+            if entry is None and self._llm_graphs.should_capture(key):
                 entry = self._capture_llm(flat_embeds, flat_pos)
                 self._llm_graphs.put(key, entry)
-            entry["input"].copy_(flat_embeds)
-            entry["pos"].copy_(flat_pos)
-            entry["graph"].replay()
-            all_logits = entry["logits"]
+            if entry is not None:
+                entry["input"].copy_(flat_embeds)
+                entry["pos"].copy_(flat_pos)
+                entry["graph"].replay()
+                all_logits = entry["logits"]
+            else:
+                fwd = self._get_compiled_llm() if self.compile_llm else self._llm_forward
+                all_logits = fwd(flat_embeds, flat_pos)
         else:
             fwd = self._get_compiled_llm() if self.compile_llm else self._llm_forward
             all_logits = fwd(flat_embeds, flat_pos)
