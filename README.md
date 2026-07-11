@@ -156,7 +156,8 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 ## What did not work
 
 - **INT8 weight-only quant** is slower — decode is launch-bound, not bandwidth-bound.
-- **FP8 `_scaled_mm`** is slower for the same reason.
+- **FP8 `_scaled_mm`** is slower for M=1 decode and proved unsafe across many
+  captured graphs. The shipped FP8 path uses a fused weight-only Triton GEMV.
 - **`torch.compile` on the encoder** is not byte-exact: inductor upcasts attention to fp32 and the conformer's BatchNorm amplifies the difference.
 - **Batched spec decoding at B≥16** is slower than non-spec (0.76x) — lock-step cache rewind wastes verify work when streams differ in acceptance.
 
@@ -177,7 +178,7 @@ isolated `.venv-higgs` environment documented in `src/starling/higgs/UV_NOTES.md
 ```bash
 python -m starling.server --model granite --port 8181 --max-chunk-seconds 30
 python -m starling.server --model parakeet --profile realtime --warmup
-python -m starling.server --model moss --profile batch  # SDPA + fp8 file jobs
+python -m starling.server --model moss --profile batch  # SDPA + fused fp8
 ```
 
 Endpoints (FastAPI when available, stdlib fallback):
@@ -210,7 +211,7 @@ Profiles provide supported defaults for the main workloads:
 | ------- | ----------------- | ------------------------- |
 | `file` (default) | one-shot files | adaptive graphs, strict flags |
 | `realtime` | low-latency dictation | graphed recurring windows + SDPA |
-| `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus fp8 weights on granite/moss; do not use for `/stream` |
+| `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus graph-safe fused fp8 weights on granite/moss |
 | `accuracy` | strict/reference output | adaptive graphs, strict byte-exact flags |
 
 Model selection is workload-dependent: parakeet has the lowest realtime

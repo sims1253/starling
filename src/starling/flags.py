@@ -121,27 +121,15 @@ class OptFlags:
     scheduling; **byte-exact** (identical per-chunk work, just overlapped)."""
 
     fp8_weights: bool = False
-    """Cast the 28 decoder-layer projection weights (q/k/v/o, gate/up/down) to
-    fp8e4m3 with dynamic per-token activation scaling, via ``torch._scaled_mm``
-    (Blackwell fp8 tensor cores).  Halves the weight bandwidth that dominates
-    decode (~72% of the captured step is these GEMMs) for a ~1.2x end-to-end
-    speedup on decode-bound MOSS audio -- the largest speedup that needs **no**
-    fine-tune. This end-to-end result includes multi-row work during prefill;
-    it does not contradict Granite's isolated M=1 GEMV measurement, where
-    ``torch._scaled_mm`` is 8.7x slower and the Triton dequant-GEMV is used
-    instead (see :mod:`starling.granite.fp8`). The **lm_head stays bf16** (its
+    """Cast decoder-layer projection weights (q/k/v/o, gate/up/down) to
+    fp8e4m3 and run M=1 decode projections with a fused Triton dequant-GEMV.
+    This halves weight traffic without quantizing the activation or dispatching
+    the general ``torch._scaled_mm`` GEMM. The **lm_head stays bf16** (its
     152k-way argmax has fp8-fragile
     near-ties).  **Breaks byte-exactness** in principle (fp8 weight rounding),
     though it reproduces the golden transcript token-for-token on the fixtures;
     requires ``tolerance_mode=True`` and forces ``fused_qkv`` (it reads the
-    pre-concatenated qkv/gate-up weights).  See ``starling.moss.fp8`` /
-    ``starling.granite.fp8`` (shared flag, per-model quant helpers).
-
-    **Batch / one-off use only.**  ``torch._scaled_mm`` captured in a CUDA graph
-    corrupts intermittently under sustained streaming churn (hundreds of
-    varying-length transcribes in one process -- a cuBLASLt-workspace-under-
-    graphs issue), so this is unsafe for the long-lived ``/stream`` server path.
-    The MOSS server keeps it off; enable it only for single-shot batch jobs."""
+    pre-concatenated qkv/gate-up weights).  See :mod:`starling.fp8_gemv`."""
 
     # ------------------------------------------------------------------
     # EXPERIMENTAL / UNIMPLEMENTED

@@ -418,9 +418,9 @@ class MossBackend(ModelBackend):
         # in one process can hit a graph-accumulation limit in the megakernel
         # decode graph (bench_leaderboard shards per dataset to avoid it).
         #
-        # fp8 decode (+20%%, ~0%% WER) is deliberately NOT enabled: torch._scaled_mm
-        # in a captured graph corrupts under sustained streaming churn.  It stays
-        # opt-in for one-off batch jobs, where it is stable.
+        # Optional FP8 decode uses the graph-safe fused dequant-GEMV; unlike the
+        # old torch._scaled_mm path it has no cuBLASLt workspace to alias across
+        # the recurring decode graphs used here.
         model, processor = load_model_and_processor()
         self.pipe = MossMegaPipeline(
             model, processor, max_cache_len=2048, encoder_mode="cudagraph",
@@ -1025,10 +1025,6 @@ class StreamSession:
 
     def __post_init__(self) -> None:
         cfg = self.server.config
-        if getattr(getattr(cfg, "opt_flags", None), "fp8_weights", False):
-            raise ValueError(
-                "fp8_weights is restricted to batch/file requests and cannot be used with /stream"
-            )
         if getattr(cfg, "stream_chunk_seconds", 0.0) and cfg.stream_chunk_seconds > 0:
             from .stream_chunk import ChunkStreamer
 
@@ -1767,7 +1763,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--fp8-weights", action="store_true",
-        help="enable tolerance-mode fp8 decoder weights (batch/file only)",
+        help="enable tolerance-mode fused fp8 decoder weights",
     )
     p.add_argument(
         "--tolerance-mode", action="store_true",

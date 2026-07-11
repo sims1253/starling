@@ -597,8 +597,7 @@ class FusedLLMMega(LLMMega):
         # FP8 weight-only quantization (flag-gated, additive). When
         # ``fp8_weights`` is on we quantize the per-layer projection weights to
         # fp8e4m3 at load time and replace the bf16 ``F.linear`` calls in
-        # :meth:`_decode_step_eager` with :func:`fp8_linear` (which dispatches
-        # ``torch._scaled_mm`` on Blackwell fp8 tensor cores).  Halves the
+        # :meth:`_decode_step_eager` with the shared fused dequant-GEMV. Halves the
         # weight bandwidth that dominates decode (~57% of the captured step per
         # the profiler).  NOT byte-exact (fp8 weight rounding); gated by
         # ``OptFlags.fp8_weights`` (which requires ``tolerance_mode=True`` and
