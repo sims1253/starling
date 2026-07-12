@@ -23,8 +23,9 @@ All do speech-to-text.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — Whisper encoder + MLP adapter + Qwen2.5 decoder.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — first seq2seq encoder-decoder: 48-layer FastConformer encoder + 8-layer Transformer decoder (self + cross attention).
 - [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. Runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13.
+- [`nvidia/Nemotron-Labs-Audex-2B`](https://huggingface.co/nvidia/Nemotron-Labs-Audex-2B) — Whisper-large-v3 encoder (with avg-pooler) + relu2 projector + Nemotron-Dense 2B decoder (squared-ReLU MLP, not SwiGLU). ASR path only. **NVIDIA Oneway Noncommercial License** — non-commercial use only, unlike the Apache/MIT-licensed models above.
 
-The autoregressive models (granite, moss, qwen3, ark, higgs, cohere) share an
+The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere) share an
 encoder + LLM-decoder pattern where the decode loop is the bottleneck. Parakeet
 is a transducer; granite-nar is a single bidirectional pass.
 
@@ -102,6 +103,14 @@ median ± standard deviation across repetitions.
 | short    |       1 | 55ms (134x)  | 323ms (23x)          |
 | medium   |       1 | 171ms (131x) | 918ms (24x)          |
 | long     |       1 | 324ms (230x) | 1825ms (41x)         |
+
+**nemotron-labs-audex-2b** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling       | stock transformers   |
+|----------|---------|----------------|----------------------|
+| short    |       1 | 234ms (32x)    | 1346ms (6x)          |
+| medium   |       1 | 451ms (49x)    | 3884ms (6x)          |
+| long     |       1 | 1613ms (46x)   | 13234ms (6x)         |
 <!-- BENCH:END -->
 
 **granite-speech-4.1-2b-nar** — latency / RTFx (ms, RTFx×)
@@ -121,6 +130,8 @@ median ± standard deviation across repetitions.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|-------|
 | ark-asr-3b                 | starling           | 11.35%      | 6.31% | 8.04%        | 3.77%        | 2.60%               | 3.97%               | 2.35%        | 5.48% |
 | ark-asr-3b                 | stock transformers | 11.38%      | 6.21% | 8.15%        | 3.77%        | 2.63%               | 3.81%               | 2.25%        | 5.46% |
+| nemotron-labs-audex-2b     | starling           | 9.80%       | 11.90%| 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
+| nemotron-labs-audex-2b     | stock transformers | 9.80%       | 11.90%| 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
 | cohere-transcribe-03-2026  | starling           | 10.32%      | 6.31% | 8.59%        | 5.47%        | 1.47%               | 1.78%               | 2.45%        | 5.20% |
 | cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31% | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
 | granite-speech-4.1-2b      | starling           | 7.47%       | 8.02% | 8.48%        | 5.21%        | 1.77%               | 2.35%               | 2.80%        | 5.16% |
@@ -138,6 +149,8 @@ median ± standard deviation across repetitions.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|
 | ark-asr-3b                 | starling           | 53x         | 46x   | 46x          | 40x          | 50x                 | 47x                 | 42x          |
 | ark-asr-3b                 | stock transformers | 7x          | 6x    | 6x           | 5x           | 6x                  | 6x                  | 5x           |
+| nemotron-labs-audex-2b     | starling           | 60x         | 58x   | 66x          | 49x          | 60x                 | 55x                 | 48x          |
+| nemotron-labs-audex-2b     | stock transformers | 9x          | 8x    | 10x          | 7x           | 9x                  | 8x                  | 8x           |
 | cohere-transcribe-03-2026  | starling           | 97x         | 83x   | 102x         | 75x          | 110x                | 97x                 | 82x          |
 | cohere-transcribe-03-2026  | stock transformers | 32x         | 29x   | 36x          | 29x          | 29x                 | 26x                 | 26x          |
 | granite-speech-4.1-2b      | starling           | 78x         | 74x   | 78x          | 64x          | 69x                 | 63x                 | 66x          |
@@ -179,7 +192,7 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 
 `src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps
 one model resident in VRAM. One process runs one model at a time (`--model
-granite|parakeet|parakeet_unified|moss|qwen3|ark|cohere|higgs`, default
+granite|parakeet|parakeet_unified|moss|qwen3|ark|cohere|higgs|audex`, default
 `granite`); `/health` reports which is loaded. Higgs must be run from the
 isolated `.venv-higgs` environment documented in `src/starling/higgs/UV_NOTES.md`.
 
@@ -231,7 +244,7 @@ jobs rather than silently changing per-request latency semantics.
 
 **Timestamps.** `/inference` returns chunk-level segments
 (`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3, ark,
-higgs) have no
+higgs, audex) have no
 per-token audio alignment, so segments are at `--max-chunk-seconds` granularity;
 shrink it for finer segments at the cost of more decode passes. Parakeet
 and cohere chunk internally and return a single whole-utterance segment.

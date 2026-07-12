@@ -70,6 +70,7 @@ MODEL_LABELS = {
     "ark": "ark-asr-3b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
+    "audex": "nemotron-labs-audex-2b",
 }
 
 
@@ -424,8 +425,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs; "
-                         "qwen3/higgs are auto-gated on availability)")
+                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs,audex; "
+                         "qwen3/higgs/audex are auto-gated on availability)")
     ap.add_argument("--engines", default="starling,stock",
                     help="comma list of engine families: starling,stock,crispasr,"
                          "parakeet.cpp,starling-batched,starling-spec,"

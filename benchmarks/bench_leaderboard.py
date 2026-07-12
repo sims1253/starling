@@ -57,6 +57,7 @@ MODEL_LABELS = {
     "ark": "ark-asr-3b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
+    "audex": "nemotron-labs-audex-2b",
 }
 
 

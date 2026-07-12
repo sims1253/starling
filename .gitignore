@@ -35,3 +35,6 @@ comms.md
 
 # higgs isolated venv (transformers 4.51 for the model's own code)
 .venv-higgs/
+
+# downloaded model checkpoints (never check these in)
+.hf-cache/

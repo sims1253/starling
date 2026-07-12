@@ -99,7 +99,7 @@ WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "cohere", "higgs")
+MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "cohere", "higgs", "audex")
 
 
 def _gpu_lock_model(slug: str) -> str:
@@ -112,6 +112,7 @@ def _gpu_lock_model(slug: str) -> str:
         "ark": "ark-asr-3b",
         "cohere": "cohere-transcribe-03-2026",
         "higgs": "higgs-audio-v3-stt",
+        "audex": "nemotron-labs-audex-2b",
     }.get(slug, slug)
 
 
@@ -599,6 +600,38 @@ class HiggsBackend(ModelBackend):
         return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
+class AudexBackend(ModelBackend):
+    """nemotron-labs-audex-2b: Whisper encoder + Nemotron-Dense 2B decoder (ASR).
+
+    The pipeline's ``transcribe`` takes a 1-D float32 waveform. Audio is
+    chunked to 30 s clips (the Whisper window), each producing 750 audio
+    embeddings. File input is waveform-chunked to bound the static KV cache.
+    """
+
+    slug = "audex"
+
+    def load(self) -> None:
+        from .audex.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
+        self.pipe.set_prefill_use_graph(
+            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
+        )
+
+    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        wav = np.ascontiguousarray(samples, dtype=np.float32)
+        text, _ = self.pipe.transcribe(wav, max_new_tokens=budget)
+        return text
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        return self._transcribe_chunked(samples, self._transcribe_chunk)
+
+
 _BACKENDS: dict[str, type[ModelBackend]] = {
     "granite": GraniteBackend,
     "parakeet": ParakeetBackend,
@@ -608,6 +641,7 @@ _BACKENDS: dict[str, type[ModelBackend]] = {
     "ark": ArkBackend,
     "cohere": CohereBackend,
     "higgs": HiggsBackend,
+    "audex": AudexBackend,
 }
 
 
@@ -1684,7 +1718,7 @@ def _run_stdlib_server(server: StarlingServer, host: str, port: int) -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m starling.server",
-        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/cohere/higgs).",
+        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/cohere/higgs/audex).",
     )
     p.add_argument(
         "--model",
