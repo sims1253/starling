@@ -26,12 +26,12 @@ import argparse
 import json
 import os
 import platform
+import statistics
 import sys
 import time
 import warnings
 from pathlib import Path
 
-import numpy as np
 import torch
 from tabulate import tabulate
 
@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
 import leaderboard_corpus as lc  # noqa: E402
 from engines import Engine, SkipCell, build_engines  # noqa: E402
-from wer_leaderboard import composite_wer, score_dataset  # noqa: E402
+from wer_leaderboard import score_dataset  # noqa: E402
 
 OUTPUTS = REPO_ROOT / "outputs"
 README = REPO_ROOT / "README.md"
@@ -57,6 +57,7 @@ MODEL_LABELS = {
     "ark": "ark-asr-3b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
+    "audex": "nemotron-labs-audex-2b",
 }
 
 
@@ -99,7 +100,7 @@ def _run_engine_on_dataset(
             text = engine.transcribe(clip.audio, B=1)[0]
             torch.cuda.synchronize()
             t = time.perf_counter() - t0
-        except SkipCell as sc:
+        except SkipCell:
             refs.append(clip.reference)
             hyps.append("")
             times_s.append(float("nan"))
@@ -120,6 +121,14 @@ def _run_engine_on_dataset(
     vrefs, vhyps, vtimes, vdurs = zip(*valid)
     scored = score_dataset(list(vrefs), list(vhyps),
                            times_s=list(vtimes), durations_s=list(vdurs))
+    latency_ms = [t * 1000.0 for t in vtimes]
+    scored.update({
+        "latency_ms_median": round(statistics.median(latency_ms), 1),
+        "latency_ms_stdev": round(statistics.stdev(latency_ms), 1)
+        if len(latency_ms) > 1 else 0.0,
+        "latency_ms_min": round(min(latency_ms), 1),
+        "latency_ms_max": round(max(latency_ms), 1),
+    })
     return scored
 
 
@@ -144,8 +153,12 @@ def run_grid(
                 rtfx = rec.get("rtfx")
                 wer_s = f"{wer:.2f}%" if wer == wer else "skip"
                 rtfx_s = f"{rtfx:.0f}x" if rtfx == rtfx else "-"
+                spread_s = (
+                    f"σ={rec['latency_ms_stdev']:.0f}ms"
+                    if rec.get("latency_ms_stdev") is not None else ""
+                )
                 print(f"  {key:20s} n={rec.get('n',0):4d}  WER {wer_s:>8s}  "
-                      f"RTFx {rtfx_s:>7s}", flush=True)
+                      f"RTFx {rtfx_s:>7s}  {spread_s}", flush=True)
             engine.close()
     return {
         "title": "starling open-asr-leaderboard benchmark",
@@ -210,7 +223,12 @@ def _rtfx_table(records: list[dict], models: list[str], engines: list[str],
                     cells.append("—")
                 else:
                     r = rec["rtfx"]
-                    cells.append(f"{r:.0f}x" if r == r else "—")
+                    spread = rec.get("latency_ms_stdev")
+                    cells.append(
+                        f"{r:.0f}x (σ {spread:.0f}ms)"
+                        if r == r and spread is not None
+                        else (f"{r:.0f}x" if r == r else "—")
+                    )
                     if r == r:
                         has = True
             if has:
@@ -412,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     all_engines = sorted({r["engine"] for r in results["records"]})
     md = build_markdown(results, models=list(engine_map.keys()), engines=all_engines)
     (OUTPUTS / "leaderboard.md").write_text(md)
-    print(f"\n[leaderboard] markdown:\n")
+    print("\n[leaderboard] markdown:\n")
     print(md)
 
     if args.update_readme:

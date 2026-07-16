@@ -31,7 +31,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -53,7 +53,8 @@ class SkipCell(Exception):
         self.reason = reason
 
 # CrispASR install (absent -> crispasr-* engines are silently skipped).
-ASR_BENCH = Path("/home/m0hawk/asr-bench")
+# Override on other machines with ASR_BENCH_ROOT=/path/to/asr-bench.
+ASR_BENCH = Path(os.environ.get("ASR_BENCH_ROOT", Path.home() / "asr-bench")).expanduser()
 CRISPASR_BIN = ASR_BENCH / "bin" / "crispasr-linux-x86_64-cuda13" / "crispasr"
 CRISPASR_MODELS = ASR_BENCH / "models"
 _CRISPASR_ENV = {
@@ -215,7 +216,6 @@ class GraniteStarlingBatched(Engine):
         super().__init__("starling (batched)", "granite", supports_batch=True)
 
     def _load(self) -> None:
-        from starling.granite.batched import BatchedPipeline
         from starling.granite.loader import load_model_and_processor
 
         # BatchedPipeline needs the raw model + processor (not MegaPipeline).
@@ -439,8 +439,6 @@ class MossStarling(Engine):
         self.pipe = None
 
     def _run_one(self, audio: np.ndarray) -> str:
-        from starling.moss.loader import load_model_and_processor
-
         inp = self.pipe.processor(audio.astype("float32"))
         inp = {
             k: (v.cuda() if isinstance(v, torch.Tensor) else v)
@@ -517,8 +515,6 @@ class Qwen3Starling(Engine):
         self.pipe = None
 
     def _run_one(self, audio: np.ndarray) -> str:
-        import torchaudio
-
         wav = torch.from_numpy(audio).float().unsqueeze(0)
         inp = self._build_inputs(self.pipe.processor, wav, sr=16000)
         text, _ = self.pipe.transcribe(
@@ -815,6 +811,105 @@ class HiggsStock(Engine):
 
 
 # ====================================================================== #
+# Nemotron-Labs-Audex-2B  (ASR path: Whisper encoder + Nemotron-Dense decoder)
+# ====================================================================== #
+class AudexStarling(Engine):
+    """starling fused pipeline for Audex-2B (graphed Whisper+avg-pooler encoder
+    + K-step graphed Nemotron-Dense decode). Byte-identical to eager."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "audex", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.audex.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+        self.pipe.set_prefill_use_graph(True)
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        text, _ids = self.pipe.transcribe(audio, max_new_tokens=400)
+        return text
+
+
+class AudexStock(Engine):
+    """Stock eager ``model.generate`` reference for Audex-2B ASR.
+
+    Replicates the ``inference_scripts_hf`` recipe: 30 s Whisper clips,
+    ChatML prompt with ``<so_embedding>`` placeholders, greedy decode.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "audex", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.audex.audio import build_inputs
+        from starling.audex.loader import load_model_and_processor
+
+        self._build_inputs = build_inputs
+        self.model, self.tokenizer, self.feature_extractor = (
+            load_model_and_processor(attn_impl="eager")
+        )
+
+    def _release(self) -> None:
+        self.model = self.tokenizer = self.feature_extractor = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        import re as _re
+
+        from starling.audex.audio import normalize_audio
+        from starling.audex.config import EOS_TOKEN_ID, SOUND_CLIP_DURATION, SOUND_TARGET_RATE
+
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        wav = normalize_audio(wav)
+        clip_samples = int(round(SOUND_TARGET_RATE * SOUND_CLIP_DURATION))
+
+        # Chunk at 30s (same as the starling pipeline) to avoid multi-clip
+        # repetition hallucination on long/repetitive audio.
+        if len(wav) <= clip_samples:
+            clips = [wav]
+        else:
+            clips = []
+            for start in range(0, len(wav), clip_samples):
+                clip = wav[start : start + clip_samples]
+                if len(clip) < 100:
+                    continue
+                if len(clip) < clip_samples:
+                    clip = np.pad(clip, (0, clip_samples - len(clip)))
+                clips.append(clip)
+
+        texts = []
+        for clip in clips:
+            inputs = self._build_inputs(
+                self.tokenizer, self.feature_extractor, clip
+            )
+            prompt_len = inputs["input_ids"].shape[1]
+            gen = self.model.generate(
+                input_ids=inputs["input_ids"],
+                input_features=inputs["input_features"],
+                max_new_tokens=400,
+                do_sample=False,
+                num_beams=1,
+                eos_token_id=EOS_TOKEN_ID,
+            )
+            gen_new = gen[0][prompt_len:]
+            raw = self.tokenizer.decode(gen_new, skip_special_tokens=False)
+            if "</think>" in raw:
+                raw = raw.rsplit("</think>", 1)[-1]
+            if "<|im_end|>" in raw:
+                raw = raw.split("<|im_end|>", 1)[0]
+            raw = raw.strip()
+            m = _re.search(r"'(.+)'", raw, _re.DOTALL)
+            if m:
+                texts.append(m.group(1).strip())
+            else:
+                texts.append(raw)
+        return " ".join(texts)
+
+
+# ====================================================================== #
 # CrispASR  (external ggml binary; granite + qwen3 backends only)
 # ====================================================================== #
 class CrispASR(Engine):
@@ -988,6 +1083,8 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "stock-ark": ArkStock,
     "starling-cohere": CohereStarling,
     "stock-cohere": CohereStock,
+    "starling-audex": AudexStarling,
+    "stock-audex": AudexStock,
 }
 
 

@@ -23,8 +23,9 @@ All do speech-to-text.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — Whisper encoder + MLP adapter + Qwen2.5 decoder.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — first seq2seq encoder-decoder: 48-layer FastConformer encoder + 8-layer Transformer decoder (self + cross attention).
 - [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. Runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13.
+- [`nvidia/Nemotron-Labs-Audex-2B`](https://huggingface.co/nvidia/Nemotron-Labs-Audex-2B) — Whisper-large-v3 encoder (with avg-pooler) + relu2 projector + Nemotron-Dense 2B decoder (squared-ReLU MLP, not SwiGLU). ASR path only. **NVIDIA Oneway Noncommercial License** — non-commercial use only, unlike the Apache/MIT-licensed models above.
 
-The autoregressive models (granite, moss, qwen3, ark, higgs, cohere) share an
+The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere) share an
 encoder + LLM-decoder pattern where the decode loop is the bottleneck. Parakeet
 is a transducer; granite-nar is a single bidirectional pass.
 
@@ -52,7 +53,12 @@ uv run python benchmarks/bench_leaderboard.py --num-samples 0  # full splits
 RTFx = audio_seconds / transcribe_seconds (higher is faster). bf16, model load
 excluded, single RTX 5090.
 
-### Latency / RTFx
+### Synthetic fixture latency / RTFx
+
+These tiled single-utterance numbers are a deterministic regression gate, not
+a representative workload distribution. Use the real-corpus leaderboard RTFx
+table below for headline cross-model throughput. Newly generated tables report
+median ± standard deviation across repetitions.
 
 <!-- BENCH:START -->
 **granite-speech-4.1-2b** — latency / RTFx (ms, RTFx×)
@@ -97,7 +103,23 @@ excluded, single RTX 5090.
 | short    |       1 | 55ms (134x)  | 323ms (23x)          |
 | medium   |       1 | 171ms (131x) | 918ms (24x)          |
 | long     |       1 | 324ms (230x) | 1825ms (41x)         |
+
+**nemotron-labs-audex-2b** — latency / RTFx (ms, RTFx×)
+
+| length   |   batch | starling       | stock transformers   |
+|----------|---------|----------------|----------------------|
+| short    |       1 | 234ms (32x)    | 1346ms (6x)          |
+| medium   |       1 | 451ms (49x)    | 3884ms (6x)          |
+| long     |       1 | 1613ms (46x)   | 13234ms (6x)         |
 <!-- BENCH:END -->
+
+**granite-speech-4.1-2b-nar** — latency / RTFx (ms, RTFx×)
+
+| length | batch | starling | stock transformers |
+|--------|------:|----------|--------------------|
+| short  |     1 | 14ms (531x) | 75ms (99x) |
+| medium |     1 | 30ms (744x) | 95ms (235x) |
+| long   |     1 | 104ms (715x) | 139ms (535x) |
 
 ### Accuracy (Open ASR Leaderboard reproduction)
 
@@ -108,6 +130,8 @@ excluded, single RTX 5090.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|-------|
 | ark-asr-3b                 | starling           | 11.35%      | 6.31% | 8.04%        | 3.77%        | 2.60%               | 3.97%               | 2.35%        | 5.48% |
 | ark-asr-3b                 | stock transformers | 11.38%      | 6.21% | 8.15%        | 3.77%        | 2.63%               | 3.81%               | 2.25%        | 5.46% |
+| nemotron-labs-audex-2b     | starling           | 9.80%       | 11.90%| 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
+| nemotron-labs-audex-2b     | stock transformers | 9.80%       | 11.90%| 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
 | cohere-transcribe-03-2026  | starling           | 10.32%      | 6.31% | 8.59%        | 5.47%        | 1.47%               | 1.78%               | 2.45%        | 5.20% |
 | cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31% | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
 | granite-speech-4.1-2b      | starling           | 7.47%       | 8.02% | 8.48%        | 5.21%        | 1.77%               | 2.35%               | 2.80%        | 5.16% |
@@ -125,6 +149,8 @@ excluded, single RTX 5090.
 |----------------------------|--------------------|-------------|-------|--------------|--------------|---------------------|---------------------|--------------|
 | ark-asr-3b                 | starling           | 53x         | 46x   | 46x          | 40x          | 50x                 | 47x                 | 42x          |
 | ark-asr-3b                 | stock transformers | 7x          | 6x    | 6x           | 5x           | 6x                  | 6x                  | 5x           |
+| nemotron-labs-audex-2b     | starling           | 60x         | 58x   | 66x          | 49x          | 60x                 | 55x                 | 48x          |
+| nemotron-labs-audex-2b     | stock transformers | 9x          | 8x    | 10x          | 7x           | 9x                  | 8x                  | 8x           |
 | cohere-transcribe-03-2026  | starling           | 97x         | 83x   | 102x         | 75x          | 110x                | 97x                 | 82x          |
 | cohere-transcribe-03-2026  | stock transformers | 32x         | 29x   | 36x          | 29x          | 29x                 | 26x                 | 26x          |
 | granite-speech-4.1-2b      | starling           | 78x         | 74x   | 78x          | 64x          | 69x                 | 63x                 | 66x          |
@@ -151,7 +177,8 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 ## What did not work
 
 - **INT8 weight-only quant** is slower — decode is launch-bound, not bandwidth-bound.
-- **FP8 `_scaled_mm`** is slower for the same reason.
+- **FP8 `_scaled_mm`** is slower for M=1 decode and proved unsafe across many
+  captured graphs. The shipped FP8 path uses a fused weight-only Triton GEMV.
 - **`torch.compile` on the encoder** is not byte-exact: inductor upcasts attention to fp32 and the conformer's BatchNorm amplifies the difference.
 - **Batched spec decoding at B≥16** is slower than non-spec (0.76x) — lock-step cache rewind wastes verify work when streams differ in acceptance.
 
@@ -165,12 +192,14 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 
 `src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps
 one model resident in VRAM. One process runs one model at a time (`--model
-granite|parakeet|moss|qwen3`, default `granite`); `/health` reports which is
-loaded.
+granite|parakeet|parakeet_unified|moss|qwen3|ark|cohere|higgs|audex`, default
+`granite`); `/health` reports which is loaded. Higgs must be run from the
+isolated `.venv-higgs` environment documented in `src/starling/higgs/UV_NOTES.md`.
 
 ```bash
 python -m starling.server --model granite --port 8181 --max-chunk-seconds 30
-python -m starling.server --model parakeet --warmup   # pre-capture CUDA graphs
+python -m starling.server --model parakeet --profile realtime --warmup
+python -m starling.server --model moss --profile batch  # SDPA + fused fp8
 ```
 
 Endpoints (FastAPI when available, stdlib fallback):
@@ -181,7 +210,7 @@ Endpoints (FastAPI when available, stdlib fallback):
 | `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
 | `POST /transcribe`        | raw WAV bytes -> same shape as `/inference` |
 | `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202 Accepted) |
-| `DELETE /inference/<id>`  | cancel a queued request by its `X-Request-Id` |
+| `DELETE /inference/<id>`  | cancel a queued or running request by its `X-Request-Id` |
 | `WS   /stream`            | real-time streaming dictation |
 
 A single GPU worker serves one request at a time; concurrent requests queue
@@ -190,8 +219,32 @@ enables `DELETE /inference/<id>` cancellation — best-effort once on the GPU
 (CUDA-graph replays aren't preemptible; an in-flight request finishes its
 current step then returns HTTP 499).
 
+Requests without an `X-Request-Id` receive a generated ID in the response.
+Uploads are capped at 256 MiB and requests have a 10-minute wall-clock deadline
+by default; tune these with `--max-upload-mb` and
+`--request-timeout-seconds`. The API has no authentication, so binding a
+non-loopback `--host` emits a warning and should only be done behind an
+authenticated proxy.
+
+Profiles provide supported defaults for the main workloads:
+
+| profile | intended workload | graph/optimization policy |
+| ------- | ----------------- | ------------------------- |
+| `file` (default) | one-shot files | adaptive graphs, strict flags |
+| `realtime` | low-latency dictation | graphed recurring windows + SDPA |
+| `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus graph-safe fused fp8 weights on granite/moss |
+| `accuracy` | strict/reference output | adaptive graphs, strict byte-exact flags |
+
+Model selection is workload-dependent: parakeet has the lowest realtime
+latency, moss has the best measured leaderboard WER, qwen3 is a strong
+speed/accuracy compromise, and granite is useful when its self-speculative
+path is desired. The HTTP server intentionally serializes requests; the
+granite/qwen3 batched pipelines are exposed by `bench_all.py` for offline batch
+jobs rather than silently changing per-request latency semantics.
+
 **Timestamps.** `/inference` returns chunk-level segments
-(`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3) have no
+(`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3, ark,
+higgs, audex) have no
 per-token audio alignment, so segments are at `--max-chunk-seconds` granularity;
 shrink it for finer segments at the cost of more decode passes. Parakeet
-aligns internally and returns a single whole-utterance segment.
+and cohere chunk internally and return a single whole-utterance segment.

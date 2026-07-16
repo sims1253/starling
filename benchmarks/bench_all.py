@@ -43,7 +43,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from statistics import median
+from statistics import median, stdev
 
 import numpy as np
 import torch
@@ -70,14 +70,15 @@ MODEL_LABELS = {
     "ark": "ark-asr-3b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
+    "audex": "nemotron-labs-audex-2b",
 }
 
 
 # ---------------------------------------------------------------------- #
 # timing
 # ---------------------------------------------------------------------- #
-def _time_ms(fn, *, warmup: int, reps: int) -> float:
-    """Median wall time (ms) of ``fn`` over ``reps`` runs after ``warmup``.
+def _time_samples_ms(fn, *, warmup: int, reps: int) -> list[float]:
+    """Wall-time samples for ``fn`` after warmup, synchronized around each run.
 
     Bracketed by ``torch.cuda.synchronize()`` so GPU work is fully counted.
     CrispASR (no GPU tensors of ours) is timed the same way; the synchronize is
@@ -93,7 +94,12 @@ def _time_ms(fn, *, warmup: int, reps: int) -> float:
         fn()
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - t0) * 1000.0)
-    return float(median(samples))
+    return samples
+
+
+def _time_ms(fn, *, warmup: int, reps: int) -> float:
+    """Backward-compatible median timing helper."""
+    return float(median(_time_samples_ms(fn, warmup=warmup, reps=reps)))
 
 
 def _vram_gb() -> float:
@@ -182,9 +188,11 @@ def _run_cell(
         return rec
 
     torch.cuda.reset_peak_memory_stats()
-    ms = _time_ms(
+    timing_samples = _time_samples_ms(
         lambda: engine.transcribe(audio, B=B), warmup=warmup, reps=reps,
     )
+    ms = float(median(timing_samples))
+    ms_stdev = float(stdev(timing_samples)) if len(timing_samples) > 1 else 0.0
     vram = _vram_gb()
     # one transcript for WER (B copies are identical; take the first)
     hyp = probe[0] if engine.supports_batch and B > 1 else engine.transcribe(audio, B=1)[0]
@@ -199,6 +207,9 @@ def _run_cell(
         "batch": B,
         "audio_s": round(audio_s, 3),
         "ms": round(ms, 1),
+        "ms_stdev": round(ms_stdev, 1),
+        "ms_min": round(min(timing_samples), 1),
+        "ms_max": round(max(timing_samples), 1),
         "rtfx": round(rtfx, 1),
         "vram_gb": round(vram, 2),
         "wer_pct": round(wer, 2),
@@ -217,7 +228,7 @@ def _print_cell(rec: dict) -> None:
     note = " (Bx1 sequential)" if rec["sequential"] else ""
     print(
         f"  {rec['length']:6s} B={rec['batch']:<2d}{note}: "
-        f"{rec['ms']:7.0f}ms  RTFx {rec['rtfx']:5.1f}x  "
+        f"{rec['ms']:7.0f}ms ± {rec.get('ms_stdev', 0):5.1f}  RTFx {rec['rtfx']:5.1f}x  "
         f"WER {rec['wer_pct']:5.2f}%  VRAM {rec['vram_gb']:4.1f}GB"
     )
 
@@ -285,7 +296,13 @@ def latency_table(model: str, engines: list[Engine], records, *,
                     row.append(f"†{len(footnotes)+1}")
                     footnotes.append(f"{length}/B{B} {eng}: {rec['skipped']}")
                 else:
-                    row.append(f"{rec['ms']:.0f}ms ({rec['rtfx']:.0f}x)")
+                    spread = rec.get("ms_stdev")
+                    timing = (
+                        f"{rec['ms']:.0f}±{spread:.0f}ms"
+                        if spread is not None
+                        else f"{rec['ms']:.0f}ms"
+                    )
+                    row.append(f"{timing} ({rec['rtfx']:.0f}x)")
             rows.append(row)
     out = [f"**{MODEL_LABELS.get(model, model)}** — latency / RTFx (ms, RTFx×)\n"]
     out.append(tabulate(rows, headers=header, tablefmt="github"))
@@ -408,8 +425,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs; "
-                         "qwen3/higgs are auto-gated on availability)")
+                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs,audex; "
+                         "qwen3/higgs/audex are auto-gated on availability)")
     ap.add_argument("--engines", default="starling,stock",
                     help="comma list of engine families: starling,stock,crispasr,"
                          "parakeet.cpp,starling-batched,starling-spec,"
@@ -474,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
 
     md = build_markdown(results, engine_map, lengths=lengths, batches=batches)
     (OUTPUTS / "bench_all.md").write_text(md)
-    print(f"\n[bench] markdown tables:\n")
+    print("\n[bench] markdown tables:\n")
     print(md)
 
     if args.update_readme:
@@ -494,9 +511,12 @@ def main(argv: list[str] | None = None) -> int:
             if abs(s["wer_pct"] - k["wer_pct"]) > 1.0:
                 drift.append((model, length, B, s["wer_pct"], k["wer_pct"]))
     if drift:
-        print("\n[bench] WARNING: starling vs stock WER drift > 1% (expected ~0):")
+        print("\n[bench] ERROR: starling vs stock WER drift > 1 percentage point.")
+        print("        The threshold tolerates fixture-normalization noise; larger drift")
+        print("        violates the benchmark's stock-equivalence sanity gate.")
         for model, length, B, sw, kw in drift:
             print(f"          {model}/{length}/B{B}: starling {sw}% vs stock {kw}%")
+        return 1
 
     return 0
 

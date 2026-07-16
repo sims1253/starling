@@ -114,11 +114,6 @@ class OptFlags:
     elementwise divide/step, folded into the cuBLAS GEMM epilogue).
     **Byte-exact** (fp32 rescale of weights then re-cast).  On by default."""
 
-    gemm_epilogue_fusion: bool = False
-    """Fold RMSNorm + residual + SiLU-gate into the adjacent cuBLASLt GEMM
-    epilogues (CODA-style).  Removes ~4-5% of decode-step elementwise launches.
-    **Experimental** -- under construction; off by default."""
-
     chunk_prefill_overlap: bool = True
     """Long-audio: run chunk N+1's encoder prefill on a second CUDA stream
     while chunk N's LLM decode runs on the default stream (prefill is
@@ -126,23 +121,25 @@ class OptFlags:
     scheduling; **byte-exact** (identical per-chunk work, just overlapped)."""
 
     fp8_weights: bool = False
-    """Cast the 28 decoder-layer projection weights (q/k/v/o, gate/up/down) to
-    fp8e4m3 with dynamic per-token activation scaling, via ``torch._scaled_mm``
-    (Blackwell fp8 tensor cores).  Halves the weight bandwidth that dominates
-    decode (~72% of the captured step is these GEMMs) for a ~1.2x end-to-end
-    speedup on decode-bound audio -- the largest speedup that needs **no**
-    fine-tune.  The **lm_head stays bf16** (its 152k-way argmax has fp8-fragile
+    """Cast decoder-layer projection weights (q/k/v/o, gate/up/down) to
+    fp8e4m3 and run M=1 decode projections with a fused Triton dequant-GEMV.
+    This halves weight traffic without quantizing the activation or dispatching
+    the general ``torch._scaled_mm`` GEMM. The **lm_head stays bf16** (its
+    152k-way argmax has fp8-fragile
     near-ties).  **Breaks byte-exactness** in principle (fp8 weight rounding),
     though it reproduces the golden transcript token-for-token on the fixtures;
     requires ``tolerance_mode=True`` and forces ``fused_qkv`` (it reads the
-    pre-concatenated qkv/gate-up weights).  See ``starling.moss.fp8`` /
-    ``starling.granite.fp8`` (shared flag, per-model quant helpers).
+    pre-concatenated qkv/gate-up weights).  See :mod:`starling.fp8_gemv`."""
 
-    **Batch / one-off use only.**  ``torch._scaled_mm`` captured in a CUDA graph
-    corrupts intermittently under sustained streaming churn (hundreds of
-    varying-length transcribes in one process -- a cuBLASLt-workspace-under-
-    graphs issue), so this is unsafe for the long-lived ``/stream`` server path.
-    The MOSS server keeps it off; enable it only for single-shot batch jobs."""
+    # ------------------------------------------------------------------
+    # EXPERIMENTAL / UNIMPLEMENTED
+    # These flags are research placeholders, not supported optimizations.
+    # ------------------------------------------------------------------
+
+    gemm_epilogue_fusion: bool = False
+    """Fold RMSNorm + residual + SiLU-gate into the adjacent cuBLASLt GEMM
+    epilogues (CODA-style).  Removes ~4-5% of decode-step elementwise launches.
+    **Experimental** -- under construction; off by default."""
 
     nvfp4_weights: bool = False
     """Load the LLM weights at NVFP4 (4-bit microscaling) with dequant fused

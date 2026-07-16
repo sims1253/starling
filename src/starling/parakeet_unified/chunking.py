@@ -133,8 +133,6 @@ class ChunkedTranscriber:
         output to get the (token, frame) pairs. The chunker is the
         long-audio path; its decode cost is negligible vs the encoder.
         """
-        from .decode_eager import greedy_decode  # local import avoids cycles
-
         pipe = self.pipeline
         features, lengths = pipe.mel([chunk_audio])
         features = features.to(pipe.dtype)
@@ -182,7 +180,7 @@ class ChunkedTranscriber:
     # public API
     # ------------------------------------------------------------------ #
     @torch.inference_mode()
-    def transcribe(self, audio: np.ndarray, sr: int = C.SAMPLE_RATE) -> str:
+    def transcribe(self, audio: np.ndarray, sr: int = C.SAMPLE_RATE, should_stop=None) -> str:
         """Transcribe arbitrarily-long audio; returns the stitched text string."""
         if int(sr) != self.sr:
             raise ValueError(f"sr={sr} != pipeline sr {self.sr}")
@@ -192,6 +190,8 @@ class ChunkedTranscriber:
         surviving_tokens: List[int] = []
         furthest_global_sample = -1
         for chunk_audio, start_sample in zip(chunks, starts):
+            if should_stop is not None:
+                should_stop()
             emitted, frames = self._decode_chunk(chunk_audio)
             if not emitted:
                 continue

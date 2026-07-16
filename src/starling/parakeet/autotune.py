@@ -306,8 +306,7 @@ def load_cache(gpu_name: str, *, cache_dir: Path | None = None) -> KernelConfig 
 # the sweep
 # ====================================================================== #
 def _repo_root() -> Path:
-    # src/starling/parakeet/autotune.py -> parents[3] is the repo root (matches
-    # gpu_lock.LOCK_PATH's parents[3] derivation).
+    # src/starling/parakeet/autotune.py -> parents[3] is the repo root.
     return Path(__file__).resolve().parents[3]
 
 
@@ -422,7 +421,7 @@ def _run_sweep(
 
 
 def _autotune_holds_lock() -> bool:
-    """True if the shared ``.gpu.lock`` is currently held by the autotune sweep.
+    """True if the shared GPU lock is currently held by the autotune sweep.
 
     Prevents self-deadlock when a caller that already holds the lock invokes the
     sweep (benchmarks do this with ``acquire_lock=False``, but this is a safety

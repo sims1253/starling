@@ -16,12 +16,23 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import tempfile
+import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-LOCK_PATH = Path(__file__).resolve().parents[3] / ".gpu.lock"
+_GPU_KEY = os.environ.get("CUDA_VISIBLE_DEVICES", "default").replace("/", "_").replace(",", "-")
+LOCK_PATH = Path(
+    os.environ.get(
+        "STARLING_GPU_LOCK",
+        str(Path(tempfile.gettempdir()) / f"starling-gpu-{_GPU_KEY}.lock"),
+    )
+)
 STALE_SEC = 10 * 60  # 10 minutes
+_LOCAL = threading.local()
 
 
 class GpuLockBusy(RuntimeError):
@@ -40,6 +51,15 @@ def _read_lock() -> dict | None:
 def _is_stale(entry: dict | None, now: float | None = None) -> bool:
     if entry is None:
         return True
+    # A local PID is authoritative: crashed holders are reclaimable
+    # immediately, while long-running live holders are never stolen by age.
+    if entry.get("hostname") == socket.gethostname() and "pid" in entry:
+        try:
+            os.kill(int(entry["pid"]), 0)
+        except (OSError, TypeError, ValueError):
+            return True
+        return False
+
     now = time.time() if now is None else now
     started = entry.get("started_at", 0)
     try:
@@ -57,7 +77,7 @@ def acquire_gpu_lock(
     wait: bool = True,
     poll_sec: float = 5.0,
     max_wait_sec: float = 600.0,
-) -> None:
+) -> str:
     """Acquire `.gpu.lock`. If a fresh lock exists, wait (or raise if wait=False).
 
     Stale locks are stolen; the takeover is noted so the previous holder can see it.
@@ -89,10 +109,14 @@ def acquire_gpu_lock(
         except FileExistsError:
             # someone created it between our unlink and create; loop and re-check
             continue
+        owner_id = uuid.uuid4().hex
         payload = {
             "session": session,
             "model": model,
             "started_at": now,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "owner_id": owner_id,
             "eta_min": eta_min,
             "note": note,
         }
@@ -101,22 +125,30 @@ def acquire_gpu_lock(
             payload["stale_started_at"] = existing.get("started_at")
         with os.fdopen(fd, "w") as fh:
             json.dump(payload, fh)
-        return
+        _LOCAL.owner_id = owner_id
+        return owner_id
 
 
-def release_gpu_lock() -> None:
-    """Release `.gpu.lock` (best-effort unlink)."""
+def release_gpu_lock(owner_id: str | None = None) -> bool:
+    """Release the lock only when it is still owned by this acquisition."""
+    expected = owner_id or getattr(_LOCAL, "owner_id", None)
+    entry = _read_lock()
+    if not expected or entry is None or entry.get("owner_id") != expected:
+        return False
     try:
         LOCK_PATH.unlink()
     except FileNotFoundError:
-        pass
+        return False
+    if getattr(_LOCAL, "owner_id", None) == expected:
+        _LOCAL.owner_id = None
+    return True
 
 
 @contextmanager
 def with_gpu_lock(*, session: str, model: str, eta_min: int = 5, note: str = ""):
     """Context manager wrapper around acquire/release."""
-    acquire_gpu_lock(session=session, model=model, eta_min=eta_min, note=note)
+    owner_id = acquire_gpu_lock(session=session, model=model, eta_min=eta_min, note=note)
     try:
         yield
     finally:
-        release_gpu_lock()
+        release_gpu_lock(owner_id)

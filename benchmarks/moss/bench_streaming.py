@@ -12,7 +12,8 @@ sweeping ``chunk_seconds`` x ``overlap_seconds``.  For each cell it reports:
 * **WER%**        stitched transcript vs the human reference (accuracy cost of
                   chunking), via the Open-ASR-Leaderboard scorer.
 
-Uses the same fp8 + adaptive-cudagraph pipeline the MOSS server runs.
+Uses the same adaptive-cudagraph pipeline as the MOSS server and can optionally
+exercise fused FP8 decode.
 
 Run:  ``uv run python -m benchmarks.moss.bench_streaming``
 """
@@ -143,7 +144,7 @@ def main():
     ap.add_argument("--lengths", type=float, nargs="+", default=[30, 90, 180])
     ap.add_argument("--partial-interval", type=float, default=3.0)
     ap.add_argument("--fp8", action="store_true",
-                    help="enable fp8 decode (batch-only; unstable under streaming churn)")
+                    help="enable fused FP8 decode")
     args = ap.parse_args()
 
     if args.fp8:

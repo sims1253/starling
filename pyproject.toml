@@ -10,6 +10,7 @@ dependencies = [
     "transformers",
     "accelerate",
     "numpy",
+    "scipy",
     "soundfile",
     "librosa",
     "einops",
@@ -61,7 +62,7 @@ torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
 # transformers must come from git source because the released PyPI 5.8.0 does not
 # register the `granite_speech` model type (needed for ibm-granite/granite-speech-4.1-2b).
-transformers = { git = "https://github.com/huggingface/transformers" }
+transformers = { git = "https://github.com/huggingface/transformers", rev = "1048e9af78a6045444244412dfe216ba5810e7fb" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

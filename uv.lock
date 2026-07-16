@@ -2411,6 +2411,9 @@ dependencies = [
     { name = "matplotlib", version = "3.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sentencepiece" },
     { name = "soundfile" },
     { name = "tabulate" },
@@ -2440,13 +2443,14 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pytest", marker = "extra == 'dev'" },
+    { name = "scipy" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "soundfile" },
     { name = "tabulate" },
     { name = "torch", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchaudio", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchcodec", specifier = ">=0.14.0" },
-    { name = "transformers", git = "https://github.com/huggingface/transformers" },
+    { name = "transformers", git = "https://github.com/huggingface/transformers?rev=1048e9af78a6045444244412dfe216ba5810e7fb" },
     { name = "triton", specifier = ">=3.6" },
     { name = "whisper-normalizer", specifier = ">=0.1.12" },
 ]
@@ -2623,7 +2627,7 @@ wheels = [
 [[package]]
 name = "transformers"
 version = "5.13.0.dev0"
-source = { git = "https://github.com/huggingface/transformers#1048e9af78a6045444244412dfe216ba5810e7fb" }
+source = { git = "https://github.com/huggingface/transformers?rev=1048e9af78a6045444244412dfe216ba5810e7fb#1048e9af78a6045444244412dfe216ba5810e7fb" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
