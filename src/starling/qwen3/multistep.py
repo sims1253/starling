@@ -25,6 +25,8 @@ import torch
 from .config import EOS_TOKEN_ID
 from .llm_mega import FusedLLMMega, GenerateResult
 
+from .._kernels._compile import torch_compile
+
 
 class MultiStepLLMMega(FusedLLMMega):
     """K-step CUDA-graph-captured greedy decoder for the Qwen3 LLM.
@@ -73,7 +75,7 @@ class MultiStepLLMMega(FusedLLMMega):
         # logit noise Inductor introduces; verified 0 token mismatches over full
         # decodes). Set False for the strict per-logit byte-exact fallback.
         if compile_decode:
-            self._decode_step_eager = torch.compile(
+            self._decode_step_eager = torch_compile(
                 self._decode_step_eager, mode="max-autotune-no-cudagraphs"
             )
 

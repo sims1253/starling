@@ -1,0 +1,69 @@
+name: tests
+
+# CPU-safe cross-platform CI.
+#
+# Starling's heavy GPU work (model byte-exactness, benchmarks, CUDA-graph
+# capture) needs an RTX 5090 / sm_120 and stays out of CI -- it is run manually
+# on the benchmark box. This workflow runs ONLY the CPU-safe subset:
+#
+#   * tests/test_server_routing.py -- pure, GPU-free slug->backend routing,
+#     CLI parsing, config plumbing (no model loaded, no CUDA).
+#   * an import smoke test of starling._kernels, proving the backend dispatch
+#     resolves correctly on each OS (triton on Linux, torch on Windows).
+#
+# The matrix runs both Linux and Windows to guard the kernel-backend
+# abstraction that landed with cross-platform support (src/starling/_kernels/).
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Cancel in-progress runs for the same ref when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    name: CPU tests (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Create venv
+        run: uv venv --python ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # `uv sync --extra dev` resolves from the project. triton is marked
+        # `sys_platform == 'linux'` in pyproject.toml, so it is NOT installed
+        # on windows-latest (no official Windows wheel) and the kernel package
+        # auto-selects the torch backend there instead.
+        run: uv sync --extra dev
+
+      - name: CPU-safe routing tests
+        # No CUDA, no model loading: verifies slug->backend routing, CLI
+        # arg parsing, config plumbing, and cancellation/error paths.
+        run: uv run python -m pytest tests/test_server_routing.py -q
+
+      - name: Import smoke (kernel backend dispatches per-OS)
+        # Only call have_triton() + get_backend_name() (NOT get_backend()) --
+        # both are pure (no backend import, no torch import) and safe on a
+        # CUDA-less runner. Expected output:
+        #   ubuntu : backend: triton  triton: True
+        #   windows: backend: torch   triton: False
+        run: uv run python -c "import starling._kernels as K; print('backend:', K.get_backend_name(), 'triton:', K.have_triton())"

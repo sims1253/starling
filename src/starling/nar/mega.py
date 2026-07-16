@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from . import config as cfg
+from .._kernels._compile import torch_compile
 
 
 # =========================================================================== #
@@ -323,7 +324,7 @@ class NarMega:
 
     def _get_compiled_llm(self) -> Any:
         if self._llm_forward_compiled is None and self.compile_llm:
-            self._llm_forward_compiled = torch.compile(
+            self._llm_forward_compiled = torch_compile(
                 self._llm_forward,
                 mode="max-autotune-no-cudagraphs",
                 dynamic=False,

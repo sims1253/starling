@@ -45,6 +45,8 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 
+from .._kernels._compile import torch_compile
+
 try:
     from torch._dynamo import mark_static_address as _mark_static
 except Exception:  # pragma: no cover - older torch
@@ -377,7 +379,7 @@ class CompiledEncoder:
                 input_features=input_features, attention_mask=attention_mask
             )
 
-        self._compiled = torch.compile(_encode, mode=self.compile_mode)
+        self._compiled = torch_compile(_encode, mode=self.compile_mode)
         # warmup state per (B, T_mel) shape: True once warmup is done for it
         self._warmed: Dict[Tuple[int, int], bool] = {}
 

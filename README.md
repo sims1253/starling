@@ -188,6 +188,58 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 - CUDA 13.0, Python 3.10–3.12, [uv](https://github.com/astral-sh/uv). Torch wheels are pinned to the cu130 index in `pyproject.toml` — the default PyPI wheel is cu12/sm_90 and will not run on Blackwell.
 - The leaderboard bench pulls the `hf-audio/open-asr-leaderboard` dataset (set `HF_TOKEN` if rate-limited). Clips cache under `tests/fixtures/leaderboard_corpus/`. External `CrispASR` / `parakeet.cpp` engines live in a sibling `~/asr-bench` checkout and are silently skipped if absent.
 
+## Platforms (Linux + Windows)
+
+Starling runs on **Linux** and **native Windows** (no WSL2 needed). The fused
+decode kernels live behind a backend dispatch in `src/starling/_kernels/`, so
+the same model code runs unchanged on both OSes — it just picks a different
+kernel backend. All three backends are **byte-exact** on the default decode
+path (verified by `tests/test_kernel_backends.py` and the per-model golden
+tests run under each backend).
+
+The dispatch (`auto`) selects the fastest backend available, in this order:
+
+- **Triton backend** (`src/starling/_kernels/triton_backend.py`) — the
+  hand-tuned, autotuned kernels the benchmark tables were measured on. Default
+  on Linux, where the `triton` wheel installs cleanly. **Fastest.**
+- **CUDA C++ backend** (`src/starling/_kernels/cuda_backend.py` +
+  `cuda/backend.cu`) — selected on Windows when a CUDA toolkit + compiler are
+  present (Triton has no official Windows wheel). The kernels are JIT-compiled
+  from CUDA C++ via `torch.utils.cpp_extension.load_inline` on first use (one
+  ~30–60 s compile, then cached under `~/.cache/starling`). Delivers
+  Linux/Triton-class performance: near-parity on the elementwise kernels
+  (1–2 µs each) and 2.6–8× faster fp8 than the torch backend, closing the gap
+  that otherwise made the fp8-weights path pointless on Windows.
+- **Torch backend** (`src/starling/_kernels/torch_backend.py`) — stock-PyTorch
+  fused ops, selected as the last resort when neither Triton nor a CUDA
+  toolchain is available. Byte-exact for the elementwise kernels; its fp8 GEMV
+  materializes the full bf16 weight (correct but not bandwidth-optimal), so on
+  a torch-only install leave `fp8_weights` off (the default).
+
+- **macOS / Apple Silicon is not supported** — the architecture is built on
+  `torch.cuda.CUDAGraph`, which is NVIDIA-only.
+
+Select the backend explicitly with the `STARLING_KERNEL_BACKEND` env var
+(`auto` | `triton` | `cuda` | `torch`) or the `OptFlags.kernel_backend` field.
+`auto` resolves to `triton` (if importable) → `cuda` (if a CUDA GPU is
+visible) → `torch`. On Windows + CUDA toolkit that means full speed with no
+code changes.
+
+Set up either platform with the same command (the old `scripts/setup_env.sh`
+is replaced by a cross-platform Python entry point):
+
+```bash
+python scripts/setup_env.py
+```
+
+To A/B/C compare the Triton, torch, and CUDA backends head-to-head (on a box
+that has all three), use the dedicated harness:
+
+```bash
+uv run python benchmarks/bench_kernels.py
+```
+
+
 ## Server
 
 `src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps

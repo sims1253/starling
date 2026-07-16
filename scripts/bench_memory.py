@@ -20,9 +20,14 @@ Usage:
 from __future__ import annotations
 
 import json
-import resource
 import sys
 from pathlib import Path
+
+try:
+    import resource  # Unix-only stdlib; absent on Windows.
+    _HAVE_RESOURCE = True
+except ImportError:
+    _HAVE_RESOURCE = False
 
 import torch
 
@@ -69,6 +74,10 @@ def _peak_reserved_mb() -> float:
 
 def _rss_mb() -> float:
     """Peak RSS of this process in MB (Linux: ru_maxrss is in KB)."""
+    if not _HAVE_RESOURCE:
+        # Windows has no `resource` module; fall back to 0.0 (RSS column is
+        # informational only; the VRAM numbers are the meaningful ones).
+        return 0.0
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
