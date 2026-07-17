@@ -103,9 +103,18 @@ GGML_PARAKEET_PORT = int(os.environ.get("GGML_PARAKEET_PORT", "0"))  # 0 = pick 
 # encoder + Qwen3 LLM, ggml/CUDA). The released CrispASR v0.8.2 binary does NOT
 # include the moss-transcribe backend (the source is in the repo but was wired
 # into the build later), so this points at a locally-built CrispASR binary.
-# Override with GGML_MOSS_* env vars. The moss-transcribe backend's chunked
-# path has a heap-corruption bug on long audio; --chunk-seconds is set large to
-# force the single-chunk path (the chunk boundary crash is avoided).
+# Override with GGML_MOSS_* env vars.
+#
+# Two invocation paths, both driving the SAME locally-built crispasr binary:
+#   * PERSISTENT SERVER (preferred): `crispasr --server --backend moss-transcribe`
+#     loads the model ONCE and serves clips over a localhost OpenAI-compatible
+#     endpoint (`POST /v1/audio/transcriptions`), mirroring GgmlParakeet. This
+#     removes the ~2 s per-call model-load tax, so steady-state latency is
+#     encoder+decode only (short ~0.4 s vs ~2.5 s one-shot).
+#   * ONE-SHOT CLI (fallback): `crispasr --backend moss-transcribe <wav>` pays
+#     the full model-load tax per call but is always correct + stable. Used when
+#     the server binary is absent, fails to bind, OR crashes mid-bench (see the
+#     server-mode caveats in GgmlMoss's docstring).
 GGML_MOSS_BIN = Path(os.environ.get(
     "GGML_MOSS_BIN",
     Path.home() / "Documents" / "CrispASR" / "build" / "bin" / "crispasr",
@@ -113,6 +122,11 @@ GGML_MOSS_BIN = Path(os.environ.get(
 GGML_MOSS_MODEL = Path(os.environ.get(
     "GGML_MOSS_MODEL", str(CRISPASR_MODELS / "moss-transcribe-preview-2b-f16.gguf"),
 )).expanduser()
+# The persistent server is the same binary invoked with `--server`. It is
+# optional: if absent or it fails to start, GgmlMoss silently falls back to the
+# one-shot CLI path. Set GGML_MOSS_SERVER=0 to force-disable the server.
+GGML_MOSS_HOST = os.environ.get("GGML_MOSS_HOST", "127.0.0.1")
+GGML_MOSS_PORT = int(os.environ.get("GGML_MOSS_PORT", "0"))  # 0 = pick a free port
 
 
 class Engine:
@@ -1231,7 +1245,7 @@ class GgmlParakeet(Engine):
 
 
 class GgmlMoss(Engine):
-    """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend (one-shot CLI).
+    """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend.
 
     Drives the locally-built CrispASR binary (the released v0.8.2 binary omits
     the moss-transcribe backend) with ``--backend moss-transcribe`` on the F16
@@ -1239,37 +1253,160 @@ class GgmlMoss(Engine):
     style audio encoder + Qwen3-1.7B LLM) -- NOT MoE despite the encoder class
     name (zero expert weights in the checkpoint).
 
-    Byte-exactness: matches the moss golden on the SHORT fixture; on medium/
-    long there are small punctuation-normalization differences (CrispASR's
-    decode inserts a period at some repetition boundaries the golden does not)
-    and the long fixture can truncate below the golden's token count. The
-    moss-transcribe chunked path also has a heap-corruption crash at chunk
-    boundaries on long audio, so ``--chunk-seconds`` is set large to force the
-    single-chunk path (which is stable). These gaps are documented in
-    ``docs/ggml-engine.md``; the engine is correct on short and near-exact
-    elsewhere.
+    TWO invocation paths, server preferred (load model once) with a one-shot
+    CLI fallback that is always correct:
 
-    Not batched (one-shot CLI); B>1 loops on the host.
+      * PERSISTENT SERVER -- ``crispasr --server --backend moss-transcribe``
+        loads the model ONCE in :meth:`_load` and serves every clip over a
+        localhost OpenAI-compatible endpoint (``POST /v1/audio/transcriptions``),
+        mirroring :class:`GgmlParakeet`. Steady-state latency is encoder+decode
+        only: ~0.4 s on short vs ~2.5 s for the one-shot CLI.
+
+      * ONE-SHOT CLI (fallback) -- ``crispasr --backend moss-transcribe <wav>``
+        pays the full model-load tax per call. Used when the server binary is
+        absent, fails to bind, OR has crashed mid-bench: :meth:`_run_one`
+        detects a dead server (connection refused / timeout / closed) and
+        transparently reruns that clip through the CLI, then pins the engine to
+        CLI mode so subsequent calls skip the dead server.
+
+    Server-mode caveats (CrispASR 0.8.6, upstream bugs, not fixable from
+    Starling):
+
+      * The implicit LID (whisper-tiny) pre-step shares the ggml CUDA
+        backend/scheduler with moss and corrupts the moss context across
+        requests -> the server segfaults on the 2nd transcription. Passing
+        ``-l en`` skips LID entirely, which makes the server stable.
+      * ``--chunk-seconds 3600`` (the single-chunk path that matches the
+        one-shot CLI / golden structure on medium/long) triggers a KV-cache
+        resize crash on repeated large-context requests in server mode. The
+        server therefore uses the default 30 s chunking (stable); the CLI
+        fallback keeps ``--chunk-seconds 3600`` (single chunk, byte-identical
+        to the golden-structure reference). On short/medium audio (< 30 s) the
+        two chunking modes coincide, so the server and CLI agree there.
+      * The moss backend ignores ``-n`` / ``--max-new-tokens`` (its C API has
+        no token-cap field; ``max_new = 512`` is hardcoded in moss_transcribe),
+        so that flag is NOT passed -- it would be silently dropped anyway.
+
+    Byte-exactness: byte-exact on SHORT (the correctness gate). On medium/long
+    CrispASR's ggml f16-KV-cache decode diverges from the golden's HF bf16 eager
+    greedy path at low-confidence repetition boundaries -- it emits ``eyes. It``
+    (period + capital) where the golden emits ``eyes it``. This is an inherent
+    numeric-path divergence (not a flag): normalized CER is 0.0 on medium and
+    <0.02 on long. See ``tests/test_ggml_parity.py`` and ``docs/ggml-engine.md``.
+
+    Not batched; B>1 loops on the host (the server serialises behind a mutex).
     """
 
     def __init__(self) -> None:
         super().__init__("ggml", "moss", supports_batch=False)
         self._wav_path: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._port: int = 0
+        self._base_url: str = ""
+        # Once the server has crashed mid-bench, pin to the CLI fallback for the
+        # rest of this engine's life (avoids re-probing a dead process per call).
+        self._server_disabled: bool = False
 
     @property
     def available(self) -> bool:
         return GGML_MOSS_BIN.exists() and GGML_MOSS_MODEL.exists()
 
+    # -- lifecycle ---------------------------------------------------------
     def _load(self) -> None:
         import tempfile
 
+        # The CLI fallback writes hypothesis audio here; also used as the WAV
+        # source if the server path is unavailable.
         self._tmp = tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False, dir=str(REPO_ROOT)
         )
         self._tmp.close()
         self._wav_path = self._tmp.name
 
+        # Try the persistent server first (big speedup when it comes up). Any
+        # failure (binary absent, disabled via env, bind error, health-probe
+        # timeout) silently falls through to the one-shot CLI path.
+        if os.environ.get("GGML_MOSS_SERVER", "1") not in ("", "0"):
+            try:
+                self._load_server()
+                return
+            except Exception:
+                # Server did not come up -- tear down any half-spawned process
+                # and continue with the CLI fallback.
+                self._teardown_server()
+        self._server_disabled = True
+
+    def _load_server(self) -> None:
+        import socket
+        import time as _time
+        import urllib.request
+
+        if not GGML_MOSS_BIN.exists():
+            raise RuntimeError("crispasr binary absent; cannot start server")
+
+        # Pick a free TCP port unless GGML_MOSS_PORT pins one.
+        port = GGML_MOSS_PORT
+        if port == 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((GGML_MOSS_HOST, 0))
+            port = s.getsockname()[1]
+            s.close()
+        self._port = port
+        self._base_url = f"http://{GGML_MOSS_HOST}:{port}"
+
+        # Spawn the server. -l en is REQUIRED: without it the implicit LID
+        # (whisper-tiny) pre-step corrupts the moss context across requests and
+        # the server segfaults on the 2nd transcription. Default 30 s chunking
+        # is used (stable in server mode); --chunk-seconds 3600 crashes on
+        # repeated large-context requests. See the class docstring.
+        cmd = [
+            str(GGML_MOSS_BIN),
+            "--server",
+            "--backend", "moss-transcribe",
+            "-m", str(GGML_MOSS_MODEL),
+            "--gpu-backend", "cuda",
+            "--host", GGML_MOSS_HOST,
+            "--port", str(port),
+            "-l", "en",   # skip LID pre-step (server-stability critical)
+            "-nt",        # transcript text only, no timestamps
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ),
+        )
+        # Wait for /health (model load is ~1-2 s).
+        deadline = _time.time() + 90.0
+        while _time.time() < deadline:
+            if self._proc.poll() is not None:
+                raise RuntimeError(
+                    f"crispasr-server exited rc={self._proc.returncode} before binding"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"{self._base_url}/health", timeout=2
+                ) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                _time.sleep(0.5)
+        raise RuntimeError("crispasr-server did not become healthy in 90 s")
+
+    def _teardown_server(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._base_url = ""
+        self._port = 0
+
     def _release(self) -> None:
+        self._teardown_server()
         if self._wav_path and os.path.exists(self._wav_path):
             try:
                 os.unlink(self._wav_path)
@@ -1277,25 +1414,73 @@ class GgmlMoss(Engine):
                 pass
         self._wav_path = None
 
+    # -- inference ---------------------------------------------------------
     def _run_one(self, audio: np.ndarray) -> str:
+        # Server path (preferred). On ANY failure (server crashed between calls,
+        # connection refused, timeout, empty body), fall back to the one-shot CLI
+        # for this clip and pin the engine to CLI mode for the rest of the run.
+        if self._base_url and not self._server_disabled:
+            try:
+                return self._run_one_http(audio)
+            except Exception:
+                # Server is unreliable from here on -- tear it down and rerun
+                # this one clip through the always-correct CLI fallback.
+                self._teardown_server()
+                self._server_disabled = True
+        return self._run_one_cli(audio)
+
+    def _run_one_http(self, audio: np.ndarray) -> str:
+        import io
+        import json as _json
+        import uuid
+        import urllib.request
+
+        import soundfile as sf
+
+        # Render 16 kHz mono PCM16 WAV in memory (no disk roundtrip), mirroring
+        # GgmlParakeet._run_one_http's multipart POST.
+        buf = io.BytesIO()
+        sf.write(buf, audio, 16000, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+        boundary = "----pkbench" + uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+            b"Content-Type: audio/wav\r\n\r\n"
+            + wav_bytes + b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            f"{self._base_url}/v1/audio/transcriptions", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as r:
+            out = _json.loads(r.read().decode())
+        text = out.get("text", "").strip()
+        if not text:
+            raise RuntimeError("crispasr-server returned empty transcript")
+        return text
+
+    def _run_one_cli(self, audio: np.ndarray) -> str:
         import soundfile as sf
 
         sf.write(self._wav_path, audio, 16000, subtype="PCM_16")
         # --chunk-seconds 3600 forces the single-chunk path (avoids the
-        # moss-transcribe heap-corruption crash at chunk boundaries on long
-        # audio). -n 600 raises the token cap toward the golden's 200-token
-        # decode; -nt emits just the transcript text on stdout.
+        # moss-transcribe chunk-boundary instability on long audio in the CLI).
+        # -l en skips the LID pre-step (no effect on the moss decode output;
+        # matches the server path's flags). -nt emits just the transcript text.
+        # NOTE: -n / --max-new-tokens is intentionally omitted -- the moss C API
+        # ignores it (max_new=512 hardcoded); passing it is a silent no-op.
         cmd = [
             str(GGML_MOSS_BIN),
             "--backend", "moss-transcribe",
             "-m", str(GGML_MOSS_MODEL),
             "-f", self._wav_path,
-            "-n", "600",
             "--chunk-seconds", "3600",
             "--gpu-backend", "cuda",
+            "-l", "en",   # skip LID (matches server; no effect on decode)
             "-nt",
         ]
-        # CrispASR needs CUDA + (for some backends) openblas on the loader path.
         env = dict(os.environ)
         try:
             p = subprocess.run(
