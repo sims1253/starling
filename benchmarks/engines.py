@@ -99,6 +99,21 @@ GGML_PARAKEET_MODEL = Path(os.environ.get(
 GGML_PARAKEET_HOST = os.environ.get("GGML_PARAKEET_HOST", "127.0.0.1")
 GGML_PARAKEET_PORT = int(os.environ.get("GGML_PARAKEET_PORT", "0"))  # 0 = pick a free port
 
+# ggml Moss engine: CrispASR's moss-transcribe backend (Qwen3-Omni audio
+# encoder + Qwen3 LLM, ggml/CUDA). The released CrispASR v0.8.2 binary does NOT
+# include the moss-transcribe backend (the source is in the repo but was wired
+# into the build later), so this points at a locally-built CrispASR binary.
+# Override with GGML_MOSS_* env vars. The moss-transcribe backend's chunked
+# path has a heap-corruption bug on long audio; --chunk-seconds is set large to
+# force the single-chunk path (the chunk boundary crash is avoided).
+GGML_MOSS_BIN = Path(os.environ.get(
+    "GGML_MOSS_BIN",
+    Path.home() / "Documents" / "CrispASR" / "build" / "bin" / "crispasr",
+)).expanduser()
+GGML_MOSS_MODEL = Path(os.environ.get(
+    "GGML_MOSS_MODEL", str(CRISPASR_MODELS / "moss-transcribe-preview-2b-f16.gguf"),
+)).expanduser()
+
 
 class Engine:
     """Base adapter. Subclasses override :meth:`load` / :meth:`_run_one`."""
@@ -1215,6 +1230,88 @@ class GgmlParakeet(Engine):
         return out.get("text", "").strip()
 
 
+class GgmlMoss(Engine):
+    """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend (one-shot CLI).
+
+    Drives the locally-built CrispASR binary (the released v0.8.2 binary omits
+    the moss-transcribe backend) with ``--backend moss-transcribe`` on the F16
+    Moss GGUF. The moss model is MOSS-Transcribe-preview-2B (Qwen3-Omni Whisper-
+    style audio encoder + Qwen3-1.7B LLM) -- NOT MoE despite the encoder class
+    name (zero expert weights in the checkpoint).
+
+    Byte-exactness: matches the moss golden on the SHORT fixture; on medium/
+    long there are small punctuation-normalization differences (CrispASR's
+    decode inserts a period at some repetition boundaries the golden does not)
+    and the long fixture can truncate below the golden's token count. The
+    moss-transcribe chunked path also has a heap-corruption crash at chunk
+    boundaries on long audio, so ``--chunk-seconds`` is set large to force the
+    single-chunk path (which is stable). These gaps are documented in
+    ``docs/ggml-engine.md``; the engine is correct on short and near-exact
+    elsewhere.
+
+    Not batched (one-shot CLI); B>1 loops on the host.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("ggml", "moss", supports_batch=False)
+        self._wav_path: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return GGML_MOSS_BIN.exists() and GGML_MOSS_MODEL.exists()
+
+    def _load(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, dir=str(REPO_ROOT)
+        )
+        self._tmp.close()
+        self._wav_path = self._tmp.name
+
+    def _release(self) -> None:
+        if self._wav_path and os.path.exists(self._wav_path):
+            try:
+                os.unlink(self._wav_path)
+            except OSError:
+                pass
+        self._wav_path = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        import soundfile as sf
+
+        sf.write(self._wav_path, audio, 16000, subtype="PCM_16")
+        # --chunk-seconds 3600 forces the single-chunk path (avoids the
+        # moss-transcribe heap-corruption crash at chunk boundaries on long
+        # audio). -n 600 raises the token cap toward the golden's 200-token
+        # decode; -nt emits just the transcript text on stdout.
+        cmd = [
+            str(GGML_MOSS_BIN),
+            "--backend", "moss-transcribe",
+            "-m", str(GGML_MOSS_MODEL),
+            "-f", self._wav_path,
+            "-n", "600",
+            "--chunk-seconds", "3600",
+            "--gpu-backend", "cuda",
+            "-nt",
+        ]
+        # CrispASR needs CUDA + (for some backends) openblas on the loader path.
+        env = dict(os.environ)
+        try:
+            p = subprocess.run(
+                cmd, capture_output=True, text=True, env=env,
+                cwd=str(GGML_MOSS_BIN.parent.parent), timeout=240,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"ggml-moss timed out: {e}") from e
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"ggml-moss failed (rc={p.returncode}):\n{p.stderr[-1000:]}"
+            )
+        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+
 # ====================================================================== #
 # Registry + filter resolution
 # ====================================================================== #
@@ -1287,6 +1384,14 @@ def _ggml_parakeet_keys() -> list[str]:
     return []
 
 
+def _ggml_moss_keys() -> list[str]:
+    """The CrispASR moss-transcribe ggml engine. Skipped if the local CrispASR
+    binary (with the moss-transcribe backend) or the F16 Moss GGUF is absent."""
+    if GgmlMoss().available:
+        return ["ggml-moss"]
+    return []
+
+
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
@@ -1303,7 +1408,8 @@ def available_keys() -> list[str]:
     """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
     return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
-            + _crispasr_keys() + _parakeet_cpp_keys() + _ggml_parakeet_keys())
+            + _crispasr_keys() + _parakeet_cpp_keys()
+            + _ggml_parakeet_keys() + _ggml_moss_keys())
 
 
 def build_engines(
@@ -1336,9 +1442,12 @@ def build_engines(
         elif key.startswith("parakeet.cpp-"):
             chosen[mdl].append(ParakeetCpp())
         elif key.startswith("ggml-"):
-            # the persistent-server ggml engine family (currently parakeet only)
+            # the ggml first-class engine family: parakeet (persistent server /
+            # in-process) and moss (CrispASR moss-transcribe).
             if mdl == "parakeet":
                 chosen[mdl].append(GgmlParakeet())
+            elif mdl == "moss":
+                chosen[mdl].append(GgmlMoss())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,
