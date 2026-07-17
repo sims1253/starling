@@ -73,7 +73,8 @@ def ggml_engine():
     "short",
     "medium",
     pytest.param("long", marks=pytest.mark.xfail(
-        reason="parakeet.cpp C API diverges on long audio (pre-existing; CLI "
+        reason="parakeet.cpp plain decode path (tokens==nullptr) doesn't "
+               "terminate on long audio (pre-existing; --json timestamps path "
                "is byte-exact); see docs/ggml-parakeet-perf-analysis.md",
         strict=False,
     )),
@@ -81,14 +82,15 @@ def ggml_engine():
 def test_ggml_parakeet_byte_exact(ggml_engine, name: str) -> None:
     """The ggml engine transcript must match the golden BYTE-FOR-BYTE.
 
-    short/medium are byte-exact. The LONG fixture is xfail: the parakeet.cpp C
-    API (``parakeet_capi_transcribe_pcm``, which the in-process engine uses)
-    diverges from the golden on long audio (~6% WER, 1161 vs 1226 chars) -- a
-    pre-existing C-API-vs-CLI encoder/tiling path difference in parakeet.cpp
-    that reproduces with the byte-identical serial (K=1) decode and is unrelated
-    to the ggml engine or the K-step decode work. The CLI ``parakeet-cli
-    transcribe`` IS byte-exact on long (1226/1226). Tracked as a parakeet.cpp
-    upstream issue.
+    short/medium are byte-exact on all paths. The LONG fixture is xfail:
+    parakeet.cpp's plain (tokens==nullptr) greedy-TDT decode path -- which the
+    in-process C-API engine uses for speed -- does not terminate correctly on
+    long audio and runs past the golden length (~1160-3560 chars vs 1226). This
+    is a pre-existing parakeet.cpp bug (reproduces with the byte-identical
+    serial K=1 path, so it is NOT the K-step decode work) and affects both the
+    C API and the plain ``parakeet-cli transcribe``. The timestamps path
+    (``parakeet-cli transcribe --json``, tokens != nullptr, which bypasses the
+    K-step fast path) IS byte-exact on long (1226/1226). Tracked upstream.
     """
     golden_text = (GOLDEN / f"parakeet_tdt_{name}_text.txt").read_text()
     out = ggml_engine._run_one(FIXTURES[name])
