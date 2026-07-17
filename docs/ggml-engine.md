@@ -14,8 +14,9 @@ fixtures, same golden contract, portable. **Correctness:** parakeet-tdt is
 byte-exact on all fixtures; moss is byte-exact on short and near-exact on
 medium/long (an inherent f16-KV-cache vs bf16-eager numeric divergence at
 low-confidence boundaries — documented below, not a bug). **Speed:** parakeet-tdt
-is within ~2-3x of the PyTorch peak (see `docs/ggml-parakeet-perf-analysis.md`);
-moss is slower (one-shot/per-server load path) and not yet at parity.
+short is at parity with the PyTorch peak; medium/long within ~1.5-1.8x
+(see `docs/ggml-parakeet-perf-analysis.md`); moss is slower
+(one-shot/per-server load path) and not yet at parity.
 
 ## Correctness contract
 
@@ -92,20 +93,21 @@ stable across calls — `src/encoder.cpp`).
 
 ## Performance (RTX 5090, bf16, B=1, model load excluded)
 
-Wall-clock per utterance, in-process (native ctypes path):
+Wall-clock per utterance, harness `bench_all.py` (20 reps, steady-state) and
+the in-process ctypes path (median of 7, steady-state):
 
-| length | audio | ggml   | starling | gap   |
-|--------|-------|--------|----------|-------|
-| short  | 7.4s  | 36 ms  | 14 ms    | 2.6x  |
-| medium | 22.3s | 89 ms  | 25 ms    | 3.6x  |
-| long   | 74.3s | 264 ms | 58 ms    | 4.6x  |
+| length | audio | ggml (harness) | ggml (ctypes) | starling (harness) | gap   |
+|--------|-------|----------------|---------------|--------------------|-------|
+| short  | 7.4s  | 16 ms          | 16 ms         | 16 ms              | 1.00x |
+| medium | 22.3s | 38 ms          | 37 ms         | 26 ms              | 1.46x |
+| long   | 74.3s | 108 ms         | 126 ms        | 60 ms              | 1.80x |
 
-WER 0.00% (byte-exact) on all three. The remaining gap to the PyTorch peak is
-kernel fusion: starling uses Triton fused kernels (fp8 dequant-GEMV, fused
-rmsnorm/SiLU/residual) and a multi-step decode megakernel, while parakeet.cpp
-uses generic ggml ops. The encoder is already CUDA-graph-captured; ongoing work
-targets the TDT decode loop (per-step host readback/argmax) and porting the
-fused ops as ggml custom kernels.
+WER 0.00% (byte-exact) on all three. **Short is at parity with the PyTorch
+peak.** The remaining medium/long gap is the TDT decode loop (data-dependent,
+serial — each step's argmax determines the next token), now GPU-compute-bound
+after the K-step multistep + double-sync elimination. The encoder graph
+itself is ~2.8ms GPU compute (faster than starling's on raw compute). See
+`docs/ggml-parakeet-perf-analysis.md` for the full per-phase breakdown.
 
 ## Build
 

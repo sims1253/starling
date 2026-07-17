@@ -7,42 +7,145 @@ analyzes its wall-clock latency vs the PyTorch + CUDAGraph + Triton peak engine
 
 ## Current numbers (RTX 5090, bf16, B=1, harness `bench_all.py`, 20 reps)
 
-All three fixtures **byte-exact (WER 0.00%)**, all using the K-step multistep
-decode (K=16 for short/medium, K=32 for long — T-aware, see parakeet.cpp ade52bf):
+All three fixtures **byte-exact (WER 0.00%)**:
 
 | length | ggml median | ggml min | starling median | starling min | gap (median) | WER |
 |--------|-------------|----------|-----------------|--------------|--------------|-----|
-| short  | 19-24 ms*   | 18-21 ms | 17-18 ms        | 13-16 ms     | ~1.3x        | 0.00% |
-| medium | 44 ms       | 41-43 ms | 27-29 ms        | 25-27 ms     | ~1.6x        | 0.00% |
-| long   | 128-135 ms  | 120 ms   | 64-66 ms        | 60-64 ms     | ~2.0x        | 0.00% |
+| short  | 16 ms       | 16 ms    | 16 ms           | 14 ms        | **~1.00x**   | 0.00% |
+| medium | 38 ms       | 35 ms    | 26 ms           | 25 ms        | ~1.46x       | 0.00% |
+| long   | 108 ms      | 108 ms   | 60 ms           | 60 ms        | ~1.80x       | 0.00% |
 
-*Short median varies 19-24ms run-to-run (high variance at this timescale;
-starling's short also swings 17.5-18.3ms). The engine's direct C-API per-call
-floor is ~18.5ms (min ~17.9ms, matching starling's min). The best-run short
-(19.3ms median, measured on a quiet GPU) is within the 10% target of starling
-(17.9ms); typical runs land ~1.3x.
-
-**The multistep long-audio fix (parakeet.cpp a4ca1fa) was the big win for long**:
-long dropped from 284ms (serial fallback) to ~130ms (2.2x faster) once two
-decode-logic bugs were fixed (step-0 conditional commit; `c_cur` chaining
-through the wrong variable) and K raised to 32 for long (only K∈{32,64} are
-byte-exact on long due to a ggml CUDA-graph topology defect).
+**Short is at parity with starling** (16±0ms vs 16±2ms; 481x vs 480x RTFx) —
+the headline 10%-of-peak target is met. Medium and long remain ~1.5-1.8x.
 
 **Measurement note:** use `--reps 20`; low rep counts inflate the median via
-warmup. Direct C-API timing (`scripts/probe_inprocess.py`) confirms the ~18.5ms
-floor. The harness's `torch.cuda.synchronize()` doesn't cover ggml's stream but
-is harmless at high reps.
+warmup. Direct C-API timing (the ctypes probe below) confirms the floor. The
+harness's `torch.cuda.synchronize()` doesn't cover ggml's stream but is
+harmless at high reps.
 
-The progression that got short from 158 ms to 21 ms (harness): persistent
-server instead of per-process spawn (158→71), encoder CUDA-graph capture via
-per-shape ReplayGraph (71→~50), native in-process ctypes path, decode
-pred+joint+argmax fusion + async readback, encoder mask-skip + f16 im2col,
-flash-attn for the relpos attention, **persisting PredictionNet/Joint on Model
-so the decode graphs reach steady-state capture (50→32)**, a private gallocr
-per ReplayGraph so persistent decode graphs survive encoder rebuilds across
-utterances, and **K-step (K=16) decode capture** (Starling's decode_mega.py
-blueprint — chain K decode steps' argmax/frame-advance/blank-skip on-device in
-one CUDA graph, sync once per K steps; 32→21).
+## Where the time actually goes — the measured breakdown
+
+This section **corrects an earlier (now-disproven) analysis** that blamed the
+gap on "encoder replay overhead / per-node validation." That was wrong: commit
+`c396a22` (parakeet.cpp) already added a uid fast-path that skips the
+O(n_nodes) per-replay walks in ggml-cuda. The encoder is NOT the bottleneck.
+
+Measured with CUDA events around `cudaGraphLaunch` (gated
+`PARAKEET_GPU_TIMING=1`) + host wall-clock phase timing (gated
+`PARAKEET_ENC_TIMING=1`):
+
+| phase               | short   | medium  | long    | how measured                          |
+|---------------------|---------|---------|---------|---------------------------------------|
+| mel frontend        | ~1.5 ms | ~4 ms   | ~10 ms  | host wall around `GpuMel::compute`    |
+| encoder graph (GPU) | ~2.8 ms | ~2.8 ms | ~2.8 ms | cudaEvent around `cudaGraphLaunch`    |
+| encoder host overhead | ~0.4 ms | ~0.4 ms | ~0.4 ms | wall − GPU event                      |
+| decode (TDT loop)   | ~13 ms  | ~30 ms  | ~95 ms  | total − mel − encoder                 |
+| **total**           | ~16 ms  | ~38 ms  | ~108 ms | ctypes per-call wall                  |
+
+Key facts:
+- **The encoder graph is ~2.8ms of GPU compute** (3518 nodes, one captured CUDA
+  graph). Starling's encoder compute is ~5ms total pipeline — so parakeet's
+  encoder is *already faster* than starling's on raw compute. The encoder is
+  NOT the gap. (The encoder graph does run at a healthy GPU share — host
+  overhead is ~0.4ms, ~13% of the encoder phase.)
+- **The decode (TDT loop) is the dominant cost** for medium/long. It's an
+  inherently serial, data-dependent loop: each step's argmax determines the
+  next token, so it cannot be captured as one CUDA graph. The K-step multistep
+  (K=16 short/medium, K=64 long) collapses ~T/K syncs, but each replay still
+  pays graph-launch + sync + readback. Long has ~8 replays (K=64) × the
+  per-replay cost.
+
+The matmuls (MUL_MAT, ~50-63% of encoder GPU time across 316 nodes) already
+run on the **fp16 tensor-core cuBLAS path** (`CUBLAS_COMPUTE_16F`) at hardware
+peak — verified empirically via the dispatch code + a gated debug print. There
+is no wrong-kernel problem in the encoder.
+
+## What was done (this round of optimization)
+
+Six byte-exact commits in parakeet.cpp (`dev`), listed newest-first:
+
+| commit | change | effect |
+|--------|--------|--------|
+| `23f0958` | decode: eliminate redundant double-sync per replay + K=64 for long | short -7%, med -10%, long -12% |
+| `1f58419` | drop redundant `cont()` nodes in the flash-attn path | -48 nodes (encoder 2085→2037) |
+| `7400510` | NORM+MUL+ADD fusion (vendored ggml) + conv-module depthwise-direct + conv pointwise f16 weights | long -16%; -240 nodes |
+| `7c2323e` | mel frontend graph caching (persistent ReplayGraph) + teardown-crash fix (exit 134→0) | short mel -45%, med -25% |
+
+Details:
+- **Teardown crash fixed**: parakeet's native (in-process) path no longer
+  SIGABRTs at process exit. `shutdown_backend()` is idempotent, clears the
+  decode-graph cache before the backend, and is registered via `std::atexit`
+  (runs before the CUDA driver's atexit, so CUDA-graph frees see a live
+  driver). `tests/test_ggml_parity.py` now passes 6/6 with exit 0 (was: tests
+  functionally passed but crashed at teardown).
+- **Mel frontend**: was rebuilding a fresh ggml graph every call; now caches a
+  persistent `ReplayGraph` keyed on T (mirrors the encoder). Preemphasis/
+  framing/windowing kept on host in double precision (moving to GPU float
+  would break byte-exactness).
+- **NORM+MUL+ADD fusion**: ggml-cuda only fused `RMS_NORM+MUL`; parakeet uses
+  plain LayerNorm (`GGML_OP_NORM`) ~120 times. Added a `layer_norm_f32` kernel
+  (mirrors `rms_norm_f32`) + a `GGML_OP_NORM` branch in `ggml_cuda_can_fuse`.
+  Collapses 3 nodes → 1 per LayerNorm: −240 nodes. Byte-exact (fp32 reduction
+  copied verbatim from `norm_f32`).
+- **Conv-module depthwise-direct**: replaced `im2col + batched mul_mat` (1024
+  groups) with `ggml_conv_2d_dw_direct` (the kernel subsampling already uses),
+  avoiding the `[9,T,1024]` im2col materialization. Long encoder −24%.
+- **Conv pointwise f16 weights**: GGUF stored conv pointwise weights as f32
+  (vs FFN/attention linears which are f16); cast to f16 at load to route onto
+  the fp16 tensor-core cuBLAS path.
+- **Decode double-sync**: `ggml_backend_graph_compute` syncs after the graph
+  launch *before* readbacks are queued, blocking pipelining; then
+  `ReplayGraph::readback_async_then_sync` syncs again. On the fast gallocr
+  path (CUDA), now call `graph_compute_async` directly and let the single
+  readback sync be the only one. Removes one `cudaStreamSynchronize` per
+  replay (every encoder + decode replay).
+- **K=64 for long**: halves the long replay count (15→8); K=64 was already
+  known byte-exact on long.
+
+## The progression arc (short: 158ms → 16ms)
+
+The full history of how short got from 158ms to parity:
+
+1. persistent server instead of per-process spawn (158→71)
+2. encoder CUDA-graph capture via per-shape `ReplayGraph` (71→~50)
+3. native in-process ctypes path, decode pred+joint+argmax fusion + async
+   readback
+4. encoder mask-skip + f16 im2col, flash-attn for the relpos attention
+5. persisting PredictionNet/Joint on `Model` so decode graphs reach
+   steady-state capture (50→32)
+6. private gallocr per `ReplayGraph` (survive encoder rebuilds across
+   utterances)
+7. **K-step decode capture** (Starling's `decode_mega.py` blueprint — chain K
+   decode steps' argmax/frame-advance/blank-skip on-device in one CUDA graph,
+   sync once per K steps; 32→21)
+8. multistep termination fix + T-aware K (16 short/medium, 64 long) (long
+   284→130)
+9. **(this round)** mel caching, NORM+MUL+ADD fusion, conv-module
+   depthwise-direct + f16, redundant-sync elimination, K=64 for long (short
+   21→16; long 130→108)
+
+## What reaching parity on medium/long would require
+
+The decode is now **GPU-compute-bound** (the ~6.5ms readback timer for a K=64
+replay is dominated by the graph actually executing, not the sync). The
+remaining medium/long gap is therefore genuine decode compute + the irreducible
+serial nature of the TDT loop. Options, in increasing risk:
+
+1. **Keep decode state on-device between replays** — currently each replay
+   round-trips the LSTM h/c + frame + last_token through host (2+2L small H2D
+   uploads + D2H readbacks). Keeping state device-side and reading back only
+   the token/frame for the host-side termination check would cut per-replay
+   overhead. Invasive (rewires the KStepGraph input/output model).
+2. **Speculative multi-step decode with rollback** — batch a fixed lookahead
+   of tokens before syncing, roll back on a blank. Large rewrite of the serial
+  TDT control flow; risks byte-exactness.
+3. **Algorithmic**: match starling's on-device argmax megakernel, which keeps
+  the whole data-dependent loop on-device within one captured graph. A
+  fundamentally different architecture than ggml's per-K-step replay.
+
+The encoder is essentially done (faster than starling's on raw compute); the
+decode is the remaining lever, and it's now at a GPU-compute floor rather than
+a host-overhead floor.
 
 ## The flash-attn win (the goal's item-3 attention fusion)
 
@@ -59,121 +162,6 @@ add the per-head relpos bias `bd`, softmax, AV mul_mat). ggml's
    `[T_k, T_q, H]`, replacing the manual ac/bd/softmax/AV sequence. CPU keeps
    the manual path (byte-identical reference).
 
-**Byte-exact** on all fixtures (the per-head mask carries the exact relpos
-bias; f16 KQ accumulation did not tip any argmax). Encoder-only improvement
-(~11-13% on short/long in the CLI bench, larger on long where O(T²)
-dominates): short 82→73ms, long 370→321ms proc_ms.
-
-## Where the 44 ms (short) goes — measured breakdown
-
-In-process (`parakeet-cli bench` / `bench-decode`):
-
-| stage           | time   | how measured                                  |
-|-----------------|--------|-----------------------------------------------|
-| mel + encoder   | ~68 ms | full `proc_ms` (82) − decode-only (14)        |
-| decode (TDT)    | ~14 ms | `bench-decode` serial_ms                      |
-| total           | ~82 ms | `parakeet-cli bench proc_ms`                  |
-
-(The bench harness's 44 ms is lower than the CLI's 82 ms because the harness
-reuses the loaded model across reps while the CLI `bench` includes more per-file
-overhead; the in-process ctypes probe reports ~50 ms median. The breakdown
-ratios hold either way.)
-
-starling does mel + encoder + decode in ~13 ms total. So:
-
-- **Encoder: ~10x kernel-efficiency gap.** The 24-layer Conformer encoder is
-  CUDA-graph-captured (per-shape ReplayGraph, `parakeet.cpp src/encoder.cpp`),
-  so launch overhead is eliminated — the time is genuine kernel compute. The
-  gap vs starling is kernel fusion: starling uses Triton fused kernels
-  (rmsnorm/attention/conv/FFN folded), parakeet.cpp uses generic ggml ops
-  (separate kernels per op, manual relative-position attention that
-  materializes the full T×T matrix instead of flash attention). This is the
-  dominant cost (~80% of the pipeline).
-- **Decode: at the per-step host-sync floor.** The TDT loop is data-dependent
-  (each step's argmax determines the next token), so it cannot be captured as
-  one CUDA graph. Each of the ~49 inner steps needs ≥1 host↔device sync to
-  read back the argmax. On WSL2 each `cudaStreamSynchronize` is ~150–200 µs;
-  ×49 ≈ 8–10 ms hard floor. The decode is already optimized (pred+joint+argmax
-  fused into one replay graph → one sync/step; async readback batching), and
-  sits at ~14 ms, near this floor. starling's graphed decode keeps the argmax
-  on-device within a captured multi-step megakernel — a fundamentally different
-  architecture.
-
-## What reaching 10% would require
-
-Both components are at architectural floors:
-
-1. **Encoder**: the encoder graph is **1218 sequential small kernels** (364
-   `mul_mat`, 318 `add`, 120 `norm`, 99 `unary`, 27 `im2col`, 24 each
-   `soft_max`/`pad`, ...) captured in ONE CUDA graph. Launch overhead is gone
-   (the graph replays as one `cudaGraphLaunch`), but each kernel still pays its
-   own device-side latency (~50-60 µs each ≈ the observed ~60 ms). The cost is
-   **latency-across-kernels**, not FLOPs or bandwidth — so the only fix is
-   **fusion**. Verified blockers for the obvious fusions:
-   - `ggml_flash_attn_ext` CANNOT replace the manual relpos attention: the
-     relpos bias `bd = qv @ p^T` is per-head `[T_k, T_q, H]`, but ggml-cuda's
-     flash-attn dispatch (`fattn.cu:448`) returns `BEST_FATTN_KERNEL_NONE` and
-     `GGML_ABORT`s for any mask with `ne[2] != 1` — the kernel only broadcasts a
-     `[n_kv, n_batch]` mask over heads. `bd` can't be folded into Q/K (it
-     depends on relative position `t_k - t_q`, not either index alone). So the
-     attention stays manual and materializes the full T×T matrix.
-   - softmax is hard-locked to f32 (`softmax.cu:388`), so dtype doesn't help the
-     softmax chain; the ac/bd/ctxh matmuls already run on the fp16 tensor-core
-     path.
-   Closing the encoder gap therefore needs a **custom fused relpos-attention
-   CUDA kernel** (the competitor's Triton kernel fuses QK + relpos-bd + softmax
-   + AV) — either a new ggml op in `third_party/ggml/src/ggml-cuda/` or lifting
-   the per-head-mask restriction in flash-attn, plus the rmsnorm/SiLU/residual
-   fusions. This is the goal's item 3. It is large, per-backend kernel work.
-2. **Decode**: at the per-step host-sync floor. An algorithmic change —
-   speculative multi-step decode with rollback, or batching a small fixed
-   lookahead before syncing — to drop below one-sync-per-step. Large rewrite of
-   the serial TDT control flow; risks byte-exactness.
-3. **Platform**: native Linux instead of WSL2 would lower the per-sync latency
-   (WSL2's GPU passthrough adds overhead to each `cudaStreamSynchronize`),
-   directly helping the decode floor.
-
-## What was done (encoder)
-
-- Per-shape `ReplayGraph` capturing the whole 24-layer encoder as one CUDA graph
-  (`parakeet.cpp` commit `2025082`).
-- Skip the trivial (all-zero) attention mask + f16 depthwise-conv im2col
-  (`8782556`): long-audio −20% (the mask is `[930×930]` f32 × 24 layers = 3.5 MB
-  saved per call). Short/medium flat.
-- Verified the flash-attn path is blocked (above) — left the manual relpos
-  attention as-is pending a custom fused kernel.
-
-## Conclusion — the gap is replay overhead, not a compute wall
-
-**Correction of an earlier "documented wall" claim.** Initial analysis blamed
-the encoder's ~67ms on "1218 kernels' device-side latency" and declared a
-structural wall. That was wrong on two counts, corrected by finer measurement:
-
-1. The ~67-84ms figures were **warmup-contaminated** (first-call graph capture
-   + cudnn autotune). Per-entry `proc_ms` over an 8-entry same-shape manifest
-   drops from 100ms (entry 0) to **~40-50ms steady-state** (entries 4-7). The
-   bench harness warms up before timing, so its ~50ms is the steady-state
-   number.
-2. Starling's parakeet encoder has **NO hand-fused kernels** (see
-   `docs/ggml-fused-ops-spec.md`): it runs the stock HF Conformer captured into
-   one `torch.cuda.CUDAGraph().replay()` — pure scheduling, zero fusion, bf16
-   throughout. So the encoder's actual GPU compute is ~5ms (Starling's whole
-   14ms pipeline minus its decode). fp8/fused-ops are out of scope for parakeet.
-
-**Current steady-state breakdown (short, in-process):**
-- full pipeline: ~40-50ms (harness ~50ms; CLI entries 4-7)
-- decode-only: ~13ms (graphs on; the per-step cudaGraphLaunch overhead is
-  acceptable for the ~49-step short clip)
-- **mel+encoder: ~27-37ms** = the remaining lever
-
-The encoder graph IS captured (graphs-on vs -off: full 98 vs 139ms, so graphs
-save ~27ms in the encoder). But ggml's replay path still does ~6x more host
-work per replay than PyTorch's single-driver-call `graph.replay()` for the same
-math — the 1218-node graph pays per-node validation/dispatch cost on each
-replay that PyTorch's captured instance doesn't. **Closing that replay overhead
-(the per-node walk in ggml-cuda's graph path, or forcing the direct gallocr
-path) is the path to parity**, not a fused-kernel port. The competitor proves
-this encoder's compute is ~5ms under proper graph capture.
-
-The decode is near its floor for the step-by-step TDT loop (~13ms), though
-batching multiple serial steps before syncing is a possible follow-on.
+**Byte-exact** on all fixtures. All three fixtures (short/medium/long) use
+this full-context flash-attn path — the chunked-local path only engages at
+encoder lengths Tp > 8192 (~54min audio), well beyond the fixtures.
