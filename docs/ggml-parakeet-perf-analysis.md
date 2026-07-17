@@ -7,20 +7,23 @@ analyzes its wall-clock latency vs the PyTorch + CUDAGraph + Triton peak engine
 
 ## Current numbers (RTX 5090, bf16, B=1, in-process, model load excluded)
 
-Harness (`bench_all.py`, native ctypes path) and in-process CLI (`parakeet-cli
-bench proc_ms`) agree to within noise:
+Harness (`bench_all.py`, native ctypes path, 8 reps) and in-process CLI
+(`parakeet-cli bench proc_ms`, steady-state entries 4-7):
 
-| length | audio  | ggml (harness) | ggml (CLI proc_ms) | starling | gap   | WER   |
-|--------|--------|----------------|--------------------|----------|-------|-------|
-| short  | 7.4s   | 51 ms          | 73 ms              | 14-17 ms | ~3x   | 0.00% |
-| medium | 22.3s  | 124 ms         | 153 ms             | 24-26 ms | ~5x   | 0.00% |
-| long   | 74.3s  | 262 ms         | 321 ms             | 57-58 ms | ~5x   | 0.00% |
+| length | audio  | ggml (harness, 8 reps) | ggml (CLI steady) | starling | gap   | WER   |
+|--------|--------|------------------------|-------------------|----------|-------|-------|
+| short  | 7.4s   | 32 ms                  | ~27 ms            | 14-15 ms | ~2.2x | 0.00% |
+| medium | 22.3s  | 74 ms                  | ~64 ms            | 25-27 ms | ~2.9x | 0.00% |
+| long   | 74.3s  | 258 ms                 | ~190 ms           | 57-62 ms | ~4x   | 0.00% |
 
-The progression that got here (short, harness): persistent server instead of
-per-process spawn (158→71), encoder CUDA-graph capture via per-shape
-ReplayGraph (71→~50), native in-process ctypes path (→44→50), decode
-pred+joint+argmax fusion + async readback, encoder mask-skip + f16 im2col, and
-**flash-attn for the relpos attention** (the biggest single encoder lever).
+The progression that got short from 158 ms to 32 ms (harness): persistent
+server instead of per-process spawn (158→71), encoder CUDA-graph capture via
+per-shape ReplayGraph (71→~50), native in-process ctypes path, decode
+pred+joint+argmax fusion + async readback, encoder mask-skip + f16 im2col,
+flash-attn for the relpos attention, **persisting PredictionNet/Joint on Model
+so the decode graphs reach steady-state capture (50→32)**, and giving each
+ReplayGraph a private gallocr so persistent decode graphs survive encoder
+rebuilds across utterances.
 
 ## The flash-attn win (the goal's item-3 attention fusion)
 
