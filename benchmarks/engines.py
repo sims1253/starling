@@ -39,6 +39,10 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
+# ctypes float* for the in-process parakeet C API (see _ggml_parakeet_native).
+import ctypes as _ctypes
+_c_float_p = _ctypes.POINTER(_ctypes.c_float)
+
 
 class SkipCell(Exception):
     """Raised when a (model, engine, length, batch) cell is infeasible.
@@ -1082,13 +1086,33 @@ class GgmlParakeet(Engine):
         self._proc: Optional[subprocess.Popen] = None
         self._port: int = 0
         self._base_url: str = ""
+        self._native = None  # NativeParakeet when the in-process C API is used
 
     @property
     def available(self) -> bool:
+        # The native (in-process) path is preferred: it needs only libparakeet.so
+        # + the model. The HTTP server path is the fallback.
+        try:
+            from _ggml_parakeet_native import available as _native_available
+            if _native_available() and GGML_PARAKEET_MODEL.exists():
+                return True
+        except Exception:
+            pass
         return GGML_PARAKEET_SERVER.exists() and GGML_PARAKEET_MODEL.exists()
 
     # -- lifecycle ---------------------------------------------------------
     def _load(self) -> None:
+        # Prefer the in-process ctypes binding (no HTTP / WAV overhead). Falls
+        # back to the persistent HTTP server if libparakeet.so is absent.
+        try:
+            from _ggml_parakeet_native import NativeParakeet
+            self._native = NativeParakeet(str(GGML_PARAKEET_MODEL))
+            return
+        except Exception:
+            self._native = None
+        self._load_server()
+
+    def _load_server(self) -> None:
         import socket
         import time as _time
         import urllib.request
@@ -1132,6 +1156,13 @@ class GgmlParakeet(Engine):
         raise RuntimeError("parakeet-server did not become healthy in 90 s")
 
     def _release(self) -> None:
+        # native path: free the in-process context (drops the ggml model).
+        if self._native is not None:
+            try:
+                self._native.close()
+            except Exception:
+                pass
+            self._native = None
         proc, self._proc = self._proc, None
         if proc is not None:
             try:
@@ -1147,6 +1178,15 @@ class GgmlParakeet(Engine):
 
     # -- inference ---------------------------------------------------------
     def _run_one(self, audio: np.ndarray) -> str:
+        # Native path: feed raw float32 PCM straight to the C API. No HTTP, no
+        # WAV encode/decode -- the lowest-overhead Python->ggml bridge.
+        if self._native is not None:
+            pcm = np.ascontiguousarray(audio, dtype=np.float32)
+            ptr = pcm.ctypes.data_as(_c_float_p)
+            return self._native.transcribe_pcm(ptr, pcm.size, 16000, 0).strip()
+        return self._run_one_http(audio)
+
+    def _run_one_http(self, audio: np.ndarray) -> str:
         import io
         import json as _json
         import uuid
