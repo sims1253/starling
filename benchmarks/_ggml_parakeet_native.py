@@ -129,7 +129,13 @@ class NativeParakeet:
             self._ctx = None
         # Free the global ggml backend explicitly so its device buffers are
         # released while the CUDA driver is still alive (avoids the abort in
-        # the Backend static destructor at process exit).
+        # the Backend static destructor at process exit). NOTE: with the
+        # persistent PredictionNet/Joint decode graphs (parakeet.cpp 5a98272),
+        # the Model destructor (via parakeet_capi_free above) frees the nets'
+        # ReplayGraph device buffers first; shutdown_backend then frees the
+        # global backend. If shutdown_backend is called it can double-free / race
+        # with the nets' teardown under some build states, so we call it best-
+        # effort and swallow any error -- the OS reclaims the rest at exit.
         shutdown = getattr(self._lib, "_shutdown_backend", None)
         if shutdown is not None:
             try:
