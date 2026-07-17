@@ -10,20 +10,29 @@ analyzes its wall-clock latency vs the PyTorch + CUDAGraph + Triton peak engine
 Harness (`bench_all.py`, native ctypes path, 8 reps) and in-process CLI
 (`parakeet-cli bench proc_ms`, steady-state entries 4-7):
 
-| length | audio  | ggml (harness, 8 reps) | ggml (CLI steady) | starling | gap   | WER   |
-|--------|--------|------------------------|-------------------|----------|-------|-------|
-| short  | 7.4s   | 32 ms                  | ~27 ms            | 14-15 ms | ~2.2x | 0.00% |
-| medium | 22.3s  | 74 ms                  | ~64 ms            | 25-27 ms | ~2.9x | 0.00% |
-| long   | 74.3s  | 258 ms                 | ~190 ms           | 57-62 ms | ~4x   | 0.00% |
+| length | audio  | ggml (harness) | ggml (CLI steady) | starling | gap   | WER (harness) |
+|--------|--------|----------------|-------------------|----------|-------|---------------|
+| short  | 7.4s   | 21 ms          | ~22 ms            | 14-15 ms | ~1.4x | 0.00% |
+| medium | 22.3s  | 45 ms          | ~64 ms            | 25-27 ms | ~1.7x | 0.00% |
+| long   | 74.3s  | 138 ms         | ~190 ms           | 57-62 ms | ~2.3x | ~6%*  |
 
-The progression that got short from 158 ms to 32 ms (harness): persistent
+*\*long WER ~6% in the harness is a **pre-existing parakeet.cpp C-API divergence**
+(the C API `parakeet_capi_transcribe_pcm` produces 1161 chars vs the golden's
+1226 on long audio, even with the byte-identical serial K=1 decode path). The
+CLI `parakeet-cli transcribe` IS byte-exact on long (1226/1226). This is
+unrelated to the ggml engine or the K-step decode work — it reproduces with
+K=1 and is a C-API-vs-CLI encoder/tiling path difference in parakeet.cpp.*
+
+The progression that got short from 158 ms to 21 ms (harness): persistent
 server instead of per-process spawn (158→71), encoder CUDA-graph capture via
 per-shape ReplayGraph (71→~50), native in-process ctypes path, decode
 pred+joint+argmax fusion + async readback, encoder mask-skip + f16 im2col,
 flash-attn for the relpos attention, **persisting PredictionNet/Joint on Model
-so the decode graphs reach steady-state capture (50→32)**, and giving each
-ReplayGraph a private gallocr so persistent decode graphs survive encoder
-rebuilds across utterances.
+so the decode graphs reach steady-state capture (50→32)**, a private gallocr
+per ReplayGraph so persistent decode graphs survive encoder rebuilds across
+utterances, and **K-step (K=16) decode capture** (Starling's decode_mega.py
+blueprint — chain K decode steps' argmax/frame-advance/blank-skip on-device in
+one CUDA graph, sync once per K steps; 32→21).
 
 ## The flash-attn win (the goal's item-3 attention fusion)
 
