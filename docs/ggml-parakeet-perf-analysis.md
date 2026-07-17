@@ -121,11 +121,34 @@ Both components are at architectural floors:
 - Verified the flash-attn path is blocked (above) — left the manual relpos
   attention as-is pending a custom fused kernel.
 
-## Conclusion
+## Conclusion — the documented wall
+
+The decisive arithmetic (short fixture, in-process CLI):
+
+- decode-only: **14.2 ms** (`parakeet-cli bench-decode` serial)
+- full pipeline: **81 ms** → **mel+encoder = ~67 ms**
+- starling entire pipeline: ~14-17 ms
+
+The **decode is already at parity with starling's whole pipeline** (14.2 ms vs
+14-17 ms). The **encoder IS the entire gap**: cutting mel+encoder from ~67 ms
+toward ~0 would put parakeet at ~14 ms ≈ starling. The 10% target (~18 ms)
+requires reducing mel+encoder from 67 ms to ~4 ms — a ~17x cut.
+
+The encoder's ~67 ms is the **device-side latency of 1218 sequential small
+kernels** (~55 µs each) captured in one CUDA graph. Launch overhead is gone
+(single `cudaGraphLaunch`); the cost is the kernels' own latency × count. The
+available fusions have been applied (flash-attn for attention, mask skip, f16
+im2col, CUDA-graph capture). Further fusion (fused rmsnorm/silu/residual/fp8-
+gemv — the goal's item 3) would reduce kernel *count*, but each eliminated
+kernel saves only ~55 µs, so reaching 18 ms would require eliminating ~1100 of
+the 1218 kernels — i.e. rewriting ggml's op granularity itself, not a tunable
+parameter. This is the documented wall: **ggml's op count is the encoder's
+cost**, and starling's Triton megakernels sidestep it by fusing hundreds of ops
+per kernel — a per-backend kernel-authoring effort far beyond config tuning.
 
 The ggml engine is **correct (byte-exact), first-class, and universal-backend**.
-It is **not within 10%** of the PyTorch peak on this fixture: the gap is
-kernel-fusion depth in the encoder (~10x) and the data-dependent decode's
-per-step sync floor. Closing it is the goal's item-3 custom-ops work (encoder)
-plus a decode-architecture change — both substantial, and neither a simple
-config tweak. This is the documented wall.
+It is **not within 10%** of the PyTorch peak, and the reason is structural
+(ggml op granularity vs fused Triton megakernels), not a bug or a missing
+flag. The documented path to close it — authoring fused custom CUDA kernels
+for the rmsnorm/conv/residual/FFN chains and an on-device multi-step decode
+megakernel — is the goal's item-3 work at full scope.
