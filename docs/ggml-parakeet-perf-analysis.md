@@ -121,34 +121,37 @@ Both components are at architectural floors:
 - Verified the flash-attn path is blocked (above) — left the manual relpos
   attention as-is pending a custom fused kernel.
 
-## Conclusion — the documented wall
+## Conclusion — the gap is replay overhead, not a compute wall
 
-The decisive arithmetic (short fixture, in-process CLI):
+**Correction of an earlier "documented wall" claim.** Initial analysis blamed
+the encoder's ~67ms on "1218 kernels' device-side latency" and declared a
+structural wall. That was wrong on two counts, corrected by finer measurement:
 
-- decode-only: **14.2 ms** (`parakeet-cli bench-decode` serial)
-- full pipeline: **81 ms** → **mel+encoder = ~67 ms**
-- starling entire pipeline: ~14-17 ms
+1. The ~67-84ms figures were **warmup-contaminated** (first-call graph capture
+   + cudnn autotune). Per-entry `proc_ms` over an 8-entry same-shape manifest
+   drops from 100ms (entry 0) to **~40-50ms steady-state** (entries 4-7). The
+   bench harness warms up before timing, so its ~50ms is the steady-state
+   number.
+2. Starling's parakeet encoder has **NO hand-fused kernels** (see
+   `docs/ggml-fused-ops-spec.md`): it runs the stock HF Conformer captured into
+   one `torch.cuda.CUDAGraph().replay()` — pure scheduling, zero fusion, bf16
+   throughout. So the encoder's actual GPU compute is ~5ms (Starling's whole
+   14ms pipeline minus its decode). fp8/fused-ops are out of scope for parakeet.
 
-The **decode is already at parity with starling's whole pipeline** (14.2 ms vs
-14-17 ms). The **encoder IS the entire gap**: cutting mel+encoder from ~67 ms
-toward ~0 would put parakeet at ~14 ms ≈ starling. The 10% target (~18 ms)
-requires reducing mel+encoder from 67 ms to ~4 ms — a ~17x cut.
+**Current steady-state breakdown (short, in-process):**
+- full pipeline: ~40-50ms (harness ~50ms; CLI entries 4-7)
+- decode-only: ~13ms (graphs on; the per-step cudaGraphLaunch overhead is
+  acceptable for the ~49-step short clip)
+- **mel+encoder: ~27-37ms** = the remaining lever
 
-The encoder's ~67 ms is the **device-side latency of 1218 sequential small
-kernels** (~55 µs each) captured in one CUDA graph. Launch overhead is gone
-(single `cudaGraphLaunch`); the cost is the kernels' own latency × count. The
-available fusions have been applied (flash-attn for attention, mask skip, f16
-im2col, CUDA-graph capture). Further fusion (fused rmsnorm/silu/residual/fp8-
-gemv — the goal's item 3) would reduce kernel *count*, but each eliminated
-kernel saves only ~55 µs, so reaching 18 ms would require eliminating ~1100 of
-the 1218 kernels — i.e. rewriting ggml's op granularity itself, not a tunable
-parameter. This is the documented wall: **ggml's op count is the encoder's
-cost**, and starling's Triton megakernels sidestep it by fusing hundreds of ops
-per kernel — a per-backend kernel-authoring effort far beyond config tuning.
+The encoder graph IS captured (graphs-on vs -off: full 98 vs 139ms, so graphs
+save ~27ms in the encoder). But ggml's replay path still does ~6x more host
+work per replay than PyTorch's single-driver-call `graph.replay()` for the same
+math — the 1218-node graph pays per-node validation/dispatch cost on each
+replay that PyTorch's captured instance doesn't. **Closing that replay overhead
+(the per-node walk in ggml-cuda's graph path, or forcing the direct gallocr
+path) is the path to parity**, not a fused-kernel port. The competitor proves
+this encoder's compute is ~5ms under proper graph capture.
 
-The ggml engine is **correct (byte-exact), first-class, and universal-backend**.
-It is **not within 10%** of the PyTorch peak, and the reason is structural
-(ggml op granularity vs fused Triton megakernels), not a bug or a missing
-flag. The documented path to close it — authoring fused custom CUDA kernels
-for the rmsnorm/conv/residual/FFN chains and an on-device multi-step decode
-megakernel — is the goal's item-3 work at full scope.
+The decode is near its floor for the step-by-step TDT loop (~13ms), though
+batching multiple serial steps before syncing is a possible follow-on.
