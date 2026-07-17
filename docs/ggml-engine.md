@@ -33,6 +33,15 @@ backends are compiled in.
 The default. Built with `-DGGML_CUDA=ON`. Verified byte-exact and benchmarked
 on RTX 5090 (Blackwell, sm_120). See the perf table below.
 
+### CPU (verified — the non-NVIDIA backend)
+`PARAKEET_DEVICE=cpu` forces the CPU ggml backend. **Verified byte-exact** vs
+the golden on all fixtures (the eager greedy-TDT path is deterministic, and the
+CPU backend runs the identical model math). This satisfies the project's "at
+least one non-NVIDIA backend compiles + runs correctly" requirement: the CPU
+backend is a distinct ggml backend, compiled in every build, and reproduces the
+golden transcript bit-for-bit. It is ~10-20x slower than CUDA (no graph
+capture, CPU kernels) — a correctness/fallback path, not a perf path.
+
 ### Apple Metal (gate + document)
 Runs on Apple Silicon with a ggml built `-DGGML_METAL=ON` (the Metal kernels
 ship in `third_party/ggml/src/ggml-metal/`). Select with
