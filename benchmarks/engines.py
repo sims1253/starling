@@ -1123,7 +1123,8 @@ class GgmlParakeet(Engine):
         # + the model. The HTTP server path is the fallback.
         try:
             from _ggml_parakeet_native import available as _native_available
-            if _native_available() and GGML_PARAKEET_MODEL.exists():
+            if (_native_available() and GGML_PARAKEET_MODEL.exists()
+                    and os.environ.get("GGML_PARAKEET_NATIVE", "1") not in ("", "0")):
                 return True
         except Exception:
             pass
@@ -1132,13 +1133,17 @@ class GgmlParakeet(Engine):
     # -- lifecycle ---------------------------------------------------------
     def _load(self) -> None:
         # Prefer the in-process ctypes binding (no HTTP / WAV overhead). Falls
-        # back to the persistent HTTP server if libparakeet.so is absent.
-        try:
-            from _ggml_parakeet_native import NativeParakeet
-            self._native = NativeParakeet(str(GGML_PARAKEET_MODEL))
-            return
-        except Exception:
-            self._native = None
+        # back to the persistent HTTP server if libparakeet.so is absent OR the
+        # caller disabled the native path (GGML_PARAKEET_NATIVE=0) -- e.g. to
+        # isolate ggml's at-exit teardown crash in a separate process (pytest).
+        if os.environ.get("GGML_PARAKEET_NATIVE", "1") not in ("", "0"):
+            try:
+                from _ggml_parakeet_native import NativeParakeet
+                self._native = NativeParakeet(str(GGML_PARAKEET_MODEL))
+                return
+            except Exception:
+                self._native = None
+        self._native = None
         self._load_server()
 
     def _load_server(self) -> None:

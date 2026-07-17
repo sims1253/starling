@@ -14,6 +14,7 @@ Run with:  uv run pytest tests/test_ggml_parity.py -q
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -51,7 +52,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def ggml_engine():
-    """One persistent parakeet-server for the whole module (load paid once)."""
+    """One persistent parakeet engine for the whole module (load paid once).
+
+    The default path is the in-process ctypes binding (fastest). ggml's global
+    Backend static destructor aborts at process exit on some builds; that crash
+    is after all tests pass and does not affect their outcome (pytest reports
+    before the atexit crash on stdout-flushed runs). For environments where the
+    atexit crash must be fully isolated, set GGML_PARAKEET_NATIVE=0 to use the
+    HTTP-server path (ggml runs in a child process).
+    """
     from engines import GgmlParakeet
 
     eng = GgmlParakeet()
