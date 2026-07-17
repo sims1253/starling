@@ -13,11 +13,21 @@ fixture, same golden contract, byte-exact transcripts, but portable.
 
 ## Correctness contract
 
-Byte-exact transcripts vs the golden references (`golden/parakeet_tdt_*.txt`),
-asserted by `tests/test_ggml_parity.py` (skipped if the ggml binary isn't
-built). `parakeet.cpp` is the verified byte-exact ggml port — it reproduces the
-eager greedy-TDT token stream bit-for-bit on short/medium/long, including
-the subtle comma variations in the long fixture.
+Byte-exact transcripts vs the golden references (`golden/parakeet_tdt_*.txt`
+for parakeet, `golden/moss_*.txt` for moss), asserted by
+`tests/test_ggml_parity.py` (skipped if the ggml binaries aren't built).
+
+- **parakeet-tdt**: byte-exact on short/medium/long. `parakeet.cpp` reproduces
+  the eager greedy-TDT token stream bit-for-bit, including the subtle comma
+  variations in the long fixture.
+- **moss**: byte-exact on the short fixture. On medium/long, CrispASR's
+  moss-transcribe decode diverges from the golden capture path in punctuation
+  normalization (a period at some repetition boundaries) and can truncate
+  below the golden token count; the parity test asserts a normalized CER < 10%
+  floor on medium/long so regressions beyond the known gap are caught. The
+  moss-transcribe chunked path has a heap-corruption crash at chunk boundaries
+  on long audio, so `GgmlMoss` forces the single-chunk path
+  (`--chunk-seconds 3600`).
 
 ## Backends
 
@@ -93,6 +103,7 @@ fused ops as ggml custom kernels.
 
 ## Build
 
+### parakeet-tdt
 In the parakeet.cpp repo (`/home/m0hawk/Documents/parakeet.cpp`):
 ```
 cmake -B build-cuda -DGGML_CUDA=ON -DPARAKEET_SHARED=ON
@@ -101,3 +112,17 @@ cmake --build build-cuda -j --target parakeet parakeet-cli parakeet-server
 `PARAKEET_SHARED=ON` produces `libparakeet.so`, which the Starling engine
 ctypes-binds for the in-process path. Override paths with `GGML_PARAKEET_LIB`,
 `GGML_PARAKEET_MODEL` (see `benchmarks/engines.py`).
+
+### moss
+The moss engine uses CrispASR's `moss-transcribe` backend. The released
+CrispASR v0.8.2 binary omits it (the source is in the repo but was wired into
+the build later), so build CrispASR locally:
+```
+cd /home/m0hawk/Documents/CrispASR
+cmake -B build -DGGML_CUDA=ON -DCRISPASR_BUILD_EXAMPLES=ON
+cmake --build build -j --target crispasr
+```
+Download the F16 GGUF: `moss-transcribe-preview-2b-f16.gguf` from
+`cstr/MOSS-Transcribe-preview-2B-GGUF`. Override paths with `GGML_MOSS_BIN`,
+`GGML_MOSS_MODEL`. The moss engine is one-shot (per-process model load);
+starling-moss stays the NVIDIA peak path.
