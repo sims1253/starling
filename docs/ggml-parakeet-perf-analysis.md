@@ -7,28 +7,31 @@ analyzes its wall-clock latency vs the PyTorch + CUDAGraph + Triton peak engine
 
 ## Current numbers (RTX 5090, bf16, B=1, harness `bench_all.py`, 20 reps)
 
-**Short is WITHIN the 10% target; all three byte-exact (WER 0.00%).**
+All three fixtures **byte-exact (WER 0.00%)**, all using the K-step multistep
+decode (K=16 for short/medium, K=32 for long — T-aware, see parakeet.cpp ade52bf):
 
-| length | ggml median | ggml min | starling median | starling min | gap (median) | WER | decode path |
-|--------|-------------|----------|-----------------|--------------|--------------|-----|-------------|
-| short  | 19.3 ms     | 18.2 ms  | 17.9 ms         | 13.4 ms      | **1.08x**    | 0.00% | K-step multistep (K=16) |
-| medium | 42.6 ms     | 40.4 ms  | 26.5 ms         | 25.0 ms      | 1.61x        | 0.00% | K-step multistep (K=16) |
-| long   | 283.9 ms    | 184.8 ms | 62.1 ms         | 60.3 ms      | 4.57x        | 0.00% | serial greedy (byte-exact) |
+| length | ggml median | ggml min | starling median | starling min | gap (median) | WER |
+|--------|-------------|----------|-----------------|--------------|--------------|-----|
+| short  | 19-24 ms*   | 18-21 ms | 17-18 ms        | 13-16 ms     | ~1.3x        | 0.00% |
+| medium | 44 ms       | 41-43 ms | 27-29 ms        | 25-27 ms     | ~1.6x        | 0.00% |
+| long   | 128-135 ms  | 120 ms   | 64-66 ms        | 60-64 ms     | ~2.0x        | 0.00% |
 
-**Short meets the goal's ~10% target** (ggml 19.3ms vs starling 17.9ms = within
-8%). The K-step multistep fast path is byte-exact on short/medium (T_enc<=512)
-but has a termination bug on long audio, so long is guarded to the byte-exact
-serial greedy loop (parakeet.cpp 147ba98) — correct but slower (no K-step win
-on long). Fixing the multistep's long-audio termination would bring long
-toward the K-step curve (its min of 184.8ms already hints at the multistep
-benefit when the graph cache is warm).
+*Short median varies 19-24ms run-to-run (high variance at this timescale;
+starling's short also swings 17.5-18.3ms). The engine's direct C-API per-call
+floor is ~18.5ms (min ~17.9ms, matching starling's min). The best-run short
+(19.3ms median, measured on a quiet GPU) is within the 10% target of starling
+(17.9ms); typical runs land ~1.3x.
 
-**Measurement note:** earlier "1.5x short" / "3x short" figures were from low
-rep counts (5-6) whose median was pulled up by warmup/first-rep graph-capture
-cost; with 20 reps the steady-state median (19.3ms) reflects the engine's true
-per-call latency. The harness's `torch.cuda.synchronize()` brackets each rep;
-the ggml engine's per-call floor (~18.5ms via direct C-API timing) matches the
-20-rep harness median.
+**The multistep long-audio fix (parakeet.cpp a4ca1fa) was the big win for long**:
+long dropped from 284ms (serial fallback) to ~130ms (2.2x faster) once two
+decode-logic bugs were fixed (step-0 conditional commit; `c_cur` chaining
+through the wrong variable) and K raised to 32 for long (only K∈{32,64} are
+byte-exact on long due to a ggml CUDA-graph topology defect).
+
+**Measurement note:** use `--reps 20`; low rep counts inflate the median via
+warmup. Direct C-API timing (`scripts/probe_inprocess.py`) confirms the ~18.5ms
+floor. The harness's `torch.cuda.synchronize()` doesn't cover ggml's stream but
+is harmless at high reps.
 
 The progression that got short from 158 ms to 21 ms (harness): persistent
 server instead of per-process spawn (158→71), encoder CUDA-graph capture via
