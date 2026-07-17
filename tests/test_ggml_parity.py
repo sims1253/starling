@@ -112,11 +112,10 @@ def ggml_moss_engine():
 def test_ggml_moss_byte_exact(ggml_moss_engine, name: str) -> None:
     """Moss ggml engine matches the golden BYTE-FOR-BYTE on the short fixture.
 
-    The short fixture is the byte-exact gate. Medium/long are NOT asserted
-    here: CrispASR's moss-transcribe decode diverges from the golden capture
-    path in punctuation normalization (a period at some repetition boundaries)
-    and can truncate below the golden token count on long audio. See
-    ``docs/ggml-engine.md`` for the documented gaps.
+    The short fixture is the byte-exact gate. Both invocation paths (persistent
+    server and one-shot CLI fallback) reproduce it exactly because the audio
+    fits one 30 s chunk and the decode has not yet accumulated enough KV-cache
+    context to diverge from the golden's HF eager greedy path.
     """
     golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text().rstrip()
     out = ggml_moss_engine._run_one(FIXTURES[name]).rstrip()
@@ -131,9 +130,29 @@ def test_ggml_moss_byte_exact(ggml_moss_engine, name: str) -> None:
 def test_ggml_moss_near_exact(ggml_moss_engine, name: str) -> None:
     """Moss is NEAR-exact (not byte-exact) on medium/long: assert a CER floor.
 
-    Documents the known divergence from byte-exact (punctuation + truncation)
-    with a character-error-rate bound so regressions beyond the known gap are
-    caught, without failing on the documented punctuation differences.
+    The residual divergence is NOT a flag/CrispASR-post-processing issue -- it
+    is an inherent numeric-path difference between CrispASR's ggml f16 KV-cache
+    decode and the golden's HF bf16 eager greedy decode. At the low-confidence
+    ``eyes`` repetition boundary the two argmax results flip: CrispASR emits
+    ``eyes. It`` (period + capital) where the golden emits ``eyes it``. This was
+    confirmed by inspecting the raw token stream (``moss_transcribe: N tokens``
+    verbose log): the period appears in the LLM output itself, before any
+    post-processing. Flags tried that do NOT fix it: ``--no-punctuation`` (strips
+    ALL punctuation, including the golden's own commas -- too aggressive),
+    ``-nfa`` (no flash attention), ``--frequency-penalty 0``, ``-bs greedy``.
+
+    Characterized residual (one-shot CLI / server single-chunk, byte-identical):
+      * medium: 2 inserted periods -- golden has ``eyes. it`` only at boundary 1
+        (no period at boundaries 2,3); CrispASR has ``eyes. it`` at all 3.
+        normalized CER = 0.0000.
+      * long:   6 inserted periods + 6 capitalizations (``eyes. It`` at every
+        boundary; golden has ``eyes it`` throughout) + a different EOS/truncation
+        point (CrispASR's extra period tokens change where the LLM emits
+        ``<|im_end|>``, so the 200-token golden truncation point is not matched).
+        normalized CER < 0.02.
+
+    The CER bound catches any regression beyond this known, documented gap
+    without failing on the residual punctuation/capitalization differences.
     """
     golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text().rstrip()
     out = ggml_moss_engine._run_one(FIXTURES[name]).rstrip()
@@ -160,6 +179,9 @@ def test_ggml_moss_near_exact(ggml_moss_engine, name: str) -> None:
         return prev[-1]
 
     cer = lev(g_n, o_n) / max(1, len(g_n))
+    # medium's normalized CER is 0.0; long's is <0.02. 0.10 leaves headroom for
+    # the server path's 30 s-chunk long-audio boundary differences while still
+    # catching a real regression (a totally broken decode is CER >> 0.10).
     assert cer < 0.10, (
         f"moss ggml CER too high on {name} (cer={cer:.3f}):\n"
         f"  golden: {g_n[:120]!r}\n  ggml:   {o_n[:120]!r}"
