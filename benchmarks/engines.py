@@ -78,6 +78,23 @@ _PARAKEET_CPP_ENV = {
     "LD_LIBRARY_PATH": f"{ASR_BENCH}/bin/parakeet-v0.3.2-bin-linux-cuda-x64",
 }
 
+# parakeet.cpp persistent HTTP server (the "ggml" first-class engine). The
+# one-shot `parakeet-cli` pays the full model-load + CUDA-driver init tax on
+# every utterance (~2 s), so the `parakeet.cpp` engine above is launch-bound.
+# The server (examples/server/parakeet-server) loads the model ONCE and serves
+# many clips over a localhost OpenAI-compatible endpoint, so steady-state
+# latency is mel+encoder+decode only -- the ggml equivalent of the starling
+# pipeline. Override paths/ports with the GGML_PARAKEET_* env vars.
+GGML_PARAKEET_SERVER = Path(os.environ.get(
+    "GGML_PARAKEET_SERVER",
+    Path.home() / "Documents" / "parakeet.cpp" / "build-cuda" / "examples" / "server" / "parakeet-server",
+)).expanduser()
+GGML_PARAKEET_MODEL = Path(os.environ.get(
+    "GGML_PARAKEET_MODEL", str(PARAKEET_CPP_MODEL),
+)).expanduser()
+GGML_PARAKEET_HOST = os.environ.get("GGML_PARAKEET_HOST", "127.0.0.1")
+GGML_PARAKEET_PORT = int(os.environ.get("GGML_PARAKEET_PORT", "0"))  # 0 = pick a free port
+
 
 class Engine:
     """Base adapter. Subclasses override :meth:`load` / :meth:`_run_one`."""
@@ -1041,6 +1058,123 @@ class ParakeetCpp(Engine):
         return blob.strip()
 
 
+class GgmlParakeet(Engine):
+    """ggml/CUDA first-class engine: mudler's parakeet.cpp via a PERSISTENT server.
+
+    The sibling :class:`ParakeetCpp` engine shells out to ``parakeet-cli`` once
+    per utterance, which pays the full model-load + CUDA-driver init tax (~2 s)
+    on every call -- it is launch-bound, not compute-bound, so its bench number
+    reflects process startup rather than the ggml decode. This engine instead
+    spawns the parakeet.cpp HTTP server (``examples/server/parakeet-server``)
+    ONCE in :meth:`_load`, waits for ``/health``, and serves every utterance
+    over a localhost OpenAI-compatible endpoint. Steady-state latency is then
+    mel + encoder + decode only -- the ggml equivalent of the starling
+    pipeline. Output is byte-exact with the golden (parakeet.cpp is the
+    verified byte-exact ggml port; the server only removes the per-process tax).
+
+    Not batched: the server serialises inference behind a mutex (one clip at a
+    time), so B>1 loops B times on the host -- matching the existing
+    ``parakeet.cpp`` engine contract.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("ggml", "parakeet", supports_batch=False)
+        self._proc: Optional[subprocess.Popen] = None
+        self._port: int = 0
+        self._base_url: str = ""
+
+    @property
+    def available(self) -> bool:
+        return GGML_PARAKEET_SERVER.exists() and GGML_PARAKEET_MODEL.exists()
+
+    # -- lifecycle ---------------------------------------------------------
+    def _load(self) -> None:
+        import socket
+        import time as _time
+        import urllib.request
+
+        # pick a free TCP port unless GGML_PARAKEET_PORT pins one
+        port = GGML_PARAKEET_PORT
+        if port == 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((GGML_PARAKEET_HOST, 0))
+            port = s.getsockname()[1]
+            s.close()
+        self._port = port
+        self._base_url = f"http://{GGML_PARAKEET_HOST}:{port}"
+
+        # spawn the server (model load + bind happens here, paid once)
+        cmd = [
+            str(GGML_PARAKEET_SERVER),
+            "--model", str(GGML_PARAKEET_MODEL),
+            "--host", GGML_PARAKEET_HOST,
+            "--port", str(port),
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ),
+        )
+        # wait for /health (model load is ~1-2 s)
+        deadline = _time.time() + 90.0
+        while _time.time() < deadline:
+            if self._proc.poll() is not None:
+                raise RuntimeError(
+                    f"parakeet-server exited rc={self._proc.returncode} before binding"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"{self._base_url}/health", timeout=2
+                ) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                _time.sleep(0.5)
+        raise RuntimeError("parakeet-server did not become healthy in 90 s")
+
+    def _release(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._base_url = ""
+        self._port = 0
+
+    # -- inference ---------------------------------------------------------
+    def _run_one(self, audio: np.ndarray) -> str:
+        import io
+        import json as _json
+        import uuid
+        import urllib.request
+
+        # render 16 kHz mono PCM16 WAV in memory (no disk roundtrip)
+        import soundfile as sf
+        buf = io.BytesIO()
+        sf.write(buf, audio, 16000, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+
+        boundary = "----pkbench" + uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+            b"Content-Type: audio/wav\r\n\r\n"
+            + wav_bytes + b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            f"{self._base_url}/v1/audio/transcriptions", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as r:
+            out = _json.loads(r.read().decode())
+        return out.get("text", "").strip()
+
+
 # ====================================================================== #
 # Registry + filter resolution
 # ====================================================================== #
@@ -1105,6 +1239,14 @@ def _parakeet_cpp_keys() -> list[str]:
     return []
 
 
+def _ggml_parakeet_keys() -> list[str]:
+    """The persistent-server ggml engine (first-class). Skipped if the
+    parakeet-server binary or model is absent."""
+    if GgmlParakeet().available:
+        return ["ggml-parakeet"]
+    return []
+
+
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
@@ -1121,7 +1263,7 @@ def available_keys() -> list[str]:
     """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
     return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
-            + _crispasr_keys() + _parakeet_cpp_keys())
+            + _crispasr_keys() + _parakeet_cpp_keys() + _ggml_parakeet_keys())
 
 
 def build_engines(
@@ -1153,6 +1295,10 @@ def build_engines(
             chosen[mdl].append(CrispASR(backend_gguf[0], backend_gguf[1], mdl))
         elif key.startswith("parakeet.cpp-"):
             chosen[mdl].append(ParakeetCpp())
+        elif key.startswith("ggml-"):
+            # the persistent-server ggml engine family (currently parakeet only)
+            if mdl == "parakeet":
+                chosen[mdl].append(GgmlParakeet())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,
