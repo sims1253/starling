@@ -7,26 +7,20 @@ analyzes its wall-clock latency vs the PyTorch + CUDAGraph + Triton peak engine
 
 ## Current numbers (RTX 5090, bf16, B=1, in-process, model load excluded)
 
-Harness (`bench_all.py`, native ctypes path, 8 reps) and in-process CLI
-(`parakeet-cli bench proc_ms`, steady-state entries 4-7):
+Harness (`bench_all.py`, native ctypes path) — all three fixtures now
+**byte-exact (WER 0.00%)**:
 
-| length | audio  | ggml (harness) | ggml (CLI steady) | starling | gap   | WER (harness) |
-|--------|--------|----------------|-------------------|----------|-------|---------------|
-| short  | 7.4s   | 21 ms          | ~22 ms            | 14-15 ms | ~1.4x | 0.00% |
-| medium | 22.3s  | 45 ms          | ~64 ms            | 25-27 ms | ~1.7x | 0.00% |
-| long   | 74.3s  | 138 ms         | ~190 ms           | 57-62 ms | ~2.3x | ~6%*  |
+| length | audio  | ggml (harness) | starling | gap   | WER   | decode path |
+|--------|--------|----------------|----------|-------|-------|-------------|
+| short  | 7.4s   | 27 ms          | 15-18 ms | ~1.5x | 0.00% | K-step multistep (K=16) |
+| medium | 22.3s  | 46 ms          | 26-29 ms | ~1.6x | 0.00% | K-step multistep (K=16) |
+| long   | 74.3s  | 306 ms         | 60-65 ms | ~4.7x | 0.00% | serial greedy (byte-exact) |
 
-*\*long WER ~6% in the harness is a **pre-existing parakeet.cpp bug in the
-plain (tokens==nullptr) decode path**: on long audio the greedy TDT loop does
-not terminate correctly and runs past the golden length (the C API
-`parakeet_capi_transcribe_pcm` and the plain `parakeet-cli transcribe` both
-produce ~1160-3560 chars vs the golden's 1226, even with the byte-identical
-serial K=1 path — so it is NOT caused by the K-step decode work). The
-**timestamps path** (`parakeet-cli transcribe --json`, `tokens != nullptr`,
-which bypasses the K-step fast path) IS byte-exact on long (1226/1226). The
-in-process engine uses the plain C API path for speed; tracking the long-audio
-termination bug as a parakeet.cpp upstream issue. Short/medium are byte-exact
-on all paths.*
+The K-step multistep fast path is byte-exact on short/medium (T_enc<=512) but
+has a termination bug on long audio, so long is guarded to the byte-exact
+serial greedy loop (parakeet.cpp 147ba98) — correct but slower (no K-step
+win on long). Fixing the multistep's long-audio termination would bring long
+toward the K-step curve.
 
 The progression that got short from 158 ms to 21 ms (harness): persistent
 server instead of per-process spawn (158→71), encoder CUDA-graph capture via
