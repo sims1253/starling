@@ -1,15 +1,21 @@
 # ggml engine — universal backend ASR for Starling
 
-The `ggml-parakeet` (and planned `ggml-moss`) engine brings a second,
-**universal-backend** transcription path to Starling alongside the PyTorch +
-CUDA-graph peak engine. It runs mudler's `parakeet.cpp` — a byte-exact ggml
-port of `nvidia/parakeet-tdt-0.6b-v3` — in-process via the parakeet C API,
-so it reaches any backend ggml supports (NVIDIA CUDA, AMD via HIP, Apple
-Metal, Intel/AMD/ARM via Vulkan, CPU) from one codebase.
+The `ggml-parakeet` and `ggml-moss` engines bring a second, **universal-backend**
+transcription path to Starling alongside the PyTorch + CUDA-graph peak engine.
+`ggml-parakeet` runs mudler's `parakeet.cpp` (a ggml port of
+`nvidia/parakeet-tdt-0.6b-v3`) in-process via the parakeet C API; `ggml-moss`
+runs CrispASR's `moss-transcribe` backend (a ggml port of
+`MOSS-Transcribe-preview-2B`). Both reach any backend ggml supports (NVIDIA
+CUDA, AMD via HIP, Apple Metal, Intel/AMD/ARM via Vulkan, CPU) from one codebase.
 
 The PyTorch engine remains the NVIDIA peak path (CUDAGraph + Triton fused
-kernels, tuned on sm_120). The ggml engine is dispatched alongside it: same
-fixture, same golden contract, byte-exact transcripts, but portable.
+kernels, tuned on sm_120). The ggml engines are dispatched alongside it: same
+fixtures, same golden contract, portable. **Correctness:** parakeet-tdt is
+byte-exact on all fixtures; moss is byte-exact on short and near-exact on
+medium/long (an inherent f16-KV-cache vs bf16-eager numeric divergence at
+low-confidence boundaries — documented below, not a bug). **Speed:** parakeet-tdt
+is within ~2-3x of the PyTorch peak (see `docs/ggml-parakeet-perf-analysis.md`);
+moss is slower (one-shot/per-server load path) and not yet at parity.
 
 ## Correctness contract
 
