@@ -63,11 +63,24 @@ bool ModelLoader::load(const char* path) {
             case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32:
             case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64:
                 v.kind = GgufValue::Kind::k_int;
-                v.i = gguf_get_val_i64(gguf_ctx_, i);
+                // Use the type-specific accessor (gguf_get_val_i64 aborts on
+                // non-INT64 types). Map each width to its accessor.
+                switch (t) {
+                    case GGUF_TYPE_UINT8:  v.i = gguf_get_val_u8(gguf_ctx_, i); break;
+                    case GGUF_TYPE_INT8:   v.i = gguf_get_val_i8(gguf_ctx_, i); break;
+                    case GGUF_TYPE_UINT16: v.i = gguf_get_val_u16(gguf_ctx_, i); break;
+                    case GGUF_TYPE_INT16:  v.i = gguf_get_val_i16(gguf_ctx_, i); break;
+                    case GGUF_TYPE_UINT32: v.i = gguf_get_val_u32(gguf_ctx_, i); break;
+                    case GGUF_TYPE_INT32:  v.i = gguf_get_val_i32(gguf_ctx_, i); break;
+                    case GGUF_TYPE_UINT64: v.i = (int64_t)gguf_get_val_u64(gguf_ctx_, i); break;
+                    case GGUF_TYPE_INT64:  v.i = gguf_get_val_i64(gguf_ctx_, i); break;
+                    default: continue;
+                }
                 break;
             case GGUF_TYPE_FLOAT32: case GGUF_TYPE_FLOAT64:
                 v.kind = GgufValue::Kind::k_float;
-                v.f = gguf_get_val_f64(gguf_ctx_, i);
+                v.f = (t == GGUF_TYPE_FLOAT32) ? (double)gguf_get_val_f32(gguf_ctx_, i)
+                                                : gguf_get_val_f64(gguf_ctx_, i);
                 break;
             case GGUF_TYPE_ARRAY: {
                 const enum gguf_type at = gguf_get_arr_type(gguf_ctx_, i);

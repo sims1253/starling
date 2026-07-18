@@ -113,7 +113,15 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
         device_name_ = "cpu";
     }
     // GPU -> also create a CPU fallback backend for op offload + set the sched flag.
-    impl_->use_sched = (device_name_ != "cpu");
+    // Compare case-insensitively: the CPU device reports its name as "CPU" (and
+    // some platforms use other casings), so a bare != "cpu" mis-classifies a
+    // selected CPU backend as GPU and routes mel to the GPU path.
+    {
+        std::string lname = device_name_;
+        std::transform(lname.begin(), lname.end(), lname.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        impl_->use_sched = (lname != "cpu");
+    }
     if (impl_->use_sched) {
         impl_->cpu_backend = ggml_backend_cpu_init();
     } else {

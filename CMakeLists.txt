@@ -116,6 +116,7 @@ endif()
 target_include_directories(starling_ggml PUBLIC
     ${CMAKE_SOURCE_DIR}/cpp/include
     PRIVATE
+    ${CMAKE_SOURCE_DIR}/cpp                     # so files include "runtime/...", "parakeet/..."
     ${CMAKE_SOURCE_DIR}/cpp/runtime
     ${CMAKE_SOURCE_DIR}/cpp/parakeet
     ${CMAKE_SOURCE_DIR}/cpp/moss
