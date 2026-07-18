@@ -1,0 +1,770 @@
+From 137575d96819bbb71d344f07b01b28504cb1962c Mon Sep 17 00:00:00 2001
+From: parakeet dev <parakeet@local>
+Date: Sat, 18 Jul 2026 00:22:56 +0200
+Subject: [PATCH] cuda: fused LayerNorm + affine (NORM+MUL[+ADD]) + per-op
+ instrumentation
+
+Add a fused plain-LayerNorm-with-affine kernel (layer_norm_f32) mirroring the
+existing rms_norm_f32 fusion: computes mean+var, then (x-mean)*inv_std[*gamma][+beta]
+in one fp32 kernel. Byte-exact with running GGML_OP_NORM ->
+GGML_OP_MUL(gamma) -> GGML_OP_ADD(beta) as separate nodes (same fp32 reduction
+and same fp32 affine). Collapses 3 nodes -> 1 per LayerNorm in captured graphs.
+
+- norm.cu: layer_norm_f32<do_multiply,do_add> + layer_norm_mul_f32_cuda launcher
+  + ggml_cuda_op_norm_fused[_add] entry points.
+- norm.cuh: declarations for the two entry points.
+- ggml-cuda.cu: GGML_OP_NORM branch in ggml_cuda_can_fuse (mirrors the RMS_NORM
+  branch) + dispatch in ggml_cuda_try_fuse.
+
+Also adds gated per-op-type and graph-launch CUDA-event instrumentation
+(PARAKEET_PEROP_TIMING, PARAKEET_GPU_TIMING), default off, zero behavior change.
+---
+ src/ggml-cuda/ggml-cuda.cu | 284 ++++++++++++++++++++++++++++++-
+ src/ggml-cuda/norm.cu      | 333 +++++++++++++++++++++++++++++++++++++
+ src/ggml-cuda/norm.cuh     |  11 ++
+ 3 files changed, 627 insertions(+), 1 deletion(-)
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index c30cb336..b13e7698 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -3704,6 +3704,54 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         return true;
+     }
+ 
++    // Fused plain LayerNorm + affine: GGML_OP_NORM -> GGML_OP_MUL[+GGML_OP_ADD].
++    // Mirrors the GGML_OP_RMS_NORM branch above; dispatched to layer_norm_f32,
++    // which is byte-exact with running the three ops separately (same fp32
++    // mean/var reduction as norm_f32, same fp32 affine as mul/add). Strictness is
++    // the same as the rms_norm fusion: only fp32, only contiguous-rows operands,
++    // and no broadcast when norm is the B operand of the mul.
++    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
++        const ggml_tensor *norm = cgraph->nodes[node_idx];
++        const ggml_tensor *mul  = cgraph->nodes[node_idx+1];
++        const ggml_tensor *add  = nullptr;
++
++        if (ops.size() == 3 && ops.begin()[2] == GGML_OP_ADD) {
++            add = cgraph->nodes[node_idx+2];
++        }
++
++        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
++        GGML_ASSERT(norm->type == GGML_TYPE_F32);
++
++        //norm only supports F32
++        if (mul->src[0]->type != GGML_TYPE_F32 ||
++            mul->src[1]->type != GGML_TYPE_F32 ||
++            mul->type != GGML_TYPE_F32) {
++            return false;
++        }
++
++        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
++            add->src[1]->type != GGML_TYPE_F32 ||
++            add->type != GGML_TYPE_F32) ) {
++            return false;
++        }
++
++        //if norm is the B operand, then we don't handle broadcast
++        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
++            return false;
++        }
++
++        //norm kernel assumes contiguous rows
++        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
++            return false;
++        }
++
++        if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
++            return false;
++        }
++
++        return true;
++    }
++
+     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
+      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
+@@ -4190,6 +4238,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
++        ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
++        return 2;
++    }
++
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
++        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
++        return 1;
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+@@ -4220,6 +4278,153 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// ---- Optional per-op-type GPU timing (parakeet instrumentation). ----
++// Gated by PARAKEET_PEROP_TIMING. When set AND graphs are disabled
++// (GGML_CUDA_DISABLE_GRAPHS=1, so every node goes through the per-node
++// ggml_cuda_compute_forward path below rather than a captured/replayed CUDA
++// graph), record a CUDA event pair around each node's forward and accumulate
++// elapsed GPU ms per op type (node->op). After each graph_compute prints a
++// table: op_type, total_ms, calls, ms/call, % of this graph's measured GPU
++// time, and the count of src-fp16 vs src-f32 matmuls. Off by default -> zero
++// effect on the steady-state byte-exact path.
++//
++// NOTE: requires GGML_CUDA_DISABLE_GRAPHS=1 because per-node events recorded
++// during cudaStreamBeginCapture are NOT emitted on cudaGraphLaunch replay.
++struct pk_per_op_stat {
++    double total_ms = 0.0;
++    uint64_t calls  = 0;
++};
++static std::unordered_map<int, pk_per_op_stat> & pk_perop_stats() {
++    static std::unordered_map<int, pk_per_op_stat> s;
++    return s;
++}
++// Unguarded tally of EVERY node iterated in the per-node loop (regardless of
++// skip/fuse/flag), for diagnosing why certain op types are absent from the
++// timed table. Only populated when PARAKEET_PEROP_TIMING is set.
++static std::unordered_map<int, uint64_t> & pk_perop_seen() {
++    static std::unordered_map<int, uint64_t> s;
++    return s;
++}
++// Per-op size inventory: op -> (count, total dst elements, sample shape). Lets
++// us judge fusion value (big tensors = more worth fusing / fewer = overhead).
++struct pk_size_stat { uint64_t count = 0; double sum_elems = 0.0; std::string sample; };
++static std::unordered_map<int, pk_size_stat> & pk_size_inv() {
++    static std::unordered_map<int, pk_size_stat> s;
++    return s;
++}
++// Why an iterated node did NOT get timed: keyed by reason -> (op -> count).
++//   noop:    hit the reshape/transpose/view/permute/none/empty early-out
++//   no_flag: GGML_TENSOR_FLAG_COMPUTE was not set
++//   fused:   ggml_cuda_try_fuse returned nonzero (handled by a fused kernel)
++static std::unordered_map<std::string, std::unordered_map<int, uint64_t>> & pk_skip_reason() {
++    static std::unordered_map<std::string, std::unordered_map<int, uint64_t>> s;
++    return s;
++}
++// Deferred per-node timing records: (op, start_event, end_event). We record a
++// CUDA event pair around each node WITHOUT syncing, then drain the whole list
++// with a single sync after the graph compute. This lets the GPU pipeline keep
++// overlapping kernels (a per-node cudaEventSynchronize would serialize them
++// and badly distort the relative breakdown).
++struct pk_node_event {
++    int       op;
++    cudaEvent_t ev0;
++    cudaEvent_t ev1;
++};
++static std::vector<pk_node_event> & pk_node_events() {
++    static std::vector<pk_node_event> v;
++    return v;
++}
++// Drain the deferred event list: sync the last event once, then read every
++// elapsed time and fold it into the per-op accumulator. Destroys the events.
++static void pk_drain_node_events() {
++    auto & evs = pk_node_events();
++    if (evs.empty()) return;
++    // Sync the last end event -> all earlier events are guaranteed complete.
++    CUDA_CHECK(cudaEventSynchronize(evs.back().ev1));
++    for (const auto & e : evs) {
++        float ms = 0.0f;
++        CUDA_CHECK(cudaEventElapsedTime(&ms, e.ev0, e.ev1));
++        auto & s = pk_perop_stats()[(int) e.op];
++        s.total_ms += (double) ms;
++        s.calls    += 1;
++        CUDA_CHECK(cudaEventDestroy(e.ev0));
++        CUDA_CHECK(cudaEventDestroy(e.ev1));
++    }
++    evs.clear();
++}
++static bool pk_perop_enabled() {
++    static const bool on = getenv("PARAKEET_PEROP_TIMING") != nullptr;
++    return on;
++}
++static void pk_perop_print_and_reset(const char * tag, int n_nodes, uint32_t uid) {
++    auto & stats = pk_perop_stats();
++    double grand = 0.0;
++    for (const auto & kv : stats) grand += kv.second.total_ms;
++    fprintf(stderr,
++        "[perop] === %s n_nodes=%d uid=%u measured_total=%.3fms ===\n",
++        tag, n_nodes, (unsigned)uid, grand);
++    if (grand <= 0.0) return;
++    std::vector<std::pair<int, pk_per_op_stat>> rows(stats.begin(), stats.end());
++    std::sort(rows.begin(), rows.end(),
++        [](const auto & a, const auto & b){ return a.second.total_ms > b.second.total_ms; });
++    fprintf(stderr, "[perop] %-22s %10s %8s %10s %7s\n",
++        "op", "total_ms", "calls", "ms/call", "pct");
++    for (const auto & r : rows) {
++        if (r.second.calls == 0) continue;
++        // Synthetic fused bucket key: 0x40000000 | lead_op.
++        std::string label;
++        if ((r.first & 0x40000000) != 0) {
++            label = std::string("FUSED_") + ggml_op_name((enum ggml_op)(r.first & ~0x40000000));
++        } else {
++            label = ggml_op_name((enum ggml_op) r.first);
++        }
++        fprintf(stderr, "[perop] %-22s %10.4f %8llu %10.5f %6.2f%%\n",
++            label.c_str(),
++            r.second.total_ms,
++            (unsigned long long) r.second.calls,
++            r.second.total_ms / (double) r.second.calls,
++            100.0 * r.second.total_ms / grand);
++    }
++    stats.clear();
++    // Dump the unguarded node tally (every node iterated, incl. skipped/fused).
++    auto & seen = pk_perop_seen();
++    std::vector<std::pair<int, uint64_t>> srows(seen.begin(), seen.end());
++    std::sort(srows.begin(), srows.end(),
++        [](const auto & a, const auto & b){ return a.second > b.second; });
++    uint64_t seen_total = 0;
++    for (const auto & r : srows) seen_total += r.second;
++    fprintf(stderr, "[perop] --- node distribution (all %llu iterated nodes) ---\n",
++        (unsigned long long) seen_total);
++    for (const auto & r : srows) {
++        fprintf(stderr, "[perop] %-22s seen=%llu\n",
++            ggml_op_name((enum ggml_op) r.first),
++            (unsigned long long) r.second);
++    }
++    seen.clear();
++    // Dump per-op size inventory (avg dst elements + sample shape per op type).
++    auto & inv = pk_size_inv();
++    fprintf(stderr, "[perop] --- per-op size inventory (count, avg dst elems, sample) ---\n");
++    for (const auto & kv : inv) {
++        double avg = kv.second.count ? (kv.second.sum_elems / (double) kv.second.count) : 0.0;
++        fprintf(stderr, "[perop] %-22s count=%-4llu avgElems=%.0f sample=%s\n",
++            ggml_op_name((enum ggml_op) kv.first),
++            (unsigned long long) kv.second.count, avg, kv.second.sample.c_str());
++    }
++    inv.clear();
++    // Dump skip reasons (why iterated nodes did not get timed).
++    auto & skips = pk_skip_reason();
++    fprintf(stderr, "[perop] --- skip reasons (why nodes seen but not timed) ---\n");
++    for (const auto & kv : skips) {
++        for (const auto & op_c : kv.second) {
++            fprintf(stderr, "[perop] %-10s %-22s count=%llu\n",
++                kv.first.c_str(),
++                ggml_op_name((enum ggml_op) op_c.first),
++                (unsigned long long) op_c.second);
++        }
++    }
++    skips.clear();
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -4320,6 +4525,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
++                if (pk_perop_enabled()) {
++                    pk_perop_seen()[(int) node->op] += 1;
++                    auto & si = pk_size_inv()[(int) node->op];
++                    si.count += 1;
++                    // ggml_nelements of dst; sample the first node's shape.
++                    int64_t nelems = ggml_nelements(node);
++                    si.sum_elems += (double) nelems;
++                    if (si.sample.empty()) {
++                        char buf[96];
++                        snprintf(buf, sizeof(buf), "[%lld,%lld,%lld,%lld] ne=%lld type=%d",
++                            (long long)node->ne[0], (long long)node->ne[1],
++                            (long long)node->ne[2], (long long)node->ne[3],
++                            (long long)nelems, (int)node->type);
++                        si.sample = buf;
++                    }
++                }
+                 if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+@@ -4359,16 +4580,40 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 prev_i = i;
+ 
+                 if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
++                    if (pk_perop_enabled()) pk_skip_reason()["noop"][(int) node->op] += 1;
+                     continue;
+                 }
+ 
+                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++                    if (pk_perop_enabled()) pk_skip_reason()["no_flag"][(int) node->op] += 1;
+                     continue;
+                 }
+ 
++                // Per-op-type GPU timing (parakeet). Only meaningful when CUDA
++                // graph capture is OFF (GGML_CUDA_DISABLE_GRAPHS=1), because
++                // events recorded during capture are dropped on graph replay.
++                // Events are recorded but NOT synced per-node; they are drained
++                // with a single sync after the whole graph compute (see
++                // pk_drain_node_events) so the GPU pipeline keeps overlapping.
++                const bool pk_time_node = pk_perop_enabled() && !use_cuda_graph;
++                cudaEvent_t pk_n0 = nullptr, pk_n1 = nullptr;
++                if (pk_time_node) {
++                    CUDA_CHECK(cudaEventCreate(&pk_n0));
++                    CUDA_CHECK(cudaEventCreate(&pk_n1));
++                    CUDA_CHECK(cudaEventRecord(pk_n0, cuda_ctx->stream()));
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (pk_time_node) {
++                        CUDA_CHECK(cudaEventRecord(pk_n1, cuda_ctx->stream()));
++                        // Attribute to a synthetic "FUSED_<lead_op>" bucket so
++                        // the fused-kernel cost (e.g. mul_mat+bias) is visible
++                        // separately from the naive per-op path.
++                        pk_node_events().push_back({ 0x40000000 | (int) node->op, pk_n0, pk_n1 });
++                        pk_skip_reason()["fused"][(int) node->op] += 1;
++                    }
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -4384,12 +4629,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #else
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+-
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                if (pk_time_node) {
++                    CUDA_CHECK(cudaEventRecord(pk_n1, cuda_ctx->stream()));
++                    pk_node_events().push_back({ (int) node->op, pk_n0, pk_n1 });
++                }
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+@@ -4414,6 +4662,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             }
+         } else {
+             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
++            if (pk_perop_enabled()) {
++                pk_drain_node_events();
++                pk_perop_print_and_reset("encoder_per_op",
++                    cgraph ? cgraph->n_nodes : 0,
++                    cgraph ? (unsigned) cgraph->uid : 0u);
++            }
+         }
+     }
+ 
+@@ -4425,8 +4679,36 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         if (cuda_graph_update_required) { // Update graph executable
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
++        // ---- Optional pure-GPU timing (parakeet instrumentation). ----
++        // Gated by PARAKEET_GPU_TIMING env var AND a node-count filter so only the
++        // large encoder graph (n_nodes > 500) is measured -- not the small per-step
++        // decode graphs. Records a CUDA event pair around the cudaGraphLaunch on the
++        // compute stream; the end event is then synchronized so cudaEventElapsedTime
++        // returns the EXACT GPU time the graph spent executing (host launch overhead
++        // excluded by construction -- cudaEventElapsedTime measures stream time
++        // between the two records). Off by default -> zero effect on the byte-exact
++        // steady state. See src/encoder.cpp + src/backend.cpp for the matching host
++        // wall-clock split.
++        static const bool pk_gpu_timing = getenv("PARAKEET_GPU_TIMING") != nullptr;
++        const bool pk_time_this = pk_gpu_timing && cgraph && cgraph->n_nodes > 500;
++        cudaEvent_t pk_ev0 = nullptr, pk_ev1 = nullptr;
++        if (pk_time_this) {
++            CUDA_CHECK(cudaEventCreate(&pk_ev0));
++            CUDA_CHECK(cudaEventCreate(&pk_ev1));
++            CUDA_CHECK(cudaEventRecord(pk_ev0, cuda_ctx->stream()));
++        }
+         // Launch graph
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
++        if (pk_time_this) {
++            CUDA_CHECK(cudaEventRecord(pk_ev1, cuda_ctx->stream()));
++            CUDA_CHECK(cudaEventSynchronize(pk_ev1));
++            float pk_ms = 0.0f;
++            CUDA_CHECK(cudaEventElapsedTime(&pk_ms, pk_ev0, pk_ev1));
++            fprintf(stderr, "[enc-timing] gpu_graph_ms=%.3f n_nodes=%d uid=%u\n",
++                    (double)pk_ms, cgraph->n_nodes, (unsigned)cgraph->uid);
++            CUDA_CHECK(cudaEventDestroy(pk_ev0));
++            CUDA_CHECK(cudaEventDestroy(pk_ev1));
++        }
+ #else
+         GGML_UNUSED(graph_key);
+         graph_evaluated_or_captured = true;
+diff --git a/src/ggml-cuda/norm.cu b/src/ggml-cuda/norm.cu
+index 09d9f3a7..6172a6fb 100644
+--- a/src/ggml-cuda/norm.cu
++++ b/src/ggml-cuda/norm.cu
+@@ -38,6 +38,99 @@ static __global__ void norm_f32(
+     }
+ }
+ 
++// Fused plain LayerNorm + affine: computes mean+var over ncols (IDENTICAL to
++// norm_f32 above -- same float2 reduction, same mean = sum/ncols,
++// var = sumsq/ncols - mean*mean, same inv_std = rsqrtf(var + eps)) and then
++// applies the per-row affine y = (x-mean)*inv_std[*gamma][+beta] in fp32 in the
++// SAME kernel. This is byte-identical to running GGML_OP_NORM followed by
++// GGML_OP_MUL(gamma) and optionally GGML_OP_ADD(beta) as separate ops, because
++// (a) the normalization reduction matches norm_f32 bit-for-bit, and (b) the
++// affine is a plain fp32 multiply/add on the already-normalized value, exactly
++// what the separate mul/add kernels would do. The mul/add tensor strides mirror
++// rms_norm_f32 (broadcast via fastmodulo over row/channel/sample/col).
++template <int block_size, bool do_multiply = false, bool do_add = false>
++static __global__ void layer_norm_f32(const float * x,
++                                      float *       dst,
++                                      const int     ncols,
++                                      const int64_t stride_row,
++                                      const int64_t stride_channel,
++                                      const int64_t stride_sample,
++                                      const float   eps,
++                                      const float * mul                  = nullptr,
++                                      const int64_t mul_stride_row       = 0,
++                                      const int64_t mul_stride_channel   = 0,
++                                      const int64_t mul_stride_sample    = 0,
++                                      const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
++                                      const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
++                                      const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
++                                      const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
++                                      const float * add                  = nullptr,
++                                      const int64_t add_stride_row       = 0,
++                                      const int64_t add_stride_channel   = 0,
++                                      const int64_t add_stride_sample    = 0,
++                                      const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
++                                      const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
++                                      const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
++                                      const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
++    const int nrows     = gridDim.x;
++    const int nchannels = gridDim.y;
++
++    const int row       = blockIdx.x;
++    const int channel   = blockIdx.y;
++    const int sample    = blockIdx.z;
++    const int tid       = threadIdx.x;
++
++    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
++
++    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
++    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
++
++    if constexpr (do_multiply) {
++        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
++        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
++        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
++        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
++    }
++
++    if constexpr (do_add) {
++        const int add_row     = fastmodulo(row, add_nrows_packed);
++        const int add_channel = fastmodulo(channel, add_nchannels_packed);
++        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
++        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
++    }
++
++    float2 mean_var = make_float2(0.0f, 0.0f);
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        mean_var.x += xi;
++        mean_var.y += xi * xi;
++    }
++
++    // sum up partial sums
++    extern __shared__ float2 s_sum2[];
++    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
++
++    const float mean = mean_var.x / ncols;
++    const float var = mean_var.y / ncols - mean * mean;
++    const float inv_std = rsqrtf(var + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        const float normed = (x[col] - mean) * inv_std;
++        if constexpr (do_multiply && do_add) {
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            const int add_col = fastmodulo(col, add_ncols_packed);
++            dst[col]          = normed * mul[mul_col] + add[add_col];
++        } else if constexpr (do_multiply) {
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            dst[col]          = normed * mul[mul_col];
++        } else {
++            dst[col] = normed;
++        }
++    }
++}
++
+ template <int block_size>
+ static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
+     // blockIdx.x: num_groups idx
+@@ -290,6 +383,94 @@ static void norm_f32_cuda(
+     }
+ }
+ 
++// Launch wrapper for the fused plain LayerNorm + affine. Mirrors
++// rms_norm_mul_f32_cuda: when mul == nullptr it just runs the un-fused norm
++// (identical to norm_f32_cuda); when add == nullptr it does NORM+MUL; else it
++// does NORM+MUL+ADD. Shared-mem sizing matches norm_f32_cuda (float2 reduce).
++static void layer_norm_mul_f32_cuda(const float *  x,
++                                    const float *  mul,
++                                    const float *  add,
++                                    float *        dst,
++                                    const int      ncols,
++                                    const int      nrows,
++                                    const int      nchannels,
++                                    const int      nsamples,
++                                    const int64_t  stride_row,
++                                    const int64_t  stride_channel,
++                                    const int64_t  stride_sample,
++                                    const int64_t  mul_stride_row,
++                                    const int64_t  mul_stride_channel,
++                                    const int64_t  mul_stride_sample,
++                                    const uint32_t mul_ncols,
++                                    const uint32_t mul_nrows,
++                                    const uint32_t mul_nchannels,
++                                    const uint32_t mul_nsamples,
++                                    const int64_t  add_stride_row,
++                                    const int64_t  add_stride_channel,
++                                    const int64_t  add_stride_sample,
++                                    const uint32_t add_ncols,
++                                    const uint32_t add_nrows,
++                                    const uint32_t add_nchannels,
++                                    const uint32_t add_nsamples,
++                                    const float    eps,
++                                    cudaStream_t   stream) {
++    const dim3 blocks_num(nrows, nchannels, nsamples);
++    if (mul == nullptr) {
++        norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
++        return;
++    }
++    if (add == nullptr) {
++        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
++        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
++        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
++        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
++        if (ncols < 1024) {
++            const dim3 block_dims(WARP_SIZE, 1, 1);
++            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 0, stream};
++            ggml_cuda_kernel_launch(layer_norm_f32<WARP_SIZE, true>, launch_params,
++                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                // underlying cudaLaunchKernelEx does not support default params
++                nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        } else {
++            const dim3 block_dims(1024, 1, 1);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream};
++            ggml_cuda_kernel_launch(layer_norm_f32<1024, true>, launch_params,
++                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
++                // underlying cudaLaunchKernelEx does not support default params
++                nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        }
++    } else {
++        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
++        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
++        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
++        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
++
++        const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
++        const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
++        const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
++        const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
++        if (ncols < 1024) {
++            const dim3 block_dims(WARP_SIZE, 1, 1);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
++            ggml_cuda_kernel_launch(layer_norm_f32<WARP_SIZE, true, true>, launch_params,
++                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
++                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
++                add_nchannels_packed, add_nsamples_packed);
++        } else {
++            const dim3 block_dims(1024, 1, 1);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream};
++            ggml_cuda_kernel_launch(layer_norm_f32<1024, true, true>, launch_params,
++                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
++                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
++                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
++                add_nchannels_packed, add_nsamples_packed);
++        }
++    }
++}
++
+ static void group_norm_f32_cuda(
+         const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
+     if (group_size < 1024) {
+@@ -456,6 +637,158 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+ }
+ 
++// Fused NORM+MUL: dst_node = norm(x) * gamma, written straight into mul_tensor's
++// buffer. Mirrors ggml_cuda_op_rms_norm_fused but dispatches layer_norm_mul_f32.
++void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
++    const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
++    float eps = 0.0f;
++
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    const float * src0_d = (const float *) norm_src->data;
++    const float * mul_d = nullptr;
++    const ggml_tensor * mul_src = nullptr;
++
++    if (mul_tensor->src[0] == dst) {
++        mul_d = (float *) mul_tensor->src[1]->data;
++        mul_src = mul_tensor->src[1];
++    } else if(mul_tensor->src[1] == dst) {
++        mul_d = (float *) mul_tensor->src[0]->data;
++        mul_src = mul_tensor->src[0];
++    } else {
++        GGML_ASSERT(false);
++    }
++
++    float * dst_d = (float *) mul_tensor->data;
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(norm_src->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int64_t ne00 = norm_src->ne[0];
++    const int64_t ne01 = norm_src->ne[1];
++    const int64_t ne02 = norm_src->ne[2];
++    const int64_t ne03 = norm_src->ne[3];
++
++    const size_t ts0 = ggml_type_size(norm_src->type);
++    GGML_ASSERT(norm_src->nb[0] == ts0);
++    const int64_t s01 = norm_src->nb[1] / ts0;
++    const int64_t s02 = norm_src->nb[2] / ts0;
++    const int64_t s03 = norm_src->nb[3] / ts0;
++
++    const size_t ts_mul = ggml_type_size(mul_src->type);
++    GGML_ASSERT(mul_src->nb[0] == ts_mul);
++    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
++    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
++    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
++
++    const int mul_ncols     = mul_src->ne[0];
++    const int mul_nrows     = mul_src->ne[1];
++    const int mul_nchannels = mul_src->ne[2];
++    const int mul_nsamples  = mul_src->ne[3];
++
++    layer_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
++                            ne00, ne01, ne02, ne03,
++                            /*s00*/ s01, s02, s03,
++                            /*mul_s00*/ mul_s01, mul_s02, mul_s03,
++                            mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
++                            /*add_s00*/ 0, 0, 0,
++                            0, 0, 0, 0,
++                            eps, stream);
++}
++
++// Fused NORM+MUL+ADD: dst_node = norm(x)*gamma + beta, written straight into
++// add_tensor's buffer. Mirrors ggml_cuda_op_rms_norm_fused_add.
++void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
++                                 ggml_tensor *               dst,
++                                 ggml_tensor *               mul_tensor,
++                                 ggml_tensor *               add_tensor) {
++    const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
++    float               eps      = 0.0f;
++
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    const float *       src0_d  = (const float *) norm_src->data;
++    const float *       mul_d   = nullptr;
++    const ggml_tensor * mul_src = nullptr;
++
++    if (mul_tensor->src[0] == dst) {
++        mul_d   = (float *) mul_tensor->src[1]->data;
++        mul_src = mul_tensor->src[1];
++    } else if (mul_tensor->src[1] == dst) {
++        mul_d   = (float *) mul_tensor->src[0]->data;
++        mul_src = mul_tensor->src[0];
++    } else {
++        GGML_ASSERT(false);
++    }
++
++    const float *       add_d   = nullptr;
++    const ggml_tensor * add_src = nullptr;
++
++    if (add_tensor->src[0] == mul_tensor) {
++        add_d   = (float *) add_tensor->src[1]->data;
++        add_src = add_tensor->src[1];
++    } else if (add_tensor->src[1] == mul_tensor) {
++        add_d   = (float *) add_tensor->src[0]->data;
++        add_src = add_tensor->src[0];
++    } else {
++        GGML_ASSERT(false);
++    }
++
++    float *      dst_d  = (float *) add_tensor->data;
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(norm_src->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
++    GGML_ASSERT(add_tensor->type == GGML_TYPE_F32);
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int64_t ne00 = norm_src->ne[0];
++    const int64_t ne01 = norm_src->ne[1];
++    const int64_t ne02 = norm_src->ne[2];
++    const int64_t ne03 = norm_src->ne[3];
++
++    const size_t ts0 = ggml_type_size(norm_src->type);
++    GGML_ASSERT(norm_src->nb[0] == ts0);
++    const int64_t s01 = norm_src->nb[1] / ts0;
++    const int64_t s02 = norm_src->nb[2] / ts0;
++    const int64_t s03 = norm_src->nb[3] / ts0;
++
++    const size_t ts_mul = ggml_type_size(mul_src->type);
++    GGML_ASSERT(mul_src->nb[0] == ts_mul);
++    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
++    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
++    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
++
++    const int mul_ncols     = mul_src->ne[0];
++    const int mul_nrows     = mul_src->ne[1];
++    const int mul_nchannels = mul_src->ne[2];
++    const int mul_nsamples  = mul_src->ne[3];
++
++    const size_t ts_add = ggml_type_size(add_src->type);
++    GGML_ASSERT(add_src->nb[0] == ts_add);
++    const int64_t add_s01 = add_src->nb[1] / ts_add;
++    const int64_t add_s02 = add_src->nb[2] / ts_add;
++    const int64_t add_s03 = add_src->nb[3] / ts_add;
++
++    const int add_ncols     = add_src->ne[0];
++    const int add_nrows     = add_src->ne[1];
++    const int add_nchannels = add_src->ne[2];
++    const int add_nsamples  = add_src->ne[3];
++
++    layer_norm_mul_f32_cuda(src0_d, mul_d, add_d, dst_d,
++                            ne00, ne01, ne02, ne03,
++                            /*s00*/ s01, s02, s03,
++                            /*mul_s00*/ mul_s01, mul_s02, mul_s03,
++                            mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
++                            /*add_s00*/ add_s01, add_s02, add_s03,
++                            add_ncols, add_nrows, add_nchannels, add_nsamples,
++                            eps, stream);
++}
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const float * src0_d = (const float *)src0->data;
+diff --git a/src/ggml-cuda/norm.cuh b/src/ggml-cuda/norm.cuh
+index a74f6376..e42c2b21 100644
+--- a/src/ggml-cuda/norm.cuh
++++ b/src/ggml-cuda/norm.cuh
+@@ -2,6 +2,17 @@
+ 
+ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// Fused plain LayerNorm (GGML_OP_NORM) + per-row affine: NORM+MUL[+ADD].
++// Mirror of the rms_norm_fused[_add] pair below; dispatches layer_norm_f32.
++// Byte-exact with running GGML_OP_NORM -> GGML_OP_MUL(gamma) -> GGML_OP_ADD(beta)
++// as separate nodes (same fp32 reduction and same fp32 affine).
++void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
++
++void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
++                                 ggml_tensor *               dst,
++                                 ggml_tensor *               mul_tensor,
++                                 ggml_tensor *               add_tensor);
++
+ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+-- 
+2.54.0
+

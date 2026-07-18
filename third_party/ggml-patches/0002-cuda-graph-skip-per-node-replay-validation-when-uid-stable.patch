@@ -1,0 +1,110 @@
+From 6e795b67e3c85faab4bb83b02b53adbcbe067b85 Mon Sep 17 00:00:00 2001
+From: Maximilian Scholz <dev.scholz@mailbox.org>
+Date: Fri, 17 Jul 2026 10:22:18 +0200
+Subject: [PATCH 2/2] cuda/graph: skip per-node replay validation when uid is
+ stable
+
+In ggml_backend_cuda_graph_compute, add a steady-state replay fast-path:
+when a graph has completed warmup AND its cgraph->uid is nonzero and
+matches the uid seen on the previous call, skip both the O(n_nodes)
+ggml_cuda_graph_check_compability walk and the O(n_nodes)
+ggml_cuda_graph_update_required node-property memcmp, going straight to
+use_cuda_graph=true.
+
+A replayed graph is provably unchanged in steady state: topology is pinned
+(the persistent cgraph carries a stable uid; an app rebuilds only on a
+shape change, which produces a NEW cgraph with a NEW uid), and the gallocr
+buffer is allocated once at build time and never moves. So neither per-node
+scan can discover anything new.
+
+This mirrors the existing uid fast-path inside ggml_cuda_graph_update_required
+(lines 3293-3298) and extends it to also elide the compatibility walk that
+runs before it. Steady-state replay now collapses to a single cudaGraphLaunch
+with zero per-node host work, matching PyTorch graph.replay().
+---
+ src/ggml-cuda/ggml-cuda.cu | 68 ++++++++++++++++++++++++++------------
+ 1 file changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index e25be359..c30cb336 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4467,28 +4467,54 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+     if (graph->is_enabled()) {
+-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+-        if (graph_compatible) {
+-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+-
+-            if (!graph->warmup_complete) {
+-                // Warmup: need at least 2 calls with no property change on the 2nd call
+-                if (!properties_changed) {
+-                    graph->warmup_complete = true;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = true;
+-                }
+-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+-            } else {
+-                // Post-warmup: normal CUDA graph operation
+-                if (properties_changed) {
+-                    // Properties changed - reset warmup, execute directly until stable again
+-                    graph->warmup_complete = false;
+-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
++        // Steady-state replay fast-path. When a graph has already completed
++        // warmup AND carries a stable nonzero uid that matches the uid we saw
++        // on the previous call, the graph is provably unchanged: its topology
++        // is pinned (the cgraph object is persistent across calls for a
++        // replayed graph, and the application only re-runs ggml_init /
++        // rebuild on a shape change, which allocates a NEW cgraph with a NEW
++        // uid), and the gallocr buffer backing it is allocated once at build
++        // time and never moves. So neither the O(n_nodes) compatibility walk
++        // (ggml_cuda_graph_check_compability) nor the O(n_nodes) node-property
++        // memcmp (ggml_cuda_graph_update_required) can discover anything new,
++        // and both are pure overhead on every replay. Skipping them collapses
++        // the steady-state host work to a single cudaGraphLaunch, matching
++        // PyTorch's graph.replay().
++        //
++        // Without this, a 2000+ node encoder graph pays ~70us of host walk per
++        // replay that the 60-node decode graph does not (the cost scales with
++        // node count). The uid match is the same condition the existing
++        // update_required fast-path relies on (see ggml_cuda_graph_update_required),
++        // extended here to also skip the compatibility walk that runs BEFORE it.
++        if (graph->warmup_complete &&
++            cgraph->uid != 0 &&
++            cgraph->uid == graph->uid) {
++            use_cuda_graph = true;
++            cuda_graph_update_required = graph->instance == nullptr;
++        } else {
++            const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
++            if (graph_compatible) {
++                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
++
++                if (!graph->warmup_complete) {
++                    // Warmup: need at least 2 calls with no property change on the 2nd call
++                    if (!properties_changed) {
++                        graph->warmup_complete = true;
++                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
++                        use_cuda_graph = true;
++                        cuda_graph_update_required = true;
++                    }
++                    // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+                 } else {
+-                    use_cuda_graph = true;
+-                    cuda_graph_update_required = graph->instance == nullptr;
++                    // Post-warmup: normal CUDA graph operation
++                    if (properties_changed) {
++                        // Properties changed - reset warmup, execute directly until stable again
++                        graph->warmup_complete = false;
++                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
++                    } else {
++                        use_cuda_graph = true;
++                        cuda_graph_update_required = graph->instance == nullptr;
++                    }
+                 }
+             }
+         }
+-- 
+2.54.0
+
