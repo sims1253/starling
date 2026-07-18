@@ -7,6 +7,7 @@
 
 #include "loader.hpp"
 #include "mel.hpp"
+#include "encoder.hpp"
 #include "config.hpp"
 
 #include "runtime/graph.hpp"
@@ -95,6 +96,52 @@ float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
     float* out = (float*)std::malloc(feats.size() * sizeof(float));
     if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
     std::memcpy(out, feats.data(), feats.size() * sizeof(float));
+    return out;
+}
+
+// Encoder entry: run the mel frontend + Conformer encoder + joint.enc projection
+// on `n` mono float32 PCM samples and return the projected encoder output as a
+// malloc'd [640, T'] feat-major float32 buffer the caller frees with
+// starling_ggml_free. Writes T' (the encoder length) to *out_T. Returns the
+// buffer or nullptr on error.
+//
+// Validation entry: forces the CPU path (the byte-identical reference). The
+// output layout matches the golden parakeet_tdt_*_enc.pt (T_enc rows x 640 cols)
+// reinterpreted feat-major (out[c*T' + t]).
+float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t n,
+                                      int * out_T, const char ** err_out) {
+    auto* c = static_cast<ParakeetCtx*>(handle);
+    if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    // 1. mel frontend -> feat-major [n_mels, T].
+    std::vector<float> feats;
+    int T_mel = 0;
+    try {
+        if (c->gmel) c->gmel->compute(pcm, (size_t)n, feats, T_mel);
+        else {
+            starling::ggml::parakeet::MelFrontend cpu(c->mel_const);
+            cpu.compute(pcm, (size_t)n, feats, T_mel);
+        }
+    } catch (const std::exception& e) {
+        if (err_out) *err_out = e.what();
+        return nullptr;
+    }
+    // 2. encoder + joint.enc projection -> feat-major [640, T'].
+    starling::ggml::parakeet::Encoder enc(*c->model);
+    std::vector<float> enc_out;
+    int Tp = 0;
+    try {
+        if (!enc.encode(feats, (int)c->mel_const.n_mels, T_mel, enc_out, Tp)) {
+            if (err_out) *err_out = "encoder graph failed";
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        if (err_out) *err_out = e.what();
+        return nullptr;
+    }
+    if (out_T) *out_T = Tp;
+    float* out = (float*)std::malloc(enc_out.size() * sizeof(float));
+    if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+    std::memcpy(out, enc_out.data(), enc_out.size() * sizeof(float));
     return out;
 }
 

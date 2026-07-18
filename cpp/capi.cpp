@@ -31,6 +31,8 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
 void   starling_ggml_parakeet_free(void * handle);
 float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
                                    int * out_T, const char ** err_out);
+float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t n,
+                                      int * out_T, const char ** err_out);
 // (moss entries declared in capi_moss.cpp, Phase 2)
 }
 
@@ -147,6 +149,22 @@ float * starling_ggml_parakeet_mel_pub(starling_ggml_ctx * ctx,
     const char* err = nullptr;
     float* r = starling_ggml_parakeet_mel(ctx->model, pcm, n, out_T, &err);
     if (!r) set_global_error(err ? err : "mel failed");
+    return r;
+}
+
+// Internal encoder-test passthrough (Phase 1b validation). Runs mel + encoder
+// + joint.enc projection and returns the [640, T'] feat-major f32 buffer. The
+// caller frees the buffer with starling_ggml_free.
+float * starling_ggml_parakeet_encode_pub(starling_ggml_ctx * ctx,
+                                          const float * pcm, int64_t n,
+                                          int * out_T) {
+    if (!ctx || ctx->kind != STARLING_GGML_PARAKEET_TDT) {
+        set_global_error("starling_ggml_parakeet_encode_pub: not a parakeet context");
+        return nullptr;
+    }
+    const char* err = nullptr;
+    float* r = starling_ggml_parakeet_encode(ctx->model, pcm, n, out_T, &err);
+    if (!r) set_global_error(err ? err : "encode failed");
     return r;
 }
 

@@ -28,6 +28,12 @@ struct Config {
     uint32_t d_model     = 0;          // 1024 (pre-projection)
     uint32_t n_layers    = 0;          // 24
     uint32_t pred_out    = 0;          // 640 (encoder_projector output)
+    uint32_t n_heads     = 0;          // 8 (attention heads)
+    uint32_t ff_dim      = 0;          // 4096 (feed-forward inner dim)
+    uint32_t conv_kernel = 0;          // 9 (conformer conv module kernel)
+    uint32_t subsampling_conv_channels = 0;  // 256 (subsampling conv width)
+    std::string conv_norm_type;        // "batch_norm" (offline) or "layer_norm"
+    bool xscaling = false;             // x *= sqrt(d_model) before layers (OFF)
 
     // ---- decoder (prediction net) ----
     uint32_t pred_hidden     = 0;      // 640

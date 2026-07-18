@@ -52,6 +52,15 @@ bool ParakeetModel::load(const char* gguf_path, std::string& err) {
     c.d_model       = kv_u32(ml, "parakeet.encoder.d_model", 1024);
     c.n_layers      = kv_u32(ml, "parakeet.encoder.n_layers", 24);
     c.pred_out      = kv_u32(ml, "parakeet.encoder.pred_out", 640);
+    c.n_heads       = kv_u32(ml, "parakeet.encoder.n_heads", 8);
+    c.ff_dim        = kv_u32(ml, "parakeet.encoder.ff_dim", 4096);
+    c.conv_kernel   = kv_u32(ml, "parakeet.encoder.conv_kernel", 9);
+    c.subsampling_conv_channels = kv_u32(ml, "parakeet.encoder.subsampling_conv_channels", 256);
+    c.conv_norm_type = kv_str(ml, "parakeet.encoder.conv_norm_type", "batch_norm");
+    {
+        int64_t xs = 0;
+        if (ml.kv_int("parakeet.encoder.xscaling", xs)) c.xscaling = (xs != 0);
+    }
 
     // ---- decoder ----
     c.pred_hidden     = kv_u32(ml, "parakeet.decoder.pred_hidden", 640);

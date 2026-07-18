@@ -168,8 +168,14 @@ void Backend::register_capture(ggml_tensor* t, std::vector<float>* dst) {
 bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                       std::vector<float>& out) {
     // 1. Build in a no_alloc=true metadata context.
+    //    ggml_graph_overhead_custom(kGraphSize, ...) reserves node/leaf slot
+    //    capacity matching the cgraph allocated below (ggml_new_graph_custom);
+    //    the default ggml_new_graph() caps at GGML_DEFAULT_GRAPH_SIZE (2048)
+    //    nodes, which the parakeet conformer encoder (24 layers, ~2400 ops)
+    //    overflows.
     struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead(),
+        /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize
+                         + ggml_graph_overhead_custom(kGraphSize, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -191,8 +197,9 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     if (!out_t) { ggml_free(ctx); return false; }
     ggml_set_output(out_t);  // mark output so the allocator keeps it
 
-    // 2. Build the cgraph.
-    ggml_cgraph* gf = ggml_new_graph(ctx);
+    // 2. Build the cgraph (capacity = kGraphSize; default 2048 is too small
+    //    for the full conformer encoder graph).
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, kGraphSize, false);
     ggml_build_forward_expand(gf, out_t);
 
     // 3. Allocate (persistent gallocr path, or sched fallback if some op is
@@ -310,7 +317,8 @@ ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
     struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead(),
+        /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize
+                         + ggml_graph_overhead_custom(kGraphSize, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -330,7 +338,7 @@ ReplayGraph::ReplayGraph(Backend& backend,
 
     if (out_) {
         ggml_set_output(out_);
-        gf_ = ggml_new_graph(ctx_);
+        gf_ = ggml_new_graph_custom(ctx_, kGraphSize, false);
         // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay memcmp
         // (patch 0002: "skip per-node replay validation when uid is stable").
         gf_->uid = ggml_graph_next_uid();
