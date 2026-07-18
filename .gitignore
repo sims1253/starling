@@ -41,3 +41,6 @@ comms.md
 
 # ggml patch-apply flock sentinel (scripts/apply_ggml_patches.sh)
 third_party/.ggml-patch.lock
+
+# CMake build output (libstarling_ggml)
+/build/
