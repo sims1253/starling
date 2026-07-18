@@ -8,6 +8,10 @@
 #include "loader.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
+#include "prediction.hpp"
+#include "joint.hpp"
+#include "tdt.hpp"
+#include "tokenizer.hpp"
 #include "config.hpp"
 
 #include "runtime/graph.hpp"
@@ -142,6 +146,115 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
     float* out = (float*)std::malloc(enc_out.size() * sizeof(float));
     if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
     std::memcpy(out, enc_out.data(), enc_out.size() * sizeof(float));
+    return out;
+}
+
+// Internal helper: run the FULL pipeline (mel + encoder + decode) on `n` mono
+// float32 PCM samples and return the emitted token id stream (INCLUDING blanks,
+// matching the golden parakeet_tdt_*_ids.pt). Used by both _decode (text) and
+// _decode_ids (id stream) entry points so they share one code path. Returns
+// true on success; sets *err_out on failure.
+//
+// The encoder Phase 1b output is feat-major [H, T'] (out[h*T' + t]); tdt_greedy
+// wants row-major [T', H] (enc_proj[t*H + h]), so we transpose here.
+static bool parakeet_full_decode(ParakeetCtx* c,
+                                 const float* pcm, int64_t n,
+                                 std::vector<int32_t>& ids,
+                                 const char** err_out) {
+    // 1. mel frontend -> feat-major [n_mels, T].
+    std::vector<float> feats;
+    int T_mel = 0;
+    try {
+        if (c->gmel) c->gmel->compute(pcm, (size_t)n, feats, T_mel);
+        else {
+            starling::ggml::parakeet::MelFrontend cpu(c->mel_const);
+            cpu.compute(pcm, (size_t)n, feats, T_mel);
+        }
+    } catch (const std::exception& e) {
+        if (err_out) *err_out = e.what();
+        return false;
+    }
+
+    // 2. encoder + joint.enc projection -> feat-major [640, T'].
+    starling::ggml::parakeet::Encoder enc(*c->model);
+    std::vector<float> enc_feat;
+    int Tp = 0;
+    try {
+        if (!enc.encode(feats, (int)c->mel_const.n_mels, T_mel, enc_feat, Tp)) {
+            if (err_out) *err_out = "encoder graph failed";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        if (err_out) *err_out = e.what();
+        return false;
+    }
+
+    const int H = enc.proj_dim();  // 640
+    // 3. The encoder Phase 1b output is row-major [T', H] (out[t*H + h]) — frame
+    //    t's projected vector is contiguous, exactly what tdt_greedy expects.
+    //    (encoder.hpp's "feat-major" comment is misleading; the buffer is
+    //    emitted row-major, verified byte-exact vs golden _enc.pt.)
+    std::vector<float>& enc_proj = enc_feat;
+    (void)H;
+
+    // 4. serial TDT greedy decode -> id stream (incl. blanks).
+    try {
+        starling::ggml::parakeet::PredictionNet pred(c->model->loader, c->model->config);
+        starling::ggml::parakeet::Joint joint(c->model->loader, c->model->config);
+        ids = starling::ggml::parakeet::tdt_greedy(
+            pred, joint, enc_proj, Tp, H,
+            c->model->config.tdt_durations,
+            (int)c->model->config.blank_id,
+            (int)c->model->config.max_symbols);
+    } catch (const std::exception& e) {
+        if (err_out) *err_out = e.what();
+        return false;
+    }
+    return true;
+}
+
+// Decode entry: run the full pipeline and return the detokenized UTF-8 text as
+// a malloc'd string the caller frees with starling_ggml_free_string. This IS
+// the transcribe path (Phase 1d wiring calls this).
+char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n,
+                                     const char ** err_out) {
+    auto* c = static_cast<ParakeetCtx*>(handle);
+    if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    std::vector<int32_t> ids;
+    if (!parakeet_full_decode(c, pcm, n, ids, err_out)) return nullptr;
+    std::string text = starling::ggml::parakeet::detokenize(
+        c->model->config.tokenizer_pieces, ids);
+    char* out = (char*)std::malloc(text.size() + 1);
+    if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+    std::memcpy(out, text.data(), text.size());
+    out[text.size()] = '\0';
+    return out;
+}
+
+// Decode-ids entry: run the full pipeline and return the emitted id stream
+// (INCLUDING blanks, matching golden parakeet_tdt_*_ids.pt) as a malloc'd int64
+// array the caller frees with starling_ggml_free. Writes the count to *out_n.
+//
+// The stream is prefixed with the blank id (decoder_start_token_id) to match
+// the format of HF `model.generate`'s `sequences` output (which the goldens
+// were saved from): the first element is the prepended start token, followed by
+// the greedy-decode emissions (blanks included). The detokenize path naturally
+// drops blanks (id 8192 is out of the [0, vocab_size) piece range), so this
+// leading blank contributes nothing to the text.
+int64_t * starling_ggml_parakeet_decode_ids(void * handle, const float * pcm, int64_t n,
+                                            int64_t * out_n, const char ** err_out) {
+    auto* c = static_cast<ParakeetCtx*>(handle);
+    if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    std::vector<int32_t> ids;
+    if (!parakeet_full_decode(c, pcm, n, ids, err_out)) return nullptr;
+    // Prepend the decoder_start_token_id (= blank_id) to match the golden
+    // stream format (HF model.generate's sequences[0] includes it).
+    const int64_t blank = (int64_t)c->model->config.blank_id;
+    if (out_n) *out_n = (int64_t)ids.size() + 1;
+    int64_t* out = (int64_t*)std::malloc(((size_t)ids.size() + 1) * sizeof(int64_t));
+    if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+    out[0] = blank;
+    for (size_t i = 0; i < ids.size(); ++i) out[i + 1] = (int64_t)ids[i];
     return out;
 }
 

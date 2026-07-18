@@ -11,6 +11,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <string>
 
@@ -33,6 +34,10 @@ float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
                                    int * out_T, const char ** err_out);
 float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t n,
                                       int * out_T, const char ** err_out);
+char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n,
+                                     const char ** err_out);
+int64_t * starling_ggml_parakeet_decode_ids(void * handle, const float * pcm, int64_t n,
+                                            int64_t * out_n, const char ** err_out);
 // (moss entries declared in capi_moss.cpp, Phase 2)
 }
 
@@ -121,11 +126,20 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
         return nullptr;
     }
     if (ctx->kind == STARLING_GGML_PARAKEET_TDT) {
-        // Full transcribe lands in Phase 1d (encoder 1b + decode 1c). For now
-        // it's a stub so the engine wiring can be validated end-to-end.
-        (void)samples; (void)n; (void)sample_rate;
-        set_global_error("starling_ggml_transcribe_pcm: parakeet decode not yet linked (Phase 1a: mel only)");
-        return nullptr;
+        // parakeet-tdt is a 16 kHz model; resample upstream if needed. We only
+        // warn (not fail) on a mismatch so a 16k caller passing sample_rate=0
+        // still works.
+        if (sample_rate != 0 && sample_rate != 16000) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                "starling_ggml_transcribe_pcm: parakeet expects 16 kHz, got %d", sample_rate);
+            set_global_error(msg);
+            return nullptr;
+        }
+        const char* err = nullptr;
+        char* r = starling_ggml_parakeet_decode(ctx->model, samples, n, &err);
+        if (!r) set_global_error(err ? err : "transcribe failed");
+        return r;
     }
     set_global_error("starling_ggml_transcribe_pcm: unsupported model kind");
     return nullptr;
@@ -165,6 +179,38 @@ float * starling_ggml_parakeet_encode_pub(starling_ggml_ctx * ctx,
     const char* err = nullptr;
     float* r = starling_ggml_parakeet_encode(ctx->model, pcm, n, out_T, &err);
     if (!r) set_global_error(err ? err : "encode failed");
+    return r;
+}
+
+// Internal decode passthrough (Phase 1c validation + the transcribe path). Runs
+// the FULL pipeline (mel + encoder + decode + detokenize) and returns a
+// malloc'd UTF-8 text string the caller frees with starling_ggml_free_string.
+char * starling_ggml_parakeet_decode_pub(starling_ggml_ctx * ctx,
+                                         const float * pcm, int64_t n) {
+    if (!ctx || ctx->kind != STARLING_GGML_PARAKEET_TDT) {
+        set_global_error("starling_ggml_parakeet_decode_pub: not a parakeet context");
+        return nullptr;
+    }
+    const char* err = nullptr;
+    char* r = starling_ggml_parakeet_decode(ctx->model, pcm, n, &err);
+    if (!r) set_global_error(err ? err : "decode failed");
+    return r;
+}
+
+// Internal decode-ids passthrough (Phase 1c validation). Runs the FULL pipeline
+// and returns the emitted id stream (INCLUDING blanks, matching golden
+// parakeet_tdt_*_ids.pt) as a malloc'd int64 array the caller frees with
+// starling_ggml_free. Writes the count to *out_n.
+int64_t * starling_ggml_parakeet_decode_ids_pub(starling_ggml_ctx * ctx,
+                                                const float * pcm, int64_t n,
+                                                int64_t * out_n) {
+    if (!ctx || ctx->kind != STARLING_GGML_PARAKEET_TDT) {
+        set_global_error("starling_ggml_parakeet_decode_ids_pub: not a parakeet context");
+        return nullptr;
+    }
+    const char* err = nullptr;
+    int64_t* r = starling_ggml_parakeet_decode_ids(ctx->model, pcm, n, out_n, &err);
+    if (!r) set_global_error(err ? err : "decode_ids failed");
     return r;
 }
 
