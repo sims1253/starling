@@ -18,6 +18,8 @@
 
 #include "ggml.h"
 
+#include "ggml-backend.h"  // ggml_backend_tensor_get (D2H, works for host + device tensors)
+
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -114,14 +116,25 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         // guard against F16 to be safe.
         float* sc = pool.alloc_f32(D);
         float* sh = pool.alloc_f32(D);
+        // Read a weight's f32 contents to host. Uses ggml_backend_tensor_get so
+        // it works whether the weight lives in host (CPU backend, mmap'd GGUF)
+        // or device (GPU backend, realized + uploaded) memory. A raw ->data
+        // memcpy would dereference a device pointer on GPU and segfault.
+        // (global_backend() is safe to call here: it only lazy-creates + locks
+        // briefly; it does NOT re-enter run_graph's g_backend_mutex because
+        // global_backend() is called BEFORE the build lambda runs and the
+        // backend already exists by this point.)
         auto read_f32 = [&](const std::string& nm, std::vector<float>& dst) {
             ggml_tensor* t = ml.tensor(nm.c_str());
+            if (!t) { dst.clear(); return; }
             size_t n = (size_t)ggml_nelements(t);
             dst.resize(n);
             if (t->type == GGML_TYPE_F32) {
-                std::memcpy(dst.data(), t->data, n * sizeof(float));
+                ggml_backend_tensor_get(t, dst.data(), 0, n * sizeof(float));
             } else if (t->type == GGML_TYPE_F16) {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t*)t->data, dst.data(), n);
+                std::vector<ggml_fp16_t> raw(n);
+                ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_fp16_t));
+                ggml_fp16_to_fp32_row(raw.data(), dst.data(), n);
             } else {
                 GGML_ASSERT(false && "unsupported batch_norm dtype");
             }

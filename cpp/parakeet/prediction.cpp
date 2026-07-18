@@ -17,6 +17,7 @@
 #include "runtime/model_loader.hpp"
 
 #include "ggml.h"
+#include "ggml-backend.h"  // ggml_backend_tensor_get (D2H, works for host + device)
 
 #include <cassert>
 #include <cstring>
@@ -34,15 +35,17 @@ PredState PredictionNet::zero_state() const {
 
 void PredictionNet::ensure_embed_host_() const {
     if (!embed_host_.empty()) return;
-    // Make sure the loader's weights have a backend buffer (idempotent) — on CPU
-    // the tensor's ->data is the GGUF mmap, directly readable.
+    // Make sure the loader's weights have a backend buffer (idempotent). On CPU
+    // the tensor's ->data is the GGUF mmap; on GPU it's a device pointer, so we
+    // MUST use ggml_backend_tensor_get (D2H) rather than a raw ->data memcpy.
     ensure_weights_realized(ml_);
     ggml_tensor* emb = ml_.tensor("decoder.prediction.embed.weight");
     assert(emb && "missing decoder.prediction.embed.weight");
     embed_host_.resize((size_t)vocab_p1_ * H_);
     // Read the (F32) embedding table row-major: ggml row i == embedding of id i,
-    // ne[0]=H fastest. Read ggml_nbytes bytes from ->data.
-    std::memcpy(embed_host_.data(), emb->data, (size_t)vocab_p1_ * H_ * sizeof(float));
+    // ne[0]=H fastest.
+    ggml_backend_tensor_get(emb, embed_host_.data(), 0,
+                            (size_t)vocab_p1_ * H_ * sizeof(float));
 }
 
 void PredictionNet::step(int32_t token_id, bool is_sos,
