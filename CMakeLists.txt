@@ -119,7 +119,9 @@ target_include_directories(starling_ggml PUBLIC
     ${CMAKE_SOURCE_DIR}/cpp/runtime
     ${CMAKE_SOURCE_DIR}/cpp/parakeet
     ${CMAKE_SOURCE_DIR}/cpp/moss
-    ${CMAKE_SOURCE_DIR}/third_party)  # for dr_wav.h
+    ${CMAKE_SOURCE_DIR}/third_party             # for dr_wav.h
+    ${CMAKE_SOURCE_DIR}/third_party/ggml/src    # for ggml-impl.h (cgraph uid field)
+    ${CMAKE_SOURCE_DIR}/third_party/ggml/include) # ggml.h etc.
 target_compile_definitions(starling_ggml PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
 target_link_libraries(starling_ggml PUBLIC ggml)
 

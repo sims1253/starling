@@ -15,6 +15,7 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct gguf_context;
 
 namespace starling::ggml {
 
@@ -80,7 +81,7 @@ public:
 
 private:
     ggml_context* ctx_ = nullptr;          // owns the weight tensors
-    void*         gguf_ctx_ = nullptr;      // the gguf_init_from_file handle
+    gguf_context* gguf_ctx_ = nullptr;      // the gguf_init_from_file handle
     std::unordered_map<std::string, ggml_tensor*> tensors_;
     std::unordered_map<std::string, GgufValue> kv_;
     std::string error_;

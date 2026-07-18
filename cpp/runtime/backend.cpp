@@ -18,6 +18,12 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+// ggml-impl.h is ggml's internal header (under third_party/ggml/src/); it's the
+// only place the cgraph `uid` field is declared. The public ggml.h leaves
+// ggml_cgraph opaque. The uid lets ggml-cuda skip its O(n_nodes) per-replay
+// memcmp (patch 0002) — load-bearing for ReplayGraph's steady-state perf.
+#include "ggml-impl.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -56,9 +62,6 @@ thread_local std::vector<PendingCapture>* t_pending_captures = nullptr;
 
 constexpr size_t kGraphSize = 16384;  // max nodes in one ggml_cgraph
 
-// Stable-uid source for ReplayGraph cgraphs (see backend.hpp header comment).
-std::atomic<uint64_t> g_replay_uid{1};
-
 } // namespace
 
 // --------------------------------------------------------------------------- //
@@ -94,14 +97,11 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
         }
     }
     if (!chosen) {
-        // Auto: first GPU/IGPU, else CPU.
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
-            ggml_backend_dev_type t = ggml_backend_dev_type(d);
-            if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                chosen = d; break;
-            }
-        }
+        // Auto: prefer a GPU/IGPU, else CPU (ggml's registry decides what's
+        // compiled in — CUDA/Metal/Vulkan/HIP all register here).
+        chosen = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!chosen) chosen = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        if (!chosen) chosen = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
@@ -124,7 +124,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
         ggml_backend_cpu_set_n_threads(impl_->backend, n_threads_);
     }
     // Persistent gallocr (shared by one-shot computes; ReplayGraph has its own).
-    impl_->galloc = ggml_gallocr_new(impl_->backend);
+    impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
 }
 
 Backend::~Backend() {
@@ -199,7 +199,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     }
     bool ok = false;
     if (!need_sched) {
-        if (!impl_->galloc) impl_->galloc = ggml_gallocr_new(impl_->backend);
+        if (!impl_->galloc) impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
         if (ggml_gallocr_alloc_graph(impl_->galloc, gf)) {
             // 4. Push host inputs AFTER alloc (->data was NULL until now).
             for (const auto& in : pin)
@@ -209,8 +209,12 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         }
     } else {
         if (!impl_->sched) {
-            impl_->sched = ggml_backend_sched_new(&impl_->backend, &impl_->cpu_backend,
-                                                  1, ggml_tensor_overhead()*kGraphSize);
+            ggml_backend_buffer_type_t bufs[2] = {
+                ggml_backend_get_default_buffer_type(impl_->backend),
+                ggml_backend_get_default_buffer_type(impl_->cpu_backend)};
+            impl_->sched = ggml_backend_sched_new(&impl_->backend, bufs, 2,
+                                                  ggml_tensor_overhead()*kGraphSize,
+                                                  /*parallel=*/false, /*op_offload=*/true);
         }
         ggml_backend_sched_reset(impl_->sched);
         if (ggml_backend_sched_alloc_graph(impl_->sched, gf)) {
@@ -321,7 +325,7 @@ ReplayGraph::ReplayGraph(Backend& backend,
         gf_ = ggml_new_graph(ctx_);
         // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay memcmp
         // (patch 0002: "skip per-node replay validation when uid is stable").
-        gf_->uid = g_replay_uid.fetch_add(1);
+        gf_->uid = ggml_graph_next_uid();
         ggml_build_forward_expand(gf_, out_);
         // Record inputs + captures in registration order (kept across calls).
         for (const auto& in : pin) {
@@ -349,14 +353,18 @@ bool ReplayGraph::alloc_internal() {
     if (!need_sched_) {
         // PRIVATE gallocr per ReplayGraph: a shared one would invalidate other
         // graphs' device pointers when a larger graph reallocs its buffer.
-        if (!galloc_) galloc_ = ggml_gallocr_new(backend_.handle());
+        if (!galloc_) galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_.handle()));
         return ggml_gallocr_alloc_graph(galloc_, gf_);
     }
     // sched path (rare; uses the Backend's shared sched).
     if (!backend_.impl_->sched) {
         ggml_backend_t backends[2] = {backend_.handle(), backend_.impl_->cpu_backend};
-        backend_.impl_->sched = ggml_backend_sched_new(backends, nullptr, 2,
-                                                       ggml_tensor_overhead()*kGraphSize);
+        ggml_backend_buffer_type_t bufs[2] = {
+            ggml_backend_get_default_buffer_type(backend_.handle()),
+            ggml_backend_get_default_buffer_type(backend_.impl_->cpu_backend)};
+        backend_.impl_->sched = ggml_backend_sched_new(backends, bufs, 2,
+                                                       ggml_tensor_overhead()*kGraphSize,
+                                                       /*parallel=*/false, /*op_offload=*/true);
     }
     ggml_backend_sched_reset(backend_.impl_->sched);
     return ggml_backend_sched_alloc_graph(backend_.impl_->sched, gf_);

@@ -28,21 +28,27 @@ ModelLoader::~ModelLoader() {
 }
 
 bool ModelLoader::load(const char* path) {
-    gguf_ctx_ = gguf_init_from_file(path, &ctx_);
+    // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the weight
+    // tensors into a freshly-created ggml_context (zero-copy mmap-backed).
+    gguf_init_params params = {
+        /*.no_alloc =*/ false,
+        /*.ctx      =*/ &ctx_,
+    };
+    gguf_ctx_ = gguf_init_from_file(path, params);
     if (!gguf_ctx_) {
         error_ = std::string("failed to open GGUF: ") + path;
         return false;
     }
     // Map every tensor name -> tensor*.
-    const int n_tensors = gguf_get_n_tensors(gguf_ctx_);
-    for (int i = 0; i < n_tensors; ++i) {
+    const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx_);
+    for (int64_t i = 0; i < n_tensors; ++i) {
         const char* name = gguf_get_tensor_name(gguf_ctx_, i);
-        ggml_tensor* t = ggml_get_tensor(ctx_, name);
+        ggml_tensor* t = name ? ggml_get_tensor(ctx_, name) : nullptr;
         if (name && t) tensors_[name] = t;
     }
     // Read KV metadata.
-    const int n_kv = gguf_get_n_kv(gguf_ctx_);
-    for (int i = 0; i < n_kv; ++i) {
+    const int64_t n_kv = gguf_get_n_kv(gguf_ctx_);
+    for (int64_t i = 0; i < n_kv; ++i) {
         const char* key = gguf_get_key(gguf_ctx_, i);
         const enum gguf_type t = gguf_get_kv_type(gguf_ctx_, i);
         if (!key) continue;
@@ -65,17 +71,31 @@ bool ModelLoader::load(const char* path) {
                 break;
             case GGUF_TYPE_ARRAY: {
                 const enum gguf_type at = gguf_get_arr_type(gguf_ctx_, i);
-                const int n = gguf_get_arr_n(gguf_ctx_, i);
+                const size_t n = gguf_get_arr_n(gguf_ctx_, i);
                 if (at == GGUF_TYPE_STRING) {
                     v.kind = GgufValue::Kind::k_arr_str;
                     v.arr_s.reserve(n);
-                    for (int j = 0; j < n; ++j)
+                    for (size_t j = 0; j < n; ++j)
                         v.arr_s.emplace_back(gguf_get_arr_str(gguf_ctx_, i, j));
                 } else {
+                    // Integer array: gguf_get_arr_data returns the raw buffer;
+                    // interpret according to `at`.
                     v.kind = GgufValue::Kind::k_arr_int;
-                    v.arr_i.reserve(n);
-                    for (int j = 0; j < n; ++j)
-                        v.arr_i.push_back(gguf_get_arr_data(gguf_ctx_, i, j));
+                    const void* raw = gguf_get_arr_data(gguf_ctx_, i);
+                    v.arr_i.resize(n);
+                    for (size_t j = 0; j < n; ++j) {
+                        switch (at) {
+                            case GGUF_TYPE_INT8:  v.arr_i[j] = ((const int8_t*)raw)[j]; break;
+                            case GGUF_TYPE_UINT8: v.arr_i[j] = ((const uint8_t*)raw)[j]; break;
+                            case GGUF_TYPE_INT16: v.arr_i[j] = ((const int16_t*)raw)[j]; break;
+                            case GGUF_TYPE_UINT16:v.arr_i[j] = ((const uint16_t*)raw)[j]; break;
+                            case GGUF_TYPE_INT32: v.arr_i[j] = ((const int32_t*)raw)[j]; break;
+                            case GGUF_TYPE_UINT32:v.arr_i[j] = ((const uint32_t*)raw)[j]; break;
+                            case GGUF_TYPE_INT64: v.arr_i[j] = ((const int64_t*)raw)[j]; break;
+                            case GGUF_TYPE_UINT64:v.arr_i[j] = ((const uint64_t*)raw)[j]; break;
+                            default: v.arr_i[j] = 0; break;
+                        }
+                    }
                 }
                 break;
             }
@@ -127,12 +147,14 @@ std::vector<std::string> ModelLoader::tensor_names() const {
 
 bool ModelLoader::realize_weights(Backend& backend) {
     if (realized_) return true;
+    if (!ctx_) { error_ = "realize_weights: no loaded context"; return false; }
     // On CPU: borrow the loader's memory-backed context zero-copy.
     // On GPU: mirror each weight into a device-side context + upload.
     if (!backend.is_gpu()) {
-        if (!ctx_) { error_ = "realize_weights: no loaded context"; return false; }
-        ggml_backend_buffer_t buf =
-            ggml_backend_cpu_buffer_from_ptr(ctx_, (void*)ctx_->mem_buffer, ctx_->mem_size);
+        // Borrow the loader's memory-backed ggml_context zero-copy. The public
+        // accessors ggml_get_mem_buffer / ggml_get_mem_size give the mmap'd region.
+        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(
+            ggml_get_mem_buffer(ctx_), ggml_get_mem_size(ctx_));
         // Point each tensor's ->buffer at the borrowed buffer.
         for (const auto& kv : tensors_) {
             ggml_tensor* t = kv.second;
@@ -147,24 +169,24 @@ bool ModelLoader::realize_weights(Backend& backend) {
             /*.no_alloc   =*/ true,
         };
         ggml_context* dev_ctx = ggml_init(params);
-        for (const auto& kv : tensors_) {
+        // Snapshot the CPU tensors (name -> src data) before repointing the map.
+        std::vector<std::pair<std::string, ggml_tensor*>> cpu_tensors;
+        cpu_tensors.reserve(tensors_.size());
+        for (const auto& kv : tensors_) cpu_tensors.emplace_back(kv.first, kv.second);
+        // Repoint the name map at device tensors.
+        for (const auto& kv : cpu_tensors) {
             ggml_tensor* src = kv.second;
             ggml_tensor* dst = ggml_dup_tensor(dev_ctx, src);
             ggml_set_name(dst, src->name);
-            // Repoint the name map at the device tensor.
             tensors_[kv.first] = dst;
-            (void)src;
         }
         ggml_backend_buffer_t dev_buf = ggml_backend_alloc_ctx_tensors(dev_ctx, backend.handle());
         if (!dev_buf) { error_ = "realize_weights: device alloc failed"; return false; }
-        // Upload each tensor's bytes. Re-iterate the ORIGINAL map values via the
-        // device tensors' names by fetching from the (now-updated) map for src.
-        // NOTE: src pointers were the mmap'd CPU tensors; they're still valid
-        // (we haven't freed ctx_). We capture them before repointing above by
-        // walking ctx_'s tensor list.
-        for (ggml_tensor* t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
-            ggml_tensor* dst = tensor(t->name);
-            if (dst) ggml_backend_tensor_set(dst, t->data, 0, ggml_nbytes(t));
+        // Upload each tensor's bytes from the original CPU mmap'd data.
+        for (const auto& kv : cpu_tensors) {
+            ggml_tensor* dst = tensor(kv.first.c_str());
+            if (dst && kv.second->data)
+                ggml_backend_tensor_set(dst, kv.second->data, 0, ggml_nbytes(kv.second));
         }
     }
     realized_ = true;

@@ -16,19 +16,17 @@ namespace starling::ggml {
 
 bool read_wav(const char* path, std::vector<float>& out_pcm,
               int& out_sample_rate, std::string& err) {
-    unsigned channels = 0, sample_rate = 0;
-    drwav_uint64 frames = 0;
-    drwav* wav = drwav_open_file(path);
-    if (!wav) {
+    drwav wav;
+    if (!drwav_init_file(&wav, path, nullptr)) {
         err = std::string("failed to open WAV: ") + path;
         return false;
     }
-    channels = wav->channels;
-    sample_rate = wav->sampleRate;
-    frames = wav->totalPCMFrameCount;
-    std::vector<float> interleaved(frames * channels);
-    size_t got = drwav_read_pcm_frames_f32(wav, frames, interleaved.data());
-    drwav_close(wav);
+    unsigned channels = wav.channels;
+    unsigned sample_rate = wav.sampleRate;
+    drwav_uint64 frames = wav.totalPCMFrameCount;
+    std::vector<float> interleaved((size_t)frames * channels);
+    size_t got = drwav_read_pcm_frames_f32(&wav, frames, interleaved.data());
+    drwav_uninit(&wav);
     if (got == 0) { err = "WAV read returned 0 frames"; return false; }
     // Average channels -> mono.
     out_pcm.resize(got);

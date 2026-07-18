@@ -9,6 +9,8 @@
 
 #include "starling_ggml.h"
 
+#include "runtime/graph.hpp"  // global_backend, shutdown_backend, shutting_down
+
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -72,9 +74,10 @@ void starling_ggml_free(starling_ggml_ctx * /*ctx*/) {
 }
 
 void starling_ggml_shutdown(void) {
-    // Phase 0: the global backend doesn't exist yet (no model loads). The real
-    // teardown (clear_decode_caches -> backend.reset -> flag, registered via
-    // std::atexit) lands with the runtime in Phase 0c.
+    // Delegates to the runtime's shutdown (clears decode-graph caches, resets
+    // the global Backend while the CUDA driver is still alive, idempotent).
+    // Also auto-registered via std::atexit on first backend creation.
+    starling::ggml::shutdown_backend();
 }
 
 const char * starling_ggml_last_error(starling_ggml_ctx * /*ctx*/) {
