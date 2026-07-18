@@ -1249,6 +1249,69 @@ class GgmlParakeet(Engine):
         return out.get("text", "").strip()
 
 
+# Model path + env for Starling's OWN in-tree ggml engine (libstarling_ggml).
+# The .so is built from cpp/ (cmake -B build -DSTARLING_GGML_CUDA=ON
+# -DSTARLING_GGML_SHARED=ON) and discovered by src/starling/_ggml/_native.py via
+# STARLING_GGML_LIB / build dir. Override with STARLING_GGML_PARAKEET_MODEL.
+STARLING_GGML_PARAKEET_MODEL = Path(os.environ.get(
+    "STARLING_GGML_PARAKEET_MODEL",
+    str(CRISPASR_MODELS / "tdt-0.6b-v3-f16.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlParakeet(Engine):
+    """Starling's OWN in-tree ggml engine (libstarling_ggml).
+
+    Drives Starling's first-party C++/ggml implementation of parakeet-tdt
+    (built from cpp/, the universal-backend sibling to the PyTorch peak path)
+    in-process via ctypes. Byte-exact vs the golden on short/medium/long (the
+    text gate). This is the long-term replacement for :class:`GgmlParakeet`
+    (which drives mudler's external parakeet.cpp); both coexist during the
+    transition so they can be A/B'd.
+
+    OPTIONAL: the engine activates only if libstarling_ggml loads + the model
+    is present. The pure-Python Starling install keeps working when the C++ is
+    unbuilt (starling._ggml.available() returns False).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "parakeet", supports_batch=False)
+        self._model = None  # starling._ggml.GgmlModel
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_PARAKEET_MODEL.exists()
+        except Exception:
+            return False
+
+    # -- lifecycle ---------------------------------------------------------
+    def _load(self) -> None:
+        from starling._ggml import GgmlModel, PARAKEET_TDT
+        self._model = GgmlModel(PARAKEET_TDT, str(STARLING_GGML_PARAKEET_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    # -- inference ---------------------------------------------------------
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        text = self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000)
+        return text.strip()
+
+
+def _starling_ggml_parakeet_keys() -> list[str]:
+    """Starling's in-tree ggml engine (libstarling_ggml). Skipped if the .so
+    isn't built or the model is absent."""
+    if StarlingGgmlParakeet().available:
+        return ["starling-ggml-parakeet"]
+    return []
+
+
 class GgmlMoss(Engine):
     """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend.
 
@@ -1599,7 +1662,8 @@ def available_keys() -> list[str]:
     return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys()
-            + _ggml_parakeet_keys() + _ggml_moss_keys())
+            + _ggml_parakeet_keys() + _ggml_moss_keys()
+            + _starling_ggml_parakeet_keys())
 
 
 def build_engines(
@@ -1638,6 +1702,11 @@ def build_engines(
                 chosen[mdl].append(GgmlParakeet())
             elif mdl == "moss":
                 chosen[mdl].append(GgmlMoss())
+        elif key.startswith("starling-ggml-"):
+            # Starling's OWN in-tree ggml engine (libstarling_ggml). Currently
+            # parakeet only (moss in Phase 2).
+            if mdl == "parakeet":
+                chosen[mdl].append(StarlingGgmlParakeet())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,
