@@ -73,6 +73,18 @@ if [[ -z "${PARAKEET_PATCH_FLOCK_HELD:-}" ]] && command -v flock >/dev/null 2>&1
     fi
 fi
 
+# Fast path: if the LAST patch in the ordered series reverse-checks, the
+# whole series is in place (patches are a strict sequence; the tail cannot be
+# present without its predecessors). This is also the only reliable per-patch
+# idempotency signal for overlapping series: a later patch can touch context
+# lines of an earlier patch's hunks, which makes the earlier patch's
+# standalone reverse-check fail even though it is applied.
+last_patch="${PATCHES[${#PATCHES[@]}-1]}"
+if git apply --check --reverse "${last_patch}" >/dev/null 2>&1; then
+    echo "ggml patches: series already applied (tail $(basename "${last_patch}") present; nothing to do)"
+    exit 0
+fi
+
 for patch in "${PATCHES[@]}"; do
     name="$(basename "${patch}")"
 
@@ -95,6 +107,21 @@ for patch in "${PATCHES[@]}"; do
         applied=$((applied + 1))
         continue
     fi
+
+    # Buried patch? A later series patch already present can invalidate this
+    # patch's forward and reverse context. If any later patch reverse-checks,
+    # treat this one as applied underneath it.
+    buried=0
+    for later in "${PATCHES[@]}"; do
+        [[ "${later}" > "${patch}" ]] || continue
+        if git apply --check --reverse "${later}" >/dev/null 2>&1; then
+            echo "ggml patches: skipping ${name} (buried under $(basename "${later}"))"
+            skipped=$((skipped + 1))
+            buried=1
+            break
+        fi
+    done
+    [[ ${buried} -eq 1 ]] && continue
 
     # Neither forward-applicable nor already-applied: bail with diagnostics.
     echo "error: cannot apply ${name}" >&2
