@@ -201,6 +201,9 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     //    for the full conformer encoder graph).
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, kGraphSize, false);
     ggml_build_forward_expand(gf, out_t);
+    // Captured intermediates are dead branches of out_t's tree: expand the
+    // graph over them too so they're computed + allocated for readback.
+    for (const auto& c : pcap) ggml_build_forward_expand(gf, c.t);
 
     // 3. Allocate (persistent gallocr path, or sched fallback if some op is
     //    unsupported by the primary backend).
@@ -217,8 +220,11 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         if (!impl_->galloc) impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
         if (ggml_gallocr_alloc_graph(impl_->galloc, gf)) {
             // 4. Push host inputs AFTER alloc (->data was NULL until now).
+            //    Inputs not reachable from the expanded graph get no
+            //    allocation (data == NULL); skip those (diagnostic early-
+            //    return graphs legitimately drop inputs).
             for (const auto& in : pin)
-                ggml_backend_tensor_set(in.t, in.host, 0, in.nbytes);
+                if (in.t->data) ggml_backend_tensor_set(in.t, in.host, 0, in.nbytes);
             // 5. Compute.
             ok = (ggml_backend_graph_compute(impl_->backend, gf) == GGML_STATUS_SUCCESS);
         }
@@ -234,7 +240,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         ggml_backend_sched_reset(impl_->sched);
         if (ggml_backend_sched_alloc_graph(impl_->sched, gf)) {
             for (const auto& in : pin)
-                ggml_backend_tensor_set(in.t, in.host, 0, in.nbytes);
+                if (in.t->data) ggml_backend_tensor_set(in.t, in.host, 0, in.nbytes);
             ok = (ggml_backend_sched_graph_compute(impl_->sched, gf) == GGML_STATUS_SUCCESS);
         }
     }
@@ -343,6 +349,7 @@ ReplayGraph::ReplayGraph(Backend& backend,
         // (patch 0002: "skip per-node replay validation when uid is stable").
         gf_->uid = ggml_graph_next_uid();
         ggml_build_forward_expand(gf_, out_);
+        for (const auto& c : pcap) ggml_build_forward_expand(gf_, c.t);
         // Record inputs + captures in registration order (kept across calls).
         for (const auto& in : pin) {
             inputs_.push_back(in.t);

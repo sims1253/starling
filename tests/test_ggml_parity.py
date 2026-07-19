@@ -43,11 +43,6 @@ def _ggml_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _ggml_available(),
-    reason="parakeet-server binary or model not built (build it in the "
-           "parakeet.cpp repo, or set GGML_PARAKEET_SERVER / GGML_PARAKEET_MODEL)",
-)
 
 
 @pytest.fixture(scope="module")
@@ -61,6 +56,8 @@ def ggml_engine():
     atexit crash must be fully isolated, set GGML_PARAKEET_NATIVE=0 to use the
     HTTP-server path (ggml runs in a child process).
     """
+    if not _ggml_available():
+        pytest.skip("parakeet-server binary or model unavailable")
     from engines import GgmlParakeet
 
     eng = GgmlParakeet()
@@ -69,6 +66,7 @@ def ggml_engine():
     eng.close()
 
 
+@pytest.mark.skipif(not _ggml_available(), reason="parakeet-server binary or model unavailable")
 @pytest.mark.parametrize("name", ["short", "medium", "long"])
 def test_ggml_parakeet_byte_exact(ggml_engine, name: str) -> None:
     """The ggml engine transcript must match the golden BYTE-FOR-BYTE.
@@ -102,10 +100,9 @@ def _ggml_moss_available() -> bool:
 
 
 moss = pytest.mark.skipif(
-    not _ggml_moss_available(),
-    reason="CrispASR binary (with moss-transcribe backend) or F16 Moss GGUF not "
-           "present (build CrispASR locally + download cstr/MOSS-Transcribe-..."
-           "-2B-GGUF, or set GGML_MOSS_BIN / GGML_MOSS_MODEL)",
+    not (_ggml_available() and _ggml_moss_available()),
+    reason="parakeet-server or CrispASR MOSS binary/model unavailable (preserves "
+           "the historical external-engine module gate)",
 )
 
 
@@ -113,8 +110,8 @@ moss = pytest.mark.skipif(
 def ggml_moss_engine():
     """One CrispASR moss-transcribe engine for the whole module (skipped if
     unavailable)."""
-    if not _ggml_moss_available():
-        pytest.skip("CrispASR moss-transcribe binary / F16 Moss GGUF not present")
+    if not (_ggml_available() and _ggml_moss_available()):
+        pytest.skip("historical external-engine gate: parakeet/CrispASR MOSS unavailable")
     from engines import GgmlMoss
 
     eng = GgmlMoss()
@@ -201,4 +198,41 @@ def test_ggml_moss_near_exact(ggml_moss_engine, name: str) -> None:
     assert cer < 0.10, (
         f"moss ggml CER too high on {name} (cer={cer:.3f}):\n"
         f"  golden: {g_n[:120]!r}\n  ggml:   {o_n[:120]!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# In-tree MOSS C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_moss_available() -> bool:
+    try:
+        from engines import StarlingGgmlMoss
+        return StarlingGgmlMoss().available
+    except Exception:
+        return False
+
+@pytest.fixture(scope="module")
+def starling_ggml_moss_engine():
+    if not _starling_ggml_moss_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_MOSS_MODEL unavailable")
+    from engines import StarlingGgmlMoss
+    engine = StarlingGgmlMoss()
+    engine.load()
+    yield engine
+    engine.close()
+
+@pytest.mark.skipif(not _starling_ggml_moss_available(),
+                    reason="in-tree libstarling_ggml or MOSS GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_moss_text_parity(starling_ggml_moss_engine, name: str) -> None:
+    """The in-tree C API returns the golden MOSS transcript exactly.
+
+    This deliberately has no CrispASR tolerance: it gates Starling's own
+    loader → mel → encoder → adapter → prompt → LLM → detokenizer pipeline.
+    """
+    golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text().rstrip()
+    out = starling_ggml_moss_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree MOSS transcript mismatch on {name}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
     )

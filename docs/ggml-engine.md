@@ -1,19 +1,21 @@
 # ggml engine — universal backend ASR for Starling
 
-The `ggml-parakeet` and `ggml-moss` engines bring a second, **universal-backend**
-transcription path to Starling alongside the PyTorch + CUDA-graph peak engine.
-`ggml-parakeet` runs mudler's `parakeet.cpp` (a ggml port of
-`nvidia/parakeet-tdt-0.6b-v3`) in-process via the parakeet C API; `ggml-moss`
-runs CrispASR's `moss-transcribe` backend (a ggml port of
-`MOSS-Transcribe-preview-2B`). Both reach any backend ggml supports (NVIDIA
-CUDA, AMD via HIP, Apple Metal, Intel/AMD/ARM via Vulkan, CPU) from one codebase.
+Starling's in-tree `starling-ggml-parakeet` and `starling-ggml-moss` engines
+bring a second, **universal-backend** transcription path alongside the PyTorch
++ CUDA-graph peak engine. Both are model-tagged entry points in the shared
+`libstarling_ggml` C API and reach any backend ggml supports (NVIDIA CUDA, AMD
+via HIP, Apple Metal, Intel/AMD/ARM via Vulkan, CPU) from one codebase. Legacy
+external `GgmlParakeet` and `GgmlMoss` wrappers remain only for temporary A/B
+comparison and are deprecated pending Phase-4 removal.
 
 The PyTorch engine remains the NVIDIA peak path (CUDAGraph + Triton fused
 kernels, tuned on sm_120). The ggml engines are dispatched alongside it: same
-fixtures, same golden contract, portable. **Correctness:** parakeet-tdt is
-byte-exact on all fixtures; moss is byte-exact on short and near-exact on
-medium/long (an inherent f16-KV-cache vs bf16-eager numeric divergence at
-low-confidence boundaries — documented below, not a bug). **Speed:** parakeet-tdt
+fixtures, same golden contract, portable. **Correctness:** parakeet-tdt and the
+in-tree MOSS engine return the exact canonical eager token IDs/text on all
+fixtures. MOSS logits retain documented bf16 ULP differences, so its component
+gates use max-abs tolerances while the end-to-end contract is token/text exact.
+The legacy CrispASR MOSS engine remains only a near-exact comparison path.
+**Speed:** parakeet-tdt
 short is at parity with the PyTorch peak; medium/long within ~1.5-1.8x
 (see `docs/ggml-parakeet-perf-analysis.md`); moss is slower
 (one-shot/per-server load path) and not yet at parity.
@@ -27,14 +29,14 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
 - **parakeet-tdt**: byte-exact on short/medium/long. `parakeet.cpp` reproduces
   the eager greedy-TDT token stream bit-for-bit, including the subtle comma
   variations in the long fixture.
-- **moss**: byte-exact on the short fixture. On medium/long, CrispASR's
-  moss-transcribe decode diverges from the golden capture path in punctuation
-  normalization (a period at some repetition boundaries) and can truncate
-  below the golden token count; the parity test asserts a normalized CER < 10%
-  floor on medium/long so regressions beyond the known gap are caught. The
-  moss-transcribe chunked path has a heap-corruption crash at chunk boundaries
-  on long audio, so `GgmlMoss` forces the single-chunk path
-  (`--chunk-seconds 3600`).
+- **moss (in-tree `StarlingGgmlMoss`)**: exact eager greedy token IDs and text
+  on short/medium/long. The reference explicitly propagates eager attention to
+  nested model configs and uses exact-width `DynamicCache`; padded StaticCache
+  reduction-order noise is not a golden contract. Component ULP tolerances are
+  specified in `docs/ggml-moss-goldens.md`.
+- **moss (legacy external CrispASR)**: short is byte-exact; medium/long retain
+  the historical normalized-CER gate and single-chunk workaround. This engine
+  is deprecated and does not define Starling's in-tree correctness.
 
 ## Backends
 
@@ -91,6 +93,20 @@ CUDA graph itself (keyed on the graph's first node pointer, which is why the
 encoder is routed through a per-shape `ReplayGraph` that keeps that pointer
 stable across calls — `src/encoder.cpp`).
 
+## One-shot graph safety
+
+`run_graph` graphs are transient (`cgraph->uid == 0`); only persistent
+`ReplayGraph` instances receive stable nonzero UIDs and may use ggml-CUDA graph
+capture (patch 0008). This avoids pointer-key collisions across recycled
+one-shot metadata contexts. Intermediate captures must be expanded explicitly,
+but diagnostic capture branches are not a numerical oracle: changing which
+tensors are marked output changes gallocr reuse. In particular, never mark a
+graph-input leaf as an output merely to inspect it. MOSS's former
+`ggml_set_output(mask_input)` experiment changed the allocation layout and
+produced non-deterministic mask/softmax garbage; the durable LLM parity probes
+instead select an intermediate as the graph's normal output via
+`STARLING_MOSS_L0_STAGE`.
+
 ## Performance (RTX 5090, bf16, B=1, model load excluded)
 
 Wall-clock per utterance, harness `bench_all.py` (20 reps, steady-state) and
@@ -122,15 +138,20 @@ ctypes-binds for the in-process path. Override paths with `GGML_PARAKEET_LIB`,
 `GGML_PARAKEET_MODEL` (see `benchmarks/engines.py`).
 
 ### moss
-The moss engine uses CrispASR's `moss-transcribe` backend. The released
-CrispASR v0.8.2 binary omits it (the source is in the repo but was wired into
-the build later), so build CrispASR locally:
+MOSS is now built into Starling's shared `libstarling_ggml` alongside
+parakeet. Build the in-tree library from the repository root:
 ```
-cd /home/m0hawk/Documents/CrispASR
-cmake -B build -DGGML_CUDA=ON -DCRISPASR_BUILD_EXAMPLES=ON
-cmake --build build -j --target crispasr
+flock /tmp/starling-cpp-build.lock bash -c \
+  'cmake -B build -DSTARLING_GGML_CUDA=ON -DSTARLING_GGML_SHARED=ON && cmake --build build -j'
 ```
-Download the F16 GGUF: `moss-transcribe-preview-2b-f16.gguf` from
-`cstr/MOSS-Transcribe-preview-2B-GGUF`. Override paths with `GGML_MOSS_BIN`,
-`GGML_MOSS_MODEL`. The moss engine is one-shot (per-process model load);
-starling-moss stays the NVIDIA peak path.
+
+Place Starling's exact BF16 GGUF at
+`models/moss-transcribe-preview-2b-bf16-exact.gguf`, or override it with
+`STARLING_GGML_MOSS_MODEL=/path/to/model.gguf`. The benchmark key is
+`starling-ggml-moss`; it loads once and calls the in-tree C API directly. For
+example, the Python binding is `GgmlModel(MOSS, path)` from
+`starling._ggml`.
+
+The legacy external `GgmlMoss` CrispASR engine remains available temporarily
+for A/B comparisons, but is **deprecated** and will be removed in Phase 4.
+It is not required to build or run the Starling-owned MOSS path.

@@ -38,6 +38,7 @@ option(STARLING_GGML_CUDA   "Forward GGML_CUDA (NVIDIA)" OFF)
 option(STARLING_GGML_METAL  "Forward GGML_METAL (Apple)" OFF)
 option(STARLING_GGML_VULKAN "Forward GGML_VULKAN (Intel/AMD/ARM)" OFF)
 option(STARLING_GGML_HIP    "Forward GGML_HIP (AMD ROCm)" OFF)
+option(STARLING_GGML_TESTS  "Build Starling C++ stage tests" ON)
 
 set(GGML_CUDA    ${STARLING_GGML_CUDA}    CACHE BOOL "" FORCE)
 set(GGML_METAL   ${STARLING_GGML_METAL}   CACHE BOOL "" FORCE)
@@ -103,28 +104,36 @@ set(STARLING_GGML_CPP
     ${STARLING_GGML_MOSS_CPP}
     ${CMAKE_SOURCE_DIR}/cpp/capi.cpp)
 
+add_library(starling_ggml_core OBJECT ${STARLING_GGML_CPP})
+set_target_properties(starling_ggml_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(starling_ggml_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/cpp/include ${CMAKE_SOURCE_DIR}/cpp
+    ${CMAKE_SOURCE_DIR}/cpp/runtime ${CMAKE_SOURCE_DIR}/cpp/parakeet
+    ${CMAKE_SOURCE_DIR}/cpp/moss ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/ggml/src ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
+target_compile_definitions(starling_ggml_core PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
+target_link_libraries(starling_ggml_core PUBLIC ggml)
+
 if(STARLING_GGML_SHARED)
-  add_library(starling_ggml SHARED ${STARLING_GGML_CPP})
-  # The C-API header uses plain extern "C" with no __declspec(dllexport), so
-  # without this MSVC produces a DLL with zero exported symbols (no import .lib,
-  # useless for ctypes). Auto-exports everything. No effect on Linux/macOS.
+  add_library(starling_ggml SHARED $<TARGET_OBJECTS:starling_ggml_core>)
   set_target_properties(starling_ggml PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 else()
-  add_library(starling_ggml STATIC ${STARLING_GGML_CPP})
+  add_library(starling_ggml STATIC $<TARGET_OBJECTS:starling_ggml_core>)
 endif()
-
-target_include_directories(starling_ggml PUBLIC
-    ${CMAKE_SOURCE_DIR}/cpp/include
-    PRIVATE
-    ${CMAKE_SOURCE_DIR}/cpp                     # so files include "runtime/...", "parakeet/..."
-    ${CMAKE_SOURCE_DIR}/cpp/runtime
-    ${CMAKE_SOURCE_DIR}/cpp/parakeet
-    ${CMAKE_SOURCE_DIR}/cpp/moss
-    ${CMAKE_SOURCE_DIR}/third_party             # for dr_wav.h
-    ${CMAKE_SOURCE_DIR}/third_party/ggml/src    # for ggml-impl.h (cgraph uid field)
-    ${CMAKE_SOURCE_DIR}/third_party/ggml/include) # ggml.h etc.
-target_compile_definitions(starling_ggml PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
+target_include_directories(starling_ggml PUBLIC ${CMAKE_SOURCE_DIR}/cpp/include)
 target_link_libraries(starling_ggml PUBLIC ggml)
+
+if(STARLING_GGML_TESTS)
+  set(STARLING_GGML_TEST_SUPPORT_CPP ${CMAKE_SOURCE_DIR}/cpp/tests/golden_io.cpp)
+  file(GLOB STARLING_GGML_TEST_MAIN_CPP ${CMAKE_SOURCE_DIR}/cpp/tests/*_test.cpp)
+  foreach(test_src IN LISTS STARLING_GGML_TEST_MAIN_CPP)
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src} ${STARLING_GGML_TEST_SUPPORT_CPP} $<TARGET_OBJECTS:starling_ggml_core>)
+    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${CMAKE_SOURCE_DIR}/cpp/tests ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
+    target_link_libraries(${test_name} PRIVATE ggml)
+    set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  endforeach()
+endif()
 
 # Output the .so next to the build dir root so _native.py's default search path
 # (build/libstarling_ggml.so) finds it without env-var help during development.
