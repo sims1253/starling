@@ -5,16 +5,18 @@
 // mirrors the proven parakeet.cpp CPU reference exactly (the bd skew, the
 // head-split reshape/permute order, the v^T transpose, the soft_max_ext scale).
 //
-// The CPU path is the byte-identical reference. The GPU flash-attn path is NOT
-// emitted here — Phase 1b targets CPU validation; the GPU perf path lands later.
+// The CPU manual path is the byte-identical reference. GPU uses fused flash
+// attention unless STARLING_PARAKEET_NO_FATTN=1 is set.
 
 #include "relpos_attention.hpp"
 
 #include "runtime/backend.hpp"  // clone_weight, clone_weight_opt, graph_input_tensor
+#include "runtime/graph.hpp"    // global_backend
 
 #include "ggml.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 
 namespace starling::ggml::parakeet {
@@ -92,39 +94,57 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     bd = ggml_view_3d(ctx, bd, T, T, H, bd->nb[1], bd->nb[2], 0);
     bd = ggml_cont(ctx, bd);                                          // [T_k, T_q, H]
 
-    // ---- manual path (CPU reference, byte-identical) ----
-    // ac = q_u @ k^T : ggml_mul_mat([dk,T,H],[dk,T,H]) -> [T_k, T_q, H]
-    ggml_tensor* ac = ggml_mul_mat(ctx, kh, qu);            // [T(key), T(query), H]
-    ggml_tensor* scores = ggml_add(ctx, ac, bd);            // [T_k, T_q, H]
-    // For the offline full-context model on a non-padded single clip, the
-    // additive mask is uniformly 0 -> omit it (soft_max_ext with mask=null).
-    // When valid_len < T we apply the standard key-validity mask (-inf beyond
-    // valid_len) so padded keys get zero attention.
-    ggml_tensor* mask = nullptr;
+    // GPU fused path: flash computes softmax(scale*ac + mask), whereas the
+    // reference computes softmax((ac + bd)*scale + validity_mask). Therefore
+    // its per-head additive mask is cast_f16(bd*scale + validity_mask).
+    // Our ggml patch 0001 permits mask.ne[2] == H. Keep the manual path for CPU
+    // and as an emergency byte-exactness kill-switch.
+    ggml_tensor* merged = nullptr;
+    const char* no_fattn = std::getenv("STARLING_PARAKEET_NO_FATTN");
+    const bool use_flash = global_backend().is_gpu() &&
+                           !(no_fattn && std::string(no_fattn) == "1");
     const bool mask_is_trivial = (valid_len >= T);
-    if (!mask_is_trivial) {
-        float* mask_host = pool.alloc_f32((size_t)T * T);
-        {
-            float* md = mask_host;
+    if (use_flash) {
+        ggml_tensor* mask_flash = ggml_scale(ctx, bd, scale);
+        if (!mask_is_trivial) {
+            float* mask_host = pool.alloc_f32((size_t)T * T);
             const float ninf = -INFINITY;
-            for (int qi = 0; qi < T; ++qi) {
-                for (int kj = 0; kj < T; ++kj) {
-                    md[(size_t)qi * T + kj] = (kj < valid_len) ? 0.0f : ninf;
-                }
-            }
+            for (int qi = 0; qi < T; ++qi)
+                for (int kj = 0; kj < T; ++kj)
+                    mask_host[(size_t)qi * T + kj] =
+                        (kj < valid_len) ? 0.0f : ninf;
+            int64_t mask_ne[3] = {T, T, 1};
+            ggml_tensor* vmask = graph_input_tensor(ctx, GGML_TYPE_F32, 3,
+                mask_ne, mask_host, (size_t)T * T * sizeof(float));
+            mask_flash = ggml_add(ctx, mask_flash, vmask);
         }
-        int64_t mask_ne[2] = {T, T};
-        mask = graph_input_tensor(ctx, GGML_TYPE_F32, 2, mask_ne,
-                                  mask_host,
-                                  (size_t)T * T * sizeof(float));
+        mask_flash = ggml_cast(ctx, mask_flash, GGML_TYPE_F16);
+        ggml_tensor* fa = ggml_flash_attn_ext(ctx, qu, kh, vh, mask_flash,
+                                              scale, 0.0f, 0.0f);
+        merged = ggml_reshape_2d(ctx, fa, D, T);
+    } else {
+        ggml_tensor* ac = ggml_mul_mat(ctx, kh, qu);
+        ggml_tensor* scores = ggml_add(ctx, ac, bd);
+        ggml_tensor* mask = nullptr;
+        if (!mask_is_trivial) {
+            float* mask_host = pool.alloc_f32((size_t)T * T);
+            const float ninf = -INFINITY;
+            for (int qi = 0; qi < T; ++qi)
+                for (int kj = 0; kj < T; ++kj)
+                    mask_host[(size_t)qi * T + kj] =
+                        (kj < valid_len) ? 0.0f : ninf;
+            int64_t mask_ne[2] = {T, T};
+            mask = graph_input_tensor(ctx, GGML_TYPE_F32, 2, mask_ne,
+                                      mask_host,
+                                      (size_t)T * T * sizeof(float));
+        }
+        ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+        ggml_tensor* vtk = ggml_cont(ctx,
+            ggml_permute(ctx, vh, 1, 0, 2, 3));
+        ggml_tensor* ctxh = ggml_mul_mat(ctx, vtk, attn);
+        merged = ggml_cont(ctx, ggml_permute(ctx, ctxh, 0, 2, 1, 3));
+        merged = ggml_reshape_2d(ctx, merged, D, T);
     }
-    ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f); // [T_k, T_q, H]
-    // context = attn @ v -> [dk, T_q, H]
-    ggml_tensor* vtk = ggml_cont(ctx, ggml_permute(ctx, vh, 1, 0, 2, 3)); // [T_k, dk, H]
-    ggml_tensor* ctxh = ggml_mul_mat(ctx, vtk, attn);                      // [dk, T_q, H]
-    // concat heads: [dk, T, H] -> [dk, H, T] -> [D, T]
-    ggml_tensor* merged = ggml_cont(ctx, ggml_permute(ctx, ctxh, 0, 2, 1, 3)); // [dk, H, T]
-    merged = ggml_reshape_2d(ctx, merged, D, T);                              // [D, T]
 
     // Zero the context for PADDED query rows (NeMo masks padded query rows fully
     // -> output reduces to linear_out.bias). Apply a query-row mask [1, T].

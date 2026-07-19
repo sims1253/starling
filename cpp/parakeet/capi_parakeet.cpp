@@ -19,6 +19,7 @@
 
 #include "starling_ggml.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -37,6 +38,11 @@ struct ParakeetCtx {
     starling::ggml::parakeet::MelConstants mel_const;
     // Persistent GPU mel (kept warm across utterances); null on CPU.
     std::unique_ptr<starling::ggml::parakeet::GpuMel> gmel;
+    // Model-bound compute objects persist across transcription calls so their
+    // lazy host weights and per-shape replay graphs reach steady state.
+    std::unique_ptr<starling::ggml::parakeet::Encoder> encoder;
+    std::unique_ptr<starling::ggml::parakeet::PredictionNet> prediction;
+    std::unique_ptr<starling::ggml::parakeet::Joint> joint;
     std::string err;
 };
 
@@ -68,6 +74,11 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
         ctx->gmel = std::make_unique<starling::ggml::parakeet::GpuMel>(
             starling::ggml::global_backend(), ctx->mel_const);
     }
+    ctx->encoder = std::make_unique<starling::ggml::parakeet::Encoder>(*ctx->model);
+    ctx->prediction = std::make_unique<starling::ggml::parakeet::PredictionNet>(
+        ctx->model->loader, ctx->model->config);
+    ctx->joint = std::make_unique<starling::ggml::parakeet::Joint>(
+        ctx->model->loader, ctx->model->config);
     if (err_out) *err_out = nullptr;
     return ctx.release();
 }
@@ -130,11 +141,10 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
         return nullptr;
     }
     // 2. encoder + joint.enc projection -> feat-major [640, T'].
-    starling::ggml::parakeet::Encoder enc(*c->model);
     std::vector<float> enc_out;
     int Tp = 0;
     try {
-        if (!enc.encode(feats, (int)c->mel_const.n_mels, T_mel, enc_out, Tp)) {
+        if (!c->encoder->encode(feats, (int)c->mel_const.n_mels, T_mel, enc_out, Tp)) {
             if (err_out) *err_out = "encoder graph failed";
             return nullptr;
         }
@@ -161,6 +171,11 @@ static bool parakeet_full_decode(ParakeetCtx* c,
                                  const float* pcm, int64_t n,
                                  std::vector<int32_t>& ids,
                                  const char** err_out) {
+    using Clock = std::chrono::steady_clock;
+    const char* timing_env = std::getenv("STARLING_PARAKEET_TIMING");
+    const bool timing = timing_env && std::strcmp(timing_env, "1") == 0;
+    const auto t0 = Clock::now();
+
     // 1. mel frontend -> feat-major [n_mels, T].
     std::vector<float> feats;
     int T_mel = 0;
@@ -176,11 +191,11 @@ static bool parakeet_full_decode(ParakeetCtx* c,
     }
 
     // 2. encoder + joint.enc projection -> feat-major [640, T'].
-    starling::ggml::parakeet::Encoder enc(*c->model);
+    const auto t_mel = Clock::now();
     std::vector<float> enc_feat;
     int Tp = 0;
     try {
-        if (!enc.encode(feats, (int)c->mel_const.n_mels, T_mel, enc_feat, Tp)) {
+        if (!c->encoder->encode(feats, (int)c->mel_const.n_mels, T_mel, enc_feat, Tp)) {
             if (err_out) *err_out = "encoder graph failed";
             return false;
         }
@@ -189,7 +204,8 @@ static bool parakeet_full_decode(ParakeetCtx* c,
         return false;
     }
 
-    const int H = enc.proj_dim();  // 640
+    const auto t_encoder = Clock::now();
+    const int H = c->encoder->proj_dim();  // 640
     // 3. The encoder Phase 1b output is row-major [T', H] (out[t*H + h]) — frame
     //    t's projected vector is contiguous, exactly what tdt_greedy expects.
     //    (encoder.hpp's "feat-major" comment is misleading; the buffer is
@@ -199,16 +215,24 @@ static bool parakeet_full_decode(ParakeetCtx* c,
 
     // 4. serial TDT greedy decode -> id stream (incl. blanks).
     try {
-        starling::ggml::parakeet::PredictionNet pred(c->model->loader, c->model->config);
-        starling::ggml::parakeet::Joint joint(c->model->loader, c->model->config);
         ids = starling::ggml::parakeet::tdt_greedy(
-            pred, joint, enc_proj, Tp, H,
+            *c->prediction, *c->joint, enc_proj, Tp, H,
             c->model->config.tdt_durations,
             (int)c->model->config.blank_id,
             (int)c->model->config.max_symbols);
     } catch (const std::exception& e) {
         if (err_out) *err_out = e.what();
         return false;
+    }
+    if (timing) {
+        const auto t_decode = Clock::now();
+        auto ms = [](Clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::fprintf(stderr,
+            "[PARAKEET_TIMING] mel=%.3f ms encoder=%.3f ms decode=%.3f ms total=%.3f ms\n",
+            ms(t_mel - t0), ms(t_encoder - t_mel),
+            ms(t_decode - t_encoder), ms(t_decode - t0));
     }
     return true;
 }
