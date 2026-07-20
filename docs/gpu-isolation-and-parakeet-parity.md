@@ -1,12 +1,11 @@
 # GPU isolation (Task 1) + in-tree Parakeet parity gate (Task 2, Phase 0)
 
-Implementation notes for the two tasks selected by the upstream synthesis,
-recorded so the deviations from the synthesis's stated plan (and the empirical
-findings) are auditable.
+Implementation notes for the two selected tasks, including deviations from the
+initial plan and the empirical findings.
 
-## What changed versus the synthesis's plan
+## What changed versus the initial plan
 
-The synthesis was written against `windows-support` HEAD `5a43ffc`. By the time
+The initial research used `windows-support` HEAD `5a43ffc`. By the time
 this work ran, `origin/windows-support` had advanced to `3fb6510`, which is the
 **merge of `ggml-perf` (PR #5)** and contains Task 2's headline code already:
 
@@ -14,7 +13,7 @@ this work ran, `origin/windows-support` had advanced to `3fb6510`, which is the
   (`d929bc6`) — **already merged** into `3fb6510`.
 * `cpp/moss/*` whole-model graphs + K-step (`10861f4`) — **already merged**.
 
-So the synthesis's Task 2 step "cherry-pick `d929bc6`" is obsolete: that change
+So the initial Task 2 step "cherry-pick `d929bc6`" is obsolete: that change
 is upstream. This branch therefore **bases on `3fb6510`** (current upstream)
 rather than re-doing merged work on the stale `5a43ffc` base. What Task 2 still
 needed — and what this branch adds — is the **missing correctness seam**:
@@ -30,7 +29,7 @@ validated end-to-end below.
 
 ## Task 1 — flock-based `GpuSession` + UUID keying + `starling-gpu-run`
 
-Closes the two hazards the synthesis flagged:
+Closes the two identified hazards:
 
 1. **Orphaned native children** (`gpu_lock.py` recorded only the Python parent
    PID; native GPU subprocesses survived the parent and kept VRAM with no lock
@@ -86,7 +85,7 @@ point is needed), and `StarlingGgmlParakeet._run_one_ids` (`engines.py`).
 
 ### Empirical finding — blanks differ, content tokens are exact
 
-The synthesis assumed exact equality of the *full* id stream (incl. blanks).
+The initial plan assumed exact equality of the *full* id stream (incl. blanks).
 Measured against the real `libstarling_ggml` + the `parakeet_tdt_*_ids.pt`
 goldens (HF `model.generate().sequences[0]`):
 
@@ -133,11 +132,11 @@ uv run pytest tests/test_ggml_parity.py -k parakeet  # skips cleanly if lib/mode
 The tests skip cleanly when `libstarling_ggml`, the model, or the goldens are
 absent, so the pure-Python install keeps working unbuilt.
 
-## Deferred (per the synthesis — not this branch)
+## Deferred (not this branch)
 
-MOSS whole-model graphs + flash-attn decode (already merged at `3fb6510`, but
-no extra work done here), vendor-don't-patch, energy/VAD segmentation, server
-contracts, speculative decoding — all "investigate" in the synthesis. Also noted:
-`docs/ggml-parakeet-perf-analysis.md` still cites 7 external `parakeet.cpp`
-SHAs as if in-tree (synthesis correction #2) — a doc-accuracy fix, out of scope
-here.
+MOSS whole-model graphs + flash-attn decode are already merged at `3fb6510`, but
+no extra work was done here. Vendor-don't-patch, energy/VAD segmentation, server
+contracts, and speculative decoding remain investigations. Also note that
+`docs/ggml-parakeet-perf-analysis.md` still cites external `parakeet.cpp` SHAs
+as if they describe the in-tree implementation; that document needs a separate
+accuracy cleanup.
