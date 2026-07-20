@@ -112,6 +112,15 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
 // called from inside a build lambda.
 void capture_graph_output(ggml_tensor* t, std::vector<float>* dst);
 
+// Mark `t` as a graph node that MUST execute as a side effect but is NOT read
+// back to host. The Wave D decode-state write-back uses this: the K-step graph
+// cpy's its final (h/c/cc/frame/last_token) state into persistent device
+// buffers (graph leaves) so the next replay reads it in-graph with no host
+// round-trip; those cpy nodes are unreachable from the output/captures, so they
+// must be registered as expansion roots. Must be called from inside a build
+// lambda; the node is expanded into the cgraph alongside the output + captures.
+void add_graph_root(ggml_tensor* t);
+
 // Reference a loader weight DIRECTLY as a graph leaf (zero per-call copy). The
 // loader gives every weight a backend buffer once (realize_weights); with
 // ->data set, the gallocr treats the weight as already-allocated and never

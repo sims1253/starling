@@ -54,17 +54,30 @@ static buffers make that unsafe without duplicating pipeline state per stream.
 
 ### 5. Shared graph-cache and replay-policy helper
 
-The current model graph caches are bounded, so there is no active unbounded-OOM
-bug. The bounded cache mechanics and model-specific K-selection policies are
-still duplicated, however. A future ninth model would benefit from a small
-shared helper providing:
+The per-shape ReplayGraph caches (parakeet `Encoder::replay_cache_`, moss
+`g_encoder_cache`, moss `g_prefill_cache`) are now genuinely bounded by a shared
+LRU helper (`cpp/runtime/lru_cache.hpp`), capacity `STARLING_REPLAY_CACHE_SIZE`
+(default 16). This was a real stability bug, not a hypothetical one: the caches
+were previously unbounded `unordered_map`s, and the "the current model graph
+caches are bounded" claim that used to live here was false — running the
+leaderboard benchmark on real diverse-length audio exhausted VRAM on the second
+dataset (`CUDA error: out of memory`; see `plans/wave-h-graph-cache-lru.md` and
+the permanent stress regression `cpp/tests/replay_cache_lru_test.cpp`). On a
+miss at capacity the LRU now evicts the least-recently-used shape (freeing its
+private gallocr + captured graph) before inserting the new one; rebuild of an
+evicted shape is byte-identical. The MOSS K-step decode cache (`g_moss_kstep_cache`,
+keyed on `K`) is out of scope: `K` is clamped to `[1,8]`, an inherently tiny
+bounded domain.
 
-- bounded LRU ownership and graph cleanup;
-- shape bucketing/key normalization;
+What remains duplicated / worth centralizing for a future ninth model is the
+richer policy layer on top of the now-shared bound:
+
+- shape bucketing/key normalization (so near-equal lengths share a graph);
 - explicit model-specific replay-step selection;
-- cache metrics for captures, hits, misses, and evictions.
+- cache metrics for captures, hits, misses, and evictions (the bound is enforced;
+the observability is not).
 
-Keep the thresholds model-specific; centralize lifecycle safety rather than
+Keep the capacity model-specific; centralize lifecycle safety rather than
 forcing one tuning policy across incompatible decoders.
 
 ### 6. Finish transport consolidation
