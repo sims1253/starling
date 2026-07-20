@@ -1303,6 +1303,17 @@ class StarlingGgmlParakeet(Engine):
             pcm.ctypes.data_as(_c_float_p), pcm.size, 16000)
         return text.strip()
 
+    def _run_one_ids(self, audio: np.ndarray) -> list[int]:
+        """The raw greedy-TDT id stream (incl. blanks) for strict parity.
+
+        Mirrors :meth:`_run_one` but returns the emitted token-id stream via
+        ``starling_ggml_parakeet_decode_ids_pub`` (leading blank prepended in
+        C to match the ``parakeet_tdt_*_ids.pt`` golden format).
+        """
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return list(self._model.transcribe_pcm_ids(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000))
+
 
 def _starling_ggml_parakeet_keys() -> list[str]:
     """Starling's in-tree ggml engine (libstarling_ggml). Skipped if the .so

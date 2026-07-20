@@ -181,6 +181,43 @@ class GgmlModel:
         self._lib.starling_ggml_free_string(ptr)
         return text
 
+    def transcribe_pcm_ids(self, samples, n: int, sample_rate: int = 16000):
+        """Transcribe ``n`` mono float32 samples; return the raw token-id stream.
+
+        Parakeet-only. Returns the emitted id stream INCLUDING blanks, prefixed
+        with the decoder-start (blank) token, matching the format of the golden
+        ``parakeet_tdt_*_ids.pt`` (HF ``model.generate().sequences[0]``). This
+        is the strictest in-tree parity gate (greedy TDT is deterministic).
+
+        Lazily resolves ``starling_ggml_parakeet_decode_ids_pub`` so it does not
+        gate :func:`available` for builds that pre-date the symbol.
+        """
+        lib = self._lib
+        fn = getattr(lib, "starling_ggml_parakeet_decode_ids_pub", None)
+        if fn is None:
+            raise RuntimeError(
+                "libstarling_ggml has no starling_ggml_parakeet_decode_ids_pub "
+                "symbol (rebuild cpp/)")
+        fn.restype = ctypes.POINTER(ctypes.c_int64)
+        fn.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+        ]
+        out_n = ctypes.c_int64(0)
+        ptr = fn(self._ctx, samples, n, ctypes.byref(out_n))
+        if not ptr:
+            err = self._last_error()
+            raise RuntimeError(f"starling_ggml_parakeet_decode_ids failed: {err}")
+        try:
+            ids = ptr[: out_n.value]  # list[int]
+        finally:
+            # The buffer was std::malloc'd in C; starling_ggml_free_string does
+            # std::free, which is type-agnostic (element type is irrelevant to
+            # free), so reusing it is correct and avoids a new C entry point.
+            lib.starling_ggml_free_string(
+                ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char)))
+        return ids
+
     def close(self) -> None:
         if getattr(self, "_ctx", None):
             self._lib.starling_ggml_free(self._ctx)

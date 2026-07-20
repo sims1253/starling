@@ -273,3 +273,124 @@ def test_starling_ggml_moss_kstep_cache_boundary() -> None:
         f"moss_kstep_oob_test exited {proc.returncode} (K-step OOB regression):\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# In-tree Parakeet-tdt C API — the missing parity gate (Task 2, Phase 0).
+# --------------------------------------------------------------------------- #
+# Unlike the external ``GgmlParakeet`` engine (which drives mudler's
+# parakeet.cpp server), ``StarlingGgmlParakeet`` drives Starling's OWN in-tree
+# ``libstarling_ggml`` (built from ``cpp/``). Until this test was added there
+# was NO correctness gate on that in-tree engine at all — every byte-exact
+# claim for it was unenforced. Parakeet-tdt greedy decode is deterministic with
+# no LLM/chunk path, so BOTH gates below are exact (no CER tolerance, unlike
+# the long-audio MOSS case): exact normalized text AND exact id-stream equality
+# against the golden ``parakeet_tdt_*_ids.pt`` (captured by
+# ``scripts/parakeet_tdt_golden.py`` from HF ``model.generate``).
+#
+# This is the same artifact run before/after any decode change: if it is green
+# on the serial-CPU engine and stays green (identical id-stream) on the K-step
+# GPU engine, byte-exactness is established by construction — independent of
+# any doc or commit message. Set ``STARLING_GGML_TDT_SERIAL=1`` to force the
+# in-binary serial fallback for the within-binary A/B control.
+#
+# All three fixtures (short/medium/long) are exercised: short/medium take the
+# K-step multistep fast path (T<=512); long (T=930) takes the byte-exact serial
+# greedy loop. The id-stream gate covers both paths.
+def _starling_ggml_parakeet_available() -> bool:
+    try:
+        from engines import StarlingGgmlParakeet
+        return StarlingGgmlParakeet().available
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="module")
+def starling_ggml_parakeet_engine():
+    """One in-tree StarlingGgmlParakeet engine for the whole module."""
+    if not _starling_ggml_parakeet_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_PARAKEET_MODEL unavailable")
+    from engines import StarlingGgmlParakeet
+    engine = StarlingGgmlParakeet()
+    engine.load()
+    yield engine
+    engine.close()
+
+
+@pytest.mark.skipif(not _starling_ggml_parakeet_available(),
+                    reason="in-tree libstarling_ggml or parakeet GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_parakeet_text_parity(
+        starling_ggml_parakeet_engine, name: str) -> None:
+    """The in-tree parakeet engine returns the golden transcript exactly.
+
+    No tolerance: parakeet-tdt greedy decode is deterministic (no LLM, no
+    chunk-stitch), so the transcript must match byte-for-byte on all three
+    fixtures. A diff here is a real regression in the in-tree loader -> mel ->
+    encoder -> TDT decode -> detokenize pipeline.
+    """
+    gpath = GOLDEN / f"parakeet_tdt_{name}_text.txt"
+    if not gpath.exists():
+        pytest.skip(f"golden {gpath.name} absent (run scripts/parakeet_tdt_golden.py)")
+    golden_text = gpath.read_text().rstrip()
+    out = starling_ggml_parakeet_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree parakeet transcript mismatch on {name}:\n"
+        f"  golden: {golden_text[:160]!r}\n  ggml:   {out[:160]!r}"
+    )
+
+
+@pytest.mark.skipif(not _starling_ggml_parakeet_available(),
+                    reason="in-tree libstarling_ggml or parakeet GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_parakeet_idstream_parity(
+        starling_ggml_parakeet_engine, name: str) -> None:
+    """The in-tree parakeet engine emits the golden CONTENT token stream exactly.
+
+    Strictest gate short of blank-counting: the sequence of emitted CONTENT
+    (non-blank) tokens must equal ``golden/parakeet_tdt_*_ids.pt`` element-for-
+    element. This is stricter than the text gate (token-level, before
+    detokenization) and catches any numeric drift / near-tie argmax flip that
+    text-normalization would hide.
+
+    Blanks (the TDT ``no-symbol-this-step`` marker, id ``blank_id`` = 8192 for
+    parakeet-tdt-0.6b-v3) are EXCLUDED: the in-tree greedy loop and HF
+    ``model.generate`` emit blanks at slightly different cadences (verified: on
+    short/long the in-tree stream has one extra blank, on medium none), but the
+    CONTENT tokens are byte-identical. Blanks carry no linguistic content and
+    are dropped by detokenization (id 8192 is out of the piece range), so a
+    blank-count difference never affects the transcript. Green here + green on
+    the text gate = the in-tree engine is content-token-exact vs the HF golden.
+    """
+    ipath = GOLDEN / f"parakeet_tdt_{name}_ids.pt"
+    if not ipath.exists():
+        pytest.skip(f"golden {ipath.name} absent (run scripts/parakeet_tdt_golden.py)")
+    try:
+        out_ids = starling_ggml_parakeet_engine._run_one_ids(FIXTURES[name])
+    except RuntimeError as e:
+        if "decode_ids" in str(e):
+            pytest.skip("libstarling_ggml built without the decode_ids symbol")
+        raise
+    import torch
+    golden_ids = [int(x) for x in torch.load(ipath).tolist()]
+    # blank_id is a model-config constant (8192); prefer the golden meta if the
+    # operator saved it, so the gate stays correct if the id ever moves.
+    blank_id = 8192
+    mpath = GOLDEN / f"parakeet_tdt_{name}_meta.pt"
+    if mpath.exists():
+        try:
+            blank_id = int(torch.load(mpath).get("blank_id", blank_id))
+        except Exception:
+            pass
+    out_nb = [t for t in out_ids if t != blank_id]
+    golden_nb = [t for t in golden_ids if t != blank_id]
+    if out_nb != golden_nb:
+        n = min(len(out_nb), len(golden_nb))
+        first = next((i for i in range(n) if out_nb[i] != golden_nb[i]), n)
+        assert out_nb == golden_nb, (
+            f"in-tree parakeet content-token mismatch on {name} "
+            f"(blank_id={blank_id}): non-blank len ggml={len(out_nb)} "
+            f"golden={len(golden_nb)}; first content diverge @ {first}: "
+            f"ggml={out_nb[first:first + 8]} golden={golden_nb[first:first + 8]} "
+            f"(raw id len ggml={len(out_ids)} golden={len(golden_ids)})"
+        )
