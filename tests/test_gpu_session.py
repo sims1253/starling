@@ -49,7 +49,9 @@ def _holder_script(body: str) -> str:
         "GpuSession = _m.GpuSession\n"
         "GpuLockBusy = _m.GpuLockBusy\n"
     )
-    return loader + body
+    # Triple-quoted snippets conventionally begin with a formatting newline;
+    # strip only newlines so the holder's first stdout line is protocol data.
+    return loader + body.lstrip("\r\n")
 
 
 def _poll_until_free(lock_dir: Path, uuid: str, timeout: float = 5.0) -> bool:
@@ -127,6 +129,10 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
             line = proc.stdout.readline()
             if not line:
                 break
+            # Some development environments install startup hooks that emit
+            # cosmetic blank lines before user code. They are not protocol.
+            if not line.strip():
+                continue
             tag, pid = line.split()
             if tag == "HOLDER":
                 holder_pid = int(pid)
