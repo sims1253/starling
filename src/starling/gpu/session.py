@@ -49,7 +49,7 @@ from __future__ import annotations
 import errno
 try:
     import fcntl
-except ImportError:  # native Windows: import-safe compatibility fallback
+except ImportError:  # native Windows: import remains safe; acquire fails closed
     fcntl = None  # type: ignore[assignment]
 import json
 import os
@@ -67,8 +67,7 @@ from typing import IO, Optional
 TOKEN_VERSION = 2
 TOKEN_SCHEMA = "starling.gpu.session"
 
-HEARTBEAT_SEC = 5.0          # how often the holder refreshes ``heartbeat_at``
-STALE_HEARTBEAT_SEC = 120.0  # a token older than this is considered a hung holder
+HEARTBEAT_SEC = 5.0  # how often an in-process holder refreshes observability
 
 _QUERY_CACHE: Optional[list[str]] = None
 
@@ -251,9 +250,10 @@ class GpuSession:
         self.max_wait_sec = max_wait_sec
         self._want_signal_handlers = install_signal_handlers
         self._want_heartbeat = heartbeat
-        if force is None:
-            force = os.environ.get("STARLING_GPU_LOCK_FORCE", "") == "1"
-        self.force = force
+        # Retained as an accepted compatibility argument. Automatic takeover is
+        # deliberately unsupported because stale metadata cannot prove that an
+        # inherited native child has stopped valid GPU work.
+        self.force = bool(force or os.environ.get("STARLING_GPU_LOCK_FORCE", "") == "1")
 
         self._fd: Optional[int] = None
         self._path: Optional[Path] = None
@@ -301,8 +301,15 @@ class GpuSession:
             self._owner_id = _uuid.uuid4().hex
             return self
 
+        if fcntl is None:
+            raise RuntimeError(
+                "Starling GPU isolation requires POSIX fcntl.flock on this "
+                "platform. Set STARLING_GPU_LOCK_DISABLE=1 only when external "
+                "serialization is guaranteed."
+            )
+
         key = self._uuid_arg or _resolve_lock_key()
-        if self._uuid_arg is None and "," in key:
+        if "," in key:
             raise RuntimeError(
                 "GpuSession currently requires exactly one visible GPU; set "
                 "CUDA_VISIBLE_DEVICES to one device. Multi-GPU set locking "
@@ -325,6 +332,12 @@ class GpuSession:
                 self._fd = None
             if self._fd is not None:
                 self._path = path
+                # This duplicate is intentionally only a nested reference. The
+                # original env-published fd remains open for the wrapped
+                # process's whole lifetime, so releasing an inner legacy
+                # with_gpu_lock cannot release the outer runner's lock. os.dup
+                # returns a non-inheritable fd (PEP 446); spawn() explicitly
+                # marks it inheritable when another native child is launched.
                 self._borrowed = True
                 self._acquired = True
                 self._owner_id = os.environ.get(
@@ -398,13 +411,8 @@ class GpuSession:
 
     # -- internals ---------------------------------------------------------
     def _flock_with_contention(self) -> None:
-        assert self._fd is not None
-        if fcntl is None:
-            # Windows compatibility: preserve importability and single-parent
-            # operation. Native-child fd inheritance is POSIX-only for now.
-            return
+        assert self._fd is not None and fcntl is not None
         deadline = time.time() + (self.max_wait_sec if self.wait else 0.0)
-        first = True
         while True:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -412,9 +420,6 @@ class GpuSession:
             except BlockingIOError:
                 if not self.wait:
                     raise GpuLockBusy(self._who())
-                if self.force and first:
-                    first = False
-                    self._force_takeover()
                 if time.time() >= deadline:
                     raise GpuLockTimeout(
                         f"timed out after {self.max_wait_sec}s waiting for GPU "
@@ -427,16 +432,6 @@ class GpuSession:
             return (f"session={tok.get('session')!r} pid={tok.get('pid')} "
                     f"uuid={tok.get('uuid')}")
         return f"{self._path}"
-
-    def _force_takeover(self) -> None:
-        """Refuse unsafe metadata-only takeover.
-
-        A stale heartbeat does not prove the flock is orphaned: an inherited
-        native child may still be doing valid GPU work after its Python parent
-        exited. The kernel lock remains authoritative, so callers must terminate
-        a known holder explicitly rather than risking biased/corrupted runs.
-        """
-        return
 
     def _write_token(self, heartbeat: bool = False) -> None:
         assert self._path is not None and self._fd is not None

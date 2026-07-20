@@ -52,6 +52,11 @@ class* as `starling.gpu.session.GpuLockBusy`. New additive module
 `starling.gpu` (`session.py`, `run.py`); `starling-gpu-run` wraps any command
 in the lock with zero per-script edits.
 
+The flock implementation is POSIX-only. On native Windows it imports safely but
+**fails closed** on acquisition; use an external machine-wide mutex or set
+`STARLING_GPU_LOCK_DISABLE=1` only when benchmark serialization is guaranteed by
+the caller.
+
 Env knobs: `STARLING_GPU_LOCK_DISABLE`, `STARLING_GPU_LOCK_DIR`. The legacy
 `STARLING_GPU_LOCK_FORCE` knob is accepted but deliberately does not kill a
 holder: stale heartbeat metadata cannot distinguish a hung parent from a valid

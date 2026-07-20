@@ -79,6 +79,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     except OSError:
         pass  # already a session leader, or unsupported -> not fatal
 
+    # execvp replaces this Python process, so its heartbeat thread cannot run in
+    # the wrapped command. The token remains useful acquisition metadata; the
+    # kernel flock, not heartbeat freshness, is the ownership authority.
     session = GpuSession(
         session=args.session,
         model=args.model,
@@ -88,7 +91,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         uuid=args.uuid,
         wait=True,
         install_signal_handlers=not args.no_signal_handlers,
-        heartbeat=not args.no_heartbeat,
+        heartbeat=False,
     )
     try:
         session.acquire()

@@ -237,6 +237,24 @@ def test_multi_gpu_session_fails_closed_instead_of_allowing_overlap(
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     with pytest.raises(RuntimeError, match="exactly one visible GPU"):
         GpuSession(session="multi", lock_dir=str(tmp_path), wait=False).acquire()
+    with pytest.raises(RuntimeError, match="exactly one visible GPU"):
+        GpuSession(session="multi-explicit", lock_dir=str(tmp_path),
+                   uuid="GPU-AAAA,GPU-BBBB", wait=False).acquire()
+
+
+def test_missing_flock_fails_closed_unless_explicitly_disabled(
+        tmp_path, monkeypatch) -> None:
+    """Unsupported platforms must never silently allow concurrent benchmarks."""
+    import starling.gpu.session as session
+    monkeypatch.setattr(session, "fcntl", None)
+    with pytest.raises(RuntimeError, match="requires POSIX fcntl.flock"):
+        GpuSession(session="unsupported", lock_dir=str(tmp_path),
+                   uuid="GPU-X", wait=False).acquire()
+
+    monkeypatch.setenv("STARLING_GPU_LOCK_DISABLE", "1")
+    with GpuSession(session="explicit-opt-out", lock_dir=str(tmp_path),
+                    uuid="GPU-X", wait=False):
+        pass
 
 
 # --------------------------------------------------------------------------- #
