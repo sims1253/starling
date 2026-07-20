@@ -236,3 +236,40 @@ def test_starling_ggml_moss_text_parity(starling_ggml_moss_engine, name: str) ->
         f"in-tree MOSS transcript mismatch on {name}:\n"
         f"  golden: {golden_text!r}\n  ggml:   {out!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Wave G regression: MOSS K-step decode must not access the KV cache / RoPE
+# tables past max_cache when a block's remaining token budget < K.
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _starling_ggml_moss_available(),
+                    reason="in-tree libstarling_ggml or MOSS GGUF unavailable")
+def test_starling_ggml_moss_kstep_cache_boundary() -> None:
+    """The K-step decode must stay in-bounds at the max_cache boundary.
+
+    Drives the C++ regression binary ``build/moss_kstep_oob_test`` (auto-built
+    from ``cpp/tests/moss_kstep_oob_test.cpp``) which constructs a synthetic
+    ``inputs_embeds`` with ``n_tokens + max_new_tokens == max_cache`` and runs
+    ``greedy_generate`` for K=4 and K=8. On unpatched code the final K-step
+    block's wasted tail steps write KV slots / read RoPE rows at indices
+    ``>= max_cache`` and the resulting sticky CUDA illegal-memory-access makes
+    ``greedy_generate`` return false. The fix caps each block's step count to
+    the remaining budget so every device index stays ``< max_cache``.
+
+    Gated on the same model/lib availability as the in-tree MOSS parity tests;
+    a CPU backend is a vacuous pass (the K-step path is GPU-only, where the bug
+    lives).
+    """
+    import subprocess
+
+    bin_path = _REPO_ROOT / "build" / "moss_kstep_oob_test"
+    if not bin_path.exists():
+        pytest.skip("build/moss_kstep_oob_test not built (run cmake --build build -j)")
+    proc = subprocess.run(
+        [str(bin_path), str(_REPO_ROOT)],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, (
+        f"moss_kstep_oob_test exited {proc.returncode} (K-step OOB regression):\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
