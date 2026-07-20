@@ -43,11 +43,25 @@ Measured with CUDA events around `cudaGraphLaunch` (gated
 | **total**           | ~16 ms  | ~38 ms  | ~108 ms | ctypes per-call wall                  |
 
 Key facts:
-- **The encoder graph is ~2.8ms of GPU compute** (3518 nodes, one captured CUDA
-  graph). Starling's encoder compute is ~5ms total pipeline — so parakeet's
-  encoder is *already faster* than starling's on raw compute. The encoder is
-  NOT the gap. (The encoder graph does run at a healthy GPU share — host
-  overhead is ~0.4ms, ~13% of the encoder phase.)
+- **CORRECTED (Wave F, 2026-07-20):** the "~2.8ms flat" figure above was a
+  measurement artifact, not the encoder's steady-state GPU cost. On a
+  one-shot CLI invocation, `graph_compute` blocks for the full capture+replay
+  duration, so by the time the readback timer starts the GPU is already done
+  and the timer only sees the ~2.7ms D2H tail — that tail was mistakenly
+  recorded as "encoder GPU time." A warm looping harness (matching how the
+  in-tree engine is actually driven) shows the external encoder's real
+  readback-inclusive cost scales with T exactly like the in-tree one: **~5ms
+  short (Tp=93), ~7.5ms medium (Tp=279), ~29ms long (Tp=930)** — both engines
+  agree within noise at every tier. A compute-bound matmul-heavy encoder
+  cannot be flat across a 10x range of Tp; it must scale with T, and it does.
+  The in-tree encoder was independently confirmed to be running steady-state
+  captured (stable uid, no per-call rebuild), on the f16 tensor-core cuBLAS
+  path (266/293 matmuls f16; the remaining 27 f32 are inherent — relpos skew
+  matmul + subsampling convs, f32 in the external repo too), with the
+  NORM+MUL+ADD fusion and depthwise-direct conv both engaged, and no
+  avoidable node bloat (2037 nodes, identical to external). **The encoder is
+  at its hardware floor on both engines; it is not the source of any
+  in-tree-vs-external or in-tree-vs-PyTorch-peak gap.**
 - **The decode (TDT loop) is the dominant cost** for medium/long. It's an
   inherently serial, data-dependent loop: each step's argmax determines the
   next token, so it cannot be captured as one CUDA graph. The K-step multistep

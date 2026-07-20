@@ -8,6 +8,7 @@
 #include "subsampling.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph_builder.hpp"
+#include "runtime/lru_cache.hpp"
 
 #include <memory>
 #include <unordered_map>
@@ -25,6 +26,10 @@ public:
 
     int proj_dim() const { return (int)config_.joint_hidden; }
 
+    // Current number of cached per-T encoder graphs (diagnostic + the Wave H
+    // bounded-LRU regression-test hook). Zero before first GPU encode.
+    size_t cache_size() const;
+
 private:
     struct ReplayEntry {
         int T = 0;
@@ -34,7 +39,8 @@ private:
         std::unique_ptr<ReplayGraph> graph;
     };
     struct ReplayCache {
-        std::unordered_map<int, std::unique_ptr<ReplayEntry>> by_T;
+        LruCache<int, ReplayEntry> by_T;
+        explicit ReplayCache(size_t cap) : by_T(cap) {}
         void clear() { by_T.clear(); }
     };
 
