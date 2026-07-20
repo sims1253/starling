@@ -76,7 +76,17 @@ A model-independent segmentation contract is worth adopting after the in-tree
 CLI exists. It should remain outside model inference so accuracy/performance can
 be benchmarked with and without segmentation.
 
-### 5. Release and binding discipline
+### 5. Decode flash attention as a measured MOSS candidate
+
+`transcribe.cpp` uses ggml flash attention, including native grouped-query
+attention and valid-KV views, across its LLM-style decoders. Starling's MOSS
+decode currently does not call `ggml_flash_attn_ext` even though the pinned ggml
+exposes it. This is worth a **default-off, token-gated experiment**, not an
+assumed win: MOSS decode is already near its weight-streaming floor and its long
+fixture contains a known near-tie, so any reduction-order change can flip a
+token. Benchmark only after exact short/medium/long IDs and text pass.
+
+### 6. Release and binding discipline
 
 `transcribe.cpp` supplies a minimal C example, generated bindings, versioned ABI
 metadata, model converters, quantization tools, and canonical model artifacts.
@@ -114,9 +124,11 @@ risk for future Starling-owned ports. It does **not** remove the need to:
 - benchmark Starling's own runtime under the GPU lock,
 - review license compatibility per checkpoint.
 
-Good candidates are evaluated in `docs/ggml-roadmap.md`; the likely shortest
-paths are models that reuse an engine already present in `cpp/` (FastConformer /
-transducer reuse from Parakeet, or Qwen3 decoder reuse from MOSS).
+Good candidates are evaluated in `docs/ggml-roadmap.md`. The shortest path is
+Parakeet Unified: `transcribe.cpp` demonstrates that RNN-T is a configuration of
+the same Parakeet family (no duration head/classes), so Starling can reuse its
+FastConformer, prediction, joint, and K-step infrastructure. Qwen3-ASR follows
+because its Qwen3 decoder can reuse MOSS's device-resident runtime.
 
 ## Immediate actions
 

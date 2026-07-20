@@ -85,10 +85,13 @@ audio path has no routed experts; see `docs/ggml-moss-spec.md`.
 Landed: Starling-owned GGUF conversion/loading, staged goldens, exact mel/audio
 encoder/adapter/prompt merge, exact greedy IDs/text, whole-model captured
 prefill/decode, device-resident KV, K-step decode, captured encoder, parallel
-mel, OOB tail protection, and bounded replay caches. Future MOSS work should be
-profile-led. The most plausible safe target is frontend/encoder or prefill
-latency on short/medium audio; decode is already near the PyTorch per-token
-floor and long end-to-end is already faster than the PyTorch path.
+mel, OOB tail protection, and bounded replay caches. Future MOSS work should be profile-led. The most plausible safe targets are
+frontend/encoder or prefill latency on short/medium audio. A second,
+competitor-derived experiment is default-off `ggml_flash_attn_ext` in decode
+with native GQA and valid-KV views; it requires exact token/text gates before
+benchmarking because MOSS long has a known near-tie. Decode is already near the
+PyTorch per-token floor and long end-to-end is already faster than PyTorch, so
+do not assume a large payoff.
 
 ### Phase 3 — parakeet perf closure (mostly landed)
 
