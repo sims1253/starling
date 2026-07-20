@@ -70,6 +70,28 @@ def test_live_local_holder_is_never_stolen_regardless_of_age(
         gpu_lock.release_gpu_lock(owner)
 
 
+def test_spawn_gpu_subprocess_keeps_lock_after_parent_release(
+        tmp_path, monkeypatch) -> None:
+    """The compatibility API must cover real benchmark server subprocesses."""
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr("starling.gpu.session._query_gpu_uuids",
+                        lambda: ["GPU-SHIM"])
+    owner = gpu_lock.acquire_gpu_lock(
+        session="parent", model="test", wait=False)
+    child = gpu_lock.spawn_gpu_subprocess(["sleep", "60"])
+    try:
+        assert gpu_lock.release_gpu_lock(owner) is True
+        with pytest.raises(gpu_lock.GpuLockBusy):
+            gpu_lock.acquire_gpu_lock(
+                session="probe", model="test", wait=False)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    probe = gpu_lock.acquire_gpu_lock(
+        session="probe", model="test", wait=False)
+    gpu_lock.release_gpu_lock(probe)
+
+
 def test_dead_holder_releases_the_lock_immediately(tmp_path, monkeypatch) -> None:
     """A holder that dies releases the lock at once (flock closes with the fd).
 

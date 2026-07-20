@@ -1168,7 +1168,8 @@ class GgmlParakeet(Engine):
             "--host", GGML_PARAKEET_HOST,
             "--port", str(port),
         ]
-        self._proc = subprocess.Popen(
+        from starling.parakeet.gpu_lock import spawn_gpu_subprocess
+        self._proc = spawn_gpu_subprocess(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=dict(os.environ),
         )
@@ -1490,7 +1491,8 @@ class GgmlMoss(Engine):
             "-l", "en",   # skip LID pre-step (server-stability critical)
             "-nt",        # transcript text only, no timestamps
         ]
-        self._proc = subprocess.Popen(
+        from starling.parakeet.gpu_lock import spawn_gpu_subprocess
+        self._proc = spawn_gpu_subprocess(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=dict(os.environ),
         )

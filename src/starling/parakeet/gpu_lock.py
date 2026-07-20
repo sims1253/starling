@@ -87,6 +87,20 @@ def acquire_gpu_lock(
     return owner_id
 
 
+def spawn_gpu_subprocess(args, *, owner_id: str | None = None, **popen_kwargs):
+    """Spawn a GPU subprocess that inherits the currently-held lock.
+
+    Persistent native benchmark servers must use this instead of bare
+    ``subprocess.Popen`` so they keep exclusivity if the Python parent exits.
+    """
+    sess = _sessions()
+    key = owner_id or getattr(_LOCAL, "last_owner", None)
+    gs = sess.get(key) if key else None
+    if gs is None:
+        raise RuntimeError("spawn_gpu_subprocess requires an acquired GPU lock")
+    return gs.spawn(args, **popen_kwargs)
+
+
 def release_gpu_lock(owner_id: str | None = None) -> bool:
     """Release the lock for ``owner_id`` (or the last acquirer).
 
