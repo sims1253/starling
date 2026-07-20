@@ -96,9 +96,20 @@ def spawn_gpu_subprocess(args, *, owner_id: str | None = None, **popen_kwargs):
     sess = _sessions()
     key = owner_id or getattr(_LOCAL, "last_owner", None)
     gs = sess.get(key) if key else None
-    if gs is None:
-        raise RuntimeError("spawn_gpu_subprocess requires an acquired GPU lock")
-    return gs.spawn(args, **popen_kwargs)
+    if gs is not None:
+        return gs.spawn(args, **popen_kwargs)
+
+    # Standalone engine/test use: acquire solely for the child, pass the fd,
+    # then close the parent's reference. The child remains the kernel owner.
+    gs = GpuSession(
+        session="native-subprocess", model="external", note="auto child lock",
+        install_signal_handlers=False,
+    )
+    gs.acquire()
+    try:
+        return gs.spawn(args, **popen_kwargs)
+    finally:
+        gs.release()
 
 
 def release_gpu_lock(owner_id: str | None = None) -> bool:
