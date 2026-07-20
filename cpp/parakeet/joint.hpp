@@ -21,8 +21,10 @@
 #pragma once
 
 #include "config.hpp"
+#include "prediction.hpp"  // PredictionNet, PredState (for step_fused_argmax)
 #include "runtime/model_loader.hpp"
 
+#include <memory>
 #include <vector>
 
 namespace starling::ggml::parakeet {
@@ -30,6 +32,7 @@ namespace starling::ggml::parakeet {
 class Joint {
 public:
     Joint(const ModelLoader& ml, const Config& cfg);
+    ~Joint();  // out-of-line: FusedReplay is only complete in the .cpp
 
     // Run the joint graph for one (enc_proj_t, g) step and read back the full
     // [V_plus] logits vector. One run_graph call (CPU reference path).
@@ -48,12 +51,40 @@ public:
                      const float* g, int pred_hidden,
                      int& k_out, int& d_k_out) const;
 
+    // GPU fast path for the TDT serial decode loop: ONE ReplayGraph spanning
+    // the prediction LSTM + joint + token/duration argmax, so the prediction
+    // output g flows pred -> joint ENTIRELY on the device (no host round-trip)
+    // and only ONE host<-device sync happens per step (vs two for pred.step +
+    // step_argmax). Byte-identical to pred.step + step_argmax (same math, same
+    // ggml ops, same argmax tie-break); g simply never leaves the device. The
+    // K-step multistep path also uses this for its eager step-0 init.
+    //
+    //   pred:        the prediction net (supplies the LSTM weights + embedding).
+    //   enc_proj_t:  joint enc-projection row for frame t ([joint_hidden]).
+    //   token_count: vocab + 1 (the token-slice width).
+    //   token_id/is_sos: embedding lookup for the prediction-net input.
+    //   in_state:    committed LSTM (h, c) per layer.
+    //   out_state:   OUT new LSTM (h', c') per layer (carried to the next emit).
+    //   k_out:       OUT argmax over logits[0:token_count).
+    //   d_k_out:     OUT argmax over logits[token_count:V_plus).
+    void step_fused_argmax(const PredictionNet& pred,
+                           const float* enc_proj_t, int token_count,
+                           int32_t token_id, bool is_sos,
+                           const PredState& in_state,
+                           PredState& out_state,
+                           int& k_out, int& d_k_out) const;
+
     int joint_hidden() const { return joint_hidden_; }
     int pred_hidden() const  { return pred_hidden_; }
     int enc_hidden() const   { return enc_hidden_; }
     int vocab_size() const   { return vocab_size_; }
     int num_durations() const { return num_durations_; }
     int V_plus() const       { return V_plus_; }
+
+    // Access used by the fused TDT decode step (ONE graph spanning the
+    // prediction LSTM + joint + argmax to keep g on-device between them) and
+    // the K-step multistep graph (to clone the joint weights as graph leaves).
+    const ModelLoader& model_loader() const { return ml_; }
 
 private:
     const ModelLoader& ml_;
@@ -63,6 +94,12 @@ private:
     int vocab_size_    = 0;  // config.vocab_size (= 8192)
     int num_durations_ = 0;  // config.tdt_durations.size() (= 5)
     int V_plus_        = 0;  // vocab + 1 + num_durations (= 8198)
+
+    // GPU-only: replayable FUSED prediction-LSTM + joint + argmax graph (one
+    // sync per step). Lazily built on the first step_fused_argmax. Incomplete in
+    // the header (ReplayGraph stays in the .cpp).
+    struct FusedReplay;
+    mutable std::unique_ptr<FusedReplay> fused_replay_;
 };
 
 } // namespace starling::ggml::parakeet

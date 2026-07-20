@@ -31,6 +31,7 @@
 #include "runtime/model_loader.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace starling::ggml::parakeet {
@@ -44,11 +45,8 @@ struct PredState {
 
 class PredictionNet {
 public:
-    PredictionNet(const ModelLoader& ml, const Config& cfg)
-        : ml_(ml),
-          H_((int)cfg.pred_hidden),
-          vocab_p1_((int)cfg.vocab_size + 1),
-          n_layers_((int)cfg.pred_rnn_layers > 0 ? (int)cfg.pred_rnn_layers : 1) {}
+    PredictionNet(const ModelLoader& ml, const Config& cfg);
+    ~PredictionNet();  // out-of-line: StepReplay is only complete in the .cpp
 
     // Returns a zero-initialised LSTM state (h and c each [hidden] zeros).
     PredState zero_state() const;
@@ -68,11 +66,23 @@ public:
     int num_layers() const  { return n_layers_; }
     int vocab_p1() const    { return vocab_p1_; }
 
+    // Access used by the fused TDT decode step (Joint::step_fused_argmax) and
+    // the K-step multistep graph: the loader (to clone the LSTM weights as
+    // zero-copy graph leaves) and the host embedding table (to pack the
+    // layer-0 input exactly like step()). embed_host() is lazily populated on
+    // the first step() call (see ensure_embed_host_).
+    const ModelLoader& model_loader() const { return ml_; }
+    const std::vector<float>& embed_host() const { return embed_host_; }
+
 private:
     const ModelLoader& ml_;
     int H_;          // pred_hidden
     int vocab_p1_;   // vocab + 1 (embedding rows, incl. blank)
     int n_layers_;   // pred_rnn_layers (stacked LSTM layers)
+
+    // GPU-only: replayable per-step LSTM graph, lazily built on first step().
+    struct StepReplay;
+    mutable std::unique_ptr<StepReplay> replay_;
 
     // Host-side copy of the embedding table, lazily fetched on the first step()
     // via the loader tensor's ->data (the loader backs the tensor with the GGUF
