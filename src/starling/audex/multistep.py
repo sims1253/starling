@@ -20,6 +20,8 @@ import torch
 from .config import EOS_TOKEN_ID
 from .llm_mega import FusedLLMMega, GenerateResult
 
+from .._kernels._compile import torch_compile
+
 
 class MultiStepLLMMega(FusedLLMMega):
     """K-step CUDA-graph-captured greedy decoder for the Nemotron-Dense LLM."""
@@ -50,7 +52,7 @@ class MultiStepLLMMega(FusedLLMMega):
         self.steps_per_replay = max(1, int(steps_per_replay))
         self.K = self.steps_per_replay
         if compile_decode:
-            self._decode_step_eager = torch.compile(
+            self._decode_step_eager = torch_compile(
                 self._decode_step_eager, mode="max-autotune-no-cudagraphs"
             )
 

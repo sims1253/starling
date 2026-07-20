@@ -43,6 +43,8 @@ import torch
 
 from .config import LLM_EOS_TOKEN_ID
 
+from .._kernels._compile import torch_compile
+
 
 # ---------------------------------------------------------------------------
 # Result containers
@@ -129,7 +131,7 @@ class MossLLMMega:
         # inductor fuses the PyTorch elementwise glue + attention into far fewer
         # kernels, ~3.8x faster).  Verified byte-exact vs the eager reference.
         if compile_decode:
-            self._decode_step_eager = torch.compile(  # type: ignore[method-assign]
+            self._decode_step_eager = torch_compile(  # type: ignore[method-assign]
                 self._decode_step_eager,
                 mode="max-autotune-no-cudagraphs",
                 fullgraph=False,

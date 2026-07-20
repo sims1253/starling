@@ -1,14 +1,15 @@
 """Reference (stock-style) eager greedy decoder for MOSS-Transcribe.
 
-This is the byte-exact golden path.  It runs the audio encoder + adapter with
-the model's own modules, merges audio embeddings exactly as
-``MossModel.forward`` does, then greedy-decodes with the Qwen3 ``language_model``
-over a ``transformers.StaticCache`` using a precomputed 4D attention mask (the
-same trick as ``starling.granite.llm_mega``: a 4D mask makes
-``create_causal_mask`` early-exit so no CPU scalar is allocated during capture).
+This is the token-exact golden path. It runs the audio encoder + adapter with
+the model's own eager modules, merges audio embeddings exactly as
+``MossModel.forward`` does, then greedy-decodes with the Qwen3
+``language_model`` over an exact-width ``transformers.DynamicCache``. The model
+builds its causal mask internally; avoiding padded StaticCache attention keeps
+bf16 near-ties independent of the chosen cache capacity.
 
-The decoded token sequence from here IS the golden reference the megakernel
-must reproduce bit-for-bit.
+The decoded token sequence from here is the golden reference the native engines
+must reproduce exactly. Intermediate floating tensors retain documented ULP
+tolerances (see ``docs/ggml-moss-goldens.md``).
 """
 
 from __future__ import annotations
@@ -54,32 +55,35 @@ def greedy_generate(
     eos_token_id: int = LLM_EOS_TOKEN_ID,
     max_cache_len: int = 1024,
 ) -> torch.Tensor:
-    """Eager greedy decode over a StaticCache.  Returns (1, n_new) int64 on CPU."""
-    from transformers.cache_utils import StaticCache
+    """Eager greedy decode over an exact-width DynamicCache.
+
+    Exact-width (unpadded) attention is the canonical eager math: a
+    StaticCache pads every attention to max_cache_len with masked zeros,
+    whose f32 softmax reduction-order differences flip bf16 near-ties
+    (observed: golden medium/long token 21).  Returns (1, n_new) int64 on
+    CPU."""
+    from transformers.cache_utils import DynamicCache
 
     comps = _comps(model)
     lm = comps["language_model"]
     lm_head = comps["lm_head"]
     device = inputs_embeds.device
-    dtype = inputs_embeds.dtype
     cfg = lm.config
 
     T = inputs_embeds.shape[1]
     assert T + max_new_tokens <= max_cache_len, f"cache overflow: {T}+{max_new_tokens}>{max_cache_len}"
 
-    cache = StaticCache(config=cfg, max_cache_len=max_cache_len)
-    neg = torch.finfo(dtype).min
-    ar = torch.arange(max_cache_len, device=device)
+    cache = DynamicCache(config=cfg)
 
+    # attention_mask=None: the model builds its own causal mask. Bit-identical
+    # to an explicit 0/-inf bf16 mask (verified on the eager golden path) and
+    # the only form the eager mask builder accepts for decode steps.
     # ---- prefill ----
     pos = torch.arange(T, device=device).unsqueeze(0)
     cp = torch.arange(T, device=device)
-    # 4D causal mask (1,1,T,max_cache_len): key j valid iff j <= query i.
-    q = torch.arange(T, device=device).unsqueeze(1)
-    mask4 = torch.where(ar[None, None, None, :] <= q[None, None, :, :], 0.0, neg).to(dtype)
     out = lm(
         inputs_embeds=inputs_embeds,
-        attention_mask=mask4,
+        attention_mask=None,
         position_ids=pos,
         past_key_values=cache,
         use_cache=True,
@@ -95,10 +99,9 @@ def greedy_generate(
         static_ids.copy_(next_token)
         pos = torch.tensor([[cur]], device=device)
         cp = torch.tensor([cur], device=device)
-        mask4 = torch.where(ar[None, None, None, :] <= cur, 0.0, neg).to(dtype)
         out = lm(
             input_ids=static_ids,
-            attention_mask=mask4,
+            attention_mask=None,
             position_ids=pos,
             past_key_values=cache,
             use_cache=True,

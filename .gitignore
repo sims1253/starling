@@ -24,7 +24,13 @@ tests/fixtures/leaderboard_corpus/
 
 # internal coordination / runtime locks (not for publication)
 comms.md
+review.md
 .gpu.lock
+
+# agent-tool working state (accidentally swept in by a git add . in 918da17)
+.claude/
+.zcode/
+plans/
 
 # test/lint caches
 .pytest_cache/
@@ -38,3 +44,9 @@ comms.md
 
 # downloaded model checkpoints (never check these in)
 .hf-cache/
+
+# ggml patch-apply flock sentinel (scripts/apply_ggml_patches.sh)
+third_party/.ggml-patch.lock
+
+# CMake build output (libstarling_ggml)
+/build/

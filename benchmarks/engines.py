@@ -39,6 +39,10 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
+# ctypes float* for the in-process parakeet C API (see _ggml_parakeet_native).
+import ctypes as _ctypes
+_c_float_p = _ctypes.POINTER(_ctypes.c_float)
+
 
 class SkipCell(Exception):
     """Raised when a (model, engine, length, batch) cell is infeasible.
@@ -77,6 +81,52 @@ _PARAKEET_CPP_ENV = {
     "HOME": str(Path.home()),
     "LD_LIBRARY_PATH": f"{ASR_BENCH}/bin/parakeet-v0.3.2-bin-linux-cuda-x64",
 }
+
+# parakeet.cpp persistent HTTP server (the "ggml" first-class engine). The
+# one-shot `parakeet-cli` pays the full model-load + CUDA-driver init tax on
+# every utterance (~2 s), so the `parakeet.cpp` engine above is launch-bound.
+# The server (examples/server/parakeet-server) loads the model ONCE and serves
+# many clips over a localhost OpenAI-compatible endpoint, so steady-state
+# latency is mel+encoder+decode only -- the ggml equivalent of the starling
+# pipeline. Override paths/ports with the GGML_PARAKEET_* env vars.
+GGML_PARAKEET_SERVER = Path(os.environ.get(
+    "GGML_PARAKEET_SERVER",
+    Path.home() / "Documents" / "parakeet.cpp" / "build-cuda" / "examples" / "server" / "parakeet-server",
+)).expanduser()
+GGML_PARAKEET_MODEL = Path(os.environ.get(
+    "GGML_PARAKEET_MODEL", str(PARAKEET_CPP_MODEL),
+)).expanduser()
+GGML_PARAKEET_HOST = os.environ.get("GGML_PARAKEET_HOST", "127.0.0.1")
+GGML_PARAKEET_PORT = int(os.environ.get("GGML_PARAKEET_PORT", "0"))  # 0 = pick a free port
+
+# ggml Moss engine: CrispASR's moss-transcribe backend (Qwen3-Omni audio
+# encoder + Qwen3 LLM, ggml/CUDA). The released CrispASR v0.8.2 binary does NOT
+# include the moss-transcribe backend (the source is in the repo but was wired
+# into the build later), so this points at a locally-built CrispASR binary.
+# Override with GGML_MOSS_* env vars.
+#
+# Two invocation paths, both driving the SAME locally-built crispasr binary:
+#   * PERSISTENT SERVER (preferred): `crispasr --server --backend moss-transcribe`
+#     loads the model ONCE and serves clips over a localhost OpenAI-compatible
+#     endpoint (`POST /v1/audio/transcriptions`), mirroring GgmlParakeet. This
+#     removes the ~2 s per-call model-load tax, so steady-state latency is
+#     encoder+decode only (short ~0.4 s vs ~2.5 s one-shot).
+#   * ONE-SHOT CLI (fallback): `crispasr --backend moss-transcribe <wav>` pays
+#     the full model-load tax per call but is always correct + stable. Used when
+#     the server binary is absent, fails to bind, OR crashes mid-bench (see the
+#     server-mode caveats in GgmlMoss's docstring).
+GGML_MOSS_BIN = Path(os.environ.get(
+    "GGML_MOSS_BIN",
+    Path.home() / "Documents" / "CrispASR" / "build" / "bin" / "crispasr",
+)).expanduser()
+GGML_MOSS_MODEL = Path(os.environ.get(
+    "GGML_MOSS_MODEL", str(CRISPASR_MODELS / "moss-transcribe-preview-2b-f16.gguf"),
+)).expanduser()
+# The persistent server is the same binary invoked with `--server`. It is
+# optional: if absent or it fails to start, GgmlMoss silently falls back to the
+# one-shot CLI path. Set GGML_MOSS_SERVER=0 to force-disable the server.
+GGML_MOSS_HOST = os.environ.get("GGML_MOSS_HOST", "127.0.0.1")
+GGML_MOSS_PORT = int(os.environ.get("GGML_MOSS_PORT", "0"))  # 0 = pick a free port
 
 
 class Engine:
@@ -1041,6 +1091,521 @@ class ParakeetCpp(Engine):
         return blob.strip()
 
 
+class GgmlParakeet(Engine):
+    """ggml/CUDA first-class engine: mudler's parakeet.cpp via a PERSISTENT server.
+
+    The sibling :class:`ParakeetCpp` engine shells out to ``parakeet-cli`` once
+    per utterance, which pays the full model-load + CUDA-driver init tax (~2 s)
+    on every call -- it is launch-bound, not compute-bound, so its bench number
+    reflects process startup rather than the ggml decode. This engine instead
+    spawns the parakeet.cpp HTTP server (``examples/server/parakeet-server``)
+    ONCE in :meth:`_load`, waits for ``/health``, and serves every utterance
+    over a localhost OpenAI-compatible endpoint. Steady-state latency is then
+    mel + encoder + decode only -- the ggml equivalent of the starling
+    pipeline. Output is byte-exact with the golden (parakeet.cpp is the
+    verified byte-exact ggml port; the server only removes the per-process tax).
+
+    Not batched: the server serialises inference behind a mutex (one clip at a
+    time), so B>1 loops B times on the host -- matching the existing
+    ``parakeet.cpp`` engine contract.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("ggml", "parakeet", supports_batch=False)
+        self._proc: Optional[subprocess.Popen] = None
+        self._port: int = 0
+        self._base_url: str = ""
+        self._native = None  # NativeParakeet when the in-process C API is used
+
+    @property
+    def available(self) -> bool:
+        # The native (in-process) path is preferred: it needs only libparakeet.so
+        # + the model. The HTTP server path is the fallback.
+        try:
+            from _ggml_parakeet_native import available as _native_available
+            if (_native_available() and GGML_PARAKEET_MODEL.exists()
+                    and os.environ.get("GGML_PARAKEET_NATIVE", "1") not in ("", "0")):
+                return True
+        except Exception:
+            pass
+        return GGML_PARAKEET_SERVER.exists() and GGML_PARAKEET_MODEL.exists()
+
+    # -- lifecycle ---------------------------------------------------------
+    def _load(self) -> None:
+        # Prefer the in-process ctypes binding (no HTTP / WAV overhead). Falls
+        # back to the persistent HTTP server if libparakeet.so is absent OR the
+        # caller disabled the native path (GGML_PARAKEET_NATIVE=0) -- e.g. to
+        # isolate ggml's at-exit teardown crash in a separate process (pytest).
+        if os.environ.get("GGML_PARAKEET_NATIVE", "1") not in ("", "0"):
+            try:
+                from _ggml_parakeet_native import NativeParakeet
+                self._native = NativeParakeet(str(GGML_PARAKEET_MODEL))
+                return
+            except Exception:
+                self._native = None
+        self._native = None
+        self._load_server()
+
+    def _load_server(self) -> None:
+        import socket
+        import time as _time
+        import urllib.request
+
+        # pick a free TCP port unless GGML_PARAKEET_PORT pins one
+        port = GGML_PARAKEET_PORT
+        if port == 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((GGML_PARAKEET_HOST, 0))
+            port = s.getsockname()[1]
+            s.close()
+        self._port = port
+        self._base_url = f"http://{GGML_PARAKEET_HOST}:{port}"
+
+        # spawn the server (model load + bind happens here, paid once)
+        cmd = [
+            str(GGML_PARAKEET_SERVER),
+            "--model", str(GGML_PARAKEET_MODEL),
+            "--host", GGML_PARAKEET_HOST,
+            "--port", str(port),
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ),
+        )
+        # wait for /health (model load is ~1-2 s)
+        deadline = _time.time() + 90.0
+        while _time.time() < deadline:
+            if self._proc.poll() is not None:
+                raise RuntimeError(
+                    f"parakeet-server exited rc={self._proc.returncode} before binding"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"{self._base_url}/health", timeout=2
+                ) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                _time.sleep(0.5)
+        raise RuntimeError("parakeet-server did not become healthy in 90 s")
+
+    def _release(self) -> None:
+        # native path: free the in-process context (drops the ggml model).
+        if self._native is not None:
+            try:
+                self._native.close()
+            except Exception:
+                pass
+            self._native = None
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._base_url = ""
+        self._port = 0
+
+    # -- inference ---------------------------------------------------------
+    def _run_one(self, audio: np.ndarray) -> str:
+        # Native path: feed raw float32 PCM straight to the C API. No HTTP, no
+        # WAV encode/decode -- the lowest-overhead Python->ggml bridge.
+        if self._native is not None:
+            pcm = np.ascontiguousarray(audio, dtype=np.float32)
+            ptr = pcm.ctypes.data_as(_c_float_p)
+            return self._native.transcribe_pcm(ptr, pcm.size, 16000, 0).strip()
+        return self._run_one_http(audio)
+
+    def _run_one_http(self, audio: np.ndarray) -> str:
+        import io
+        import json as _json
+        import uuid
+        import urllib.request
+
+        # render 16 kHz mono PCM16 WAV in memory (no disk roundtrip)
+        import soundfile as sf
+        buf = io.BytesIO()
+        sf.write(buf, audio, 16000, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+
+        boundary = "----pkbench" + uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+            b"Content-Type: audio/wav\r\n\r\n"
+            + wav_bytes + b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            f"{self._base_url}/v1/audio/transcriptions", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as r:
+            out = _json.loads(r.read().decode())
+        return out.get("text", "").strip()
+
+
+# Model path + env for Starling's OWN in-tree ggml engine (libstarling_ggml).
+# The .so is built from cpp/ (cmake -B build -DSTARLING_GGML_CUDA=ON
+# -DSTARLING_GGML_SHARED=ON) and discovered by src/starling/_ggml/_native.py via
+# STARLING_GGML_LIB / build dir. Override with STARLING_GGML_PARAKEET_MODEL.
+STARLING_GGML_PARAKEET_MODEL = Path(os.environ.get(
+    "STARLING_GGML_PARAKEET_MODEL",
+    str(CRISPASR_MODELS / "tdt-0.6b-v3-f16.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlParakeet(Engine):
+    """Starling's OWN in-tree ggml engine (libstarling_ggml).
+
+    Drives Starling's first-party C++/ggml implementation of parakeet-tdt
+    (built from cpp/, the universal-backend sibling to the PyTorch peak path)
+    in-process via ctypes. Byte-exact vs the golden on short/medium/long (the
+    text gate). This is the long-term replacement for :class:`GgmlParakeet`
+    (which drives mudler's external parakeet.cpp); both coexist during the
+    transition so they can be A/B'd.
+
+    OPTIONAL: the engine activates only if libstarling_ggml loads + the model
+    is present. The pure-Python Starling install keeps working when the C++ is
+    unbuilt (starling._ggml.available() returns False).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "parakeet", supports_batch=False)
+        self._model = None  # starling._ggml.GgmlModel
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_PARAKEET_MODEL.exists()
+        except Exception:
+            return False
+
+    # -- lifecycle ---------------------------------------------------------
+    def _load(self) -> None:
+        from starling._ggml import GgmlModel, PARAKEET_TDT
+        self._model = GgmlModel(PARAKEET_TDT, str(STARLING_GGML_PARAKEET_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    # -- inference ---------------------------------------------------------
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        text = self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000)
+        return text.strip()
+
+
+def _starling_ggml_parakeet_keys() -> list[str]:
+    """Starling's in-tree ggml engine (libstarling_ggml). Skipped if the .so
+    isn't built or the model is absent."""
+    if StarlingGgmlParakeet().available:
+        return ["starling-ggml-parakeet"]
+    return []
+
+# MOSS uses the same shared C API as parakeet; this separate path keeps the
+# model artifact independently configurable during the Phase-2 rollout.
+STARLING_GGML_MOSS_MODEL = Path(os.environ.get(
+    "STARLING_GGML_MOSS_MODEL",
+    str(REPO_ROOT / "models" / "moss-transcribe-preview-2b-bf16-exact.gguf"),
+)).expanduser()
+
+class StarlingGgmlMoss(Engine):
+    """Starling's in-tree MOSS ggml engine, driven directly through ctypes."""
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "moss", supports_batch=False)
+        self._model = None
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_MOSS_MODEL.exists()
+        except Exception:
+            return False
+
+    def _load(self) -> None:
+        from starling._ggml import GgmlModel, MOSS
+        self._model = GgmlModel(MOSS, str(STARLING_GGML_MOSS_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
+
+def _starling_ggml_moss_keys() -> list[str]:
+    if StarlingGgmlMoss().available:
+        return ["starling-ggml-moss"]
+    return []
+
+
+class GgmlMoss(Engine):
+    """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend.
+
+    Drives the locally-built CrispASR binary (the released v0.8.2 binary omits
+    the moss-transcribe backend) with ``--backend moss-transcribe`` on the F16
+    Moss GGUF. The moss model is MOSS-Transcribe-preview-2B (Qwen3-Omni Whisper-
+    style audio encoder + Qwen3-1.7B LLM) -- NOT MoE despite the encoder class
+    name (zero expert weights in the checkpoint).
+
+    TWO invocation paths, server preferred (load model once) with a one-shot
+    CLI fallback that is always correct:
+
+      * PERSISTENT SERVER -- ``crispasr --server --backend moss-transcribe``
+        loads the model ONCE in :meth:`_load` and serves every clip over a
+        localhost OpenAI-compatible endpoint (``POST /v1/audio/transcriptions``),
+        mirroring :class:`GgmlParakeet`. Steady-state latency is encoder+decode
+        only: ~0.4 s on short vs ~2.5 s for the one-shot CLI.
+
+      * ONE-SHOT CLI (fallback) -- ``crispasr --backend moss-transcribe <wav>``
+        pays the full model-load tax per call. Used when the server binary is
+        absent, fails to bind, OR has crashed mid-bench: :meth:`_run_one`
+        detects a dead server (connection refused / timeout / closed) and
+        transparently reruns that clip through the CLI, then pins the engine to
+        CLI mode so subsequent calls skip the dead server.
+
+    Server-mode caveats (CrispASR 0.8.6, upstream bugs, not fixable from
+    Starling):
+
+      * The implicit LID (whisper-tiny) pre-step shares the ggml CUDA
+        backend/scheduler with moss and corrupts the moss context across
+        requests -> the server segfaults on the 2nd transcription. Passing
+        ``-l en`` skips LID entirely, which makes the server stable.
+      * ``--chunk-seconds 3600`` (the single-chunk path that matches the
+        one-shot CLI / golden structure on medium/long) triggers a KV-cache
+        resize crash on repeated large-context requests in server mode. The
+        server therefore uses the default 30 s chunking (stable); the CLI
+        fallback keeps ``--chunk-seconds 3600`` (single chunk, byte-identical
+        to the golden-structure reference). On short/medium audio (< 30 s) the
+        two chunking modes coincide, so the server and CLI agree there.
+      * The moss backend ignores ``-n`` / ``--max-new-tokens`` (its C API has
+        no token-cap field; ``max_new = 512`` is hardcoded in moss_transcribe),
+        so that flag is NOT passed -- it would be silently dropped anyway.
+
+    Byte-exactness: byte-exact on SHORT (the correctness gate). On medium/long
+    CrispASR's ggml f16-KV-cache decode diverges from the golden's HF bf16 eager
+    greedy path at low-confidence repetition boundaries -- it emits ``eyes. It``
+    (period + capital) where the golden emits ``eyes it``. This is an inherent
+    numeric-path divergence (not a flag): normalized CER is 0.0 on medium and
+    <0.02 on long. See ``tests/test_ggml_parity.py`` and ``docs/ggml-engine.md``.
+
+    Not batched; B>1 loops on the host (the server serialises behind a mutex).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("ggml", "moss", supports_batch=False)
+        self._wav_path: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._port: int = 0
+        self._base_url: str = ""
+        # Once the server has crashed mid-bench, pin to the CLI fallback for the
+        # rest of this engine's life (avoids re-probing a dead process per call).
+        self._server_disabled: bool = False
+
+    @property
+    def available(self) -> bool:
+        return GGML_MOSS_BIN.exists() and GGML_MOSS_MODEL.exists()
+
+    # -- lifecycle ---------------------------------------------------------
+    def _load(self) -> None:
+        import tempfile
+
+        # The CLI fallback writes hypothesis audio here; also used as the WAV
+        # source if the server path is unavailable.
+        self._tmp = tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, dir=str(REPO_ROOT)
+        )
+        self._tmp.close()
+        self._wav_path = self._tmp.name
+
+        # Try the persistent server first (big speedup when it comes up). Any
+        # failure (binary absent, disabled via env, bind error, health-probe
+        # timeout) silently falls through to the one-shot CLI path.
+        if os.environ.get("GGML_MOSS_SERVER", "1") not in ("", "0"):
+            try:
+                self._load_server()
+                return
+            except Exception:
+                # Server did not come up -- tear down any half-spawned process
+                # and continue with the CLI fallback.
+                self._teardown_server()
+        self._server_disabled = True
+
+    def _load_server(self) -> None:
+        import socket
+        import time as _time
+        import urllib.request
+
+        if not GGML_MOSS_BIN.exists():
+            raise RuntimeError("crispasr binary absent; cannot start server")
+
+        # Pick a free TCP port unless GGML_MOSS_PORT pins one.
+        port = GGML_MOSS_PORT
+        if port == 0:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((GGML_MOSS_HOST, 0))
+            port = s.getsockname()[1]
+            s.close()
+        self._port = port
+        self._base_url = f"http://{GGML_MOSS_HOST}:{port}"
+
+        # Spawn the server. -l en is REQUIRED: without it the implicit LID
+        # (whisper-tiny) pre-step corrupts the moss context across requests and
+        # the server segfaults on the 2nd transcription. Default 30 s chunking
+        # is used (stable in server mode); --chunk-seconds 3600 crashes on
+        # repeated large-context requests. See the class docstring.
+        cmd = [
+            str(GGML_MOSS_BIN),
+            "--server",
+            "--backend", "moss-transcribe",
+            "-m", str(GGML_MOSS_MODEL),
+            "--gpu-backend", "cuda",
+            "--host", GGML_MOSS_HOST,
+            "--port", str(port),
+            "-l", "en",   # skip LID pre-step (server-stability critical)
+            "-nt",        # transcript text only, no timestamps
+        ]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ),
+        )
+        # Wait for /health (model load is ~1-2 s).
+        deadline = _time.time() + 90.0
+        while _time.time() < deadline:
+            if self._proc.poll() is not None:
+                raise RuntimeError(
+                    f"crispasr-server exited rc={self._proc.returncode} before binding"
+                )
+            try:
+                with urllib.request.urlopen(
+                    f"{self._base_url}/health", timeout=2
+                ) as r:
+                    if r.status == 200:
+                        return
+            except Exception:
+                _time.sleep(0.5)
+        raise RuntimeError("crispasr-server did not become healthy in 90 s")
+
+    def _teardown_server(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._base_url = ""
+        self._port = 0
+
+    def _release(self) -> None:
+        self._teardown_server()
+        if self._wav_path and os.path.exists(self._wav_path):
+            try:
+                os.unlink(self._wav_path)
+            except OSError:
+                pass
+        self._wav_path = None
+
+    # -- inference ---------------------------------------------------------
+    def _run_one(self, audio: np.ndarray) -> str:
+        # Server path (preferred). On ANY failure (server crashed between calls,
+        # connection refused, timeout, empty body), fall back to the one-shot CLI
+        # for this clip and pin the engine to CLI mode for the rest of the run.
+        if self._base_url and not self._server_disabled:
+            try:
+                return self._run_one_http(audio)
+            except Exception:
+                # Server is unreliable from here on -- tear it down and rerun
+                # this one clip through the always-correct CLI fallback.
+                self._teardown_server()
+                self._server_disabled = True
+        return self._run_one_cli(audio)
+
+    def _run_one_http(self, audio: np.ndarray) -> str:
+        import io
+        import json as _json
+        import uuid
+        import urllib.request
+
+        import soundfile as sf
+
+        # Render 16 kHz mono PCM16 WAV in memory (no disk roundtrip), mirroring
+        # GgmlParakeet._run_one_http's multipart POST.
+        buf = io.BytesIO()
+        sf.write(buf, audio, 16000, format="WAV", subtype="PCM_16")
+        wav_bytes = buf.getvalue()
+        boundary = "----pkbench" + uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+            b"Content-Type: audio/wav\r\n\r\n"
+            + wav_bytes + b"\r\n--" + boundary.encode() + b"--\r\n"
+        )
+        req = urllib.request.Request(
+            f"{self._base_url}/v1/audio/transcriptions", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as r:
+            out = _json.loads(r.read().decode())
+        text = out.get("text", "").strip()
+        if not text:
+            raise RuntimeError("crispasr-server returned empty transcript")
+        return text
+
+    def _run_one_cli(self, audio: np.ndarray) -> str:
+        import soundfile as sf
+
+        sf.write(self._wav_path, audio, 16000, subtype="PCM_16")
+        # --chunk-seconds 3600 forces the single-chunk path (avoids the
+        # moss-transcribe chunk-boundary instability on long audio in the CLI).
+        # -l en skips the LID pre-step (no effect on the moss decode output;
+        # matches the server path's flags). -nt emits just the transcript text.
+        # NOTE: -n / --max-new-tokens is intentionally omitted -- the moss C API
+        # ignores it (max_new=512 hardcoded); passing it is a silent no-op.
+        cmd = [
+            str(GGML_MOSS_BIN),
+            "--backend", "moss-transcribe",
+            "-m", str(GGML_MOSS_MODEL),
+            "-f", self._wav_path,
+            "--chunk-seconds", "3600",
+            "--gpu-backend", "cuda",
+            "-l", "en",   # skip LID (matches server; no effect on decode)
+            "-nt",
+        ]
+        env = dict(os.environ)
+        try:
+            p = subprocess.run(
+                cmd, capture_output=True, text=True, env=env,
+                cwd=str(GGML_MOSS_BIN.parent.parent), timeout=240,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"ggml-moss timed out: {e}") from e
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"ggml-moss failed (rc={p.returncode}):\n{p.stderr[-1000:]}"
+            )
+        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+        return lines[-1] if lines else ""
+
+
 # ====================================================================== #
 # Registry + filter resolution
 # ====================================================================== #
@@ -1105,6 +1670,22 @@ def _parakeet_cpp_keys() -> list[str]:
     return []
 
 
+def _ggml_parakeet_keys() -> list[str]:
+    """The persistent-server ggml engine (first-class). Skipped if the
+    parakeet-server binary or model is absent."""
+    if GgmlParakeet().available:
+        return ["ggml-parakeet"]
+    return []
+
+
+def _ggml_moss_keys() -> list[str]:
+    """The CrispASR moss-transcribe ggml engine. Skipped if the local CrispASR
+    binary (with the moss-transcribe backend) or the F16 Moss GGUF is absent."""
+    if GgmlMoss().available:
+        return ["ggml-moss"]
+    return []
+
+
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
@@ -1121,7 +1702,9 @@ def available_keys() -> list[str]:
     """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
     return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
-            + _crispasr_keys() + _parakeet_cpp_keys())
+            + _crispasr_keys() + _parakeet_cpp_keys()
+            + _ggml_parakeet_keys() + _ggml_moss_keys()
+            + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys())
 
 
 def build_engines(
@@ -1153,6 +1736,20 @@ def build_engines(
             chosen[mdl].append(CrispASR(backend_gguf[0], backend_gguf[1], mdl))
         elif key.startswith("parakeet.cpp-"):
             chosen[mdl].append(ParakeetCpp())
+        elif key.startswith("ggml-"):
+            # the ggml first-class engine family: parakeet (persistent server /
+            # in-process) and moss (CrispASR moss-transcribe).
+            if mdl == "parakeet":
+                chosen[mdl].append(GgmlParakeet())
+            elif mdl == "moss":
+                chosen[mdl].append(GgmlMoss())
+        elif key.startswith("starling-ggml-"):
+            # Starling's OWN in-tree ggml engine (libstarling_ggml). Currently
+            # parakeet and MOSS share the model-tagged C API.
+            if mdl == "parakeet":
+                chosen[mdl].append(StarlingGgmlParakeet())
+            elif mdl == "moss":
+                chosen[mdl].append(StarlingGgmlMoss())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

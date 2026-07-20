@@ -55,6 +55,14 @@ def load_model_and_processor(
         torch_dtype=dtype,
         attn_implementation=attn_impl,
     ).to(device)
+    # from_pretrained(attn_implementation=...) only reaches the top-level
+    # config; the LLM/audio sub-configs keep their default ("sdpa"), which
+    # silently puts the "eager" golden path on the mem-efficient SDPA kernel
+    # (bf16-nondeterministic across attention kernels). Propagate explicitly.
+    for module in model.modules():
+        cfg = getattr(module, "config", None)
+        if cfg is not None and hasattr(cfg, "_attn_implementation"):
+            cfg._attn_implementation = attn_impl
     model.eval()
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID)

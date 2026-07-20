@@ -2421,7 +2421,7 @@ dependencies = [
     { name = "torchaudio" },
     { name = "torchcodec" },
     { name = "transformers" },
-    { name = "triton" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
     { name = "whisper-normalizer" },
 ]
 
@@ -2451,7 +2451,7 @@ requires-dist = [
     { name = "torchaudio", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchcodec", specifier = ">=0.14.0" },
     { name = "transformers", git = "https://github.com/huggingface/transformers?rev=1048e9af78a6045444244412dfe216ba5810e7fb" },
-    { name = "triton", specifier = ">=3.6" },
+    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6" },
     { name = "whisper-normalizer", specifier = ">=0.1.12" },
 ]
 provides-extras = ["dev"]

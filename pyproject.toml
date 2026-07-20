@@ -6,7 +6,11 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.11",
     "torchaudio>=2.11",
-    "triton>=3.6",
+    # Triton ships no official Windows wheels (experimental at best).  Mark it
+    # Linux-only so `pip install` / `uv sync` succeeds on Windows; the
+    # `starling._kernels` package then auto-selects the torch backend.  See
+    # src/starling/_kernels/__init__.py.
+    "triton>=3.6 ; sys_platform == 'linux'",
     "transformers",
     "accelerate",
     "numpy",

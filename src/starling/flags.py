@@ -165,6 +165,24 @@ class OptFlags:
     factorisation (SlimSpec, arXiv:2605.10453).  4-5x faster draft head, no
     acceptance ceiling.  Composes with the existing CTC-BPE draft path."""
 
+    # ------------------------------------------------------------------
+    # Cross-platform kernel backend (Windows support).
+    # ------------------------------------------------------------------
+    kernel_backend: str = "auto"
+    """Which fused-kernel backend to use for the decode elementwise ops and the
+    FP8 dequant-GEMV.  See :mod:`starling._kernels`.
+
+    * ``"auto"`` (default) -- triton if importable (Linux), else torch.
+    * ``"triton"`` -- the hand-tuned Triton kernels (max perf; needs the triton
+      package, which has no official Windows wheel).
+    * ``"torch"`` -- stock-PyTorch fused ops (cross-platform; the Windows
+      default).  Correct, not optimised.
+    * ``"cuda"`` -- ``load_inline`` CUDA C++ kernels (cross-platform, perf
+      parity with triton; added later where the benchmark harness flags a loss).
+
+    Set via the ``STARLING_KERNEL_BACKEND`` env var or
+    :func:`starling._kernels.set_backend`."""
+
     def __post_init__(self) -> None:
         """Validate flag combinations at construction time."""
         if self.batched_encoder and not self.tolerance_mode:
@@ -262,6 +280,7 @@ def flags(**overrides):
         nvfp4_lm_head_only=overrides.get("nvfp4_lm_head_only", saved.nvfp4_lm_head_only),
         kv_cache_compression=overrides.get("kv_cache_compression", saved.kv_cache_compression),
         slim_draft_head=overrides.get("slim_draft_head", saved.slim_draft_head),
+        kernel_backend=overrides.get("kernel_backend", saved.kernel_backend),
     )
     _DEFAULT_FLAGS = new
     try:

@@ -1,0 +1,282 @@
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index ba006d9b..fe8b6a5c 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1818,6 +1818,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_CONV_2D_DW);
++
++    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
++    GGML_ASSERT(ggml_is_contiguous(op->src[1]));
++    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->type         == GGML_TYPE_F32);
++
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_conv_2d_dw_f32_f32");
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_3d(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_CONV_3D);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 1f212a92..c1130431 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -150,6 +150,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_3d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index 780dfe81..1c9960a8 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1122,6 +1122,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->type == GGML_TYPE_F32 &&
+                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
++        case GGML_OP_CONV_2D_DW:
++            // Depthwise conv2d, WHCN/F32 only (what the Conformer subsampling
++            // uses). CWHN and F16 fall through to the CPU backend.
++            return ggml_is_contiguous(op->src[0]) &&
++                   ggml_is_contiguous(op->src[1]) &&
++                   op->src[0]->type == GGML_TYPE_F32 &&
++                   op->src[1]->type == GGML_TYPE_F32 &&
++                   op->type         == GGML_TYPE_F32;
+         case GGML_OP_UPSCALE:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_POOL_1D:
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index ff74cafb..d7b4b60a 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -646,6 +646,34 @@ typedef struct {
+     int32_t  d1;
+ } ggml_metal_kargs_conv_2d;
+ 
++typedef struct {
++    uint64_t nbk0;  // kernel nb[0]  (KW stride)
++    uint64_t nbk1;  // kernel nb[1]  (KH stride)
++    uint64_t nbkc;  // kernel nb[3]  (channel stride; kernel is [KW,KH,1,C])
++    uint64_t nb10;  // src nb[0]
++    uint64_t nb11;  // src nb[1]
++    uint64_t nb12;  // src nb[2]     (channel)
++    uint64_t nb13;  // src nb[3]     (batch)
++    uint64_t nb0;   // dst nb[0]
++    uint64_t nb1;   // dst nb[1]
++    uint64_t nb2;   // dst nb[2]     (channel)
++    uint64_t nb3;   // dst nb[3]     (batch)
++    int32_t  IW;
++    int32_t  IH;
++    int32_t  KW;
++    int32_t  KH;
++    int32_t  C;
++    int32_t  OW;
++    int32_t  OH;
++    int32_t  N;
++    int32_t  s0;
++    int32_t  s1;
++    int32_t  p0;
++    int32_t  p1;
++    int32_t  d0;
++    int32_t  d1;
++} ggml_metal_kargs_conv_2d_dw;
++
+ typedef struct {
+     uint64_t  ofs0;
+     uint64_t  ofs1;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 206af227..6035ba2a 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -386,6 +386,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_conv_2d(ctx, idx);
+             } break;
++        case GGML_OP_CONV_2D_DW:
++            {
++                n_fuse = ggml_metal_op_conv_2d_dw(ctx, idx);
++            } break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             {
+                 n_fuse = ggml_metal_op_conv_transpose_1d(ctx, idx);
+@@ -3727,6 +3731,83 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);  // kernel: KW,KH,1,C
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);  // src:    IW,IH,C,N
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);  // dst:    OW,OH,C,N
++    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++
++    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
++    GGML_ASSERT(ggml_is_contiguous(op->src[1]));
++    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
++    GGML_ASSERT(op->type == GGML_TYPE_F32);
++
++    const int32_t s0 = ((const int32_t *) op->op_params)[0];
++    const int32_t s1 = ((const int32_t *) op->op_params)[1];
++    const int32_t p0 = ((const int32_t *) op->op_params)[2];
++    const int32_t p1 = ((const int32_t *) op->op_params)[3];
++    const int32_t d0 = ((const int32_t *) op->op_params)[4];
++    const int32_t d1 = ((const int32_t *) op->op_params)[5];
++
++    ggml_metal_kargs_conv_2d_dw args = {
++        /*.nbk0 =*/ nb00,
++        /*.nbk1 =*/ nb01,
++        /*.nbkc =*/ nb03,
++        /*.nb10 =*/ nb10,
++        /*.nb11 =*/ nb11,
++        /*.nb12 =*/ nb12,
++        /*.nb13 =*/ nb13,
++        /*.nb0  =*/ nb0,
++        /*.nb1  =*/ nb1,
++        /*.nb2  =*/ nb2,
++        /*.nb3  =*/ nb3,
++        /*.IW   =*/ ne10,
++        /*.IH   =*/ ne11,
++        /*.KW   =*/ ne00,
++        /*.KH   =*/ ne01,
++        /*.C    =*/ ne12,
++        /*.OW   =*/ ne0,
++        /*.OH   =*/ ne1,
++        /*.N    =*/ ne3,
++        /*.s0   =*/ s0,
++        /*.s1   =*/ s1,
++        /*.p0   =*/ p0,
++        /*.p1   =*/ p1,
++        /*.d0   =*/ d0,
++        /*.d1   =*/ d1,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_conv_2d_dw(lib, op);
++
++    int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
++    nth = std::min(nth, 256);
++    nth = std::max(nth, 1);
++
++    const uint64_t n_out = ggml_nelements(op);
++
++    uint64_t tg = (n_out + nth - 1)/nth;
++    tg = std::max<uint64_t>(tg, 1);
++    tg = std::min<uint64_t>(tg, (uint64_t) std::numeric_limits<int>::max());
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, tg, 1, 1, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_conv_3d(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index 36c61071..4b6195a1 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -75,6 +75,7 @@ int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_conv_2d_dw        (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_3d           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_transpose_1d (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_transpose_2d (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index e772664b..7c4fae05 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -4864,6 +4864,62 @@ kernel void kernel_conv_2d<half>(
+         uint3   tpitg[[thread_position_in_threadgroup]],
+         uint3     ntg[[threads_per_threadgroup]]);
+ 
++kernel void kernel_conv_2d_dw_f32_f32(
++        constant ggml_metal_kargs_conv_2d_dw & args,
++        device const char * weights,
++        device const char * src,
++        device       char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        uint3    tgpg[[threadgroups_per_grid]],
++        uint3   tpitg[[thread_position_in_threadgroup]],
++        uint3     ntg[[threads_per_threadgroup]]) {
++
++    const uint threads_per_tg = ntg.x * ntg.y * ntg.z;
++    const uint tg_index = (tgpig.z * tgpg.y + tgpig.y) * tgpg.x + tgpig.x;
++    const uint local_thread = tpitg.z * (ntg.x * ntg.y) + tpitg.y * ntg.x + tpitg.x;
++    const uint thread_index = tg_index * threads_per_tg + local_thread;
++    const uint64_t total_threads = (uint64_t) threads_per_tg * tgpg.x * tgpg.y * tgpg.z;
++    const uint64_t total_outputs = (uint64_t) args.N * args.C * args.OH * args.OW;
++
++    for (uint64_t index = thread_index; index < total_outputs; index += total_threads) {
++        uint64_t tmp = index;
++
++        const int32_t ow = tmp % args.OW; tmp /= args.OW;
++        const int32_t oh = tmp % args.OH; tmp /= args.OH;
++        const int32_t  c = tmp % args.C;  tmp /= args.C;
++        const int32_t  n = tmp;
++
++        const int32_t base_x = ow*args.s0 - args.p0;
++        const int32_t base_y = oh*args.s1 - args.p1;
++
++        const uint64_t src_base = (uint64_t) n * args.nb13 + (uint64_t) c * args.nb12;
++        const uint64_t w_base   = (uint64_t) c * args.nbkc;
++
++        float acc = 0.0f;
++        for (int32_t ky = 0; ky < args.KH; ++ky) {
++            const int32_t iy = base_y + ky*args.d1;
++            if (iy < 0 || iy >= args.IH) continue;
++            const uint64_t src_row = src_base + (uint64_t) iy * args.nb11;
++            const uint64_t w_row   = w_base   + (uint64_t) ky * args.nbk1;
++            for (int32_t kx = 0; kx < args.KW; ++kx) {
++                const int32_t ix = base_x + kx*args.d0;
++                if (ix < 0 || ix >= args.IW) continue;
++                const float xv = *(device const float *)(src     + src_row + (uint64_t) ix * args.nb10);
++                const float wv = *(device const float *)(weights + w_row   + (uint64_t) kx * args.nbk0);
++                acc += xv * wv;
++            }
++        }
++
++        const uint64_t dst_offs =
++            (uint64_t) n  * args.nb3 +
++            (uint64_t) c  * args.nb2 +
++            (uint64_t) oh * args.nb1 +
++            (uint64_t) ow * args.nb0;
++
++        *(device float *)(dst + dst_offs) = acc;
++    }
++}
++
+ typedef void (conv_transpose_1d_t)(
+         constant ggml_metal_kargs_conv_transpose_1d & args,
+         device const float * src0,

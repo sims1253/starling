@@ -27,6 +27,7 @@ import torch
 
 from ..attention import gqa_attention as _gqa_attention
 from ..flags import get_default_flags
+from .._kernels._compile import torch_compile
 from . import llm_kernels as _k
 from .llm_mega import LLMMega
 
@@ -77,7 +78,7 @@ class FusedLLMMega(LLMMega):
             # the LLM). Method-assign (not a self-calling wrapper) to avoid dynamo
             # recursion. Credit: Instance D (moss) validated this on the same
             # Qwen3-decode pattern.
-            self._decode_step_eager = torch.compile(  # type: ignore[method-assign]
+            self._decode_step_eager = torch_compile(  # type: ignore[method-assign]
                 self._decode_step_eager, mode="max-autotune-no-cudagraphs", dynamic=False
             )
 
