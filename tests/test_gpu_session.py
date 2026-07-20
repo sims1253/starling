@@ -168,6 +168,25 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
             proc.wait(timeout=5)
 
 
+def test_graceful_parent_release_keeps_inherited_child_lock(tmp_path) -> None:
+    """Closing the parent's fd must not explicitly unlock the child's flock."""
+    session = GpuSession(session="parent", lock_dir=str(tmp_path),
+                         uuid="uuid-graceful", install_signal_handlers=False)
+    session.acquire()
+    child = session.spawn(["sleep", "60"])
+    try:
+        session.release()
+        with pytest.raises(GpuLockBusy):
+            with GpuSession(session="probe", lock_dir=str(tmp_path),
+                            uuid="uuid-graceful", wait=False,
+                            install_signal_handlers=False):
+                pass
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    assert _poll_until_free(tmp_path, "uuid-graceful", timeout=5.0)
+
+
 # --------------------------------------------------------------------------- #
 # 3. UUID keying collapses CUDA_VISIBLE_DEVICES variants on a 1-GPU box
 # --------------------------------------------------------------------------- #
@@ -208,6 +227,16 @@ def test_lock_key_distinguishes_different_gpus(monkeypatch) -> None:
     assert k0 == "GPU-AAAA"
     assert k1 == "GPU-BBBB"
     assert k0 != k1
+
+
+def test_multi_gpu_session_fails_closed_instead_of_allowing_overlap(
+        tmp_path, monkeypatch) -> None:
+    """Set locks need per-device acquisition; reject them until implemented."""
+    monkeypatch.setattr("starling.gpu.session._query_gpu_uuids",
+                        lambda: ["GPU-AAAA", "GPU-BBBB"])
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with pytest.raises(RuntimeError, match="exactly one visible GPU"):
+        GpuSession(session="multi", lock_dir=str(tmp_path), wait=False).acquire()
 
 
 # --------------------------------------------------------------------------- #
@@ -320,3 +349,32 @@ def test_runner_exec_under_lock(tmp_path) -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_runner_allows_nested_legacy_lock_without_deadlock(tmp_path) -> None:
+    """A wrapped benchmark may safely call its existing with_gpu_lock internally."""
+    _RUN_PY = _REPO / "src" / "starling" / "gpu" / "run.py"
+    nested = _holder_script(textwrap.dedent("""
+        lock_dir = sys.argv[1]
+        uuid = sys.argv[2]
+        with GpuSession(session="nested", lock_dir=lock_dir, uuid=uuid,
+                        max_wait_sec=1, install_signal_handlers=False):
+            print("NESTED_OK", flush=True)
+    """))
+    runner_loader = textwrap.dedent(f"""
+        import importlib.util, sys
+        _spec = importlib.util.spec_from_file_location(
+            "starling_gpu_run", {str(_RUN_PY)!r})
+        _m = importlib.util.module_from_spec(_spec)
+        sys.modules["starling_gpu_run"] = _m
+        _spec.loader.exec_module(_m)
+        raise SystemExit(_m.main())
+    """)
+    proc = subprocess.run([
+        sys.executable, "-c", runner_loader,
+        "--session", "outer", "--lock-dir", str(tmp_path),
+        "--uuid", "uuid-nested", "--",
+        sys.executable, "-c", nested, str(tmp_path), "uuid-nested",
+    ], capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, proc.stderr
+    assert "NESTED_OK" in proc.stdout

@@ -11,9 +11,10 @@ lock with zero source edits::
     starling-gpu-run --session decode-bench --eta 5 -- python bench_decode.py
     starling-gpu-run --session moss        --       ./build/moss_server
 
-Because the runner ``os.setsid()``\\s first, the runner + its exec'd child form
-one process group, so ``STARLING_GPU_LOCK_FORCE=1`` can kill the whole tree to
-free a hung holder.
+The runner ``os.setsid()``\\s first so the command has an isolated process
+group. Lock takeover is intentionally not automatic: stale metadata cannot
+distinguish a hung process from a valid inherited native child, so the kernel
+flock remains authoritative.
 
 This module is stdlib-only (loads session.py by relative import when used as a
 package, and also supports ``python -m`` / direct-file invocation).
@@ -72,7 +73,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("no command given (use: starling-gpu-run [opts] -- CMD ...)")
         return 2
 
-    # The runner + its exec'd child must be one killable group for --force.
+    # Keep the wrapped command in its own process group for operator cleanup.
     try:
         os.setsid()
     except OSError:
@@ -96,8 +97,14 @@ def main(argv: Optional[list[str]] = None) -> int:
               file=sys.stderr)
         return 75  # EX_TEMPFAIL
 
-    # The flock fd is inheritable (set in GpuSession.acquire); execvp carries
-    # it into the child, so the lock persists for the child's whole lifetime.
+    # Publish the inherited lock so benchmark scripts that retain their own
+    # with_gpu_lock call borrow it rather than deadlocking on a second flock.
+    if session._fd is not None:
+        os.environ["STARLING_GPU_LOCK_FD"] = str(session._fd)
+        os.environ["STARLING_GPU_LOCK_KEY"] = session._key or ""
+        os.environ["STARLING_GPU_LOCK_OWNER"] = session.owner_id or ""
+    # The fd is inheritable (set in GpuSession.acquire); execvp carries it into
+    # the command, so the kernel lock persists for the command's whole lifetime.
     os.execvp(cmd[0], cmd)
     return 127  # unreachable if execvp succeeds
 

@@ -35,6 +35,9 @@ dev = [
     "pytest",
 ]
 
+[project.scripts]
+starling-gpu-run = "starling.gpu.run:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -70,3 +73,4 @@ transformers = { git = "https://github.com/huggingface/transformers", rev = "104
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]

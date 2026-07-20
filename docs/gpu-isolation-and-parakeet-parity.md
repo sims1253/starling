@@ -40,9 +40,10 @@ Closes the two hazards the synthesis flagged:
    native children via `GpuSession.spawn(pass_fds=…)`. The lock is held for the
    child's whole lifetime even if the parent is SIGKILLed.
 2. **`CUDA_VISIBLE_DEVICES` keying** (`CVD=0` vs unset vs `CVD=0,1` on one GPU
-   produced different files). The key is now the set of **GPU UUIDs** actually
-   visible (`nvidia-smi --query-gpu=uuid`), so every spelling of "this GPU"
-   maps to one file.
+   produced different files). The key is now the **GPU UUID** actually visible
+   (`nvidia-smi --query-gpu=uuid`), so every spelling of "this GPU" maps to one
+   file. Multi-GPU visibility currently fails closed; correct support requires
+   acquiring one lock per UUID in stable order so overlapping sets contend.
 
 The old `starling.parakeet.gpu_lock` API (`with_gpu_lock` /
 `acquire_gpu_lock` / `release_gpu_lock` / `GpuLockBusy`) is preserved as a thin
@@ -51,8 +52,10 @@ class* as `starling.gpu.session.GpuLockBusy`. New additive module
 `starling.gpu` (`session.py`, `run.py`); `starling-gpu-run` wraps any command
 in the lock with zero per-script edits.
 
-Env knobs: `STARLING_GPU_LOCK_DISABLE`, `STARLING_GPU_LOCK_DIR`,
-`STARLING_GPU_LOCK_FORCE`.
+Env knobs: `STARLING_GPU_LOCK_DISABLE`, `STARLING_GPU_LOCK_DIR`. The legacy
+`STARLING_GPU_LOCK_FORCE` knob is accepted but deliberately does not kill a
+holder: stale heartbeat metadata cannot distinguish a hung parent from a valid
+native child that inherited the lock.
 
 ### Tests (`tests/test_gpu_session.py`, `tests/test_gpu_lock.py`) — CPU/fs only
 

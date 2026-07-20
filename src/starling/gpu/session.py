@@ -23,12 +23,15 @@ This module fixes both:
   to native children via :meth:`GpuSession.spawn` (``pass_fds``). A native child
   therefore keeps the lock held for its whole lifetime even if the Python parent
   is SIGKILLed — closing hazard #1.
-* The lock key is the set of **GPU UUIDs** actually visible (``nvidia-smi``),
-  so every spelling of "this GPU" (``CVD=0`` / unset / ``CVD=0,1`` on one GPU)
-  maps to one file — closing hazard #2.
+* The lock key is the **GPU UUID** actually visible (``nvidia-smi``), so every
+  spelling of "this GPU" (``CVD=0`` / unset / ``CVD=0,1`` on a one-GPU host)
+  maps to one file — closing hazard #2. Multi-GPU visibility fails closed until
+  per-device ordered lock acquisition is implemented, preventing partial-set
+  overlap from silently corrupting measurements.
 
-A v2 JSON token is written into the flock file for observability and for the
-best-effort ``--force`` takeover of a hung-but-alive holder (heartbeat + pgid).
+A v2 JSON token is written into the flock file for observability. The kernel
+flock is authoritative; stale metadata is never used to kill a holder because
+an inherited native child may remain valid after its Python parent exits.
 
 This module is **stdlib-only** (no ``starling`` package import, no torch) so it
 can be loaded directly by ``importlib.util.spec_from_file_location`` in
@@ -37,13 +40,17 @@ subprocess holders, keeping the test suite hermetic and GPU-free.
 Environment knobs:
 * ``STARLING_GPU_LOCK_DISABLE=1`` — make every session a no-op (hermetic opt-out).
 * ``STARLING_GPU_LOCK_DIR``       — directory for the ``.flock`` files.
-* ``STARLING_GPU_LOCK_FORCE=1``   — best-effort kill a stale holder on contention.
+* ``STARLING_GPU_LOCK_FORCE=1``   — retained compatibility knob; takeover is
+  intentionally refused unless a future design can prove the holder is dead.
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # native Windows: import-safe compatibility fallback
+    fcntl = None  # type: ignore[assignment]
 import json
 import os
 import signal
@@ -261,6 +268,7 @@ class GpuSession:
         self._token_lock = threading.Lock()
         self._old_handlers: dict[int, object] = {}
         self._atexit_registered = False
+        self._borrowed = False
 
     # -- introspection -----------------------------------------------------
     def read_token(self) -> Optional[dict]:
@@ -294,8 +302,34 @@ class GpuSession:
             return self
 
         key = self._uuid_arg or _resolve_lock_key()
+        if self._uuid_arg is None and "," in key:
+            raise RuntimeError(
+                "GpuSession currently requires exactly one visible GPU; set "
+                "CUDA_VISIBLE_DEVICES to one device. Multi-GPU set locking "
+                "must acquire one lock per UUID to prevent partial overlap."
+            )
         self._key = key
         path = _lock_file_path(key, self._lock_dir)
+
+        # A command launched by starling-gpu-run (or GpuSession.spawn) already
+        # owns this exact lock through an inherited fd. Borrow a dup instead of
+        # trying to flock the same file through a new open-file description,
+        # which would deadlock existing benchmark scripts that also call the
+        # legacy with_gpu_lock API internally.
+        inherited_fd = os.environ.get("STARLING_GPU_LOCK_FD")
+        inherited_key = os.environ.get("STARLING_GPU_LOCK_KEY")
+        if inherited_fd is not None and inherited_key == key:
+            try:
+                self._fd = os.dup(int(inherited_fd))
+            except (OSError, ValueError):
+                self._fd = None
+            if self._fd is not None:
+                self._path = path
+                self._borrowed = True
+                self._acquired = True
+                self._owner_id = os.environ.get(
+                    "STARLING_GPU_LOCK_OWNER", self._owner_id)
+                return self
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = path
         self._owner_id = _uuid.uuid4().hex
@@ -328,23 +362,18 @@ class GpuSession:
             return
         self._stop_heartbeat()
         self._restore_signal_handlers()
-        # Clear the token so readers see "free"; then close -> flock releases.
-        try:
-            if self._path is not None and self._path.exists():
-                with open(self._path, "w"):
-                    pass  # truncate
-        except OSError:
-            pass
+        # Do NOT issue LOCK_UN: spawned children share this open-file
+        # description, and an explicit unlock would release their lock too.
+        # Closing our fd drops only our reference; flock releases naturally
+        # after the last inherited/duplicated fd closes. The token is metadata,
+        # not the lock, so leaving the last owner record is intentional.
         if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
             try:
                 os.close(self._fd)
             except OSError:
                 pass
             self._fd = None
+        self._borrowed = False
 
     # -- native children ---------------------------------------------------
     def spawn(self, args, **popen_kwargs) -> subprocess.Popen:
@@ -355,15 +384,25 @@ class GpuSession:
         """
         if not self._acquired or self._fd is None:
             raise RuntimeError("GpuSession.spawn before acquire()")
-        extra = popen_kwargs.pop("pass_fds", ())
-        fds = tuple(dict.fromkeys((self._fd, *extra)))  # dedup, keep order
-        os.set_inheritable(self._fd, True)
-        popen_kwargs["pass_fds"] = fds
+        env = dict(popen_kwargs.pop("env", os.environ))
+        env["STARLING_GPU_LOCK_FD"] = str(self._fd)
+        env["STARLING_GPU_LOCK_KEY"] = self._key or ""
+        env["STARLING_GPU_LOCK_OWNER"] = self._owner_id or ""
+        popen_kwargs["env"] = env
+        if fcntl is not None:
+            extra = popen_kwargs.pop("pass_fds", ())
+            fds = tuple(dict.fromkeys((self._fd, *extra)))  # dedup, keep order
+            os.set_inheritable(self._fd, True)
+            popen_kwargs["pass_fds"] = fds
         return subprocess.Popen(args, **popen_kwargs)
 
     # -- internals ---------------------------------------------------------
     def _flock_with_contention(self) -> None:
         assert self._fd is not None
+        if fcntl is None:
+            # Windows compatibility: preserve importability and single-parent
+            # operation. Native-child fd inheritance is POSIX-only for now.
+            return
         deadline = time.time() + (self.max_wait_sec if self.wait else 0.0)
         first = True
         while True:
@@ -390,23 +429,14 @@ class GpuSession:
         return f"{self._path}"
 
     def _force_takeover(self) -> None:
-        """Best-effort: kill a hung holder's process group so the flock frees."""
-        tok = self.read_token()
-        if not tok:
-            return
-        pgid = tok.get("pgid")
-        pid = tok.get("pid")
-        # Only act on a genuinely stale (hung-but-alive) holder.
-        hb = tok.get("heartbeat_at")
-        if hb is not None and (time.time() - float(hb)) < STALE_HEARTBEAT_SEC:
-            return
-        target = pgid if pgid is not None else pid
-        if target is None:
-            return
-        try:
-            os.killpg(int(target), signal.SIGTERM)
-        except (OSError, ProcessLookupError, TypeError, ValueError):
-            pass
+        """Refuse unsafe metadata-only takeover.
+
+        A stale heartbeat does not prove the flock is orphaned: an inherited
+        native child may still be doing valid GPU work after its Python parent
+        exited. The kernel lock remains authoritative, so callers must terminate
+        a known holder explicitly rather than risking biased/corrupted runs.
+        """
+        return
 
     def _write_token(self, heartbeat: bool = False) -> None:
         assert self._path is not None and self._fd is not None
