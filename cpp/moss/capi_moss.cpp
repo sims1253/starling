@@ -9,6 +9,7 @@
 #include "runtime/graph.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,21 +92,29 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
     }
     try {
         using namespace starling::ggml::moss;
+        const bool timing = std::getenv("STARLING_MOSS_TIMING") != nullptr;
+        auto now = [&]() { return std::chrono::steady_clock::now(); };
+        auto ms = [&](auto t0, auto t1) {
+            return std::chrono::duration<double, std::milli>(t1 - t0).count(); };
+
+        auto a0 = now();
         MelFeatures mel;
         if (!compute_log_mel(c->model->config, c->model->loader, pcm,
                              static_cast<size_t>(n), mel, c->err)) {
             report(err_out, c->err); return nullptr;
         }
-        AudioEncoding encoded, adapted;
-        if (!encode_audio(*c->model, mel, encoded, c->err) ||
-            !apply_adapter(*c->model, encoded, adapted, c->err)) {
+        auto a1 = now();
+        AudioEncoding adapted;
+        if (!encode_audio_and_adapt(*c->model, mel, adapted, c->err)) {
             report(err_out, c->err); return nullptr;
         }
+        auto a2 = now();
         Prompt prompt = build_transcribe_prompt(c->model->config, mel.n_frames);
         InputsEmbeds inputs;
         if (!build_inputs_embeds(*c->model, prompt, adapted, inputs, c->err)) {
             report(err_out, c->err); return nullptr;
         }
+        auto a3 = now();
         if (std::getenv("STARLING_MOSS_DEBUG")) {
             double mx = 0; size_t bad = 0;
             for (float v : inputs.data) { if (!std::isfinite(v)) ++bad; mx = std::max(mx, std::abs((double)v)); }
@@ -120,6 +129,13 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
         GenerateResult generated;
         if (!greedy_generate(*c->model, inputs, options, generated, c->err)) {
             report(err_out, c->err); return nullptr;
+        }
+        auto a4 = now();
+        if (timing) {
+            std::fprintf(stderr, "MOSS_STAGE frames=%lld mel=%.1fms enc+adapt=%.1fms prompt+embeds=%.1fms gen=%.1fms audio_tokens=%lld prompt_tokens=%lld gen_tokens=%zu\n",
+                         (long long)mel.n_frames, ms(a0, a1), ms(a1, a2), ms(a2, a3),
+                         ms(a3, a4), (long long)adapted.n_tokens, (long long)inputs.n_tokens,
+                         generated.ids.size());
         }
         const std::string text = c->tokenizer.decode(generated.ids, true);
         char * out = static_cast<char *>(std::malloc(text.size() + 1));
