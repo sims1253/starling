@@ -10,7 +10,6 @@ public surface (``with_gpu_lock`` / ``acquire_gpu_lock`` / ``release_gpu_lock``
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import textwrap

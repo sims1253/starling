@@ -29,7 +29,20 @@ from contextlib import contextmanager
 from pathlib import Path
 
 # Same exception class as the real lock (isinstance-equivalent across modules).
+# GpuLockBusy is re-exported so `from starling.parakeet.gpu_lock import GpuLockBusy`
+# keeps working at every call site (see module docstring).
 from starling.gpu.session import GpuLockBusy, GpuSession
+
+__all__ = [
+    "LOCK_PATH",
+    "STALE_SEC",
+    "GpuLockBusy",
+    "GpuSession",
+    "acquire_gpu_lock",
+    "release_gpu_lock",
+    "spawn_gpu_subprocess",
+    "with_gpu_lock",
+]
 
 # --- compat attributes (kept so external readers / old tests still resolve) --
 # Computed CHEAPLY (no nvidia-smi) from the CVD string; the REAL lock key (the

@@ -46,11 +46,10 @@ Environment knobs:
 
 from __future__ import annotations
 
-import errno
 try:
     import fcntl
 except ImportError:  # native Windows: import remains safe; acquire fails closed
-    fcntl = None  # type: ignore[assignment]
+    fcntl: types.ModuleType | None = None  # type: ignore[assignment]
 import json
 import os
 import signal
@@ -59,9 +58,13 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import uuid as _uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Optional
+from typing import Any, cast
+
+from typing_extensions import Self
 
 # v2 token schema. Bumped only on a breaking change to the token *contract*.
 TOKEN_VERSION = 2
@@ -69,7 +72,12 @@ TOKEN_SCHEMA = "starling.gpu.session"
 
 HEARTBEAT_SEC = 5.0  # how often an in-process holder refreshes observability
 
-_QUERY_CACHE: Optional[list[str]] = None
+# A previously-installed signal handler as returned by ``signal.getsignal``: a
+# callable taking ``(signum, frame)``, the ``SIG_DFL``/``SIG_IGN`` integers, or
+# ``None`` (no handler installed yet).
+_SignalHandler = Callable[[int, Any], Any] | int | None
+
+_QUERY_CACHE: list[str] | None = None
 
 
 class GpuLockBusy(RuntimeError):
@@ -96,7 +104,7 @@ def _query_gpu_uuids() -> list[str]:
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         if out.returncode == 0:
             for line in out.stdout.splitlines():
@@ -109,7 +117,7 @@ def _query_gpu_uuids() -> list[str]:
     return list(uuids)
 
 
-def _parse_cvd(cvd: Optional[str]) -> Optional[list[int]]:
+def _parse_cvd(cvd: str | None) -> list[int] | None:
     """Parse ``CUDA_VISIBLE_DEVICES`` into a sorted list of indices.
 
     Returns ``None`` for unset/empty ("all GPUs"). Supports comma lists and
@@ -143,8 +151,8 @@ def _parse_cvd(cvd: Optional[str]) -> Optional[list[int]]:
 
 
 def _resolve_lock_key(
-    cvd: Optional[str] = None,
-    uuids: Optional[list[str]] = None,
+    cvd: str | None = None,
+    uuids: list[str] | None = None,
 ) -> str:
     """Collapse the visible-device set into one stable lock key.
 
@@ -182,7 +190,7 @@ def _default_lock_dir() -> Path:
                                tempfile.gettempdir())).expanduser()
 
 
-def _lock_file_path(key: str, lock_dir: Optional[str] = None) -> Path:
+def _lock_file_path(key: str, lock_dir: str | None = None) -> Path:
     base = Path(lock_dir) if lock_dir else _default_lock_dir()
     return base / f"starling-gpu-{_sanitize(key)}.flock"
 
@@ -190,7 +198,7 @@ def _lock_file_path(key: str, lock_dir: Optional[str] = None) -> Path:
 # --------------------------------------------------------------------------- #
 # token (v2) helpers
 # --------------------------------------------------------------------------- #
-def _parse_token(path: Path) -> Optional[dict]:
+def _parse_token(path: Path) -> dict | None:
     """Read + validate a token file. Returns ``None`` if absent/empty/stale-v1."""
     try:
         raw = path.read_text()
@@ -230,14 +238,14 @@ class GpuSession:
         model: str = "",
         eta_min: int = 5,
         note: str = "",
-        lock_dir: Optional[str] = None,
-        uuid: Optional[str] = None,
+        lock_dir: str | None = None,
+        uuid: str | None = None,
         wait: bool = True,
         poll_sec: float = 0.2,
         max_wait_sec: float = 600.0,
         install_signal_handlers: bool = False,
         heartbeat: bool = True,
-        force: Optional[bool] = None,
+        force: bool | None = None,
     ) -> None:
         self.session = session
         self.model = model
@@ -255,45 +263,45 @@ class GpuSession:
         # inherited native child has stopped valid GPU work.
         self.force = bool(force or os.environ.get("STARLING_GPU_LOCK_FORCE", "") == "1")
 
-        self._fd: Optional[int] = None
-        self._path: Optional[Path] = None
-        self._key: Optional[str] = None
-        self._owner_id: Optional[str] = None
+        self._fd: int | None = None
+        self._path: Path | None = None
+        self._key: str | None = None
+        self._owner_id: str | None = None
         self._disabled = (
             os.environ.get("STARLING_GPU_LOCK_DISABLE", "") == "1"
         )
         self._acquired = False
-        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
         self._token_lock = threading.Lock()
-        self._old_handlers: dict[int, object] = {}
+        self._old_handlers: dict[int, _SignalHandler] = {}
         self._atexit_registered = False
         self._borrowed = False
 
     # -- introspection -----------------------------------------------------
-    def read_token(self) -> Optional[dict]:
+    def read_token(self) -> dict | None:
         """The current v2 token for this session (or ``None`` if not held)."""
         if self._path is None:
             return None
         return _parse_token(self._path)
 
     @property
-    def owner_id(self) -> Optional[str]:
+    def owner_id(self) -> str | None:
         return self._owner_id
 
     @property
-    def lock_path(self) -> Optional[Path]:
+    def lock_path(self) -> Path | None:
         return self._path
 
     # -- lifecycle ---------------------------------------------------------
-    def __enter__(self) -> "GpuSession":
+    def __enter__(self) -> Self:
         self.acquire()
         return self
 
     def __exit__(self, *exc) -> None:
         self.release()
 
-    def acquire(self) -> "GpuSession":
+    def acquire(self) -> Self:
         if self._acquired:
             return self
         if self._disabled:
@@ -506,7 +514,7 @@ class GpuSession:
             finally:
                 prev = self._old_handlers.get(signum)
                 if callable(prev):
-                    prev(signum, frame)
+                    cast(Callable[[int, Any], Any], prev)(signum, frame)
                 else:
                     signal.signal(signum, signal.SIG_DFL)
                     os.kill(os.getpid(), signum)
@@ -515,7 +523,7 @@ class GpuSession:
     def _restore_signal_handlers(self) -> None:
         for sig, prev in list(self._old_handlers.items()):
             try:
-                signal.signal(sig, prev)  # type: ignore[arg-type]
+                signal.signal(sig, prev)
             except (ValueError, OSError, TypeError):
                 pass
         self._old_handlers.clear()

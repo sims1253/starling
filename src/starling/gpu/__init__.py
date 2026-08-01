@@ -15,7 +15,10 @@ from .session import (
 )
 
 __all__ = [
-    "GpuSession",
     "GpuLockBusy",
     "GpuLockTimeout",
+    "GpuSession",
+    "_parse_token",
+    "_query_gpu_uuids",
+    "_resolve_lock_key",
 ]

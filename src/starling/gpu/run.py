@@ -25,15 +25,18 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Optional
 
 # Allow loading this file directly (importlib path) without the package.
 try:
-    from .session import GpuSession, GpuLockBusy, GpuLockTimeout  # type: ignore
+    from .session import GpuLockBusy, GpuLockTimeout, GpuSession
 except ImportError:  # pragma: no cover - direct-file execution path
     _here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, _here)
-    from session import GpuSession, GpuLockBusy, GpuLockTimeout  # type: ignore
+    from session import (  # ty: ignore[unresolved-import]
+        GpuLockBusy,
+        GpuLockTimeout,
+        GpuSession,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -61,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 

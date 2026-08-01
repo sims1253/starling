@@ -14,7 +14,6 @@ Run with:  uv run pytest tests/test_ggml_parity.py -q
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -25,7 +24,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "benchmarks"))
 
-import make_fixtures as mkfx  # noqa: E402
+import make_fixtures as mkfx
 
 GOLDEN = _REPO_ROOT / "golden"
 FIXTURES = mkfx.load_fixtures()  # {short, medium, long} -> 1-D float32 @16kHz
@@ -34,7 +33,7 @@ FIXTURES = mkfx.load_fixtures()  # {short, medium, long} -> 1-D float32 @16kHz
 def _ggml_available() -> bool:
     """True iff the parakeet-server binary + model exist (so the test can run)."""
     try:
-        from engines import GgmlParakeet  # noqa: F401
+        from engines import GgmlParakeet
     except Exception:
         return False
     try:
@@ -90,7 +89,7 @@ def test_ggml_parakeet_byte_exact(ggml_engine, name: str) -> None:
 # --------------------------------------------------------------------------- #
 def _ggml_moss_available() -> bool:
     try:
-        from engines import GgmlMoss  # noqa: F401
+        from engines import GgmlMoss
     except Exception:
         return False
     try:

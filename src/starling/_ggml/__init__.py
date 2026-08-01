@@ -19,11 +19,11 @@ Example::
 """
 
 from ._native import (
-    GgmlModel,
     MOSS,
     PARAKEET_TDT,
+    GgmlModel,
     available,
     backend_name,
 )
 
-__all__ = ["GgmlModel", "PARAKEET_TDT", "MOSS", "available", "backend_name"]
+__all__ = ["MOSS", "PARAKEET_TDT", "GgmlModel", "available", "backend_name"]

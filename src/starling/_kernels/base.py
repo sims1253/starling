@@ -67,7 +67,7 @@ def have_triton() -> bool:
     the ``auto`` backend selects triton (Linux) or torch (Windows).
     """
     try:
-        import triton  # noqa: F401
+        import triton
         import triton.language  # noqa: F401
     except Exception:
         return False
@@ -83,7 +83,7 @@ def have_cuda_compile() -> bool:
     the cuda backend (which would JIT-compile on import).
     """
     try:
-        import torch  # noqa: F401
+        import torch
         return torch.cuda.is_available()
     except Exception:
         return False

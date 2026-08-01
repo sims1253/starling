@@ -52,7 +52,7 @@ def _have_triton() -> bool:
     everywhere CUDA is present.
     """
     try:
-        import triton  # noqa: F401
+        import triton
         import triton.language  # noqa: F401
     except Exception:
         return False
@@ -587,8 +587,8 @@ def test_cuda_fp4_gemv_fused_matches_torch():
     F.linear.  fp4.py documents ~1e-1 relative weight error; on magnitude-70
     decode projections that is ~1.0 max-abs, hence atol=1.5.
     """
-    from starling.granite.fp4 import quantize_fp4_packed
     from starling._kernels import cuda_backend, torch_backend
+    from starling.granite.fp4 import quantize_fp4_packed
 
     torch.manual_seed(18)
     OUT = 2048

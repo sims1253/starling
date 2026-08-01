@@ -26,7 +26,6 @@ import ctypes
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 # The ABI version this binding expects. Bumped in lockstep with
 # STARLING_GGML_ABI_VERSION in cpp/include/starling_ggml.h.
@@ -116,9 +115,7 @@ def _resolve_symbols(lib: ctypes.CDLL) -> bool:
     # ABI check: refuse to load a mismatched .so (prevents cryptic arg
     # misalignment after an API bump the binding hasn't tracked).
     got = lib.starling_ggml_abi_version()
-    if got != _EXPECTED_ABI_VERSION:
-        return False
-    return True
+    return got == _EXPECTED_ABI_VERSION
 
 
 def available() -> bool:
@@ -177,7 +174,8 @@ class GgmlModel:
         if not ptr:
             err = self._last_error()
             raise RuntimeError(f"starling_ggml_transcribe_pcm failed: {err}")
-        text = ctypes.cast(ptr, ctypes.c_char_p).value.decode("utf-8", "replace")
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value
+        text = (raw or b"").decode("utf-8", "replace")
         self._lib.starling_ggml_free_string(ptr)
         return text
 

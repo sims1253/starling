@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from starling.gpu.session import GpuSession, GpuLockBusy
+from starling.gpu.session import GpuLockBusy, GpuSession
 
 _REPO = Path(__file__).resolve().parent.parent
 _SESSION_PY = _REPO / "src" / "starling" / "gpu" / "session.py"
@@ -81,7 +81,6 @@ def test_flock_serializes_concurrent_acquirers(tmp_path) -> None:
 
     def worker():
         barrier.wait()  # release all threads together to maximize contention
-        t0 = time.monotonic()
         with GpuSession(session="w", lock_dir=str(tmp_path), uuid=uuid,
                         max_wait_sec=30, install_signal_handlers=False):
             t1 = time.monotonic()
@@ -251,7 +250,7 @@ def test_multi_gpu_session_fails_closed_instead_of_allowing_overlap(
 def test_missing_flock_fails_closed_unless_explicitly_disabled(
         tmp_path, monkeypatch) -> None:
     """Unsupported platforms must never silently allow concurrent benchmarks."""
-    import starling.gpu.session as session
+    from starling.gpu import session
     monkeypatch.setattr(session, "fcntl", None)
     with pytest.raises(RuntimeError, match="requires POSIX fcntl.flock"):
         GpuSession(session="unsupported", lock_dir=str(tmp_path),
