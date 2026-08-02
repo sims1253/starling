@@ -1168,7 +1168,8 @@ class GgmlParakeet(Engine):
             "--host", GGML_PARAKEET_HOST,
             "--port", str(port),
         ]
-        self._proc = subprocess.Popen(
+        from starling.parakeet.gpu_lock import spawn_gpu_subprocess
+        self._proc = spawn_gpu_subprocess(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=dict(os.environ),
         )
@@ -1303,6 +1304,17 @@ class StarlingGgmlParakeet(Engine):
             pcm.ctypes.data_as(_c_float_p), pcm.size, 16000)
         return text.strip()
 
+    def _run_one_ids(self, audio: np.ndarray) -> list[int]:
+        """The raw greedy-TDT id stream (incl. blanks) for strict parity.
+
+        Mirrors :meth:`_run_one` but returns the emitted token-id stream via
+        ``starling_ggml_parakeet_decode_ids_pub`` (leading blank prepended in
+        C to match the ``parakeet_tdt_*_ids.pt`` golden format).
+        """
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return list(self._model.transcribe_pcm_ids(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000))
+
 
 def _starling_ggml_parakeet_keys() -> list[str]:
     """Starling's in-tree ggml engine (libstarling_ggml). Skipped if the .so
@@ -1350,6 +1362,48 @@ class StarlingGgmlMoss(Engine):
 def _starling_ggml_moss_keys() -> list[str]:
     if StarlingGgmlMoss().available:
         return ["starling-ggml-moss"]
+    return []
+
+
+# ARK-ASR-3B uses the same shared C API as parakeet/moss; this separate path
+# keeps the model artifact independently configurable.
+STARLING_GGML_ARK_MODEL = Path(os.environ.get(
+    "STARLING_GGML_ARK_MODEL",
+    str(REPO_ROOT / "models" / "ark-asr-3b-bf16-exact.gguf"),
+)).expanduser()
+
+class StarlingGgmlArk(Engine):
+    """Starling's in-tree ARK-ASR-3B ggml engine, driven directly through ctypes."""
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "ark", supports_batch=False)
+        self._model = None
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_ARK_MODEL.exists()
+        except Exception:
+            return False
+
+    def _load(self) -> None:
+        from starling._ggml import GgmlModel, ARK
+        self._model = GgmlModel(ARK, str(STARLING_GGML_ARK_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
+
+def _starling_ggml_ark_keys() -> list[str]:
+    if StarlingGgmlArk().available:
+        return ["starling-ggml-ark"]
     return []
 
 
@@ -1479,7 +1533,8 @@ class GgmlMoss(Engine):
             "-l", "en",   # skip LID pre-step (server-stability critical)
             "-nt",        # transcript text only, no timestamps
         ]
-        self._proc = subprocess.Popen(
+        from starling.parakeet.gpu_lock import spawn_gpu_subprocess
+        self._proc = spawn_gpu_subprocess(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=dict(os.environ),
         )
@@ -1704,7 +1759,8 @@ def available_keys() -> list[str]:
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys()
             + _ggml_parakeet_keys() + _ggml_moss_keys()
-            + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys())
+            + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys()
+            + _starling_ggml_ark_keys())
 
 
 def build_engines(
@@ -1744,12 +1800,14 @@ def build_engines(
             elif mdl == "moss":
                 chosen[mdl].append(GgmlMoss())
         elif key.startswith("starling-ggml-"):
-            # Starling's OWN in-tree ggml engine (libstarling_ggml). Currently
-            # parakeet and MOSS share the model-tagged C API.
+            # Starling's OWN in-tree ggml engine (libstarling_ggml). parakeet,
+            # MOSS, and ARK share the model-tagged C API.
             if mdl == "parakeet":
                 chosen[mdl].append(StarlingGgmlParakeet())
             elif mdl == "moss":
                 chosen[mdl].append(StarlingGgmlMoss())
+            elif mdl == "ark":
+                chosen[mdl].append(StarlingGgmlArk())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

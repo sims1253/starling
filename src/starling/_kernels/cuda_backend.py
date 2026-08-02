@@ -39,7 +39,7 @@ from pathlib import Path
 
 import torch
 
-from .base import FP8_DTYPE, FP8_MAX  # noqa: F401  (re-exported public constants)
+from .base import FP8_DTYPE, FP8_MAX
 
 _CUDA_SRC = Path(__file__).resolve().parent / "cuda" / "backend.cu"
 

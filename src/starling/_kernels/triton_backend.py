@@ -64,8 +64,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .base import FP8_DTYPE, FP8_MAX  # noqa: F401  (re-exported public constants)
-
+from .base import FP8_DTYPE, FP8_MAX
 
 # =========================================================================== #
 # Autotune toggle (Deliverable 1: "autotuned Triton" baseline).
@@ -258,7 +257,7 @@ def fused_rope(
     BLOCK_D = triton.next_power_of_2(hd)
     _rope_kernel[(total_heads,)](
         q_flat, k_flat, q_out, k_out, cos_flat, sin_flat,
-        n_q, head_dim=hd, BLOCK_D=BLOCK_D,
+        n_q, head_dim=hd, BLOCK_D=BLOCK_D,  # type: ignore
     )
     return q_out.view_as(q), k_out.view_as(k)
 
@@ -419,7 +418,7 @@ def compute_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
     N = x.shape[-1]
     x1 = x.reshape(-1).contiguous()
     rstd = torch.empty((1,), dtype=torch.float32, device=x.device)
-    _rstd_kernel[(1,)](x1, rstd, eps, N=N, BLOCK_N=triton.next_power_of_2(N))
+    _rstd_kernel[(1,)](x1, rstd, eps, N=N, BLOCK_N=triton.next_power_of_2(N))  # type: ignore
     return rstd
 
 
@@ -466,7 +465,7 @@ def fused_gemv_normscale(x: torch.Tensor, w_scaled: torch.Tensor,
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     grid = (triton.cdiv(OUT, BLOCK_M),)
     _gemv_normscale_kernel[grid](
-        x1, w_scaled, rstd, out, OUT=OUT, K=K, BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+        x1, w_scaled, rstd, out, OUT=OUT, K=K, BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,  # type: ignore
     )
     return out
 

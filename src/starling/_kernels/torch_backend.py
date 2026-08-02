@@ -43,7 +43,7 @@ import torch.nn.functional as F
 
 # Re-export the canonical FP8 (e4m3) constants from the shared base so that
 # every backend module and every consumer reads the same source of truth.
-from .base import FP8_DTYPE, FP8_MAX  # noqa: F401  (re-exported public names)
+from .base import FP8_DTYPE, FP8_MAX
 
 __all__ = [
     # constants (re-exported)
@@ -83,7 +83,7 @@ def set_autotune(enabled: bool) -> None:
     # Deliberately does nothing -- there is no AUTOTUNE flag to flip here.  The
     # triton backend's set_autotune toggles its kernel autotuner; this backend
     # has nothing equivalent, so we just accept and discard the argument.
-    return None
+    return
 
 
 def autotune_enabled() -> bool:

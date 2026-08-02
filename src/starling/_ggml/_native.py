@@ -26,7 +26,6 @@ import ctypes
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 # The ABI version this binding expects. Bumped in lockstep with
 # STARLING_GGML_ABI_VERSION in cpp/include/starling_ggml.h.
@@ -116,9 +115,7 @@ def _resolve_symbols(lib: ctypes.CDLL) -> bool:
     # ABI check: refuse to load a mismatched .so (prevents cryptic arg
     # misalignment after an API bump the binding hasn't tracked).
     got = lib.starling_ggml_abi_version()
-    if got != _EXPECTED_ABI_VERSION:
-        return False
-    return True
+    return got == _EXPECTED_ABI_VERSION
 
 
 def available() -> bool:
@@ -140,6 +137,7 @@ def backend_name() -> str:
 # Model selector constants (mirror the C enum starling_ggml_model).
 PARAKEET_TDT = 1
 MOSS = 2
+ARK = 3
 
 
 class GgmlModel:
@@ -177,9 +175,47 @@ class GgmlModel:
         if not ptr:
             err = self._last_error()
             raise RuntimeError(f"starling_ggml_transcribe_pcm failed: {err}")
-        text = ctypes.cast(ptr, ctypes.c_char_p).value.decode("utf-8", "replace")
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value
+        text = (raw or b"").decode("utf-8", "replace")
         self._lib.starling_ggml_free_string(ptr)
         return text
+
+    def transcribe_pcm_ids(self, samples, n: int, sample_rate: int = 16000):
+        """Transcribe ``n`` mono float32 samples; return the raw token-id stream.
+
+        Parakeet-only. Returns the emitted id stream INCLUDING blanks, prefixed
+        with the decoder-start (blank) token, matching the format of the golden
+        ``parakeet_tdt_*_ids.pt`` (HF ``model.generate().sequences[0]``). This
+        is the strictest in-tree parity gate (greedy TDT is deterministic).
+
+        Lazily resolves ``starling_ggml_parakeet_decode_ids_pub`` so it does not
+        gate :func:`available` for builds that pre-date the symbol.
+        """
+        lib = self._lib
+        fn = getattr(lib, "starling_ggml_parakeet_decode_ids_pub", None)
+        if fn is None:
+            raise RuntimeError(
+                "libstarling_ggml has no starling_ggml_parakeet_decode_ids_pub "
+                "symbol (rebuild cpp/)")
+        fn.restype = ctypes.POINTER(ctypes.c_int64)
+        fn.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+        ]
+        out_n = ctypes.c_int64(0)
+        ptr = fn(self._ctx, samples, n, ctypes.byref(out_n))
+        if not ptr:
+            err = self._last_error()
+            raise RuntimeError(f"starling_ggml_parakeet_decode_ids failed: {err}")
+        try:
+            ids = ptr[: out_n.value]  # list[int]
+        finally:
+            # The buffer was std::malloc'd in C; starling_ggml_free_string does
+            # std::free, which is type-agnostic (element type is irrelevant to
+            # free), so reusing it is correct and avoids a new C entry point.
+            lib.starling_ggml_free_string(
+                ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char)))
+        return ids
 
     def close(self) -> None:
         if getattr(self, "_ctx", None):

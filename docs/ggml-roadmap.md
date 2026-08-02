@@ -48,27 +48,25 @@ GPU driver.
    semantics, conv/sub sampling in the reference's precision. Every staged
    golden names its dtype. When in doubt, the reference code wins.
 
-## Current state (verified 2026-07-18)
+## Current state (verified 2026-07-21)
 
-- **In-tree engine** (`cpp/`, ggml v0.13.0 + 7 patches, `libstarling_ggml.so`):
-  parakeet-tdt Phase 1 complete — loader, CPU mel frontend, 24-layer Conformer
-  encoder, TDT greedy + K-step multistep decode. **BYTE-EXACT on
-  short/medium/long** (verified via `StarlingGgmlParakeet` ctypes path).
-  MOSS Phase 2 pipeline is present (`cpp/moss/`: loader, mel, audio encoder,
-  adapter, prompt merge, Qwen3 LLM, tokenizer, and shared-C-API wiring). The
-  staged pipeline is byte-exact through merged embeddings; decoder exactness
-  remains blocked: CUDA short reaches a layer-0 non-finite and CPU prefill
-  differs (max abs 59.1484375), so IDs/text are not yet byte-exact. The
-  in-tree parity tests are intentionally an exact gate and expose this until
-  the LLM numeric divergence is resolved.
-- **External parakeet.cpp analysis** (`docs/ggml-parakeet-perf-analysis.md`)
-  showed: encoder ~2.8ms GPU (faster than PyTorch peak), TDT decode is the
-  medium/long bottleneck (serial, data-dependent), short at 1.00x parity,
-  medium ~1.46x, long ~1.80x. The in-tree engine inherited the architecture;
-  its own steady-state baseline is being measured (Phase 3 entry).
-- **MOSS PyTorch peak** (`src/starling/moss/`): fused-Triton decode
-  4.85ms/tok (206 tok/s), encoder eager ~25-40ms, end-to-end short 248ms /
-  medium 618ms / long 1151ms. This is the bar for ggml-moss.
+- **In-tree engine** (`cpp/`, ggml v0.13.0 + patch series,
+  `libstarling_ggml.so`) supports Parakeet-TDT and MOSS through one C API.
+  Parakeet has shape-cached encoder graphs, fused relative-position attention,
+  K-step TDT decode, on-device argmax, and device-resident state for K<=16.
+  It is exact at transcript and non-blank content-token level on the three
+  canonical fixtures. Current synthetic latency is 14 / 30 / 86 ms versus
+  16 / 24 / 58 ms for the PyTorch peak (short / medium / long).
+- **MOSS Phase 2 correctness and performance are complete enough to ship**:
+  exact canonical greedy token IDs/text, whole-model prefill/decode graphs,
+  device-resident KV, K-step decode, captured audio encoder, parallel mel, and
+  bounded replay caches. Current synthetic latency is 214 / 535 / 1180 ms
+  versus 166 / 397 / 1499 ms for the PyTorch peak. Decode is near its 4.85
+  ms/token PyTorch target; remaining short/medium cost is frontend/encoder and
+  prefill rather than the old per-layer host graph loop.
+- `docs/ggml-parakeet-perf-analysis.md` includes useful history but mixes
+  external `parakeet.cpp` commits with in-tree state. Treat current code and the
+  maintained README tables as authoritative.
 - **Granite ggml study** (comms.md): naive per-op ggml decode is ~4x slower
   than the Triton peak (host dispatch + f32 elementwise traffic); with
   CUDA-graph capture the gap closes to ~parity. Our ReplayGraph + K-step
@@ -76,50 +74,52 @@ GPU driver.
 
 ## Phases
 
-### Phase 2 — MOSS in-tree (current focus)
+### Phase 2 — MOSS in-tree (landed; optimize incrementally)
 
-Model: `OpenMOSS-Team/MOSS-Transcribe-preview-2B` = Qwen3-omni MoE audio
+Model: `OpenMOSS-Team/MOSS-Transcribe-preview-2B` = Qwen3-omni dense audio
 encoder (32L, d1280, H20, conv2d ÷8 subsample, sinusoidal pos, windowed
-non-causal attention via cu_seqlens, LayerNorm+GELU) → gated-MLP adapter
-(2048→8192→2048 SiLU) → Qwen3 LLM decoder (28L, d2048, GQA 16Q/8KV, hd128,
-SwiGLU 6144, RMSNorm eps 1e-6, QK-norm before RoPE, RoPE θ=1e6, tied
-embeddings, vocab 151936, bf16 KV cache).
+non-causal attention, LayerNorm+GELU) → gated adapter → Qwen3 decoder (28L,
+d2048, GQA 16Q/8KV, bf16 KV cache). Despite the upstream class name, the ASR
+audio path has no routed experts; see `docs/ggml-moss-spec.md`.
 
-- **2a — spec + goldens** (running): `docs/ggml-moss-spec.md` (op-by-op
-  contract) + staged component goldens `golden/moss_{short,medium,long}_*
-  {mel,audio_embeds,inputs_embeds,prefill_logits}.pt` alongside the existing
-  ids/text goldens.
-- **2b — GGUF converter + loader + mel**: `scripts/convert_moss_gguf.py`
-  (HF checkpoint → starling GGUF, HF-native tensor names, F16 weights /
-  F32 norms); `cpp/moss/{config,loader,mel}` byte-exact mel vs golden.
-  Resolve the n_fft 400-vs-640 question against the golden mel first.
-- **2c — audio encoder + adapter**: conv2d stack, sinusoidal pos, 32×
-  (LN → windowed attn → LN → GELU MLP), ln_post, proj, adapter.
-  Gate: audio_embeds golden.
-- **2d — prompt merge + Qwen3 prefill + greedy decode**: embed merge
-  (masked_scatter semantics), 4D-mask causal attention, bf16 KV cache,
-  QK-norm→RoPE order, tied-embedding lm_head, BPE detok. Gates: prefill
-  logits golden, then ids/text goldens (short/medium exact).
-- **2e — perf**: per-shape ReplayGraph for encoder (the PyTorch encoder is
-  *eager* 25-40ms — a captured ggml encoder can beat it), K-step multistep
-  decode with on-device argmax chaining (target ≤4.85ms/tok, the starling
-  bar), single-sync-per-K. Then bench vs starling-moss.
-- Wiring: `_native.py` MOSS binding, `StarlingGgmlMoss` engine, parity tests
-  extended to moss.
+Landed: Starling-owned GGUF conversion/loading, staged goldens, exact mel/audio
+encoder/adapter/prompt merge, exact greedy IDs/text, whole-model captured
+prefill/decode, device-resident KV, K-step decode, captured encoder, parallel
+mel, OOB tail protection, and bounded replay caches. Future MOSS work should be profile-led. The most plausible safe targets are
+frontend/encoder or prefill latency on short/medium audio. A second,
+competitor-derived experiment is default-off `ggml_flash_attn_ext` in decode
+with native GQA and valid-KV views; it requires exact token/text gates before
+benchmarking because MOSS long has a known near-tie. Decode is already near the
+PyTorch per-token floor and long end-to-end is already faster than PyTorch, so
+do not assume a large payoff.
 
-### Phase 3 — parakeet perf closure
+### Phase 3 — parakeet perf closure (mostly landed)
 
-Baseline the in-tree engine (steady state), then close medium/long:
-1. Device-resident decode state between K-step replays (kill per-replay
-   H2D/D2H round-trips of LSTM h/c + frame + token).
-2. K tuning + termination-check readback minimization.
-3. Encoder: verify the in-tree encoder matches the 2.8ms external
-   measurement; port any missing wins (depthwise-direct, NORM fusion — both
-   already in patches).
-Stretch: fully on-device TDT loop (megakernel-style) — evaluate against
-exactness risk.
+Landed: K-step decode, on-device argmax, T-aware K tuning, shape-cached encoder,
+attention/norm/depthwise fusions, and device-resident state for K<=16. The
+remaining concrete gap is long-audio K>16 state writeback: it falls back to
+host state round-trips after a ggml CUDA-graph topology defect. The next safe
+experiment is to isolate that writeback in a tiny replay regression, fix or
+work around the topology instability, then enable device-resident state for
+K=96 behind the existing exact content-token/text gates. Do not re-optimize the
+encoder without a profile showing a new bottleneck.
 
-### Phase 4 — self-containment hardening
+### Phase 4 — self-containment hardening and next family
+
+The recommended next family is **Parakeet Unified RNN-T**: it reuses the
+FastConformer frontend/encoder and prediction/joint machinery already in
+`cpp/parakeet`, while Starling already owns Python goldens. `transcribe.cpp`
+commit `a951f0af73b5d6f6153729039ba32e3017dc65cf` provides primary-source
+converter/reference-validation research for this exact checkpoint. Keep the
+implementation and GGUF format Starling-owned.
+
+After Unified, Qwen3-ASR is the strongest LLM-family candidate because its
+Qwen3 decoder can reuse MOSS's device-resident decode runtime; its Whisper-style
+encoder is new work. Cohere has excellent external reference material but a
+new seq2seq cross-attention decoder, so it is a larger first port. Granite/NAR,
+ARK, Higgs, and Audex require more family-specific encoder/decoder work or have
+license/environment constraints.
+
 
 - `scripts/convert_parakeet_gguf.py` (HF/.nemo → the loader's GGUF layout).
 - Delete `GgmlParakeet`/`GgmlMoss` external engines + their docs; rewrite

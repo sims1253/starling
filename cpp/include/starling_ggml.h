@@ -42,6 +42,7 @@ typedef struct starling_ggml_ctx starling_ggml_ctx;
 typedef enum {
     STARLING_GGML_PARAKEET_TDT = 1,  // nvidia/parakeet-tdt-0.6b-v3
     STARLING_GGML_MOSS         = 2,  // MOSS-Transcribe-preview-2B
+    STARLING_GGML_ARK          = 3,  // AutoArk-AI/ARK-ASR-3B
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------
