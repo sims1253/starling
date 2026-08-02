@@ -1,46 +1,8 @@
-From f17233994d80374fc94295c50295bc88210e9868 Mon Sep 17 00:00:00 2001
-From: parakeet dev <dev@parakeet.local>
-Date: Fri, 17 Jul 2026 06:54:20 +0200
-Subject: [PATCH 1/2] cuda/fattn: support per-head additive mask (ne[2] ==
- n_head)
-
-Lift the blanket fattn restriction that required mask->ne[2] == 1. Two mask
-shapes are now accepted:
-
-  (1) broadcast mask: ne[2] == 1, applied identically to every head (the
-      common case for causal/ALiBi/padding masks). All kernels still support
-      it; the broadcast path is unchanged and stays fast.
-  (2) per-head mask:  ne[2] == Q->ne[2] (== n_head), a distinct additive
-      bias per head (e.g. NeMo rel-pos attention bias bd[T_k,T_q,H]).
-      Only the WMMA and MMA tensor-core kernels index mask[h]; the VEC and
-      TILE kernels do not, so per-head masks are routed away from them and
-      refused (BEST_FATTN_KERNEL_NONE -> abort) rather than silently
-      producing wrong results.
-
-Kernel changes:
-  * fattn.cu: replace the `mask->ne[2] != 1 -> NONE` gate with a
-    broadcast/per-head distinction; force per-head masks onto MMA/WMMA and
-    away from VEC/TILE; also exclude per-head masks from the GQA ncols2
-    batching (mask[h] indexing is incompatible with it) in both the
-    best-kernel selector and the ncols2 switch.
-  * fattn-wmma-f16.cu: bake a head offset `nb32*head` into the mask pointer
-    at setup when ne[2] == n_head (0 for broadcast).
-  * fattn-mma-f16.cuh: same head offset `nb32*zt_Q` at both launch sites.
-
-The tile kernel (fattn-tile.cu) is left aborting on ne[2] != 1; it is not
-hit on sm_120 (RTX 5090), where the encoder lands on MMA, and adding mask[h]
-indexing there would be extra surface for no measured benefit.
----
- src/ggml-cuda/fattn-mma-f16.cuh | 14 ++++++++++----
- src/ggml-cuda/fattn-wmma-f16.cu |  6 +++++-
- src/ggml-cuda/fattn.cu          | 32 +++++++++++++++++++++++++++-----
- 3 files changed, 42 insertions(+), 10 deletions(-)
-
 diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
-index 4871b90d..226e39a8 100644
+index 7f4cfd55..088a164e 100644
 --- a/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1806,8 +1806,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1814,8 +1814,11 @@ static __global__ void flash_attn_ext_f16(
  
          const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
          const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
@@ -54,7 +16,7 @@ index 4871b90d..226e39a8 100644
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
-@@ -1852,8 +1855,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1860,8 +1863,11 @@ static __global__ void flash_attn_ext_f16(
  
      const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
      const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
@@ -68,28 +30,11 @@ index 4871b90d..226e39a8 100644
      float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
-diff --git a/src/ggml-cuda/fattn-wmma-f16.cu b/src/ggml-cuda/fattn-wmma-f16.cu
-index 4b6f6501..6f19dc15 100644
---- a/src/ggml-cuda/fattn-wmma-f16.cu
-+++ b/src/ggml-cuda/fattn-wmma-f16.cu
-@@ -93,7 +93,11 @@ static __global__ void flash_attn_ext_f16(
-     const float * Q_f    = (const float *) (Q    + nb03* sequence         + nb02* head              + nb01*ic0);
-     const half  * K_h    = (const half  *) (K    + nb13* sequence         + nb12*(head / gqa_ratio));
-     const half  * V_h    = (const half  *) (V    + nb13* sequence         + nb12*(head / gqa_ratio)); // K and V have same shape
--    const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33)                           + nb31*ic0);
-+    // For a per-head mask (ne32 == ne02 == n_head) index mask[head]; for a
-+    // broadcast mask (ne32 == 1) the ne32-conditional offset is 0 (the head
-+    // stride nb32 is ignored, the same [n_kv, n_batch] slice is shared by all heads).
-+    const int     mask_h_offs = ne32 == 1 ? 0 : nb32*head;
-+    const half  * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + mask_h_offs            + nb31*ic0);
-     const half2 * mask2  = (const half2 *)  maskh;
-     const float * sinksf = (const float *) sinks;
- 
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index 1c7777e8..c643896b 100644
+index ab7a3b29..389b9612 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
-@@ -46,9 +46,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -45,9 +45,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
  
@@ -102,7 +47,7 @@ index 1c7777e8..c643896b 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -357,7 +358,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -375,7 +376,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
  
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -112,8 +57,8 @@ index 1c7777e8..c643896b 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -445,13 +447,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
-             return BEST_FATTN_KERNEL_NONE;
+@@ -449,13 +451,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
      }
  
 -    if (mask && mask->ne[2] != 1) {
@@ -122,8 +67,8 @@ index 1c7777e8..c643896b 100644
 +    //       common case for causal/ALiBi/padding masks). All kernels support it.
 +    //   (2) per-head mask:  ne[2] == Q->ne[2] (== n_head), a distinct additive
 +    //       bias per head (e.g. NeMo rel-pos attention bias bd[T_k,T_q,H]).
-+    //       Only the WMMA and MMA tensor-core kernels index mask[h]; the VEC and
-+    //       TILE kernels do not, so they are rejected below for this case.
++    //       Only the MMA tensor-core kernel indexes mask[h]; the VEC and TILE
++    //       kernels do not, so they are rejected below for this case.
 +    const bool mask_is_broadcast = !mask || mask->ne[2] == 1;
 +    const bool mask_is_per_head  = mask && mask->ne[2] == Q->ne[2];
 +    if (mask && !mask_is_broadcast && !mask_is_per_head) {
@@ -138,7 +83,7 @@ index 1c7777e8..c643896b 100644
  
      // If Turing tensor cores are available, use them:
      if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-@@ -488,6 +500,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -492,6 +504,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
              return BEST_FATTN_KERNEL_VEC;
          }
@@ -149,19 +94,16 @@ index 1c7777e8..c643896b 100644
          if (Q->ne[1] * gqa_ratio_eff <= 16) {
              return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
          }
-@@ -534,6 +550,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -530,6 +546,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              }
          }
      }
 +    // The tile kernel does not index mask[h]; a per-head additive mask requires
-+    // the WMMA/MMA tensor-core kernels. If none of those was selected, refuse
-+    // (aborting loudly) rather than silently producing wrong results.
++    // the MMA tensor-core kernel. If none of those was selected, refuse (aborting
++    // loudly) rather than silently producing wrong results.
 +    if (mask_is_per_head) {
 +        return BEST_FATTN_KERNEL_NONE;
 +    }
      return BEST_FATTN_KERNEL_TILE;
  }
  
--- 
-2.54.0
-
