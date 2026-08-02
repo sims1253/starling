@@ -137,6 +137,7 @@ def backend_name() -> str:
 # Model selector constants (mirror the C enum starling_ggml_model).
 PARAKEET_TDT = 1
 MOSS = 2
+ARK = 3
 
 
 class GgmlModel:

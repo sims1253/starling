@@ -14,6 +14,7 @@ Run with:  uv run pytest tests/test_ggml_parity.py -q
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -233,6 +234,44 @@ def test_starling_ggml_moss_text_parity(starling_ggml_moss_engine, name: str) ->
     out = starling_ggml_moss_engine._run_one(FIXTURES[name]).rstrip()
     assert out == golden_text, (
         f"in-tree MOSS transcript mismatch on {name}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# In-tree ARK-ASR-3B C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_ark_available() -> bool:
+    try:
+        from engines import StarlingGgmlArk
+        return StarlingGgmlArk().available
+    except Exception:
+        return False
+
+@pytest.fixture(scope="module")
+def starling_ggml_ark_engine():
+    if not _starling_ggml_ark_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_ARK_MODEL unavailable")
+    from engines import StarlingGgmlArk
+    engine = StarlingGgmlArk()
+    engine.load()
+    yield engine
+    engine.close()
+
+@pytest.mark.skipif(not _starling_ggml_ark_available(),
+                    reason="in-tree libstarling_ggml or ARK GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_ark_text_parity(starling_ggml_ark_engine, name: str) -> None:
+    """The in-tree C API returns the golden ARK transcript exactly.
+
+    This deliberately has no tolerance: it gates Starling's own
+    loader -> mel -> encoder -> adapter -> prompt -> LLM -> detokenizer pipeline
+    for the ARK-ASR-3B model against the byte-exact reference.
+    """
+    golden_text = json.loads((GOLDEN / "ark_reference.json").read_text())[name]["text"].rstrip()
+    out = starling_ggml_ark_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree ARK transcript mismatch on {name}:\n"
         f"  golden: {golden_text!r}\n  ggml:   {out!r}"
     )
 

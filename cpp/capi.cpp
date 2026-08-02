@@ -42,6 +42,10 @@ void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_moss_free(void * handle);
 char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
                                  const char ** err_out);
+void * starling_ggml_ark_load(const char * gguf_path, const char ** err_out);
+void   starling_ggml_ark_free(void * handle);
+char * starling_ggml_ark_decode(void * handle, const float * pcm, int64_t n,
+                                const char ** err_out);
 }
 
 std::mutex g_err_mutex;
@@ -87,6 +91,8 @@ starling_ggml_ctx * starling_ggml_load(starling_ggml_model model,
         handle = starling_ggml_parakeet_load(gguf_path, &err);
     } else if (model == STARLING_GGML_MOSS) {
         handle = starling_ggml_moss_load(gguf_path, &err);
+    } else if (model == STARLING_GGML_ARK) {
+        handle = starling_ggml_ark_load(gguf_path, &err);
     } else {
         set_global_error("starling_ggml_load: unsupported model kind");
         return nullptr;
@@ -108,6 +114,8 @@ void starling_ggml_free(starling_ggml_ctx * ctx) {
             starling_ggml_parakeet_free(ctx->model);
         else if (ctx->kind == STARLING_GGML_MOSS)
             starling_ggml_moss_free(ctx->model);
+        else if (ctx->kind == STARLING_GGML_ARK)
+            starling_ggml_ark_free(ctx->model);
     }
     delete ctx;
 }
@@ -157,6 +165,17 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
         const char* err = nullptr;
         char* r = starling_ggml_moss_decode(ctx->model, samples, n, &err);
         if (!r) { ctx->last_error = err ? err : "MOSS transcribe failed"; set_global_error(ctx->last_error); }
+        return r;
+    }
+    if (ctx->kind == STARLING_GGML_ARK) {
+        if (sample_rate != 0 && sample_rate != 16000) {
+            ctx->last_error = "starling_ggml_transcribe_pcm: ARK expects 16 kHz";
+            set_global_error(ctx->last_error);
+            return nullptr;
+        }
+        const char* err = nullptr;
+        char* r = starling_ggml_ark_decode(ctx->model, samples, n, &err);
+        if (!r) { ctx->last_error = err ? err : "ARK transcribe failed"; set_global_error(ctx->last_error); }
         return r;
     }
     ctx->last_error = "starling_ggml_transcribe_pcm: unsupported model kind";
