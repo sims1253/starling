@@ -126,7 +126,7 @@ bool ArkModel::load(const char* path, std::string& err) {
         return false;
     }
     if (std::string prof; m.kv_str("starling.numeric_profile", prof) &&
-        prof != "bf16_exact" && prof != "f16") {
+        prof != "bf16_exact" && prof != "f16" && prof != "q8_0") {
         err = "unsupported ARK numeric profile: " + prof;
         return false;
     }

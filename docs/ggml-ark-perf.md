@@ -80,18 +80,31 @@ breaks CUDA-graph capture). Byte-exact transcripts preserved. Kill-switch:
 ## Remaining optimization headroom (decode-bound now)
 The encoder is no longer the bottleneck; decode (~7-10 ms/token, ~50-80% of wall)
 is. Options, in priority order:
-1. **Weight quantization (q8_0/q4_0)** for the decoder — engages ggml's MMQ
-   tensor-core kernels and cuts the decode GEMM memory traffic (the decode is
-   memory-bandwidth-bound). Would need a byte-exactness check (q8_0 usually keeps
-   argmax-stable transcripts; q4_0 may drift). Highest decode leverage.
+1. **~~Weight quantization (q8_0) for the decoder~~ — TRIED, does not help on this
+   GPU.** q8_0 decoder-linears GGUF (`models/ark-asr-3b-q8_0.gguf`, 4.3 GB vs 7.0 GB)
+   is **byte-exact** (all three fixtures pass the hard `assert out == golden_text`
+   gate) but **~27% slower end-to-end** (362/986/1102 ms vs 280/758/873 bf16).
+   The regression is entirely in decode: 10.9 ms/tok q8_0 vs 8.5 ms/tok bf16
+   (warm, K=4); serial decode widens it to 82.7 vs 50.8 ms/tok (+63%), confirming
+   it is not a CUDA-graph artifact. The decode GEMMs (2048×2048 hit by a B=1
+   vector, 36 layers × 7/step) are **compute-bound, not memory-bandwidth-bound** on
+   RTX 5090 (sm_120): ggml's MMQ/MVQ dequant overhead loses to cuBLAS bf16 for
+   these small single-token matmuls. The earlier "memory-bandwidth-bound" claim
+   above was wrong for this GPU+model combination. The `scripts/convert_ark_gguf.py
+   --quant q8_0` path and the `q8_0` numeric-profile loader gate are retained as
+   opt-in infra (e.g. memory-constrained GPUs where the 4.3 GB size matters more
+   than speed, or future larger models where MMQ may win); select via
+   `STARLING_GGML_ARK_MODEL=models/ark-asr-3b-q8_0.gguf`. q4_0 was not tried — it
+   would share the same MMQ-overhead penalty at even smaller block size and is
+   flagged "may drift" on exactness, so is unlikely to help.
 2. **Larger K** for the K-step (currently K=4, clamped to 8) — more tokens per
    host sync, but the decode is compute-bound so the gain is marginal.
 3. **`prompt+embeds`** is negligible (~2-20ms); not worth optimizing.
 4. The encoder's one-time per-shape CUDA-graph capture (~1-2s first call) could be
    pre-warmed (`prewarm`) for latency-sensitive single-utterance use.
 
-With q8_0 decode, projected end-to-end: short ~150ms, medium ~350ms, long ~400ms
-— at or below PyTorch peak.
+The decode stage is compute-bound on small GEMMs; the realistic next lever is
+either a larger K (marginal) or a different decode scheduling strategy.
 
 ## Build/run/bench
 ```

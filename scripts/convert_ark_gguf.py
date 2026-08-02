@@ -109,10 +109,10 @@ def gguf_name(name: str) -> str:
     raise KeyError(f"no ARK GGUF mapping for {name!r}")
 
 
-def add_metadata(w: gguf.GGUFWriter) -> None:
+def add_metadata(w: gguf.GGUFWriter, numeric_profile: str = "bf16_exact") -> None:
     V = gguf.GGUFValueType
     w.add_key_value("starling.format_version", 1, V.UINT32)
-    w.add_string("starling.numeric_profile", "bf16_exact")
+    w.add_string("starling.numeric_profile", numeric_profile)
     w.add_string("general.architecture", "ark")
 
     def ints(**xs):
@@ -307,6 +307,41 @@ def rope_tables() -> tuple[np.ndarray, np.ndarray]:
     return np.cos(freqs).astype(np.float32), np.sin(freqs).astype(np.float32)
 
 
+# --------------------------------------------------------------------------- #
+# Weight-quantization target selection.
+#
+# The ARK decode (Qwen2.5 autoregressive loop) is memory-bandwidth-bound on the
+# decoder linears; quantizing them to q8_0 engages ggml's MMQ/MVQ dequant-GEMM
+# kernels and roughly halves the per-token weight traffic. The audio encoder is
+# attention-bound (not weight-bound) and is left at bf16 to preserve the
+# audio-conditioning path. Norms and biases are tiny and stay bf16/f32. The
+# tied lm_head embedding (`llm.embed.weight`) is the single biggest tensor and
+# a quantization candidate (it dominates the embedding-lookup / logits matmul).
+#
+# See docs/ggml-ark-perf.md "Remaining optimization headroom" for the rationale
+# and the projected latency win.
+# --------------------------------------------------------------------------- #
+_QUANT_LINEARS = {
+    "attn.q", "attn.k", "attn.v", "attn.o",
+    "ffn.gate", "ffn.up", "ffn.down",
+}
+
+
+def is_quant_target(name: str) -> bool:
+    """True iff this GGUF tensor name should be quantized for the fast path.
+
+    Matches the decoder linears: ``llm.blk.{N}.{attn.q|attn.k|attn.v|attn.o|
+    ffn.gate|ffn.up|ffn.down}.weight`` (7 per layer) plus the tied lm_head
+    embedding ``llm.embed.weight``. The dotted linear names (``attn.q``) mean a
+    naive split would miscount, so match by suffix.
+    """
+    if name == "llm.embed.weight":
+        return True
+    if not name.startswith("llm.blk.") or not name.endswith(".weight"):
+        return False
+    return any(name.endswith(f"{lin}.weight") for lin in _QUANT_LINEARS)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
@@ -315,20 +350,31 @@ def main() -> None:
         type=Path,
         default=Path("models/ark-asr-3b-bf16-exact.gguf"),
     )
+    ap.add_argument(
+        "--quant",
+        choices=["bf16", "q8_0"],
+        default="bf16",
+        help="Weight quantization for the decoder linears (q8_0 engages ggml's "
+             "MMQ dequant-GEMM; the encoder/norms/biases stay bf16 either way).",
+    )
     args = ap.parse_args()
+
+    quantize = args.quant == "q8_0"
+    numeric_profile = "q8_0" if quantize else "bf16_exact"
 
     index = json.loads((args.snapshot / "model.safetensors.index.json").read_text())
     weight_map = index["weight_map"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     w = gguf.GGUFWriter(args.output, "ark", use_temp_file=True)
-    add_metadata(w)
+    add_metadata(w, numeric_profile=numeric_profile)
     tokenizer(w, args.snapshot)
 
     # Resolve every shard file once.
     shards = {s: args.snapshot / s for s in sorted(set(weight_map.values()))}
 
     learned = 0
+    quantized = 0
     dtypes = set()
     skipped = []
     # Stream tensors shard-by-shard so each file opens once.
@@ -343,12 +389,26 @@ def main() -> None:
                 dtypes.add(str(t.dtype))
                 if t.dtype is not torch.bfloat16:
                     raise TypeError(f"{source}: expected BF16, found {t.dtype}")
-                # GGUF stores dims innermost-first; keep the BF16 byte stream in
-                # checkpoint row-major order (same convention as moss).
-                a = np.ascontiguousarray(t.view(torch.uint16).numpy())
-                w.add_tensor(
-                    target, a, raw_shape=a.shape, raw_dtype=gguf.GGMLQuantizationType.BF16
-                )
+
+                if quantize and is_quant_target(target):
+                    # Quantize this decoder linear to q8_0. Cast bf16 -> f32 (value
+                    # upcast, NOT a byte view), then quantize. gguf.quantize blocks
+                    # along the innermost (C-contiguous) axis, which is the ggml
+                    # ne[0] axis -- exactly what ggml_mul_mat expects for a
+                    # quantized src0.
+                    f32 = np.ascontiguousarray(t.to(torch.float32).numpy())
+                    q = gguf.quantize(f32, gguf.GGMLQuantizationType.Q8_0)
+                    w.add_tensor(
+                        target, q, raw_shape=q.shape, raw_dtype=gguf.GGMLQuantizationType.Q8_0
+                    )
+                    quantized += 1
+                else:
+                    # GGUF stores dims innermost-first; keep the BF16 byte stream in
+                    # checkpoint row-major order (same convention as moss).
+                    a = np.ascontiguousarray(t.view(torch.uint16).numpy())
+                    w.add_tensor(
+                        target, a, raw_shape=a.shape, raw_dtype=gguf.GGMLQuantizationType.BF16
+                    )
                 learned += 1
 
     mel, window = frontend(args.snapshot)
@@ -367,8 +427,9 @@ def main() -> None:
     w.write_tensors_to_file()
     w.close()
     print(
-        f"wrote {args.output}: {learned + 4} tensors ({learned} learned), "
-        f"skipped {len(skipped)} (tied/unused), source dtypes={sorted(dtypes)}"
+        f"wrote {args.output}: {learned + 4} tensors ({learned} learned"
+        + (f", {quantized} q8_0" if quantize else "")
+        + f"), skipped {len(skipped)} (tied/unused), source dtypes={sorted(dtypes)}"
     )
     if skipped:
         print(f"skipped: {skipped}")
