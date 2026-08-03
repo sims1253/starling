@@ -43,8 +43,9 @@ Usage
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 
 
 @dataclass
@@ -235,6 +236,7 @@ class OptFlags:
 # process-global default flags
 # ---------------------------------------------------------------------------
 _DEFAULT_FLAGS = OptFlags()
+_FLAGS_LOCK = threading.Lock()
 
 
 def get_default_flags() -> OptFlags:
@@ -262,28 +264,17 @@ def flags(**overrides):
         # back to byte-exact default here
     """
     global _DEFAULT_FLAGS
-    saved = _DEFAULT_FLAGS
-    new = OptFlags(
-        multistep_graph=overrides.get("multistep_graph", saved.multistep_graph),
-        batched_encoder=overrides.get("batched_encoder", saved.batched_encoder),
-        tolerance_mode=overrides.get("tolerance_mode", saved.tolerance_mode),
-        fused_qkv=overrides.get("fused_qkv", saved.fused_qkv),
-        sdpa_attention=overrides.get("sdpa_attention", saved.sdpa_attention),
-        flash_attention=overrides.get("flash_attention", saved.flash_attention),
-        fp8_attention=overrides.get("fp8_attention", saved.fp8_attention),
-        rope_alloc_free=overrides.get("rope_alloc_free", saved.rope_alloc_free),
-        lm_head_scale_fold=overrides.get("lm_head_scale_fold", saved.lm_head_scale_fold),
-        gemm_epilogue_fusion=overrides.get("gemm_epilogue_fusion", saved.gemm_epilogue_fusion),
-        chunk_prefill_overlap=overrides.get("chunk_prefill_overlap", saved.chunk_prefill_overlap),
-        fp8_weights=overrides.get("fp8_weights", saved.fp8_weights),
-        nvfp4_weights=overrides.get("nvfp4_weights", saved.nvfp4_weights),
-        nvfp4_lm_head_only=overrides.get("nvfp4_lm_head_only", saved.nvfp4_lm_head_only),
-        kv_cache_compression=overrides.get("kv_cache_compression", saved.kv_cache_compression),
-        slim_draft_head=overrides.get("slim_draft_head", saved.slim_draft_head),
-        kernel_backend=overrides.get("kernel_backend", saved.kernel_backend),
-    )
-    _DEFAULT_FLAGS = new
+    with _FLAGS_LOCK:
+        saved = _DEFAULT_FLAGS
+        # Only apply overrides for fields that actually exist on OptFlags,
+        # so callers passing a stale/unknown key don't crash (matches prior
+        # lenient behavior).
+        valid_fields = {f.name for f in fields(saved)}
+        filtered = {k: v for k, v in overrides.items() if k in valid_fields}
+        new = replace(saved, **filtered)
+        _DEFAULT_FLAGS = new
     try:
         yield new
     finally:
-        _DEFAULT_FLAGS = saved
+        with _FLAGS_LOCK:
+            _DEFAULT_FLAGS = saved

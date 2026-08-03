@@ -5,7 +5,6 @@ so we know how much of the ggml engine's latency is wrapper overhead vs the
 ggml decode itself. Run inside one Bash call.
 """
 import ctypes
-import sys
 import time
 from pathlib import Path
 

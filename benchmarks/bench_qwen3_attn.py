@@ -21,8 +21,6 @@ import sys
 from pathlib import Path
 from statistics import median
 
-import numpy as np
-import soundfile as sf
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

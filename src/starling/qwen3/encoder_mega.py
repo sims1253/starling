@@ -27,8 +27,7 @@ because it replays the model's own ops unchanged -- only host launch overhead
 
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -167,7 +166,6 @@ class StaticEncoder:
         frames present) -- only correct for clips that fill the padded length.
         """
         from transformers.models.qwen3_asr.modeling_qwen3_asr import (
-            _get_feat_extract_output_lengths,
             get_audio_cu_seqlens,
         )
 

@@ -256,11 +256,14 @@ class ConvSubsampling(nn.Module):
     def forward(self, x: torch.Tensor, x_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: (B, F, T) -> (B, 1, T, F)
         x = x.transpose(1, 2).unsqueeze(1)
-        x = self.conv[0](x); x = F.relu(x)        # conv.0 + conv.1/relu
+        x = self.conv[0](x)                        # conv.0 + conv.1/relu
+        x = F.relu(x)
         x = self.conv[1](x)                        # conv.2
-        x = self.conv[2](x); x = F.relu(x)         # conv.3 + conv.4/relu
+        x = self.conv[2](x)                        # conv.3 + conv.4/relu
+        x = F.relu(x)
         x = self.conv[3](x)                        # conv.5
-        x = self.conv[4](x); x = F.relu(x)         # conv.6 + conv.7/relu
+        x = self.conv[4](x)                        # conv.6 + conv.7/relu
+        x = F.relu(x)
         B, Cc, Tp, Fp = x.shape
         x = x.transpose(1, 2).contiguous().view(B, Tp, Cc * Fp)   # (B, T', 4096)
         x = self.out(x)

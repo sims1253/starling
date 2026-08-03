@@ -245,7 +245,6 @@ class MossLLMMega:
         fixed-address input buffer, ``graph`` replays the prefill, and
         ``out_tok`` is the (1,1) first-token output (overwritten each replay).
         """
-        T = inputs_embeds.shape[1]
         device = inputs_embeds.device
         static_emb = torch.empty_like(inputs_embeds)
         static_emb.copy_(inputs_embeds)

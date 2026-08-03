@@ -34,7 +34,6 @@ def main() -> int:
 
     comps_inner = model.model
     lm, lm_head = comps_inner.language_model, model.lm_head
-    T = emb.shape[1]
 
     # single-step
     print("[test] single-step decoder ...")

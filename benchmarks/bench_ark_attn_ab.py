@@ -6,7 +6,8 @@ attention-backend optimization from everything else.
 """
 from __future__ import annotations
 
-import os, sys, time
+import sys
+import time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np

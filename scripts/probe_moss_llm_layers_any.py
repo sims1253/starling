@@ -38,9 +38,7 @@ def main() -> int:
     from transformers.cache_utils import DynamicCache
 
     cache = DynamicCache(config=lm.config)
-    dtype = embeds.dtype
     device = embeds.device
-    q = torch.arange(T, device=device).unsqueeze(1)
     pos = torch.arange(T, device=device).unsqueeze(0)
     cp = torch.arange(T, device=device)
 

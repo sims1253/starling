@@ -62,7 +62,13 @@ def _restore_dirs() -> bool:
         return False
     src = _git_checkout_models_dir()
     if src is None:
-        return False
+        # The git-checkout restore path is only needed for the OLD pinned
+        # commit (957e6032) whose `find_packages` dropped these dirs. Newer
+        # pins ship the dirs in the wheel already. If the checkout can't be
+        # found (hash drifted, uv cache evicted), fall through and report
+        # success when every dir is already present in site-packages, so the
+        # CONFIG_MAPPING registration below still runs.
+        return all((inst / m).exists() for m in _MISSING_DIRS)
     for m in _MISSING_DIRS:
         dst = inst / m
         if not dst.exists():
@@ -104,6 +110,8 @@ def _sync_base_files(src_tf_dir: Path) -> None:
         except Exception:
             continue
         try:
+            if mod.__file__ is None:
+                continue
             dst_file = Path(mod.__file__)
             shutil.copy2(src_file, dst_file)
         except Exception:
@@ -125,7 +133,6 @@ def _register() -> None:
     # class-definition time and does not know the not-yet-upstream config). It
     # is purely cosmetic and fires on EVERY import, so we swallow just those
     # lines around the submodule imports below.
-    import contextlib
 
     class _SwallowDocstringNoise:
         def __enter__(self):

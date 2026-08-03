@@ -39,7 +39,6 @@ def encode(
     enc = comps["encoder"](input_features=input_features, attention_mask=attention_mask)
     enc_h = enc.last_hidden_state
     B, S, _ = enc_h.shape
-    neg = torch.finfo(enc_h.dtype).min
     # bidirectional: all keys valid. (B,1,1,S) additive 0 mask.
     enc_mask = torch.zeros(B, 1, 1, S, device=enc_h.device, dtype=enc_h.dtype)
     return enc_h, enc_mask

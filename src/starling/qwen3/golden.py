@@ -86,7 +86,6 @@ def capture_golden(force: bool = False, *, max_new_tokens: int = 200) -> dict[st
     model, processor = load_model_and_processor(attn_impl="eager")
     components = get_components(model)
     encoder = components["encoder"]
-    projector = components["projector"]
 
     print(f"[golden] loading sample audio {SAMPLE_AUDIO} ...")
     wav, sr = load_wav(_fixture_wav())
@@ -95,8 +94,6 @@ def capture_golden(force: bool = False, *, max_new_tokens: int = 200) -> dict[st
     input_features = inputs["input_features"]
     input_features_mask = inputs.get("input_features_mask")
     prompt_len = int(input_ids.shape[1])
-
-    dtype = model.dtype  # bfloat16
 
     with torch.inference_mode():
         # (1) Encoder last hidden state (packed valid-only sequence).

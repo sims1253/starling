@@ -97,10 +97,15 @@ def main() -> int:
             x = torch.randn(1, in_features, device="cuda", dtype=torch.bfloat16)
             scaled_mm_weight, scaled_mm_scale = quantize_scaled_mm(weight)
             triton_weight, triton_scale = quantize_triton(weight)
-            scaled_mm_call = lambda: scaled_mm_linear(
-                x, scaled_mm_weight, scaled_mm_scale
-            )
-            triton_call = lambda: triton_linear(x, triton_weight, triton_scale)
+
+            def scaled_mm_call(
+                _x=x, _w=scaled_mm_weight, _s=scaled_mm_scale
+            ):
+                return scaled_mm_linear(_x, _w, _s)
+
+            def triton_call(_x=x, _w=triton_weight, _s=triton_scale):
+                return triton_linear(_x, _w, _s)
+
             scaled_mm_us = _time_us(scaled_mm_call)
             triton_us = _time_us(triton_call)
             scaled_mm_output = scaled_mm_call()

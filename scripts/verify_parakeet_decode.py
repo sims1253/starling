@@ -25,7 +25,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tests" / "fixtures"))

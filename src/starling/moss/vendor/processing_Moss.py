@@ -19,7 +19,6 @@ class MelConfig:
 
 def load_chat_template(template_path: str, package_path: Optional[str] = None) -> List:
     """Dynamically import a chat template module by file path and return its `chat_template`."""
-    import os
 
     if package_path and package_path not in sys.path:
         sys.path.insert(0, package_path)

@@ -25,14 +25,20 @@ reference, so the end-to-end transcript reproduces the golden reference.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 
 from .config import AUDIO_TOKEN_ID, EOS_TOKEN_ID
 from .encoder_mega import GraphedEncoder
 from .loader import get_components, load_model_and_processor
-from .llm_mega import FusedLLMMega, LLMMega
+from .llm_mega import LLMMega
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime in ``_get_multistep_llm`` to keep the
+    # multistep CUDA-graph path out of the import graph when unused; this
+    # TYPE_CHECKING import only satisfies the type annotation below.
+    from .multistep import MultiStepLLMMega
 
 
 class MegaPipeline:
@@ -246,7 +252,7 @@ def main() -> int:
     import time
 
     from .audio import build_inputs, load_wav
-    from .golden import _fixture_wav, load_golden, load_golden_text, INPUTS_EMBEDS, GREEDY_TEXT
+    from .golden import _fixture_wav, load_golden, load_golden_text, INPUTS_EMBEDS
 
     print("[pipeline] loading model + building MegaPipeline ...")
     t0 = time.perf_counter()

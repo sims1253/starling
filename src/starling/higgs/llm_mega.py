@@ -498,10 +498,9 @@ class LLMMega:
         ``max_new_tokens - 1`` decode steps are served by CUDA-graph replay when
         ``prefill_graph``/``capture`` are enabled.
         """
-        T = batch["input_ids"].shape[1]
-        # The merged prompt can be longer than T (audio features expand the
-        # <|AUDIO|> placeholder); the real cache footprint is only known after
-        # prefill.  Guard against the post-prefill case in prefill().
+        # The merged prompt can be longer than input_ids (audio features expand
+        # the <|AUDIO|> placeholder); the real cache footprint is only known
+        # after prefill, so guard against the post-prefill case in prefill().
         if max_new_tokens <= 0:
             return self._finalize([], 0.0, tokenizer)
 

@@ -2,7 +2,7 @@ import warnings
 import torch
 
 from typing import Optional, Tuple
-from transformers.cache_utils import Cache, StaticCache, EncoderDecoderCache
+from transformers.cache_utils import StaticCache, EncoderDecoderCache
 try:
     from transformers.models.whisper.modeling_whisper import WhisperFlashAttention2, WHISPER_ATTENTION_CLASSES
 except ImportError:
@@ -16,7 +16,7 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.integrations import is_deepspeed_available
 
 
-from .utils import support_deepspeed_ulysses, is_deepspeed_ulysses_enabled, deepspeed_ulysses_attention, deepspeed_ulysses_rope, sequence_chunking_per_rank
+from .utils import support_deepspeed_ulysses, is_deepspeed_ulysses_enabled, deepspeed_ulysses_attention
 
 DistributedAttention = None
 vocab_sequence_parallel_cross_entropy = None

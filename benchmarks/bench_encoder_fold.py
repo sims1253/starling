@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 from statistics import median
 
@@ -29,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from starling.granite.encoder_mega import FusedEncoder  # noqa: E402
-from starling.granite.golden import load_golden  # noqa: E402
 from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
 
 
@@ -43,11 +41,8 @@ def main() -> int:
     print("loading model ...", flush=True)
     model, processor = load_model_and_processor(attn_impl="eager")
     components = get_components(model)
-    feats = load_golden("audio_embeds.pt")  # not used; we need input_features
-    # The encoder takes input_features (mel). Load from golden.
-    from starling.granite.golden import load_golden as _lg
-    # input_features is stored as part of golden capture? Check what's there.
-    # We'll rebuild from audio instead.
+    # The encoder takes input_features (mel). Rebuild from audio rather than the
+    # golden capture (which only stores audio_embeds, not the mel features).
     from starling.granite.audio import build_inputs, load_sample_audio
     wav, sr = load_sample_audio()
     inputs = build_inputs(processor, wav)

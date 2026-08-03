@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Any

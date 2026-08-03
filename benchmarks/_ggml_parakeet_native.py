@@ -23,7 +23,6 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
-from typing import Optional
 
 # Build artifact: libparakeet.so lives in the parakeet.cpp build tree. Override
 # with GGML_PARAKEET_LIB. The model path is shared with the server engine.

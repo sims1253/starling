@@ -152,16 +152,13 @@ class GraphedDecoder:
         if getattr(cache, "is_updated", None) is not None:
             cache.is_updated = {i: False for i in range(self.n_layers)}
         # rewind both write heads so this prefill lands at [0, T) / [0, S)
-        zero = None
         for cache_half in (cache.self_attention_cache, cache.cross_attention_cache):
             for layer in cache_half.layers:
                 if getattr(layer, "is_initialized", False):
-                    if zero is None:
-                        zero = torch.zeros(
-                            (1,), dtype=layer.cumulative_length.dtype,
-                            device=layer.cumulative_length.device,
-                        )
-                    layer.cumulative_length.copy_(zero)
+                    # Use fill_ so the write is agnostic to whether the layer's
+                    # ``cumulative_length`` is a scalar (transformers >= 5.14) or
+                    # a 1-element tensor (older versions).
+                    layer.cumulative_length.fill_(0)
 
         B, T = dec_in.shape
         device = enc_h.device
@@ -196,9 +193,10 @@ class GraphedDecoder:
         into the correct K/V slots. The K/V *contents* at slots [0, pos) are left
         intact (the previous replays wrote them correctly).
         """
-        fill = torch.full((1,), pos, dtype=torch.long, device=self.device)
         for layer in self._cache.self_attention_cache.layers:
-            layer.cumulative_length.copy_(fill)
+            # fill_ is agnostic to scalar vs. 1-element tensor shape across
+            # transformers versions (see note in _prefill above).
+            layer.cumulative_length.fill_(pos)
 
     def _reset_cache(self, cache, first_token):
         """Rewind the decode state to the post-prefill position for a new decode.
@@ -224,9 +222,10 @@ class GraphedDecoder:
         mask only admits keys ``<= cur_pos``, and every such slot was written by
         this utterance's prefill or by an earlier step of this decode.
         """
-        fill = torch.full((1,), self._T, dtype=torch.long, device=self.device)
         for layer in cache.self_attention_cache.layers:
-            layer.cumulative_length.copy_(fill)
+            # fill_ is agnostic to scalar vs. 1-element tensor shape across
+            # transformers versions (see note in _prefill above).
+            layer.cumulative_length.fill_(self._T)
         cache.is_updated = {i: True for i in range(self.n_layers)}
         self.self_token.copy_(first_token)
         self.cur_pos.fill_(self._T)
@@ -463,7 +462,6 @@ def greedy_decode_graphed(
             input_features=input_features, attention_mask=attention_mask
         ).last_hidden_state
         B, S = enc_h.shape[:2]
-        neg = torch.finfo(enc_h.dtype).min
         enc_mask = torch.zeros(B, 1, 1, S, device=enc_h.device, dtype=enc_h.dtype)
         gd.capture(decoder_input_ids, enc_h, enc_mask)
         return gd.decode(

@@ -549,7 +549,10 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> t
     x1 = x.reshape(-1)[:K].contiguous()
     scale1d = w_scale.reshape(-1)
     out = torch.empty(N, dtype=torch.bfloat16, device=w_fp8.device)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_M"]),)
+
+    def grid(meta):
+        return (triton.cdiv(N, meta["BLOCK_M"]),)
+
     _fp8_gemv_kernel[grid](x1, w_fp8, scale1d, out, K=K, OUT_N=N)
     return out.view(1, N)
 
@@ -697,7 +700,10 @@ def fp4_gemv_fused(
     x1 = x.reshape(-1).contiguous()
     out = torch.empty((OUT,), dtype=x.dtype, device=codes.device)
     BLOCK_K = 128
-    grid = lambda meta: (triton.cdiv(OUT, meta["BLOCK_M"]),)
+
+    def grid(meta):
+        return (triton.cdiv(OUT, meta["BLOCK_M"]),)
+
     _fp4_gemv_kernel[grid](
         x1, codes, scales, out,
         K=K, K_BYTES=K // 2, K_BLOCKS=K_BLOCKS, OUT_N=OUT, BLOCK_K=BLOCK_K,

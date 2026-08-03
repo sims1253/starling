@@ -195,7 +195,6 @@ class GraphedDecoder:
         ``last_token`` and ``sym_count`` are chained IN GRAPH so the next in-graph
         step reads the correct values without a host sync.
         """
-        B = self._B
         T_enc = self._T_enc
         # (1) prediction net step: embed(last_token) -> one LSTM step
         lt = self.last_token.unsqueeze(1)                          # (B,1)
@@ -333,7 +332,6 @@ class GraphedDecoder:
         self.c_buf.zero_()
         self.output.fill_(self.blank_id)
 
-        B = self._B
         self.valid_lengths_cpu.copy_(self.valid_lengths, non_blocking=False)
         valid_lengths_cpu = self.valid_lengths_cpu                # (B,)
         blank_cpu = self.blank_cpu                                # (B,)

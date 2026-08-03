@@ -25,10 +25,18 @@ longest common run in that region (``difflib``) and splice, deduping the overlap
 from __future__ import annotations
 
 import difflib
+import logging
 import re
+import time
 from typing import Callable, Optional
 
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+# Retry/backoff for the final tail window on commit when the transcriber is busy.
+_FLUSH_TAIL_MAX_RETRIES = 5
+_FLUSH_TAIL_BACKOFF_SECONDS = 0.05
 
 _WORD_NORM = re.compile(r"[^\w']+")
 
@@ -150,16 +158,33 @@ class ChunkStreamer:
         return " ".join(self.committed) if finalized else None
 
     def flush(self, samples: np.ndarray, tx: TranscribeFn) -> str:
-        """Finalize all remaining audio (on ``commit``) and return the full text."""
+        """Finalize all remaining audio (on ``commit``) and return the full text.
+
+        If the transcribe callback is busy (returns ``None``), the tail window is
+        retried a few times with a short backoff.  If it still cannot be
+        transcribed, the tail is dropped and a warning is logged -- committed
+        text is still returned so the caller receives the bulk of the dictation.
+        """
         self._finalize_full_windows(samples, tx)
         tail = samples[self.boundary :]
         if len(tail) > 0:
-            text = tx(tail)
+            text = None
+            for attempt in range(_FLUSH_TAIL_MAX_RETRIES):
+                text = tx(tail)
+                if text is not None:
+                    break
+                time.sleep(_FLUSH_TAIL_BACKOFF_SECONDS)
             if text:
                 self.committed = stitch_words(
                     self.committed, text.split(), max_overlap=self.max_overlap_words
                 )
                 self.boundary = len(samples)
+            else:
+                log.warning(
+                    "flush: dropped untranscribed tail (%d samples) after %d "
+                    "retries; transcriber remained busy",
+                    len(tail), _FLUSH_TAIL_MAX_RETRIES,
+                )
         return " ".join(self.committed)
 
     def reset(self) -> None:

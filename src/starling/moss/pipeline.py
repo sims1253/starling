@@ -25,7 +25,6 @@ import torch
 from .config import LLM_EOS_TOKEN_ID
 from .encoder_graph import GraphedAudioEncoder
 from .loader import get_components
-from .multistep import MossMultiStepMega
 
 
 class MossMegaPipeline:
@@ -42,7 +41,6 @@ class MossMegaPipeline:
         encoder_mode: str = "eager",
         compile_decode: bool = True,
     ) -> None:
-        from ..flags import get_default_flags
 
         self.model = model
         self.processor = processor
@@ -169,7 +167,6 @@ class MossMegaPipeline:
 
         from starling.moss.reference import _get_feat_extract_output_lengths  # noqa
         # num audio tokens for this mel len
-        from . import config as C
 
         class _P:
             pass

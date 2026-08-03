@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import zipfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 

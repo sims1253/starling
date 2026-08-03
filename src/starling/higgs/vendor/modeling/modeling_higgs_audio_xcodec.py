@@ -1,7 +1,5 @@
 # coding: utf-8
 from typing import Optional, Tuple, Union
-import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +12,7 @@ except ImportError:
     librosa = None
 try:
     from omegaconf import OmegaConf
-except Exception as e:
+except Exception:
     OmegaConf = None  # only needed for ckpt/yaml loader
 # xcodec is only needed when audio_encoder_config.model_type == "higgs_audio_encoder_xcodec"
 # Make imports lazy so the model can be loaded for ASR/understanding without xcodec installed.

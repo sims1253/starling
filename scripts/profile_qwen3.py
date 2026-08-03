@@ -8,14 +8,12 @@ wall clock for host. The output tells us which stage to attack next.
 from __future__ import annotations
 
 import statistics
-import time
 
 import torch
 
 from starling.qwen3.audio import build_inputs, load_wav
 from starling.qwen3.config import MODEL_ID, REPO_ROOT
-from starling.qwen3.golden import _fixture_wav
-from starling.qwen3.loader import get_components, load_model_and_processor
+from starling.qwen3.loader import get_components
 from starling.qwen3.pipeline import MegaPipeline
 
 
@@ -64,20 +62,20 @@ def main() -> int:
         enc_lhs = enc(input_features=feats, input_features_mask=mask, return_dict=True).last_hidden_state
 
         # projector
-        proj_ms = _cuda_ms(lambda: proj(enc_lhs.clone()))
+        proj_ms = _cuda_ms(lambda _lhs=enc_lhs: proj(_lhs.clone()))
         audio_embeds = proj(enc_lhs.clone())
 
         # merge
-        def _merge():
-            return pipe.build_inputs_embeds(input_ids, audio_embeds)
+        def _merge(_emb=audio_embeds):
+            return pipe.build_inputs_embeds(input_ids, _emb)
 
         merge_ms = _cuda_ms(_merge)
         inputs_embeds = _merge()
 
         # prefill
-        def _prefill():
+        def _prefill(_emb=inputs_embeds):
             pipe.llm._reset_cache_pos(0)
-            return pipe.llm.prefill(inputs_embeds)
+            return pipe.llm.prefill(_emb)
 
         prefill_ms = _cuda_ms(_prefill, warmup=2, iters=5)
         first_tok = pipe.llm.prefill(inputs_embeds)
