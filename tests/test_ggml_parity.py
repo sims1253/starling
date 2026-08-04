@@ -483,7 +483,9 @@ def test_starling_ggml_parakeet_idstream_parity(
         # medium stay element-for-element exact.
         n = min(len(out_nb), len(golden_nb))
         matches = sum(1 for i in range(n) if out_nb[i] == golden_nb[i])
-        rate = matches / max(1, n)
+        # Divide by the MAX length so unmatched trailing tokens count against
+        # the score (a decode that just truncates can't score 1.0).
+        rate = matches / max(1, max(len(out_nb), len(golden_nb)))
         assert rate >= 0.65, (
             f"in-tree parakeet content-token drift too high on {name} "
             f"(blank_id={blank_id}): match rate {rate:.3f} "

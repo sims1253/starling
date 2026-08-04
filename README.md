@@ -36,8 +36,8 @@ Two scripts, each the single source of truth for its slice. Both support
 
 - **`benchmarks/bench_all.py`** — latency/RTFx grid. Sweeps model × engine ×
   audio length × batch size on tiled-LibriSpeech fixtures. Engines: `starling`,
-  `stock`, `crispasr`, `parakeet.cpp`, `starling-batched` (granite/qwen3),
-  `starling-spec` (granite).
+  `stock`, `crispasr`, `parakeet.cpp`, `starling-ggml`, `starling-batched`
+  (granite/qwen3), `starling-spec` (granite).
 - **`benchmarks/bench_leaderboard.py`** — accuracy grid. Reproduces the
   [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard)
   English short-form methodology (Whisper `EnglishTextNormalizer` +
@@ -288,10 +288,12 @@ current step then returns HTTP 499).
 Requests without an `X-Request-Id` receive a generated ID in the response.
 Uploads are capped at 256 MiB and requests have a 10-minute wall-clock deadline
 by default; tune these with `--max-upload-mb` and `--request-timeout-seconds`
-(pass `0` or a negative value to disable the deadline entirely). The API has no
-authentication, so binding a
-non-loopback `--host` emits a warning and should only be done behind an
-authenticated proxy.
+(pass `0` or a negative value to disable the deadline entirely). A single GPU
+worker serves one request at a time, so disabling the deadline can occupy it
+indefinitely — only use a non-positive value for trusted local use, or ensure
+an upstream proxy enforces its own timeout. The API has no authentication, so
+binding a non-loopback `--host` emits a warning and should only be done behind
+an authenticated proxy.
 
 Profiles provide supported defaults for the main workloads:
 

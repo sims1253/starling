@@ -382,7 +382,12 @@ def test_prefill_rewinds_self_cache_so_reused_graphs_do_not_leak():
         f"the prompt K/V did not land in slots [0, T)"
     )
     keys_reused = [layer.keys[:, :, :T].clone() for layer in layers]
-    del pipe
+    values_reused = [layer.values[:, :, :T].clone() for layer in layers]
+    # Release the first decoder and its cached graph state before constructing
+    # the fresh pipeline, so no objects from the first capture remain
+    # referenced during the second.
+    dec._cache = None
+    del dec, layers, pipe
     torch.cuda.empty_cache()
 
     # same clip B, prefilled on a pristine cache -> the ground truth prompt K/V
@@ -391,12 +396,21 @@ def test_prefill_rewinds_self_cache_so_reused_graphs_do_not_leak():
     dec2 = fresh._get_decoder(dec_in_b2, enc_b2, mask_b2)  # captures on clip B
     keys_fresh = [layer.keys[:, :, :T].clone()
                   for layer in dec2._cache.self_attention_cache.layers]
+    values_fresh = [layer.values[:, :, :T].clone()
+                    for layer in dec2._cache.self_attention_cache.layers]
 
     for i, (reused, fresh_k) in enumerate(zip(keys_reused, keys_fresh)):
         assert torch.equal(reused, fresh_k), (
             f"layer {i}: prompt K on a reused graph differs from a fresh prefill "
             f"(maxdiff {(reused.float() - fresh_k.float()).abs().max():.3e}) -- "
             f"the previous utterance's decode state is leaking"
+        )
+    # Also verify cached values: clip A's V must not leak into clip B's decode.
+    for i, (reused_v, fresh_v) in enumerate(zip(values_reused, values_fresh)):
+        assert torch.equal(reused_v, fresh_v), (
+            f"layer {i}: prompt V on a reused graph differs from a fresh prefill "
+            f"(maxdiff {(reused_v.float() - fresh_v.float()).abs().max():.3e}) -- "
+            f"stale values from the previous utterance are leaking"
         )
 
 

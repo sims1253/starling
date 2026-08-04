@@ -12,7 +12,7 @@ except ImportError:
     librosa = None
 try:
     from omegaconf import OmegaConf
-except Exception:
+except ImportError:
     OmegaConf = None  # only needed for ckpt/yaml loader
 # xcodec is only needed when audio_encoder_config.model_type == "higgs_audio_encoder_xcodec"
 # Make imports lazy so the model can be loaded for ASR/understanding without xcodec installed.

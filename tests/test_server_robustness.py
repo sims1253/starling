@@ -21,6 +21,7 @@ import os
 import struct
 import sys
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -40,6 +41,7 @@ from starling.server import (  # noqa: E402
     TranscribeResult,
     _extract_multipart_payload,
     _transcribe_payload_sync,
+    _wav_bytes_to_float32,
     _ws_read_frame,
 )
 from starling.stream_chunk import (  # noqa: E402
@@ -62,9 +64,11 @@ def _wav_bytes(samples: np.ndarray, sampwidth: int = 2, framerate: int = SAMPLE_
         wf.setsampwidth(sampwidth)
         wf.setframerate(framerate)
         if sampwidth == 2:
-            raw = (np.clip(samples, -1.0, 1.0) * 32768.0).astype("<i2").tobytes()
+            # Scale by the positive max-representable value so a clipped +1.0
+            # maps to +32767 rather than overflowing int16 to -32768.
+            raw = (np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         elif sampwidth == 4:
-            raw = (np.clip(samples, -1.0, 1.0) * 2147483648.0).astype("<i4").tobytes()
+            raw = (np.clip(samples, -1.0, 1.0) * 2147483647.0).astype("<i4").tobytes()
         elif sampwidth == 1:
             raw = ((np.clip(samples, -1.0, 1.0) * 128.0) + 128.0).astype(np.uint8).tobytes()
         else:
@@ -76,23 +80,30 @@ def _wav_bytes(samples: np.ndarray, sampwidth: int = 2, framerate: int = SAMPLE_
 class _FakeServer:
     """Minimal stand-in for StarlingServer for ``_transcribe_payload_sync``.
 
-    Only the surface used by the transport adapter is faked; the decode path
-    runs against the *real* ``_wav_bytes_to_float32`` to exercise the fix.
+    Only the surface used by the transport adapter is faked: ``decode_wav_bytes``
+    raises the injected ``exc`` (simulating a decode failure) when set, and
+    ``_run_queued_sync`` returns a canned :class:`TranscribeResult` on the clean
+    path. NOTE: these tests exercise only the exception-to-status mapping in
+    ``_transcribe_payload_sync``; they do NOT exercise the real
+    ``_wav_bytes_to_float32`` -- see ``test_wav_bytes_to_float32_*`` below for
+    direct decoder coverage.
     """
 
     def __init__(self, exc=None, *, result_text: str = "ok") -> None:
-        # ``exc``: if set, ``transcribe_bytes_sync`` raises it (so the decode
-        # is simulated as failing). If None, a canned TranscribeResult is
-        # returned (meaning the bytes decoded cleanly).
+        # ``exc``: if set, ``decode_wav_bytes`` raises it (simulating a decode
+        # failure). If None, decode + inference succeed with ``result_text``.
         self._exc = exc
         self._result_text = result_text
         # a real queue_depth()/registry is not needed for the 400 path
         self._n_waiters = 0
         self._lock = threading.Lock()
 
-    def transcribe_bytes_sync(self, wav_bytes, request_id=None):  # noqa: ANN001
+    def decode_wav_bytes(self, wav_bytes):  # noqa: ANN001
         if self._exc is not None:
             raise self._exc
+        return np.zeros(SAMPLE_RATE, dtype=np.float32)
+
+    def _run_queued_sync(self, samples, request_id, *, streaming=False):  # noqa: ANN001
         return TranscribeResult(text=self._result_text)
 
     def queue_depth(self) -> int:
@@ -139,6 +150,19 @@ def test_transcribe_payload_passes_through_200_on_clean_wav() -> None:
     assert status == 200
     assert response["text"] == "hello world"
     assert response["request_id"] == "req-3"
+
+
+def test_wav_bytes_to_float32_raises_on_truncated_body() -> None:
+    """A truncated WAV body raises ValueError/wave.Error from the real decoder.
+
+    This exercises the actual ``_wav_bytes_to_float32`` decode path (the
+    section-A tests above only check the exception-to-status mapping in the
+    transport adapter via the faked decode).
+    """
+    import wave
+
+    with pytest.raises((ValueError, wave.Error)):
+        _wav_bytes_to_float32(b"RIFF\x00\x00\x00\x00WAVEjunk")
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +247,40 @@ def test_multipart_without_boundary_returns_raw_body() -> None:
     assert out == raw
 
 
+def test_multipart_all_zero_score_parts_returns_last_part() -> None:
+    """Multiple parts that all score 0 (no audio/file name, no filename, no
+    audio content-type) fall back to the LAST non-empty part."""
+    boundary = "----b"
+    part_a = _mp_part(
+        [("Content-Disposition", 'form-data; name="note"')],
+        b"first note",
+    )
+    part_b = _mp_part(
+        [("Content-Disposition", 'form-data; name="note2"')],
+        b"second note",
+    )
+    body = b"--" + boundary.encode() + b"\r\n" + part_a + b"\r\n" \
+        + b"--" + boundary.encode() + b"\r\n" + part_b + b"\r\n" \
+        + b"--" + boundary.encode() + b"--\r\n"
+    ctype = f"multipart/form-data; boundary={boundary}"
+
+    out = _extract_multipart_payload(body, ctype)
+
+    assert out == b"second note"  # last part wins
+
+
+def test_multipart_boundary_with_no_usable_parts_returns_original_body() -> None:
+    """A Content-Type carrying a boundary whose body yields no candidate parts
+    returns the original body unchanged."""
+    boundary = "----b"
+    body = b"--" + boundary.encode() + b"--\r\n"
+    ctype = f"multipart/form-data; boundary={boundary}"
+
+    out = _extract_multipart_payload(body, ctype)
+
+    assert out == body
+
+
 # ---------------------------------------------------------------------------
 # C. WS frame cap + mask validation
 # ---------------------------------------------------------------------------
@@ -304,6 +362,35 @@ def test_ws_read_frame_allows_max_size_header() -> None:
     # the EOF "closed mid-frame" ConnectionError proves the cap allowed it.
 
 
+def test_ws_read_frame_rejects_oversized_fragmented_message() -> None:
+    """The size cap applies across the WHOLE fragmented message, not per frame.
+
+    An unfinished text frame followed by a continuation whose combined payload
+    exceeds MAX_WS_FRAME_BYTES must raise, not return the joined payload.
+    """
+    mask_key = b"\x01\x02\x03\x04"
+
+    def _masked_frame(payload: bytes, opcode: int, fin: bool) -> bytes:
+        b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
+        n = len(payload)
+        b1 = 0x80 | (126 if n < 65536 else 127)
+        out = bytearray()
+        if n < 65536:
+            out += struct.pack(">BBH", b0, b1, n)
+        else:
+            out += struct.pack(">BBQ", b0, b1, n)
+        out += mask_key
+        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        return bytes(out)
+
+    half = MAX_WS_FRAME_BYTES // 2 + 1  # two halves each under the per-frame cap...
+    first = _masked_frame(b"\x00" * half, opcode=0x1, fin=False)  # unfinished text
+    cont = _masked_frame(b"\x00" * half, opcode=0x0, fin=True)    # ...but combined > cap
+
+    with pytest.raises(ValueError, match="too large"):
+        _ws_read_frame(_rfile(first + cont))
+
+
 # ---------------------------------------------------------------------------
 # D. Streaming buffer is bounded
 # ---------------------------------------------------------------------------
@@ -372,6 +459,42 @@ def test_stream_session_does_not_trim_when_nothing_committed() -> None:
     assert len(sess.samples) == total  # nothing trimmed
 
 
+def test_stream_session_does_not_trim_small_committed_prefix() -> None:
+    """A committed boundary below the min threshold AND below half the buffer
+    leaves the boundary and samples unchanged (the small-prefix guard)."""
+    chunker = _FakeChunker(boundary=0)
+    sess = _stream_session_with_chunker(chunker)
+
+    # Grow the buffer well past the threshold so a small committed prefix is
+    # both < STREAM_TRIM_MIN_SAMPLES and < half the buffer.
+    grow = STREAM_TRIM_MIN_SAMPLES * 4
+    sess.append_pcm(_pcm_chunk(grow))
+    small = STREAM_TRIM_MIN_SAMPLES // 2  # below min threshold
+    chunker.boundary = small
+
+    sess.append_pcm(_pcm_chunk(500))
+
+    # Guard fired: nothing trimmed.
+    assert chunker.boundary == small
+    assert len(sess.samples) == grow + 500
+
+
+def test_stream_session_does_not_trim_when_boundary_equals_buffer() -> None:
+    """A boundary equal to the buffer length (b >= len) leaves the full buffer
+    and boundary unchanged (the b >= len(samples) guard)."""
+    chunker = _FakeChunker(boundary=0)
+    sess = _stream_session_with_chunker(chunker)
+
+    n = STREAM_TRIM_MIN_SAMPLES * 3
+    sess.append_pcm(_pcm_chunk(n))
+    chunker.boundary = n  # boundary == buffer length
+
+    sess.append_pcm(_pcm_chunk(0))
+
+    assert chunker.boundary == n
+    assert len(sess.samples) == n  # full buffer retained
+
+
 # ---------------------------------------------------------------------------
 # E. flush retries on busy
 # ---------------------------------------------------------------------------
@@ -429,6 +552,33 @@ def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog)
     assert any("dropped untranscribed tail" in rec.message for rec in caplog.records)
 
 
+def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) -> None:
+    """A tx returning '' (silence) is a success: boundary advances, no warning.
+
+    Any non-None result -- including an empty string -- must be treated as
+    successful, advancing the boundary to len(samples) and NOT emitting the
+    busy/dropped-tail warning. Pre-seeded committed text survives unchanged.
+    """
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+    chunker = _chunker()
+    chunker.committed = ["already", "committed"]
+
+    calls = {"n": 0}
+
+    def tx(_window):  # noqa: ANN001
+        calls["n"] += 1
+        return ""  # silence transcribed to no words (still a success)
+
+    samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+    with caplog.at_level("WARNING", logger="starling.stream_chunk"):
+        out = chunker.flush(samples, tx)
+
+    assert out == "already committed"  # committed kept, empty tail added nothing
+    assert calls["n"] == 1  # exactly one tx call (success, no retries)
+    assert chunker.boundary == len(samples)  # tail finalized
+    assert not any("dropped untranscribed tail" in rec.message for rec in caplog.records)
+
+
 def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:
     """The retry loop must be bounded: flush returns in finite time, not hang."""
     monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
@@ -468,12 +618,24 @@ def test_flags_applies_override_and_restores() -> None:
 
 
 def test_flags_ignores_unknown_keys() -> None:
-    """An unknown override key does not crash (lenient behavior preserved)."""
+    """An unknown override key does not crash (lenient behavior preserved).
+
+    Validates that the nonexistent override is ignored while every *known* field
+    keeps its established prior default (not just one unrelated field).
+    """
+    import dataclasses
+
     from starling import flags as flags_mod
 
+    saved = flags_mod.get_default_flags()
+    saved_snapshot = {fld.name: getattr(saved, fld.name) for fld in dataclasses.fields(saved)}
+
     with flags_mod.flags(nonexistent_flag=True) as f:
-        # known defaults still present
-        assert f.multistep_graph is True
+        # The unknown key is filtered out, so every real field equals its prior default.
+        for fld in dataclasses.fields(f):
+            assert getattr(f, fld.name) == saved_snapshot[fld.name], (
+                f"field {fld.name!r} changed when only an unknown key was passed"
+            )
 
 
 def test_flags_preserves_all_existing_fields_on_override() -> None:
@@ -497,8 +659,15 @@ def test_flags_preserves_all_existing_fields_on_override() -> None:
 
 
 def test_flags_concurrent_overrides_do_not_crash() -> None:
-    """Two threads entering flags() concurrently with different overrides succeed."""
+    """Two threads entering flags() concurrently with different overrides succeed.
+
+    Captures the default global flags before the threads start and asserts they
+    match that snapshot (including tolerance_mode) after both joins -- so a
+    cross-scope restore leak would be caught, not just a crash.
+    """
     from starling import flags as flags_mod
+
+    snapshot = flags_mod.get_default_flags()
 
     errors: list[BaseException] = []
 
@@ -516,6 +685,54 @@ def test_flags_concurrent_overrides_do_not_crash() -> None:
         t.join()
 
     assert not errors
+    # The process-global default must be fully restored after both scopes exit,
+    # including tolerance_mode -- overlapping scopes must not leak overrides.
+    assert flags_mod.get_default_flags() == snapshot
+
+
+def test_flags_overlapping_scopes_do_not_clobber_restore() -> None:
+    """Concurrent scopes cannot restore each other's snapshots.
+
+    The RLock is held across the entire yielded body, so two ``flags()`` scopes
+    are serialized: the second scope waits for the first to fully exit (snapshot
+    + body + restore) before it can itself snapshot. Each scope therefore sees
+    a consistent global default, and after both exit the global is back to the
+    pre-test default -- overlapping scopes never leak or clobber each other.
+    """
+    from starling import flags as flags_mod
+
+    snapshot = flags_mod.get_default_flags()
+    errors: list[BaseException] = []
+    active = {"n": 0, "max": 0}
+    active_lock = threading.Lock()
+
+    def worker(value: bool) -> None:
+        try:
+            with flags_mod.flags(tolerance_mode=value) as f:
+                # Each scope observes its own locally-built override.
+                assert f.tolerance_mode is value
+                # Track overlap: if scopes ever interleave, max > 1.
+                with active_lock:
+                    active["n"] += 1
+                    active["max"] = max(active["max"], active["n"])
+                # Small delay to widen the concurrency window.
+                time.sleep(0.05)
+                with active_lock:
+                    active["n"] -= 1
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(v,)) for v in (True, False)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # Scopes are serialized (never overlap) -> max concurrency inside a scope is 1.
+    assert active["max"] == 1
+    # The process-global default is fully restored after both scopes exit.
+    assert flags_mod.get_default_flags() == snapshot
 
 
 # ---------------------------------------------------------------------------

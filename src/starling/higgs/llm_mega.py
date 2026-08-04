@@ -500,7 +500,8 @@ class LLMMega:
         """
         # The merged prompt can be longer than input_ids (audio features expand
         # the <|AUDIO|> placeholder); the real cache footprint is only known
-        # after prefill, so guard against the post-prefill case in prefill().
+        # after prefill, so guard against the post-prefill case below, after
+        # prefill() returns (the check is in generate(), not in prefill()).
         if max_new_tokens <= 0:
             return self._finalize([], 0.0, tokenizer)
 

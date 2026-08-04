@@ -100,10 +100,10 @@ def main() -> int:
 
             def scaled_mm_call(
                 _x=x, _w=scaled_mm_weight, _s=scaled_mm_scale
-            ):
+            ) -> torch.Tensor:
                 return scaled_mm_linear(_x, _w, _s)
 
-            def triton_call(_x=x, _w=triton_weight, _s=triton_scale):
+            def triton_call(_x=x, _w=triton_weight, _s=triton_scale) -> torch.Tensor:
                 return triton_linear(_x, _w, _s)
 
             scaled_mm_us = _time_us(scaled_mm_call)

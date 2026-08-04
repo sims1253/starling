@@ -236,7 +236,11 @@ class OptFlags:
 # process-global default flags
 # ---------------------------------------------------------------------------
 _DEFAULT_FLAGS = OptFlags()
-_FLAGS_LOCK = threading.Lock()
+# Reentrant: ``flags()`` must hold the lock across the *entire* yielded context
+# (not just the snapshot/restore swap) so overlapping scopes on the same thread
+# (e.g. a nested ``flags()`` inside another ``flags()``) cannot restore each
+# other's snapshots.  A plain Lock would deadlock on such re-entry; RLock does not.
+_FLAGS_LOCK = threading.RLock()
 
 
 def get_default_flags() -> OptFlags:
@@ -247,7 +251,8 @@ def get_default_flags() -> OptFlags:
 def set_default_flags(fl: OptFlags) -> None:
     """Replace the process-global default flags."""
     global _DEFAULT_FLAGS
-    _DEFAULT_FLAGS = fl
+    with _FLAGS_LOCK:
+        _DEFAULT_FLAGS = fl
 
 
 @contextmanager
@@ -257,6 +262,13 @@ def flags(**overrides):
     Only the given keyword overrides change; all others inherit the current
     global default.  The original default is restored on exit (even on error).
 
+    The RLock is held for the *whole* yielded body, serialising overlapping
+    scopes: a concurrent ``flags()`` block on another thread waits until this
+    scope exits before it can snapshot+override, so neither scope can observe
+    or restore a snapshot belonging to the other.  On the same thread the
+    reentrant lock permits clean nesting (inner exit restores the outer's
+    override, outer exit restores the original).
+
     Example::
 
         with flags(tolerance_mode=True):
@@ -264,7 +276,11 @@ def flags(**overrides):
         # back to byte-exact default here
     """
     global _DEFAULT_FLAGS
-    with _FLAGS_LOCK:
+    # Hold the lock across snapshot, the entire yielded body, AND restore, so
+    # overlapping scopes cannot interleave and clobber each other's snapshots.
+    # RLock (not Lock) so a nested flags() on the same thread doesn't deadlock.
+    _FLAGS_LOCK.acquire()
+    try:
         saved = _DEFAULT_FLAGS
         # Only apply overrides for fields that actually exist on OptFlags,
         # so callers passing a stale/unknown key don't crash (matches prior
@@ -273,8 +289,9 @@ def flags(**overrides):
         filtered = {k: v for k, v in overrides.items() if k in valid_fields}
         new = replace(saved, **filtered)
         _DEFAULT_FLAGS = new
-    try:
-        yield new
-    finally:
-        with _FLAGS_LOCK:
+        try:
+            yield new
+        finally:
             _DEFAULT_FLAGS = saved
+    finally:
+        _FLAGS_LOCK.release()

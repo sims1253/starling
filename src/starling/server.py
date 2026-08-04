@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import email.policy
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from email.parser import BytesParser
 from typing import Any, Optional
 
 import numpy as np
@@ -891,13 +893,24 @@ class StarlingServer:
     # ------------------------------------------------------------------ #
     # public entry points (synchronous; offload by caller)
     # ------------------------------------------------------------------ #
+    def decode_wav_bytes(self, wav_bytes: bytes) -> np.ndarray:
+        """Decode a WAV byte blob to mono float32 samples at :data:`SAMPLE_RATE`.
+
+        Raises ``ValueError`` / ``wave.Error`` for malformed or unsupported
+        payloads.  Kept as a distinct step from inference so callers can map
+        *only* decode failures to a 400 without swallowing inference-layer
+        ``ValueError``\\s.
+        """
+        samples, sr = _wav_bytes_to_float32(wav_bytes)
+        if sr != SAMPLE_RATE:
+            samples = _resample_audio(samples, sr, SAMPLE_RATE)
+        return samples
+
     def transcribe_bytes_sync(
         self, wav_bytes: bytes, request_id: Optional[str] = None
     ) -> TranscribeResult:
         self._ensure_loaded()
-        samples, sr = _wav_bytes_to_float32(wav_bytes)
-        if sr != SAMPLE_RATE:
-            samples = _resample_audio(samples, sr, SAMPLE_RATE)
+        samples = self.decode_wav_bytes(wav_bytes)
         return self._run_queued_sync(samples, request_id)
 
     def transcribe_pcm_sync(
@@ -1013,8 +1026,17 @@ def _transcribe_payload_sync(
     server: StarlingServer, payload: bytes, request_id: str
 ) -> tuple[int, dict[str, Any]]:
     """Shared HTTP transport adapter for one WAV transcription request."""
+    # Decode in its own step so a malformed payload maps to a 400, while a
+    # ValueError from inference / server-side processing is NOT swallowed into
+    # a "malformed audio" response (it should surface as a 500 / be logged).
     try:
-        result = server.transcribe_bytes_sync(payload, request_id)
+        samples = server.decode_wav_bytes(payload)
+    except (ValueError, wave.Error):
+        # Malformed/truncated WAV or unsupported encoding from the decoder.
+        # Map to 400 (client error) instead of propagating as a 500 / dead socket.
+        return 400, {"error": "malformed audio payload", "text": ""}
+    try:
+        result = server._run_queued_sync(samples, request_id)
     except _Busy:
         return 503, {
             "error": "server busy",
@@ -1027,10 +1049,6 @@ def _transcribe_payload_sync(
         return 504, {"error": "request timed out", "text": ""}
     except _DuplicateRequest:
         return 409, {"error": "request id already active", "text": ""}
-    except (ValueError, wave.Error):
-        # Malformed/truncated WAV or unsupported encoding from the decoder.
-        # Map to 400 (client error) instead of propagating as a 500 / dead socket.
-        return 400, {"error": "malformed audio payload", "text": ""}
     response = result.to_dict()
     response["request_id"] = request_id
     return 200, response
@@ -1102,6 +1120,13 @@ class StreamSession:
     samples: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     last_partial_ts: float = 0.0
     chunker: Any = None
+    # Cumulative samples dropped by _maybe_trim_samples (committed prefix that
+    # was finalized and trimmed from the rolling buffer). Used so reported
+    # duration_s / end_s reflect the *full* audio received this session, not
+    # just the live (post-trim) buffer length. Buffer-processing checks
+    # (should_emit_partial, stream_step) keep using the live buffer only via
+    # ``live_seconds`` / ``buffered_seconds`` so chunker behaviour is unchanged.
+    trimmed_samples: int = 0
 
     def __post_init__(self) -> None:
         cfg = self.server.config
@@ -1160,6 +1185,7 @@ class StreamSession:
         if b < STREAM_TRIM_MIN_SAMPLES and b < len(self.samples) // 2:
             return
         self.samples = np.ascontiguousarray(self.samples[b:], dtype=np.float32)
+        self.trimmed_samples += b
         chunker.boundary = 0
 
     def append_pcm(self, pcm16_bytes: bytes) -> None:
@@ -1178,7 +1204,9 @@ class StreamSession:
         except (ValueError, wave.Error):
             # Malformed WAV despite the header -- don't silently reinterpret as
             # PCM16 (that decodes header bytes as audio samples -> garbage).
-            # Drop just this chunk.
+            # Drop just this chunk, but log it so each dropped chunk is recorded
+            # (matches the odd-PCM-byte handling in _pcm16_bytes_to_float32).
+            log.warning("dropping malformed WAV chunk (len=%d)", len(wav_bytes))
             return
         if sr != SAMPLE_RATE:
             s = _resample_audio(s, sr, SAMPLE_RATE)
@@ -1188,10 +1216,22 @@ class StreamSession:
 
     @property
     def buffered_seconds(self) -> float:
+        """Seconds of audio in the *reported* timeline (trimmed + live buffer)."""
+        return (self.trimmed_samples + len(self.samples)) / SAMPLE_RATE
+
+    @property
+    def live_seconds(self) -> float:
+        """Seconds of audio in the live (untrimmed) buffer only.
+
+        Buffer-processing checks (``should_emit_partial``, ``stream_step``) use
+        this so chunker behaviour depends only on the live buffer length, while
+        reported ``duration_s`` / ``end_s`` use the full timeline via
+        ``buffered_seconds``.
+        """
         return len(self.samples) / SAMPLE_RATE
 
     def should_emit_partial(self, now: float) -> bool:
-        if self.buffered_seconds < self.server.config.min_chunk_seconds:
+        if self.live_seconds < self.server.config.min_chunk_seconds:
             return False
         if (now - self.last_partial_ts) < self.server.config.partial_interval_seconds:
             return False
@@ -1200,6 +1240,7 @@ class StreamSession:
     def reset(self) -> None:
         self.samples = np.zeros(0, dtype=np.float32)
         self.last_partial_ts = 0.0
+        self.trimmed_samples = 0
         if self.chunker is not None:
             self.chunker.reset()
 
@@ -1465,22 +1506,22 @@ def _parse_content_disposition(header_value: str) -> dict[str, str]:
     """Parse a ``Content-Disposition`` value into its parameters.
 
     Returns a dict that always has a ``disposition`` key (e.g. ``form-data``)
-    and any ``name``/``filename`` params (values are unquoted if quoted).
+    and any ``name``/``filename`` params. Uses :mod:`email` so quoted parameter
+    values containing semicolons and RFC 5987 ``filename*`` extended parameters
+    are handled correctly.
     """
+    # email.message.Message parses a full header block; wrap the bare value as a
+    # single header so get_params() (which is RFC 2231-aware) can tokenize it.
+    from email.message import Message
+
+    msg = Message()
+    msg["content-disposition"] = header_value
     out: dict[str, str] = {}
-    # Split on ';' but be tolerant: the first token is the disposition type.
-    pieces = [p.strip() for p in header_value.split(";") if p.strip()]
-    if not pieces:
+    params = msg.get_params(header="content-disposition") or []
+    if not params:
         return out
-    out["disposition"] = pieces[0].lower()
-    for tok in pieces[1:]:
-        if "=" not in tok:
-            continue
-        key, _, val = tok.partition("=")
-        key = key.strip().lower()
-        val = val.strip()
-        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-            val = val[1:-1]
+    out["disposition"] = params[0][0].lower()
+    for key, val in params[1:]:
         out[key] = val
     return out
 
@@ -1497,6 +1538,9 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
       3. a part whose ``Content-Type`` starts with ``audio/``, then
       4. the last non-empty part (multipart form convention puts the file last).
 
+    Parsing uses the stdlib :mod:`email` module (RFC 2231/5987-aware), so quoted
+    parameters containing semicolons and ``filename*`` extended values survive.
+
     If no boundary is present the body is returned unchanged (callers may post
     raw WAV with ``Content-Type: application/octet-stream`` -- that path is
     valid and must keep working).
@@ -1510,39 +1554,27 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
     if not boundary:
         return body
 
-    delim = b"--" + boundary.encode()
+    # Prepend the Content-Type as a header so the parser can split on the
+    # boundary; email.policy.HTTP gives RFC-compliant multipart handling.
+    header_blob = (f"Content-Type: {content_type}\r\n\r\n").encode()
+    msg = BytesParser(policy=email.policy.HTTP).parsebytes(header_blob + body)
+    if not msg.is_multipart():
+        return body
+
     # (name, filename, content_type, payload) per candidate part.
     candidates: list[tuple[Optional[str], Optional[str], Optional[str], bytes]] = []
     last_payload: Optional[bytes] = None
-    for raw in body.split(delim):
-        # Drop the surrounding CRLF wrappers and the closing ``--`` marker.
-        if raw in (b"", b"--", b"--\r\n", b"\r\n"):
-            continue
-        if raw.startswith(b"\r\n"):
-            raw = raw[2:]
-        if raw.endswith(b"\r\n"):
-            raw = raw[:-2]
-        if not raw:
-            continue
-        if b"\r\n\r\n" in raw:
-            header_bytes, payload = raw.split(b"\r\n\r\n", 1)
-        else:
-            header_bytes, payload = b"", raw
+    for part in msg.iter_parts():
+        disp = part.get_content_disposition()
         name: Optional[str] = None
         filename: Optional[str] = None
-        ctype: Optional[str] = None
-        for line in header_bytes.split(b"\r\n"):
-            if b":" not in line:
-                continue
-            hkey, _, hval = line.partition(b":")
-            hkey = hkey.strip().lower()
-            hval = hval.strip().decode("latin-1", "replace")
-            if hkey == b"content-disposition":
-                params = _parse_content_disposition(hval)
-                name = params.get("name")
-                filename = params.get("filename")
-            elif hkey == b"content-type":
-                ctype = hval
+        if disp == "form-data":
+            params = dict(part.get_params(header="content-disposition") or [])
+            name = params.get("name")
+        # get_filename() honours RFC 2231/5987 filename* automatically.
+        filename = part.get_filename()
+        ctype = part.get_content_type()
+        payload = part.get_payload(decode=True) or b""
         last_payload = payload
         candidates.append((name, filename, ctype, payload))
 
@@ -1583,6 +1615,7 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
         return bytes(buf)
 
     pieces: list[bytes] = []
+    total = 0
     final_opcode = 0x1
     while True:
         hdr = _read_exact(2)
@@ -1607,6 +1640,16 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
         payload = _read_exact(length)
         if masked:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+        # Enforce the cap across the *whole* fragmented message, not just per
+        # frame: an unbounded run of <=16 MiB continuation frames could otherwise
+        # assemble an arbitrarily large message (memory exhaustion).
+        if opcode in (0x1, 0x2, 0x0):
+            total += len(payload)
+            if total > MAX_WS_FRAME_BYTES:
+                raise ValueError(
+                    f"websocket message too large: {total} bytes"
+                )
 
         if opcode == 0x8:
             raise ConnectionError("client closed")

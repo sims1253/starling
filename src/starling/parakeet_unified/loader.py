@@ -26,7 +26,6 @@ from __future__ import annotations
 import os
 import zipfile
 from pathlib import Path
-from typing import Dict
 
 import torch
 
@@ -92,7 +91,7 @@ def _weights_zip_path(nemo_path: Path) -> Path:
 
 def load_state_dict(
     *, device: str | torch.device = "cpu", dtype: torch.dtype | None = None,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Load and return the parakeet-unified state_dict.
 
     The checkpoint is bf16 on disk; pass ``dtype`` to cast (e.g.

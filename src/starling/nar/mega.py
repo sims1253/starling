@@ -485,7 +485,7 @@ class NarMega:
             all_logits = fwd(flat_embeds, flat_pos)
 
         all_logits = all_logits.squeeze(0)
-        segment_lengths = [length for a, t in zip(audio_lengths, text_lengths) for length in (a, t)]
+        segment_lengths = [length for a, t in zip(audio_lengths, text_lengths, strict=True) for length in (a, t)]
         text_logits = torch.cat(list(all_logits.split(segment_lengths)[1::2]))
         return list(text_logits.split(text_lengths))
 

@@ -142,9 +142,9 @@ def main() -> int:
             probe.capture(ft, T)
             probe._reset_to_chunk_start(T, ft)
 
-            def _k(_p=probe):
+            def _k(_p=probe, _T=T, _ft=ft) -> None:
                 _p._ms_graph.replay()
-                _p._reset_to_chunk_start(T, ft)
+                _p._reset_to_chunk_start(_T, _ft)
 
             replay_ms = _cuda_timer(_k, iters=15)
             decode_ms_per_tok = replay_ms / probe.K

@@ -66,14 +66,14 @@ def main() -> int:
         audio_embeds = proj(enc_lhs.clone())
 
         # merge
-        def _merge(_emb=audio_embeds):
-            return pipe.build_inputs_embeds(input_ids, _emb)
+        def _merge(_emb=audio_embeds, _ids=input_ids) -> torch.Tensor:
+            return pipe.build_inputs_embeds(_ids, _emb)
 
         merge_ms = _cuda_ms(_merge)
         inputs_embeds = _merge()
 
         # prefill
-        def _prefill(_emb=inputs_embeds):
+        def _prefill(_emb=inputs_embeds) -> torch.Tensor:
             pipe.llm._reset_cache_pos(0)
             return pipe.llm.prefill(_emb)
 

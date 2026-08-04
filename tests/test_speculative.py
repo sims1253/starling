@@ -189,10 +189,15 @@ def test_speculative_matches_greedy(pipeline):
     )
 
     # --- token-level EXACT match vs non-speculative (the real consistency gate) ---
-    n2 = min(ids_spec.shape[1], ids_nonspec.shape[1])
-    assert (ids_spec[0, :n2] == ids_nonspec[0, :n2]).all(), (
+    # Assert equal shapes first so early termination or extra trailing tokens
+    # cannot pass when only the shared prefix matches.
+    assert ids_spec.shape == ids_nonspec.shape, (
+        f"speculative vs non-speculative token-count mismatch: "
+        f"spec {ids_spec.shape} vs nonspec {ids_nonspec.shape}"
+    )
+    assert torch.equal(ids_spec[0], ids_nonspec[0]), (
         f"speculative vs non-speculative mismatch at "
-        f"{(ids_spec[0, :n2] != ids_nonspec[0, :n2]).nonzero()[0].item()}"
+        f"{(ids_spec[0] != ids_nonspec[0]).nonzero()[0].item()}"
     )
 
     # --- transcript similarity vs golden (punctuation-only drift) ---

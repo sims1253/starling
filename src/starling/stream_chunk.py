@@ -174,7 +174,11 @@ class ChunkStreamer:
                 if text is not None:
                     break
                 time.sleep(_FLUSH_TAIL_BACKOFF_SECONDS)
-            if text:
+            if text is not None:
+                # Any non-None result is a success, including an empty string
+                # (silence transcribed to no words). stitch_words is a no-op for
+                # empty ``new`` (returns committed unchanged), and we still
+                # advance the boundary so this tail isn't retried.
                 self.committed = stitch_words(
                     self.committed, text.split(), max_overlap=self.max_overlap_words
                 )
