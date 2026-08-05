@@ -22,6 +22,7 @@ import struct
 import sys
 import threading
 import time
+from typing import Any, NoReturn
 
 import numpy as np
 import pytest
@@ -89,7 +90,7 @@ class _FakeServer:
     direct decoder coverage.
     """
 
-    def __init__(self, exc=None, *, result_text: str = "ok") -> None:
+    def __init__(self, exc: BaseException | None = None, *, result_text: str = "ok") -> None:
         # ``exc``: if set, ``decode_wav_bytes`` raises it (simulating a decode
         # failure). If None, decode + inference succeed with ``result_text``.
         self._exc = exc
@@ -365,7 +366,7 @@ def _ws_frame(*, payload: bytes, opcode: int = 0x1, mask: bool = True,
     return bytes(out)
 
 
-def _rfile(data: bytes):
+def _rfile(data: bytes) -> io.BufferedReader:
     """A file-like rfile backed by BytesIO (has ``.read(n)``)."""
     return io.BufferedReader(io.BytesIO(data))
 
@@ -424,7 +425,7 @@ def test_ws_read_frame_rejects_oversized_fragmented_message() -> None:
     """
     mask_key = b"\x01\x02\x03\x04"
 
-    def _masked_frame(payload: bytes, opcode: int, fin: bool) -> bytes:
+    def _masked_frame(payload: bytes, opcode: int, *, fin: bool) -> bytes:
         b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
         n = len(payload)
         b1 = 0x80 | (126 if n < 65536 else 127)
@@ -515,7 +516,7 @@ class _FakeChunker:
         self.boundary = boundary
 
 
-def _stream_session_with_chunker(chunker) -> StreamSession:
+def _stream_session_with_chunker(chunker: Any) -> StreamSession:
     """Build a StreamSession whose chunker is replaced by ``chunker``.
 
     We bypass the real ChunkStreamer construction (and the GPU-touching
@@ -618,14 +619,14 @@ def _chunker() -> ChunkStreamer:
     )
 
 
-def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:
+def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:  # noqa: ANN001
     """tx returning None then succeeding commits the tail text."""
     monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
 
     calls = {"n": 0}
 
-    def tx(_window):  # noqa: ANN001
+    def tx(_window: np.ndarray) -> str | None:
         calls["n"] += 1
         return None if calls["n"] == 1 else "tail text"
 
@@ -639,14 +640,14 @@ def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:
     assert chunker.boundary == len(samples)  # tail finalized
 
 
-def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog) -> None:
+def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
     """Always-busy tx: committed text returned WITHOUT the tail, warning logged."""
     monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
 
     calls = {"n": 0}
 
-    def tx(_window):  # noqa: ANN001
+    def tx(_window: np.ndarray) -> None:
         calls["n"] += 1
         return None  # always busy
 
@@ -662,7 +663,7 @@ def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog)
     assert any("dropped untranscribed tail" in rec.message for rec in caplog.records)
 
 
-def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) -> None:
+def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
     """A tx returning '' (silence) is a success: boundary advances, no warning.
 
     Any non-None result -- including an empty string -- must be treated as
@@ -675,7 +676,7 @@ def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) 
 
     calls = {"n": 0}
 
-    def tx(_window):  # noqa: ANN001
+    def tx(_window: np.ndarray) -> str:
         calls["n"] += 1
         return ""  # silence transcribed to no words (still a success)
 
@@ -689,7 +690,7 @@ def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) 
     assert not any("dropped untranscribed tail" in rec.message for rec in caplog.records)
 
 
-def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:
+def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:  # noqa: ANN001
     """The retry loop must be bounded: flush returns in finite time, not hang."""
     monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
@@ -781,7 +782,7 @@ def test_flags_concurrent_overrides_do_not_crash() -> None:
 
     errors: list[BaseException] = []
 
-    def worker(value: bool) -> None:
+    def worker(value: bool) -> None:  # noqa: FBT001 -- positional: Thread(args=...)
         try:
             with flags_mod.flags(tolerance_mode=value) as f:
                 assert f.tolerance_mode is value
@@ -816,7 +817,7 @@ def test_flags_overlapping_scopes_do_not_clobber_restore() -> None:
     active = {"n": 0, "max": 0}
     active_lock = threading.Lock()
 
-    def worker(value: bool) -> None:
+    def worker(value: bool) -> None:  # noqa: FBT001 -- positional: Thread(args=...)
         try:
             with flags_mod.flags(tolerance_mode=value) as f:
                 # Each scope observes its own locally-built override.
@@ -848,7 +849,7 @@ def test_flags_overlapping_scopes_do_not_clobber_restore() -> None:
 # ---------------------------------------------------------------------------
 # G. Warmup dedup
 # ---------------------------------------------------------------------------
-def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:
+def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:  # noqa: ANN001
     """Build a loaded StarlingServer whose GPU work is faked + counted.
 
     Returns (server, counters) where counters['transcribe'] counts how many
@@ -860,13 +861,13 @@ def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:
         _cancel_event = None
         _deadline = float("inf")
 
-        def set_graph_mode(self, **kwargs):  # noqa: ANN001, ARG002
+        def set_graph_mode(self, **_kwargs: Any) -> None:
             pass
 
     counters = {"transcribe": 0}
     server = StarlingServer(backend=_Backend(), _loaded=True)
 
-    def fake_transcribe(self, samples, *, streaming=False):  # noqa: ANN001, ARG002
+    def fake_transcribe(self, _samples: np.ndarray, *, _streaming: bool = False) -> TranscribeResult:  # noqa: ANN001, ARG001
         counters["transcribe"] += 1
         return TranscribeResult(text="warm")
 
@@ -879,7 +880,7 @@ def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:
     return server, counters
 
 
-def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:
+def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:  # noqa: ANN001
     """Two concurrent warmup() calls run the GPU body exactly once.
 
     The dedup guards *concurrent in-flight* calls. To exercise it reliably we
@@ -897,7 +898,7 @@ def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:
 
     real_fake_transcribe = StarlingServer._transcribe_np
 
-    def blocking_fake_transcribe(self, samples, *, streaming=False):  # noqa: ANN001, ARG002
+    def blocking_fake_transcribe(self, _samples: np.ndarray, *, _streaming: bool = False) -> TranscribeResult:  # noqa: ANN001, ARG001
         in_gpu_work.set()  # signal that the first call is inside the GPU work
         release_gpu_work.wait(timeout=5.0)  # hold until the test releases us
         counters["transcribe"] += 1
@@ -929,7 +930,7 @@ def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:
     assert server._warmup_in_progress is False  # flag reset afterward
 
 
-def test_warmup_second_call_after_first_completes_runs_again(monkeypatch) -> None:
+def test_warmup_second_call_after_first_completes_runs_again(monkeypatch) -> None:  # noqa: ANN001
     """A later warmup (after the first finished) is allowed to run again.
 
     The dedup is only for *concurrent* in-flight warmups, not a once-ever guard.
@@ -943,14 +944,14 @@ def test_warmup_second_call_after_first_completes_runs_again(monkeypatch) -> Non
     assert server._warmup_in_progress is False
 
 
-def test_warmup_noop_when_not_loaded(monkeypatch) -> None:
+def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
     """warmup() on an unloaded server is a no-op (no GPU work)."""
     import starling.parakeet.gpu_lock as gpu_lock
 
     server = StarlingServer()  # not loaded, backend None
     assert server.loaded is False
 
-    def boom(**_kwargs):  # pragma: no cover - must not be called
+    def boom(**_kwargs: Any) -> NoReturn:  # pragma: no cover - must not be called
         raise AssertionError("warmup should not reach GPU lock when unloaded")
 
     monkeypatch.setattr(gpu_lock, "acquire_gpu_lock", boom)

@@ -1507,30 +1507,6 @@ def create_app(
 # ===========================================================================
 # BACKEND B: stdlib-only (http.server + minimal RFC 6455 WebSocket)
 # ===========================================================================
-def _parse_content_disposition(header_value: str) -> dict[str, str]:
-    """Parse a ``Content-Disposition`` value into its parameters.
-
-    Returns a dict that always has a ``disposition`` key (e.g. ``form-data``)
-    and any ``name``/``filename`` params. Uses :mod:`email` so quoted parameter
-    values containing semicolons and RFC 5987 ``filename*`` extended parameters
-    are handled correctly.
-    """
-    # email.message.Message parses a full header block; wrap the bare value as a
-    # single header so get_params() (which is RFC 2231-aware) can tokenize it.
-    from email.message import Message
-
-    msg = Message()
-    msg["content-disposition"] = header_value
-    out: dict[str, str] = {}
-    params = msg.get_params(header="content-disposition") or []
-    if not params:
-        return out
-    out["disposition"] = params[0][0].lower()
-    for key, val in params[1:]:
-        out[key] = val
-    return out
-
-
 def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
     """Pull the audio bytes out of a ``multipart/form-data`` upload.
 
