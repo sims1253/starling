@@ -180,10 +180,13 @@ def test_transcribe_payload_loads_backend_before_queueing_inference() -> None:
     def _track_load() -> None:
         calls.append("load")
 
-    def _track_queue(_samples, _request_id, *, _streaming=False):  # noqa: ANN001
+    def _track_queue(  # noqa: ANN001
+        _samples: np.ndarray, _request_id: str, *, _streaming: bool = False
+    ) -> TranscribeResult:
         # The queued fake asserts loading already happened -- the strongest
         # ordering check: if _ensure_loaded hasn't run yet, this raises.
-        assert calls and calls[-1] == "load", (
+        assert calls, "_run_queued_sync ran but _ensure_loaded never did"
+        assert calls[-1] == "load", (
             "_run_queued_sync started before _ensure_loaded completed"
         )
         calls.append("queue")

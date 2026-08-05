@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from collections.abc import Callable
 import email.policy
 import hashlib
 import io
@@ -48,7 +49,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.parser import BytesParser
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
 
