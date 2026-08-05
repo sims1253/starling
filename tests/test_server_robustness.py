@@ -169,20 +169,36 @@ def test_transcribe_payload_loads_backend_before_queueing_inference() -> None:
     """A valid request to an (unloaded) server triggers _ensure_loaded() before
     inference is queued -- regression: the decode/inference split dropped the
     lazy-load call that transcribe_bytes_sync makes, so an unloaded server would
-    crash inside _run_queued_sync instead of loading first."""
+    crash inside _run_queued_sync instead of loading first.
+
+    Records the call order so a load-after-queue regression (e.g. moving the
+    _ensure_loaded() call into _run_queued_sync, or after it) fails here rather
+    than silently passing on a single boolean."""
     server = _FakeServer(result_text="loaded-and-transcribed")
-    server._ensure_loaded_called = False
+    calls: list[str] = []
 
     def _track_load() -> None:
-        server._ensure_loaded_called = True
+        calls.append("load")
+
+    def _track_queue(_samples, _request_id, *, _streaming=False):  # noqa: ANN001
+        # The queued fake asserts loading already happened -- the strongest
+        # ordering check: if _ensure_loaded hasn't run yet, this raises.
+        assert calls and calls[-1] == "load", (
+            "_run_queued_sync started before _ensure_loaded completed"
+        )
+        calls.append("queue")
+        return TranscribeResult(text=server._result_text)
 
     server._ensure_loaded = _track_load  # type: ignore[method-assign]
+    server._run_queued_sync = _track_queue  # type: ignore[method-assign]
     payload = _wav_bytes(np.zeros(SAMPLE_RATE, dtype=np.float32))
 
     status, response = _transcribe_payload_sync(server, payload, "req-load")
 
     assert status == 200
-    assert server._ensure_loaded_called is True
+    assert response["text"] == "loaded-and-transcribed"
+    # Explicit order assertion: load precedes queue.
+    assert calls == ["load", "queue"]
 
 
 def test_wav_bytes_to_float32_raises_on_truncated_body() -> None:
