@@ -1620,6 +1620,17 @@ def _ws_read_frame(
             length = struct.unpack(">H", _read_exact(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", _read_exact(8))[0]
+        # RFC 6455 §5.5: control frames (close 0x8, ping 0x9, pong 0xA) MUST be
+        # FIN (cannot be fragmented) and MUST NOT exceed 125 bytes payload.
+        # Validate BEFORE reading/unmasking the payload so a malformed oversized
+        # ping is rejected before on_ping could answer it.
+        if opcode in (0x8, 0x9, 0xA):
+            if not fin:
+                raise ValueError(f"control frame {opcode:#x} must have FIN set")
+            if length > 125:
+                raise ValueError(
+                    f"control frame {opcode:#x} payload exceeds 125 bytes ({length})"
+                )
         # Cap the claimed length so a bogus 2^63 can't wedge _read_exact forever.
         if length > MAX_WS_FRAME_BYTES:
             raise ValueError(f"websocket frame too large: {length} bytes")

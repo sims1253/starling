@@ -518,6 +518,33 @@ def test_ws_read_frame_standalone_ping_when_no_pending_message() -> None:
     assert out == b"keepalive"
 
 
+def test_ws_read_frame_rejects_non_final_ping() -> None:
+    """RFC 6455 §5.5: a control frame (ping) MUST have FIN set -- it cannot be
+    fragmented. A non-final ping is rejected before any payload handling."""
+    # FIN clear (fin=False) on a ping (0x9).
+    frame = _ws_raw_frame(b"x", opcode=0x9, fin=False)
+
+    with pytest.raises(ValueError, match="control frame .* must have FIN set"):
+        _ws_read_frame(_rfile(frame))
+
+
+def test_ws_read_frame_rejects_ping_payload_over_125_bytes() -> None:
+    """RFC 6455 §5.5: a control frame payload MUST NOT exceed 125 bytes. A
+    126-byte ping is rejected before on_ping could answer it."""
+    # A 126-byte payload uses the 16-bit extended-length encoding; _ws_raw_frame
+    # emits it correctly, but the reader must reject it as an invalid ping.
+    frame = _ws_raw_frame(b"\x00" * 126, opcode=0x9, fin=True)
+
+    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
+        _ws_read_frame(_rfile(frame))
+
+    # And it must also be rejected before invoking on_ping (no pong emitted).
+    pongs: list[bytes] = []
+    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
+        _ws_read_frame(_rfile(frame), on_ping=pongs.append)
+    assert pongs == []  # on_ping never called for the invalid frame
+
+
 def test_ws_read_frame_mid_fragment_ping_answers_via_callback_before_continuation() -> None:
     """A ping interleaved mid-fragmented message is answered *immediately* via
     on_ping, before the continuation frame is read -- not silently held until
