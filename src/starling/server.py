@@ -1662,9 +1662,23 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
 
         if opcode == 0x8:
             raise ConnectionError("client closed")
-        if opcode == 0x9:
-            return 0x9, payload
-        if opcode == 0xA:
+        if opcode in (0x9, 0xA):
+            # Ping (0x9) / pong (0xA): control frames may arrive interleaved
+            # with a fragmented data message. Do NOT abandon the accumulated
+            # pieces/total -- handle the control frame inline and keep reading
+            # continuation frames until the data message is complete. (Pong is
+            # a no-op reply; ping cannot be answered here because this reader
+            # only has the rfile -- the caller surfaces pings for the non-
+            # fragmented common case. The FastAPI backend handles its own
+            # pings via Starlette.)
+            if opcode == 0x9:
+                # Surface the first ping of an otherwise-empty message so the
+                # caller can pong; a ping mid-fragment is held until the message
+                # completes (the fragments are preserved below).
+                if not pieces:
+                    return 0x9, payload
+                # Mid-message ping: preserve state and keep reading.
+                continue
             continue
 
         if opcode in (0x1, 0x2):

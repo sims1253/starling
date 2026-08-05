@@ -445,6 +445,62 @@ def test_ws_read_frame_rejects_oversized_fragmented_message() -> None:
         _ws_read_frame(_rfile(first + cont))
 
 
+def _ws_raw_frame(payload: bytes, opcode: int, *, fin: bool, mask: bool = True,
+                  mask_key: bytes = b"\x01\x02\x03\x04") -> bytes:
+    """Build one masked client->server frame with a controlled FIN bit."""
+    b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
+    n = len(payload)
+    out = bytearray()
+    if n < 126:
+        out += struct.pack(">BB", b0, (0x80 if mask else 0x00) | n)
+    elif n < 65536:
+        out += struct.pack(">BBH", b0, (0x80 if mask else 0x00) | 126, n)
+    else:
+        out += struct.pack(">BBQ", b0, (0x80 if mask else 0x00) | 127, n)
+    if mask:
+        out += mask_key
+        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    else:
+        out += payload
+    return bytes(out)
+
+
+def test_ws_read_frame_text_fragment_with_interleaved_ping_assembles_message() -> None:
+    """A ping interleaved mid-fragmented TEXT message must not discard the
+    accumulated fragments; the assembled text is returned once FIN arrives."""
+    first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)   # unfinished text
+    ping = _ws_raw_frame(b"ping-body", opcode=0x9, fin=True)  # interleaved ping
+    cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)      # finishing continuation
+
+    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
+
+    assert opcode == 0x1
+    assert out == b"hello"  # fragments preserved across the ping
+
+
+def test_ws_read_frame_binary_fragment_with_interleaved_ping_assembles_message() -> None:
+    """A ping interleaved mid-fragmented BINARY message preserves the fragments."""
+    first = _ws_raw_frame(b"\x01\x02", opcode=0x2, fin=False)  # unfinished binary
+    ping = _ws_raw_frame(b"x", opcode=0x9, fin=True)           # interleaved ping
+    cont = _ws_raw_frame(b"\x03\x04", opcode=0x0, fin=True)    # finishing continuation
+
+    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
+
+    assert opcode == 0x2
+    assert out == b"\x01\x02\x03\x04"
+
+
+def test_ws_read_frame_standalone_ping_when_no_pending_message() -> None:
+    """A ping with no pending fragmented message is surfaced to the caller (so it
+    can pong) -- the common case is unchanged."""
+    ping = _ws_raw_frame(b"keepalive", opcode=0x9, fin=True)
+
+    opcode, out = _ws_read_frame(_rfile(ping))
+
+    assert opcode == 0x9
+    assert out == b"keepalive"
+
+
 # ---------------------------------------------------------------------------
 # D. Streaming buffer is bounded
 # ---------------------------------------------------------------------------
