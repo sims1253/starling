@@ -313,6 +313,28 @@ def test_multipart_boundary_with_no_usable_parts_returns_original_body() -> None
     assert out == body
 
 
+def test_multipart_zero_score_fallback_ignores_trailing_empty_part() -> None:
+    """The all-zero-score fallback returns the last NON-EMPTY part, not a
+    trailing empty part (regression: last_payload was clobbered by empties)."""
+    boundary = "----b"
+    note_part = _mp_part(
+        [("Content-Disposition", 'form-data; name="note"')],
+        b"the real payload",
+    )
+    empty_part = _mp_part(
+        [("Content-Disposition", 'form-data; name="trailer"')],
+        b"",  # trailing empty part -- must not become the fallback
+    )
+    body = b"--" + boundary.encode() + b"\r\n" + note_part + b"\r\n" \
+        + b"--" + boundary.encode() + b"\r\n" + empty_part + b"\r\n" \
+        + b"--" + boundary.encode() + b"--\r\n"
+    ctype = f"multipart/form-data; boundary={boundary}"
+
+    out = _extract_multipart_payload(body, ctype)
+
+    assert out == b"the real payload"  # last non-empty, not the empty trailer
+
+
 # ---------------------------------------------------------------------------
 # C. WS frame cap + mask validation
 # ---------------------------------------------------------------------------

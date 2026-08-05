@@ -1580,7 +1580,11 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
         filename = part.get_filename()
         ctype = part.get_content_type()
         payload = part.get_payload(decode=True) or b""
-        last_payload = payload
+        # Preserve the previous non-empty payload across trailing empty parts:
+        # the fallback ("last non-empty part") must not be clobbered by a blank
+        # trailing part.
+        if payload:
+            last_payload = payload
         candidates.append((name, filename, ctype, payload))
 
     if not candidates:
