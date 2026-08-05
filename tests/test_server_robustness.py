@@ -502,6 +502,45 @@ def test_ws_read_frame_standalone_ping_when_no_pending_message() -> None:
     assert out == b"keepalive"
 
 
+def test_ws_read_frame_mid_fragment_ping_answers_via_callback_before_continuation() -> None:
+    """A ping interleaved mid-fragmented message is answered *immediately* via
+    on_ping, before the continuation frame is read -- not silently held until
+    the message completes. Regression: the original mid-fragment path swallowed
+    the ping, so no pong was ever sent for it."""
+    events: list[str] = []
+    pongs: list[bytes] = []
+
+    def on_ping(payload: bytes) -> None:
+        events.append(f"pong:{payload!r}")
+        pongs.append(payload)
+
+    # Wrap the rfile so reading the continuation records an event after the
+    # ping callback -- proving the callback ran *before* the continuation read.
+    raw_first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)
+    ping = _ws_raw_frame(b"ping", opcode=0x9, fin=True)
+    raw_cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)
+    rfile = _rfile(raw_first + ping + raw_cont)
+    real_read = rfile.read
+
+    def tracking_read(n: int = -1) -> bytes:
+        data = real_read(n)
+        # Only tag continuation reads (after the ping byte boundary); the
+        # simplest reliable marker is that pong has already been recorded.
+        if pongs and "cont-read" not in events:
+            events.append("cont-read")
+        return data
+
+    rfile.read = tracking_read  # type: ignore[method-assign]
+
+    opcode, out = _ws_read_frame(rfile, on_ping=on_ping)
+
+    assert opcode == 0x1
+    assert out == b"hello"  # message still assembled correctly
+    assert pongs == [b"ping"]  # pong payload captured
+    # The pong callback fired before the continuation frame was read.
+    assert events.index("pong:b'ping'") < events.index("cont-read")
+
+
 # ---------------------------------------------------------------------------
 # D. Streaming buffer is bounded
 # ---------------------------------------------------------------------------

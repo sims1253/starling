@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.parser import BytesParser
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -1589,7 +1589,9 @@ def _ws_accept_key(client_key: str) -> str:
     return base64.b64encode(h).decode()
 
 
-def _ws_read_frame(rfile) -> tuple[int, bytes]:
+def _ws_read_frame(
+    rfile, on_ping: Optional[Callable[[bytes], None]] = None
+) -> tuple[int, bytes]:
     def _read_exact(n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
@@ -1643,17 +1645,24 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
             # with a fragmented data message. Do NOT abandon the accumulated
             # pieces/total -- handle the control frame inline and keep reading
             # continuation frames until the data message is complete. (Pong is
-            # a no-op reply; ping cannot be answered here because this reader
-            # only has the rfile -- the caller surfaces pings for the non-
-            # fragmented common case. The FastAPI backend handles its own
-            # pings via Starlette.)
+            # a no-op reply.) When an ``on_ping`` callback is supplied (the
+            # stdlib backend passes one that writes the pong frame), answer the
+            # ping *immediately* -- even mid-fragment -- so the peer gets its
+            # pong without waiting for the data message to finish assembling.
+            # Without a callback, a standalone ping (no pending message) is
+            # surfaced to the caller as (0x9, payload) so it can pong; a
+            # mid-fragment ping with no callback cannot be answered here (the
+            # reader only has the rfile) and is held until the message
+            # completes. The FastAPI backend handles its own pings via
+            # Starlette.
+            if opcode == 0x9 and on_ping is not None:
+                on_ping(payload)
+                continue
             if opcode == 0x9:
-                # Surface the first ping of an otherwise-empty message so the
-                # caller can pong; a ping mid-fragment is held until the message
-                # completes (the fragments are preserved below).
+                # No callback: surface a standalone ping so the caller can pong.
+                # A mid-fragment ping is held (preserve state, keep reading).
                 if not pieces:
                     return 0x9, payload
-                # Mid-message ping: preserve state and keep reading.
                 continue
             continue
 
@@ -1698,7 +1707,9 @@ def _serve_stream_session(
     try:
         while True:
             try:
-                opcode, payload = _ws_read_frame(rfile)
+                opcode, payload = _ws_read_frame(
+                    rfile, on_ping=lambda p: _ws_send_pong(wfile, p)
+                )
             except ConnectionError:
                 break
             except socket.timeout:
