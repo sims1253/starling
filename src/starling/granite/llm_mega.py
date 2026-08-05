@@ -151,7 +151,13 @@ class LLMMega:
     def _reset_cache_pos(self, n: int) -> None:
         """Reset every layer's ``cumulative_length`` to ``n`` in-place."""
         for layer in self.cache.layers:
-            layer.cumulative_length.fill_(n)
+            cl = layer.cumulative_length
+            # StaticCache layers store a tensor; some layer variants store an
+            # int. Handle both (fill_ for tensor, assignment for int).
+            if hasattr(cl, "fill_"):
+                cl.fill_(n)
+            else:
+                layer.cumulative_length = n
 
     def _set_mask(self, valid_len: int) -> None:
         """Unmask positions ``[0, valid_len)``; mask the rest to ``-inf``."""
@@ -162,7 +168,11 @@ class LLMMega:
         """One eager decode forward writing into ``static_logits``.
 
         Uses the model's own layers with the pre-computed 4D attention mask so
-        ``create_causal_mask`` early-exits (no CPU scalar allocation).
+        ``create_causal_mask`` early-exits (no CPU tensor allocation). Passing
+        ``attention_mask=None`` forces transformers 5.14+ to materialise a mask
+        internally (``torch.where`` with a fresh scalar), which crashes under
+        CUDA-graph capture and diverges from ``model.generate``'s SDPA
+        ``is_causal`` fast-path.
         """
         out = self.lm(
             input_ids=self.static_input_ids,

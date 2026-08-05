@@ -53,9 +53,10 @@ if(STARLING_GGML_CUDA)
   set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
 
-# -march=native + tinyBLAS SGEMM: free speedups for local/dev builds. Force ON
-# unless the caller overrides (CI/release sets GGML_NATIVE=OFF / passes it
-# explicitly for portable distributable binaries).
+# GGML_NATIVE and GGML_LLAMAFILE default ON for best local performance
+# (-march=native, tinyBLAS SGEMM tuned to this host). When building a
+# DISTRIBUTABLE artifact (.so / wheel for other machines), pass
+# -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF to avoid host-specific codegen.
 if(NOT DEFINED GGML_NATIVE)
   set(GGML_NATIVE ON CACHE BOOL "ggml: optimize for the current system" FORCE)
 endif()
@@ -71,7 +72,9 @@ endif()
 # NOTE for Windows CI: invoke `bash scripts/apply_ggml_patches.sh` explicitly
 # under Git Bash first — CMake's find_program(bash) can pick up the stub
 # WSL bash.exe in System32 and silently skip the patches (parakeet.cpp's
-# documented landmine). A non-zero patch result here is a WARNING, not fatal.
+# documented landmine). On Windows a non-zero patch result stays a WARNING
+# (that same bash.exe environment issue can cause spurious failures); on
+# Unix it is FATAL_ERROR — we refuse to silently ship an unpatched ggml.
 # --------------------------------------------------------------------------- #
 find_program(BASH_EXECUTABLE bash)
 if(BASH_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/scripts/apply_ggml_patches.sh")
@@ -82,7 +85,11 @@ if(BASH_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/scripts/apply_ggml_patches.sh
     OUTPUT_VARIABLE _patch_output
     ERROR_VARIABLE _patch_output)
   if(NOT _patch_result EQUAL 0)
-    message(WARNING "ggml patch apply returned ${_patch_result}:\n${_patch_output}")
+    if(WIN32)
+      message(WARNING "ggml patch apply returned ${_patch_result} (skipped on Windows):\n${_patch_output}")
+    else()
+      message(FATAL_ERROR "ggml patch apply failed (rc=${_patch_result}). Refusing to build an unpatched ggml:\n${_patch_output}")
+    endif()
   endif()
 endif()
 

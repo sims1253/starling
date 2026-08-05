@@ -4,14 +4,14 @@ the isolated microbench couldn't give us (cache noise).
 """
 from __future__ import annotations
 
-import os, sys
+import os
+import sys
 os.environ["MEGAPAR_LLM_AUTOTUNE"] = "0"
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
 import soundfile as sf
 import torch
-import torch.nn.functional as F
 
 from starling.ark.audio import build_inputs_embeds, build_prompt_ids, extract_mel
 from starling.ark.config import EOS_TOKEN_ID
@@ -61,7 +61,6 @@ def main():
 
     # ---- patch: quantize every GEMM weight and swap the calls ----
     llm = pipe.llm
-    saved = {}
     fp4_layers = []
     for idx, f in enumerate(llm._fused):
         fp4_layers.append({
@@ -124,7 +123,7 @@ def main():
     fp4_text = measure(pipe, wav, "fp4 ")
     type(llm)._decode_step_eager = orig_decode
 
-    print(f"\ntranscript drift:")
+    print("\ntranscript drift:")
     print(f"  bf16: {ref_text[:120]}")
     print(f"  fp4 : {fp4_text[:120]}")
     same = ref_text.strip() == fp4_text.strip()

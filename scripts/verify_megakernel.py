@@ -22,7 +22,6 @@ import torch
 import soundfile as sf
 
 from starling.higgs.loader import load_model_and_tokenizer, make_collator
-from starling.higgs.vendor import ChatMLDatasetSample
 from starling.higgs.config import EOS_TOKEN_IDS
 from starling.higgs.llm_mega import LLMMega
 

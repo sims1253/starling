@@ -163,7 +163,6 @@ def test_reference_matches_generate():
 @pytest.mark.skipif(not (_FIXTURE_OK and _GOLDEN_OK), reason="fixtures/golden absent")
 @pytest.mark.parametrize("name", ["short", "medium"])
 def test_pipeline_transcribe_byte_exact(name):
-    import torch
     from starling.cohere.pipeline import CohereMegaPipeline
 
     model, proc = _load()
@@ -356,7 +355,6 @@ def test_prefill_rewinds_self_cache_so_reused_graphs_do_not_leak():
     end-to-end effect is a ~18% clip-level transcript flip on real audio, too
     sparse for three fixtures to catch reliably.
     """
-    import numpy as np
     import torch
 
     from starling.cohere.pipeline import CohereMegaPipeline
@@ -378,27 +376,41 @@ def test_prefill_rewinds_self_cache_so_reused_graphs_do_not_leak():
         dec._prefill(dec_in_b, enc_b, mask_b, dec._cache)
 
     layers = dec._cache.self_attention_cache.layers
-    cums = [int(l.cumulative_length) for l in layers]
+    cums = [int(layer.cumulative_length) for layer in layers]
     assert all(c == T for c in cums), (
         f"prefill left the self-attn write head at {cums[:3]}, expected {T}: "
         f"the prompt K/V did not land in slots [0, T)"
     )
-    keys_reused = [l.keys[:, :, :T].clone() for l in layers]
-    del pipe
+    keys_reused = [layer.keys[:, :, :T].clone() for layer in layers]
+    values_reused = [layer.values[:, :, :T].clone() for layer in layers]
+    # Release the first decoder and its cached graph state before constructing
+    # the fresh pipeline, so no objects from the first capture remain
+    # referenced during the second.
+    dec._cache = None
+    del dec, layers, pipe
     torch.cuda.empty_cache()
 
     # same clip B, prefilled on a pristine cache -> the ground truth prompt K/V
     fresh = CohereMegaPipeline(model, proc, steps_per_replay=8)
     dec_in_b2, enc_b2, mask_b2 = _pipeline_inputs(fresh, audio_b)
     dec2 = fresh._get_decoder(dec_in_b2, enc_b2, mask_b2)  # captures on clip B
-    keys_fresh = [l.keys[:, :, :T].clone()
-                  for l in dec2._cache.self_attention_cache.layers]
+    keys_fresh = [layer.keys[:, :, :T].clone()
+                  for layer in dec2._cache.self_attention_cache.layers]
+    values_fresh = [layer.values[:, :, :T].clone()
+                    for layer in dec2._cache.self_attention_cache.layers]
 
     for i, (reused, fresh_k) in enumerate(zip(keys_reused, keys_fresh)):
         assert torch.equal(reused, fresh_k), (
             f"layer {i}: prompt K on a reused graph differs from a fresh prefill "
             f"(maxdiff {(reused.float() - fresh_k.float()).abs().max():.3e}) -- "
             f"the previous utterance's decode state is leaking"
+        )
+    # Also verify cached values: clip A's V must not leak into clip B's decode.
+    for i, (reused_v, fresh_v) in enumerate(zip(values_reused, values_fresh)):
+        assert torch.equal(reused_v, fresh_v), (
+            f"layer {i}: prompt V on a reused graph differs from a fresh prefill "
+            f"(maxdiff {(reused_v.float() - fresh_v.float()).abs().max():.3e}) -- "
+            f"stale values from the previous utterance are leaking"
         )
 
 

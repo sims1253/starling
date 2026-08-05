@@ -125,12 +125,10 @@ def capture_stages(model: Any, proc: Any, wav: np.ndarray) -> tuple[dict, list[i
             )
             prefill_logits = out.logits[:, -1:, :]  # (1, 1, vocab)
 
-            # Reconstruct inputs_embeds the same way the model did: embed the
-            # (audio-injected) ids. The model's forward set inputs_embeds
-            # internally then called self.model(...); we replicate the embed by
-            # re-running embed + inject using the captured audio_embeds, which is
-            # exactly _inject_audio_embeddings.
-            embed = model.model.embed_tokens(prompt_ids)
+            # Reconstruct inputs_embeds the same way the model did: re-derive
+            # the (audio-injected) ids. The model's forward set inputs_embeds
+            # internally then called self.model(...); we replicate the inject
+            # path manually using the captured audio_embeds.
             mask = prompt_ids == model.audio_token_id
             llm_ids = torch.where(mask, 0, prompt_ids)
             inputs_embeds = model.model.embed_tokens(llm_ids)

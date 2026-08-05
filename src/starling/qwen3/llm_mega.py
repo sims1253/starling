@@ -41,9 +41,6 @@ from typing import Any, Optional
 import torch
 
 from .config import (
-    LLM_HEAD_DIM,
-    LLM_NUM_ATTN_HEADS,
-    LLM_NUM_KV_HEADS,
     LLM_RMS_NORM_EPS,
 )
 

@@ -22,7 +22,6 @@ Usage::
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -61,9 +60,6 @@ def _err_report(name: str, w: torch.Tensor) -> dict:
 
 @torch.inference_mode()
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    args = ap.parse_args()
-
     print("loading granite model ...", flush=True)
     model, processor = load_model_and_processor(attn_impl="eager")
     comps = get_components(model)
@@ -111,11 +107,11 @@ def main() -> int:
     print(f"  compression      : {compression:.2f}x")
     print("\n== Theoretical decode-step speedup ceiling (UPPER BOUND) ==")
     print(f"  GEMV fraction of decode step : {GEMV_FRACTION_OF_STEP:.2f}")
-    print(f"  (from benchmarks/bench_decode_profile.py)")
+    print("  (from benchmarks/bench_decode_profile.py)")
     print(f"  idealized step speedup       : {ideal_step_speedup:.2f}x")
-    print(f"  NOTE: assumes fused dequant-GEMV kernel with ZERO dequant overhead.")
-    print(f"  The scaffold's _fp4_linear dequantizes the FULL bf16 weight first,")
-    print(f"  so it will be SLOWER than bf16. Fused kernel + QAD = future work.")
+    print("  NOTE: assumes fused dequant-GEMV kernel with ZERO dequant overhead.")
+    print("  The scaffold's _fp4_linear dequantizes the FULL bf16 weight first,")
+    print("  so it will be SLOWER than bf16. Fused kernel + QAD = future work.")
     return 0
 
 

@@ -26,8 +26,8 @@ import torch.nn.functional as F
 import math
 from typing import List, Tuple
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Optional
 from transformers.models.whisper.processing_whisper import WhisperProcessor
 
 

@@ -14,8 +14,8 @@ import logging
 import numpy as np
 import torch
 from abc import ABC, abstractmethod  # noqa: F401  (kept for parity with upstream imports)
-from dataclasses import dataclass, fields
-from typing import List, Optional, Union
+from dataclasses import dataclass
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 from statistics import median
 
@@ -22,7 +21,6 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
 from starling.granite.golden import load_golden  # noqa: E402
 from starling.granite.llm_mega import FusedLLMMega  # noqa: E402
 from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402
@@ -39,9 +37,7 @@ def main() -> int:
     print(f"[{args.label}] loading model ...", flush=True)
     model, processor = load_model_and_processor(attn_impl="eager")
     components = get_components(model)
-    tokenizer = processor.tokenizer
     inputs_embeds = load_golden("inputs_embeds.pt").to("cuda", torch.bfloat16)
-    golden_ids = load_golden("greedy_ids.pt")
 
     dec = FusedLLMMega(components["language_model"], model.lm_head, max_cache_len=896)
 

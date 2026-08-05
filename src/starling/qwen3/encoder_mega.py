@@ -27,9 +27,6 @@ because it replays the model's own ops unchanged -- only host launch overhead
 
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -167,7 +164,6 @@ class StaticEncoder:
         frames present) -- only correct for clips that fill the padded length.
         """
         from transformers.models.qwen3_asr.modeling_qwen3_asr import (
-            _get_feat_extract_output_lengths,
             get_audio_cu_seqlens,
         )
 
@@ -298,7 +294,7 @@ class GraphedEncoder:
         # byte-exact-safe: capture is shape-only and static buffers are rewritten
         # each call, so re-capturing an evicted shape reproduces the identical graph.
         self.max_cached_shapes = int(max_cached_shapes)
-        self._graphs: Dict[Tuple[int, int], dict] = {}
+        self._graphs: dict[tuple[int, int], dict] = {}
 
     # ------------------------------------------------------------------ #
     # shape-keyed capture (cudagraph mode)

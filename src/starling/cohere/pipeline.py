@@ -326,7 +326,6 @@ class CohereMegaPipeline:
         Returns ``(texts, ids)`` where ``texts`` is a list of ``B`` transcript
         strings and ``ids`` is a ``(B, n_gen)`` CPU long tensor of generated ids.
         """
-        import numpy as np
 
         if isinstance(wav, torch.Tensor):
             wav = wav.numpy()

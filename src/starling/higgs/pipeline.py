@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
 
-from .config import EOS_TOKEN_IDS, MODEL_ID
+from .config import EOS_TOKEN_IDS
 from .llm_mega import GenerateResult, LLMMega
 
 DEFAULT_PROMPT = (

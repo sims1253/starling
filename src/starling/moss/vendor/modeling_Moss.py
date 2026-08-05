@@ -2,9 +2,8 @@ from typing import Optional, List, Union, Tuple
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
-from transformers.utils import logging
 
-from transformers.models.qwen3.modeling_qwen3 import Qwen3Model, Qwen3PreTrainedModel, Qwen3DecoderLayer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Model, Qwen3DecoderLayer
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeAudioEncoderConfig
 

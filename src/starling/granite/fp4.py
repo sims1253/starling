@@ -275,7 +275,10 @@ def _fp4_linear_fused(
     x1 = x.reshape(-1).contiguous()
     out = torch.empty((OUT,), dtype=x.dtype, device=codes.device)
     BLOCK_K = 128
-    grid = lambda meta: (triton.cdiv(OUT, meta["BLOCK_M"]),)
+
+    def grid(meta) -> tuple[int, ...]:
+        return (triton.cdiv(OUT, meta["BLOCK_M"]),)
+
     _fp4_gemv_kernel[grid](
         x1, codes, scales, out,
         K=K, K_BYTES=K // 2, K_BLOCKS=K_BLOCKS, OUT_N=OUT, BLOCK_K=BLOCK_K,

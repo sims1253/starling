@@ -152,7 +152,7 @@ class MultiStepLLMMega(FusedLLMMega):
                 f"max_cache_len={self.max_cache_len}; max {max_safe})."
             )
         if inputs_embeds.shape[0] != 1:
-            raise ValueError(f"MultiStepLLMMega only supports batch=1.")
+            raise ValueError("MultiStepLLMMega only supports batch=1.")
         if max_new_tokens <= 0:
             return self._finalize([], 0.0, tokenizer)
 

@@ -31,11 +31,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from collections.abc import Callable
+import email.policy
 import hashlib
 import io
 import json
 import logging
 import math
+import socket
 import struct
 import threading
 import time
@@ -45,6 +48,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from email.parser import BytesParser
 from typing import Any, Optional
 
 import numpy as np
@@ -96,6 +100,29 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS: float = 10 * 60.0
 """Wall-clock deadline covering both queueing and model execution."""
 
 WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+MAX_WS_FRAME_BYTES: int = 16 * 1024 * 1024
+"""Maximum accepted single WebSocket frame payload (16 MiB cap).
+
+A client that claims a gigantic 64-bit payload length would otherwise block the
+receiver (``_read_exact``) indefinitely. Frames larger than this raise and tear
+the connection down instead.
+"""
+
+WS_SOCKET_TIMEOUT_SECONDS: float = 120.0
+"""Idle timeout (seconds) on a stdlib WebSocket session.
+
+A long dictation can stay silent for many seconds between utterances, so this is
+generous; a totally dead/silent connection still times out rather than hanging a
+handler thread forever.
+"""
+
+STREAM_TRIM_MIN_SAMPLES: int = SAMPLE_RATE
+"""Minimum committed-prefix length (in samples) to drop from a stream buffer.
+
+``StreamSession`` trims the chunker's finalized prefix once it crosses this size,
+bounding per-append ``np.concatenate`` copying and RAM. 1 second of audio.
+"""
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
@@ -457,14 +484,12 @@ class Qwen3Backend(ModelBackend):
     slug = "qwen3"
 
     def load(self) -> None:
-        from .qwen3.audio import build_inputs  # noqa: F401
         from .qwen3.loader import load_model_and_processor
         from .qwen3.pipeline import MegaPipeline
 
         model, processor = load_model_and_processor(attn_impl=self.config.attn_impl)
         self.pipe = MegaPipeline.from_pretrained()
         self.processor = processor
-        self._build_inputs = build_inputs
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
         # Long files are chunked into recurring shapes, so graph capture can
@@ -768,6 +793,13 @@ class StarlingServer:
     #   unloaded -> loading_weights -> warming_up -> ready
     _phase: str = "unloaded"
 
+    # --- warmup dedup -----------------------------------------------------
+    #   ``/warmup`` and ``warmup()`` may be called concurrently; without a guard
+    #   each call captures a fresh CUDA graph on the GPU. The lock + flag make
+    #   warmup idempotent: a second caller no-ops while one is in flight.
+    _warmup_lock: threading.Lock = field(default_factory=threading.Lock)
+    _warmup_in_progress: bool = False
+
     def __post_init__(self) -> None:
         self._queue_changed = threading.Condition(self._lock)
 
@@ -812,24 +844,35 @@ class StarlingServer:
             self._phase = "ready"
 
     def warmup(self) -> None:
-        """Capture CUDA graphs on a short silent clip (no-op if not loaded)."""
+        """Capture CUDA graphs on a short silent clip (no-op if not loaded or already warming)."""
         if not self._loaded or self.backend is None:
             return
-        from .parakeet.gpu_lock import with_gpu_lock
+        # Dedup: if another thread is already capturing graphs, no-op. The flag
+        # is checked/released under the lock but the GPU work runs unlocked so a
+        # long warmup never blocks other callers.
+        with self._warmup_lock:
+            if self._warmup_in_progress:
+                return
+            self._warmup_in_progress = True
+        try:
+            from .parakeet.gpu_lock import with_gpu_lock
 
-        self._phase = "warming_up"
-        log.info("warming up CUDA graphs on %.1fs silent clip ...", WARMUP_SECONDS)
-        n = int(WARMUP_SECONDS * SAMPLE_RATE)
-        dummy = np.zeros(n, dtype=np.float32)
-        with with_gpu_lock(
-            session=GPU_LOCK_SESSION,
-            model=_gpu_lock_model(self.config.model),
-            eta_min=GPU_LOCK_ETA_MIN,
-            note="warmup",
-        ):
-            self._transcribe_np(dummy)
-        self._phase = "ready"
-        log.info("warmup complete")
+            self._phase = "warming_up"
+            log.info("warming up CUDA graphs on %.1fs silent clip ...", WARMUP_SECONDS)
+            n = int(WARMUP_SECONDS * SAMPLE_RATE)
+            dummy = np.zeros(n, dtype=np.float32)
+            with with_gpu_lock(
+                session=GPU_LOCK_SESSION,
+                model=_gpu_lock_model(self.config.model),
+                eta_min=GPU_LOCK_ETA_MIN,
+                note="warmup",
+            ):
+                self._transcribe_np(dummy)
+            self._phase = "ready"
+            log.info("warmup complete")
+        finally:
+            with self._warmup_lock:
+                self._warmup_in_progress = False
 
     # ------------------------------------------------------------------ #
     # inference core (callers acquire the GPU lock)
@@ -851,13 +894,24 @@ class StarlingServer:
     # ------------------------------------------------------------------ #
     # public entry points (synchronous; offload by caller)
     # ------------------------------------------------------------------ #
+    def decode_wav_bytes(self, wav_bytes: bytes) -> np.ndarray:
+        """Decode a WAV byte blob to mono float32 samples at :data:`SAMPLE_RATE`.
+
+        Raises ``ValueError`` / ``wave.Error`` for malformed or unsupported
+        payloads.  Kept as a distinct step from inference so callers can map
+        *only* decode failures to a 400 without swallowing inference-layer
+        ``ValueError``\\s.
+        """
+        samples, sr = _wav_bytes_to_float32(wav_bytes)
+        if sr != SAMPLE_RATE:
+            samples = _resample_audio(samples, sr, SAMPLE_RATE)
+        return samples
+
     def transcribe_bytes_sync(
         self, wav_bytes: bytes, request_id: Optional[str] = None
     ) -> TranscribeResult:
         self._ensure_loaded()
-        samples, sr = _wav_bytes_to_float32(wav_bytes)
-        if sr != SAMPLE_RATE:
-            samples = _resample_audio(samples, sr, SAMPLE_RATE)
+        samples = self.decode_wav_bytes(wav_bytes)
         return self._run_queued_sync(samples, request_id)
 
     def transcribe_pcm_sync(
@@ -973,8 +1027,22 @@ def _transcribe_payload_sync(
     server: StarlingServer, payload: bytes, request_id: str
 ) -> tuple[int, dict[str, Any]]:
     """Shared HTTP transport adapter for one WAV transcription request."""
+    # Decode in its own step so a malformed payload maps to a 400, while a
+    # ValueError from inference / server-side processing is NOT swallowed into
+    # a "malformed audio" response (it should surface as a 500 / be logged).
     try:
-        result = server.transcribe_bytes_sync(payload, request_id)
+        samples = server.decode_wav_bytes(payload)
+    except (ValueError, wave.Error):
+        # Malformed/truncated WAV or unsupported encoding from the decoder.
+        # Map to 400 (client error) instead of propagating as a 500 / dead socket.
+        return 400, {"error": "malformed audio payload", "text": ""}
+    # Lazily load the backend before queueing inference (mirrors the ordering in
+    # transcribe_bytes_sync). Done here, outside the malformed-audio handler, so
+    # a valid request to an unloaded server triggers load() rather than crashing
+    # inside _run_queued_sync -> _serial_run.
+    server._ensure_loaded()
+    try:
+        result = server._run_queued_sync(samples, request_id)
     except _Busy:
         return 503, {
             "error": "server busy",
@@ -1021,6 +1089,9 @@ def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:
     if len(data) == 0:
         return np.zeros(0, dtype=np.float32)
     if len(data) % 2 == 1:
+        # Odd byte count can't be whole int16 samples; drop the trailing byte
+        # rather than silently misaligning the whole stream.
+        log.warning("dropping odd trailing PCM byte (len=%d)", len(data))
         data = data[:-1]
     return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
@@ -1054,8 +1125,14 @@ class StreamSession:
     server: StarlingServer
     samples: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     last_partial_ts: float = 0.0
-    last_partial_text: str = ""
     chunker: Any = None
+    # Cumulative samples dropped by _maybe_trim_samples (committed prefix that
+    # was finalized and trimmed from the rolling buffer). Used so reported
+    # duration_s / end_s reflect the *full* audio received this session, not
+    # just the live (post-trim) buffer length. Buffer-processing checks
+    # (should_emit_partial, stream_step) keep using the live buffer only via
+    # ``live_seconds`` / ``buffered_seconds`` so chunker behaviour is unchanged.
+    trimmed_samples: int = 0
 
     def __post_init__(self) -> None:
         cfg = self.server.config
@@ -1088,28 +1165,79 @@ class StreamSession:
         """Finalize all buffered audio (on commit) and return the full text."""
         return self.chunker.flush(self.samples, self._tx)
 
+    def _maybe_trim_samples(self) -> None:
+        """Drop the chunker's committed prefix from the rolling buffer.
+
+        ``ChunkStreamer.boundary`` is the sample index up to which audio is fully
+        finalized (advanced only at whole-window boundaries). Everything below it
+        is dead weight we keep re-copying on every append and re-passing to the
+        chunker. Trimming it keeps the buffer (and per-append ``concatenate`` cost)
+        bounded over a long dictation.
+
+        Index-shift invariant: after we drop the first ``boundary`` samples, the
+        chunker's absolute ``boundary`` index points into dropped territory, so we
+        reset ``chunker.boundary = 0``. The chunker then sees the trimmed array as
+        fresh from index 0, and its committed-text state stays consistent because
+        audio before ``boundary`` was already stitched into ``committed`` -- it is
+        never read again. We only trim once the prefix is substantial (>= 1s and
+        a meaningful fraction of the buffer) to avoid trimming on every tiny chunk.
+        """
+        chunker = self.chunker
+        if chunker is None:
+            return
+        b = chunker.boundary
+        if b <= 0 or b >= len(self.samples):
+            return
+        if b < STREAM_TRIM_MIN_SAMPLES and b < len(self.samples) // 2:
+            return
+        self.samples = np.ascontiguousarray(self.samples[b:], dtype=np.float32)
+        self.trimmed_samples += b
+        chunker.boundary = 0
+
     def append_pcm(self, pcm16_bytes: bytes) -> None:
         s = _pcm16_bytes_to_float32(pcm16_bytes)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
+        self._maybe_trim_samples()
 
     def append_wav(self, wav_bytes: bytes) -> None:
+        # Only treat as WAV if it has a RIFF/WAVE header; otherwise it's raw PCM16.
+        if wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+            self.append_pcm(wav_bytes)
+            return
         try:
             s, sr = _wav_bytes_to_float32(wav_bytes)
-        except Exception:
-            self.append_pcm(wav_bytes)
+        except (ValueError, wave.Error):
+            # Malformed WAV despite the header -- don't silently reinterpret as
+            # PCM16 (that decodes header bytes as audio samples -> garbage).
+            # Drop just this chunk, but log it so each dropped chunk is recorded
+            # (matches the odd-PCM-byte handling in _pcm16_bytes_to_float32).
+            log.warning("dropping malformed WAV chunk (len=%d)", len(wav_bytes))
             return
         if sr != SAMPLE_RATE:
             s = _resample_audio(s, sr, SAMPLE_RATE)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
+        self._maybe_trim_samples()
 
     @property
     def buffered_seconds(self) -> float:
+        """Seconds of audio in the *reported* timeline (trimmed + live buffer)."""
+        return (self.trimmed_samples + len(self.samples)) / SAMPLE_RATE
+
+    @property
+    def live_seconds(self) -> float:
+        """Seconds of audio in the live (untrimmed) buffer only.
+
+        Buffer-processing checks (``should_emit_partial``, ``stream_step``) use
+        this so chunker behaviour depends only on the live buffer length, while
+        reported ``duration_s`` / ``end_s`` use the full timeline via
+        ``buffered_seconds``.
+        """
         return len(self.samples) / SAMPLE_RATE
 
     def should_emit_partial(self, now: float) -> bool:
-        if self.buffered_seconds < self.server.config.min_chunk_seconds:
+        if self.live_seconds < self.server.config.min_chunk_seconds:
             return False
         if (now - self.last_partial_ts) < self.server.config.partial_interval_seconds:
             return False
@@ -1117,8 +1245,8 @@ class StreamSession:
 
     def reset(self) -> None:
         self.samples = np.zeros(0, dtype=np.float32)
-        self.last_partial_text = ""
         self.last_partial_ts = 0.0
+        self.trimmed_samples = 0
         if self.chunker is not None:
             self.chunker.reset()
 
@@ -1158,6 +1286,13 @@ def create_app(
 
     app = FastAPI(title="starling-server", version="2.0.0", lifespan=_lifespan)
     app.state.starling_server = server  # type: ignore[attr-defined]
+
+    # Strong references for fire-and-forget background tasks. asyncio only holds
+    # a weak reference to tasks created via create_task, so an unreferenced task
+    # can be garbage-collected before it ever runs. Each entry is dropped again
+    # as soon as its task completes (see add_done_callback) so the set cannot
+    # grow without bound.
+    _background_tasks: set = set()
 
     async def _decode_inference_body(request: "Request") -> bytes:
         declared = request.headers.get("content-length")
@@ -1206,7 +1341,10 @@ def create_app(
 
     @app.post("/warmup")
     async def warmup_route() -> JSONResponse:
-        asyncio.create_task(asyncio.to_thread(server.warmup))
+        task = asyncio.create_task(asyncio.to_thread(server.warmup))
+        # Retain a strong reference until completion (see _background_tasks).
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         return JSONResponse(
             {"status": "warmup started", "phase": server.phase()}, status_code=202
         )
@@ -1320,7 +1458,6 @@ def create_app(
                     text = await asyncio.to_thread(sess.stream_step, now)
                     if text is not None:
                         sess.last_partial_ts = now
-                        sess.last_partial_text = text
                         await ws.send_json(
                             {
                                 "type": "partial",
@@ -1339,7 +1476,6 @@ def create_app(
                     except _Cancelled:
                         continue
                     sess.last_partial_ts = now
-                    sess.last_partial_text = result.text
                     await ws.send_json(
                         {
                             "type": "partial",
@@ -1373,6 +1509,24 @@ def create_app(
 # BACKEND B: stdlib-only (http.server + minimal RFC 6455 WebSocket)
 # ===========================================================================
 def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
+    """Pull the audio bytes out of a ``multipart/form-data`` upload.
+
+    Handles the convention where the file is the last part AND where it is named
+    explicitly: parts are scored and the best match is returned. Selection order
+    (most specific to least):
+
+      1. a part named ``audio`` or ``file`` (explicit audio field), then
+      2. a part with a non-empty ``filename``, then
+      3. a part whose ``Content-Type`` starts with ``audio/``, then
+      4. the last non-empty part (multipart form convention puts the file last).
+
+    Parsing uses the stdlib :mod:`email` module (RFC 2231/5987-aware), so quoted
+    parameters containing semicolons and ``filename*`` extended values survive.
+
+    If no boundary is present the body is returned unchanged (callers may post
+    raw WAV with ``Content-Type: application/octet-stream`` -- that path is
+    valid and must keep working).
+    """
     boundary = None
     for tok in content_type.split(";"):
         tok = tok.strip()
@@ -1381,20 +1535,54 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
             break
     if not boundary:
         return body
-    delim = b"--" + boundary.encode()
-    parts = body.split(delim)
-    for part in parts:
-        if part in (b"", b"--", b"--\r\n", b"\r\n"):
-            continue
-        if part.startswith(b"\r\n"):
-            part = part[2:]
-        if part.endswith(b"\r\n"):
-            part = part[:-2]
-        if b"\r\n\r\n" in part:
-            _headers, payload = part.split(b"\r\n\r\n", 1)
-            return payload
-        return part
-    return body
+
+    # Prepend the Content-Type as a header so the parser can split on the
+    # boundary; email.policy.HTTP gives RFC-compliant multipart handling.
+    header_blob = (f"Content-Type: {content_type}\r\n\r\n").encode()
+    msg = BytesParser(policy=email.policy.HTTP).parsebytes(header_blob + body)
+    if not msg.is_multipart():
+        return body
+
+    # (name, filename, content_type, payload) per candidate part.
+    candidates: list[tuple[Optional[str], Optional[str], Optional[str], bytes]] = []
+    last_payload: Optional[bytes] = None
+    for part in msg.iter_parts():
+        disp = part.get_content_disposition()
+        name: Optional[str] = None
+        filename: Optional[str] = None
+        if disp == "form-data":
+            params = dict(part.get_params(header="content-disposition") or [])
+            name = params.get("name")
+        # get_filename() honours RFC 2231/5987 filename* automatically.
+        filename = part.get_filename()
+        ctype = part.get_content_type()
+        payload = part.get_payload(decode=True) or b""
+        # Preserve the previous non-empty payload across trailing empty parts:
+        # the fallback ("last non-empty part") must not be clobbered by a blank
+        # trailing part.
+        if payload:
+            last_payload = payload
+        candidates.append((name, filename, ctype, payload))
+
+    if not candidates:
+        return body
+
+    def _score(c: tuple[Optional[str], Optional[str], Optional[str], bytes]) -> int:
+        name, filename, ctype, _payload = c
+        if name is not None and name.lower() in ("audio", "file"):
+            return 4
+        if filename:
+            return 3
+        if ctype and ctype.lower().startswith("audio/"):
+            return 2
+        return 0
+
+    best = max(candidates, key=_score)
+    # If nothing scored (only bare text fields), fall back to the last part.
+    if _score(best) == 0:
+        return last_payload if last_payload is not None else body
+    return best[3]
+
 
 
 def _ws_accept_key(client_key: str) -> str:
@@ -1402,7 +1590,9 @@ def _ws_accept_key(client_key: str) -> str:
     return base64.b64encode(h).decode()
 
 
-def _ws_read_frame(rfile) -> tuple[int, bytes]:
+def _ws_read_frame(
+    rfile, on_ping: Optional[Callable[[bytes], None]] = None
+) -> tuple[int, bytes]:
     def _read_exact(n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
@@ -1413,6 +1603,7 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
         return bytes(buf)
 
     pieces: list[bytes] = []
+    total = 0
     final_opcode = 0x1
     while True:
         hdr = _read_exact(2)
@@ -1420,21 +1611,71 @@ def _ws_read_frame(rfile) -> tuple[int, bytes]:
         fin = bool(b0 & 0x80)
         opcode = b0 & 0x0F
         masked = bool(b1 & 0x80)
+        # RFC 6455 §5.1: client->server frames MUST be masked. A missing mask is
+        # a protocol error; the spec wants a close with code 1002, but tearing
+        # the connection down here is the practical security-equivalent measure.
+        if not masked:
+            raise ConnectionError("unmasked client frame (RFC 6455 violation)")
         length = b1 & 0x7F
         if length == 126:
             length = struct.unpack(">H", _read_exact(2))[0]
         elif length == 127:
             length = struct.unpack(">Q", _read_exact(8))[0]
+        # RFC 6455 §5.5: control frames (close 0x8, ping 0x9, pong 0xA) MUST be
+        # FIN (cannot be fragmented) and MUST NOT exceed 125 bytes payload.
+        # Validate BEFORE reading/unmasking the payload so a malformed oversized
+        # ping is rejected before on_ping could answer it.
+        if opcode in (0x8, 0x9, 0xA):
+            if not fin:
+                raise ValueError(f"control frame {opcode:#x} must have FIN set")
+            if length > 125:
+                raise ValueError(
+                    f"control frame {opcode:#x} payload exceeds 125 bytes ({length})"
+                )
+        # Cap the claimed length so a bogus 2^63 can't wedge _read_exact forever.
+        if length > MAX_WS_FRAME_BYTES:
+            raise ValueError(f"websocket frame too large: {length} bytes")
         mask = _read_exact(4) if masked else b""
         payload = _read_exact(length)
         if masked:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
+        # Enforce the cap across the *whole* fragmented message, not just per
+        # frame: an unbounded run of <=16 MiB continuation frames could otherwise
+        # assemble an arbitrarily large message (memory exhaustion).
+        if opcode in (0x1, 0x2, 0x0):
+            total += len(payload)
+            if total > MAX_WS_FRAME_BYTES:
+                raise ValueError(
+                    f"websocket message too large: {total} bytes"
+                )
+
         if opcode == 0x8:
             raise ConnectionError("client closed")
-        if opcode == 0x9:
-            return 0x9, payload
-        if opcode == 0xA:
+        if opcode in (0x9, 0xA):
+            # Ping (0x9) / pong (0xA): control frames may arrive interleaved
+            # with a fragmented data message. Do NOT abandon the accumulated
+            # pieces/total -- handle the control frame inline and keep reading
+            # continuation frames until the data message is complete. (Pong is
+            # a no-op reply.) When an ``on_ping`` callback is supplied (the
+            # stdlib backend passes one that writes the pong frame), answer the
+            # ping *immediately* -- even mid-fragment -- so the peer gets its
+            # pong without waiting for the data message to finish assembling.
+            # Without a callback, a standalone ping (no pending message) is
+            # surfaced to the caller as (0x9, payload) so it can pong; a
+            # mid-fragment ping with no callback cannot be answered here (the
+            # reader only has the rfile) and is held until the message
+            # completes. The FastAPI backend handles its own pings via
+            # Starlette.
+            if opcode == 0x9 and on_ping is not None:
+                on_ping(payload)
+                continue
+            if opcode == 0x9:
+                # No callback: surface a standalone ping so the caller can pong.
+                # A mid-fragment ping is held (preserve state, keep reading).
+                if not pieces:
+                    return 0x9, payload
+                continue
             continue
 
         if opcode in (0x1, 0x2):
@@ -1478,8 +1719,14 @@ def _serve_stream_session(
     try:
         while True:
             try:
-                opcode, payload = _ws_read_frame(rfile)
+                opcode, payload = _ws_read_frame(
+                    rfile, on_ping=lambda p: _ws_send_pong(wfile, p)
+                )
             except ConnectionError:
+                break
+            except socket.timeout:
+                # Idle beyond WS_SOCKET_TIMEOUT_SECONDS -- close cleanly.
+                log.info("WS /stream client %s timed out (idle)", client_addr)
                 break
 
             if opcode == 0x9:
@@ -1544,7 +1791,6 @@ def _serve_stream_session(
                 text = sess.stream_step(now)
                 if text is not None:
                     sess.last_partial_ts = now
-                    sess.last_partial_text = text
                     _ws_send_json(
                         wfile,
                         {
@@ -1564,7 +1810,6 @@ def _serve_stream_session(
                 except _Cancelled:
                     continue
                 sess.last_partial_ts = now
-                sess.last_partial_text = result.text
                 _ws_send_json(
                     wfile,
                     {
@@ -1675,6 +1920,10 @@ def _build_stdlib_handler(server: StarlingServer):
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", accept)
             self.end_headers()
+            # Bound the session so a dead/silent client can't pin a handler
+            # thread forever. Setting the socket timeout propagates to the
+            # rfile/wfile buffered file objects used by the frame reader.
+            self.request.settimeout(WS_SOCKET_TIMEOUT_SECONDS)
             _serve_stream_session(self.rfile, self.wfile, server, self.client_address)
             return True
 
@@ -1809,7 +2058,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--request-timeout-seconds", type=float, default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
-        help="wall-clock request deadline including queue time (default 600)",
+        help="wall-clock request deadline including queue time (default 600; "
+             "0 or negative disables)",
     )
     p.add_argument(
         "--warmup",
@@ -1913,6 +2163,12 @@ def run(argv: Optional[list[str]] = None) -> int:
         )
     if not args.no_eager_load:
         server.load()
+
+    if args.warmup and args.no_eager_load:
+        log.warning(
+            "--warmup is set but --no-eager-load skips startup warmup; "
+            "warmup will run on the first request instead"
+        )
 
     log.info(
         "starting starling server on %s:%d (model=%s, backend=%s, warmup=%s)",

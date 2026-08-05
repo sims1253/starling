@@ -12,14 +12,12 @@ from __future__ import annotations
 import json
 import statistics
 import time
-from pathlib import Path
 
 import torch
 
 from starling.qwen3.audio import build_inputs, load_wav
 from starling.qwen3.config import GOLDEN_DIR, MODEL_ID, REPO_ROOT
-from starling.qwen3.golden import _fixture_wav
-from starling.qwen3.loader import get_components, load_model_and_processor
+from starling.qwen3.loader import load_model_and_processor
 from starling.qwen3.pipeline import MegaPipeline
 
 

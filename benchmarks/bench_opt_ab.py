@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from starling.config import LLM_EOS_TOKEN_ID  # noqa: E402
-from starling.flags import OptFlags, flags, set_default_flags  # noqa: E402
+from starling.flags import OptFlags, set_default_flags  # noqa: E402
 from starling.granite.golden import load_golden, load_golden_text  # noqa: E402
 from starling.granite.llm_mega import FusedLLMMega  # noqa: E402
 from starling.granite.loader import get_components, load_model_and_processor  # noqa: E402

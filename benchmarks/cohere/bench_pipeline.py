@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from statistics import median
 
@@ -51,7 +50,6 @@ def _cuda_timer(fn, warmup: int = 3, iters: int = 7) -> float:
 
 
 def main() -> int:
-    from starling.cohere.config import EOS_TOKEN_ID
     from starling.cohere.decode_mega import GraphedDecoder
     from starling.cohere.encoder_graph import GraphedEncoder
     from starling.cohere.loader import load_model_and_processor
@@ -88,7 +86,6 @@ def main() -> int:
                 input_features=feat, attention_mask=amask
             ).last_hidden_state
             S = enc_h.shape[1]
-            neg = torch.finfo(torch.bfloat16).min
             enc_mask = torch.zeros(B, 1, 1, S, device="cuda", dtype=torch.bfloat16)
             gd = GraphedDecoder(model, steps_per_replay=args.K, warmup_iters=4)
             gd.capture(dec_in, enc_h, enc_mask)

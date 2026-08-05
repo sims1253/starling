@@ -4,16 +4,14 @@ import torch
 import torch.nn as nn
 import math
 import glob
-import functools
-import copy
 import os
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 from typing import Optional, Tuple, Union, List, Dict, Any
 
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 
 from transformers import AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
@@ -22,13 +20,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer, Qwen3RMSNorm, Qwen3RotaryEmbedding, Qwen3Config
 )
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from transformers.cache_utils import Cache, DynamicCache, StaticCache, EncoderDecoderCache
-from transformers.activations import ACT2FN
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import GenerateNonBeamOutput, GenerateDecoderOnlyOutput
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList, BaseStreamer
+from transformers.generation.utils import GenerateNonBeamOutput
 from transformers.utils import logging, ModelOutput
 from transformers.integrations import is_deepspeed_available
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 DistributedAttention = None
 vocab_sequence_parallel_cross_entropy = None
@@ -39,17 +35,13 @@ if is_deepspeed_available():
     DistributedAttention = _ds_layer.DistributedAttention
     vocab_sequence_parallel_cross_entropy = _ds_ce.vocab_sequence_parallel_cross_entropy
 
-from .attention import HiggsDistributedWhisperFlashAttention2
-from transformers.modeling_utils import PreTrainedModel
 from .utils import (
     merge_input_ids_with_audio_features,
     sequence_chunking_per_rank,
     count_parameters,
-    deepspeed_ulysses_attention,
     support_deepspeed_ulysses,
     is_deepspeed_ulysses_enabled,
     all_gather_tensors,
-    deepspeed_ulysses_rope,
     drop_tokens,
     gather_tokens,
 )
@@ -1450,7 +1442,7 @@ class HiggsAudio3Model(HiggsAudioPreTrainedModel, GenerationMixin):
         # parameters related to repetition aware sampling
         ras_win_len = generation_config.generation_kwargs.get("ras_win_len", None)
         ras_win_max_num_repeat = generation_config.generation_kwargs.get("ras_win_max_num_repeat", 2)
-        audio_eos_token_id = generation_config.generation_kwargs.get("audio_eos_token_id", None)
+        _audio_eos_token_id = generation_config.generation_kwargs.get("audio_eos_token_id", None)  # noqa: F841  (vendored; preserved for parity with upstream)
 
         # In the audio generation mode, we sample from audio_logits and keep updating audio_out_ids.
         next_audio_token_logits = audio_logits.clone()[-1, :, :].float().to(device)
@@ -1617,7 +1609,7 @@ class HiggsAudio3Model(HiggsAudioPreTrainedModel, GenerationMixin):
         output_scores = generation_config.output_scores
         output_logits = generation_config.output_logits
         return_dict_in_generate = generation_config.return_dict_in_generate
-        max_length = generation_config.max_length
+        _max_length = generation_config.max_length  # noqa: F841  (vendored; preserved for parity with upstream)
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
         do_sample = generation_config.do_sample
         # Used to track which past_key_va

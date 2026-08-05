@@ -75,9 +75,9 @@ Batching
 --------
 The mel extractor, Conformer encoder and graphed TDT decoder are all already
 batched, so :class:`ChunkedTranscriber` groups the planned chunks into
-mini-batches of up to ``chunk_batch_size`` (default ``8``) and runs each through
+mini-batches of up to ``chunk_batch_size`` (default ``32``) and runs each through
 one set of batched mel+encoder+decode forwards -- turning ~121 sequential B=1
-iterations for 1 h of audio into ~16 B=8 iterations, recovering most of the
+iterations for 1 h of audio into ~4 B=32 iterations, recovering most of the
 megakernel pipeline's batched throughput. Per-chunk token+durations streams are
 split out of the batched result and stitched exactly as in the sequential path.
 A single chunk (audio <= one window) forms a mini-batch of ``B=1`` and is
@@ -116,18 +116,18 @@ class ChunkedTranscriber:
             :meth:`_effective_batch_size` is the primary OOM defence and reduces
             B before this floor is ever reached).
         chunk_batch_size: number of chunks processed simultaneously per
-            mini-batch through mel+encoder+decode (default ``8``). The mel
+            mini-batch through mel+encoder+decode (default ``32``). The mel
             extractor, Conformer encoder and graphed TDT decoder are all already
             batched (they take ``(B, ...)`` inputs), so grouping ``B`` chunks
             into one forward recovers the megakernel pipeline's batched
-            throughput: ~16 sequential B=8 iterations for 1 h of audio instead
+            throughput: ~4 sequential B=32 iterations for 1 h of audio instead
             of ~121 sequential B=1 iterations. The last mini-batch may contain
             fewer than ``chunk_batch_size`` chunks (it runs at its natural
             ``B = remainder``; no dummy padding, see Memory safety / batching).
             ``1`` reproduces the original one-chunk-at-a-time behaviour exactly.
         per_chunk_vram_gb: estimated peak VRAM cost of ONE ~32 s chunk through
             mel+encoder+decode, used by :meth:`_effective_batch_size` to size
-            each mini-batch from the live free-VRAM reading (default ``2.0``).
+            each mini-batch from the live free-VRAM reading (default ``0.15``).
         vram_headroom_gb: headroom (GB) reserved for the resident model + any
             other GPU processes when sizing a mini-batch (default ``4.0``).
 
@@ -242,7 +242,7 @@ class ChunkedTranscriber:
         is the primary OOM defence for the batched path: it *reduces* ``B``
         (rather than aborting) when free VRAM is low. With the defaults
         (``per_chunk_vram_gb=0.15``, ``vram_headroom_gb=4.0``) the full
-        ``chunk_batch_size=8`` is used while free VRAM >= ~20 GB and shrinks
+        ``chunk_batch_size=32`` is used while free VRAM >= ~9 GB and shrinks
         below that, never OOM'ing. At least ``1`` is always returned (the hard
         :attr:`min_free_vram_gb` floor in :meth:`_decode_batch` catches the
         truly-starved case).

@@ -215,7 +215,7 @@ def _ws_connect(host: str, port: int, path: str) -> socket.socket:
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
-    expected = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+    expected = base64.b64encode(hashlib.sha1(ws_handshake_nonce.encode() + WS_GUID).digest()).decode()
     if headers.get("sec-websocket-accept") != expected:
         sock.close()
         raise ConnectionError("bad Sec-WebSocket-Accept")

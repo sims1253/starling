@@ -70,7 +70,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from statistics import median
 from typing import Callable
 
 import torch

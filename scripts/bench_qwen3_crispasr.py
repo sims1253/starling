@@ -4,7 +4,7 @@
 Same audio as the starling bench. Reports transcribe_ms + RTFx + transcript.
 CrispASR uses the cstr/qwen3-asr-1.7b-GGUF f16 conversion (same weights).
 """
-import json, re, subprocess, time
+import json, subprocess, time
 from pathlib import Path
 
 ASR_BENCH = Path("/home/m0hawk/asr-bench")

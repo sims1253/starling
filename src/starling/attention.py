@@ -26,7 +26,6 @@ once per decode forward, not per layer.
 
 from __future__ import annotations
 
-from typing import Optional
 
 import torch
 import torch.nn.functional as F

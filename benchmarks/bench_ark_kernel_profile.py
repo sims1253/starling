@@ -21,7 +21,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from starling.ark.audio import build_inputs_embeds, build_prompt_ids, extract_mel
-from starling.ark.config import EOS_TOKEN_ID
 from starling.ark.pipeline import MegaPipeline
 
 FIXTURES = REPO_ROOT / "tests" / "fixtures"

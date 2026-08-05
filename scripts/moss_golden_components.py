@@ -25,7 +25,6 @@ STAGES = ("mel", "encoder_hidden", "audio_embeds", "prompt_ids", "inputs_embeds"
 
 
 def load_wav(path: Path) -> tuple[torch.Tensor, int]:
-    import numpy as np
 
     wav, sr = sf.read(str(path))
     if sr != 16000:

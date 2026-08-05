@@ -11,7 +11,7 @@ dependencies = [
     # `starling._kernels` package then auto-selects the torch backend.  See
     # src/starling/_kernels/__init__.py.
     "triton>=3.6 ; sys_platform == 'linux'",
-    "transformers",
+    "transformers>=5.14.1",
     "accelerate",
     "numpy",
     "scipy",
@@ -67,10 +67,51 @@ explicit = true
 # PyPI's cu12 wheels (which will not run on Blackwell / sm_120).
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
-# transformers must come from git source because the released PyPI 5.8.0 does not
-# register the `granite_speech` model type (needed for ibm-granite/granite-speech-4.1-2b).
-transformers = { git = "https://github.com/huggingface/transformers", rev = "1048e9af78a6045444244412dfe216ba5810e7fb" }
+# transformers: use PyPI (>= 5.14.1). Earlier releases (5.8.0) did not register
+# the `granite_speech` or `qwen3_asr` model types, requiring a git pin; both are
+# natively registered as of 5.14.1. The qwen3 bootstrap (_tf_bootstrap.py) is
+# now a no-op on 5.14.1 but remains as a fallback for older installs.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+# ---- ruff configuration ----
+# Pinned so CI and local lint agree. Conservative: selects only the ruff
+# default rule families (E = pycodestyle errors, F = Pyflakes) that the
+# existing `# noqa` codes in this repo actually belong to. The other noqa
+# codes scattered across the codebase (WPS433, BLE001, ANN001, N802, D401,
+# A003) come from flake8 plugins that ruff does not enable, so they remain
+# inert under ruff. No autofix is configured — CI stays check-only.
+[tool.ruff]
+# 100 matches actual practice: only ~62 of ~28k first-party lines exceed it
+# (and none carry an explicit `# noqa: E501`). Vendored Higgs code under
+# src/starling/higgs/vendor has much longer lines but is third-party and is
+# expected to be excluded from lint, not to dictate the project limit.
+line-length = 100
+# requires-python = ">=3.10,<3.13" — target the floor so ruff never suggests
+# syntax/features newer than the minimum supported Python.
+target-version = "py310"
+
+[tool.ruff.lint]
+# `E501` (line length) is intentionally ignored: the project never enforced a
+# line cap (zero `# noqa: E501` anywhere, and ~62 first-party lines exceed 100).
+# `line-length` above documents the intended target without breaking the build
+# on pre-existing code. Re-enable E501 once the long lines are cleaned up.
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `__init__.py` modules re-export public symbols via relative imports; F401
+# (imported but unused) is expected and intentional for these re-exports.
+"__init__.py" = ["F401"]
+# Vendored / third-party model code — not ours to edit; excluded wholesale from
+# style rules. F-class (real bugs) still apply so we notice if they break.
+"src/starling/higgs/vendor/**" = ["E"]
+"src/starling/moss/vendor/**" = ["E"]
+"src/starling/nar/vendor/**" = ["E"]
+# Throwaway probe / scratch scripts under scripts/ and benchmarks/ use compact
+# one-liners (`if ...: x; y`) intentionally; E701/E702 (multiple statements on
+# one line) are suppressed there. F-class rules still apply.
+"scripts/**" = ["E701", "E702", "E402", "E401"]
+"benchmarks/**" = ["E701", "E702", "E402", "E731", "E741"]

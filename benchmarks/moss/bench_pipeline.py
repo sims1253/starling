@@ -51,12 +51,9 @@ def _cuda_timer(fn, warmup: int = 3, iters: int = 10) -> float:
 
 
 def main() -> int:
-    from starling.moss.encoder_graph import GraphedAudioEncoder
-    from starling.moss.fused_decode import FusedMossLLMMega
     from starling.moss.loader import load_model_and_processor
     from starling.moss.multistep import FusedMossMultiStepMega
     from starling.moss.reference import (
-        audio_features,
         build_inputs_embeds,
         greedy_generate,
     )
@@ -145,9 +142,9 @@ def main() -> int:
             probe.capture(ft, T)
             probe._reset_to_chunk_start(T, ft)
 
-            def _k():
-                probe._ms_graph.replay()
-                probe._reset_to_chunk_start(T, ft)
+            def _k(_p=probe, _T=T, _ft=ft) -> None:
+                _p._ms_graph.replay()
+                _p._reset_to_chunk_start(_T, _ft)
 
             replay_ms = _cuda_timer(_k, iters=15)
             decode_ms_per_tok = replay_ms / probe.K
