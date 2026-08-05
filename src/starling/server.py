@@ -1035,6 +1035,11 @@ def _transcribe_payload_sync(
         # Malformed/truncated WAV or unsupported encoding from the decoder.
         # Map to 400 (client error) instead of propagating as a 500 / dead socket.
         return 400, {"error": "malformed audio payload", "text": ""}
+    # Lazily load the backend before queueing inference (mirrors the ordering in
+    # transcribe_bytes_sync). Done here, outside the malformed-audio handler, so
+    # a valid request to an unloaded server triggers load() rather than crashing
+    # inside _run_queued_sync -> _serial_run.
+    server._ensure_loaded()
     try:
         result = server._run_queued_sync(samples, request_id)
     except _Busy:

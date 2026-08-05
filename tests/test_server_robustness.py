@@ -98,12 +98,24 @@ class _FakeServer:
         self._n_waiters = 0
         self._lock = threading.Lock()
 
-    def decode_wav_bytes(self, wav_bytes):  # noqa: ANN001
+    def decode_wav_bytes(self, _wav_bytes: bytes) -> np.ndarray:
+        # Argument mirrors StarlingServer.decode_wav_bytes' signature so this
+        # fake is duck-typed to the transport adapter; the bytes are unused
+        # (the injected ``_exc`` decides the path, not the payload).
         if self._exc is not None:
             raise self._exc
         return np.zeros(SAMPLE_RATE, dtype=np.float32)
 
-    def _run_queued_sync(self, samples, request_id, *, streaming=False):  # noqa: ANN001
+    def _ensure_loaded(self) -> None:
+        # No-op: the fake has no real backend to load. Lets _transcribe_payload_sync
+        # call _ensure_loaded() before queueing (mirrors the real StarlingServer).
+        pass
+
+    def _run_queued_sync(
+        self, _samples: np.ndarray, _request_id: str, *, _streaming: bool = False
+    ) -> TranscribeResult:
+        # Signature matches StarlingServer._run_queued_sync for duck-typing; the
+        # arguments are intentionally unused (a canned result is always returned).
         return TranscribeResult(text=self._result_text)
 
     def queue_depth(self) -> int:
@@ -150,6 +162,26 @@ def test_transcribe_payload_passes_through_200_on_clean_wav() -> None:
     assert status == 200
     assert response["text"] == "hello world"
     assert response["request_id"] == "req-3"
+
+
+def test_transcribe_payload_loads_backend_before_queueing_inference() -> None:
+    """A valid request to an (unloaded) server triggers _ensure_loaded() before
+    inference is queued -- regression: the decode/inference split dropped the
+    lazy-load call that transcribe_bytes_sync makes, so an unloaded server would
+    crash inside _run_queued_sync instead of loading first."""
+    server = _FakeServer(result_text="loaded-and-transcribed")
+    server._ensure_loaded_called = False
+
+    def _track_load() -> None:
+        server._ensure_loaded_called = True
+
+    server._ensure_loaded = _track_load  # type: ignore[method-assign]
+    payload = _wav_bytes(np.zeros(SAMPLE_RATE, dtype=np.float32))
+
+    status, response = _transcribe_payload_sync(server, payload, "req-load")
+
+    assert status == 200
+    assert server._ensure_loaded_called is True
 
 
 def test_wav_bytes_to_float32_raises_on_truncated_body() -> None:
