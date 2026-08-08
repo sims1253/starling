@@ -24,7 +24,8 @@ extern "C" {
 // Bumped on any breaking change to this API. The Python binding refuses to
 // load on mismatch. History:
 //   1 — initial (Phase 0): abi + version + shutdown only.
-#define STARLING_GGML_ABI_VERSION 1
+//   2 — added STARLING_GGML_HIGGS (bosonai/higgs-audio-v3-stt).
+#define STARLING_GGML_ABI_VERSION 2
 
 // ABI / build introspection --------------------------------------------------
 
@@ -43,6 +44,7 @@ typedef enum {
     STARLING_GGML_PARAKEET_TDT = 1,  // nvidia/parakeet-tdt-0.6b-v3
     STARLING_GGML_MOSS         = 2,  // MOSS-Transcribe-preview-2B
     STARLING_GGML_ARK          = 3,  // AutoArk-AI/ARK-ASR-3B
+    STARLING_GGML_HIGGS        = 4,  // bosonai/higgs-audio-v3-stt
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------

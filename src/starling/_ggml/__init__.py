@@ -20,6 +20,7 @@ Example::
 
 from ._native import (
     ARK,
+    HIGGS,
     MOSS,
     PARAKEET_TDT,
     GgmlModel,
@@ -27,4 +28,12 @@ from ._native import (
     backend_name,
 )
 
-__all__ = ["ARK", "MOSS", "PARAKEET_TDT", "GgmlModel", "available", "backend_name"]
+__all__ = [
+    "ARK",
+    "HIGGS",
+    "MOSS",
+    "PARAKEET_TDT",
+    "GgmlModel",
+    "available",
+    "backend_name",
+]
