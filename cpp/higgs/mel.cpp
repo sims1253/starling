@@ -101,7 +101,11 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
         ggml_backend_tensor_get(ft, bank_host.data(), 0, M * B * sizeof(float));
         bank = bank_host.data();
     }
-    const size_t fullT = S / H + 1, T = fullT - 1;
+    // The Whisper extractor emits ceil(S / hop) valid frames for S samples (the
+    // attention mask's sum). fullT frames are computed by the FFT (floor(S/H)+1,
+    // >= ceil(S/H) always), and the valid count T = ceil(S/H) keeps the partial
+    // last frame the extractor retains when S is not a hop multiple.
+    const size_t fullT = S / H + 1, T = (S + H - 1) / H;
     std::vector<float> logmel(M * fullT);
     std::vector<double> powers(B * fullT);
     std::vector<double> mel64(M * fullT);
@@ -140,13 +144,21 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
         }
     });
     // Loop 3a: log10 + per-chunk max for a deterministic global-max reduction.
+    // The max is taken over the KEPT (valid) frames only [0, T), matching the
+    // eager Whisper extractor (which drops the trailing frame via [:, :-1]
+    // BEFORE the global max-clamp). Including the dropped frame in the max
+    // shifts the clamp threshold and perturbs every kept frame. logmel/mel64
+    // are laid out mel-major with stride fullT, so iterate m in [0,M), t in [0,T).
     std::vector<float> chunk_max(nthr, -std::numeric_limits<float>::infinity());
-    mel_parallel(nthr, M * fullT, [&](size_t tid, size_t lo, size_t hi) {
+    mel_parallel(nthr, M, [&](size_t tid, size_t m_lo, size_t m_hi) {
         float cm = -std::numeric_limits<float>::infinity();
-        for (size_t idx = lo; idx < hi; ++idx) {
-            float v = (float) std::log10(std::max(mel64[idx], (double) c.mel_floor));
-            logmel[idx] = v;
-            cm = std::max(cm, v);
+        for (size_t m = m_lo; m < m_hi; ++m) {
+            for (size_t t = 0; t < T; ++t) {
+                const size_t idx = m * fullT + t;
+                float v = (float) std::log10(std::max(mel64[idx], (double) c.mel_floor));
+                logmel[idx] = v;
+                cm = std::max(cm, v);
+            }
         }
         chunk_max[tid] = cm;
     });

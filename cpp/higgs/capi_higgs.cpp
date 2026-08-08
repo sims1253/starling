@@ -97,27 +97,52 @@ char* starling_ggml_higgs_decode(void* handle, const float* pcm, int64_t n,
         };
 
         auto a0 = now();
-        MelFeatures mel;
-        if (!compute_log_mel(c->model->config, c->model->loader, pcm,
-                             static_cast<size_t>(n), mel, c->err)) {
-            report(err_out, c->err);
-            return nullptr;
-        }
-        auto a1 = now();
+        // Higgs chunks each clip into ceil(n / chunk_size_samples) <= 4 s chunks
+        // (config.chunk_size_seconds), runs the audio tower + projector PER chunk,
+        // and emits one <|audio_bos|>...<|audio_eos|> segment per chunk in the
+        // prompt. Replicate that here: mel + encode + project each chunk, collect
+        // the per-chunk token counts + the concatenated feature stream. The eager
+        // collator pads each chunk's mel to nb_max_frames (3000) and masks the
+        // padding in self-attention; running the encoder on each chunk's UNPADDED
+        // valid mel (no mask) is bit-identical for the valid outputs (the masked
+        // keys contribute zero attention weight), so no mask is needed.
+        const auto& fc = c->model->config.frontend;
+        const int64_t sr = fc.sample_rate > 0 ? (int64_t) fc.sample_rate : 16000;
+        const int64_t chunk_samples = c->model->config.frontend.chunk_size_seconds > 0.0f
+            ? (int64_t)(c->model->config.frontend.chunk_size_seconds * (float) sr)
+            : (int64_t) c->model->config.frontend.n_samples;
+        const int64_t num_chunks = (n + chunk_samples - 1) / chunk_samples;
         AudioEncoding projected;
-        if (!encode_audio_and_project(*c->model, mel, projected, c->err)) {
-            report(err_out, c->err);
-            return nullptr;
+        std::vector<int64_t> chunk_tokens;
+        chunk_tokens.reserve((size_t) num_chunks);
+        int64_t total_audio_tokens = 0;
+        auto a1 = now();
+        for (int64_t ci = 0; ci < num_chunks; ++ci) {
+            const int64_t off = ci * chunk_samples;
+            const int64_t len = std::min(chunk_samples, n - off);
+            MelFeatures mel;
+            if (!compute_log_mel(c->model->config, c->model->loader, pcm + off,
+                                 static_cast<size_t>(len), mel, c->err)) {
+                report(err_out, c->err);
+                return nullptr;
+            }
+            AudioEncoding chunk_enc;
+            if (!encode_audio_and_project(*c->model, mel, chunk_enc, c->err)) {
+                report(err_out, c->err);
+                return nullptr;
+            }
+            chunk_tokens.push_back(chunk_enc.n_tokens);
+            total_audio_tokens += chunk_enc.n_tokens;
+            // Concatenate this chunk's projector features onto the stream that
+            // gets scattered into the prompt's <|AUDIO|> slots (in chunk order,
+            // matching merge_input_ids_with_audio_features).
+            projected.data.insert(projected.data.end(),
+                                  chunk_enc.data.begin(), chunk_enc.data.end());
         }
+        projected.n_tokens = total_audio_tokens;
+        projected.width = c->model->config.projector.output_size;
         auto a2 = now();
-        // The prompt's audio-token count derives from the UNCAPPED mel-frame
-        // count (len(pcm)//hop), not the extractor's capped n_frames (3000 for
-        // long audio). compute_log_mel returns the capped count; recompute the
-        // uncapped count for the prompt so it matches the eager reference.
-        const int64_t uncapped_frames = c->model->config.frontend.hop_length > 0
-            ? (int64_t) n / (int64_t) c->model->config.frontend.hop_length
-            : mel.n_frames;
-        Prompt prompt = build_transcribe_prompt(c->model->config, uncapped_frames);
+        Prompt prompt = build_transcribe_prompt(c->model->config, chunk_tokens);
         InputsEmbeds inputs;
         if (!build_inputs_embeds(*c->model, prompt, projected, inputs, c->err)) {
             report(err_out, c->err);
@@ -137,9 +162,9 @@ char* starling_ggml_higgs_decode(void* handle, const float* pcm, int64_t n,
         auto a4 = now();
         if (timing) {
             std::fprintf(stderr,
-                "HIGGS_STAGE frames=%lld mel=%.1fms enc+proj=%.1fms prompt+embeds=%.1fms "
+                "HIGGS_STAGE chunks=%lld mel+enc+proj=%.1fms prompt+embeds=%.1fms "
                 "gen=%.1fms audio_tokens=%lld prompt_tokens=%lld gen_tokens=%zu\n",
-                (long long) uncapped_frames, ms(a0, a1), ms(a1, a2), ms(a2, a3),
+                (long long) num_chunks, ms(a0, a2), ms(a2, a3),
                 ms(a3, a4), (long long) projected.n_tokens, (long long) inputs.n_tokens,
                 generated.ids.size());
         }

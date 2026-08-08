@@ -34,6 +34,13 @@ struct FrontendConfig {
     float mel_floor = 1e-10f, dynamic_range = 8.0f;
     // Whisper: x=(log+4)/4. The C++ mel uses (v+offset)/divisor, so offset=4.
     float normalization_offset = 4.0f, normalization_divisor = 4.0f;
+    // Higgs audio chunking: the eager collator (HiggsAudioSampleCollator) splits
+    // each clip into ceil(n_samples / chunk_size_samples) chunks of <= 4 s each,
+    // pads each chunk's mel to nb_max_frames, and runs the audio tower + projector
+    // PER chunk (with a padding mask). The merged prompt inserts one
+    // <|audio_bos|>...<|audio_eos|> segment per chunk. bosonai/higgs-audio-v3-stt
+    // ships chunk_size_seconds=4.0 in its config; the GGUF may override it.
+    float chunk_size_seconds = 4.0f;
 };
 
 struct EncoderConfig {

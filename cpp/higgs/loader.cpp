@@ -55,6 +55,7 @@ bool HiggsModel::load(const char* path, std::string& err) {
     F(c.frontend.normalization_offset, "frontend.normalization_offset");
     F(c.frontend.normalization_divisor, "frontend.normalization_divisor");
     F(c.frontend.dynamic_range, "frontend.dynamic_range");
+    F(c.frontend.chunk_size_seconds, "frontend.chunk_size_seconds");
     c.frontend.pad_mode = str(m, "higgs.frontend.pad_mode", "reflect");
     c.frontend.mel_scale = str(m, "higgs.frontend.mel_scale", "slaney");
     c.frontend.mel_norm = str(m, "higgs.frontend.mel_norm", "slaney");
