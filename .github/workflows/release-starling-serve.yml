@@ -1,0 +1,241 @@
+# Build and publish starling-serve release binaries.
+#
+# Triggered on a tagged release (v*). Produces four static binaries:
+#   starling-serve-windows-vulkan.exe  (MSVC + Vulkan, no VC++ runtime)
+#   starling-serve-linux-cuda          (GCC + CUDA)
+#   starling-serve-linux-vulkan        (GCC + Vulkan)
+#   starling-serve-macos-metal         (Clang + Metal)
+#
+# Each binary is stripped, tarballed, checksummed, and uploaded to the GitHub
+# release. Freestyle's TypeScript download manager fetches the right artifact
+# for the detected platform + GPU.
+
+name: Release starling-serve binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0-test'
+
+permissions:
+  contents: write
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux Vulkan (universal Intel/AMD/ARM path)
+  # ---------------------------------------------------------------------------
+  linux-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.jammy.list \
+            https://packages.lunarg.com/vulkan/1.3/lunarg-vulkan-1.3-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk cmake build-essential
+
+      - name: Build starling-serve (Vulkan)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_GGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp build/starling-serve starling-serve-linux-vulkan
+          sha256sum starling-serve-linux-vulkan > starling-serve-linux-vulkan.sha256
+          tar czf starling-serve-linux-vulkan.tar.gz \
+            starling-serve-linux-vulkan starling-serve-linux-vulkan.sha256
+
+      - name: Verify version
+        run: ./starling-serve-linux-vulkan --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-serve-linux-vulkan
+          path: starling-serve-linux-vulkan.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Linux CUDA (NVIDIA path)
+  # ---------------------------------------------------------------------------
+  linux-cuda:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA toolkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-6
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+
+      - name: Build starling-serve (CUDA)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_GGML_CUDA=ON \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp build/starling-serve starling-serve-linux-cuda
+          sha256sum starling-serve-linux-cuda > starling-serve-linux-cuda.sha256
+          tar czf starling-serve-linux-cuda.tar.gz \
+            starling-serve-linux-cuda starling-serve-linux-cuda.sha256
+
+      - name: Verify version
+        run: ./starling-serve-linux-cuda --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-serve-linux-cuda
+          path: starling-serve-linux-cuda.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Windows Vulkan (MSVC + Vulkan, static CRT)
+  # ---------------------------------------------------------------------------
+  windows-vulkan:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.261.0
+          cache: true
+
+      - name: Build starling-serve (Vulkan, static CRT)
+        shell: cmd
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON ^
+            -DSTARLING_GGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release --target starling-serve
+
+      - name: Package
+        shell: cmd
+        run: |
+          copy build\Release\starling-serve.exe starling-serve-windows-vulkan.exe
+          certutil -hashfile starling-serve-windows-vulkan.exe SHA256 > starling-serve-windows-vulkan.sha256
+          7z a starling-serve-windows-vulkan.zip starling-serve-windows-vulkan.exe starling-serve-windows-vulkan.sha256
+
+      - name: Verify version
+        shell: cmd
+        run: starling-serve-windows-vulkan.exe --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-serve-windows-vulkan
+          path: starling-serve-windows-vulkan.zip
+
+  # ---------------------------------------------------------------------------
+  # macOS Metal (Apple Silicon + Intel)
+  # ---------------------------------------------------------------------------
+  macos-metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build starling-serve (Metal)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_GGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp build/starling-serve starling-serve-macos-metal
+          shasum -a 256 starling-serve-macos-metal > starling-serve-macos-metal.sha256
+          tar czf starling-serve-macos-metal.tar.gz \
+            starling-serve-macos-metal starling-serve-macos-metal.sha256
+
+      - name: Verify version
+        run: ./starling-serve-macos-metal --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: starling-serve-macos-metal
+          path: starling-serve-macos-metal.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Release: upload all artifacts
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [linux-vulkan, linux-cuda, windows-vulkan, macos-metal]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/starling-serve-linux-vulkan/starling-serve-linux-vulkan.tar.gz
+            artifacts/starling-serve-linux-cuda/starling-serve-linux-cuda.tar.gz
+            artifacts/starling-serve-windows-vulkan/starling-serve-windows-vulkan.zip
+            artifacts/starling-serve-macos-metal/starling-serve-macos-metal.tar.gz
+          body: |
+            ## starling-serve release binaries
+
+            ### Artifacts
+            | File | Platform | Backend | Notes |
+            |------|----------|---------|-------|
+            | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
+            | `starling-serve-linux-cuda.tar.gz` | Linux x86_64 | CUDA | NVIDIA |
+            | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | No VC++ runtime dep |
+            | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
+
+            ### Usage
+            ```bash
+            # Verify compatibility
+            ./starling-serve --version
+            ./starling-serve --abi-version
+
+            # Serve a model
+            ./starling-serve --model parakeet --gguf model.gguf --port 8181
+            ```
+
+            ### GPU auto-detection
+            The binary auto-selects the best available backend at runtime
+            (CUDA > Metal > Vulkan > CPU). For deterministic behavior, use the
+            platform-specific variant: download `linux-cuda` for NVIDIA,
+            `linux-vulkan` for Intel/AMD, etc.
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') }}
