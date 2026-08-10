@@ -152,6 +152,47 @@ def test_request_id_passthrough(base_url: str, tr: TestResults):
              f"got {data.get('request_id')}")
 
 
+
+
+# ---- WebSocket tests ------------------------------------------------------
+def test_websocket_control_frames(port: int, tr: TestResults):
+    """WS /stream control frames: ping→pong, reset→reset_ack, commit→final."""
+    try:
+        import asyncio
+        import websockets
+    except ImportError:
+        tr.check("websockets module available", False, "not installed")
+        return
+
+    async def run():
+        uri = f"ws://127.0.0.1:{port}/stream"
+        async with websockets.connect(uri) as ws:
+            # ping → pong
+            await ws.send(json.dumps({"type": "ping"}))
+            resp = await asyncio.wait_for(ws.recv(), timeout=3.0)
+            data = json.loads(resp)
+            tr.check("ws ping→pong", data.get("type") == "pong", str(data))
+
+            # reset → reset_ack
+            await ws.send(json.dumps({"type": "reset"}))
+            resp = await asyncio.wait_for(ws.recv(), timeout=3.0)
+            data = json.loads(resp)
+            tr.check("ws reset→reset_ack", data.get("type") == "reset_ack", str(data))
+
+            # commit with empty buffer → final
+            await ws.send(json.dumps({"type": "commit"}))
+            resp = await asyncio.wait_for(ws.recv(), timeout=3.0)
+            data = json.loads(resp)
+            tr.check("ws commit→final", data.get("type") == "final", str(data))
+            tr.check("ws final has text", "text" in data, str(data))
+            tr.check("ws final has duration_s", "duration_s" in data, str(data))
+
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        tr.check("ws test completed", False, str(e))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -191,6 +232,8 @@ def main():
         test_cancel_notfound(base_url, tr)
         test_transcribe_wav(base_url, tr)
         test_request_id_passthrough(base_url, tr)
+        print("\nTesting WebSocket control frames:")
+        test_websocket_control_frames(args.port, tr)
     finally:
         if proc:
             proc.send_signal(signal.SIGTERM)
