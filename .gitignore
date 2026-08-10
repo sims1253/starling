@@ -50,3 +50,4 @@ third_party/.ggml-patch.lock
 
 # CMake build output (libstarling_ggml)
 /build/
+build-serve/

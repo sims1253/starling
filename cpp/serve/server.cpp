@@ -128,7 +128,7 @@ StarlingServer::~StarlingServer() {
 }
 
 void StarlingServer::load() {
-    std::lock_guard<std::mutex> lk(mutex_);
+    std::lock_guard<std::mutex> lk(load_mutex_);
     if (loaded_.load()) return;
     phase_.store(Phase::Loading);
 
@@ -151,23 +151,15 @@ void StarlingServer::load() {
                   std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "[starling-serve] model loaded in %.1fs\n", dt);
 
-    if (cfg_.warmup) {
-        // Warmup is done unlocked (long GPU work).
-        // We'll handle it after releasing the lock.
-    }
     phase_.store(Phase::Ready);
-
-    if (cfg_.warmup) {
-        // Unlock not needed here since lock_guard scope ends; call warmup()
-        // which has its own locking.
-    }
 }
 
 void StarlingServer::warmup() {
     if (!loaded_.load() || !model_) return;
     {
         std::lock_guard<std::mutex> lk(warmup_mutex_);
-        if (warmup_done_) return;
+        if (warmup_done_ || warmup_in_progress_) return;
+        warmup_in_progress_ = true;
     }
     std::fprintf(stderr,
                  "[starling-serve] warming up on %.1fs silent clip ...\n",
@@ -182,6 +174,7 @@ void StarlingServer::warmup() {
     phase_.store(Phase::Ready);
     {
         std::lock_guard<std::mutex> lk(warmup_mutex_);
+        warmup_in_progress_ = false;
         warmup_done_ = true;
     }
     std::fprintf(stderr, "[starling-serve] warmup complete\n");
@@ -189,6 +182,7 @@ void StarlingServer::warmup() {
 
 RequestContext* StarlingServer::register_request(const std::string& id) {
     std::lock_guard<std::mutex> lk(mutex_);
+    if (requests_.count(id)) return nullptr;  // duplicate request ID
     auto ctx = std::make_unique<RequestContext>();
     ctx->id = id;
     auto* raw = ctx.get();
@@ -237,19 +231,34 @@ TranscribeResult StarlingServer::do_transcribe(
         }
         n_waiters_++;
 
-        // Wait for our turn (head of the queue).
+        // Wait for our turn (head of the queue), with a timeout.
+        auto wait_start = std::chrono::steady_clock::now();
         while (!req_id.empty()) {
             if (ctx && ctx->cancelled.load()) {
                 n_waiters_--;
-                // Remove from queue
                 auto it = std::find(request_order_.begin(),
                                     request_order_.end(), req_id);
                 if (it != request_order_.end()) request_order_.erase(it);
+                queue_cv_.notify_all();
                 if (err) *err = "cancelled";
                 return {};
             }
             if (!request_order_.empty() && request_order_.front() == req_id)
                 break;
+            double timeout = cfg_.request_timeout_seconds;
+            if (timeout > 0) {
+                auto elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                if (elapsed >= timeout) {
+                    n_waiters_--;
+                    auto it = std::find(request_order_.begin(),
+                                        request_order_.end(), req_id);
+                    if (it != request_order_.end()) request_order_.erase(it);
+                    queue_cv_.notify_all();
+                    if (err) *err = "request timed out";
+                    return {};
+                }
+            }
             queue_cv_.wait_for(lk, std::chrono::milliseconds(100));
         }
     }

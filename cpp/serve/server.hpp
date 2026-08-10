@@ -138,7 +138,8 @@ private:
     ServerConfig cfg_;
     starling_ggml_ctx* model_ = nullptr;
 
-    mutable std::mutex mutex_;
+    mutable std::mutex mutex_;       // protects queue state + request registry
+    std::mutex load_mutex_;           // serializes model loading (long operation)
     std::condition_variable queue_cv_;
 
     // Serial inference queue: requests wait in arrival order.
@@ -153,6 +154,7 @@ private:
     // Warmup dedup.
     std::mutex warmup_mutex_;
     bool warmup_done_ = false;
+    bool warmup_in_progress_ = false;
 
     // Internal: run transcribe under the serial lock.
     TranscribeResult do_transcribe(const float* samples, int64_t n,

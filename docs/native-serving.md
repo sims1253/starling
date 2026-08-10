@@ -115,7 +115,7 @@ Control frames (JSON text):
 
 ## Architecture
 
-```
+```text
 cpp/serve/
 ├── main.cpp            — CLI parsing, lifecycle, HTTP/WS transport (cpp-httplib)
 ├── server.hpp/.cpp     — StarlingServer: model lifecycle, serial queue, transcribe
@@ -172,9 +172,10 @@ GitHub release publishes four static binaries + checksums:
 
 ### GPU detection
 
-The binary auto-selects the best available backend at runtime (CUDA > Metal >
-Vulkan > CPU). For deterministic behavior, freestyle can pick the
-platform-specific variant explicitly.
+Each build variant is compiled for a specific backend (CUDA, Metal, Vulkan, or
+CPU). There is no runtime backend auto-selection. Freestyle should download the
+binary matching the detected platform and GPU. Explicit variant selection is
+more predictable than runtime auto-detection.
 
 ## Open questions (resolved)
 

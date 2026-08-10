@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -288,10 +289,10 @@ void StreamSession::append_wav(const std::string& bytes) {
     // Resample if needed (simple: if sr != 16k, we can't resample in C++ easily;
     // assume 16k or let the engine handle it — the C API checks).
     if (sr != kSampleRate) {
-        // For now, warn and pass through; the C engine will reject non-16k.
         std::fprintf(stderr,
-            "[starling-serve] WAV sample rate %d != %d; passing through\n",
+            "[starling-serve] dropping WAV chunk: sample rate %d != %d\n",
             sr, kSampleRate);
+        return;
     }
     if (!decoded.empty()) {
         size_t old = samples_.size();
@@ -311,7 +312,8 @@ void StreamSession::maybe_trim_samples() {
                    samples_.begin() + static_cast<size_t>(b));
     trimmed_samples_ += b;
     // The chunker's boundary index now points into dropped territory;
-    // reset it (matching the Python _maybe_trim_samples invariant).
+    // rebase it so the chunker sees the trimmed buffer as fresh from index 0.
+    chunker_->rebase(b);
 }
 
 std::optional<std::string> StreamSession::stream_step(double now) {

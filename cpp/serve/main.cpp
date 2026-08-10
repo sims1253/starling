@@ -108,17 +108,37 @@ static Args parse_args(int argc, char** argv) {
             }
             return argv[++i];
         };
+        auto next_int = [&](const char* name) -> int {
+            std::string v = next(name);
+            if (a.error) return 0;
+            try { return std::stoi(v); }
+            catch (...) {
+                std::fprintf(stderr, "error: %s requires an integer, got '%s'\n", name, v.c_str());
+                a.error = true;
+                return 0;
+            }
+        };
+        auto next_double = [&](const char* name) -> double {
+            std::string v = next(name);
+            if (a.error) return 0.0;
+            try { return std::stod(v); }
+            catch (...) {
+                std::fprintf(stderr, "error: %s requires a number, got '%s'\n", name, v.c_str());
+                a.error = true;
+                return 0.0;
+            }
+        };
         if (arg == "--model")          a.model = next("--model");
         else if (arg == "--gguf")      a.gguf = next("--gguf");
         else if (arg == "--host")      a.host = next("--host");
-        else if (arg == "--port")      a.port = std::atoi(next("--port").c_str());
+        else if (arg == "--port")      a.port = next_int("--port");
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
-        else if (arg == "--idle-timeout")  a.idle_timeout = std::atof(next("--idle-timeout").c_str());
-        else if (arg == "--stream-chunk-seconds")   a.stream_chunk = std::atof(next("--stream-chunk-seconds").c_str());
-        else if (arg == "--stream-overlap-seconds") a.stream_overlap = std::atof(next("--stream-overlap-seconds").c_str());
-        else if (arg == "--min-chunk-seconds")      a.min_chunk = std::atof(next("--min-chunk-seconds").c_str());
-        else if (arg == "--partial-interval-seconds") a.partial_interval = std::atof(next("--partial-interval-seconds").c_str());
+        else if (arg == "--idle-timeout")  a.idle_timeout = next_double("--idle-timeout");
+        else if (arg == "--stream-chunk-seconds")   a.stream_chunk = next_double("--stream-chunk-seconds");
+        else if (arg == "--stream-overlap-seconds") a.stream_overlap = next_double("--stream-overlap-seconds");
+        else if (arg == "--min-chunk-seconds")      a.min_chunk = next_double("--min-chunk-seconds");
+        else if (arg == "--partial-interval-seconds") a.partial_interval = next_double("--partial-interval-seconds");
         else if (arg == "--version")   a.show_version = true;
         else if (arg == "--abi-version") a.show_abi = true;
         else if (arg == "--help" || arg == "-h") a.show_help = true;
@@ -142,11 +162,13 @@ static std::string json_escape(const std::string& s) {
     out.reserve(s.size() + 8);
     for (char c : s) {
         switch (c) {
-        case '"':  out += "\""; break;
-        case '\\': out += "\\"; break;
-        case '\n': out += "\n";  break;
-        case '\r': out += "\r";  break;
-        case '\t': out += "\t";  break;
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
         default:
             if (static_cast<unsigned char>(c) < 0x20) {
                 char buf[8];
@@ -252,13 +274,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Start idle-timeout monitor.
-    std::thread idle_thread(idle_timeout_thread, server.get(), args.idle_timeout);
+    // Start idle-timeout monitor (only if timeout > 0).
+    std::thread idle_thread;
+    if (args.idle_timeout > 0.0) {
+        idle_thread = std::thread(idle_timeout_thread, server.get(), args.idle_timeout);
+    }
 
     g_last_activity.store(std::time(nullptr));
 
     // Build HTTP server.
     httplib::Server svr;
+
+    // Enforce upload size limit at the HTTP layer.
+    svr.set_payload_max_length(
+        static_cast<size_t>(server->config().max_upload_mb) * 1024 * 1024);
 
     // ---- GET /health ----
     svr.Get("/health",
@@ -355,6 +384,13 @@ int main(int argc, char** argv) {
 
         // Register for cancellation.
         auto* ctx = server->register_request(rid);
+        if (!ctx) {
+            send_json(res,
+                R"({"error":"request id already active","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                409);
+            return;
+        }
 
         // Run transcription.
         std::string err;
@@ -366,20 +402,20 @@ int main(int argc, char** argv) {
         if (err == "server busy") {
             std::ostringstream ss;
             ss << "{\"error\":\"server busy\",\"text\":\"\",\"queue_depth\":"
-               << server->queue_depth() << ",\"request_id\":\"" << rid << "\"}";
+               << server->queue_depth() << ",\"request_id\":\"" << json_escape(rid) << "\"}";
             send_json(res, ss.str(), 503);
             return;
         }
         if (err == "cancelled") {
             send_json(res,
-                "{\"error\":\"cancelled\",\"text\":\"\",\"request_id\":\"" + rid + "\"}",
+                R"({"error":"cancelled","text":"","request_id":")" + json_escape(rid) + "\"}",
                 499);
             return;
         }
         if (!err.empty()) {
             std::ostringstream ss;
-            ss << "{\"error\":\"" << err << "\",\"text\":\"\",\"request_id\":\""
-               << rid << "\"}";
+            ss << "{\"error\":\"" << json_escape(err) << "\",\"text\":\"\",\"request_id\":\""
+               << json_escape(rid) << "\"}";
             send_json(res, ss.str(), 500);
             return;
         }
@@ -408,7 +444,7 @@ int main(int argc, char** argv) {
             bool cancelled = server->cancel_request(rid);
             std::ostringstream ss;
             ss << "{\"status\":\"" << (cancelled ? "cancelled" : "not_found")
-               << "\",\"request_id\":\"" << rid << "\"}";
+               << "\",\"request_id\":\"" << json_escape(rid) << "\"}";
             send_json(res, ss.str(), cancelled ? 200 : 404);
         });
 
@@ -476,7 +512,7 @@ int main(int argc, char** argv) {
                     } else {
                         std::ostringstream ss;
                         ss << "{\"type\":\"error\",\"message\":\"unknown type '"
-                           << type << "'\"}";
+                           << json_escape(type) << "'\"}";
                         ws.send(ss.str());
                         continue;
                     }
@@ -537,5 +573,6 @@ int main(int argc, char** argv) {
 
     g_should_exit.store(true);
     if (idle_thread.joinable()) idle_thread.join();
+    server.reset();  // destroy StarlingServer (calls starling_ggml_free + shutdown)
     return 0;
 }

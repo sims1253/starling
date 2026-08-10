@@ -138,14 +138,13 @@ def map_key(src: str) -> str | None:
         return "joint.pred." + s[len("joint.pred_to_joint_network."):]
 
     # ---- encoder pooler / projector (the enc_out projection) ----
-    # transformers: encoder.projector.weight / encoder.proj.weight
-    # This maps to joint.enc.weight in the C++ engine (the joint does the
-    # encoder projection). Actually, looking at the C++ code, the pooler is
-    # handled by joint.enc.weight — so this may already be covered above.
-    # If there's a separate pooler, it might be an extra tensor we don't need.
-    # Skip it for now.
-    if s.startswith("encoder.projector.") or s.startswith("encoder.proj."):
-        return None  # handled by joint.enc.*
+    # transformers: encoder_projector.weight / encoder_projector.bias
+    #          or: encoder.proj.weight / encoder.proj.bias
+    # GGUF: joint.enc.weight / joint.enc.bias (the joint does the encoder projection)
+    if s.startswith("encoder_projector."):
+        return "joint.enc." + s[len("encoder_projector."):]
+    if s.startswith("encoder.proj."):
+        return "joint.enc." + s[len("encoder.proj."):]
 
     # ---- known non-weight keys to skip ----
     skip_suffixes = (
@@ -217,11 +216,11 @@ def extract_mel_filterbank(processor: Any) -> tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 # KV metadata
 # ---------------------------------------------------------------------------
-def add_metadata(w: gguf.GGUFWriter, config: Any) -> None:
+def add_metadata(w: gguf.GGUFWriter, config: Any, profile: str = "bf16_exact") -> None:
     V = gguf.GGUFValueType
 
     w.add_key_value("starling.format_version", 1, V.UINT32)
-    w.add_string("starling.numeric_profile", "bf16_exact")
+    w.add_string("starling.numeric_profile", profile)
 
     # ---- preprocessor / mel ----
     w.add_key_value("parakeet.preprocessor.sample_rate", 16000, V.UINT32)
@@ -345,7 +344,8 @@ def main() -> int:
     w = gguf.GGUFWriter(str(args.output), "parakeet_tdt", use_temp_file=True)
 
     # Metadata.
-    add_metadata(w, config)
+    profile = "bf16_exact" if args.dtype == "bf16" else "f32_exact"
+    add_metadata(w, config, profile)
 
     # Tokenizer pieces (STRING array KV).
     V = gguf.GGUFValueType

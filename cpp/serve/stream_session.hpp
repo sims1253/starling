@@ -71,6 +71,13 @@ public:
     // The sample index up to which audio is fully finalized (for buffer trimming).
     int64_t boundary() const { return boundary_; }
 
+    // Adjust the boundary after samples are dropped from the front of the buffer.
+    // Called by StreamSession::maybe_trim_samples to keep the chunker aligned
+    // with the shifted samples_ buffer.
+    void rebase(int64_t dropped) {
+        boundary_ = std::max<int64_t>(0, boundary_ - dropped);
+    }
+
 private:
     bool finalize_full_windows(const std::vector<float>& samples, const TranscribeFn& tx);
 

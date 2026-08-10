@@ -5,7 +5,7 @@ model, mirroring the `models/` directory layout in the starling repository.
 
 ## Naming convention
 
-```
+```text
 <model-slug>-<quant>.gguf
 ```
 
@@ -40,5 +40,6 @@ starling-serve --model parakeet --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf -
 ## Verification
 
 Each GGUF file includes `starling.format_version` and `starling.numeric_profile`
-metadata. The `starling-serve` binary checks the ABI version on startup and
-refuses to launch a mismatched engine.
+metadata. The `starling-serve` binary exposes `--abi-version` for binary
+compatibility information, so freestyle can verify the engine was built against
+a compatible GGML C API at startup.
