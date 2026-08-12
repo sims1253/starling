@@ -24,8 +24,9 @@ All do speech-to-text.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — first seq2seq encoder-decoder: 48-layer FastConformer encoder + 8-layer Transformer decoder (self + cross attention).
 - [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. The CUDA megakernel (encoder kept eager) runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13; the in-tree ggml engine (`starling-ggml-higgs`, full Whisper encoder + avg pool + MLP projector + Qwen3 decoder with qk_norm) runs from the main environment and is byte-exact against the golden on short/medium/long.
 - [`nvidia/Nemotron-Labs-Audex-2B`](https://huggingface.co/nvidia/Nemotron-Labs-Audex-2B) — Whisper-large-v3 encoder (with avg-pooler) + relu2 projector + Nemotron-Dense 2B decoder (squared-ReLU MLP, not SwiGLU). ASR path only. **NVIDIA Oneway Noncommercial License** — non-commercial use only, unlike the Apache/MIT-licensed models above.
+- [`HojoAI/Hojo-ASR-V1`](https://huggingface.co/HojoAI/Hojo-ASR-V1) — Whisper-large-v3 mel + Qwen3-Omni audio tower (3× conv2d + 32 transformer layers) + WeNet Conformer bottleneck (2 blocks, rel-pos MHA + BatchNorm conv module) + Qwen3-4B decoder. First **beam-4** decode model in the repo (all others are greedy). The CUDA megakernel runs under `.venv-hojo` (transformers 4.57); the in-tree ggml engine (`starling-ggml-hojo`) runs from the main environment and is byte-exact against the golden on short/medium/long.
 
-The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere) share an
+The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere, hojo) share an
 encoder + LLM-decoder pattern where the decode loop is the bottleneck. Parakeet
 is a transducer; granite-nar is a single bidirectional pass.
 
