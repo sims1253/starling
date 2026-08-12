@@ -46,7 +46,12 @@ namespace starling::ggml::hojo {
 struct FrontendConfig {
     uint32_t sample_rate = 16000, n_fft = 400, win_length = 400;
     uint32_t hop_length = 160, n_mels = 128, power = 2;
-    uint32_t nb_max_frames = 3000, n_samples = 480000, chunk_length = 30;
+    // hojo_asr_model loads WhisperFeatureExtractor.from_pretrained(whisper_path,
+    // chunk_length=40), overriding the base whisper-large-v3 preprocessor
+    // config (chunk_length=30). Audio longer than n_samples=40*16000=640000 is
+    // TRUNCATED to n_samples before the STFT (-> 4000 mel frames max). The GGUF
+    // stores the base Whisper config, so the loader overrides these three.
+    uint32_t nb_max_frames = 4000, n_samples = 640000, chunk_length = 40;
     std::string pad_mode = "reflect", mel_scale = "slaney", mel_norm = "slaney";
     std::string log = "log";
     double mel_floor = 1e-10;

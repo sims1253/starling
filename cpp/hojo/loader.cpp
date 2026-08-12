@@ -59,6 +59,14 @@ bool HojoModel::load(const char* path, std::string& err) {
     c.frontend.mel_scale = str(m, "hojo.frontend.mel_scale", "slaney");
     c.frontend.mel_norm = str(m, "hojo.frontend.mel_norm", "slaney");
     c.frontend.log = str(m, "hojo.frontend.log", "log");
+    // hojo_asr_model.HOJO_ASR loads the Whisper extractor with chunk_length=40
+    // (overriding the base whisper-large-v3 preprocessor_config.json's
+    // chunk_length=30). The GGUF stores the BASE Whisper config, so override
+    // here to match the reference: audio is truncated to 40s (640000 samples)
+    // before the STFT, yielding at most 4000 mel frames.
+    c.frontend.chunk_length = 40;
+    c.frontend.n_samples = c.frontend.chunk_length * c.frontend.sample_rate;
+    c.frontend.nb_max_frames = c.frontend.n_samples / c.frontend.hop_length;
     // Tower.
     U(c.tower.num_mel_bins, "tower.num_mel_bins");
     U(c.tower.d_model, "tower.d_model");

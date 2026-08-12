@@ -62,6 +62,11 @@ void mel_parallel(size_t nthr, size_t total, Body&& body) {
 bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
                      size_t S, MelFeatures& out, std::string& err) {
     const auto& c = cfg.frontend;
+    // WhisperFeatureExtractor (truncation=True) truncates audio longer than
+    // n_samples (= chunk_length*sr = 40s for hojo) to n_samples BEFORE the STFT.
+    // Audio shorter than n_samples is used as-is (hojo calls with padding=False,
+    // so no padding). Match this here: cap the sample count at n_samples.
+    if (S > (size_t) c.n_samples) S = (size_t) c.n_samples;
     const size_t N = c.n_fft, H = c.hop_length, M = c.n_mels, B = N / 2 + 1;
     if (!pcm && S) { err = "null PCM input"; return false; }
     if (S < 2) { err = "Hojo reflect padding requires at least 2 PCM samples"; return false; }

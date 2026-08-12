@@ -80,22 +80,29 @@ std::vector<float> read_f32(const ModelLoader& ml, const char* name) {
 }
 
 // 3 stride-2 conv2d + GELU between each, host-side (f32, double accumulation).
-// Input: window mel [win, 128] (time-major: element (t,c) at t*128+c). The conv
-// treats it as (N=1, C=1, H=win, W=128) with k3/s2/p1 on BOTH H and W (Conv2d
-// k3 s2 p1 is 2D). Output: [out_T, 7680] where out_T = 3x stride-2 of win,
-// 7680 = 480*16 (480 channels * 16 = (((128+1)//2+1)//2+1) freq slots).
+// Input: window mel [win, n_mels] time-major (element (t=time, c=freq) at
+// t*n_mels+c). The reference feeds conv2d1 an input of shape
+// (1, 1, freq=n_mels, time=win) -- i.e. freq is the H axis and time is the W
+// axis (verified by hooking hojo_asr.speech_encoder.conv2d1: input is
+// (1,1,128,743) for short). We must therefore treat H=freq, W=time so the
+// 3x3 kernel weights wf[oc,ic,kh,kw] index kh over freq and kw over time,
+// matching the eager path. Conv2d k3 s2 p1 on both axes; after 3 layers
+// freq: 128->64->32->16, time: win->...->out_T. Output [out_T, 7680] where
+// 7680 = 480*16. The reference flattens via permute(0,3,1,2).view(b,t,c*f) on
+// (b, C=480, F=16, T) -> (b, T, C*F), so per time step the layout is c-outer,
+// f-inner (element (t,c,f) at t*7680 + c*16 + f).
 //
 // Conv2d weight layout in HF/PyTorch: [out_C, in_C, kH, kW]. We compute the
 // standard 2D convolution with kH=kW=3, stride 2, pad 1 on both axes.
 std::vector<float> host_conv2d_stack(const ModelLoader& ml,
                                      const std::vector<float>& mel_win,
                                      int64_t win, int64_t n_mels) {
-    // Start as (H=win, W=n_mels, C=1) -> we track (C, H, W).
-    int64_t C = 1, H = win, W = n_mels;
+    // Track (C, H=freq, W=time). Build x from the time-major mel_win.
+    int64_t C = 1, H = n_mels, W = win;
     std::vector<float> x((size_t) C * H * W);
-    for (int64_t h = 0; h < H; ++h)
-        for (int64_t w = 0; w < W; ++w)
-            x[((size_t)0 * H + h) * W + w] = mel_win[(size_t) h * W + w];
+    for (int64_t h = 0; h < H; ++h)        // h indexes freq
+        for (int64_t w = 0; w < W; ++w)    // w indexes time
+            x[((size_t)0 * H + h) * W + w] = mel_win[(size_t) w * n_mels + h];
     const char* names[3] = {"audio.conv2d1", "audio.conv2d2", "audio.conv2d3"};
     for (int li = 0; li < 3; ++li) {
         std::vector<float> wf = read_f32(ml, (std::string(names[li]) + ".weight").c_str());
@@ -139,18 +146,17 @@ std::vector<float> host_conv2d_stack(const ModelLoader& ml,
             x[i] = v;
         }
     }
-    // x is now (C=480, H=out_T, W=16). The reference does
-    // permute(0,3,1,2).view(b, t, c*f) on (b, C, H, W) -> (b, W, C, H) ->
-    // view (b, H, W*C). So the flattened layout per time step is FREQ-major:
-    // element (t, c, f) at t*(C*F) + f*C + c (f outer, c inner). Our (C,H,W).
-    const int64_t out_T = H, F = W;
+    // x is now (C=480, H=freq_down=16=F, W=time_down=out_T). The reference does
+    // permute(0,3,1,2).view(b, t, c*f) on (b, C, F, T) -> (b, T=93, C*F=7680):
+    // c-outer, f-inner per time step (element (t,c,f) at t*7680 + c*16 + f).
+    const int64_t out_T = W, F = H;
     std::vector<float> out((size_t) out_T * C * F);
     for (int64_t t = 0; t < out_T; ++t)
         for (int64_t c = 0; c < C; ++c)
             for (int64_t f = 0; f < F; ++f)
-                out[(size_t) t * (C * F) + f * C + c] =
-                    x[((size_t) c * out_T + t) * F + f];
-    return out;  // [out_T, 7680] freq-major per step
+                out[(size_t) t * (C * F) + c * F + f] =
+                    x[((size_t) c * F + f) * out_T + t];
+    return out;  // [out_T, 7680] c-outer, f-inner per step
 }
 
 // Compute the SinusoidsPositionEmbedding for `length` positions over `channels`

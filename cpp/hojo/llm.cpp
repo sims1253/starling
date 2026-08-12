@@ -243,11 +243,10 @@ void apply_repetition_penalty(std::vector<float>& logits,
     }
 }
 
-// Beam hypothesis for HF beam search.
+// Beam hypothesis for beam search (active beams only).
 struct Beam {
     std::vector<int32_t> tokens;  // generated tokens (excl. prefix)
     float score = 0.0f;           // cumulative log-prob sum
-    bool finished = false;
 };
 
 } // namespace
@@ -302,152 +301,163 @@ bool beam_generate(const HojoModel& m, const InputsEmbeds& i,
     const int B = (int) op.num_beams;
     const int vocab = (int) m.config.llm.vocab;
     const float lp = (float) op.length_penalty;
+    const float penalty = (float) op.repetition_penalty;
     RopeTables rope = build_rope_tables(m.config.llm, (int)(i.n_tokens + max_new + 4));
 
     // Prefill (step 0): logits over vocab at the last prefix position.
     std::vector<int32_t> empty;
     if (!forward_logits(m, i.data, i.n_tokens, empty, rope, o.prefill_logits, e)) return false;
-    std::vector<float> pf = o.prefill_logits;
-    // Take top-2B candidates.
-    struct Cand { int32_t tok; float score; };
-    std::vector<Cand> top;
-    {
-        std::vector<std::pair<float, int32_t>> ranked;
-        ranked.reserve(vocab);
-        for (int k = 0; k < vocab; ++k) ranked.push_back({pf[k], k});
-        std::partial_sort(ranked.begin(), ranked.begin() + 2 * B, ranked.end(),
-                          [](const auto& a, const auto& b) { return a.first > b.first; });
-        for (int k = 0; k < 2 * B; ++k) top.push_back({ranked[k].second, ranked[k].first});
-    }
-    // log-softmax of prefill logits (HF applies log_softmax then scores).
-    float pfmax = *std::max_element(pf.begin(), pf.end());
-    float pfsum = 0.0f;
-    for (int k = 0; k < vocab; ++k) pfsum += std::exp(pf[k] - pfmax);
-    float pflogsum = std::log(pfsum) + pfmax;
-    // Initialize B beams (beam 0 score = logprob, others = -inf until step 1,
-    // matching HF: at step 0 only beam 0 expands, then top-2B picks the beams).
+
+    // ---- Helpers mirroring HF 4.57.x beam search semantics. ----
+    // log_softmax over the full vocab (f32).
+    auto log_softmax = [&](const std::vector<float>& logits, std::vector<float>& out) {
+        out.assign(vocab, 0.0f);
+        float mx = *std::max_element(logits.begin(), logits.end());
+        float s = 0.0f;
+        for (int k = 0; k < vocab; ++k) s += std::exp(logits[k] - mx);
+        float lse = std::log(s) + mx;
+        for (int k = 0; k < vocab; ++k) out[k] = logits[k] - lse;
+    };
+    // HF RepetitionPenaltyLogitsProcessor. IMPORTANT: 4.57.x applies the
+    // processor to log_softmax(logits), NOT to the raw logits. log-probs are
+    // always <= 0, so the (v < 0) branch (v *= penalty) is taken, making
+    // already-generated tokens more negative. The gather+scatter semantics
+    // apply the penalty ONCE per UNIQUE token (duplicate input_ids scatter the
+    // same value), so deduplicate -- otherwise a token seen k times gets
+    // penalty**k, which derails long highly-repetitive decodes.
+    auto rep_penalty = [&](std::vector<float>& logp, const std::vector<int32_t>& ids) {
+        std::vector<int32_t> uniq = ids;
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+        for (int32_t tok : uniq) {
+            if (tok < 0 || tok >= vocab) continue;
+            float v = logp[(size_t) tok];
+            logp[(size_t) tok] = (v < 0.0f) ? v * penalty : v / penalty;
+        }
+    };
+    // Finished hypotheses (BeamHypotheses): kept sorted by length-normalized
+    // score descending, capped at B entries (worst_score = back()).
+    struct Finished { std::vector<int32_t> tokens; float norm; };
+    std::vector<Finished> finished;
+    auto worst_finished = [&]() -> float {
+        return ((int) finished.size() >= B) ? finished.back().norm
+                                            : -std::numeric_limits<float>::infinity();
+    };
+    auto add_finished = [&](const std::vector<int32_t>& toks, float raw_score) {
+        float gen_len = (float) toks.size();
+        Finished f; f.tokens = toks; f.norm = raw_score / std::pow(gen_len, lp);
+        auto it = std::lower_bound(
+            finished.begin(), finished.end(), f,
+            [](const Finished& a, const Finished& b) { return a.norm > b.norm; });
+        finished.insert(it, f);
+        if ((int) finished.size() > B) finished.pop_back();
+    };
+
+    // Active beams: cumulative raw logprob. Init beam 0 = 0, others = -inf
+    // (HF: only beam 0 expands at step 0).
     std::vector<Beam> beams(B);
     for (int b = 0; b < B; ++b) beams[b].score = -std::numeric_limits<float>::infinity();
-    // HF step-0 selection: the first token is chosen from beam 0's top-2B.
-    std::vector<Beam> finished;
+    beams[0].score = 0.0f;
+
+    // ---- Step 0: rank beam-0 log-probs, pick first tokens. ----
     {
-        // The expansion score for a finished candidate uses cur_len = 1 (one
-        // generated token). score = logprob / (1 ** lp).
-        std::vector<std::tuple<float, int, int32_t>> ranked;  // (score, beam, tok)
-        for (int k = 0; k < 2 * B; ++k) {
-            float lp_ = (pf[top[k].tok] - pflogsum);  // logprob
-            float sc = lp_ / std::pow(1.0f, lp);
-            ranked.push_back({sc, 0, top[k].tok});
-        }
-        std::sort(ranked.begin(), ranked.end(),
-                  [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        std::vector<float> pf_logp;
+        log_softmax(o.prefill_logits, pf_logp);
+        std::vector<std::pair<float, int32_t>> ranked;  // (raw = score0 + logp, tok)
+        ranked.reserve((size_t) vocab);
+        for (int k = 0; k < vocab; ++k) ranked.push_back({beams[0].score + pf_logp[k], k});
+        std::partial_sort(ranked.begin(), ranked.begin() + 2 * B, ranked.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
         int picked = 0;
-        for (auto& [sc, beam, tok] : ranked) {
-            if (picked >= B) break;
+        for (int rank = 0; rank < 2 * B; ++rank) {
+            float raw = ranked[rank].first;
+            int32_t tok = ranked[rank].second;
             if (tok == eos) {
-                Beam fb; fb.tokens = {tok}; fb.score = sc; fb.finished = true;
-                finished.push_back(fb);
-            } else {
+                if (rank < B) add_finished({tok}, raw);  // eos in top-num_beams -> finished
+            } else if (picked < B) {
                 beams[picked].tokens = {tok};
-                beams[picked].score = sc;  // cumulative (raw logprob sum)
+                beams[picked].score = raw;
                 ++picked;
             }
         }
     }
 
-    // Decode steps.
-    for (int step = 1; step < max_new && (int) finished.size() < B; ++step) {
-        // For each active beam, run a forward over [prefix + beam.tokens] and
-        // get the next-token logits.
-        std::vector<std::vector<float>> beam_logits(B);
+    // Early-stop: no running beam can still beat the worst finished hypothesis
+    // (HF _check_earlystop_heuristic with early_stopping=False). best_running_raw
+    // is the best active beam's cumulative raw score; gen_count = generated
+    // length (decoder_prompt_len excluded since we track only generated tokens).
+    auto is_done = [&](float best_running_raw, int gen_count) -> bool {
+        if ((int) finished.size() < B) return false;
+        float highest_attainable = best_running_raw / std::pow((float) gen_count, lp);
+        return worst_finished() >= highest_attainable;
+    };
+
+    // ---- Decode steps (each step runs a fresh forward per active beam). ----
+    int step = 0;  // beams currently hold (step+1) generated tokens
+    while ((step + 1) < max_new) {
+        std::vector<std::vector<float>> beam_logp(B);
         bool any_active = false;
         for (int b = 0; b < B; ++b) {
-            if (beams[b].finished) continue;
+            if (beams[b].tokens.empty()) continue;  // unfilled slot
             any_active = true;
-            if (!forward_logits(m, i.data, i.n_tokens, beams[b].tokens, rope,
-                                beam_logits[b], e)) return false;
-            // Repetition penalty over the full generated sequence (HF uses
-            // input_ids = the generated tokens; the prefix is inputs_embeds,
-            // not input_ids, so it's excluded).
-            apply_repetition_penalty(beam_logits[b], beams[b].tokens, op.repetition_penalty);
+            std::vector<float> raw_lg;
+            if (!forward_logits(m, i.data, i.n_tokens, beams[b].tokens, rope, raw_lg, e))
+                return false;
+            log_softmax(raw_lg, beam_logp[b]);
+            rep_penalty(beam_logp[b], beams[b].tokens);
         }
         if (!any_active) break;
-        // log-softmax each beam's logits, accumulate candidate scores.
-        // cur_len = step + 1 (number of generated tokens AFTER this step).
-        const float cur_len = (float)(step + 1);
-        std::vector<std::tuple<float, int, int32_t>> ranked;  // (cmp_score, beam, tok)
-        ranked.reserve((size_t) B * vocab);
+        // Candidate cumulative raw scores = beam.score + logp[tok]. Top-2B.
+        const int gen_len = step + 2;  // generated tokens after this step's pick
+        std::vector<std::tuple<float, int, int32_t>> ranked;  // (raw, beam, tok)
+        ranked.reserve((size_t) B * (size_t) vocab);
         for (int b = 0; b < B; ++b) {
-            if (beams[b].finished) continue;
-            const auto& lg = beam_logits[b];
-            float lmax = *std::max_element(lg.begin(), lg.end());
-            float lsum = 0.0f;
-            for (int k = 0; k < vocab; ++k) lsum += std::exp(lg[k] - lmax);
-            float llogsum = std::log(lsum) + lmax;
-            for (int k = 0; k < vocab; ++k) {
-                float logp = lg[k] - llogsum;
-                float raw = beams[b].score + logp;  // cumulative logprob
-                float cmp = raw / std::pow(cur_len, lp);
-                ranked.push_back({cmp, b, (int32_t) k});
-            }
+            if (beam_logp[b].empty()) continue;
+            const float bs = beams[b].score;
+            const float* lp_ = beam_logp[b].data();
+            for (int k = 0; k < vocab; ++k)
+                ranked.push_back({bs + lp_[k], b, (int32_t) k});
         }
         std::partial_sort(ranked.begin(), ranked.begin() + 2 * B, ranked.end(),
                           [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
-        // Select next-beam tokens (2B candidates -> B active + EOS finishes).
+        // Select: eos ranked < num_beams -> finished; top-B non-eos -> running
+        // beams (eos continuations are effectively -inf for the next step).
         std::vector<Beam> next_beams(B);
         for (int b = 0; b < B; ++b) next_beams[b].score = -std::numeric_limits<float>::infinity();
         int picked = 0;
-        for (auto& [cmp, b, tok] : ranked) {
-            if (picked >= B && (int) finished.size() >= B) break;
+        float best_running_raw = -std::numeric_limits<float>::infinity();
+        for (int rank = 0; rank < 2 * B; ++rank) {
+            const auto [raw, b, tok] = ranked[rank];
             if (tok == eos) {
-                Beam fb = beams[b];
-                fb.tokens.push_back(tok);
-                fb.score = beams[b].score;  // raw cumulative (no +logp for eos)
-                fb.finished = true;
-                // HF comparison score for finished: raw / cur_len**lp.
-                finished.push_back(fb);
-                // finished comparison uses cmp of the eos candidate.
-                // (We carry cmp implicitly via insertion order; re-sort below.)
-                if ((int) finished.size() <= B) finished.back().score = beams[b].score;
-                continue;
+                if (rank < B) {
+                    std::vector<int32_t> toks = beams[b].tokens;
+                    toks.push_back(tok);
+                    add_finished(toks, raw);  // raw includes the eos logprob
+                }
+            } else if (picked < B) {
+                next_beams[picked].tokens = beams[b].tokens;
+                next_beams[picked].tokens.push_back(tok);
+                next_beams[picked].score = raw;
+                if (raw > best_running_raw) best_running_raw = raw;
+                ++picked;
             }
-            if (picked >= B) continue;
-            next_beams[picked].tokens = beams[b].tokens;
-            next_beams[picked].tokens.push_back(tok);
-            // cumulative raw score (HF stores raw; cmp uses length-normalized).
-            next_beams[picked].score = beams[b].score;
-            // We'll add the logp on the NEXT step's expansion; but HF adds it
-            // to beam_scores at selection. Store raw = beam_score + logp.
-            // Recompute logp for this token to store the cumulative.
-            // (cheaper: re-derive from beam_logits.)
-            // Use the cmp-derived raw = cmp * cur_len**lp (avoids re-softmax).
-            next_beams[picked].score = cmp * std::pow(cur_len, lp);
-            ++picked;
         }
-        // If we didn't fill B beams (lots of EOS), pad with the best remaining.
         beams = std::move(next_beams);
-        if (picked == 0 && (int) finished.size() >= B) break;
+        if (picked == 0) break;  // no open beam can continue
+        if (is_done(best_running_raw, gen_len)) break;
+        step = step + 1;
     }
 
-    // Pick the best finished hypothesis (length-normalized score); fall back to
-    // the best active beam if none finished.
+    // ---- Final selection: best finished by length-normalized score. ----
+    o.hit_eos = !finished.empty();
     if (finished.empty()) {
         int best = 0;
         for (int b = 1; b < B; ++b)
             if (beams[b].score > beams[best].score) best = b;
         o.ids = beams[best].tokens;
-        o.hit_eos = false;
     } else {
-        int best = 0;
-        // Compare finished by their length-normalized score.
-        auto norm_score = [&](const Beam& bm) {
-            float len = (float) bm.tokens.size();
-            return bm.score / std::pow(len, lp);
-        };
-        for (int k = 1; k < (int) finished.size(); ++k)
-            if (norm_score(finished[k]) > norm_score(finished[best])) best = k;
-        o.ids = finished[best].tokens;
-        o.hit_eos = true;
+        // `finished` is sorted by norm desc; front() is the winner.
+        o.ids = finished.front().tokens;
     }
     return true;
 }
