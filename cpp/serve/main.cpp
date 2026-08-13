@@ -247,6 +247,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!args.eager_load && args.warmup) {
+        std::fprintf(stderr,
+            "error: --warmup requires eager loading (incompatible with --no-eager-load)\n");
+        return 1;
+    }
+
     // Build config.
     serve::ServerConfig cfg;
     cfg.model_slug = args.model;

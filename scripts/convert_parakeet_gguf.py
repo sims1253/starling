@@ -147,11 +147,6 @@ def map_key(src: str) -> str | None:
         return "joint.enc." + s[len("encoder.proj."):]
 
     # ---- known non-weight keys to skip ----
-    skip_suffixes = (
-        ".num_batches_tracked",
-        ".running_mean",
-        ".running_var",
-    )
     # Actually, running_mean/var ARE needed for batch_norm. Don't skip them.
     # Only skip num_batches_tracked.
     if s.endswith(".num_batches_tracked"):
@@ -167,82 +162,100 @@ def map_key(src: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Mel frontend extraction
 # ---------------------------------------------------------------------------
-def extract_mel_filterbank(processor: Any) -> tuple[np.ndarray, np.ndarray]:
+def extract_mel_filterbank(processor: Any) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Extract the mel filterbank + STFT window from the NeMo preprocessor.
 
-    Returns (fb [n_mels, n_fft//2+1], window [win_length]) as float32.
+    Returns (fb [n_mels, n_fft//2+1], window [win_length], frontend_params) as float32.
     """
-    # The NeMo AudioToMelSpectrogramPreprocessor computes filterbanks via
-    # librosa.filters.mel. The transformers processor wraps this in its
-    # feature_extractor. We reconstruct the filterbank and window here.
     import librosa
 
-    # Parakeet-tdt constants (from config.hpp / NeMo defaults).
-    sample_rate = 16000
-    n_fft = 512
-    n_mels = 128
-    win_length = 400
-    hop_length = 160
-    fmin = 0.0
-    fmax = sample_rate / 2.0
-
-    # Mel filterbank (librosa 'slaney' normalization, matching NeMo).
-    fb = librosa.filters.mel(
-        sr=sample_rate, n_fft=n_fft, n_mels=n_mels,
-        fmin=fmin, fmax=fmax, htk=False, norm="slaney",
-    ).astype(np.float32)  # [n_mels, n_fft//2+1]
-
-    # Hann window (NeMo default).
-    window = np.array(
-        [0.5 - 0.5 * np.cos(2 * np.pi * n / win_length)
-         for n in range(win_length)],
-        dtype=np.float32,
-    )
-
-    # If the processor has cached filter_banks/windows, use those instead.
     fe = getattr(processor, "feature_extractor", None)
-    if fe is not None:
-        # NeMo preprocessor stores filter_banks as an attribute.
-        cached_fb = getattr(fe, "filter_banks", None)
-        if cached_fb is not None:
-            fb = np.asarray(cached_fb, dtype=np.float32)
-        cached_win = getattr(fe, "window", None)
-        if cached_win is not None:
-            window = np.asarray(cached_win, dtype=np.float32)
+    if fe is None:
+        raise RuntimeError("processor has no feature_extractor")
 
-    return fb, window
+    sample_rate = int(getattr(fe, "sampling_rate", getattr(fe, "sample_rate", 16000)))
+    n_fft = int(getattr(fe, "n_fft", 512))
+    n_mels = int(getattr(fe, "feature_size", getattr(fe, "n_mels", 128)))
+    win_length = int(getattr(fe, "win_length", getattr(fe, "n_window", 400)))
+    hop_length = int(getattr(fe, "hop_length", getattr(fe, "n_stride", 160)))
+    fmin = float(getattr(fe, "f_min", getattr(fe, "fmin", 0.0)))
+    fmax = float(getattr(fe, "f_max", getattr(fe, "fmax", sample_rate / 2.0)))
+    preemph = float(getattr(fe, "preemph", 0.97))
+    mag_power = float(getattr(fe, "mag_power", getattr(fe, "power", 2.0)))
+    log_zero_guard = float(getattr(fe, "log_zero_guard", 5.9604645e-08))
+
+    cached_fb = getattr(fe, "filter_banks", None)
+    if cached_fb is not None:
+        fb = np.asarray(cached_fb, dtype=np.float32)
+    else:
+        # Mel filterbank (librosa 'slaney' normalization, matching NeMo).
+        fb = librosa.filters.mel(
+            sr=sample_rate, n_fft=n_fft, n_mels=n_mels,
+            fmin=fmin, fmax=fmax, htk=False, norm="slaney",
+        ).astype(np.float32)
+
+    cached_win = getattr(fe, "window", None)
+    if cached_win is not None and not isinstance(cached_win, str):
+        window = np.asarray(cached_win, dtype=np.float32)
+    else:
+        # Hann window (NeMo default).
+        window = np.array(
+            [0.5 - 0.5 * np.cos(2 * np.pi * n / win_length)
+             for n in range(win_length)],
+            dtype=np.float32,
+        )
+
+    frontend_params = {
+        "sample_rate": sample_rate,
+        "n_mels": n_mels,
+        "n_fft": n_fft,
+        "win_length": win_length,
+        "hop_length": hop_length,
+        "preemph": preemph,
+        "mag_power": mag_power,
+        "log_zero_guard": log_zero_guard,
+    }
+
+    return fb, window, frontend_params
 
 
 # ---------------------------------------------------------------------------
 # KV metadata
 # ---------------------------------------------------------------------------
-def add_metadata(w: gguf.GGUFWriter, config: Any, profile: str = "bf16_exact") -> None:
+def resolve_config_attr(config: Any, *keys: str) -> Any:
+    for key in keys:
+        if hasattr(config, key):
+            val = getattr(config, key)
+            if val is not None:
+                return val
+    raise AttributeError(f"config missing required attribute (checked: {', '.join(keys)})")
+
+
+def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], profile: str = "bf16_exact") -> None:
     V = gguf.GGUFValueType
 
     w.add_key_value("starling.format_version", 1, V.UINT32)
     w.add_string("starling.numeric_profile", profile)
 
     # ---- preprocessor / mel ----
-    w.add_key_value("parakeet.preprocessor.sample_rate", 16000, V.UINT32)
-    w.add_key_value("parakeet.preprocessor.n_mels", 128, V.UINT32)
-    w.add_key_value("parakeet.preprocessor.n_fft", 512, V.UINT32)
-    w.add_key_value("parakeet.preprocessor.win_length", 400, V.UINT32)
-    w.add_key_value("parakeet.preprocessor.hop_length", 160, V.UINT32)
-    w.add_key_value("parakeet.preprocessor.preemph", 0.97, V.FLOAT32)
-    w.add_key_value("parakeet.preprocessor.mag_power", 2.0, V.FLOAT32)
+    w.add_key_value("parakeet.preprocessor.sample_rate", frontend["sample_rate"], V.UINT32)
+    w.add_key_value("parakeet.preprocessor.n_mels", frontend["n_mels"], V.UINT32)
+    w.add_key_value("parakeet.preprocessor.n_fft", frontend["n_fft"], V.UINT32)
+    w.add_key_value("parakeet.preprocessor.win_length", frontend["win_length"], V.UINT32)
+    w.add_key_value("parakeet.preprocessor.hop_length", frontend["hop_length"], V.UINT32)
+    w.add_key_value("parakeet.preprocessor.preemph", frontend["preemph"], V.FLOAT32)
+    w.add_key_value("parakeet.preprocessor.mag_power", frontend["mag_power"], V.FLOAT32)
     w.add_string("parakeet.preprocessor.normalize", "per_feature")
-    w.add_key_value("parakeet.preprocessor.log_zero_guard", 5.9604645e-08, V.FLOAT32)
+    w.add_key_value("parakeet.preprocessor.log_zero_guard", frontend["log_zero_guard"], V.FLOAT32)
 
     # ---- encoder ----
-    d_model = getattr(config, "d_model", 1024)
-    n_layers = getattr(config, "encoder_layers", 24)
-    pred_out = getattr(config, "encoder_hidden_size",
-                       getattr(config, "output_hidden_size", 640))
-    n_heads = getattr(config, "encoder_attention_heads",
-                      getattr(config, "num_attention_heads", 8))
-    ff_dim = getattr(config, "encoder_feedforward_dim", 4096)
-    conv_kernel = getattr(config, "conv_kernel_size", 9)
-    sub_channels = getattr(config, "subsampling_conv_channels", 256)
+    d_model = resolve_config_attr(config, "d_model")
+    n_layers = resolve_config_attr(config, "encoder_layers", "num_hidden_layers", "n_layers")
+    pred_out = resolve_config_attr(config, "encoder_hidden_size", "output_hidden_size")
+    n_heads = resolve_config_attr(config, "encoder_attention_heads", "num_attention_heads")
+    ff_dim = resolve_config_attr(config, "encoder_feedforward_dim")
+    conv_kernel = resolve_config_attr(config, "conv_kernel_size")
+    sub_channels = resolve_config_attr(config, "subsampling_conv_channels")
     w.add_key_value("parakeet.encoder.d_model", d_model, V.UINT32)
     w.add_key_value("parakeet.encoder.n_layers", n_layers, V.UINT32)
     w.add_key_value("parakeet.encoder.pred_out", pred_out, V.UINT32)
@@ -254,31 +267,26 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, profile: str = "bf16_exact") -
     w.add_key_value("parakeet.encoder.xscaling", 0, V.INT32)
 
     # ---- decoder (prediction net) ----
-    pred_hidden = getattr(config, "decoder_hidden_size",
-                          getattr(config, "pred_hidden", 640))
-    pred_rnn_layers = getattr(config, "decoder_num_layers",
-                              getattr(config, "pred_rnn_layers", 2))
+    pred_hidden = resolve_config_attr(config, "decoder_hidden_size", "pred_hidden")
+    pred_rnn_layers = resolve_config_attr(config, "decoder_num_layers", "pred_rnn_layers")
     w.add_key_value("parakeet.decoder.pred_hidden", pred_hidden, V.UINT32)
     w.add_key_value("parakeet.decoder.pred_rnn_layers", pred_rnn_layers, V.UINT32)
 
     # ---- joint ----
-    joint_hidden = getattr(config, "joint_hidden_size",
-                           getattr(config, "joint_hidden", 640))
+    joint_hidden = resolve_config_attr(config, "joint_hidden_size", "joint_hidden")
     w.add_key_value("parakeet.joint.joint_hidden", joint_hidden, V.UINT32)
     w.add_string("parakeet.joint.activation", "relu")
 
     # ---- decoding / vocab ----
-    max_symbols = getattr(config, "max_symbols_per_step",
-                          getattr(config, "max_symbols", 10))
-    vocab_size = getattr(config, "vocab_size", 8193)
-    blank_id = getattr(config, "blank_token_id",
-                       getattr(config, "blank_id", 8192))
+    max_symbols = resolve_config_attr(config, "max_symbols_per_step", "max_symbols")
+    vocab_size = resolve_config_attr(config, "vocab_size")
+    blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
     w.add_key_value("parakeet.decoding.max_symbols", max_symbols, V.UINT32)
     w.add_key_value("parakeet.vocab_size", vocab_size, V.UINT32)
     w.add_key_value("parakeet.blank_id", blank_id, V.UINT32)
 
     # ---- TDT durations ----
-    durations = list(getattr(config, "durations", [0, 1, 2, 3, 4]))
+    durations = list(resolve_config_attr(config, "durations"))
     w.add_key_value("parakeet.tdt.durations", durations, V.ARRAY, V.INT32)
 
 
@@ -331,7 +339,7 @@ def main() -> int:
 
     # Extract mel filterbank + window.
     print("[convert_parakeet] extracting mel filterbank + window ...")
-    fb, window = extract_mel_filterbank(processor)
+    fb, window, frontend_params = extract_mel_filterbank(processor)
     print(f"  fb: {fb.shape}, window: {window.shape}")
 
     # Extract tokenizer pieces.
@@ -345,7 +353,7 @@ def main() -> int:
 
     # Metadata.
     profile = "bf16_exact" if args.dtype == "bf16" else "f32_exact"
-    add_metadata(w, config, profile)
+    add_metadata(w, config, frontend_params, profile)
 
     # Tokenizer pieces (STRING array KV).
     V = gguf.GGUFValueType
@@ -357,7 +365,6 @@ def main() -> int:
 
     # Model weights.
     learned = 0
-    unmapped = []
     for src_name, tensor in sorted(state_dict.items()):
         gguf_name = map_key(src_name)
         if gguf_name is None:
@@ -376,26 +383,6 @@ def main() -> int:
 
         learned += 1
 
-    # Check for unmapped weight keys.
-    for src_name in sorted(state_dict.keys()):
-        if src_name.endswith(".num_batches_tracked"):
-            continue
-        gguf_name = map_key(src_name)
-        if gguf_name is None:
-            # Check if it's a known non-weight (e.g. positional buffers).
-            if not any(src_name.startswith(p) for p in
-                       ("model.encoder.", "model.decoder.", "model.joint.",
-                        "encoder.", "decoder.", "joint.")):
-                continue
-            unmapped.append(src_name)
-
-    if unmapped:
-        print(f"[convert_parakeet] WARNING: {len(unmapped)} unmapped weight keys:")
-        for k in unmapped[:20]:
-            print(f"  {k}")
-        if len(unmapped) > 20:
-            print(f"  ... and {len(unmapped) - 20} more")
-
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -404,8 +391,6 @@ def main() -> int:
     total = learned + 2  # +2 for fb + window
     print(f"[convert_parakeet] wrote {args.output}: {total} tensors "
           f"({learned} learned), dtype={args.dtype}")
-    if unmapped:
-        print(f"[convert_parakeet] WARNING: {len(unmapped)} keys were not mapped")
     return 0
 
 

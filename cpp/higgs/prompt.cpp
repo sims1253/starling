@@ -23,6 +23,8 @@
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "ggml.h"
+
+#include <algorithm>
 namespace starling::ggml::higgs {
 
 namespace {
@@ -95,7 +97,8 @@ bool build_inputs_embeds(const HiggsModel& m, const Prompt& p, const AudioEncodi
         err = "Higgs audio/prompt scatter size mismatch";
         return false;
     }
-    const int64_t sa = a.n_tokens;
+    const int64_t avail = (int64_t)(a.data.size() / (size_t) a.width);
+    const int64_t sa = std::max<int64_t>(0, std::min(a.n_tokens, avail));
     ensure_weights_realized(m.loader);
     std::vector<int32_t> ids = p.ids;
     std::vector<ggml_bf16_t> ah;

@@ -155,7 +155,7 @@ def test_request_id_passthrough(base_url: str, tr: TestResults):
 
 
 # ---- WebSocket tests ------------------------------------------------------
-def test_websocket_control_frames(port: int, tr: TestResults):
+def test_websocket_control_frames(host: str, port: int, tr: TestResults):
     """WS /stream control frames: ping→pong, reset→reset_ack, commit→final."""
     try:
         import asyncio
@@ -165,7 +165,7 @@ def test_websocket_control_frames(port: int, tr: TestResults):
         return
 
     async def run():
-        uri = f"ws://127.0.0.1:{port}/stream"
+        uri = f"ws://{host}:{port}/stream"
         async with websockets.connect(uri) as ws:
             # ping → pong
             await ws.send(json.dumps({"type": "ping"}))
@@ -233,7 +233,7 @@ def main():
         test_transcribe_wav(base_url, tr)
         test_request_id_passthrough(base_url, tr)
         print("\nTesting WebSocket control frames:")
-        test_websocket_control_frames(args.port, tr)
+        test_websocket_control_frames(args.host, args.port, tr)
     finally:
         if proc:
             proc.send_signal(signal.SIGTERM)

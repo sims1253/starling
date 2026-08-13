@@ -1,5 +1,6 @@
 # Python / venv
 .venv/
+.venv*/
 __pycache__/
 *.pyc
 *.egg-info/
@@ -13,6 +14,9 @@ outputs/
 traces/
 golden/
 *.trace.json
+*.pt
+*.safetensors
+*.gguf
 
 # Audio samples (never check these in)
 *.wav
@@ -39,15 +43,21 @@ plans/
 # notebooks / editor
 .ipynb_checkpoints/
 
-# higgs isolated venv (transformers 4.51 for the model's own code)
-.venv-higgs/
-
 # downloaded model checkpoints (never check these in)
 .hf-cache/
 
 # ggml patch-apply flock sentinel (scripts/apply_ggml_patches.sh)
 third_party/.ggml-patch.lock
 
-# CMake build output (libstarling_ggml)
-/build/
-build-serve/
+# CMake build outputs and directories
+build*/
+cmake-build-*/
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# Distribution / release binaries and archives
+starling-serve*
+artifacts/

@@ -29,7 +29,7 @@ model, mirroring the `models/` directory layout in the starling repository.
 
 ```bash
 # Download a GGUF file:
-huggingface-cli download starling/parakeet-tdt-0.6b-v3-gguf \
+hf download starling/parakeet-tdt-0.6b-v3-gguf \
   parakeet-tdt-0.6b-v3-q8_0.gguf \
   --local-dir ./models
 

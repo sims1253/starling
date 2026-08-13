@@ -52,7 +52,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo (hojo available only when enabled by build-time condition) |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |

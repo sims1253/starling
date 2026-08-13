@@ -250,6 +250,11 @@ def main() -> int:
         elapsed = time.perf_counter() - t0
 
         expected_ids = ref["fixtures"][name]["gen_ids"]
+        assert len(gen_ids) > 0, f"{name}: captured empty gen_ids"
+        assert len(gen_ids) == len(expected_ids), (
+            f"{name}: length mismatch between captured gen_ids ({len(gen_ids)}) "
+            f"and expected_ids ({len(expected_ids)}), diff={len(gen_ids) - len(expected_ids)}"
+        )
         # The golden may stop early (EOS); compare up to the shorter length, but
         # require the captured ids to match the golden prefix exactly.
         n = min(len(gen_ids), len(expected_ids))
