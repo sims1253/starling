@@ -1,12 +1,14 @@
 # Build and publish starling-serve release binaries.
 #
-# Triggered on a tagged release (v*). Produces four static binaries:
-#   starling-serve-windows-vulkan.exe  (MSVC + Vulkan, no VC++ runtime)
-#   starling-serve-linux-cuda          (GCC + CUDA)
-#   starling-serve-linux-vulkan        (GCC + Vulkan)
-#   starling-serve-macos-metal         (Clang + Metal)
+# Triggered on a tagged release (v*). Produces six static binaries:
+#   starling-serve-linux-cuda          (GCC + CUDA, NVIDIA)
+#   starling-serve-linux-rocm          (Clang + ROCm/HIP, AMD)
+#   starling-serve-linux-vulkan        (GCC + Vulkan, Intel/AMD/ARM)
+#   starling-serve-windows-cuda.exe    (MSVC + CUDA, NVIDIA, static CRT)
+#   starling-serve-windows-vulkan.exe  (MSVC + Vulkan, static CRT)
+#   starling-serve-macos-metal         (Clang + Metal, Apple Silicon)
 #
-# Each binary is stripped, tarballed, checksummed, and uploaded to the GitHub
+# Each binary is stripped, packaged, checksummed, and uploaded to the GitHub
 # release. Freestyle's TypeScript download manager fetches the right artifact
 # for the detected platform + GPU.
 
@@ -22,6 +24,10 @@ on:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
         default: 'v0.1.0-test'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -84,7 +90,7 @@ jobs:
       - name: Install CUDA toolkit
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential
+          sudo apt-get install -y cmake build-essential wget
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
@@ -95,6 +101,7 @@ jobs:
         run: |
           cmake -B build -DSTARLING_SERVE=ON \
             -DSTARLING_GGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;120" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
@@ -113,6 +120,53 @@ jobs:
         with:
           name: starling-serve-linux-cuda
           path: starling-serve-linux-cuda.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Linux ROCm / HIP (AMD Radeon & Instinct path)
+  # ---------------------------------------------------------------------------
+  linux-rocm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ROCm / HIP toolkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential wget gnupg2
+          wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/rocm.gpg] https://repo.radeon.com/rocm/apt/latest jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get install -y rocm-dev hip-runtime-amd hipblas-dev rocblas-dev
+          echo "/opt/rocm/bin" >> $GITHUB_PATH
+
+      - name: Build starling-serve (ROCm / HIP)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_GGML_HIP=ON \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DAMDGPU_TARGETS="gfx906,gfx908,gfx90a,gfx940,gfx941,gfx942,gfx1030,gfx1100,gfx1101,gfx1102" \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp build/starling-serve starling-serve-linux-rocm
+          sha256sum starling-serve-linux-rocm > starling-serve-linux-rocm.sha256
+          tar czf starling-serve-linux-rocm.tar.gz \
+            starling-serve-linux-rocm starling-serve-linux-rocm.sha256
+
+      - name: Verify version
+        run: ./starling-serve-linux-rocm --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-serve-linux-rocm
+          path: starling-serve-linux-rocm.tar.gz
 
   # ---------------------------------------------------------------------------
   # Windows Vulkan (MSVC + Vulkan, static CRT)
@@ -159,6 +213,51 @@ jobs:
           path: starling-serve-windows-vulkan.zip
 
   # ---------------------------------------------------------------------------
+  # Windows CUDA (MSVC + CUDA, static CRT)
+  # ---------------------------------------------------------------------------
+  windows-cuda:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.3.0'
+          method: 'network'
+
+      - name: Build starling-serve (CUDA, static CRT)
+        shell: cmd
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON ^
+            -DSTARLING_GGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;120" ^
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release --target starling-serve
+
+      - name: Package
+        shell: cmd
+        run: |
+          copy build\Release\starling-serve.exe starling-serve-windows-cuda.exe
+          certutil -hashfile starling-serve-windows-cuda.exe SHA256 > starling-serve-windows-cuda.sha256
+          7z a starling-serve-windows-cuda.zip starling-serve-windows-cuda.exe starling-serve-windows-cuda.sha256
+
+      - name: Verify version
+        shell: cmd
+        run: starling-serve-windows-cuda.exe --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-serve-windows-cuda
+          path: starling-serve-windows-cuda.zip
+
+  # ---------------------------------------------------------------------------
   # macOS Metal (Apple Silicon + Intel)
   # ---------------------------------------------------------------------------
   macos-metal:
@@ -196,20 +295,31 @@ jobs:
   # Release: upload all artifacts
   # ---------------------------------------------------------------------------
   release:
-    needs: [linux-vulkan, linux-cuda, windows-vulkan, macos-metal]
+    needs: [linux-vulkan, linux-cuda, linux-rocm, windows-vulkan, windows-cuda, macos-metal]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: artifacts
 
+      - name: Generate consolidated SHA256SUMS.txt
+        run: |
+          cd artifacts
+          sha256sum */*.tar.gz */*.zip | awk '{print $1 "  " substr($2, match($2, /[^/]+$/))}' > SHA256SUMS.txt
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
+            artifacts/SHA256SUMS.txt
             artifacts/starling-serve-linux-vulkan/starling-serve-linux-vulkan.tar.gz
             artifacts/starling-serve-linux-cuda/starling-serve-linux-cuda.tar.gz
+            artifacts/starling-serve-linux-rocm/starling-serve-linux-rocm.tar.gz
             artifacts/starling-serve-windows-vulkan/starling-serve-windows-vulkan.zip
+            artifacts/starling-serve-windows-cuda/starling-serve-windows-cuda.zip
             artifacts/starling-serve-macos-metal/starling-serve-macos-metal.tar.gz
           body: |
             ## starling-serve release binaries
@@ -217,9 +327,11 @@ jobs:
             ### Artifacts
             | File | Platform | Backend | Notes |
             |------|----------|---------|-------|
-            | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
             | `starling-serve-linux-cuda.tar.gz` | Linux x86_64 | CUDA | NVIDIA |
-            | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | No VC++ runtime dep |
+            | `starling-serve-linux-rocm.tar.gz` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
+            | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
+            | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
+            | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
 
             ### Usage
@@ -234,8 +346,9 @@ jobs:
 
             ### GPU auto-detection
             The binary auto-selects the best available backend at runtime
-            (CUDA > Metal > Vulkan > CPU). For deterministic behavior, use the
-            platform-specific variant: download `linux-cuda` for NVIDIA,
-            `linux-vulkan` for Intel/AMD, etc.
+            (CUDA > ROCm > Metal > Vulkan > CPU). For deterministic behavior, use the
+            platform-specific variant: download `linux-cuda` or `windows-cuda` for NVIDIA,
+            `linux-rocm` for AMD on Linux, `windows-vulkan` for AMD/Intel on Windows, etc.
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') }}
+

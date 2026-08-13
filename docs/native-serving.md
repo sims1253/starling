@@ -25,6 +25,12 @@ cmake --build build -j --target starling-serve
 cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON
 cmake --build build -j --target starling-serve
 
+# ROCm / HIP (AMD Radeon & Instinct path on Linux):
+cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_HIP=ON \
+  -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
+cmake --build build -j --target starling-serve
+
 # Vulkan (universal Intel/AMD/ARM path):
 cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_VULKAN=ON
 cmake --build build -j --target starling-serve
@@ -161,14 +167,16 @@ Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0
 
 ## Release artifacts
 
-GitHub release publishes four static binaries + checksums:
+GitHub release publishes six static binaries + checksums:
 
-| Artifact | Platform | Backend |
-|----------|----------|---------|
-| `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan (Intel/AMD/ARM) |
-| `starling-serve-linux-cuda` | Linux x86_64 | CUDA (NVIDIA) |
-| `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan (no VC++ runtime) |
-| `starling-serve-macos-metal` | macOS arm64 | Metal (Apple Silicon) |
+| Artifact | Platform | Backend | Notes |
+|----------|----------|---------|-------|
+| `starling-serve-linux-cuda` | Linux x86_64 | CUDA | NVIDIA |
+| `starling-serve-linux-rocm` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
+| `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
+| `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
+| `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
+| `starling-serve-macos-metal` | macOS arm64 | Metal | Apple Silicon |
 
 ### GPU detection
 
