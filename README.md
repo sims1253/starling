@@ -22,7 +22,7 @@ All do speech-to-text.
 - [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — Whisper-style windowed-attention encoder + Qwen3 decoder.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — Whisper encoder + MLP adapter + Qwen2.5 decoder.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — first seq2seq encoder-decoder: 48-layer FastConformer encoder + 8-layer Transformer decoder (self + cross attention).
-- [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. Runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13.
+- [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. The CUDA megakernel (encoder kept eager) runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13; the in-tree ggml engine (`starling-ggml-higgs`, full Whisper encoder + avg pool + MLP projector + Qwen3 decoder with qk_norm) runs from the main environment and is byte-exact against the golden on short/medium/long.
 - [`nvidia/Nemotron-Labs-Audex-2B`](https://huggingface.co/nvidia/Nemotron-Labs-Audex-2B) — Whisper-large-v3 encoder (with avg-pooler) + relu2 projector + Nemotron-Dense 2B decoder (squared-ReLU MLP, not SwiGLU). ASR path only. **NVIDIA Oneway Noncommercial License** — non-commercial use only, unlike the Apache/MIT-licensed models above.
 
 The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere) share an

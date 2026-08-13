@@ -106,11 +106,13 @@ file(GLOB STARLING_GGML_RUNTIME_CPP ${CMAKE_SOURCE_DIR}/cpp/runtime/*.cpp)
 file(GLOB STARLING_GGML_PARAKEET_CPP ${CMAKE_SOURCE_DIR}/cpp/parakeet/*.cpp)
 file(GLOB STARLING_GGML_MOSS_CPP ${CMAKE_SOURCE_DIR}/cpp/moss/*.cpp)
 file(GLOB STARLING_GGML_ARK_CPP ${CMAKE_SOURCE_DIR}/cpp/ark/*.cpp)
+file(GLOB STARLING_GGML_HIGGS_CPP ${CMAKE_SOURCE_DIR}/cpp/higgs/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
     ${STARLING_GGML_PARAKEET_CPP}
     ${STARLING_GGML_MOSS_CPP}
     ${STARLING_GGML_ARK_CPP}
+    ${STARLING_GGML_HIGGS_CPP}
     ${CMAKE_SOURCE_DIR}/cpp/capi.cpp)
 
 add_library(starling_ggml_core OBJECT ${STARLING_GGML_CPP})
@@ -118,7 +120,7 @@ set_target_properties(starling_ggml_core PROPERTIES POSITION_INDEPENDENT_CODE ON
 target_include_directories(starling_ggml_core PUBLIC
     ${CMAKE_SOURCE_DIR}/cpp/include ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/cpp/runtime ${CMAKE_SOURCE_DIR}/cpp/parakeet
-    ${CMAKE_SOURCE_DIR}/cpp/moss ${CMAKE_SOURCE_DIR}/cpp/ark
+    ${CMAKE_SOURCE_DIR}/cpp/moss ${CMAKE_SOURCE_DIR}/cpp/ark ${CMAKE_SOURCE_DIR}/cpp/higgs
     ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_SOURCE_DIR}/third_party/ggml/src ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
 target_compile_definitions(starling_ggml_core PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
@@ -139,8 +141,25 @@ if(STARLING_GGML_TESTS)
   foreach(test_src IN LISTS STARLING_GGML_TEST_MAIN_CPP)
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src} ${STARLING_GGML_TEST_SUPPORT_CPP} $<TARGET_OBJECTS:starling_ggml_core>)
-    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${CMAKE_SOURCE_DIR}/cpp/tests ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
+    target_include_directories(${test_name} PRIVATE
+        ${CMAKE_SOURCE_DIR}/cpp ${CMAKE_SOURCE_DIR}/cpp/tests
+        ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
     target_link_libraries(${test_name} PRIVATE ggml)
+
+    # The stream_session_test needs the serve sources (server.cpp,
+    # stream_session.cpp, audio.cpp) + cpp-httplib's header path.
+    if(test_name STREQUAL "stream_session_test")
+      target_sources(${test_name} PRIVATE
+          ${CMAKE_SOURCE_DIR}/cpp/serve/server.cpp
+          ${CMAKE_SOURCE_DIR}/cpp/serve/stream_session.cpp
+          ${CMAKE_SOURCE_DIR}/cpp/serve/audio.cpp)
+      target_include_directories(${test_name} PRIVATE
+          ${CMAKE_SOURCE_DIR}/cpp/include
+          ${CMAKE_SOURCE_DIR}/cpp/serve)
+      find_package(Threads REQUIRED)
+      target_link_libraries(${test_name} PRIVATE Threads::Threads)
+    endif()
+
     set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   endforeach()
 endif()
@@ -150,3 +169,70 @@ endif()
 set_target_properties(starling_ggml PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+
+# --------------------------------------------------------------------------- #
+# starling-serve: the native HTTP/WebSocket serving binary.
+#
+# A self-contained executable that wraps libstarling_ggml behind the same
+# HTTP/WS API as the Python `starling.server`, so freestyle's TypeScript
+# supervisor is a drop-in replacement:
+#
+#   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
+#
+# Build (CPU-only for development / CI smoke tests):
+#   cmake -B build -DSTARLING_SERVE=ON
+#   cmake --build build -j --target starling-serve
+#
+# Build (CUDA, the freestyle production path):
+#   cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON
+#   cmake --build build -j --target starling-serve
+#
+# Build (Vulkan, the universal Intel/AMD/ARM path):
+#   cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_VULKAN=ON
+#   cmake --build build -j --target starling-serve
+#
+# The binary links statically against starling_ggml_core (no separate .so to
+# ship). On Windows it has no Python / VC++ runtime dependency (static CRT
+# recommended via CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded).
+# --------------------------------------------------------------------------- #
+option(STARLING_SERVE "Build the starling-serve native HTTP/WS binary" OFF)
+
+# Starling serve version (bumped with the GGML ABI; checked by --version).
+set(STARLING_SERVE_VERSION "0.1.0" CACHE STRING "starling-serve version string")
+
+if(STARLING_SERVE)
+  set(STARLING_SERVE_CPP
+      ${CMAKE_SOURCE_DIR}/cpp/serve/main.cpp
+      ${CMAKE_SOURCE_DIR}/cpp/serve/server.cpp
+      ${CMAKE_SOURCE_DIR}/cpp/serve/stream_session.cpp
+      ${CMAKE_SOURCE_DIR}/cpp/serve/audio.cpp)
+
+  add_executable(starling-serve
+      ${STARLING_SERVE_CPP}
+      $<TARGET_OBJECTS:starling_ggml_core>)
+
+  target_include_directories(starling-serve PRIVATE
+      ${CMAKE_SOURCE_DIR}/cpp/include
+      ${CMAKE_SOURCE_DIR}/cpp/serve
+      ${CMAKE_SOURCE_DIR}/cpp
+      ${CMAKE_SOURCE_DIR}/third_party
+      ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
+
+  # Version string baked into the binary for --version.
+  target_compile_definitions(starling-serve PRIVATE
+      STARLING_SERVE_VERSION="${STARLING_SERVE_VERSION}")
+
+  # cpp-httplib needs threads on Unix.
+  find_package(Threads REQUIRED)
+  target_link_libraries(starling-serve PRIVATE ggml Threads::Threads)
+
+  # Static CRT on Windows (no VC++ redistributable dependency).
+  if(WIN32 AND MSVC)
+    set_property(TARGET starling-serve PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
+
+  set_target_properties(starling-serve PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
