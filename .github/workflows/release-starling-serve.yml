@@ -1,9 +1,9 @@
 # Build and publish starling-serve release binaries.
 #
-# Triggered on a tagged release (v*). Produces six static binaries:
+# Triggered on a version tag (v*). Produces six release binaries:
 #   starling-serve-linux-cuda          (GCC + CUDA, NVIDIA)
 #   starling-serve-linux-rocm          (Clang + ROCm/HIP, AMD)
-#   starling-serve-linux-vulkan        (GCC + Vulkan, Intel/AMD/ARM)
+#   starling-serve-linux-vulkan        (GCC + Vulkan, Intel/AMD/NVIDIA)
 #   starling-serve-windows-cuda.exe    (MSVC + CUDA, NVIDIA, static CRT)
 #   starling-serve-windows-vulkan.exe  (MSVC + Vulkan, static CRT)
 #   starling-serve-macos-metal         (Clang + Metal, Apple Silicon)
@@ -29,20 +29,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
+# Build jobs only need to read the repository. The release job elevates this
+# permission locally when it uploads the finished artifacts.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: 4
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux Vulkan (universal Intel/AMD/ARM path)
+  # Linux Vulkan (cross-vendor GPU path; x86_64 executable)
   # ---------------------------------------------------------------------------
   linux-vulkan:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
@@ -56,8 +59,10 @@ jobs:
 
       - name: Build starling-serve (Vulkan)
         run: |
-          cmake -B build -DSTARLING_SERVE=ON \
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
             -DSTARLING_GGML_VULKAN=ON \
+            -DSTARLING_GGML_TESTS=OFF \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
@@ -69,8 +74,12 @@ jobs:
           tar czf starling-serve-linux-vulkan.tar.gz \
             starling-serve-linux-vulkan starling-serve-linux-vulkan.sha256
 
-      - name: Verify version
-        run: ./starling-serve-linux-vulkan --version
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-linux-vulkan --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-linux-vulkan --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -83,7 +92,7 @@ jobs:
   linux-cuda:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
@@ -95,13 +104,15 @@ jobs:
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y cuda-toolkit-13-3
-          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
 
       - name: Build starling-serve (CUDA)
         run: |
-          cmake -B build -DSTARLING_SERVE=ON \
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
             -DSTARLING_GGML_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;120" \
+            -DSTARLING_GGML_TESTS=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
@@ -113,8 +124,12 @@ jobs:
           tar czf starling-serve-linux-cuda.tar.gz \
             starling-serve-linux-cuda starling-serve-linux-cuda.sha256
 
-      - name: Verify version
-        run: ./starling-serve-linux-cuda --version
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-linux-cuda --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-linux-cuda --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -127,7 +142,7 @@ jobs:
   linux-rocm:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
@@ -140,15 +155,17 @@ jobs:
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y rocm-dev hip-runtime-amd hipblas-dev rocblas-dev
-          echo "/opt/rocm/bin" >> $GITHUB_PATH
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       - name: Build starling-serve (ROCm / HIP)
         run: |
-          cmake -B build -DSTARLING_SERVE=ON \
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
             -DSTARLING_GGML_HIP=ON \
+            -DSTARLING_GGML_TESTS=OFF \
             -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
-            -DAMDGPU_TARGETS="gfx906,gfx908,gfx90a,gfx940,gfx941,gfx942,gfx1030,gfx1100,gfx1101,gfx1102" \
+            -DAMDGPU_TARGETS="gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100;gfx1101;gfx1102" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
@@ -160,8 +177,12 @@ jobs:
           tar czf starling-serve-linux-rocm.tar.gz \
             starling-serve-linux-rocm starling-serve-linux-rocm.sha256
 
-      - name: Verify version
-        run: ./starling-serve-linux-rocm --version
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-linux-rocm --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-linux-rocm --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -172,40 +193,47 @@ jobs:
   # Windows Vulkan (MSVC + Vulkan, static CRT)
   # ---------------------------------------------------------------------------
   windows-vulkan:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.357.0
           cache: true
 
       - name: Build starling-serve (Vulkan, static CRT)
-        shell: cmd
+        shell: pwsh
         run: |
-          cmake -B build -DSTARLING_SERVE=ON ^
-            -DSTARLING_GGML_VULKAN=ON ^
-            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF ^
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+            -DSTARLING_SERVE=ON `
+            "-DSTARLING_SERVE_VERSION=$version" `
+            -DSTARLING_GGML_VULKAN=ON `
+            -DSTARLING_GGML_TESTS=OFF `
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release --target starling-serve
 
       - name: Package
-        shell: cmd
+        shell: pwsh
         run: |
-          copy build\Release\starling-serve.exe starling-serve-windows-vulkan.exe
-          certutil -hashfile starling-serve-windows-vulkan.exe SHA256 > starling-serve-windows-vulkan.sha256
+          Copy-Item build\Release\starling-serve.exe starling-serve-windows-vulkan.exe
+          $hash = (Get-FileHash starling-serve-windows-vulkan.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  starling-serve-windows-vulkan.exe" | Set-Content -Encoding ascii starling-serve-windows-vulkan.sha256
           7z a starling-serve-windows-vulkan.zip starling-serve-windows-vulkan.exe starling-serve-windows-vulkan.sha256
 
-      - name: Verify version
-        shell: cmd
-        run: starling-serve-windows-vulkan.exe --version
+      - name: Verify binary metadata
+        shell: pwsh
+        run: |
+          $version = .\starling-serve-windows-vulkan.exe --version
+          $version
+          $expected = "starling-serve $($env:RELEASE_TAG -replace '^v', '')"
+          if ($version -notcontains $expected) { throw "Expected version line: $expected" }
+          .\starling-serve-windows-vulkan.exe --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -216,41 +244,48 @@ jobs:
   # Windows CUDA (MSVC + CUDA, static CRT)
   # ---------------------------------------------------------------------------
   windows-cuda:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
         with:
           cuda: '13.3.0'
           method: 'network'
 
       - name: Build starling-serve (CUDA, static CRT)
-        shell: cmd
+        shell: pwsh
         run: |
-          cmake -B build -DSTARLING_SERVE=ON ^
-            -DSTARLING_GGML_CUDA=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90;120" ^
-            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF ^
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+            -DSTARLING_SERVE=ON `
+            "-DSTARLING_SERVE_VERSION=$version" `
+            -DSTARLING_GGML_CUDA=ON `
+            -DSTARLING_GGML_TESTS=OFF `
+            "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" `
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release --target starling-serve
 
       - name: Package
-        shell: cmd
+        shell: pwsh
         run: |
-          copy build\Release\starling-serve.exe starling-serve-windows-cuda.exe
-          certutil -hashfile starling-serve-windows-cuda.exe SHA256 > starling-serve-windows-cuda.sha256
+          Copy-Item build\Release\starling-serve.exe starling-serve-windows-cuda.exe
+          $hash = (Get-FileHash starling-serve-windows-cuda.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  starling-serve-windows-cuda.exe" | Set-Content -Encoding ascii starling-serve-windows-cuda.sha256
           7z a starling-serve-windows-cuda.zip starling-serve-windows-cuda.exe starling-serve-windows-cuda.sha256
 
-      - name: Verify version
-        shell: cmd
-        run: starling-serve-windows-cuda.exe --version
+      - name: Verify binary metadata
+        shell: pwsh
+        run: |
+          $version = .\starling-serve-windows-cuda.exe --version
+          $version
+          $expected = "starling-serve $($env:RELEASE_TAG -replace '^v', '')"
+          if ($version -notcontains $expected) { throw "Expected version line: $expected" }
+          .\starling-serve-windows-cuda.exe --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -258,19 +293,22 @@ jobs:
           path: starling-serve-windows-cuda.zip
 
   # ---------------------------------------------------------------------------
-  # macOS Metal (Apple Silicon + Intel)
+  # macOS Metal (Apple Silicon)
   # ---------------------------------------------------------------------------
   macos-metal:
+    # The standard macos-14 label is an Apple Silicon runner.
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
 
       - name: Build starling-serve (Metal)
         run: |
-          cmake -B build -DSTARLING_SERVE=ON \
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
             -DSTARLING_GGML_METAL=ON \
+            -DSTARLING_GGML_TESTS=OFF \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
@@ -283,8 +321,12 @@ jobs:
           tar czf starling-serve-macos-metal.tar.gz \
             starling-serve-macos-metal starling-serve-macos-metal.sha256
 
-      - name: Verify version
-        run: ./starling-serve-macos-metal --version
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-macos-metal --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-macos-metal --abi-version
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -297,6 +339,8 @@ jobs:
   release:
     needs: [linux-vulkan, linux-cuda, linux-rocm, windows-vulkan, windows-cuda, macos-metal]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -305,12 +349,16 @@ jobs:
       - name: Generate consolidated SHA256SUMS.txt
         run: |
           cd artifacts
-          sha256sum */*.tar.gz */*.zip | awk '{print $1 "  " substr($2, match($2, /[^/]+$/))}' > SHA256SUMS.txt
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | awk '{name=$2; sub(/^.*\//, "", name); print $1 "  " name}' \
+            > SHA256SUMS.txt
           echo "=== SHA256SUMS.txt ==="
           cat SHA256SUMS.txt
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
@@ -329,7 +377,7 @@ jobs:
             |------|----------|---------|-------|
             | `starling-serve-linux-cuda.tar.gz` | Linux x86_64 | CUDA | NVIDIA |
             | `starling-serve-linux-rocm.tar.gz` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
-            | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
+            | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
             | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
             | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
@@ -344,11 +392,9 @@ jobs:
             ./starling-serve --model parakeet --gguf model.gguf --port 8181
             ```
 
-            ### GPU auto-detection
-            The binary auto-selects the best available backend at runtime
-            (CUDA > ROCm > Metal > Vulkan > CPU). For deterministic behavior, use the
-            platform-specific variant: download `linux-cuda` or `windows-cuda` for NVIDIA,
-            `linux-rocm` for AMD on Linux, `windows-vulkan` for AMD/Intel on Windows, etc.
+            ### Choosing an artifact
+            Download `linux-cuda` or `windows-cuda` for NVIDIA, `linux-rocm` for AMD
+            on Linux, `windows-vulkan` for AMD/Intel on Windows, and `macos-metal`
+            for Apple Silicon. The Linux Vulkan build is also a cross-vendor fallback.
           draft: false
-          prerelease: ${{ contains(github.ref, '-rc') }}
-
+          prerelease: ${{ contains(env.RELEASE_TAG, '-rc') }}
