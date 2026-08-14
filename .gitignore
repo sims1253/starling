@@ -61,3 +61,4 @@ cmake-build-*/
 # Distribution / release binaries and archives
 starling-serve*
 artifacts/
+*.tensors.json

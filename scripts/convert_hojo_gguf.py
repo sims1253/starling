@@ -4,7 +4,7 @@
 Hojo-ASR-V1 = Whisper-large-v3 mel -> Qwen3-Omni audio tower -> WeNet Conformer
 bottleneck -> LayerNorm -> Qwen3-4B decoder (beam-4). 5.19B params, Apache-2.0.
 
-Architecture (verified against hojo-asr-v1.tensors.json + the hojo_asr package):
+Architecture (verified against the hojo_asr package):
   - Mel: Whisper-large-v3 extractor, 128 mel, 16kHz, hop 160, n_fft 400.
   - Qwen3-Omni audio tower (`speech_encoder.*`, F32): 3x Conv2d downsample
     (k3/s2/p1, GELU between each) -> flatten freq -> conv_out Linear -> add
