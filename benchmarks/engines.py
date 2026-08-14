@@ -1449,6 +1449,48 @@ def _starling_ggml_higgs_keys() -> list[str]:
     return []
 
 
+STARLING_GGML_HOJO_MODEL = Path(os.environ.get(
+    "STARLING_GGML_HOJO_MODEL",
+    str(REPO_ROOT / "models" / "hojo-asr-v1.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlHojo(Engine):
+    """Starling's in-tree HojoAI/Hojo-ASR-V1 ggml engine (ctypes)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "hojo", supports_batch=False)
+        self._model = None
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_HOJO_MODEL.exists()
+        except Exception:
+            return False
+
+    def _load(self) -> None:
+        from starling._ggml import GgmlModel, HOJO
+        self._model = GgmlModel(HOJO, str(STARLING_GGML_HOJO_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
+
+
+def _starling_ggml_hojo_keys() -> list[str]:
+    if StarlingGgmlHojo().available:
+        return ["starling-ggml-hojo"]
+    return []
+
+
 class GgmlMoss(Engine):
     """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend.
 
@@ -1802,7 +1844,8 @@ def available_keys() -> list[str]:
             + _crispasr_keys() + _parakeet_cpp_keys()
             + _ggml_parakeet_keys() + _ggml_moss_keys()
             + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys()
-            + _starling_ggml_ark_keys() + _starling_ggml_higgs_keys())
+            + _starling_ggml_ark_keys() + _starling_ggml_higgs_keys()
+            + _starling_ggml_hojo_keys())
 
 
 def build_engines(
@@ -1852,6 +1895,8 @@ def build_engines(
                 chosen[mdl].append(StarlingGgmlArk())
             elif mdl == "higgs":
                 chosen[mdl].append(StarlingGgmlHiggs())
+            elif mdl == "hojo":
+                chosen[mdl].append(StarlingGgmlHojo())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

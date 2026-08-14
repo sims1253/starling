@@ -22,6 +22,7 @@
 #include "prompt.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
+#include "lib/embed_scatter.hpp"
 #include "ggml.h"
 
 #include <algorithm>
@@ -90,48 +91,11 @@ Prompt build_transcribe_prompt(const Config& c, const std::vector<int64_t>& chun
 
 bool build_inputs_embeds(const HiggsModel& m, const Prompt& p, const AudioEncoding& a,
                          InputsEmbeds& out, std::string& err) {
-    if (p.ids.size() != p.audio_mask.size()) { err = "invalid Higgs prompt mask"; return false; }
-    size_t slots = 0;
-    for (auto x : p.audio_mask) slots += x != 0;
-    if (a.width != (int64_t) m.config.llm.hidden || a.data.size() % (size_t) a.width != 0) {
-        err = "Higgs audio/prompt scatter size mismatch";
-        return false;
-    }
-    const int64_t avail = (int64_t)(a.data.size() / (size_t) a.width);
-    const int64_t sa = std::max<int64_t>(0, std::min(a.n_tokens, avail));
-    ensure_weights_realized(m.loader);
-    std::vector<int32_t> ids = p.ids;
-    std::vector<ggml_bf16_t> ah;
-    if (sa > 0) {
-        ah.resize((size_t) sa * (size_t) a.width);
-        for (size_t i = 0; i < ah.size(); ++i) ah[i] = ggml_fp32_to_bf16(a.data[i]);
-    }
     std::vector<float> emb;
-    bool ok = run_graph([&](ggml_context* c) {
-        int64_t ne[1] = {(int64_t) ids.size()};
-        auto* it = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, ids.data(),
-                                      ids.size() * sizeof(ids[0]));
-        return ggml_cast(c, ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), it),
-                         GGML_TYPE_F32);
-    }, emb);
-    if (!ok) { err = "Higgs embedding lookup failed"; return false; }
-    size_t row = 0;
-    for (size_t i = 0; i < p.ids.size(); ++i) {
-        if (!p.audio_mask[i]) continue;
-        for (size_t d = 0; d < (size_t) a.width; ++d) {
-            // row indexes into the (possibly truncated) feature stream. When the
-            // projector emits fewer features than audio slots (long audio, mel
-            // capped), the overflow slots must be ZEROED — matching HF
-            // merge_input_ids_with_audio_features (final_embedding zero-init then
-            // scatter), which overwrites the slot with a literal zero, NOT the
-            // embedded audio_placeholder_id value the lookup left there.
-            if (row < (size_t) sa)
-                emb[i * (size_t) a.width + d] = ggml_bf16_to_fp32(ah[row * (size_t) a.width + d]);
-            else
-                emb[i * (size_t) a.width + d] = 0.0f;
-        }
-        ++row;
-    }
+    if (!lib::embed_and_scatter_audio(m.loader, m.config.llm.hidden, p.ids,
+                                      p.audio_mask, a.data.data(), a.data.size(),
+                                      a.width, a.n_tokens, emb, "Higgs", err))
+        return false;
     out.data = std::move(emb);
     out.n_tokens = (int64_t) p.ids.size();
     out.width = m.config.llm.hidden;

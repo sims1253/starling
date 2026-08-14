@@ -359,6 +359,47 @@ def test_starling_ggml_higgs_text_parity(starling_ggml_higgs_engine, name: str) 
 
 
 # --------------------------------------------------------------------------- #
+# In-tree HojoAI/Hojo-ASR-V1 C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_hojo_available() -> bool:
+    try:
+        from engines import StarlingGgmlHojo
+        return StarlingGgmlHojo().available
+    except Exception:
+        return False
+
+@pytest.fixture(scope="module")
+def starling_ggml_hojo_engine():
+    if not _starling_ggml_hojo_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_HOJO_MODEL unavailable")
+    from engines import StarlingGgmlHojo
+    engine = StarlingGgmlHojo()
+    engine.load()
+    yield engine
+    engine.close()
+
+@pytest.mark.skipif(not _starling_ggml_hojo_available(),
+                    reason="in-tree libstarling_ggml or HOJO GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_hojo_text_parity(starling_ggml_hojo_engine, name: str) -> None:
+    """The in-tree C API returns the golden Hojo transcript.
+
+    Gates Starling's own mel -> Qwen3-Omni audio tower -> WeNet Conformer
+    bottleneck -> ln_speech -> Qwen3-4B decoder (beam-4, qk_norm) -> BPE
+    detokenizer pipeline for HojoAI/Hojo-ASR-V1 against the eager reference
+    captured by scripts/hojo_golden_components.py (golden/hojo_reference.json).
+    Asserts exact text parity with no tolerance.
+    """
+    golden = json.loads((GOLDEN / "hojo_reference.json").read_text())
+    golden_text = golden["fixtures"][name]["text"].rstrip()
+    out = starling_ggml_hojo_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree HOJO transcript mismatch on {name}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Wave G regression: MOSS K-step decode must not access the KV cache / RoPE
 # tables past max_cache when a block's remaining token budget < K.
 # --------------------------------------------------------------------------- #

@@ -21,6 +21,7 @@ Example::
 from ._native import (
     ARK,
     HIGGS,
+    HOJO,
     MOSS,
     PARAKEET_TDT,
     GgmlModel,
@@ -31,6 +32,7 @@ from ._native import (
 __all__ = [
     "ARK",
     "HIGGS",
+    "HOJO",
     "MOSS",
     "PARAKEET_TDT",
     "GgmlModel",

@@ -1,5 +1,5 @@
 // capi_higgs.cpp — higgs-audio-v3-stt C API entry points behind the shared shell.
-// Mirrors capi_ark.cpp: load -> mel -> encode+project -> prompt+embeds -> greedy
+// C API flow: load -> mel -> encode+project -> prompt/embeds -> greedy
 // decode -> detokenize, with a STARLING_HIGGS_TIMING phase-timing gate.
 #include "loader.hpp"
 #include "mel.hpp"
@@ -181,7 +181,12 @@ char* starling_ggml_higgs_decode(void* handle, const float* pcm, int64_t n,
         c->err = e.what();
         report(err_out, c->err);
     } catch (...) {
-        report(err_out, "unknown exception transcribing Higgs audio");
+        // Copy into the context's owned error string: report() stores
+        // message.c_str() into *err_out, and a string literal passed by const
+        // reference materializes a temporary std::string whose buffer dangles
+        // once the call returns (unlike report_load_error, report does not copy).
+        c->err = "unknown exception transcribing Higgs audio";
+        report(err_out, c->err);
     }
     return nullptr;
 }

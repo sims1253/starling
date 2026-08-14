@@ -1,16 +1,15 @@
 #pragma once
 #include "loader.hpp"
-#include <cstdint>
-#include <string>
-#include <unordered_map>
-#include <vector>
+#include "lib/bpe_tokenizer.hpp"
 namespace starling::ggml::moss {
-class Tokenizer {
+// Qwen BPE byte-decoder: thin adapter over the shared lib::BpeTokenizer.
+class Tokenizer : public lib::BpeTokenizer {
  public:
-  bool load(const ModelLoader&,const Config&,std::string& err);
-  std::string decode(const std::vector<int32_t>&,bool skip_special_tokens=true) const;
- private:
-  std::vector<std::string> tokens_; std::vector<int64_t> types_;
-  std::unordered_map<uint32_t,uint8_t> byte_decoder_;
+  bool load(const ModelLoader& m, const Config&, std::string& e) {
+      return lib::BpeTokenizer::load(m, e);
+  }
+  std::string decode(const std::vector<int32_t>& ids, bool skip_special_tokens = true) const {
+      return lib::BpeTokenizer::decode(ids, skip_special_tokens);
+  }
 };
 }

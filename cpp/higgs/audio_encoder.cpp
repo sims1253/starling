@@ -31,6 +31,7 @@
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
 #include "runtime/lru_cache.hpp"
+#include "lib/graph_helpers.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
@@ -47,43 +48,31 @@
 namespace starling::ggml::higgs {
 namespace {
 
-ggml_tensor* weight(ggml_context* c, const ModelLoader& ml, const std::string& n) {
-    return clone_weight(c, ml, n.c_str());
-}
-ggml_tensor* bf16(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_BF16 ? x : ggml_cast(c, x, GGML_TYPE_BF16);
-}
-ggml_tensor* f32(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
-// nn.Linear in the BF16 oracle: GEMM (+ optional bias) exposes F32, round at the
-// BF16 boundary.
+// Shared graph-builder helpers (lib/graph_helpers.hpp); the audio encoder is
+// bf16-oracle discipline.
+using lib::weight;
+using lib::bf16;
+using lib::f32;
 ggml_tensor* linear(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                     const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), bf16(c, x));
-    if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
-    return bf16(c, y);
+    return lib::linear_bf16(c, ml, x, n, bias);
 }
 // exact GELU (erf), the activation_fn for both conv front-end and FFN
 // (config.activation_function="gelu", approximate="none").
 ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
-    return bf16(c, ggml_gelu_erf(c, f32(c, x)));
+    return lib::gelu_erf_bf16(c, x);
 }
 ggml_tensor* add_bf16(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf16(c, ggml_add(c, f32(c, a), f32(c, b)));
+    return lib::addb(c, a, b);
 }
 // PyTorch LayerNorm: F32 reduction + affine, one BF16 store. eps from config.
 ggml_tensor* layer_norm(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                         const std::string& n, float eps) {
-    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
-    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
-    return bf16(c, y);
+    return lib::layer_norm_bf16(c, ml, x, n, eps);
 }
 
 bool debug_enabled() {
-    const char* p = std::getenv("STARLING_HIGGS_DEBUG");
-    return p && std::strcmp(p, "1") == 0;
+    return lib::debug_enabled("STARLING_HIGGS_DEBUG");
 }
 
 // Global bidirectional self-attention (WhisperSdpaAttention, absolute positional
@@ -96,7 +85,8 @@ bool debug_enabled() {
 //    [T,T,H] score tensor is never materialized). Higgs is plain MHA
 //    (n_head == n_head_kv == H) and bidirectional -> mask = nullptr.
 //  - CPU / byte-exact fallback: the original materialized mul_mat+softmax path,
-//    selected via STARLING_HIGGS_NO_FATTN=1 (or non-GPU). Mirrors ark's dual-path.
+//    selected via STARLING_HIGGS_NO_FATTN=1 (or non-GPU). Both paths must stay
+    // byte-identical.
 ggml_tensor* global_attention(ggml_context* ctx, const HiggsModel& model,
                               ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
                               int64_t T) {
@@ -286,8 +276,7 @@ ggml_tensor* build_projector(ggml_context* ctx, const HiggsModel& model,
 // values under CUDA-graph capture in the ark port (docs/ggml-ark-port-status.md);
 // the depthwise conv + avg_pool have not been validated under capture either, so
 // the CPU / debug path runs them as host scalar loops (byte-exact vs torch) and
-// only the encoder layers + projector linears run as graphs. Mirrors ark's
-// host_conv1d_gelu.
+// only the encoder layers + projector linears run as graphs.
 // ---------------------------------------------------------------------------
 
 std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name) {
@@ -353,26 +342,11 @@ std::vector<float> host_conv1d(const ModelLoader& ml, const std::vector<float>& 
 }
 } // namespace
 
-// Host-side AvgPool1d(k=2, s=2, p=0) over the time axis. `in` is [C, L]
-// feat-major; returns [C, floor((L-2)/2)+1] feat-major.
-namespace {
-std::vector<float> host_avg_pool1d(const std::vector<float>& in, int64_t C, int64_t L) {
-    const int64_t k = 2, s = 2, p = 0;
-    const int64_t OL = (L + 2 * p - k) / s + 1;
-    std::vector<float> y((size_t) C * OL, 0.0f);
-    for (int64_t c = 0; c < C; ++c)
-        for (int64_t t = 0; t < OL; ++t)
-            y[(size_t) c * OL + t] = 0.5f * (in[(size_t) c * L + (t * s)] +
-                                             in[(size_t) c * L + (t * s) + 1]);
-    return y;
-}
-} // namespace
-
 // ---------------------------------------------------------------------------
 // Fused conv + encode + avg_pool + ln_post + project with a per-mel_T bounded-LRU
 // ReplayGraph cache (GPU). The full Whisper Conv1d front-end + avg_pool + depthwise
 // conv run IN-GRAPH on GPU; on CPU / debug they run as the host scalar fallbacks.
-// Keyed on mel_T. Mirrors ark's encode_audio_and_adapt + bounded LruCache.
+// Keyed on mel_T (the cache is LRU-bounded; eviction frees the device buffer).
 // ---------------------------------------------------------------------------
 struct EncoderReplayEntry {
     int64_t mel_T = 0, T_enc = 0, T_avg = 0, T_proj = 0;

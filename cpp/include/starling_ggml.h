@@ -25,7 +25,8 @@ extern "C" {
 // load on mismatch. History:
 //   1 — initial (Phase 0): abi + version + shutdown only.
 //   2 — added STARLING_GGML_HIGGS (bosonai/higgs-audio-v3-stt).
-#define STARLING_GGML_ABI_VERSION 2
+//   3 — added STARLING_GGML_HOJO (HojoAI/Hojo-ASR-V1).
+#define STARLING_GGML_ABI_VERSION 3
 
 // ABI / build introspection --------------------------------------------------
 
@@ -45,6 +46,7 @@ typedef enum {
     STARLING_GGML_MOSS         = 2,  // MOSS-Transcribe-preview-2B
     STARLING_GGML_ARK          = 3,  // AutoArk-AI/ARK-ASR-3B
     STARLING_GGML_HIGGS        = 4,  // bosonai/higgs-audio-v3-stt
+    STARLING_GGML_HOJO         = 5,  // HojoAI/Hojo-ASR-V1
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------

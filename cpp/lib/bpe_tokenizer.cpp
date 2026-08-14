@@ -1,10 +1,7 @@
-// tokenizer.cpp — Qwen3 BPE byte-decoder (identical scheme to moss/ark; higgs's
-// tokenizer is a standard Qwen3 tokenizer stored in the GGUF). Verbatim copy of
-// ark/tokenizer.cpp with the namespace renamed; the GPT-2 byte-to-unicode inverse
-// map is model-agnostic.
-#include "tokenizer.hpp"
+// bpe_tokenizer.cpp — GPT-2/Qwen BPE byte-decoder (see bpe_tokenizer.hpp).
+#include "bpe_tokenizer.hpp"
 #include <algorithm>
-namespace starling::ggml::higgs {
+namespace starling::ggml::lib {
 namespace {
 std::vector<uint32_t> cps(const std::string& s) {
     std::vector<uint32_t> o;
@@ -63,7 +60,8 @@ std::string valid_utf8(const std::string& b) {
     return o;
 }
 } // namespace
-bool Tokenizer::load(const ModelLoader& m, const Config&, std::string& e) {
+
+bool BpeTokenizer::load(const ModelLoader& m, std::string& e) {
     std::string model;
     if (!m.kv_str("tokenizer.ggml.model", model) || model != "gpt2" ||
         !m.kv_arr_str("tokenizer.ggml.tokens", tokens_)) {
@@ -86,7 +84,8 @@ bool Tokenizer::load(const ModelLoader& m, const Config&, std::string& e) {
     for (size_t i = 0; i < b.size(); ++i) byte_decoder_[(uint32_t) cs[i]] = (uint8_t) b[i];
     return true;
 }
-std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip) const {
+
+std::string BpeTokenizer::decode(const std::vector<int32_t>& ids, bool skip) const {
     std::string bytes;
     for (int32_t id : ids) {
         if (id < 0 || (size_t) id >= tokens_.size()) continue;
@@ -99,4 +98,4 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids, bool skip) const 
     }
     return valid_utf8(bytes);
 }
-} // namespace starling::ggml::higgs
+} // namespace starling::ggml::lib

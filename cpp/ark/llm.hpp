@@ -1,25 +1,23 @@
 #pragma once
 #include "prompt.hpp"
+#include "lib/qwen_decode.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
 namespace starling::ggml::ark {
-struct LayerKvCache { std::vector<ggml_bf16_t> k, v; };
-struct LlmState { std::vector<LayerKvCache> layers; int64_t length = 0; };
-struct PrefillResult { std::vector<float> logits; int32_t first_token = -1; LlmState state; };
+using LayerKvCache = lib::LayerKvCache;
+using LlmState = lib::LlmState;
+using PrefillResult = lib::PrefillResult;
+using GenerateResult = lib::GenerateResult;
+// Defaults are model-specific (max_cache_len 4096 for ark).
 struct GenerateOptions {
     int32_t max_new_tokens = 200, max_cache_len = 4096, eos_token_id = 151645;
-};
-struct GenerateResult {
-    std::vector<int32_t> ids;
-    bool hit_eos = false;
-    std::vector<float> prefill_logits;
 };
 bool llm_prefill(const ArkModel&, const InputsEmbeds&, int32_t max_cache_len,
                  PrefillResult&, std::string&);
 bool greedy_generate(const ArkModel&, const InputsEmbeds&, const GenerateOptions&,
                      GenerateResult&, std::string&);
-// Current number of cached per-S prefill graphs (diagnostic + regression-test
-// hook). Zero on CPU / before first GPU prefill.
+// Current number of cached per-S prefill graphs (diagnostic + the
+// bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
 size_t prefill_replay_cache_size();
-} // namespace starling::ggml::ark
+}

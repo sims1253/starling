@@ -29,7 +29,7 @@ from pathlib import Path
 
 # The ABI version this binding expects. Bumped in lockstep with
 # STARLING_GGML_ABI_VERSION in cpp/include/starling_ggml.h.
-_EXPECTED_ABI_VERSION = 2
+_EXPECTED_ABI_VERSION = 3
 
 
 def _candidate_lib_paths() -> list[Path]:
@@ -139,6 +139,7 @@ PARAKEET_TDT = 1
 MOSS = 2
 ARK = 3
 HIGGS = 4
+HOJO = 5
 
 
 class GgmlModel:

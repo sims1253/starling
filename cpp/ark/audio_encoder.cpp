@@ -7,14 +7,14 @@
 // merge-by-4 -> Linear(5120->4096) GELU Linear(4096->2048)).
 //
 // On GPU this is ONE captured ReplayGraph keyed on the (post-conv) encoder
-// length T_enc (global attention => one graph per T_enc, LRU-bounded). On CPU /
-// debug it is the one-shot pair. Mirrors moss/audio_encoder.cpp's fused
-// encode+adapt + bounded LruCache.
+// length T_enc (global attention => one graph per T_enc; the cache is
+// LRU-bounded). On CPU / debug it is the one-shot pair.
 #include "audio_encoder.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
 #include "runtime/lru_cache.hpp"
+#include "lib/graph_helpers.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
@@ -31,30 +31,22 @@
 namespace starling::ggml::ark {
 namespace {
 
-ggml_tensor* weight(ggml_context* c, const ModelLoader& ml, const std::string& n) {
-    return clone_weight(c, ml, n.c_str());
-}
-ggml_tensor* bf16(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_BF16 ? x : ggml_cast(c, x, GGML_TYPE_BF16);
-}
-ggml_tensor* f32(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
-// nn.Linear in the BF16 oracle: GEMM (+ optional bias) exposes F32, round at the
-// BF16 boundary.
+// Shared graph-builder helpers (lib/graph_helpers.hpp); the audio encoder is
+// bf16-oracle discipline.
+using lib::weight;
+using lib::bf16;
+using lib::f32;
 ggml_tensor* linear(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                     const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), bf16(c, x));
-    if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
-    return bf16(c, y);
+    return lib::linear_bf16(c, ml, x, n, bias);
 }
 // exact GELU (erf), the modeling_audio activation_fn for both conv front-end and
 // adapter (config.activation_function="gelu", approximate="none").
 ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
-    return bf16(c, ggml_gelu_erf(c, f32(c, x)));
+    return lib::gelu_erf_bf16(c, x);
 }
 ggml_tensor* add_bf16(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf16(c, ggml_add(c, f32(c, a), f32(c, b)));
+    return lib::addb(c, a, b);
 }
 // PyTorch LayerNorm: F32 reduction + affine, one BF16 store. eps from config.
 // (ggml_norm and an explicit mean/var/div formulation gave byte-identical output;
@@ -62,15 +54,11 @@ ggml_tensor* add_bf16(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
 // scrambled on the device in this ggml build, see docs/ggml-ark-port-status.md.)
 ggml_tensor* layer_norm(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                         const std::string& n, float eps) {
-    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
-    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
-    return bf16(c, y);
+    return lib::layer_norm_bf16(c, ml, x, n, eps);
 }
 
 bool debug_enabled() {
-    const char* p = std::getenv("STARLING_ARK_DEBUG");
-    return p && std::strcmp(p, "1") == 0;
+    return lib::debug_enabled("STARLING_ARK_DEBUG");
 }
 
 // Apply RoPE to q/k for global self-attention. The HF path (modeling_audio)
@@ -311,7 +299,7 @@ ggml_tensor* build_adapter(ggml_context* ctx, const ArkModel& model,
 // ggml_conv_1d with F32 inputs) instead of as a host scalar loop, so the
 // encoder graph takes the mel as its varying input and runs conv1/gelu/conv2/
 // gelu/layers/adapter end-to-end. Keyed on mel_T (conv1's internal sizes depend
-// on mel_T directly, not just T_enc). Mirrors moss's encode_audio_and_adapt.
+// on mel_T directly, not just T_enc; the cache is LRU-bounded).
 // ---------------------------------------------------------------------------
 struct EncoderReplayEntry {
     int64_t mel_T = 0, T_enc = 0, N = 0;
@@ -327,7 +315,7 @@ struct EncoderReplayEntry {
 // encoder cost (~1-2%), and the bf16 boundary (mel is bf16, the layer input is
 // bf16) is preserved by the f32->bf16 round at the end. `in` is [IC, L] bf16
 // (feat-major); weight is [OC, IC, K] (HF order); returns [OC, OL] f32.
-// Mirrors the validated numpy im2col (verified bit-exact vs torch.nn.functional.conv1d).
+// im2col must match torch.nn.functional.conv1d bit-exactly.
 std::vector<float> read_bf16_to_f32(const ModelLoader& ml, const char* name) {
     ggml_tensor* t = ml.tensor(name);
     if (!t) return {};

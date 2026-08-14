@@ -1,26 +1,13 @@
 #include "loader.hpp"
+#include "lib/loader_kit.hpp"
 #include <cstdio>
 #include <vector>
 
 namespace starling::ggml::higgs {
 namespace {
-uint32_t u32(const ModelLoader& m, const char* k, uint32_t d) {
-    int64_t v;
-    return m.kv_int(k, v) ? (uint32_t) v : d;
-}
-float f32(const ModelLoader& m, const char* k, float d) {
-    double v;
-    return m.kv_float(k, v) ? (float) v : d;
-}
-std::string str(const ModelLoader& m, const char* k, const char* d) {
-    std::string v;
-    return m.kv_str(k, v) ? v : d;
-}
-bool require(const ModelLoader& m, const std::string& n, std::string& err) {
-    if (m.tensor(n.c_str())) return true;
-    err = "Higgs GGUF missing required tensor: " + n;
-    return false;
-}
+// GGUF-metadata helpers shared across the engines (lib/loader_kit.hpp).
+using lib::f32;
+using lib::str;
 } // namespace
 
 int64_t audio_token_count(int64_t mel_frames) {
@@ -39,7 +26,7 @@ bool HiggsModel::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
-#define U(field, key) field = u32(m, "higgs." key, field)
+#define U(field, key) do { if (!lib::u32(m, "higgs." key, field, field, err)) return false; } while (0)
 #define F(field, key) field = f32(m, "higgs." key, field)
     // Frontend.
     U(c.frontend.sample_rate, "frontend.sample_rate");
@@ -101,13 +88,18 @@ bool HiggsModel::load(const char* path, std::string& err) {
         if (m.kv_int("higgs.llm.has_qk_norm", qn)) c.llm.has_qk_norm = qn != 0;
     }
     // Token ids + generation.
-    c.audio_placeholder_id = (int32_t) u32(m, "higgs.audio_placeholder_id", c.audio_placeholder_id);
-    c.audio_bos_id = (int32_t) u32(m, "higgs.audio_bos_id", c.audio_bos_id);
-    c.audio_eos_id = (int32_t) u32(m, "higgs.audio_eos_id", c.audio_eos_id);
-    c.im_start_id = (int32_t) u32(m, "higgs.im_start_id", c.im_start_id);
-    c.im_end_id = (int32_t) u32(m, "higgs.im_end_id", c.im_end_id);
-    c.pad_token_id = (int32_t) u32(m, "higgs.pad_token_id", c.pad_token_id);
-    c.eos_token_id = (int32_t) u32(m, "higgs.eos_token_id", c.eos_token_id);
+    {
+        uint32_t t;
+#define T(field, key) do { if (!lib::u32(m, "higgs." key, (uint32_t) field, t, err)) return false; field = (int32_t) t; } while (0)
+        T(c.audio_placeholder_id, "audio_placeholder_id");
+        T(c.audio_bos_id, "audio_bos_id");
+        T(c.audio_eos_id, "audio_eos_id");
+        T(c.im_start_id, "im_start_id");
+        T(c.im_end_id, "im_end_id");
+        T(c.pad_token_id, "pad_token_id");
+        T(c.eos_token_id, "eos_token_id");
+#undef T
+    }
     U(c.max_new_tokens, "max_new_tokens");
     c.default_instruction = str(m, "higgs.default_instruction", c.default_instruction.c_str());
 #undef U
@@ -124,39 +116,28 @@ bool HiggsModel::load(const char* path, std::string& err) {
         for (auto v : a) c.prompt_suffix.push_back((int32_t) v);
     }
 
-    // --- Validate untrusted GGUF metadata (mirror ark/loader.cpp). The
+    // --- Validate untrusted GGUF metadata (lib/loader_kit.hpp). The
     // consumers divide by these (encoder head grouping; llm head grouping
     // h / (n_heads/n_kv_heads)), so a zero or inconsistent value is div-by-zero.
-    if (std::string arch; m.kv_str("general.architecture", arch) && arch != "higgs") {
-        err = "unsupported Higgs GGUF architecture: " + arch;
+    if (!lib::check_gguf_header(m, "higgs", "Higgs", {"bf16_exact", "f16"}, err))
         return false;
-    }
-    if (std::string prof; m.kv_str("starling.numeric_profile", prof) &&
-        prof != "bf16_exact" && prof != "f16") {
-        err = "unsupported Higgs numeric profile: " + prof;
-        return false;
-    }
-    if (int64_t fv; m.kv_int("starling.format_version", fv) && fv != 1) {
-        err = "unsupported Starling GGUF format version: " + std::to_string(fv);
-        return false;
-    }
-    if (m.tensor_names().empty()) {
-        err = "Higgs GGUF contains no tensors";
-        return false;
-    }
 #define POS(v, name) do { if (!(v)) { err = "Higgs GGUF " name " must be positive"; return false; } } while (0)
     POS(c.encoder.n_layers, "enc.encoder_layers");
     POS(c.encoder.d_model, "enc.d_model");
     POS(c.encoder.n_heads, "enc.encoder_attention_heads");
     POS(c.encoder.head_dim, "enc.head_dim");
     POS(c.encoder.ffn_dim, "enc.encoder_ffn_dim");
+    POS(c.encoder.max_source_positions, "enc.max_source_positions");
+    POS(c.frontend.n_samples, "frontend.n_samples");
     POS(c.projector.input_size, "proj.input_size");
     POS(c.projector.output_size, "proj.output_size");
     POS(c.llm.hidden, "llm.hidden_size");
+    POS(c.llm.n_layers, "llm.num_layers");
     POS(c.llm.n_heads, "llm.num_heads");
     POS(c.llm.n_kv_heads, "llm.num_kv_heads");
     POS(c.llm.head_dim, "llm.head_dim");
     POS(c.llm.intermediate, "llm.intermediate_size");
+    POS(c.llm.max_cache, "llm.max_cache_len");
     POS(c.llm.vocab, "llm.vocab_size");
 #undef POS
     if (c.encoder.d_model != c.encoder.n_heads * c.encoder.head_dim) {
@@ -176,6 +157,25 @@ bool HiggsModel::load(const char* path, std::string& err) {
         err = "unsupported Higgs frontend metadata (requires n_fft/win=400, hop=160, n_mels=128)";
         return false;
     }
+    // The mel front-end emits at most ceil(n_samples / hop_length) frames
+    // (compute_log_mel truncates the waveform to n_samples), and conv2 (K3,s2,p1)
+    // halves that to an encoder extent of (T+1)/2 — the number of absolute
+    // positional embedding rows the encoder indexes. Reject metadata whose
+    // worst-case extent overruns enc.max_source_positions before decoding
+    // reads past the end of the positional_emb table.
+    {
+        const int64_t mel_cap = ((int64_t) c.frontend.n_samples +
+                                 (int64_t) c.frontend.hop_length - 1) /
+                                (int64_t) c.frontend.hop_length;
+        const int64_t enc_cap = (mel_cap + 1) / 2;
+        if (enc_cap > (int64_t) c.encoder.max_source_positions) {
+            err = "Higgs GGUF encoder time extent " + std::to_string(enc_cap) +
+                  " (from frontend.n_samples=" + std::to_string(c.frontend.n_samples) +
+                  ") exceeds enc.max_source_positions " +
+                  std::to_string(c.encoder.max_source_positions);
+            return false;
+        }
+    }
 
     // Require every expected tensor so a structural change fails loudly.
     for (const char* n : {"audio.mel_filters", "audio.mel_window", "enc.conv1.weight",
@@ -185,7 +185,7 @@ bool HiggsModel::load(const char* path, std::string& err) {
                           "proj.linear1.weight", "proj.linear1.bias",
                           "proj.linear2.weight", "proj.linear2.bias",
                           "llm.embed.weight", "llm.lm_head.weight"})
-        if (!require(m, n, err)) return false;
+        if (!lib::require(m, n, "Higgs", err)) return false;
     // Encoder layers: attn_norm(w+b), attn.q(w+b), attn.k(w), attn.v(w+b),
     // attn.o(w+b), ffn_norm(w+b), ffn.fc1(w+b), ffn.fc2(w+b) = 15 each. q/v/o HAVE
     // bias, k has NO bias (Whisper WhisperAttention convention).
@@ -197,7 +197,7 @@ bool HiggsModel::load(const char* path, std::string& err) {
                                  "ffn_norm.weight", "ffn_norm.bias", "ffn.fc1.weight",
                                  "ffn.fc1.bias", "ffn.fc2.weight", "ffn.fc2.bias"}) {
             std::snprintf(n, sizeof n, "enc.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "Higgs", err)) return false;
         }
     }
     // LLM layers: attn_norm(w), attn.q(w), attn.k(w), attn.v(w), attn.o(w),
@@ -210,9 +210,9 @@ bool HiggsModel::load(const char* path, std::string& err) {
                                  "attn.k_norm.weight", "ffn_norm.weight", "ffn.gate.weight",
                                  "ffn.up.weight", "ffn.down.weight"}) {
             std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "Higgs", err)) return false;
         }
     }
-    return require(m, "llm.final_norm.weight", err);
+    return lib::require(m, "llm.final_norm.weight", "Higgs", err);
 }
 } // namespace starling::ggml::higgs
