@@ -19,6 +19,22 @@ struct TowerOutput {
     std::vector<int64_t> per_window_frames;
 };
 
+// Host-side conv2d stack weights (conv2d1..3 weight + bias, f32). Read once
+// per tower call and shared across windows; exposed so the CPU-only
+// parity/perf test can drive host_conv2d_stack directly without a backend.
+struct ConvStackWeights {
+    std::vector<float> w[3], b[3];  // conv2d1..3: weight [OC,IC,3,3], bias [OC]
+};
+
+// 3 stride-2 conv2d + exact-erf GELU between them, host-side (f32 math, double
+// accumulation, multithreaded over output channels — each output element keeps
+// the serial accumulation order, so it is bit-identical to the single-threaded
+// form). mel_win is one window's mel [win, n_mels] time-major; returns
+// [out_T, conv_width] c-outer, f-inner per time step.
+std::vector<float> host_conv2d_stack(const ConvStackWeights& cw,
+                                     const std::vector<float>& mel_win,
+                                     int64_t win, int64_t n_mels);
+
 // Run the Qwen3-Omni audio tower over a single utterance's mel:
 //   mel reshape -> 3x Conv2d downsample (GELU between) over windows of
 //   tc.n_window*2 = 3000 frames (conv_chunksize controls the conv batching, not

@@ -1,27 +1,14 @@
 #include "loader.hpp"
+#include "lib/loader_kit.hpp"
 #include <cstdio>
 #include <string>
 #include <vector>
 
 namespace starling::ggml::hojo {
 namespace {
-uint32_t u32(const ModelLoader& m, const char* k, uint32_t d) {
-    int64_t v;
-    return m.kv_int(k, v) ? (uint32_t) v : d;
-}
-double f64(const ModelLoader& m, const char* k, double d) {
-    double v;
-    return m.kv_float(k, v) ? v : d;
-}
-std::string str(const ModelLoader& m, const char* k, const char* d) {
-    std::string v;
-    return m.kv_str(k, v) ? v : d;
-}
-bool require(const ModelLoader& m, const std::string& n, std::string& err) {
-    if (m.tensor(n.c_str())) return true;
-    err = "Hojo GGUF missing required tensor: " + n;
-    return false;
-}
+// GGUF-metadata helpers shared across the engines (lib/loader_kit.hpp).
+using lib::f64;
+using lib::str;
 } // namespace
 
 // Tower conv output length for one mel window: three stride-2 conv2d, each
@@ -39,7 +26,7 @@ bool HojoModel::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
-#define U(field, key) field = u32(m, "hojo." key, field)
+#define U(field, key) do { if (!lib::u32(m, "hojo." key, field, field, err)) return false; } while (0)
 #define D(field, key) field = f64(m, "hojo." key, field)
     // Frontend.
     U(c.frontend.sample_rate, "frontend.sample_rate");
@@ -136,7 +123,9 @@ bool HojoModel::load(const char* path, std::string& err) {
         int64_t mnt = 0;
         if (m.kv_int("hojo.decode.max_new_tokens", mnt) ||
             m.kv_int("hojo.max_new_tokens", mnt)) {
-            c.decode.max_new_tokens = (uint32_t) mnt;
+            uint32_t t;
+            if (!lib::u32(m, "hojo.decode.max_new_tokens", 0, t, err)) return false;
+            c.decode.max_new_tokens = t;
         }
     }
     D(c.decode.repetition_penalty, "decode.repetition_penalty");
@@ -148,30 +137,21 @@ bool HojoModel::load(const char* path, std::string& err) {
         if (m.kv_int("hojo.decode.do_sample", ds)) c.decode.do_sample = ds != 0;
     }
     // Token ids.
-    c.bos_token_id = (int32_t) u32(m, "hojo.bos_token_id", c.bos_token_id);
-    c.eos_token_id = (int32_t) u32(m, "hojo.eos_token_id", c.eos_token_id);
-    c.pad_token_id = (int32_t) u32(m, "hojo.pad_token_id", c.pad_token_id);
+    {
+        uint32_t t;
+#define T(field, key) do { if (!lib::u32(m, "hojo." key, (uint32_t) field, t, err)) return false; field = (int32_t) t; } while (0)
+        T(c.bos_token_id, "bos_token_id");
+        T(c.eos_token_id, "eos_token_id");
+        T(c.pad_token_id, "pad_token_id");
+#undef T
+    }
 #undef U
 #undef D
 
-    // --- Validate untrusted GGUF metadata (mirror higgs/loader.cpp). ---
-    if (std::string arch; m.kv_str("general.architecture", arch) && arch != "hojo") {
-        err = "unsupported Hojo GGUF architecture: " + arch;
+    // --- Validate untrusted GGUF metadata (lib/loader_kit.hpp). ---
+    if (!lib::check_gguf_header(m, "hojo", "Hojo",
+                                {"mixed_f32_bf16_exact", "bf16_exact", "f16"}, err))
         return false;
-    }
-    if (std::string prof; m.kv_str("starling.numeric_profile", prof) &&
-        prof != "mixed_f32_bf16_exact" && prof != "bf16_exact" && prof != "f16") {
-        err = "unsupported Hojo numeric profile: " + prof;
-        return false;
-    }
-    if (int64_t fv; m.kv_int("starling.format_version", fv) && fv != 1) {
-        err = "unsupported Starling GGUF format version: " + std::to_string(fv);
-        return false;
-    }
-    if (m.tensor_names().empty()) {
-        err = "Hojo GGUF contains no tensors";
-        return false;
-    }
 #define POS(v, name) do { if (!(v)) { err = "Hojo GGUF " name " must be positive"; return false; } } while (0)
     POS(c.tower.d_model, "tower.d_model");
     POS(c.tower.encoder_layers, "tower.encoder_layers");
@@ -226,7 +206,7 @@ bool HojoModel::load(const char* path, std::string& err) {
                           "bottleneck.after_norm.weight", "bottleneck.after_norm.bias",
                           "ln_speech.weight", "ln_speech.bias",
                           "llm.embed.weight", "llm.lm_head.weight", "llm.final_norm.weight"})
-        if (!require(m, n, err)) return false;
+        if (!lib::require(m, n, "Hojo", err)) return false;
     // Tower layers: attn_norm(w+b), attn.q/k/v/o (w+b), ffn_norm(w+b), ffn.fc1/fc2
     // (w+b) = 16 each.
     for (uint32_t i = 0; i < c.tower.encoder_layers; ++i) {
@@ -240,7 +220,7 @@ bool HojoModel::load(const char* path, std::string& err) {
                                  "ffn.fc1.weight", "ffn.fc1.bias",
                                  "ffn.fc2.weight", "ffn.fc2.bias"}) {
             std::snprintf(n, sizeof n, "audio.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "Hojo", err)) return false;
         }
     }
     // Bottleneck layers: norm_mha/ff/ff_macaron/conv/final (w+b) = 5*2, mha
@@ -272,7 +252,7 @@ bool HojoModel::load(const char* path, std::string& err) {
                                  "conv.norm.running_mean", "conv.norm.running_var",
                                  "conv.norm.num_batches_tracked"}) {
             std::snprintf(n, sizeof n, "bottleneck.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "Hojo", err)) return false;
         }
     }
     // LLM layers: attn_norm(w), attn.q/k/v/o(w), attn.q_norm/k_norm(w),
@@ -284,7 +264,7 @@ bool HojoModel::load(const char* path, std::string& err) {
                                  "attn.k_norm.weight", "ffn_norm.weight", "ffn.gate.weight",
                                  "ffn.up.weight", "ffn.down.weight"}) {
             std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "Hojo", err)) return false;
         }
     }
     return true;

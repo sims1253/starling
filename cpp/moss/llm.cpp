@@ -13,6 +13,9 @@
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
 #include "runtime/lru_cache.hpp"
+#include "lib/graph_helpers.hpp"
+#include "lib/device_cache.hpp"
+#include "lib/mask_rope.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -39,36 +42,24 @@ namespace {
 // stay bit-exact with the golden path.
 // ---------------------------------------------------------------------------
 
-ggml_tensor* bf(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_BF16 ? x : ggml_cast(c, x, GGML_TYPE_BF16);
-}
-ggml_tensor* ff(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
+// Small tensor helpers shared with the other engines (lib/graph_helpers.hpp).
+using lib::bf;
+using lib::ff;
+using lib::addb;
+using lib::mulb;
+using lib::tobf;
+using lib::argmax_low;
 ggml_tensor* wb(ggml_context* c, const MossModel& m, const std::string& n) {
-    return clone_weight(c, m.loader, n.c_str());
+    return lib::wb(c, m.loader, n);
 }
 // Linear: y = W x, result bf16.
 ggml_tensor* lin(ggml_context* c, const MossModel& m, ggml_tensor* x, const std::string& n) {
-    return bf(c, ggml_mul_mat(c, wb(c, m, n), bf(c, x)));
-}
-ggml_tensor* addb(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf(c, ggml_add(c, ff(c, a), ff(c, b)));
-}
-ggml_tensor* mulb(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf(c, ggml_mul(c, ff(c, a), ff(c, b)));
+    return lib::lin(c, m.loader, x, n);
 }
 // RMSNorm in f32, then scale by the (bf16) weight.
-ggml_tensor* rms(ggml_context* c, const MossModel& m, ggml_tensor* x, const std::string& n, float eps) {
-    ggml_tensor* y = ggml_rms_norm(c, ff(c, x), eps);
-    y = bf(c, y);
-    return mulb(c, y, bf(c, wb(c, m, n)));
-}
-
-std::vector<ggml_bf16_t> tobf(const std::vector<float>& x) {
-    std::vector<ggml_bf16_t> r(x.size());
-    for (size_t i = 0; i < x.size(); ++i) r[i] = ggml_fp32_to_bf16(x[i]);
-    return r;
+ggml_tensor* rms(ggml_context* c, const MossModel& m, ggml_tensor* x, const std::string& n,
+                 float eps) {
+    return lib::rms(c, m.loader, x, n, eps);
 }
 
 // Append `add` new rows of k/v (src layout [heads, add, D] f32) to the cache
@@ -88,12 +79,6 @@ void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
     dst.swap(out);
 }
 
-int32_t argmax_low(const std::vector<float>& x) {
-    int32_t best = 0;
-    for (int32_t i = 1; i < (int32_t)x.size(); ++i)
-        if (x[i] > x[best]) best = i;
-    return best;
-}
 
 // ---------------------------------------------------------------------------
 // Staged layer-0 parity probe.
@@ -392,82 +377,8 @@ bool debug_probe_active() {
 // tensors live in a persistent ggml_context allocated on the backend buffer;
 // graphs reference them (and the RoPE tables) as fixed leaves. Freed by the
 // registered decode-cache-clearer BEFORE backend teardown.
-struct DeviceCache {
-    ggml_context* ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    std::vector<ggml_tensor*> k, v;    // [n_layers], each [D, max_cache, KV] bf16
-    ggml_tensor* rope_cos = nullptr;  // [D, max_pos] bf16
-    ggml_tensor* rope_sin = nullptr;  // [D, max_pos] bf16
-    int max_cache = 0, max_pos = 0;
-    int n_layers = 0, D = 0, KV = 0;
-
-    bool init(const LlmConfig& lc, ggml_backend_t backend, std::string& e);
-    void zero(ggml_backend_t backend);
-    ~DeviceCache() {
-        if (shutting_down()) return;  // driver gone -> leak (fine at exit)
-        if (buf) ggml_backend_buffer_free(buf);
-        if (ctx) ggml_free(ctx);
-    }
-};
-
-bool DeviceCache::init(const LlmConfig& lc, ggml_backend_t backend, std::string& e) {
-    n_layers = (int)lc.n_layers;
-    D = (int)lc.head_dim;
-    KV = (int)lc.n_kv_heads;
-    max_cache = (int)lc.max_cache;
-    max_pos = (int)lc.max_cache;  // decode positions stay < max_cache
-
-    const size_t n_tensors = 2 * (size_t)n_layers + 2;
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 8),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    ctx = ggml_init(params);
-    if (!ctx) { e = "DeviceCache: ggml_init failed"; return false; }
-
-    int64_t kv_ne[3] = {D, max_cache, KV};
-    k.resize(n_layers);
-    v.resize(n_layers);
-    for (int i = 0; i < n_layers; ++i) {
-        k[i] = ggml_new_tensor(ctx, GGML_TYPE_BF16, 3, kv_ne);
-        v[i] = ggml_new_tensor(ctx, GGML_TYPE_BF16, 3, kv_ne);
-    }
-    int64_t rope_ne[2] = {D, max_pos};
-    rope_cos = ggml_new_tensor(ctx, GGML_TYPE_BF16, 2, rope_ne);
-    rope_sin = ggml_new_tensor(ctx, GGML_TYPE_BF16, 2, rope_ne);
-
-    buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) { e = "DeviceCache: backend alloc failed"; return false; }
-
-    // Precompute the RoPE cos/sin tables with the EXACT f32 std::pow-based
-    // formula used by layer_legacy, duplicated halves, rounded to bf16.
-    std::vector<ggml_bf16_t> cos_t((size_t)D * max_pos), sin_t((size_t)D * max_pos);
-    for (int p = 0; p < max_pos; ++p) {
-        for (int i = 0; i < D / 2; ++i) {
-            float inv = 1.0f / std::pow(lc.rope_theta, (2.0f * i) / D);
-            float a = (float)p * inv;
-            ggml_bf16_t c = ggml_fp32_to_bf16(std::cos(a));
-            ggml_bf16_t s = ggml_fp32_to_bf16(std::sin(a));
-            cos_t[(size_t)p * D + i] = cos_t[(size_t)p * D + i + D / 2] = c;
-            sin_t[(size_t)p * D + i] = sin_t[(size_t)p * D + i + D / 2] = s;
-        }
-    }
-    ggml_backend_tensor_set(rope_cos, cos_t.data(), 0, cos_t.size() * sizeof(ggml_bf16_t));
-    ggml_backend_tensor_set(rope_sin, sin_t.data(), 0, sin_t.size() * sizeof(ggml_bf16_t));
-
-    zero(backend);
-    return true;
-}
-
-void DeviceCache::zero(ggml_backend_t backend) {
-    (void)backend;
-    std::vector<ggml_bf16_t> z((size_t)D * max_cache * KV, ggml_bf16_t{0});
-    for (int i = 0; i < n_layers; ++i) {
-        ggml_backend_tensor_set(k[i], z.data(), 0, z.size() * sizeof(ggml_bf16_t));
-        ggml_backend_tensor_set(v[i], z.data(), 0, z.size() * sizeof(ggml_bf16_t));
-    }
-}
+using lib::DeviceCache;
+using lib::build_causal_mask;
 
 std::unique_ptr<DeviceCache> g_device_cache;
 std::once_flag g_device_cache_once;
@@ -480,23 +391,11 @@ DeviceCache* get_device_cache(const MossModel& m, std::string& e) {
     register_device_cache_clearer_once();
     if (g_device_cache) return g_device_cache.get();
     g_device_cache = std::unique_ptr<DeviceCache>(new DeviceCache());
-    if (!g_device_cache->init(m.config.llm, global_backend().handle(), e)) {
+    if (!g_device_cache->init((int) m.config.llm.n_layers, (int) m.config.llm.head_dim, (int) m.config.llm.n_kv_heads, (int) m.config.llm.max_cache, (float) m.config.llm.rope_theta, global_backend().handle(), e)) {
         g_device_cache.reset();
         return nullptr;
     }
     return g_device_cache.get();
-}
-
-// Causal additive mask [K, S] f32: 0 where allowed, -3.3895313892515355e38 beyond
-// (row qi covers keys j <= past+qi). Same constant + layout as layer_legacy.
-std::vector<float> build_causal_mask(int64_t S, int64_t past) {
-    const int64_t K = past + S;
-    std::vector<float> mask((size_t)K * S);
-    const float neg = -3.3895313892515355e38f;
-    for (int64_t qi = 0; qi < S; ++qi)
-        for (int64_t j = 0; j < K; ++j)
-            mask[(size_t)qi * K + j] = (j <= past + qi) ? 0.0f : neg;
-    return mask;
 }
 
 // Append one transformer layer's ops to ctx. x_in is [hidden, S] bf16
@@ -732,7 +631,7 @@ bool forward_prefill_new(const MossModel& m, const std::vector<float>& input,
     ensure_weights_realized(m.loader);
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
-    dc->zero(global_backend().handle());  // fresh utterance
+    dc->zero();  // fresh utterance
     state.length = 0;
     if (state.layers.empty()) state.layers.resize(lc.n_layers);
 

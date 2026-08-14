@@ -103,6 +103,7 @@ add_subdirectory(third_party/ggml)
 # added as they're written.
 # --------------------------------------------------------------------------- #
 file(GLOB STARLING_GGML_RUNTIME_CPP ${CMAKE_SOURCE_DIR}/cpp/runtime/*.cpp)
+file(GLOB STARLING_GGML_LIB_CPP ${CMAKE_SOURCE_DIR}/cpp/lib/*.cpp)
 file(GLOB STARLING_GGML_PARAKEET_CPP ${CMAKE_SOURCE_DIR}/cpp/parakeet/*.cpp)
 file(GLOB STARLING_GGML_MOSS_CPP ${CMAKE_SOURCE_DIR}/cpp/moss/*.cpp)
 file(GLOB STARLING_GGML_ARK_CPP ${CMAKE_SOURCE_DIR}/cpp/ark/*.cpp)
@@ -110,6 +111,7 @@ file(GLOB STARLING_GGML_HIGGS_CPP ${CMAKE_SOURCE_DIR}/cpp/higgs/*.cpp)
 file(GLOB STARLING_GGML_HOJO_CPP ${CMAKE_SOURCE_DIR}/cpp/hojo/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
+    ${STARLING_GGML_LIB_CPP}
     ${STARLING_GGML_PARAKEET_CPP}
     ${STARLING_GGML_MOSS_CPP}
     ${STARLING_GGML_ARK_CPP}

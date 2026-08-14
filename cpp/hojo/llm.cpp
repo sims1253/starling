@@ -15,6 +15,8 @@
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
+#include "lib/graph_helpers.hpp"
+#include "lib/mask_rope.hpp"
 #include "ggml.h"
 #include <algorithm>
 #include <cmath>
@@ -28,74 +30,26 @@
 namespace starling::ggml::hojo {
 namespace {
 
-ggml_tensor* bf(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_BF16 ? x : ggml_cast(c, x, GGML_TYPE_BF16);
-}
-ggml_tensor* ff(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
+// Small tensor helpers shared with the other engines (lib/graph_helpers.hpp).
+using lib::bf;
+using lib::ff;
+using lib::build_causal_mask;
+using lib::build_rope_tables;
+using lib::RopeTables;
+using lib::addb;
+using lib::mulb;
+using lib::tobf;
 ggml_tensor* wb(ggml_context* c, const HojoModel& m, const std::string& n) {
-    return clone_weight(c, m.loader, n.c_str());
+    return lib::wb(c, m.loader, n);
 }
 // nn.Linear (Qwen3 attention has NO q/k/v/o bias).
 ggml_tensor* lin(ggml_context* c, const HojoModel& m, ggml_tensor* x, const std::string& n) {
-    return bf(c, ggml_mul_mat(c, wb(c, m, n), bf(c, x)));
+    return lib::lin(c, m.loader, x, n);
 }
-ggml_tensor* addb(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf(c, ggml_add(c, ff(c, a), ff(c, b)));
-}
-ggml_tensor* mulb(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
-    return bf(c, ggml_mul(c, ff(c, a), ff(c, b)));
-}
-// RMSNorm in f32, scaled by the (bf16) weight.
+// RMSNorm in f32, then scale by the (bf16) weight.
 ggml_tensor* rms(ggml_context* c, const HojoModel& m, ggml_tensor* x, const std::string& n,
                  float eps) {
-    ggml_tensor* y = ggml_rms_norm(c, ff(c, x), eps);
-    y = bf(c, y);
-    return mulb(c, y, bf(c, wb(c, m, n)));
-}
-
-std::vector<ggml_bf16_t> tobf(const std::vector<float>& x) {
-    std::vector<ggml_bf16_t> r(x.size());
-    for (size_t i = 0; i < x.size(); ++i) r[i] = ggml_fp32_to_bf16(x[i]);
-    return r;
-}
-
-// Causal additive mask [K, S] f32: 0 where allowed, -inf beyond.
-std::vector<float> build_causal_mask(int64_t S, int64_t past) {
-    const int64_t K = past + S;
-    std::vector<float> mask((size_t) K * S);
-    const float neg = -3.3895313892515355e38f;
-    for (int64_t qi = 0; qi < S; ++qi)
-        for (int64_t j = 0; j < K; ++j)
-            mask[(size_t) qi * K + j] = (j <= past + qi) ? 0.0f : neg;
-    return mask;
-}
-
-// Precompute RoPE cos/sin for positions [0, max_pos) as f32 host tables
-// (duplicated halves, matching higgs). Returned as two [D, max_pos] f32 tables.
-struct RopeTables {
-    std::vector<float> cos, sin;  // [D, max_pos]
-    int D = 0, max_pos = 0;
-};
-RopeTables build_rope_tables(const LlmConfig& lc, int max_pos) {
-    RopeTables r;
-    r.D = (int) lc.head_dim;
-    r.max_pos = max_pos;
-    r.cos.assign((size_t) r.D * max_pos, 0.0f);
-    r.sin.assign((size_t) r.D * max_pos, 0.0f);
-    for (int p = 0; p < max_pos; ++p) {
-        for (int i = 0; i < r.D / 2; ++i) {
-            float inv = 1.0f / std::pow((float) lc.rope_theta, (2.0f * i) / r.D);
-            float a = (float) p * inv;
-            float c = std::cos(a), s = std::sin(a);
-            r.cos[(size_t) p * r.D + i] = c;
-            r.cos[(size_t) p * r.D + i + r.D / 2] = c;
-            r.sin[(size_t) p * r.D + i] = s;
-            r.sin[(size_t) p * r.D + i + r.D / 2] = s;
-        }
-    }
-    return r;
+    return lib::rms(c, m.loader, x, n, eps);
 }
 
 // Append one Qwen3 layer over x_in [hidden, S] (inputs_embeds for this forward).
@@ -261,7 +215,7 @@ bool greedy_generate(const HojoModel& m, const InputsEmbeds& i,
     ensure_weights_realized(m.loader);
     const int32_t eos = op.eos_token_id;
     const int32_t max_new = (int32_t) op.max_new_tokens;
-    RopeTables rope = build_rope_tables(m.config.llm, (int)(i.n_tokens + max_new + 4));
+    RopeTables rope = build_rope_tables((int) m.config.llm.head_dim, (float) m.config.llm.rope_theta, (int)(i.n_tokens + max_new + 4));
     // Prefill.
     std::vector<int32_t> extra;
     if (!forward_logits(m, i.data, i.n_tokens, extra, rope, o.prefill_logits, e)) return false;
@@ -302,15 +256,19 @@ bool beam_generate(const HojoModel& m, const InputsEmbeds& i,
     const int vocab = (int) m.config.llm.vocab;
     // num_beams comes from untrusted GGUF metadata; the candidate ranking does
     // std::partial_sort(..., begin + 2*B, end) over a `vocab`-sized list, so
-    // reject B outside [1, vocab/2] to keep begin + 2*B within bounds.
-    if (B < 1 || vocab < 2 || B > vocab / 2) {
+    // reject B outside [1, vocab/2] to keep begin + 2*B within bounds. Beam
+    // search is only validated against the beam-4 golden reference, so cap B
+    // at 4 (checked before any beam_logp / B*vocab allocation below).
+    const int max_beams = 4;
+    if (B < 1 || vocab < 2 || B > vocab / 2 || B > max_beams) {
         e = "invalid Hojo beam count " + std::to_string(B) +
-            " (must be in [1, vocab/2=" + std::to_string(vocab / 2) + "])";
+            " (must be in [1, " + std::to_string(std::min(vocab / 2, max_beams)) +
+            "])";
         return false;
     }
     const float lp = (float) op.length_penalty;
     const float penalty = (float) op.repetition_penalty;
-    RopeTables rope = build_rope_tables(m.config.llm, (int)(i.n_tokens + max_new + 4));
+    RopeTables rope = build_rope_tables((int) m.config.llm.head_dim, (float) m.config.llm.rope_theta, (int)(i.n_tokens + max_new + 4));
 
     // Prefill (step 0): logits over vocab at the last prefix position.
     std::vector<int32_t> empty;

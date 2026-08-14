@@ -2,25 +2,12 @@
 #include <cstdio>
 #include <vector>
 
+#include "lib/loader_kit.hpp"
 namespace starling::ggml::ark {
 namespace {
-uint32_t u32(const ModelLoader& m, const char* k, uint32_t d) {
-    int64_t v;
-    return m.kv_int(k, v) ? (uint32_t) v : d;
-}
-float f32(const ModelLoader& m, const char* k, float d) {
-    double v;
-    return m.kv_float(k, v) ? (float) v : d;
-}
-std::string str(const ModelLoader& m, const char* k, const char* d) {
-    std::string v;
-    return m.kv_str(k, v) ? v : d;
-}
-bool require(const ModelLoader& m, const std::string& n, std::string& err) {
-    if (m.tensor(n.c_str())) return true;
-    err = "ARK GGUF missing required tensor: " + n;
-    return false;
-}
+// GGUF-metadata helpers shared across the engines (lib/loader_kit.hpp).
+using lib::f32;
+using lib::str;
 } // namespace
 
 int64_t audio_token_count(int64_t mel_frames, uint32_t merge_factor) {
@@ -38,7 +25,7 @@ bool ArkModel::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
-#define U(field, key) field = u32(m, "ark." key, field)
+#define U(field, key) do { if (!lib::u32(m, "ark." key, field, field, err)) return false; } while (0)
 #define F(field, key) field = f32(m, "ark." key, field)
     // Frontend.
     U(c.frontend.sample_rate, "frontend.sample_rate");
@@ -99,14 +86,19 @@ bool ArkModel::load(const char* path, std::string& err) {
         if (m.kv_int("ark.llm.has_qk_norm", qn)) c.llm.has_qk_norm = qn != 0;
     }
     // Token ids + generation.
-    c.audio_token_id = (int32_t) u32(m, "ark.audio_token_id", c.audio_token_id);
-    c.begin_audio_id = (int32_t) u32(m, "ark.begin_audio_id", c.begin_audio_id);
-    c.end_audio_id = (int32_t) u32(m, "ark.end_audio_id", c.end_audio_id);
-    c.user_id = (int32_t) u32(m, "ark.user_id", c.user_id);
-    c.assistant_id = (int32_t) u32(m, "ark.assistant_id", c.assistant_id);
-    c.pad_token_id = (int32_t) u32(m, "ark.pad_token_id", c.pad_token_id);
-    c.bos_token_id = (int32_t) u32(m, "ark.bos_token_id", c.bos_token_id);
-    c.eos_token_id = (int32_t) u32(m, "ark.eos_token_id", c.eos_token_id);
+    {
+        uint32_t t;
+#define T(field, key) do { if (!lib::u32(m, "ark." key, (uint32_t) field, t, err)) return false; field = (int32_t) t; } while (0)
+        T(c.audio_token_id, "audio_token_id");
+        T(c.begin_audio_id, "begin_audio_id");
+        T(c.end_audio_id, "end_audio_id");
+        T(c.user_id, "user_id");
+        T(c.assistant_id, "assistant_id");
+        T(c.pad_token_id, "pad_token_id");
+        T(c.bos_token_id, "bos_token_id");
+        T(c.eos_token_id, "eos_token_id");
+#undef T
+    }
     U(c.max_new_tokens, "max_new_tokens");
     c.default_instruction = str(m, "ark.default_instruction", c.default_instruction.c_str());
 #undef U
@@ -121,23 +113,8 @@ bool ArkModel::load(const char* path, std::string& err) {
     // --- Validate untrusted GGUF metadata (mirror moss/loader.cpp). The
     // consumers divide by these (encoder head grouping; llm head grouping
     // h / (n_heads/n_kv_heads)), so a zero or inconsistent value is div-by-zero.
-    if (std::string arch; m.kv_str("general.architecture", arch) && arch != "ark") {
-        err = "unsupported ARK GGUF architecture: " + arch;
+    if (!lib::check_gguf_header(m, "ark", "ARK", {"bf16_exact", "f16"}, err))
         return false;
-    }
-    if (std::string prof; m.kv_str("starling.numeric_profile", prof) &&
-        prof != "bf16_exact" && prof != "f16") {
-        err = "unsupported ARK numeric profile: " + prof;
-        return false;
-    }
-    if (int64_t fv; m.kv_int("starling.format_version", fv) && fv != 1) {
-        err = "unsupported Starling GGUF format version: " + std::to_string(fv);
-        return false;
-    }
-    if (m.tensor_names().empty()) {
-        err = "ARK GGUF contains no tensors";
-        return false;
-    }
 #define POS(v, name) do { if (!(v)) { err = "ARK GGUF " name " must be positive"; return false; } } while (0)
     POS(c.encoder.n_layers, "enc.encoder_layers");
     POS(c.encoder.d_model, "enc.d_model");
@@ -178,7 +155,7 @@ bool ArkModel::load(const char* path, std::string& err) {
                           "enc.conv2.weight", "enc.conv2.bias", "enc.ln_post.weight",
                           "enc.ln_post.bias", "adapter.fc0.weight", "adapter.fc0.bias",
                           "adapter.fc2.weight", "adapter.fc2.bias", "llm.embed.weight"})
-        if (!require(m, n, err)) return false;
+        if (!lib::require(m, n, "ARK", err)) return false;
     // Encoder layers: attn_norm(w+b), attn.q(w+b), attn.k(w), attn.v(w+b),
     // attn.o(w+b), ffn_norm(w+b), ffn.fc1(w+b), ffn.fc2(w+b) = 15 each.
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
@@ -189,7 +166,7 @@ bool ArkModel::load(const char* path, std::string& err) {
                                  "ffn_norm.weight", "ffn_norm.bias", "ffn.fc1.weight",
                                  "ffn.fc1.bias", "ffn.fc2.weight", "ffn.fc2.bias"}) {
             std::snprintf(n, sizeof n, "enc.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "ARK", err)) return false;
         }
     }
     // LLM layers: attn_norm(w), attn.q(w+b), attn.k(w+b), attn.v(w+b), attn.o(w),
@@ -201,9 +178,9 @@ bool ArkModel::load(const char* path, std::string& err) {
                                  "attn.v.bias", "attn.o.weight", "ffn_norm.weight",
                                  "ffn.gate.weight", "ffn.up.weight", "ffn.down.weight"}) {
             std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!require(m, n, err)) return false;
+            if (!lib::require(m, n, "ARK", err)) return false;
         }
     }
-    return require(m, "llm.final_norm.weight", err);
+    return lib::require(m, "llm.final_norm.weight", "ARK", err);
 }
 } // namespace starling::ggml::ark

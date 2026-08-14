@@ -17,7 +17,8 @@
 #include <limits>
 #include <thread>
 #include <vector>
-#include "pocketfft_hdronly.h"
+#include "lib/pocketfft_hdronly.h"
+#include "lib/threads.hpp"
 #include "ggml-backend.h"
 
 namespace starling::ggml::higgs {
@@ -32,34 +33,6 @@ size_t reflect_index(int64_t i, size_t n) {
     return (size_t)(i < (int64_t) n ? i : period - i);
 }
 
-size_t mel_thread_count() {
-    if (const char* p = std::getenv("STARLING_MEL_THREADS")) {
-        char* end = nullptr;
-        long v = std::strtol(p, &end, 10);
-        if (end != p && v >= 1) return static_cast<size_t>(v);
-    }
-    unsigned hc = std::thread::hardware_concurrency();
-    if (hc == 0) hc = 1;
-    if (hc > 16) hc = 16;
-    return static_cast<size_t>(hc);
-}
-
-template <typename Body>
-void mel_parallel(size_t nthr, size_t total, Body&& body) {
-    if (total == 0) return;
-    if (nthr <= 1) { body((size_t)0, (size_t)0, total); return; }
-    if (nthr > total) nthr = total;
-    std::vector<std::thread> ths;
-    ths.reserve(nthr);
-    const size_t chunk = (total + nthr - 1) / nthr;
-    for (size_t i = 0; i < nthr; ++i) {
-        const size_t lo = i * chunk;
-        if (lo >= total) break;
-        const size_t hi = std::min(lo + chunk, total);
-        ths.emplace_back([&, i, lo, hi]() { body(i, lo, hi); });
-    }
-    for (auto& t : ths) t.join();
-}
 } // namespace
 
 bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
@@ -109,13 +82,13 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
     std::vector<float> logmel(M * fullT);
     std::vector<double> powers(B * fullT);
     std::vector<double> mel64(M * fullT);
-    const size_t nthr = mel_thread_count();
+    const size_t nthr = lib::mel_thread_count();
     // Transpose the filterbank to bank_t[m*B+b] for cache-friendly dot products.
     std::vector<float> bank_t(M * B);
     for (size_t m = 0; m < M; ++m)
         for (size_t b = 0; b < B; ++b) bank_t[m * B + b] = bank[b * M + m];
     // Loop 1: per frame reflect-pad + window + r2c FFT + power.
-    mel_parallel(nthr, fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
+    lib::parallel_for(nthr, fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
         std::vector<double> frame(N);
         std::vector<std::complex<double>> z(B);
         for (size_t t = lo; t < hi; ++t) {
@@ -133,7 +106,7 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
         }
     });
     // Loop 2: mel filterbank.
-    mel_parallel(nthr, M * fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
+    lib::parallel_for(nthr, M * fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
         for (size_t idx = lo; idx < hi; ++idx) {
             const size_t m = idx / fullT, t = idx % fullT;
             double a = 0;
@@ -150,7 +123,7 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
     // shifts the clamp threshold and perturbs every kept frame. logmel/mel64
     // are laid out mel-major with stride fullT, so iterate m in [0,M), t in [0,T).
     std::vector<float> chunk_max(nthr, -std::numeric_limits<float>::infinity());
-    mel_parallel(nthr, M, [&](size_t tid, size_t m_lo, size_t m_hi) {
+    lib::parallel_for(nthr, M, [&](size_t tid, size_t m_lo, size_t m_hi) {
         float cm = -std::numeric_limits<float>::infinity();
         for (size_t m = m_lo; m < m_hi; ++m) {
             for (size_t t = 0; t < T; ++t) {
@@ -169,7 +142,7 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
     out.f32.resize(M * T);
     out.data.resize(M * T);
     // Loop 3b: clamp + Whisper normalize (x+4)/4 + bf16.
-    mel_parallel(nthr, M * T, [&](size_t /*tid*/, size_t lo, size_t hi) {
+    lib::parallel_for(nthr, M * T, [&](size_t /*tid*/, size_t lo, size_t hi) {
         for (size_t idx = lo; idx < hi; ++idx) {
             const size_t m = idx / T, t = idx % T;
             float v = std::max(logmel[m * fullT + t], mx - c.dynamic_range);

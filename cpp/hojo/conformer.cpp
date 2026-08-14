@@ -31,6 +31,7 @@
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
+#include "lib/graph_helpers.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
@@ -42,44 +43,22 @@
 namespace starling::ggml::hojo {
 namespace {
 
-ggml_tensor* weight(ggml_context* c, const ModelLoader& ml, const std::string& n) {
-    return clone_weight(c, ml, n.c_str());
-}
-ggml_tensor* f32(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
+// Shared graph-builder helpers (lib/graph_helpers.hpp); the hojo bottleneck is
+// f32-discipline, so the local names route to the _f32 variants.
+using lib::f32;
+using lib::weight;
+using lib::read_f32;
 ggml_tensor* linear_b(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                       const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), f32(c, x));
-    if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
+    return lib::linear_f32(c, ml, x, n, bias);
 }
 ggml_tensor* layer_norm(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                         const std::string& n, float eps) {
-    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
-    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
+    return lib::layer_norm_f32(c, ml, x, n, eps);
 }
 // Swish == SiLU.
 ggml_tensor* swish(ggml_context* c, ggml_tensor* x) {
     return f32(c, ggml_silu(c, f32(c, x)));
-}
-
-std::vector<float> read_f32(const ModelLoader& ml, const char* name) {
-    ggml_tensor* t = ml.tensor(name);
-    if (!t) return {};
-    ensure_weights_realized(ml);
-    size_t n = (size_t) ggml_nelements(t);
-    std::vector<float> out(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_BF16) {
-        std::vector<ggml_bf16_t> raw(n);
-        ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_bf16_t));
-        for (size_t i = 0; i < n; ++i) out[i] = ggml_bf16_to_fp32(raw[i]);
-    }
-    return out;
 }
 
 // Rel-pos MHA (NO rel_shift) over x [D, T]. pos_emb is [D, T] (the pe slice,

@@ -7,7 +7,8 @@
 #include <limits>
 #include <thread>
 #include <vector>
-#include "pocketfft_hdronly.h"
+#include "lib/pocketfft_hdronly.h"
+#include "lib/threads.hpp"
 #include "ggml-backend.h"
 
 
@@ -26,36 +27,10 @@ size_t reflect_index(int64_t i,size_t n) {
 // to the serial path. pocketfft::r2c is reentrant: its plan cache is mutex-
 // guarded and every call uses its own scratch, so concurrent calls from
 // multiple std::threads are safe.
-size_t mel_thread_count() {
-    if (const char* p = std::getenv("STARLING_MEL_THREADS")) {
-        char* end = nullptr; long v = std::strtol(p, &end, 10);
-        if (end != p && v >= 1) return static_cast<size_t>(v);
-    }
-    unsigned hc = std::thread::hardware_concurrency();
-    if (hc == 0) hc = 1;
-    if (hc > 16) hc = 16;
-    return static_cast<size_t>(hc);
-}
-
 // Run body(tid, lo, hi) over [0, total) in contiguous disjoint chunks, one per
 // std::thread. Serial path (nthr<=1): a single call body(0, 0, total), no
 // threads spawned. tid is the chunk index (0..spawned-1) so callers can fold
 // per-chunk partial results into a deterministic order-sensitive reduction.
-template <typename Body>
-void mel_parallel(size_t nthr, size_t total, Body&& body) {
-    if (total == 0) return;
-    if (nthr <= 1) { body((size_t)0, (size_t)0, total); return; }
-    if (nthr > total) nthr = total;
-    std::vector<std::thread> ths; ths.reserve(nthr);
-    const size_t chunk = (total + nthr - 1) / nthr;
-    for (size_t i = 0; i < nthr; ++i) {
-        const size_t lo = i * chunk;
-        if (lo >= total) break;
-        const size_t hi = std::min(lo + chunk, total);
-        ths.emplace_back([&, i, lo, hi]() { body(i, lo, hi); });
-    }
-    for (auto& t : ths) t.join();
-}
 }
 
 bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,size_t S,MelFeatures& out,std::string& err){
@@ -71,7 +46,7 @@ bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,si
     // the model instead of dereferencing device/null data on fixture 2.
     if(wt->buffer){window_host.resize(N);ggml_backend_tensor_get(wt,window_host.data(),0,N*sizeof(float));window=window_host.data();}
     if(ft->buffer){bank_host.resize(M*B);ggml_backend_tensor_get(ft,bank_host.data(),0,M*B*sizeof(float));bank=bank_host.data();}
-    const size_t fullT=S/H+1, T=fullT-1; std::vector<float> logmel(M*fullT); std::vector<double> powers(B*fullT); std::vector<double> mel64(M*fullT); const size_t nthr=mel_thread_count();
+    const size_t fullT=S/H+1, T=fullT-1; std::vector<float> logmel(M*fullT); std::vector<double> powers(B*fullT); std::vector<double> mel64(M*fullT); const size_t nthr=lib::mel_thread_count();
     // Transpose the filterbank to bank_t[m*B+b] (== bank[b*M+m], contiguous per
     // m) and lay out powers as powers[t*B+b] (contiguous per frame). Loop 2 then
     // reads both operands contiguously in b instead of strided (bank stride M,
@@ -81,7 +56,7 @@ bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,si
     // Loop 1: per frame reflect-pad + window + r2c FFT + power. Frames are
     // fully independent; frame[] and z[] were shared across iterations in the
     // serial path, so each thread now owns a private copy.
-    mel_parallel(nthr, fullT, [&](size_t /*tid*/, size_t lo, size_t hi){
+    lib::parallel_for(nthr, fullT, [&](size_t /*tid*/, size_t lo, size_t hi){
         std::vector<double> frame(N); std::vector<std::complex<double>> z(B);
         for(size_t t=lo;t<hi;++t){
             const int64_t start=(int64_t)(t*H)-(int64_t)(N/2);
@@ -101,7 +76,7 @@ bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,si
     // Loop 2: mel filterbank. Each (m,t) cell is an independent dot product;
     // the inner accumulation stays exactly b=0..B-1, and cells write disjoint
     // mel64[] entries, so the parallel path is bit-identical to the serial one.
-    mel_parallel(nthr, M*fullT, [&](size_t /*tid*/, size_t lo, size_t hi){
+    lib::parallel_for(nthr, M*fullT, [&](size_t /*tid*/, size_t lo, size_t hi){
         for(size_t idx=lo;idx<hi;++idx){
             const size_t m=idx/fullT, t=idx%fullT; double a=0;
             const float* fb=&bank_t[m*B]; const double* pw=&powers[t*B];
@@ -113,7 +88,7 @@ bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,si
     // reduction (per-chunk maxes combined in chunk order; max is order-
     // insensitive, but keep the reduction deterministic regardless).
     std::vector<float> chunk_max(nthr, -std::numeric_limits<float>::infinity());
-    mel_parallel(nthr, M*fullT, [&](size_t tid, size_t lo, size_t hi){
+    lib::parallel_for(nthr, M*fullT, [&](size_t tid, size_t lo, size_t hi){
         float cm=-std::numeric_limits<float>::infinity();
         for(size_t idx=lo;idx<hi;++idx){
             float v=(float)std::log10(std::max(mel64[idx],(double)c.mel_floor));
@@ -124,7 +99,7 @@ bool compute_log_mel(const Config& cfg,const ModelLoader& ml,const float* pcm,si
     float mx=-std::numeric_limits<float>::infinity(); for(size_t i=0;i<nthr;++i) mx=std::max(mx,chunk_max[i]);
     out.n_mels=M; out.n_frames=T; out.f32.resize(M*T); out.data.resize(M*T);
     // Loop 3b: clamp + normalize + bf16. Each (m,t) output is independent.
-    mel_parallel(nthr, M*T, [&](size_t /*tid*/, size_t lo, size_t hi){
+    lib::parallel_for(nthr, M*T, [&](size_t /*tid*/, size_t lo, size_t hi){
         for(size_t idx=lo;idx<hi;++idx){
             const size_t m=idx/T, t=idx%T;
             float v=std::max(logmel[m*fullT+t],mx-c.dynamic_range); v=(v+c.normalization_offset)/c.normalization_divisor;

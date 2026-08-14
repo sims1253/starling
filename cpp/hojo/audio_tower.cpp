@@ -26,58 +26,57 @@
 #include "audio_tower.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
+#include "lib/threads.hpp"
+#include "lib/graph_helpers.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace starling::ggml::hojo {
 namespace {
 
-ggml_tensor* weight(ggml_context* c, const ModelLoader& ml, const std::string& n) {
-    return clone_weight(c, ml, n.c_str());
-}
-ggml_tensor* f32(ggml_context* c, ggml_tensor* x) {
-    return x->type == GGML_TYPE_F32 ? x : ggml_cast(c, x, GGML_TYPE_F32);
-}
+// Shared graph-builder helpers (lib/graph_helpers.hpp); the hojo audio stack
+// is f32-discipline, so the local names route to the _f32 variants.
+using lib::f32;
+using lib::weight;
+using lib::read_f32;
 ggml_tensor* linear(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                     const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), f32(c, x));
-    if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
+    return lib::linear_f32(c, ml, x, n, bias);
 }
 // exact GELU (erf) — config.activation_function="gelu", approximate="none".
 ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
-    return f32(c, ggml_gelu_erf(c, f32(c, x)));
+    return lib::gelu_erf_f32(c, x);
 }
 // PyTorch LayerNorm: F32 reduction + affine.
 ggml_tensor* layer_norm(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                         const std::string& n, float eps) {
-    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
-    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
+    return lib::layer_norm_f32(c, ml, x, n, eps);
 }
 
-// Read a weight's f32 contents to host (host-conv path needs the raw values).
-std::vector<float> read_f32(const ModelLoader& ml, const char* name) {
-    ggml_tensor* t = ml.tensor(name);
-    if (!t) return {};
-    ensure_weights_realized(ml);
-    size_t n = (size_t) ggml_nelements(t);
-    std::vector<float> out(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-    } else if (t->type == GGML_TYPE_BF16) {
-        std::vector<ggml_bf16_t> raw(n);
-        ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_bf16_t));
-        for (size_t i = 0; i < n; ++i) out[i] = ggml_bf16_to_fp32(raw[i]);
+// Work split for the host conv stack: cores capped at 16 (same policy as the
+// mel front-ends, without the env override). Each region is disjoint, so
+// results are independent of the thread count.
+size_t conv_thread_count() { return lib::default_thread_count(); }
+
+// Read the conv2d weights once per tower call: every window shares them, and
+// re-reading per window re-fetches ~25 MB of weights from the backend each
+// time (host_conv2d_stack used to do read_f32 per layer per window).
+ConvStackWeights read_conv_stack_weights(const ModelLoader& ml) {
+    const char* names[3] = {"audio.conv2d1", "audio.conv2d2", "audio.conv2d3"};
+    ConvStackWeights cw;
+    for (int i = 0; i < 3; ++i) {
+        cw.w[i] = read_f32(ml, (std::string(names[i]) + ".weight").c_str());
+        cw.b[i] = read_f32(ml, (std::string(names[i]) + ".bias").c_str());
     }
-    return out;
+    return cw;
 }
+} // namespace
 
 // 3 stride-2 conv2d + GELU between each, host-side (f32, double accumulation).
 // Input: window mel [win, n_mels] time-major (element (t=time, c=freq) at
@@ -94,19 +93,22 @@ std::vector<float> read_f32(const ModelLoader& ml, const char* name) {
 //
 // Conv2d weight layout in HF/PyTorch: [out_C, in_C, kH, kW]. We compute the
 // standard 2D convolution with kH=kW=3, stride 2, pad 1 on both axes.
-std::vector<float> host_conv2d_stack(const ModelLoader& ml,
+// The MAC loops are parallel over output channels and the GELU over elements;
+// both splits are disjoint and keep each output element's serial accumulation
+// order, so the result is bit-identical to the single-threaded form.
+std::vector<float> host_conv2d_stack(const ConvStackWeights& cw,
                                      const std::vector<float>& mel_win,
                                      int64_t win, int64_t n_mels) {
+    const size_t nthr = conv_thread_count();
     // Track (C, H=freq, W=time). Build x from the time-major mel_win.
     int64_t C = 1, H = n_mels, W = win;
     std::vector<float> x((size_t) C * H * W);
     for (int64_t h = 0; h < H; ++h)        // h indexes freq
         for (int64_t w = 0; w < W; ++w)    // w indexes time
             x[((size_t)0 * H + h) * W + w] = mel_win[(size_t) w * n_mels + h];
-    const char* names[3] = {"audio.conv2d1", "audio.conv2d2", "audio.conv2d3"};
     for (int li = 0; li < 3; ++li) {
-        std::vector<float> wf = read_f32(ml, (std::string(names[li]) + ".weight").c_str());
-        std::vector<float> bf = read_f32(ml, (std::string(names[li]) + ".bias").c_str());
+        const std::vector<float>& wf = cw.w[li];
+        const std::vector<float>& bf = cw.b[li];
         // wf: [OC, IC, 3, 3].
         const int64_t IC = C, OC = (int64_t) bf.size(), K = 3, p = 1, s = 2;
         const int64_t OH = (H + 2 * p - K) / s + 1;
@@ -119,32 +121,36 @@ std::vector<float> host_conv2d_stack(const ModelLoader& ml,
                     xp[((size_t) c * (H + 2 * p) + (h + p)) * (W + 2 * p) + (w + p)] =
                         x[((size_t) c * H + h) * W + w];
         std::vector<double> acc((size_t) OC * OH * OW);
-        for (int64_t oc = 0; oc < OC; ++oc) {
-            for (int64_t oh = 0; oh < OH; ++oh) {
-                for (int64_t ow = 0; ow < OW; ++ow) {
-                    double a = (double) bf[(size_t) oc];
-                    for (int64_t ic = 0; ic < IC; ++ic) {
-                        for (int64_t kh = 0; kh < K; ++kh) {
-                            for (int64_t kw = 0; kw < K; ++kw) {
-                                int64_t ih = oh * s + kh;
-                                int64_t iw = ow * s + kw;
-                                a += (double) wf[((((size_t) oc * IC + ic) * K + kh) * K + kw)] *
-                                     (double) xp[((size_t) ic * (H + 2 * p) + ih) * (W + 2 * p) + iw];
+        lib::parallel_for(nthr, (size_t) OC, [&](size_t, size_t lo, size_t hi) {
+            for (size_t oc = lo; oc < hi; ++oc) {
+                for (int64_t oh = 0; oh < OH; ++oh) {
+                    for (int64_t ow = 0; ow < OW; ++ow) {
+                        double a = (double) bf[oc];
+                        for (int64_t ic = 0; ic < IC; ++ic) {
+                            for (int64_t kh = 0; kh < K; ++kh) {
+                                for (int64_t kw = 0; kw < K; ++kw) {
+                                    int64_t ih = oh * s + kh;
+                                    int64_t iw = ow * s + kw;
+                                    a += (double) wf[((((size_t) oc * IC + ic) * K + kh) * K + kw)] *
+                                         (double) xp[((size_t) ic * (H + 2 * p) + ih) * (W + 2 * p) + iw];
+                                }
                             }
                         }
+                        acc[((size_t) oc * OH + oh) * OW + ow] = a;
                     }
-                    acc[((size_t) oc * OH + oh) * OW + ow] = a;
                 }
             }
-        }
+        });
         // GELU (exact erf) between conv layers.
         C = OC; H = OH; W = OW;
         x.resize((size_t) C * H * W);
-        for (size_t i = 0; i < acc.size(); ++i) {
-            float v = (float) acc[i];
-            v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));
-            x[i] = v;
-        }
+        lib::parallel_for(nthr, acc.size(), [&](size_t, size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; ++i) {
+                float v = (float) acc[i];
+                v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));
+                x[i] = v;
+            }
+        });
     }
     // x is now (C=480, H=freq_down=16=F, W=time_down=out_T). The reference does
     // permute(0,3,1,2).view(b, t, c*f) on (b, C, F, T) -> (b, T=93, C*F=7680):
@@ -158,6 +164,8 @@ std::vector<float> host_conv2d_stack(const ModelLoader& ml,
                     x[((size_t) c * F + f) * out_T + t];
     return out;  // [out_T, 7680] c-outer, f-inner per step
 }
+
+namespace {
 
 // Compute the SinusoidsPositionEmbedding for `length` positions over `channels`
 // (must be even): sin/cos concat, log_timescale_increment = log(10000)/(ch/2-1).
@@ -243,7 +251,24 @@ bool encode_audio_tower(const HojoModel& model, const MelFeatures& mel,
         window_lens.push_back(len);
     }
 
-    // 2. Per-window host conv2d stack -> [conv_out_T, 7680] each.
+    // 2. Per-window host conv2d stack -> [conv_out_T, conv_width] each.
+    // One validated width source: conv_out.weight's input dim (ne[0]) — the
+    // shape the conv_out mul_mat actually consumes. Cross-check the
+    // metadata-derived width (downsample_hidden_size (480) * (n_mels>>3); freq is
+    // halved 3x by the stride-2 convs: 128->64->32->16) and reject metadata that
+    // disagrees, then use the validated width for the graph input and conv_T
+    // below instead of a hardcoded 7680.
+    ggml_tensor* conv_out_w = model.loader.tensor("audio.conv_out.weight");
+    const int64_t conv_width = conv_out_w ? (int64_t) conv_out_w->ne[0] : -1;
+    const int64_t meta_width = (int64_t) tc.downsample_hidden_size * (n_mels >> 3);
+    if (conv_width <= 0 || conv_width != meta_width) {
+        err = "Hojo conv_out input width " + std::to_string(conv_width) +
+              " does not match metadata-derived flattened width " +
+              std::to_string(meta_width);
+        return false;
+    }
+    // One weight fetch shared by every window's host conv stack.
+    const ConvStackWeights cw = read_conv_stack_weights(model.loader);
     std::vector<std::vector<float>> per_window_conv;
     per_window_conv.reserve(window_lens.size());
     std::vector<int64_t> per_window_frames;
@@ -255,12 +280,10 @@ bool encode_audio_tower(const HojoModel& model, const MelFeatures& mel,
             for (int64_t c = 0; c < n_mels; ++c)
                 mel_win[(size_t) t * n_mels + c] =
                     mel.data[(size_t) c * mel_T + (off + t)];
-        std::vector<float> conv = host_conv2d_stack(model.loader, mel_win, wl, n_mels);
-        // Flattened conv width = downsample_hidden_size (480) * (n_mels>>3) (freq
-        // is halved 3x by the stride-2 convs: 128->64->32->16). Validate the conv
-        // output divides evenly so a malformed window cannot yield a wrong conv_T.
-        const int64_t conv_width = (int64_t) tc.downsample_hidden_size * (n_mels >> 3);
-        if (conv_width <= 0 || conv.size() % (size_t) conv_width != 0) {
+        std::vector<float> conv = host_conv2d_stack(cw, mel_win, wl, n_mels);
+        // Validate the conv output divides evenly so a malformed window cannot
+        // yield a wrong conv_T.
+        if (conv.size() % (size_t) conv_width != 0) {
             err = "Hojo tower conv output size " + std::to_string(conv.size()) +
                   " is not divisible by the flattened width " +
                   std::to_string(conv_width);
@@ -289,7 +312,7 @@ bool encode_audio_tower(const HojoModel& model, const MelFeatures& mel,
             std::vector<float> conv_in = std::move(per_window_conv[wi]);
             std::vector<float> conv_out_f;
             bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
-                int64_t ne[2] = {7680, conv_T};
+                int64_t ne[2] = {conv_width, conv_T};
                 ggml_tensor* in = graph_input_tensor(c, GGML_TYPE_F32, 2, ne,
                     conv_in.data(), conv_in.size() * sizeof(float));
                 ggml_tensor* y = ggml_mul_mat(c, weight(c, model.loader, "audio.conv_out.weight"),
