@@ -20,7 +20,7 @@ int main(int argc,char**argv){std::setvbuf(stdout,nullptr,_IONBF,0);std::string 
   double diff=std::fabs((double)q-(double)gold[i]);
   mx=std::max(mx,diff);
   if(diff>0.0){
-   // Per-bin one-ULP tolerance (docs/ggml-moss-goldens.md): bf16 spacing is
+   // Per-bin one-ULP tolerance: bf16 spacing is
    // exponent-dependent, so a single global absolute constant both accepts
    // >1 ULP in small-magnitude bins and rejects a legit one-ULP bin in a
    // larger binade. Measure the one-bf16-step gap at THIS reference's
@@ -34,7 +34,7 @@ int main(int argc,char**argv){std::setvbuf(stdout,nullptr,_IONBF,0);std::string 
   }
  }
  mism+=gold.size()>n?gold.size()-n:got.data.size()-n;
- // Token-exact contract (docs/ggml-moss-goldens.md): the reference mel is the
+ // Token-exact contract: the reference mel is the
  // processor's bf16 values; our f32 log-mel re-rounds a handful of boundary
  // bins (observed <= 40/951680, each exactly one bf16 ULP). Gate: at most 64
  // mismatching bins, each within one bf16 ULP measured at that bin's own

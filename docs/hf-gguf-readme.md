@@ -41,5 +41,5 @@ starling-serve --model parakeet --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf -
 
 Each GGUF file includes `starling.format_version` and `starling.numeric_profile`
 metadata. The `starling-serve` binary exposes `--abi-version` for binary
-compatibility information, so freestyle can verify the engine was built against
-a compatible GGML C API at startup.
+compatibility information, so clients can check at startup that the binary and
+the GGUF file are compatible.

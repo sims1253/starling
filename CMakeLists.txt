@@ -98,9 +98,8 @@ endif()
 add_subdirectory(third_party/ggml)
 
 # --------------------------------------------------------------------------- #
-# libstarling_ggml: the Starling-owned engine. Currently a stub (runtime +
-# C-API shell come in the next commits); parakeet + moss model sources are
-# added as they're written.
+# libstarling_ggml: the Starling-owned engine (runtime + flat C API + the
+# per-model implementations under cpp/<model>/).
 # --------------------------------------------------------------------------- #
 file(GLOB STARLING_GGML_RUNTIME_CPP ${CMAKE_SOURCE_DIR}/cpp/runtime/*.cpp)
 file(GLOB STARLING_GGML_LIB_CPP ${CMAKE_SOURCE_DIR}/cpp/lib/*.cpp)
@@ -180,8 +179,7 @@ set_target_properties(starling_ggml PROPERTIES
 # starling-serve: the native HTTP/WebSocket serving binary.
 #
 # A self-contained executable that wraps libstarling_ggml behind the same
-# HTTP/WS API as the Python `starling.server`, so freestyle's TypeScript
-# supervisor is a drop-in replacement:
+# HTTP/WS API as the Python `starling.server` (a drop-in replacement):
 #
 #   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 #
@@ -189,7 +187,7 @@ set_target_properties(starling_ggml PROPERTIES
 #   cmake -B build -DSTARLING_SERVE=ON
 #   cmake --build build -j --target starling-serve
 #
-# Build (CUDA, the freestyle production path):
+# Build (CUDA, the NVIDIA production path):
 #   cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON
 #   cmake --build build -j --target starling-serve
 #

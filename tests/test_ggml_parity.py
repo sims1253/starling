@@ -76,7 +76,7 @@ def test_ggml_parakeet_byte_exact(ggml_engine, name: str) -> None:
     (``parakeet_capi_transcribe_pcm``): short/medium use the K-step multistep
     decode fast path (T<=512); long (T=930) uses the byte-exact serial greedy
     loop (the multistep has a termination bug on long, so it's guarded out --
-    see ``docs/ggml-parakeet-perf-analysis.md`` and parakeet.cpp 147ba98).
+    see parakeet.cpp 147ba98).
     """
     golden_text = (GOLDEN / f"parakeet_tdt_{name}_text.txt").read_text()
     out = ggml_engine._run_one(FIXTURES[name])

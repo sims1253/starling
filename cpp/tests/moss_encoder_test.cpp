@@ -30,7 +30,7 @@ static Stats compare(const std::vector<float>&a,const std::vector<float>&b){
   return s;
 }
 int main(int argc,char**argv){std::setvbuf(stdout,nullptr,_IONBF,0);std::string root=argc>1?argv[1]:".";moss::MossModel model;std::string e;if(!model.load((root+"/models/moss-transcribe-preview-2b-bf16-exact.gguf").c_str(),e)){std::fprintf(stderr,"load: %s\n",e.c_str());return 2;}bool all=true;std::printf("device fixture stage              bitwise       max-abs\n");for(const char*name:{"short","medium","long"}){std::vector<float>pcm;int sr=0;if(!read_wav((root+"/tests/fixtures/"+name+".wav").c_str(),pcm,sr,e)||sr!=16000){std::fprintf(stderr,"wav: %s\n",e.c_str());return 2;}moss::MelFeatures mel;if(!moss::compute_log_mel(model.config,model.loader,pcm.data(),pcm.size(),mel,e)){std::fprintf(stderr,"mel: %s\n",e.c_str());return 2;}moss::AudioEncoding enc,ad;if(!moss::encode_audio(model,mel,enc,e)||!moss::apply_adapter(model,enc,ad,e)){std::fprintf(stderr,"%s: %s\n",name,e.c_str());return 2;}for(auto item:{std::pair<const char*,const std::vector<float>*>("encoder_hidden",&enc.data),{"audio_embeds",&ad.data}}){std::vector<float>gold;if(!test::read_f32(root+"/golden/raw/moss_"+name+"_"+item.first+".f32",gold,e)){std::fprintf(stderr,"%s\n",e.c_str());return 2;}Stats s=compare(*item.second,gold);double pct=s.n?100.0*s.equal/s.n:100;
-    // Token-exact contract (docs/ggml-moss-goldens.md): bitwise-vs-eager is
+    // Token-exact contract: bitwise-vs-eager is
     // infeasible after 32 attention layers of bf16 ULP compounding; what
     // matters is audio_embeds accuracy (LLM ids/text gate verifies the
     // downstream). Tolerances = ~1.5x observed on the eager golden path.

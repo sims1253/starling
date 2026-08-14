@@ -9,7 +9,7 @@ bf16 near-ties independent of the chosen cache capacity.
 
 The decoded token sequence from here is the golden reference the native engines
 must reproduce exactly. Intermediate floating tensors retain documented ULP
-tolerances (see ``docs/ggml-moss-goldens.md``).
+tolerances.
 """
 
 from __future__ import annotations

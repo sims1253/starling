@@ -318,3 +318,23 @@ higgs, audex) have no
 per-token audio alignment, so segments are at `--max-chunk-seconds` granularity;
 shrink it for finer segments at the cost of more decode passes. Parakeet
 and cohere chunk internally and return a single whole-utterance segment.
+
+## Native serving: starling-serve
+
+`starling-serve` is a self-contained native binary that serves the GGML
+engines behind the same HTTP/WS API — no Python, no torch, one static
+executable per platform (CUDA, ROCm, Vulkan, Metal, CPU). It covers the five
+GGML-ported models (`parakeet`, `moss`, `ark`, `higgs`, `hojo`); the Python
+server above remains the path for the CUDA-megakernel-only models (granite,
+parakeet_unified, qwen3, cohere, audex).
+
+```bash
+cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON   # or VULKAN/METAL/HIP
+cmake --build build -j --target starling-serve
+./build/starling-serve --model parakeet --gguf model.gguf --port 8181
+```
+
+Note: the native server requires 16 kHz audio (no C++ resampler; non-16 kHz
+WAVs get a 400). Build variants, the full CLI, the endpoint contract, and
+pre-converted GGUF downloads are documented in
+[`docs/native-serving.md`](docs/native-serving.md).

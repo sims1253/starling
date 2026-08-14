@@ -1,7 +1,7 @@
 # Native Serving Layer: starling-serve
 
 A self-contained native binary that wraps `libstarling_ggml` behind the same
-HTTP/WebSocket API as the Python `starling.server`, so freestyle can replace:
+HTTP/WebSocket API as the Python `starling.server`:
 
 ```typescript
 // Before (Python subprocess):
@@ -58,7 +58,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo (hojo available only when enabled by build-time condition) |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -74,8 +74,9 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 ## API contract
 
-Identical to the Python server — freestyle's TypeScript supervisor is a
-drop-in replacement.
+Mirrors the Python server's endpoint set (a client written against one works
+against the other; error status codes and phase names are documented per
+server).
 
 ### `GET /health`
 
@@ -87,13 +88,20 @@ Phase drives the UI: `unloaded → loading → ready → busy`.
 
 ### `POST /transcribe` / `POST /inference`
 
-Accepts raw WAV bytes (or multipart/form-data). Returns:
+Accepts raw WAV bytes (or multipart/form-data). **Audio must be 16 kHz** —
+there is no C++ resampler, so WAVs at other sample rates are rejected with
+`400` and a `sample rate mismatch` error (the Python server resamples via
+scipy instead). Payloads that aren't valid WAV are treated as raw mono
+PCM16 @ 16 kHz little-endian. Returns:
 
 ```json
 {"text":"hello world","segments":[{"text":"hello world","start_s":0.0,"end_s":2.5}],"duration_s":2.5,"request_id":"..."}
 ```
 
-Uses `X-Request-Id` header for tracking.
+Uses `X-Request-Id` header for tracking. Errors map to: `400` malformed
+audio / sample-rate mismatch, `409` duplicate active request id, `499`
+cancelled, `503` busy or model not loaded, `504` queue timeout, `500` other
+engine failures.
 
 ### `POST /warmup`
 
@@ -181,18 +189,17 @@ GitHub release publishes six static binaries + checksums:
 ### GPU detection
 
 Each build variant is compiled for a specific backend (CUDA, Metal, Vulkan, or
-CPU). There is no runtime backend auto-selection. Freestyle should download the
-binary matching the detected platform and GPU. Explicit variant selection is
-more predictable than runtime auto-detection.
+CPU). There is no runtime backend auto-selection: download the binary matching
+the detected platform and GPU. Explicit variant selection is more predictable
+than runtime auto-detection.
 
 ## Open questions (resolved)
 
 1. **Quantization strategy**: Default download is q8_0 (halves VRAM, negligible
    WER delta); bf16-exact is an opt-in upgrade.
 
-2. **GPU detection**: The binary auto-selects Vulkan vs CUDA at runtime when
-   possible; freestyle can also pick the right variant explicitly for
-   predictability. Both approaches are supported.
+2. **GPU detection**: Resolved in favor of explicit variant selection — no
+   runtime backend auto-selection (see above).
 
 3. **Streaming buffer implementation**: Ported to C++ (lower latency, no per-chunk
    HTTP round-trips). The `ChunkStreamer` is a faithful port of the Python

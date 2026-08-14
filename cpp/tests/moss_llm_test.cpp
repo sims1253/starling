@@ -13,9 +13,8 @@
 using namespace starling::ggml;
 struct Stats{size_t eq=0,n=0;double maxabs=0;bool size_match=true,finite=true;};
 // Hardened compare: exact size match against the loaded golden (its width is
-// the ground truth -- logits must be exactly the documented 151936 vocab per
-// docs/ggml-moss-goldens.md) and explicit non-finite detection (std::max
-// silently drops NaN diffs).
+// the ground truth -- logits must be exactly the documented 151936 vocab) and
+// explicit non-finite detection (std::max silently drops NaN diffs).
 static Stats cmp(const std::vector<float>&a,const std::vector<float>&b){
   Stats s;s.size_match=(a.size()==b.size());s.n=a.size();
   size_t n=std::min(a.size(),b.size());
@@ -37,7 +36,7 @@ int main(int argc,char**argv){std::setvbuf(stdout,nullptr,_IONBF,0);std::string 
  in.data=ge;in.n_tokens=ge.size()/m.config.llm.hidden;in.width=m.config.llm.hidden;moss::PrefillResult staged;if(!moss::llm_prefill(m,in,2048,staged,e)){std::fprintf(stderr,"prefill %s: %s\n",n,e.c_str());return 2;}auto ls=cmp(staged.logits,glog);auto st1=top5(staged.logits),st2=top5(glog);std::printf("%-7s %7.3f%% %.7g %7.3f%% %.7g %s %s pending pending STAGED\n",n,es.n?100.0*es.eq/es.n:100,es.maxabs,ls.n?100.0*ls.eq/ls.n:100,ls.maxabs,st1==st2?"yes":"NO",(!st1.empty()&&!st2.empty()&&st1[0]==st2[0])?"yes":"NO");
  moss::GenerateResult gr;moss::GenerateOptions op;if(!moss::greedy_generate(m,in,op,gr,e)){std::fprintf(stderr,"generate %s: %s\n",n,e.c_str());return 2;}ls=cmp(gr.prefill_logits,glog);auto t1=top5(gr.prefill_logits),t2=top5(glog);bool ids=gr.ids.size()==gi.size();for(size_t i=0;ids&&i<gi.size();++i)ids=gr.ids[i]==gi[i];std::string got=tok.decode(gr.ids,true),want=text(root+"/golden/moss_"+n+"_text.txt");bool tx=got==want;
  // Gate: token-exact (the golden path's bf16 ULP compounding makes a strict
- // bitwise-logits gate infeasible; see docs/ggml-moss-goldens.md). Require
+ // bitwise-logits gate infeasible). Require
  // bitwise embeds, exact argmax, a generous logits max-abs bound
  // (observed <= 3.75), and exact ids/text.
  // top5 (ordered, and even set equality under exact-value ties) is
