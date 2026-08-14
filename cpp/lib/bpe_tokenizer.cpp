@@ -1,6 +1,4 @@
-// bpe_tokenizer.cpp — shared GPT-2/Qwen BPE byte-decoder (see bpe_tokenizer.hpp).
-// Body moved verbatim from higgs/tokenizer.cpp (itself a verbatim copy of
-// ark's; moss carried the same code in dense style).
+// bpe_tokenizer.cpp — GPT-2/Qwen BPE byte-decoder (see bpe_tokenizer.hpp).
 #include "bpe_tokenizer.hpp"
 #include <algorithm>
 namespace starling::ggml::lib {

@@ -2,9 +2,7 @@
 //
 // Thin adapter over the shared frontend (lib/whisper_mel.hpp); higgs's policy:
 // ceil(S/H) valid frames, n_samples truncation after the input checks, global
-// max over the KEPT frames only, f32 arithmetic, bf16 + f32 output. The
-// shared body is byte-exact against the previous per-model copy (loop nests
-// and reduction orders unchanged).
+// max over the KEPT frames only, f32 arithmetic, bf16 + f32 output.
 #include "mel.hpp"
 #include "lib/whisper_mel.hpp"
 

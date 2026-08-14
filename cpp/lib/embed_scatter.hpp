@@ -1,11 +1,6 @@
-// embed_scatter.hpp — shared prompt embedding + audio-feature scatter.
-//
-// Extracted verbatim from the near-twin build_inputs_embeds in
-// ark/prompt.cpp and higgs/prompt.cpp (identical bodies modulo the
-// error-message label; the prompt LAYOUT builders stay per-model because
-// they genuinely differ — ark emits one audio segment, higgs one segment
-// per 4 s chunk). moss is not covered: its variant is the compact
-// exact-count form with no zero-pad path.
+// embed_scatter.hpp — prompt embedding lookup + audio-feature scatter.
+// (moss is not covered: its variant is the compact exact-count form with no
+// zero-pad path.)
 #pragma once
 
 #include "runtime/backend.hpp"

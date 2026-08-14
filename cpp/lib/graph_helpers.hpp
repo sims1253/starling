@@ -1,14 +1,10 @@
-// graph_helpers.hpp — shared ggml graph-builder micro-helpers.
-//
-// Extracted from the copies in moss/ark/higgs/hojo (llm.cpp bf/ff/wb/lin/
-// addb/mulb/rms/tobf/argmax_low + the audio-side weight/bf16/f32/linear/
-// exact_gelu/add_bf16/layer_norm families and hojo's read_f32). Two numeric
+// graph_helpers.hpp — ggml graph-builder micro-helpers. Two numeric
 // disciplines share this header via explicit suffixes:
 //   *_bf16 — the bf16 oracle (moss/ark/higgs): activations live in bf16,
 //            elementwise math in f32, rounding at the bf16 boundary.
 //   *_f32  — the f32 discipline (hojo audio tower / conformer).
-// The short names (bf/ff/addb/mulb/...) keep the llm.cpp call sites unchanged
-// via using-declarations; they take ModelLoader& so every model can use them.
+// The short names (bf/ff/addb/mulb/...) exist for the llm.cpp call sites;
+// all loader-coupled helpers take ModelLoader& so every engine can use them.
 #pragma once
 
 #include "runtime/backend.hpp"

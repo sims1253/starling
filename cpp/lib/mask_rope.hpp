@@ -1,10 +1,6 @@
-// mask_rope.hpp — shared causal attention masks + host RoPE tables.
-//
-// build_causal_mask is extracted verbatim from the four identical copies in
-// moss/ark/higgs/hojo llm.cpp. The host f32 RoPE builder (duplicated-halves
-// layout, std::pow frequencies) is hojo's decode-time table builder; the
-// moss/ark/higgs decoders use the device-resident tables in DeviceCache
-// instead (same formula).
+// mask_rope.hpp — causal attention masks + host RoPE tables (duplicated-
+// halves layout, std::pow frequencies; the moss/ark/higgs decoders use the
+// device-resident tables in DeviceCache instead).
 #pragma once
 
 #include <cmath>

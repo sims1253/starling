@@ -1,9 +1,7 @@
-// whisper_mel.hpp — shared Whisper-style log-mel frontend.
-//
-// Unifies the four frontends in moss/ark/higgs/hojo mel.cpp (same algorithm:
-// reflect pad, Hann window from GGUF, pocketfft r2c, power=2, log10, global
-// max-clamp(dynamic_range), normalize). The copies differ in a handful of
-// REAL numerical/behavioral points, captured explicitly by MelPolicy:
+// whisper_mel.hpp — Whisper-style log-mel frontend: reflect pad, Hann window
+// from GGUF, pocketfft r2c, power=2, log10, global max-clamp(dynamic_range),
+// normalize. The engines differ in a handful of REAL numerical/behavioral
+// points, captured explicitly by MelPolicy:
 //   * valid-frame rule after fullT = S/H + 1 STFT frames:
 //       T_FULLT_MINUS_1  (moss/ark)  T = fullT - 1 = S/H
 //       T_CEIL_S_OVER_H  (higgs)     T = ceil(S/H)
@@ -16,8 +14,6 @@
 //     double constants/intermediates (hojo).
 //   * output: f32 always; bf16 alongside (moss/ark/higgs) or not (hojo).
 //
-// Everything else (loops 1/2, accumulation orders, chunk-max reduction) is
-// byte-identical across the four copies and lives once here.
 #pragma once
 
 #include "runtime/model_loader.hpp"

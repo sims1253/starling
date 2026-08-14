@@ -1,6 +1,5 @@
-// whisper_mel.cpp — shared Whisper log-mel frontend (see whisper_mel.hpp).
-// Body assembled verbatim from the four mel.cpp copies; every per-model
-// branch is driven by MelPolicy.
+// whisper_mel.cpp — Whisper log-mel frontend (see whisper_mel.hpp); every
+// per-engine branch is driven by MelPolicy.
 #include "whisper_mel.hpp"
 #include "pocketfft_hdronly.h"
 #include "threads.hpp"

@@ -3,7 +3,7 @@
 // Thin adapter over the shared frontend (lib/whisper_mel.hpp); ark's policy:
 // fullT-1 valid frames, n_samples truncation after the input checks, global
 // max over ALL computed frames (flat split), f32 arithmetic, bf16 + f32
-// output. The shared body is byte-exact against the previous per-model copy.
+// output.
 #include "mel.hpp"
 #include "lib/whisper_mel.hpp"
 

@@ -1,5 +1,4 @@
-// embed_scatter.cpp — shared prompt embedding + audio scatter (see
-// embed_scatter.hpp). Body moved verbatim from ark/higgs build_inputs_embeds.
+// embed_scatter.cpp — prompt embedding + audio scatter (see embed_scatter.hpp).
 #include "embed_scatter.hpp"
 #include <cstdio>
 

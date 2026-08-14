@@ -1,12 +1,9 @@
-// loader_kit.hpp — shared GGUF-metadata helpers for the model loaders.
-//
-// Extracted from the four loader.cpp copies (moss/ark/higgs/hojo). The u32
-// guard is the higgs variant (the review-hardened one): kv_int values are
-// rejected before casting when they would wrap in the uint32_t field or in
-// the int/int32_t narrowing every consumer does. check_gguf_header folds the
-// per-loader architecture / numeric-profile / format-version / non-empty
-// guard block; only arch string, message label, and the accepted profiles
-// differ between models.
+// loader_kit.hpp — shared GGUF-metadata helpers for the model loaders. The
+// u32 guard rejects kv_int values before casting when they would wrap in the
+// uint32_t field or in the int/int32_t narrowing every consumer does.
+// check_gguf_header folds the per-loader architecture / numeric-profile /
+// format-version / non-empty guard block; only arch string, message label,
+// and the accepted profiles differ between models.
 #pragma once
 
 #include "runtime/model_loader.hpp"

@@ -4,8 +4,7 @@
 // S/H valid frames (padding=False, last-frame truncation load-bearing),
 // unconditional n_samples (=40 s) truncation BEFORE the input checks, global
 // max over the KEPT frames only, double-constant clamp/normalize arithmetic,
-// f32-only output. The shared body is byte-exact against the previous
-// per-model copy.
+// f32-only output.
 #include "mel.hpp"
 #include "lib/whisper_mel.hpp"
 

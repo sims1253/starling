@@ -1,9 +1,6 @@
-// threads.hpp — shared host-side threading for the model engines.
-//
-// Extracted verbatim from the four identical mel_thread_count/mel_parallel
-// copies in moss/ark/higgs/hojo mel.cpp (this branch's "starling lib" layer).
-// parallel_for splits [0, total) into contiguous per-thread ranges; bodies
-// see disjoint regions, so results do not depend on the thread count.
+// threads.hpp — host-side threading for the model engines. parallel_for
+// splits [0, total) into contiguous per-thread ranges; bodies see disjoint
+// regions, so results do not depend on the thread count.
 #pragma once
 
 #include <algorithm>

@@ -1,6 +1,4 @@
-// device_cache.cpp — shared device-resident KV cache (see device_cache.hpp).
-// Body moved verbatim from higgs/llm.cpp (identical to the moss/ark copies
-// modulo the LlmConfig unpacking, now done by the caller's parameters).
+// device_cache.cpp — device-resident KV cache (see device_cache.hpp).
 #include "device_cache.hpp"
 #include "runtime/graph.hpp"
 #include <cmath>

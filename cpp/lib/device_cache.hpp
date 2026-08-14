@@ -1,11 +1,8 @@
-// device_cache.hpp — shared device-resident KV cache + RoPE tables.
-//
-// Extracted from the three per-model copies in moss/ark/higgs llm.cpp
-// (moss/ark byte-identical; higgs dropped the unused backend param on
-// zero() — the form kept here). One cache per process; graphs reference the
-// k/v tensors and RoPE tables as fixed leaves; zeroed at the start of each
-// utterance. The per-model get_device_cache() wrappers remain in each
-// llm.cpp, binding this to their LlmConfig and decode-cache-clearer.
+// device_cache.hpp — device-resident KV cache + RoPE tables. One cache per
+// process; graphs reference the k/v tensors and RoPE tables as fixed leaves;
+// zeroed at the start of each utterance and freed by the decode-cache
+// clearer before backend teardown. Per-model get_device_cache() wrappers
+// bind this to their LlmConfig.
 #pragma once
 
 #include "runtime/backend.hpp"
