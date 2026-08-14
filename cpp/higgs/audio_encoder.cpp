@@ -85,7 +85,8 @@ bool debug_enabled() {
 //    [T,T,H] score tensor is never materialized). Higgs is plain MHA
 //    (n_head == n_head_kv == H) and bidirectional -> mask = nullptr.
 //  - CPU / byte-exact fallback: the original materialized mul_mat+softmax path,
-//    selected via STARLING_HIGGS_NO_FATTN=1 (or non-GPU). Mirrors ark's dual-path.
+//    selected via STARLING_HIGGS_NO_FATTN=1 (or non-GPU). Both paths must stay
+    // byte-identical.
 ggml_tensor* global_attention(ggml_context* ctx, const HiggsModel& model,
                               ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
                               int64_t T) {
@@ -275,8 +276,7 @@ ggml_tensor* build_projector(ggml_context* ctx, const HiggsModel& model,
 // values under CUDA-graph capture in the ark port (docs/ggml-ark-port-status.md);
 // the depthwise conv + avg_pool have not been validated under capture either, so
 // the CPU / debug path runs them as host scalar loops (byte-exact vs torch) and
-// only the encoder layers + projector linears run as graphs. Mirrors ark's
-// host_conv1d_gelu.
+// only the encoder layers + projector linears run as graphs.
 // ---------------------------------------------------------------------------
 
 std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name) {
@@ -346,7 +346,7 @@ std::vector<float> host_conv1d(const ModelLoader& ml, const std::vector<float>& 
 // Fused conv + encode + avg_pool + ln_post + project with a per-mel_T bounded-LRU
 // ReplayGraph cache (GPU). The full Whisper Conv1d front-end + avg_pool + depthwise
 // conv run IN-GRAPH on GPU; on CPU / debug they run as the host scalar fallbacks.
-// Keyed on mel_T. Mirrors ark's encode_audio_and_adapt + bounded LruCache.
+// Keyed on mel_T (the cache is LRU-bounded; eviction frees the device buffer).
 // ---------------------------------------------------------------------------
 struct EncoderReplayEntry {
     int64_t mel_T = 0, T_enc = 0, T_avg = 0, T_proj = 0;

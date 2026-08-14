@@ -10,7 +10,7 @@
 // RoPE in f32, soft_max_ext with f32 mask, q_norm/k_norm per head) is
 // byte-identical to moss.
 //
-// Structure (mirrors moss): device-resident KV cache (DeviceCache, per-layer
+// Structure: device-resident KV cache (DeviceCache, per-layer
 // [D, max_cache, KV] bf16 + precomputed RoPE tables), one per-S prefill
 // ReplayGraph, one per-K K-step decode ReplayGraph (chained K steps in-graph so
 // there is one device<->host sync per K tokens), and the one-shot CPU fallbacks.
@@ -383,7 +383,7 @@ bool forward_decode(const HiggsModel& m, int32_t prev_token, int64_t past,
 }
 
 // ===========================================================================
-// K-step multistep decode (captured ReplayGraph). Mirrors moss's K-step design.
+// K-step multistep decode (captured ReplayGraph).
 // Captures K consecutive decode steps into ONE ReplayGraph with the per-step
 // state chained IN-GRAPH (output token -> get_rows(embed) -> next step's input),
 // so there is ONE device<->host sync per K steps. KV writes land at baked slots

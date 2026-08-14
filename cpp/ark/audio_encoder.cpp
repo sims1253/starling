@@ -7,9 +7,8 @@
 // merge-by-4 -> Linear(5120->4096) GELU Linear(4096->2048)).
 //
 // On GPU this is ONE captured ReplayGraph keyed on the (post-conv) encoder
-// length T_enc (global attention => one graph per T_enc, LRU-bounded). On CPU /
-// debug it is the one-shot pair. Mirrors moss/audio_encoder.cpp's fused
-// encode+adapt + bounded LruCache.
+// length T_enc (global attention => one graph per T_enc; the cache is
+// LRU-bounded). On CPU / debug it is the one-shot pair.
 #include "audio_encoder.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
@@ -300,7 +299,7 @@ ggml_tensor* build_adapter(ggml_context* ctx, const ArkModel& model,
 // ggml_conv_1d with F32 inputs) instead of as a host scalar loop, so the
 // encoder graph takes the mel as its varying input and runs conv1/gelu/conv2/
 // gelu/layers/adapter end-to-end. Keyed on mel_T (conv1's internal sizes depend
-// on mel_T directly, not just T_enc). Mirrors moss's encode_audio_and_adapt.
+// on mel_T directly, not just T_enc; the cache is LRU-bounded).
 // ---------------------------------------------------------------------------
 struct EncoderReplayEntry {
     int64_t mel_T = 0, T_enc = 0, N = 0;
@@ -316,7 +315,7 @@ struct EncoderReplayEntry {
 // encoder cost (~1-2%), and the bf16 boundary (mel is bf16, the layer input is
 // bf16) is preserved by the f32->bf16 round at the end. `in` is [IC, L] bf16
 // (feat-major); weight is [OC, IC, K] (HF order); returns [OC, OL] f32.
-// Mirrors the validated numpy im2col (verified bit-exact vs torch.nn.functional.conv1d).
+// im2col must match torch.nn.functional.conv1d bit-exactly.
 std::vector<float> read_bf16_to_f32(const ModelLoader& ml, const char* name) {
     ggml_tensor* t = ml.tensor(name);
     if (!t) return {};

@@ -1,5 +1,5 @@
 // capi_higgs.cpp — higgs-audio-v3-stt C API entry points behind the shared shell.
-// Mirrors capi_ark.cpp: load -> mel -> encode+project -> prompt+embeds -> greedy
+// C API flow: load -> mel -> encode+project -> prompt/embeds -> greedy
 // decode -> detokenize, with a STARLING_HIGGS_TIMING phase-timing gate.
 #include "loader.hpp"
 #include "mel.hpp"

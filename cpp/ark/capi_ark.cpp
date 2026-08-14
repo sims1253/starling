@@ -1,5 +1,5 @@
 // capi_ark.cpp — ARK-ASR-3B C API entry points behind the shared shell.
-// Mirrors capi_moss.cpp: load -> mel -> encode+adapt -> prompt+embeds -> greedy
+// C API flow: load -> mel -> encode+adapt -> prompt/embeds -> greedy
 // decode -> detokenize, with a STARLING_ARK_TIMING phase-timing gate.
 #include "loader.hpp"
 #include "mel.hpp"

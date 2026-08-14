@@ -1,5 +1,5 @@
 // capi_hojo.cpp — Hojo-ASR-V1 C API entry points behind the shared shell.
-// Mirrors capi_higgs.cpp: load -> mel -> audio_tower -> bottleneck -> ln_speech
+// C API flow: load -> mel -> audio_tower -> bottleneck -> ln_speech
 // (in prompt) -> prompt -> beam-4 decode -> detokenize.
 #include "loader.hpp"
 #include "mel.hpp"

@@ -4,8 +4,7 @@
 // fullT-1 valid frames, NO n_samples truncation (the windowing stage owns
 // truncation), global max over ALL computed frames (flat split), f32
 // arithmetic, bf16 + f32 output. n_fft=640 (vs 400 for ark/higgs/hojo) comes
-// from config like every other constant. The shared body is byte-exact
-// against the previous per-model copy.
+// from config like every other constant.
 #include "mel.hpp"
 #include "lib/whisper_mel.hpp"
 

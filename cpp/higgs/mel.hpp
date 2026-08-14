@@ -12,10 +12,9 @@ struct MelFeatures {
     std::vector<float> f32;
     int64_t n_mels = 0, n_frames = 0;
 };
-// Whisper log-mel (n_fft=400, hop=160, 128 bins). Mirrors the eager
-// WhisperFeatureExtractor the Higgs collator wraps. Output is feat-major
-// [n_mels, n_frames] bf16 (and f32). Byte-identical to the ark/moss frontend
-// (same Whisper extractor); the only model-specific bits are the constants in
+// Whisper log-mel (n_fft=400, hop=160, 128 bins), feat-major
+// [n_mels, n_frames] bf16 (and f32); implemented via lib/whisper_mel.hpp with
+// the policy set in mel.cpp. Constants come from
 // FrontendConfig.
 bool compute_log_mel(const Config&, const ModelLoader&, const float* pcm, size_t n,
                      MelFeatures&, std::string& err);
