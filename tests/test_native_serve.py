@@ -4,6 +4,9 @@
 Tests the native serving binary's HTTP/WebSocket API for compatibility with the
 Python server contract. Runs against a live server instance.
 
+This is a standalone script, NOT a pytest module: the test_* functions below
+take live-server arguments, so pytest collection is skipped explicitly.
+
 Usage:
     # Build the binary first:
     cmake -B build -DSTARLING_SERVE=ON && cmake --build build --target starling-serve
@@ -30,8 +33,17 @@ from pathlib import Path
 import numpy as np
 import requests
 
+# Standalone script: its test_* functions need a live server and would only
+# produce fixture errors under pytest. Skip collection when pytest is the
+# runner (it has already imported itself by the time we execute).
+if "pytest" in sys.modules:
+    import pytest
+
+    pytest.skip("integration script; run directly: python tests/test_native_serve.py",
+                allow_module_level=True)
+
 REPO = Path(__file__).resolve().parents[1]
-BINARY = REPO / "build-serve" / "starling-serve"
+BINARY = REPO / "build" / "starling-serve"
 DEFAULT_PORT = 18181
 
 
@@ -208,8 +220,8 @@ def main():
     if not args.no_server:
         if not args.binary.exists():
             print(f"Binary not found: {args.binary}")
-            print("Build first: cmake -B build-serve -DSTARLING_SERVE=ON && "
-                  "cmake --build build-serve --target starling-serve")
+            print("Build first: cmake -B build -DSTARLING_SERVE=ON && "
+                  "cmake --build build --target starling-serve")
             return 1
         print(f"Starting {args.binary} on {args.host}:{args.port} ...")
         proc = subprocess.Popen(
