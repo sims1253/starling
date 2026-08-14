@@ -59,6 +59,14 @@ bool HojoModel::load(const char* path, std::string& err) {
     c.frontend.mel_scale = str(m, "hojo.frontend.mel_scale", "slaney");
     c.frontend.mel_norm = str(m, "hojo.frontend.mel_norm", "slaney");
     c.frontend.log = str(m, "hojo.frontend.log", "log");
+    // Validate the base frontend params BEFORE the chunk override below: the
+    // override derives nb_max_frames = n_samples / hop_length, so a zero or
+    // invalid hop_length (untrusted GGUF) would divide by zero here.
+    if (c.frontend.n_fft != 400 || c.frontend.win_length != 400 ||
+        c.frontend.n_mels != 128 || c.frontend.hop_length != 160) {
+        err = "unsupported Hojo frontend metadata (requires n_fft/win=400, hop=160, n_mels=128)";
+        return false;
+    }
     // hojo_asr_model.HOJO_ASR loads the Whisper extractor with chunk_length=40
     // (overriding the base whisper-large-v3 preprocessor_config.json's
     // chunk_length=30). The GGUF stores the BASE Whisper config, so override
@@ -195,9 +203,11 @@ bool HojoModel::load(const char* path, std::string& err) {
         err = "Hojo GGUF llm.num_heads must be a multiple of llm.num_kv_heads";
         return false;
     }
-    if (c.frontend.n_fft != 400 || c.frontend.win_length != 400 ||
-        c.frontend.n_mels != 128 || c.frontend.hop_length != 160) {
-        err = "unsupported Hojo frontend metadata (requires n_fft/win=400, hop=160, n_mels=128)";
+    // The Conformer MHA reshapes the bottleneck output into H heads of
+    // output_size/H each, so output_size must be divisible by attention_heads.
+    if (c.bottleneck.attention_heads == 0 ||
+        c.bottleneck.output_size % c.bottleneck.attention_heads != 0) {
+        err = "Hojo GGUF bottleneck.output_size must be divisible by bottleneck.attention_heads";
         return false;
     }
 

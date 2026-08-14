@@ -81,7 +81,7 @@ def test_gen_ids_byte_exact(name: str) -> None:
     """HojoMega reproduces the golden ``gen_ids`` exactly (the authoritative gate)."""
     g = _golden()["fixtures"][name]
     pipe = _pipe()
-    text, gen_ids = pipe.transcribe_gen_ids(_fixture_audio(name), sample_rate=16000)
+    _, gen_ids = pipe.transcribe_gen_ids(_fixture_audio(name), sample_rate=16000)
     assert gen_ids == g["gen_ids"], (
         f"{name}: gen_ids diverged from golden\n"
         f"  got ({len(gen_ids)}): {gen_ids[:20]}\n"

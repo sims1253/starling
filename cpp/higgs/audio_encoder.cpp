@@ -353,21 +353,6 @@ std::vector<float> host_conv1d(const ModelLoader& ml, const std::vector<float>& 
 }
 } // namespace
 
-// Host-side AvgPool1d(k=2, s=2, p=0) over the time axis. `in` is [C, L]
-// feat-major; returns [C, floor((L-2)/2)+1] feat-major.
-namespace {
-std::vector<float> host_avg_pool1d(const std::vector<float>& in, int64_t C, int64_t L) {
-    const int64_t k = 2, s = 2, p = 0;
-    const int64_t OL = (L + 2 * p - k) / s + 1;
-    std::vector<float> y((size_t) C * OL, 0.0f);
-    for (int64_t c = 0; c < C; ++c)
-        for (int64_t t = 0; t < OL; ++t)
-            y[(size_t) c * OL + t] = 0.5f * (in[(size_t) c * L + (t * s)] +
-                                             in[(size_t) c * L + (t * s) + 1]);
-    return y;
-}
-} // namespace
-
 // ---------------------------------------------------------------------------
 // Fused conv + encode + avg_pool + ln_post + project with a per-mel_T bounded-LRU
 // ReplayGraph cache (GPU). The full Whisper Conv1d front-end + avg_pool + depthwise

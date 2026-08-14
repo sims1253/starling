@@ -18,7 +18,7 @@ Reference decode settings (from ``.hf-cache/hojo-asr-v1/config.yaml``):
 ``inputs_embeds`` (no ``input_ids``) it returns ONLY the newly generated tokens
 (no prompt prefix), including the trailing eos (151645) when it stops on eos.
 ``text`` is derived from those ids via ``tokenizer.batch_decode(ids,
-add_special_tokens=False)`` followed by the ``run_infer`` post-processing
+skip_special_tokens=False)`` followed by the ``run_infer`` post-processing
 (strip ``<|im_end|>`` / ``<|endoftext|>``, ``.strip()``), so detokenizing
 ``gen_ids`` reproduces ``text`` (the trailing eos detokenizes to empty after
 the special-token strip).
@@ -122,12 +122,12 @@ def infer_with_ids(
         min_length=generation_config.get("min_length", 1),
         temperature=generation_config.get("temperature", 1.0),
         top_p=generation_config.get("top_p", 0.9),
-        repetition_penalty=generation_config.get("repetition_penalty", 1.0),
+        repetition_penalty=generation_config.get("repetition_penalty", 2.0),
         length_penalty=generation_config.get("length_penalty", 1.0),
         attention_mask=attention_mask,
     )
 
-    texts_raw = model.tokenizer.batch_decode(output_ids, add_special_tokens=False)
+    texts_raw = model.tokenizer.batch_decode(output_ids, skip_special_tokens=False)
     results: List[Dict[str, Any]] = []
     for j in range(batch_size):
         results.append(
@@ -234,7 +234,7 @@ def main() -> int:
     }
 
     GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(GOLDEN_PATH, "w") as f:
+    with open(GOLDEN_PATH, "w", encoding="utf-8") as f:
         json.dump(golden, f, indent=2)
     print(f"wrote {GOLDEN_PATH}")
     return 0

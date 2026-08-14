@@ -49,7 +49,9 @@ MODEL_DIR = REPO / ".hf-cache" / "hojo-asr-v1"
 def load_wav(path: Path) -> tuple[np.ndarray, int]:
     wav, sr = sf.read(str(path))
     if wav.ndim > 1:
-        wav = wav.mean(axis=1)
+        # Match the runtime path (waveform[0:1, :] -> channel 0), not an average
+        # across channels; the reference and tests select channel 0.
+        wav = wav[:, 0]
     return np.asarray(wav, dtype=np.float32), int(sr)
 
 
@@ -122,7 +124,7 @@ def capture_stages(model, audio_np: np.ndarray) -> tuple[dict, list[int]]:
             stop = torch.tensor([-100], device=model.device)
             criteria = StoppingCriteriaList(
                 [StopOnTokenSequences(stop_token_seqs=[stop])])
-            feat_len = inputs_embeds.size(1)
+            feat_len = speech_embeddings.size(1)
             max_new_tokens = max(min(200, int(feat_len * 2) + 10), 10)
             outputs = model.decoder_model.generate(
                 inputs_embeds=inputs_embeds,
@@ -188,8 +190,12 @@ def main() -> int:
         elapsed = time.perf_counter() - t0
 
         expected_ids = ref["fixtures"][name]["gen_ids"]
-        n = min(len(gen_ids), len(expected_ids))
-        assert gen_ids[:n] == expected_ids[:n], (
+        assert len(gen_ids) == len(expected_ids), (
+            f"{name}: captured decode length {len(gen_ids)} != golden length "
+            f"{len(expected_ids)} (got {gen_ids[:12]}... expected {expected_ids[:12]}...)"
+        )
+        n = len(gen_ids)
+        assert gen_ids == expected_ids, (
             f"{name}: captured decode diverged from hojo_reference.json at "
             f"index {next((i for i in range(n) if gen_ids[i] != expected_ids[i]), n)} "
             f"(got {gen_ids[:12]}... expected {expected_ids[:12]}...)"

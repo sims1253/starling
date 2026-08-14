@@ -256,7 +256,17 @@ bool encode_audio_tower(const HojoModel& model, const MelFeatures& mel,
                 mel_win[(size_t) t * n_mels + c] =
                     mel.data[(size_t) c * mel_T + (off + t)];
         std::vector<float> conv = host_conv2d_stack(model.loader, mel_win, wl, n_mels);
-        const int64_t conv_T = (int64_t) conv.size() / 7680;
+        // Flattened conv width = downsample_hidden_size (480) * (n_mels>>3) (freq
+        // is halved 3x by the stride-2 convs: 128->64->32->16). Validate the conv
+        // output divides evenly so a malformed window cannot yield a wrong conv_T.
+        const int64_t conv_width = (int64_t) tc.downsample_hidden_size * (n_mels >> 3);
+        if (conv_width <= 0 || conv.size() % (size_t) conv_width != 0) {
+            err = "Hojo tower conv output size " + std::to_string(conv.size()) +
+                  " is not divisible by the flattened width " +
+                  std::to_string(conv_width);
+            return false;
+        }
+        const int64_t conv_T = (int64_t) conv.size() / conv_width;
         per_window_conv.push_back(std::move(conv));
         per_window_frames.push_back(conv_T);
     }

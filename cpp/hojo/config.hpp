@@ -14,10 +14,11 @@
 //     fc2 [1280,5120] -> residual) -> ln_post LayerNorm -> proj1 [1280,1280]
 //     GELU -> proj2 [2048,1280]. Output [n_speech, 2048].
 //
-// The tower runs the conv2d front-end over mel chunked into 200-frame windows
-// (n_window*2=100 per window, conv_chunksize=500 windows batched), then runs the
-// 32 transformer layers over the FULL packed sequence with a block-diagonal
-// 4D attention mask built from cu_seqlens (bidirectional within each window).
+// The tower runs the conv2d front-end over mel chunked into windows of
+// n_window*2 = 3000 frames (ceil(mel_T/3000); conv_chunksize batches the
+// reference's conv compute, not the window length), then runs the 32
+// transformer layers over the FULL packed sequence with a block-diagonal 4D
+// attention mask built from cu_seqlens (bidirectional within each window).
 //
 // The bottleneck (WeNet Conformer, LinearNoSubsampling + RelPositionalEncoding):
 //   Linear(2048->2560) + LayerNorm -> + RelPosEnc pe[1,5000,2560] (x scaled by

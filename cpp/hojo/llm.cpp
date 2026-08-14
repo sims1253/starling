@@ -300,6 +300,14 @@ bool beam_generate(const HojoModel& m, const InputsEmbeds& i,
     const int32_t max_new = (int32_t) op.max_new_tokens;
     const int B = (int) op.num_beams;
     const int vocab = (int) m.config.llm.vocab;
+    // num_beams comes from untrusted GGUF metadata; the candidate ranking does
+    // std::partial_sort(..., begin + 2*B, end) over a `vocab`-sized list, so
+    // reject B outside [1, vocab/2] to keep begin + 2*B within bounds.
+    if (B < 1 || vocab < 2 || B > vocab / 2) {
+        e = "invalid Hojo beam count " + std::to_string(B) +
+            " (must be in [1, vocab/2=" + std::to_string(vocab / 2) + "])";
+        return false;
+    }
     const float lp = (float) op.length_penalty;
     const float penalty = (float) op.repetition_penalty;
     RopeTables rope = build_rope_tables(m.config.llm, (int)(i.n_tokens + max_new + 4));
@@ -307,6 +315,14 @@ bool beam_generate(const HojoModel& m, const InputsEmbeds& i,
     // Prefill (step 0): logits over vocab at the last prefix position.
     std::vector<int32_t> empty;
     if (!forward_logits(m, i.data, i.n_tokens, empty, rope, o.prefill_logits, e)) return false;
+    // The lm_head output dim must match config vocab: log_softmax below indexes
+    // the logits vector with `vocab`, so a mismatch would read out of bounds.
+    // (lm_head shape is constant, so this one check covers every later forward.)
+    if ((int) o.prefill_logits.size() != vocab) {
+        e = "Hojo lm_head vocab dim (" + std::to_string(o.prefill_logits.size()) +
+            ") != config vocab (" + std::to_string(vocab) + ")";
+        return false;
+    }
 
     // ---- Helpers mirroring HF 4.57.x beam search semantics. ----
     // log_softmax over the full vocab (f32).

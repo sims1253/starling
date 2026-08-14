@@ -109,7 +109,7 @@ def capture_stages(model: Any, tokenizer: Any, audio_np: np.ndarray) -> tuple[di
       - audio_embeds: capture the output of ``model.audio_encoder_proj`` (the
         HiggsAudioFeatureProjector MLP) -> (B, T_proj, 2048).
 
-    mel is taken from the collator's ``audio_pixel_values``; prompt_ids from the
+    mel is taken from the collator's ``audio_features``; prompt_ids from the
     collator's ``input_ids``; inputs_embeds from the model forward; prefill
     logits from the first forward's last position.
     """
@@ -250,10 +250,15 @@ def main() -> int:
         elapsed = time.perf_counter() - t0
 
         expected_ids = ref["fixtures"][name]["gen_ids"]
-        # The golden may stop early (EOS); compare up to the shorter length, but
-        # require the captured ids to match the golden prefix exactly.
-        n = min(len(gen_ids), len(expected_ids))
-        assert gen_ids[:n] == expected_ids[:n], (
+        # The staged tensors must correspond to the exact golden decode, so a
+        # length mismatch is a divergence too -- reject it explicitly before the
+        # elementwise comparison.
+        assert len(gen_ids) == len(expected_ids), (
+            f"{name}: captured decode length {len(gen_ids)} != golden length "
+            f"{len(expected_ids)} (got {gen_ids[:12]}... expected {expected_ids[:12]}...)"
+        )
+        n = len(gen_ids)
+        assert gen_ids == expected_ids, (
             f"{name}: captured decode diverged from higgs_golden.json at "
             f"index {next((i for i in range(n) if gen_ids[i] != expected_ids[i]), n)} "
             f"(got {gen_ids[:12]}... expected {expected_ids[:12]}...)"

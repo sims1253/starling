@@ -150,13 +150,16 @@ bool HiggsModel::load(const char* path, std::string& err) {
     POS(c.encoder.n_heads, "enc.encoder_attention_heads");
     POS(c.encoder.head_dim, "enc.head_dim");
     POS(c.encoder.ffn_dim, "enc.encoder_ffn_dim");
+    POS(c.frontend.n_samples, "frontend.n_samples");
     POS(c.projector.input_size, "proj.input_size");
     POS(c.projector.output_size, "proj.output_size");
     POS(c.llm.hidden, "llm.hidden_size");
+    POS(c.llm.n_layers, "llm.num_layers");
     POS(c.llm.n_heads, "llm.num_heads");
     POS(c.llm.n_kv_heads, "llm.num_kv_heads");
     POS(c.llm.head_dim, "llm.head_dim");
     POS(c.llm.intermediate, "llm.intermediate_size");
+    POS(c.llm.max_cache, "llm.max_cache_len");
     POS(c.llm.vocab, "llm.vocab_size");
 #undef POS
     if (c.encoder.d_model != c.encoder.n_heads * c.encoder.head_dim) {

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from transformers import StoppingCriteria
 
 from .config import (
     AUTOMIX_DTYPE,
@@ -72,7 +73,7 @@ class BeamDecodeConfig:
     top_p: float = TOP_P
 
 
-class StopOnTokenSequences:
+class StopOnTokenSequences(StoppingCriteria):
     """Replicate ``hojo_asr.hojo_asr_model.StopOnTokenSequences``.
 
     Stops generation when the generated suffix matches any of the given token
@@ -83,6 +84,7 @@ class StopOnTokenSequences:
     """
 
     def __init__(self, stop_token_seqs: list[torch.Tensor] | None = None) -> None:
+        super().__init__()
         self.stop_token_seqs = stop_token_seqs or []
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
@@ -189,13 +191,11 @@ class LLMMega:
         stop_tensor = torch.tensor(
             list(STOP_TOKEN_SEQS[0]), device=inputs_embeds.device
         )
-        try:
-            from transformers import StoppingCriteriaList
-            criteria = StoppingCriteriaList(
-                [StopOnTokenSequences(stop_token_seqs=[stop_tensor])]
-            )
-        except Exception:
-            criteria = None
+        from transformers import StoppingCriteriaList
+
+        criteria = StoppingCriteriaList(
+            [StopOnTokenSequences(stop_token_seqs=[stop_tensor])]
+        )
 
         # The decoder is bf16; the reference runs generate under fp16 autocast.
         autocast_dtype = getattr(torch, AUTOMIX_DTYPE, torch.float16)
@@ -215,9 +215,8 @@ class LLMMega:
                 length_penalty=cfg.length_penalty,
                 attention_mask=attention_mask,
                 pad_token_id=PAD_TOKEN_ID,
+                stopping_criteria=criteria,
             )
-            if criteria is not None:
-                gen_kwargs["stopping_criteria"] = criteria
             output_ids = self.model.decoder_model.generate(**gen_kwargs)
         torch.cuda.synchronize()
         wall_ms = (time.perf_counter() - t0) * 1000.0
@@ -239,7 +238,7 @@ class LLMMega:
         n = int(ids.numel())
         text = ""
         if tokenizer is not None:
-            text = tokenizer.decode(ids.tolist(), add_special_tokens=False)
+            text = tokenizer.decode(ids.tolist(), skip_special_tokens=False)
         tok_per_s = n / max(wall_ms / 1000.0, 1e-9)
         return GenerateResult(
             ids=ids.unsqueeze(0),

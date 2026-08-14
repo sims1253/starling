@@ -18,12 +18,13 @@ Architecture (verified against hojo-asr-v1.tensors.json + the hojo_asr package):
   - Qwen3-4B decoder (`decoder_model.*`, BF16): 36 layers, hidden 2560, GQA 32/8,
     head_dim 128, intermediate 9728, vocab 151670, qk_norm, SEPARATE lm_head.
 
-The forward path packs the mel into 200-frame windows for the conv2d tower
-(conv_chunksize=500 batched windows) and runs the 32 tower transformer layers
-over the full packed sequence with a block-diagonal attention mask built from
-cu_seqlens (bidirectional within each window). The bottleneck then runs over
-the re-segmented per-window output. Single-utterance inference (the parity
-case) has exactly one window's worth of frames when feat_len <= n_window_infer.
+The forward path packs the mel into windows of n_window*2 = 3000 frames
+(ceil(mel_T/3000); conv_chunksize batches the conv compute) for the conv2d tower
+and runs the 32 tower transformer layers over the full packed sequence with a
+block-diagonal attention mask built from cu_seqlens (bidirectional within each
+window). The bottleneck then runs over the re-segmented per-window output.
+Single-utterance inference (the parity case) has exactly one window's worth of
+frames when feat_len <= n_window_infer.
 
 This converter mirrors scripts/convert_higgs_gguf.py: an explicit, complete
 tensor-name map (a checkpoint addition should fail conversion), with all model

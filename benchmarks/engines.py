@@ -1895,6 +1895,8 @@ def build_engines(
                 chosen[mdl].append(StarlingGgmlArk())
             elif mdl == "higgs":
                 chosen[mdl].append(StarlingGgmlHiggs())
+            elif mdl == "hojo":
+                chosen[mdl].append(StarlingGgmlHojo())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

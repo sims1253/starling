@@ -20,8 +20,9 @@ struct TowerOutput {
 };
 
 // Run the Qwen3-Omni audio tower over a single utterance's mel:
-//   mel reshape -> 3x Conv2d downsample (GELU between) over 200-frame windows
-//   (conv_chunksize batched) -> flatten freq -> conv_out Linear -> add computed
+//   mel reshape -> 3x Conv2d downsample (GELU between) over windows of
+//   tc.n_window*2 = 3000 frames (conv_chunksize controls the conv batching, not
+//   the window length) -> flatten freq -> conv_out Linear -> add computed
 //   SinusoidsPositionEmbedding -> 32 pre-norm LayerNorm transformer layers
 //   (bidirectional, block-diagonal mask over the packed windows) -> ln_post ->
 //   proj1 GELU proj2. Output [n_speech, 2048].
