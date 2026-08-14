@@ -69,9 +69,7 @@ starling_ggml_model slug_to_model(const std::string& slug) {
     if (slug == "moss")     return STARLING_GGML_MOSS;
     if (slug == "ark")      return STARLING_GGML_ARK;
     if (slug == "higgs")    return STARLING_GGML_HIGGS;
-#ifdef STARLING_GGML_HOJO
     if (slug == "hojo")     return STARLING_GGML_HOJO;
-#endif
     return (starling_ggml_model)0;
 }
 
@@ -81,9 +79,7 @@ const char* model_to_slug(starling_ggml_model m) {
     case STARLING_GGML_MOSS:         return "moss";
     case STARLING_GGML_ARK:          return "ark";
     case STARLING_GGML_HIGGS:        return "higgs";
-#ifdef STARLING_GGML_HOJO
     case STARLING_GGML_HOJO:         return "hojo";
-#endif
     }
     return "unknown";
 }
@@ -94,10 +90,7 @@ bool is_supported_model(const std::string& slug) {
 
 // Build the supported-models list string for --version.
 std::string supported_models_str() {
-    std::string s = "parakeet moss ark higgs";
-#ifdef STARLING_GGML_HOJO
-    s += " hojo";
-#endif
+    std::string s = "parakeet moss ark higgs hojo";
     return s;
 }
 
@@ -162,16 +155,16 @@ void StarlingServer::warmup() {
         warmup_in_progress_ = true;
     }
     std::fprintf(stderr,
-                 "[starling-serve] warming up on %.1fs silent clip ...\n",
-                 kWarmupSeconds);
+        "[starling-serve] warming up on %.1fs silent clip ...\n",
+        kWarmupSeconds);
     int n = static_cast<int>(kWarmupSeconds * kSampleRate);
     std::vector<float> dummy(n, 0.0f);
     std::string err;
-    // Warmup is a transcribe of silence — captures CUDA graphs etc.
+    // Warmup is a transcribe of silence — captures CUDA graphs etc. It takes
+    // a serial-queue ticket (blocking) so it can't overlap a real request.
     // do_transcribe sets phase Busy→Ready internally.
-    auto result = do_transcribe(dummy.data(), n, nullptr, &err);
+    auto result = do_transcribe(dummy.data(), n, nullptr, &err, QueuePolicy::Block);
     (void)result;
-    phase_.store(Phase::Ready);
     {
         std::lock_guard<std::mutex> lk(warmup_mutex_);
         warmup_in_progress_ = false;
@@ -205,7 +198,8 @@ bool StarlingServer::cancel_request(const std::string& id) {
 }
 
 TranscribeResult StarlingServer::transcribe_pcm(
-    const float* samples, int64_t n, RequestContext* ctx, std::string* err) {
+    const float* samples, int64_t n, RequestContext* ctx, std::string* err,
+    QueuePolicy policy) {
     if (!loaded_.load() || !model_) {
         load();
         if (!loaded_.load() || !model_) {
@@ -213,12 +207,15 @@ TranscribeResult StarlingServer::transcribe_pcm(
             return {};
         }
     }
-    return do_transcribe(samples, n, ctx, err);
+    return do_transcribe(samples, n, ctx, err, policy);
 }
 
 TranscribeResult StarlingServer::do_transcribe(
-    const float* samples, int64_t n, RequestContext* ctx, std::string* err) {
-    // Acquire the serial queue position.
+    const float* samples, int64_t n, RequestContext* ctx, std::string* err,
+    QueuePolicy policy) {
+    // Acquire the serial queue position. Every caller gets a ticket —
+    // anonymous ones (warmup, WS streaming) get a synthesized id so they
+    // queue like everyone else instead of racing the engine.
     std::string req_id = ctx ? ctx->id : "";
     {
         std::unique_lock<std::mutex> lk(mutex_);
@@ -226,35 +223,40 @@ TranscribeResult StarlingServer::do_transcribe(
             if (err) *err = "server busy";
             return {};
         }
-        if (!req_id.empty()) {
-            request_order_.push_back(req_id);
-        }
+        if (req_id.empty()) req_id = "#anon-" + std::to_string(next_anon_id_++);
+        request_order_.push_back(req_id);
         n_waiters_++;
+
+        // Leave the queue (waiter gone, ticket removed). Lock is held.
+        auto leave_queue = [&]() {
+            n_waiters_--;
+            auto it = std::find(request_order_.begin(),
+                                request_order_.end(), req_id);
+            if (it != request_order_.end()) request_order_.erase(it);
+            queue_cv_.notify_all();
+        };
 
         // Wait for our turn (head of the queue), with a timeout.
         auto wait_start = std::chrono::steady_clock::now();
-        while (!req_id.empty()) {
+        while (request_order_.front() != req_id) {
             if (ctx && ctx->cancelled.load()) {
-                n_waiters_--;
-                auto it = std::find(request_order_.begin(),
-                                    request_order_.end(), req_id);
-                if (it != request_order_.end()) request_order_.erase(it);
-                queue_cv_.notify_all();
+                leave_queue();
                 if (err) *err = "cancelled";
                 return {};
             }
-            if (!request_order_.empty() && request_order_.front() == req_id)
-                break;
+            if (policy == QueuePolicy::SkipIfBusy) {
+                // Anonymous latency-sensitive caller (WS streaming chunk):
+                // don't park on the queue — report busy and retry later.
+                leave_queue();
+                if (err) *err = "server busy";
+                return {};
+            }
             double timeout = cfg_.request_timeout_seconds;
             if (timeout > 0) {
                 auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - wait_start).count();
                 if (elapsed >= timeout) {
-                    n_waiters_--;
-                    auto it = std::find(request_order_.begin(),
-                                        request_order_.end(), req_id);
-                    if (it != request_order_.end()) request_order_.erase(it);
-                    queue_cv_.notify_all();
+                    leave_queue();
                     if (err) *err = "request timed out";
                     return {};
                 }
@@ -265,10 +267,9 @@ TranscribeResult StarlingServer::do_transcribe(
 
     if (ctx && ctx->cancelled.load()) {
         std::lock_guard<std::mutex> lk(mutex_);
+        // We're at the front of the queue (our turn arrived).
         n_waiters_--;
-        if (!req_id.empty() && !request_order_.empty()
-            && request_order_.front() == req_id)
-            request_order_.pop_front();
+        request_order_.pop_front();
         queue_cv_.notify_all();
         if (err) *err = "cancelled";
         return {};
@@ -278,7 +279,6 @@ TranscribeResult StarlingServer::do_transcribe(
     if (ctx) ctx->running.store(true);
 
     // Run the transcribe (the C engine is synchronous).
-    const char* cerr = nullptr;
     char* result_text = starling_ggml_transcribe_pcm(
         model_, samples, n, kSampleRate);
 
@@ -287,10 +287,9 @@ TranscribeResult StarlingServer::do_transcribe(
 
     {
         std::lock_guard<std::mutex> lk(mutex_);
+        // We're at the front of the queue; release the turn to the next waiter.
         n_waiters_--;
-        if (!req_id.empty() && !request_order_.empty()
-            && request_order_.front() == req_id)
-            request_order_.pop_front();
+        request_order_.pop_front();
         queue_cv_.notify_all();
     }
 
