@@ -32,6 +32,8 @@ import json
 import os
 import re
 import statistics
+import tempfile
+import xml.etree.ElementTree as ET
 import subprocess
 import sys
 import tempfile
@@ -192,11 +194,39 @@ def cmd_run(args: argparse.Namespace) -> int:
         failed = []
         for mdl in models:
             print(f"-- byte-exact parity: {mdl} (isolated process)")
+            # Judge by test verdicts, not the process exit code: the moss/ark
+            # ctypes processes hit a pre-existing ggml teardown double-free at
+            # interpreter shutdown (RC 134) AFTER pytest has reported results.
+            # The printed summary line always precedes the abort; junitxml
+            # (finalized around the same point) is the backup verdict.
+            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tf:
+                xml_path = tf.name
+            # Full test-name selector: bare short tokens like "ark" do not
+            # substring-filter in pytest -k and would run (and load) every
+            # model in one process.
+            selector = f"starling_ggml_{mdl}_text_parity"
             r = subprocess.run(
                 [sys.executable, "-m", "pytest", str(REPO / "tests" / "test_ggml_parity.py"),
-                 "-k", mdl, "-v"],
-                cwd=str(REPO))
-            if r.returncode != 0:
+                 "-k", selector, "-v", "--junitxml", xml_path],
+                cwd=str(REPO), capture_output=True, text=True)
+            tail = "\n".join((r.stdout + r.stderr).splitlines()[-12:])
+            print("\n".join("    " + line for line in tail.splitlines()[-6:]))
+            summaries = [l for l in r.stdout.splitlines()
+                         if re.fullmatch(r"=+ .* in .*=?=*", l) and "passed" in l]
+            ok = bool(summaries) and not any(
+                re.search(r"\b\d+ (failed|error|errors)\b", l) for l in summaries)
+            if not ok:
+                try:
+                    root = ET.parse(xml_path).getroot()
+                    suites = root.findall(".//testsuite") or [root]
+                    n_bad = sum(int(s.attrib.get("failures", "0")) +
+                                int(s.attrib.get("errors", "0")) for s in suites)
+                    n_run = sum(int(s.attrib.get("tests", "0")) for s in suites)
+                    ok = n_run > 0 and n_bad == 0
+                except ET.ParseError:
+                    pass
+            os.unlink(xml_path)
+            if not ok:
                 failed.append(mdl)
         if failed:
             print(f"PARITY FAILED for {failed} — aborting eval run")
