@@ -120,12 +120,17 @@ bool HojoModel::load(const char* path, std::string& err) {
     U(c.decode.num_beams, "decode.num_beams");
     U(c.decode.min_length, "decode.min_length");
     {
+        // max_new_tokens lives at either of two KV locations (the decode.*
+        // group or the converter's legacy top-level key); honor whichever is
+        // present, with the int32 range guard.
         int64_t mnt = 0;
         if (m.kv_int("hojo.decode.max_new_tokens", mnt) ||
             m.kv_int("hojo.max_new_tokens", mnt)) {
-            uint32_t t;
-            if (!lib::u32(m, "hojo.decode.max_new_tokens", 0, t, err)) return false;
-            c.decode.max_new_tokens = t;
+            if (mnt < 0 || mnt > (int64_t) INT32_MAX) {
+                err = "Hojo GGUF max_new_tokens out of int32 range: " + std::to_string(mnt);
+                return false;
+            }
+            c.decode.max_new_tokens = (uint32_t) mnt;
         }
     }
     D(c.decode.repetition_penalty, "decode.repetition_penalty");
