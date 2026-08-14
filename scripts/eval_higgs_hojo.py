@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -182,14 +183,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         subprocess.run(["cmake", "--build", str(REPO / "build"), "-j"], check=True)
 
     if not args.skip_parity:
-        print(f"-- byte-exact parity (pytest -k {args.parity_k!r})")
-        r = subprocess.run(
-            [sys.executable, "-m", "pytest", str(REPO / "tests" / "test_ggml_parity.py"),
-             "-k", args.parity_k, "-v"],
-            cwd=str(REPO))
-        if r.returncode != 0:
-            print("PARITY FAILED — aborting eval run")
-            return r.returncode
+        # One pytest process per model token in the expression: loading
+        # moss+ark+higgs+hojo (28 GB of weights) in ONE process overflows a
+        # 32 GB GPU because ggml's process-global backend does not return
+        # realized weights + replay caches to the pool between modules.
+        # Process exit is the only reliable VRAM fence.
+        models = [t for t in re.split(r"\s+or\s+", args.parity_k) if t]
+        failed = []
+        for mdl in models:
+            print(f"-- byte-exact parity: {mdl} (isolated process)")
+            r = subprocess.run(
+                [sys.executable, "-m", "pytest", str(REPO / "tests" / "test_ggml_parity.py"),
+                 "-k", mdl, "-v"],
+                cwd=str(REPO))
+            if r.returncode != 0:
+                failed.append(mdl)
+        if failed:
+            print(f"PARITY FAILED for {failed} — aborting eval run")
+            return 1
 
     import numpy as np
     import soundfile as sf
@@ -197,10 +208,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     fixtures = _fixtures()
     results: dict[str, dict] = {"engines": {}}
+    wanted = [m.strip() for m in args.models.split(",") if m.strip()]
     for label, cls, timing_env in (
         ("higgs", StarlingGgmlHiggs, "STARLING_HIGGS_TIMING"),
         ("hojo", StarlingGgmlHojo, "STARLING_HOJO_TIMING"),
     ):
+        if label not in wanted:
+            continue
         if not cls().available:
             print(f"-- {label}: engine unavailable, skipping")
             continue
@@ -267,8 +281,11 @@ def main() -> int:
     run_p.add_argument("--repeats", type=int, default=3, help="warm best-of-N repeats")
     run_p.add_argument("--skip-parity", action="store_true")
     run_p.add_argument("--parity-k", default="higgs or hojo",
-                       help='pytest -k expression; use "higgs or hojo or moss or ark" '
-                            "to gate the whole refactor across all four engines")
+                       help='pytest -k expression split on "or" into per-model '
+                            "subprocesses (VRAM isolation); e.g. "
+                            '"higgs or hojo or moss or ark"')
+    run_p.add_argument("--models", default="higgs,hojo",
+                       help="comma list limiting the timing/RTFx phase, e.g. --models hojo")
     args = ap.parse_args()
     return cmd_preflight(args) if args.mode == "preflight" else cmd_run(args)
 
