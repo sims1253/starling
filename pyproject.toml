@@ -33,6 +33,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "requests",
+    "websockets",
 ]
 
 [project.scripts]

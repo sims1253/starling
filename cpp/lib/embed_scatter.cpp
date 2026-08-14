@@ -1,5 +1,6 @@
 // embed_scatter.cpp — prompt embedding + audio scatter (see embed_scatter.hpp).
 #include "embed_scatter.hpp"
+#include <algorithm>
 #include <cstdio>
 
 namespace starling::ggml::lib {
@@ -19,7 +20,10 @@ bool embed_and_scatter_audio(const ModelLoader& ml, int64_t hidden,
         err = std::string(label) + " audio/prompt scatter size mismatch";
         return false;
     }
-    const int64_t sa = audio_tokens;
+    // Clamp the token count to the rows actually present: a metadata token
+    // count larger than the feature buffer would read past its end.
+    const int64_t avail = (int64_t)(audio_len / (size_t) audio_width);
+    const int64_t sa = std::max<int64_t>(0, std::min(audio_tokens, avail));
     ensure_weights_realized(ml);
     std::vector<int32_t> idv = ids;
     std::vector<ggml_bf16_t> ah;

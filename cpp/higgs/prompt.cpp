@@ -24,6 +24,8 @@
 #include "runtime/graph.hpp"
 #include "lib/embed_scatter.hpp"
 #include "ggml.h"
+
+#include <algorithm>
 namespace starling::ggml::higgs {
 
 namespace {

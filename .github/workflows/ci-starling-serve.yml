@@ -1,0 +1,49 @@
+# CI: build starling-serve (CPU smoke build) on every PR / push.
+#
+# This verifies the native serving layer compiles and --version / --abi-version
+# work. Full GPU builds (CUDA/Vulkan/Metal) are verified in the release workflow.
+
+name: CI starling-serve
+
+on:
+  push:
+    branches: [feat/native-serving-layer]
+    paths:
+      - 'cpp/serve/**'
+      - 'CMakeLists.txt'
+      - 'third_party/httplib.h'
+      - '.github/workflows/ci-starling-serve.yml'
+  pull_request:
+    paths:
+      - 'cpp/serve/**'
+      - 'CMakeLists.txt'
+      - 'third_party/httplib.h'
+
+jobs:
+  build-cpu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build (CPU)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Smoke test --version
+        run: |
+          ./build/starling-serve --version
+          ./build/starling-serve --abi-version
+
+      - name: Smoke test --help
+        run: ./build/starling-serve --help
+
+      - name: Smoke test HTTP /health
+        run: |
+          ./build/starling-serve --model parakeet --gguf /dev/null \
+            --port 18181 --no-eager-load &
+          sleep 1
+          curl -sf http://127.0.0.1:18181/health | grep -q '"model":"parakeet"'
+          kill %1 2>/dev/null || true
