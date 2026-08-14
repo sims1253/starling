@@ -1,5 +1,6 @@
 #pragma once
 #include "audio_encoder.hpp"
+#include "lib/qwen_decode.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -11,10 +12,7 @@ struct Prompt {
     std::vector<int32_t> ids;
     std::vector<uint8_t> audio_mask;
 };
-struct InputsEmbeds {
-    std::vector<float> data;
-    int64_t n_tokens = 0, width = 0;
-};
+using InputsEmbeds = lib::InputsEmbeds;
 // Build the transcribe prompt for `mel_frames` (the uncapped frame count). The
 // prefix/suffix + N are baked in the GGUF (empirically captured from the HF
 // processor: <|user|><|begin_of_audio|> + <|audio|>*N + <|end_of_audio|> +
@@ -25,4 +23,4 @@ Prompt build_transcribe_prompt(const Config& c, int64_t mel_frames);
 // modeling_arkasr._inject_audio_embeddings.
 bool build_inputs_embeds(const ArkModel& m, const Prompt& p, const AudioEncoding& audio,
                          InputsEmbeds& out, std::string& err);
-} // namespace starling::ggml::ark
+}
