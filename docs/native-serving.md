@@ -76,10 +76,13 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 ## API contract
 
 Mirrors the Python server's endpoint set, but the two are not drop-in
-identical. A client written against one needs three adjustments on the other:
+identical. A client written against one needs four adjustments on the other:
 
 - **Inputs**: this server requires 16 kHz audio (below); the Python server
   resamples non-16 kHz WAVs via scipy instead of rejecting them.
+- **Request ids**: `X-Request-Id` values starting with `#` are rejected
+  with `400` — the prefix is reserved for the server's internal queue
+  tickets. The Python server accepts them.
 - **Phase names**: `unloaded → loading → ready → busy` here; the Python
   server reports `loading_weights` and `warming_up` during startup.
 - **Error responses**: the status-code and body details documented below
@@ -106,9 +109,9 @@ PCM16 @ 16 kHz little-endian. Returns:
 ```
 
 Uses `X-Request-Id` header for tracking. Errors map to: `400` malformed
-audio / sample-rate mismatch, `409` duplicate active request id, `499`
-cancelled, `503` busy or model not loaded, `504` queue timeout, `500` other
-engine failures.
+audio / sample-rate mismatch / invalid request id, `409` duplicate active
+request id, `413` request body too large, `499` cancelled, `503` busy or
+model not loaded, `504` queue timeout, `500` other engine failures.
 
 ### `POST /warmup`
 
