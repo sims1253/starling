@@ -1,12 +1,12 @@
 // server.hpp — native starling-serve HTTP/WebSocket server.
 //
 // Wraps libstarling_ggml (the flat C API in cpp/include/starling_ggml.h) behind
-// the same HTTP/WS contract as the Python `starling.server`, so freestyle's
-// TypeScript supervisor is a drop-in replacement:
+// the same HTTP/WS contract as the Python `starling.server`, so a supervisor
+// that spawns the Python server can switch with a one-line change:
 //
 //   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 //
-// Endpoints (identical to the Python server):
+// Endpoints (mirroring the Python server):
 //   GET    /health          → { model, loaded, phase, queue_depth, busy }
 //   POST   /transcribe      → multipart/raw WAV → { text, segments, duration_s, request_id }
 //   POST   /inference       → alias for /transcribe
@@ -14,7 +14,7 @@
 //   DELETE /inference/<id>  → cancel a queued/in-flight request by X-Request-Id
 //   WS     /stream          → real-time streaming dictation
 //
-// One model is resident at a time (freestyle enforces this). Inference is
+// One model is resident at a time (the supervisor enforces this). Inference is
 // serialised through a request queue so only one transcribe is in-flight
 // (matching the Python server's single-GPU-worker model).
 #pragma once
@@ -49,7 +49,7 @@ constexpr int    kMaxUploadMB          = 256;
 constexpr double kRequestTimeoutS      = 600.0;
 
 // ---- model slug ↔ enum ----------------------------------------------------
-// Maps the freestyle CLI slug to the C-API model enum. Returns 0 (invalid)
+// Maps the CLI slug to the C-API model enum. Returns 0 (invalid)
 // if the slug is unknown.
 starling_ggml_model slug_to_model(const std::string& slug);
 const char* model_to_slug(starling_ggml_model m);
@@ -95,7 +95,18 @@ struct RequestContext {
     std::string id;
     std::atomic<bool> cancelled{false};
     std::atomic<bool> running{false};
+    // Completion claim, guarded by StarlingServer::mutex_. Set once the
+    // engine call has finished; cancellation and completion each check the
+    // other under the same lock so exactly one of them wins.
+    bool done = false;
 };
+
+// Queue behaviour for callers without a RequestContext (WS streaming chunks,
+// warmup). Everyone — including anonymous callers — takes a ticket in the
+// serial queue so only one transcribe is ever in-flight; the policy only
+// decides whether an anonymous caller waits for its turn or bails out with
+// "server busy" so it can retry later.
+enum class QueuePolicy { Block, SkipIfBusy };
 
 // ---- the server -----------------------------------------------------------
 class StarlingServer {
@@ -109,10 +120,12 @@ public:
 
     // Synchronous transcribe of raw float32 mono PCM samples. Enqueues onto the
     // serial worker, blocks until done. ctx is used for cancellation; pass
-    // nullptr for fire-and-forget (no cancellation).
+    // nullptr for fire-and-forget (no cancellation) — the call still queues
+    // behind earlier requests instead of bypassing them.
     // Returns the result, or sets *err on failure.
     TranscribeResult transcribe_pcm(const float* samples, int64_t n,
-                                     RequestContext* ctx, std::string* err);
+                                     RequestContext* ctx, std::string* err,
+                                     QueuePolicy policy = QueuePolicy::Block);
 
     // Cancel a queued/in-flight request by id. Returns true if found.
     bool cancel_request(const std::string& id);
@@ -142,10 +155,14 @@ private:
     std::mutex load_mutex_;           // serializes model loading (long operation)
     std::condition_variable queue_cv_;
 
-    // Serial inference queue: requests wait in arrival order.
+    // Serial inference queue: requests wait in arrival order. Anonymous
+    // callers (no RequestContext) get a synthesized "#anon-N" ticket so they
+    // queue too; those tickets are never in the requests_ registry and can't
+    // be cancelled.
     std::deque<std::string> request_order_;
     std::unordered_map<std::string, std::unique_ptr<RequestContext>> requests_;
     int n_waiters_ = 0;
+    uint64_t next_anon_id_ = 0;
 
     // Lifecycle phase.
     std::atomic<Phase> phase_{Phase::Unloaded};
@@ -158,7 +175,8 @@ private:
 
     // Internal: run transcribe under the serial lock.
     TranscribeResult do_transcribe(const float* samples, int64_t n,
-                                    RequestContext* ctx, std::string* err);
+                                    RequestContext* ctx, std::string* err,
+                                    QueuePolicy policy);
 };
 
 } // namespace starling::serve

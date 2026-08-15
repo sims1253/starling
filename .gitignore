@@ -31,6 +31,19 @@ comms.md
 review.md
 .gpu.lock
 
+# internal dev notes (kept locally, untracked — see docs/native-serving.md,
+# docs/ggml-engine.md, docs/hf-gguf-readme.md for the published docs)
+docs/competitor-lessons.md
+docs/ggml-roadmap.md
+docs/ggml-fused-ops-spec.md
+docs/ggml-optimization-ideas.md
+docs/ggml-moss-spec.md
+docs/ggml-ark-perf.md
+docs/ggml-parakeet-perf-analysis.md
+docs/ggml-inrepo-baseline.md
+docs/ggml-moss-goldens.md
+docs/gpu-isolation-and-parakeet-parity.md
+
 # agent-tool working state (accidentally swept in by a git add . in 918da17)
 .claude/
 .zcode/
@@ -58,7 +71,7 @@ cmake-build-*/
 *.dll
 *.exe
 
-# Distribution / release binaries and archives
-starling-serve*
+# Distribution / release binaries and archives (packaged at repo root)
+/starling-serve*
 artifacts/
 *.tensors.json

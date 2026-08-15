@@ -7,17 +7,20 @@ name: CI starling-serve
 
 on:
   push:
-    branches: [feat/native-serving-layer]
+    branches: [master]
     paths:
       - 'cpp/serve/**'
+      - 'cpp/tests/**'
       - 'CMakeLists.txt'
       - 'third_party/httplib.h'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
       - 'cpp/serve/**'
+      - 'cpp/tests/**'
       - 'CMakeLists.txt'
       - 'third_party/httplib.h'
+      - '.github/workflows/ci-starling-serve.yml'
 
 jobs:
   build-cpu:
@@ -30,7 +33,10 @@ jobs:
       - name: Build (CPU)
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          cmake --build build -j --target starling-serve
+          cmake --build build -j --target starling-serve stream_session_test
+
+      - name: C++ unit tests (serve logic, no GPU/model)
+        run: ./build/stream_session_test
 
       - name: Smoke test --version
         run: |

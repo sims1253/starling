@@ -152,12 +152,17 @@ static void test_model_mapping() {
     CHECK(slug_to_model("moss") == STARLING_GGML_MOSS);
     CHECK(slug_to_model("ark") == STARLING_GGML_ARK);
     CHECK(slug_to_model("higgs") == STARLING_GGML_HIGGS);
+    CHECK(slug_to_model("hojo") == STARLING_GGML_HOJO);
     CHECK(slug_to_model("unknown") == (starling_ggml_model)0);
 
     CHECK(is_supported_model("parakeet") == true);
+    CHECK(is_supported_model("hojo") == true);
     CHECK(is_supported_model("unknown") == false);
 
     CHECK(std::string(model_to_slug(STARLING_GGML_PARAKEET_TDT)) == "parakeet");
+    CHECK(std::string(model_to_slug(STARLING_GGML_HOJO)) == "hojo");
+
+    CHECK(supported_models_str().find("hojo") != std::string::npos);
 }
 
 // ---- main -----------------------------------------------------------------

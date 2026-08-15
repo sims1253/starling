@@ -242,7 +242,11 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     return [this, ctx](const float* samples, int64_t n)
                -> std::optional<std::string> {
         std::string err;
-        auto result = server_->transcribe_pcm(samples, n, ctx, &err);
+        // Streaming chunks never wait behind queued requests: if the serial
+        // queue is occupied, report busy and let the chunker retry later
+        // (matching the Python StreamSession._tx behavior).
+        auto result = server_->transcribe_pcm(samples, n, ctx, &err,
+                                              QueuePolicy::SkipIfBusy);
         if (!err.empty()) {
             // "server busy" or "cancelled" → return nullopt (retry without
             // advancing state, matching the Python StreamSession._tx behavior).

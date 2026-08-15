@@ -39,11 +39,11 @@ bool MossModel::load(const char* path, std::string& err) {
 #undef F
     std::vector<int64_t> a; if(m.kv_arr_int("moss_transcribe.prompt_prefix",a)) for(auto v:a)c.prompt_prefix.push_back((int32_t)v); a.clear(); if(m.kv_arr_int("moss_transcribe.prompt_suffix",a)) for(auto v:a)c.prompt_suffix.push_back((int32_t)v);
 
-    // --- Validate untrusted GGUF metadata (spec ggml-moss-spec.md §11, bring-up
-    // item 1). Fail fast with a clear message: the consumers divide by these
-    // values (audio_encoder.cpp window W = M*(n_window_infer/100); llm.cpp
-    // head grouping h / (n_heads/n_kv_heads)), so a zero or inconsistent value
-    // means div-by-zero or an infinite window loop.
+    // --- Validate untrusted GGUF metadata. Fail fast with a clear message:
+    // the consumers divide by these values (audio_encoder.cpp window W =
+    // M*(n_window_infer/100); llm.cpp head grouping h / (n_heads/n_kv_heads)),
+    // so a zero or inconsistent value means div-by-zero or an infinite window
+    // loop.
     if (!lib::check_gguf_header(m, "moss_transcribe", "MOSS", {"bf16_exact", "f16"}, err))
         return false;
 #define POS(v, name) do { if (!(v)) { err = "MOSS GGUF " name " must be positive"; return false; } } while (0)

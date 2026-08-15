@@ -5,8 +5,8 @@
 // MossModel through the spec below.
 //
 // Correctness contract: byte-exact bf16 vs the Transformers golden path on
-// CUDA (see docs/ggml-moss-spec.md). CPU bf16 GEMMs are not bit-identical to
-// cuBLAS and are a fallback only.
+// CUDA. CPU bf16 GEMMs are not bit-identical to cuBLAS and are a fallback
+// only.
 
 #include "llm.hpp"
 

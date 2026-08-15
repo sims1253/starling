@@ -1,8 +1,7 @@
 // main.cpp — starling-serve entry point.
 //
 // Parses CLI args, loads the model, and serves the HTTP/WebSocket API.
-// Designed as a drop-in replacement for `python -m starling.server` from
-// freestyle's perspective:
+// Drop-in replacement for `python -m starling.server`:
 //
 //   starling-serve --model <slug> --gguf <path> [--port 8181] [--warmup]
 //
@@ -35,7 +34,7 @@
 namespace serve = starling::serve;
 
 // ---- version / build info -------------------------------------------------
-// These are overridden at build time via -D compile definitions so freestyle
+// These are overridden at build time via -D compile definitions so clients
 // can verify compatibility.
 #ifndef STARLING_SERVE_VERSION
 #define STARLING_SERVE_VERSION "0.1.0"
@@ -185,6 +184,7 @@ static std::string json_escape(const std::string& s) {
 // ---- idle-timeout monitor -------------------------------------------------
 static std::atomic<bool> g_should_exit{false};
 static std::atomic<time_t> g_last_activity{0};
+static std::atomic<bool> g_warmup_running{false};
 
 static void idle_timeout_thread(serve::StarlingServer* server, double timeout_s) {
     if (timeout_s <= 0.0) return;
@@ -266,7 +266,9 @@ int main(int argc, char** argv) {
     cfg.min_chunk_seconds = args.min_chunk;
     cfg.partial_interval = args.partial_interval;
 
-    auto server = std::make_unique<serve::StarlingServer>(cfg);
+    // shared_ptr: the detached /warmup worker captures it and must outlive
+    // main()'s reference if a warmup is still running at shutdown.
+    auto server = std::make_shared<serve::StarlingServer>(cfg);
 
     // Eager-load the model.
     if (cfg.eager_load) {
@@ -313,10 +315,18 @@ int main(int argc, char** argv) {
     svr.Post("/warmup",
         [&server](const httplib::Request&, httplib::Response& res) {
             g_last_activity.store(std::time(nullptr));
-            // Fire warmup asynchronously (it's idempotent — deduped internally).
-            std::thread([server = server.get()]() {
-                server->warmup();
-            }).detach();
+            // Fire warmup asynchronously (it's idempotent — deduped
+            // internally). One worker at a time: a client spamming /warmup
+            // must not spawn unbounded threads.
+            if (!g_warmup_running.exchange(true)) {
+                // Capture the shared_ptr by value: the detached worker must
+                // keep the server alive for the whole warmup() call even if
+                // main() returns and resets its own reference.
+                std::thread([server]() {
+                    server->warmup();
+                    g_warmup_running.store(false);
+                }).detach();
+            }
             std::ostringstream ss;
             ss << "{\"status\":\"warmup started\",\"phase\":\""
                << (server->phase() == serve::Phase::Ready ? "ready" : "loading")
@@ -338,6 +348,11 @@ int main(int argc, char** argv) {
             ss << std::hex << std::time(nullptr) << "-"
                << std::this_thread::get_id();
             rid = ss.str();
+        } else if (rid[0] == '#') {
+            // '#' prefixes the server's internal anonymous queue tickets;
+            // a client using one could collide with them.
+            send_json(res, "{\"error\":\"invalid request id\"}", 400);
+            return;
         }
 
         // Check body size.
@@ -375,17 +390,14 @@ int main(int argc, char** argv) {
                 return;
             }
         }
-        if (sr != serve::kSampleRate && sr != 0) {
-            // The C engine expects 16k; resampling is not done here (the Python
-            // server uses scipy). For now, reject non-16k; a TODO for C++
-            // resampling. In practice freestyle sends 16k audio.
-            if (sr != serve::kSampleRate) {
-                std::ostringstream ss;
-                ss << "{\"error\":\"sample rate mismatch: expected "
-                   << serve::kSampleRate << " got " << sr << "\"}";
-                send_json(res, ss.str(), 400);
-                return;
-            }
+        if (sr != 0 && sr != serve::kSampleRate) {
+            // The engine expects 16 kHz; there is no C++ resampler (the
+            // Python server resamples via scipy). Reject non-16 kHz uploads.
+            std::ostringstream ss;
+            ss << "{\"error\":\"sample rate mismatch: expected "
+               << serve::kSampleRate << " got " << sr << "\"}";
+            send_json(res, ss.str(), 400);
+            return;
         }
 
         // Register for cancellation.
@@ -418,6 +430,18 @@ int main(int argc, char** argv) {
                 499);
             return;
         }
+        if (err == "request timed out") {
+            send_json(res,
+                R"({"error":"request timed out","text":"","request_id":")" + json_escape(rid) + "\"}",
+                504);
+            return;
+        }
+        if (err == "model not loaded") {
+            send_json(res,
+                R"({"error":"model not loaded","text":"","request_id":")" + json_escape(rid) + "\"}",
+                503);
+            return;
+        }
         if (!err.empty()) {
             std::ostringstream ss;
             ss << "{\"error\":\"" << json_escape(err) << "\",\"text\":\"\",\"request_id\":\""
@@ -430,7 +454,7 @@ int main(int argc, char** argv) {
         std::string json = result.to_json();
         // Insert request_id before closing brace.
         json = json.substr(0, json.size() - 1) +
-               ",\"request_id\":\"" + rid + "\"}";
+               ",\"request_id\":\"" + json_escape(rid) + "\"}";
         send_json(res, json, 200);
     };
 
@@ -458,7 +482,6 @@ int main(int argc, char** argv) {
     svr.WebSocket("/stream",
         [&server](const httplib::Request& req,
                   httplib::ws::WebSocket& ws) {
-            g_last_activity.store(std::time(nullptr));
             serve::StreamSession session(server.get());
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
@@ -466,6 +489,10 @@ int main(int argc, char** argv) {
             while (ws.is_open()) {
                 auto rr = ws.read(msg);
                 if (rr == httplib::ws::ReadResult::Fail) break;
+                // Every received message counts as activity so the idle
+                // timeout can't fire mid-dictation (it only checks between
+                // transcribes).
+                g_last_activity.store(std::time(nullptr));
 
                 if (rr == httplib::ws::ReadResult::Text) {
                     // Parse JSON command.
@@ -494,18 +521,13 @@ int main(int argc, char** argv) {
                         if (dur > 0.0) {
                             text = session.stream_flush();
                         }
+                        std::string safe_text = json_escape(text);
                         std::ostringstream ss;
                         ss << "{\"type\":\"final\",\"text\":\""
-                           << text << "\",\"segments\":[{\"text\":\""
-                           << text << "\",\"start_s\":0.0,\"end_s\":"
+                           << safe_text << "\",\"segments\":[{\"text\":\""
+                           << safe_text << "\",\"start_s\":0.0,\"end_s\":"
                            << dur << "}],\"duration_s\":" << dur << "}";
-                        std::string safe_text = json_escape(text);
-                        std::ostringstream ss2;
-                        ss2 << "{\"type\":\"final\",\"text\":\""
-                            << safe_text << "\",\"segments\":[{\"text\":\""
-                            << safe_text << "\",\"start_s\":0.0,\"end_s\":"
-                            << dur << "}],\"duration_s\":" << dur << "}";
-                        ws.send(ss2.str());
+                        ws.send(ss.str());
                         session.reset();
                         continue;
                     } else if (type == "ping") {

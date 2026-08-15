@@ -9,8 +9,8 @@
 #   starling-serve-macos-metal         (Clang + Metal, Apple Silicon)
 #
 # Each binary is stripped, packaged, checksummed, and uploaded to the GitHub
-# release. Freestyle's TypeScript download manager fetches the right artifact
-# for the detected platform + GPU.
+# release. A download manager picks the right artifact for the detected
+# platform + GPU.
 
 name: Release starling-serve binaries
 
@@ -199,6 +199,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply ggml patches
+        # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
+        # to the System32 WSL stub on Windows and skip patching (warning-only
+        # there). The script is idempotent; CMake's own run becomes a no-op.
+        shell: bash
+        run: bash scripts/apply_ggml_patches.sh
+
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
@@ -249,6 +256,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+
+      - name: Apply ggml patches
+        # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
+        # to the System32 WSL stub on Windows and skip patching (warning-only
+        # there). The script is idempotent; CMake's own run becomes a no-op.
+        shell: bash
+        run: bash scripts/apply_ggml_patches.sh
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d

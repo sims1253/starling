@@ -18,8 +18,8 @@ The legacy CrispASR MOSS engine remains only a near-exact comparison path.
 **Speed:** the current in-tree Parakeet path is faster than the PyTorch peak on
 short and within ~1.25-1.5x on medium/long. The current in-tree MOSS path is
 within ~1.3x on short/medium and faster on the long synthetic fixture. See the
-maintained README tables; older external-engine measurements in
-`docs/ggml-parakeet-perf-analysis.md` are historical context only.
+maintained README tables; older external-engine measurements are historical
+context only.
 
 ## Correctness contract
 
@@ -35,7 +35,7 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   on short/medium/long. The reference explicitly propagates eager attention to
   nested model configs and uses exact-width `DynamicCache`; padded StaticCache
   reduction-order noise is not a golden contract. Component ULP tolerances are
-  specified in `docs/ggml-moss-goldens.md`.
+  documented alongside the component tests.
 - **moss (legacy external CrispASR)**: short is byte-exact; medium/long retain
   the historical normalized-CER gate and single-chunk workaround. This engine
   is deprecated and does not define Starling's in-tree correctness.

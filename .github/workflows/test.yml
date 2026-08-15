@@ -8,6 +8,8 @@ name: tests
 #
 #   * tests/test_server_routing.py -- pure, GPU-free slug->backend routing,
 #     CLI parsing, config plumbing (no model loaded, no CUDA).
+#   * tests/test_server_robustness.py -- CPU-only regressions for the
+#     robustness fixes (fakes; no GPU, no model, no network).
 #   * an import smoke test of starling._kernels, proving the backend dispatch
 #     resolves correctly on each OS (triton on Linux, torch on Windows).
 #
@@ -55,10 +57,11 @@ jobs:
         # auto-selects the torch backend there instead.
         run: uv sync --extra dev
 
-      - name: CPU-safe routing tests
-        # No CUDA, no model loading: verifies slug->backend routing, CLI
-        # arg parsing, config plumbing, and cancellation/error paths.
-        run: uv run python -m pytest tests/test_server_routing.py -q
+      - name: CPU-safe server tests
+        # No CUDA, no model loading, no network: verifies slug->backend
+        # routing, CLI arg parsing, config plumbing, cancellation/error
+        # paths, and the CPU-only robustness regressions.
+        run: uv run python -m pytest tests/test_server_routing.py tests/test_server_robustness.py -q
 
       - name: Import smoke (kernel backend dispatches per-OS)
         # Only call have_triton() + get_backend_name() (NOT get_backend()) --
