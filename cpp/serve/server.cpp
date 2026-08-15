@@ -193,6 +193,7 @@ bool StarlingServer::cancel_request(const std::string& id) {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = requests_.find(id);
     if (it == requests_.end()) return false;
+    if (it->second->done) return false;  // completion already claimed the result
     it->second->cancelled.store(true);
     return true;
 }
@@ -285,12 +286,26 @@ TranscribeResult StarlingServer::do_transcribe(
     if (ctx) ctx->running.store(false);
     phase_.store(Phase::Ready);
 
+    bool cancel_won = false;
     {
         std::lock_guard<std::mutex> lk(mutex_);
         // We're at the front of the queue; release the turn to the next waiter.
         n_waiters_--;
         request_order_.pop_front();
+        if (ctx) {
+            // Claim completion under the same lock cancel_request uses: if
+            // cancellation already won, discard the result; otherwise the
+            // result stands and later cancels return false.
+            ctx->done = true;
+            cancel_won = ctx->cancelled.load();
+        }
         queue_cv_.notify_all();
+    }
+
+    if (cancel_won) {
+        if (result_text) starling_ggml_free_string(result_text);
+        if (err) *err = "cancelled";
+        return {};
     }
 
     if (!result_text) {

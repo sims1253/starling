@@ -39,7 +39,17 @@ starling-serve --model parakeet --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf -
 
 ## Verification
 
-Each GGUF file includes `starling.format_version` and `starling.numeric_profile`
-metadata. The `starling-serve` binary exposes `--abi-version` for binary
-compatibility information, so clients can check at startup that the binary and
-the GGUF file are compatible.
+Every converted file records `starling.format_version` (currently `1`) and
+`starling.numeric_profile` metadata. On load, `starling-serve` validates these
+fields when they are present:
+
+- `starling.numeric_profile` — accepted values: `bf16_exact`, `f16`
+  (parakeet, moss, ark, higgs); `mixed_f32_bf16_exact`, `bf16_exact`, `f16`
+  (hojo).
+- `starling.format_version` — must be `1`.
+
+The parakeet loader does not validate these fields; the other model loaders
+reject unsupported values at load time with a clear error.
+
+`starling-serve --abi-version` prints the binary's compiled-in GGML C-API ABI
+version. It describes the binary only — it does not inspect the GGUF file.

@@ -95,6 +95,10 @@ struct RequestContext {
     std::string id;
     std::atomic<bool> cancelled{false};
     std::atomic<bool> running{false};
+    // Completion claim, guarded by StarlingServer::mutex_. Set once the
+    // engine call has finished; cancellation and completion each check the
+    // other under the same lock so exactly one of them wins.
+    bool done = false;
 };
 
 // Queue behaviour for callers without a RequestContext (WS streaming chunks,

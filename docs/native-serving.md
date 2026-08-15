@@ -1,7 +1,8 @@
 # Native Serving Layer: starling-serve
 
 A self-contained native binary that wraps `libstarling_ggml` behind the same
-HTTP/WebSocket API as the Python `starling.server`:
+endpoint surface as the Python `starling.server` (same routes and message
+shapes; client-visible differences are listed under "API contract"):
 
 ```typescript
 // Before (Python subprocess):
@@ -74,9 +75,15 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 ## API contract
 
-Mirrors the Python server's endpoint set (a client written against one works
-against the other; error status codes and phase names are documented per
-server).
+Mirrors the Python server's endpoint set, but the two are not drop-in
+identical. A client written against one needs three adjustments on the other:
+
+- **Inputs**: this server requires 16 kHz audio (below); the Python server
+  resamples non-16 kHz WAVs via scipy instead of rejecting them.
+- **Phase names**: `unloaded → loading → ready → busy` here; the Python
+  server reports `loading_weights` and `warming_up` during startup.
+- **Error responses**: the status-code and body details documented below
+  differ in places from the Python server's.
 
 ### `GET /health`
 
@@ -188,10 +195,10 @@ GitHub release publishes six static binaries + checksums:
 
 ### GPU detection
 
-Each build variant is compiled for a specific backend (CUDA, Metal, Vulkan, or
-CPU). There is no runtime backend auto-selection: download the binary matching
-the detected platform and GPU. Explicit variant selection is more predictable
-than runtime auto-detection.
+Each build variant is compiled for a specific backend (CUDA, ROCm/HIP, Metal,
+Vulkan, or CPU). There is no runtime backend auto-selection: download the
+binary matching the detected platform and GPU. Explicit variant selection is
+more predictable than runtime auto-detection.
 
 ## Open questions (resolved)
 

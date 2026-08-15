@@ -20,6 +20,7 @@ on:
       - 'cpp/tests/**'
       - 'CMakeLists.txt'
       - 'third_party/httplib.h'
+      - '.github/workflows/ci-starling-serve.yml'
 
 jobs:
   build-cpu:

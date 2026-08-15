@@ -179,7 +179,8 @@ set_target_properties(starling_ggml PROPERTIES
 # starling-serve: the native HTTP/WebSocket serving binary.
 #
 # A self-contained executable that wraps libstarling_ggml behind the same
-# HTTP/WS API as the Python `starling.server` (a drop-in replacement):
+# HTTP/WS endpoint surface as the Python `starling.server` (client-visible
+# differences are documented in docs/native-serving.md):
 #
 #   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 #

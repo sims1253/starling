@@ -30,20 +30,39 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import requests
-
 # Standalone script: its test_* functions need a live server and would only
 # produce fixture errors under pytest. Skip collection when pytest is the
-# runner (it has already imported itself by the time we execute).
+# runner (it has already imported itself by the time we execute). This check
+# precedes the third-party imports so a pytest run skips cleanly even when
+# requests/numpy are not installed.
 if "pytest" in sys.modules:
     import pytest
 
     pytest.skip("integration script; run directly: python tests/test_native_serve.py",
                 allow_module_level=True)
 
+import numpy as np
+import requests
+
 REPO = Path(__file__).resolve().parents[1]
-BINARY = REPO / "build" / "starling-serve"
+
+
+def _default_binary() -> Path:
+    """Locate the default starling-serve binary across platforms."""
+    if os.name == "nt":
+        candidates = [
+            REPO / "build" / "Release" / "starling-serve.exe",  # MSVC multi-config
+            REPO / "build" / "starling-serve.exe",
+        ]
+    else:
+        candidates = [REPO / "build" / "starling-serve"]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
+BINARY = _default_binary()
 DEFAULT_PORT = 18181
 
 
@@ -124,6 +143,55 @@ def test_cancel_notfound(base_url: str, tr: TestResults):
     r = requests.delete(f"{base_url}/inference/nonexistent", timeout=5)
     tr.check("cancel nonexistent returns 404", r.status_code == 404,
              f"got {r.status_code}")
+
+
+def test_transcribe_wrong_sample_rate(base_url: str, tr: TestResults):
+    """Non-16 kHz WAV is rejected with 400 + sample-rate mismatch error."""
+    samples = np.zeros(800, dtype=np.float32)
+    wav = make_wav(samples, sr=8000)
+    r = requests.post(f"{base_url}/transcribe", data=wav,
+                      headers={"Content-Type": "application/octet-stream"},
+                      timeout=10)
+    tr.check("8kHz wav returns 400", r.status_code == 400, f"got {r.status_code}")
+    tr.check("8kHz error mentions sample rate",
+             "sample rate mismatch" in r.text, r.text)
+
+
+def test_transcribe_model_not_loaded(base_url: str, tr: TestResults):
+    """Valid 16 kHz WAV with an unloadable model returns a structured 503.
+
+    The test server runs --no-eager-load with a placeholder --gguf, so the
+    lazy load fails and the request must surface 'model not loaded' as JSON,
+    not a crash or a dead socket.
+    """
+    samples = np.zeros(1600, dtype=np.float32)
+    wav = make_wav(samples, sr=16000)
+    r = requests.post(f"{base_url}/transcribe", data=wav,
+                      headers={"Content-Type": "application/octet-stream"},
+                      timeout=30)
+    tr.check("16kHz wav on unloaded model returns 503", r.status_code == 503,
+             f"got {r.status_code}")
+    data = r.json()
+    tr.check("503 error is model not loaded",
+             data.get("error") == "model not loaded", str(data))
+
+
+def test_transcribe_pcm16_fallback(base_url: str, tr: TestResults):
+    """A non-WAV payload is treated as raw mono PCM16 @ 16 kHz.
+
+    Raw PCM16 of silence is not valid WAV; if the fallback works, the request
+    passes payload decoding and reaches inference (here: the 503 lazy-load
+    failure, same as the WAV path) instead of a 400 malformed-audio error.
+    """
+    pcm16 = (np.zeros(1600, dtype=np.float32) * 32768).astype("<i2").tobytes()
+    r = requests.post(f"{base_url}/transcribe", data=pcm16,
+                      headers={"Content-Type": "application/octet-stream"},
+                      timeout=30)
+    tr.check("raw PCM16 reaches inference (not 400 malformed)",
+             r.status_code != 400, f"got {r.status_code}")
+    data = r.json()
+    tr.check("raw PCM16 error is model not loaded",
+             data.get("error") == "model not loaded", str(data))
 
 
 def test_transcribe_wav(base_url: str, tr: TestResults):
@@ -242,6 +310,9 @@ def main():
         test_warmup(base_url, tr)
         test_transcribe_empty(base_url, tr)
         test_cancel_notfound(base_url, tr)
+        test_transcribe_wrong_sample_rate(base_url, tr)
+        test_transcribe_model_not_loaded(base_url, tr)
+        test_transcribe_pcm16_fallback(base_url, tr)
         test_transcribe_wav(base_url, tr)
         test_request_id_passthrough(base_url, tr)
         print("\nTesting WebSocket control frames:")

@@ -266,7 +266,9 @@ int main(int argc, char** argv) {
     cfg.min_chunk_seconds = args.min_chunk;
     cfg.partial_interval = args.partial_interval;
 
-    auto server = std::make_unique<serve::StarlingServer>(cfg);
+    // shared_ptr: the detached /warmup worker captures it and must outlive
+    // main()'s reference if a warmup is still running at shutdown.
+    auto server = std::make_shared<serve::StarlingServer>(cfg);
 
     // Eager-load the model.
     if (cfg.eager_load) {
@@ -317,7 +319,10 @@ int main(int argc, char** argv) {
             // internally). One worker at a time: a client spamming /warmup
             // must not spawn unbounded threads.
             if (!g_warmup_running.exchange(true)) {
-                std::thread([server = server.get()]() {
+                // Capture the shared_ptr by value: the detached worker must
+                // keep the server alive for the whole warmup() call even if
+                // main() returns and resets its own reference.
+                std::thread([server]() {
                     server->warmup();
                     g_warmup_running.store(false);
                 }).detach();
@@ -482,11 +487,12 @@ int main(int argc, char** argv) {
 
             std::string msg;
             while (ws.is_open()) {
-                // Every message counts as activity so the idle timeout can't
-                // fire mid-dictation (it only checks between transcribes).
-                g_last_activity.store(std::time(nullptr));
                 auto rr = ws.read(msg);
                 if (rr == httplib::ws::ReadResult::Fail) break;
+                // Every received message counts as activity so the idle
+                // timeout can't fire mid-dictation (it only checks between
+                // transcribes).
+                g_last_activity.store(std::time(nullptr));
 
                 if (rr == httplib::ws::ReadResult::Text) {
                     // Parse JSON command.
