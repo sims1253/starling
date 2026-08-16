@@ -42,7 +42,13 @@ char * starling_ggml_hojo_decode(void * handle, const float * pcm, int64_t n,
 // supported-models string is printed in table order). The message fields
 // preserve each engine's historical error strings exactly; see
 // ModelDescriptor in model_registry.hpp.
-const ModelDescriptor kRegistry[] = {
+//
+// constexpr so the most likely one-row-add mistakes — a copy-pasted kind, a
+// row appended out of enum order, a missing renumber — fail the static_assert
+// below at compile time instead of surfacing later as an unreachable engine
+// (find_model returns the first matching row) while --version still
+// advertises it.
+constexpr ModelDescriptor kRegistry[] = {
     { STARLING_GGML_PARAKEET_TDT, "parakeet",
       starling_ggml_parakeet_load, starling_ggml_parakeet_free,
       starling_ggml_parakeet_decode,
@@ -74,6 +80,12 @@ const ModelDescriptor kRegistry[] = {
       /*rate_error_in_ctx=*/true,
       "HOJO transcribe failed" },
 };
+
+static_assert([] {
+    for (size_t i = 0; i < sizeof(kRegistry) / sizeof(kRegistry[0]); ++i)
+        if (kRegistry[i].kind != (starling_ggml_model)(i + 1)) return false;
+    return true;
+}(), "registry rows must stay in starling_ggml_model enum order (1..N, no duplicate or skipped kinds)");
 
 } // namespace
 

@@ -162,7 +162,9 @@ static void test_model_mapping() {
     CHECK(std::string(model_to_slug(STARLING_GGML_PARAKEET_TDT)) == "parakeet");
     CHECK(std::string(model_to_slug(STARLING_GGML_HOJO)) == "hojo");
 
-    CHECK(supported_models_str().find("hojo") != std::string::npos);
+    // Exact equality pins the registry-derived ordering (a reordered or
+    // duplicated row would change it).
+    CHECK(supported_models_str() == "parakeet moss ark higgs hojo");
 }
 
 // ---- main -----------------------------------------------------------------
