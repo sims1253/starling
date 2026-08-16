@@ -7,7 +7,9 @@ Exercises both interfaces:
 
 The script loads a WAV file (or synthesises a short tone if none is given),
 uploads it to ``/inference``, and then replays it in ~``chunk-ms`` PCM chunks
-over the WebSocket while printing partial and final results.
+over the WebSocket while printing partial and final results. Exits 0 only if
+every requested check passed; any failed check exits 1, so the script works
+as a smoke gate as well as an interactive client.
 
 Zero third-party deps: HTTP uses :mod:`http.client`, and the WebSocket client
 is a tiny RFC 6455 implementation on a raw socket. This matches the server's
@@ -105,7 +107,7 @@ def to_pcm16_bytes(samples: np.ndarray) -> bytes:
 # ---------------------------------------------------------------------------
 # HTTP client (stdlib http.client)
 # ---------------------------------------------------------------------------
-def test_health(host: str, port: int) -> None:
+def test_health(host: str, port: int) -> bool:
     conn = http.client.HTTPConnection(host, port, timeout=5)
     try:
         conn.request("GET", "/")
@@ -119,8 +121,10 @@ def test_health(host: str, port: int) -> None:
             data = {}
         if "phase" in data or "queue_depth" in data:
             print(f"[http]   phase={data.get('phase')}  queue_depth={data.get('queue_depth')}")
+        return res.status == 200
     except Exception as exc:
         print(f"[http] health check failed: {exc}")
+        return False
     finally:
         conn.close()
 
@@ -144,7 +148,7 @@ def _build_multipart(filename: str, wav_bytes: bytes) -> tuple[bytes, str]:
     return body, ctype
 
 
-def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
+def test_inference(host: str, port: int, wav_bytes: bytes) -> bool:
     body, ctype = _build_multipart("audio.wav", wav_bytes)
     conn = http.client.HTTPConnection(host, port, timeout=120)
     # Supply a request id so the new cancel endpoint can target this request.
@@ -160,15 +164,9 @@ def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
         ms = (time.perf_counter() - t0) * 1000.0
         text = res.read().decode(errors="replace")
         print(f"[http] status={res.status}  {ms:.1f}ms")
-        if res.status == 503:
-            print(f"[http] server busy: {text}")
-            return
-        if res.status == 499:
-            print(f"[http] cancelled: {text}")
-            return
         if res.status != 200:
             print(f"[http] error: {text}")
-            return
+            return False
         data = json.loads(text)
         print(f"[http] text: {data.get('text', '')!r}")
         segs = data.get("segments") or []
@@ -178,6 +176,7 @@ def test_inference(host: str, port: int, wav_bytes: bytes) -> None:
                 print(f"[http]   [{s.get('start_s', 0):.2f}-{s.get('end_s', 0):.2f}s] {s.get('text', '')!r}")
         if "duration_s" in data:
             print(f"[http] duration_s={data['duration_s']}")
+        return True
     finally:
         conn.close()
 
@@ -286,8 +285,10 @@ def _ws_recv(sock: socket.socket) -> tuple[int, bytes]:
             return final_opcode, b"".join(pieces)
 
 
-def test_stream(host: str, port: int, samples: np.ndarray, sr: int, chunk_ms: int) -> None:
-    """Open WS /stream, replay audio in chunks, and print partial/final results."""
+def test_stream(host: str, port: int, samples: np.ndarray, sr: int, chunk_ms: int) -> bool:
+    """Open WS /stream, replay audio in chunks, and print partial/final results.
+
+    Returns True only if the server sent a terminal ``final`` message."""
     print(f"\n[ws]   connect ws://{host}:{port}/stream  "
           f"({len(samples)/sr:.1f}s audio, {chunk_ms}ms chunks)")
     pcm = to_pcm16_bytes(samples)
@@ -334,15 +335,17 @@ def test_stream(host: str, port: int, samples: np.ndarray, sr: int, chunk_ms: in
                 except Exception:
                     continue
                 if _print_ws_msg(msg, t0):
-                    return
+                    return True
         except (socket.timeout, ConnectionError):
             print("[ws]   timed out / closed waiting for final")
+            return False
     finally:
         try:
             _ws_send(sock, 0x8, b"")  # close frame
         except Exception:
             pass
         sock.close()
+    return False
 
 
 def _print_ws_msg(msg: dict, t0: float) -> bool:
@@ -397,26 +400,35 @@ def main() -> int:
         samples = synth_tone(seconds=4.0)
         print(f"[load] synthesised 4.0s tone @ {sr}Hz (pass --wav for real audio)")
     wav_bytes = to_wav_bytes(samples, sr)
+    failures = 0
 
     # ---- health check ----
-    test_health(args.host, args.port)
+    if not test_health(args.host, args.port):
+        failures += 1
     if args.health_only:
-        return 0
+        return 1 if failures else 0
 
     # ---- HTTP /inference ----
     if not args.no_http:
         try:
-            test_inference(args.host, args.port, wav_bytes)
+            if not test_inference(args.host, args.port, wav_bytes):
+                failures += 1
         except Exception as exc:
             print(f"[http] FAILED: {exc}")
+            failures += 1
 
     # ---- WS /stream ----
     if not args.no_stream:
         try:
-            test_stream(args.host, args.port, samples, sr, args.chunk_ms)
+            if not test_stream(args.host, args.port, samples, sr, args.chunk_ms):
+                failures += 1
         except Exception as exc:
             print(f"[ws]   FAILED: {exc}")
+            failures += 1
 
+    if failures:
+        print(f"[done] {failures} check(s) FAILED")
+        return 1
     return 0
 
 
