@@ -240,8 +240,8 @@ Select the backend explicitly with the `STARLING_KERNEL_BACKEND` env var
 visible) → `torch`. On Windows + CUDA toolkit that means full speed with no
 code changes.
 
-Set up either platform with the same command (the old `scripts/setup_env.sh`
-is replaced by a cross-platform Python entry point):
+Set up either platform with the same command (a cross-platform Python entry
+point):
 
 ```bash
 python scripts/setup_env.py
