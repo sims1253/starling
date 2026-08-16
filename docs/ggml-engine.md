@@ -21,6 +21,20 @@ within ~1.3x on short/medium and faster on the long synthetic fixture. See the
 maintained README tables; older external-engine measurements are historical
 context only.
 
+## Model registry (adding an engine)
+
+Every engine built into `libstarling_ggml` is registered in one place:
+`cpp/lib/model_registry.hpp/.cpp` (`ModelDescriptor`: public enum kind, serve
+slug, the load/free/decode entry points, and the error-message shape for the
+shared 16 kHz guard). The C API's `load`/`free`/`transcribe_pcm` dispatch
+(`cpp/capi.cpp`) and the serve slug mapping, supported-model check, and
+`--version` model list (`cpp/serve/server.cpp`) are all table lookups; the
+public `starling_ggml.h` stays flat and unchanged (ABI 3).
+
+Adding a model = its `cpp/<model>/` implementation (with the three
+`capi_<model>.cpp` entry points) + ONE registry row. No other per-model edits
+anywhere in the tree.
+
 ## Correctness contract
 
 Byte-exact transcripts vs the golden references (`golden/parakeet_tdt_*.txt`

@@ -9,29 +9,25 @@
 #include "lib/whisper_mel.hpp"
 
 namespace starling::ggml::hojo {
+namespace {
+const lib::EngineMelPolicy kMelPolicy = {
+    lib::MelPolicy::T_FLOOR_S_OVER_H,
+    /*cap_n_samples=*/true,
+    /*cap_before_checks=*/true,
+    lib::MelPolicy::MAX_KEPT_FRAMES,
+    /*norm_in_double=*/true,
+    /*emit_bf16=*/false,
+    "STARLING_HOJO_MEL_DUMP",
+    "Hojo",
+};
+} // namespace
 
 bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
                      size_t S, MelFeatures& out, std::string& err) {
-    const auto& c = cfg.frontend;
-    lib::MelPolicy p;
-    p.n_fft = c.n_fft;
-    p.hop_length = c.hop_length;
-    p.n_mels = c.n_mels;
-    p.mel_floor = c.mel_floor;
-    p.dynamic_range = c.dynamic_range;
-    p.normalization_offset = c.normalization_offset;
-    p.normalization_divisor = c.normalization_divisor;
-    p.t_rule = lib::MelPolicy::T_FLOOR_S_OVER_H;
-    p.cap_n_samples = true;
-    p.cap_before_checks = true;
-    p.n_samples = c.n_samples;
-    p.max_scope = lib::MelPolicy::MAX_KEPT_FRAMES;
-    p.norm_in_double = true;
-    p.emit_bf16 = false;
-    p.dump_env = "STARLING_HOJO_MEL_DUMP";
-    p.label = "Hojo";
     lib::MelOutput mo;
-    if (!lib::compute_log_mel(p, ml, pcm, S, mo, err)) return false;
+    if (!lib::compute_log_mel(lib::make_mel_policy(cfg.frontend, kMelPolicy),
+                              ml, pcm, S, mo, err))
+        return false;
     out.n_mels = (int64_t) mo.n_mels;
     out.n_frames = (int64_t) mo.n_frames;
     out.data = std::move(mo.f32);

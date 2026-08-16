@@ -57,4 +57,51 @@ struct MelOutput {
 bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm,
                      size_t S, MelOutput& out, std::string& err);
 
+// ---- shared per-model adapter ----------------------------------------------
+// The moss/ark/higgs/hojo mel wrappers are structurally identical: they map
+// their model's FrontendConfig (identical field names across engines) into a
+// MelPolicy and differ only in the fixed policy bits below. EngineMelPolicy
+// captures those bits; make_mel_policy is the one shared mapping. A new
+// Whisper-style frontend = one EngineMelPolicy constant + a compute_log_mel
+// call. (parakeet/mel.* is a different NeMo frontend and does not use this.)
+
+// Fixed per-engine policy bits — everything not derivable from a
+// FrontendConfig. See the engine rows in each cpp/<model>/mel.cpp.
+struct EngineMelPolicy {
+    MelPolicy::TRule t_rule;
+    bool cap_n_samples;
+    bool cap_before_checks;
+    MelPolicy::MaxScope max_scope;
+    bool norm_in_double;
+    bool emit_bf16;
+    const char* dump_env;  // e.g. "STARLING_HIGGS_MEL_DUMP"
+    const char* label;     // error-message prefix ("<label> mel ...")
+};
+
+// Build the full MelPolicy from any model's FrontendConfig (the field names
+// n_fft/hop_length/n_mels/mel_floor/dynamic_range/normalization_offset/
+// normalization_divisor/n_samples are shared) plus the engine's fixed bits.
+// n_samples is only consulted when cap_n_samples is set.
+template <typename FrontendConfig>
+MelPolicy make_mel_policy(const FrontendConfig& c, const EngineMelPolicy& e) {
+    MelPolicy p;
+    p.n_fft = c.n_fft;
+    p.hop_length = c.hop_length;
+    p.n_mels = c.n_mels;
+    p.mel_floor = c.mel_floor;
+    p.dynamic_range = c.dynamic_range;
+    p.normalization_offset = c.normalization_offset;
+    p.normalization_divisor = c.normalization_divisor;
+    p.n_samples = c.n_samples;
+    p.t_rule = e.t_rule;
+    p.cap_n_samples = e.cap_n_samples;
+    p.cap_before_checks = e.cap_before_checks;
+    p.max_scope = e.max_scope;
+    p.norm_in_double = e.norm_in_double;
+    p.emit_bf16 = e.emit_bf16;
+    p.dump_env = e.dump_env;
+    p.label = e.label;
+    return p;
+}
+
 } // namespace starling::ggml::lib
