@@ -168,8 +168,8 @@ def test_transcribe_payload_passes_through_200_on_clean_wav() -> None:
 def test_transcribe_payload_loads_backend_before_queueing_inference() -> None:
     """A valid request to an (unloaded) server triggers _ensure_loaded() before
     inference is queued -- regression: the decode/inference split dropped the
-    lazy-load call that transcribe_bytes_sync makes, so an unloaded server would
-    crash inside _run_queued_sync instead of loading first.
+    lazy-load call, so an unloaded server would crash inside _run_queued_sync
+    instead of loading first.
 
     Records the call order so a load-after-queue regression (e.g. moving the
     _ensure_loaded() call into _run_queued_sync, or after it) fails here rather
