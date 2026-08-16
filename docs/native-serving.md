@@ -71,7 +71,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 | `--stream-overlap-seconds <s>` | `3.0` | Overlap between windows |
 | `--min-chunk-seconds <s>` | `5.0` | Min audio before first partial |
 | `--partial-interval-seconds <s>` | `3.0` | Min gap between partials |
-| `--max-stream-seconds <s>` | `60.0` | Per-WS-connection audio buffer cap (0 = unlimited) |
+| `--max-stream-seconds <s>` | `60.0` | Per-WS-connection LIVE buffer cap in s (0 = unlimited); see `WS /stream` |
 | `--version` | — | Print version + ABI + backend, exit |
 | `--abi-version` | — | Print ABI version integer, exit |
 
@@ -138,18 +138,23 @@ receive JSON messages:
 - `{"type":"reset_ack"}` — in response to `{"type":"reset"}`
 
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
-would push the session's buffered audio past the cap is refused. The server
-emits one error frame:
+would push the session's live audio buffer past the cap is refused. The
+server emits one error frame:
 
 ```json
-{"type":"error","message":"stream buffer limit reached (60.000000 s buffered); audio ignored until reset"}
+{"type":"error","message":"stream buffer limit reached (60 s live buffer); audio ignored until reset"}
 ```
 
 and then ignores all further audio frames for that session (no more partials,
 no crash, memory bounded). The client sends `{"type":"reset"}` to clear the
-session and start accepting audio again. The cap bounds per-connection memory:
-without it a client (or a buggy loop) streaming forever grows the rolling
-buffer without limit.
+session and start accepting audio again.
+
+The cap bounds the **live** buffer (memory), not cumulative audio: finalized
+windows are trimmed from the buffer as the stream advances, so a long
+dictation session without commits keeps memory bounded without tripping the
+cap. It only fires when the un-finalized buffer itself grows past the limit
+(e.g. streaming faster than the engine finalizes, or a session where
+transcription never succeeds).
 
 Control frames (JSON text):
 - `{"type":"commit"}` — finalize all buffered audio (returns final)

@@ -267,8 +267,11 @@ void StreamSession::append_pcm(const std::string& bytes) {
     // Drop odd trailing byte.
     if (nbytes % 2 == 1) nsamples = (nbytes - 1) / 2;
     if (nsamples == 0) return;
+    // Cap the LIVE buffer (samples_ memory). Finalized audio is trimmed from
+    // samples_, so a long dictation session without commits keeps memory
+    // bounded while the cumulative audio grows freely.
     if (max_buffer_seconds_ > 0.0
-        && buffered_seconds()
+        && live_seconds()
                + static_cast<double>(nsamples) / kSampleRate
              > max_buffer_seconds_) {
         overflow_ = true;
@@ -310,7 +313,7 @@ void StreamSession::append_wav(const std::string& bytes) {
     }
     if (!decoded.empty()) {
         if (max_buffer_seconds_ > 0.0
-            && buffered_seconds()
+            && live_seconds()
                    + static_cast<double>(decoded.size()) / kSampleRate
                  > max_buffer_seconds_) {
             overflow_ = true;

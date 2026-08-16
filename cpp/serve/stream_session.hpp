@@ -110,8 +110,11 @@ public:
 
     // True when a frame exceeded the per-connection buffer cap
     // (config.max_stream_seconds): the frame was refused and every further
-    // append is a no-op until reset(). The WS layer reports this to the
-    // client as an error frame.
+    // append is a no-op until reset(). The cap bounds the LIVE rolling
+    // buffer (memory): finalized windows are trimmed from the buffer, so
+    // long dictation sessions without commits keep memory bounded without
+    // tripping the cap. The WS layer reports overflow to the client as an
+    // error frame.
     bool overflowed() const { return overflow_; }
 
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.

@@ -369,11 +369,16 @@ int main(int argc, char** argv) {
         }
 
         // Extract the audio payload FIRST: cpp-httplib parses
-        // multipart/form-data bodies itself into req.form.files (req.body
-        // stays empty for them), so the body-empty check below must not run
-        // before the form has been consulted. Selection order mirrors
-        // audio::extract_multipart_payload: "audio", then "file", then any
-        // file part. Raw bodies carry the bytes directly.
+        // multipart/form-data bodies itself into req.form (req.body stays
+        // empty for them), so the body-empty check below must not run before
+        // the form has been consulted. Selection order mirrors
+        // audio::extract_multipart_payload (the manual parser in audio.cpp —
+        // kept as the Python-parity reference; this is its production twin):
+        // a part named "audio", then one named "file", then any file part,
+        // then a filename-less field named
+        // "audio"/"file" (httplib routes parts without a filename to
+        // form.fields; the Python server accepts those too). Raw bodies
+        // carry the bytes directly.
         std::string payload;
         bool is_multipart = req.is_multipart_form_data();
         if (is_multipart) {
@@ -388,6 +393,16 @@ int main(int argc, char** argv) {
                         payload = file.content;
                         break;
                     }
+                }
+            }
+            // Filename-less parts ("audio"/"file" sent as plain form fields,
+            // e.g. curl -F 'audio=<clip.wav' or files={"audio": (None,
+            // data)}) live in form.fields, not form.files.
+            if (payload.empty()) {
+                if (!req.form.get_field("audio").empty()) {
+                    payload = req.form.get_field("audio");
+                } else if (!req.form.get_field("file").empty()) {
+                    payload = req.form.get_field("file");
                 }
             }
         } else {
@@ -610,7 +625,8 @@ int main(int argc, char** argv) {
                             std::ostringstream ss;
                             ss << "{\"type\":\"error\",\"message\":\"stream buffer"
                                << " limit reached (" << cfg.max_stream_seconds
-                               << " s buffered); audio ignored until reset\"}";
+                               << " s live buffer); audio ignored until"
+                               << " reset\"}";
                             ws.send(ss.str());
                         }
                         continue;

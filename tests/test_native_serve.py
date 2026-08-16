@@ -398,6 +398,24 @@ def test_multipart_wav_reaches_inference(base_url: str, tr: TestResults,
              f"got {r.status_code}: {data}")
 
 
+def test_multipart_filenameless_part(base_url: str, tr: TestResults):
+    """A part named "audio" with NO filename is accepted (Python parity).
+
+    cpp-httplib routes filename-less parts to form.fields, not form.files;
+    the Python server scores them like named file parts, so the native
+    handler must pick them up too (regression from PR review).
+    """
+    samples = np.zeros(1600, dtype=np.float32)
+    wav = make_wav(samples, sr=16000)
+    r = requests.post(f"{base_url}/transcribe",
+                      files={"audio": (None, wav)},  # no filename
+                      timeout=30)
+    data = r.json()
+    tr.check("filename-less 'audio' part reaches inference",
+             r.status_code == 503 and data.get("error") == "model not loaded",
+             f"got {r.status_code}: {data}")
+
+
 def test_malformed_wav_huge_frame_count(base_url: str, tr: TestResults):
     """A WAV header claiming billions of frames fails fast with 400.
 
@@ -752,15 +770,19 @@ def test_real_queue_timeout(binary: Path, model: str, gguf: str,
                             tr: TestResults, anchor: np.ndarray):
     """A queued request outlives --request-timeout-seconds → 504 (own server).
 
-    The anchor is long (~1 min) so the victim stays parked in the queue past
-    the 1 s timeout even on fast backends.
+    The anchor is very long (~3+ min of audio) and the timeout tiny (0.3 s),
+    so the anchor's REMAINING decode always outlasts the victim's queue wait —
+    even on fast backends where a minute of audio decodes in under a second
+    with warm graphs. The timeout check only runs while the caller is NOT at
+    the queue head, so the victim must still be parked behind the anchor when
+    its 0.3 s elapses.
     """
     port = _free_port()
     server = ServeProc(binary, model, gguf, "127.0.0.1", port,
-                       extra_args=["--request-timeout-seconds", "1"],
+                       extra_args=["--request-timeout-seconds", "0.3"],
                        start_timeout=180.0)
     try:
-        anchor_wav = make_wav(anchor)
+        anchor_wav = make_wav(np.tile(anchor, 3))
 
         def post_anchor():
             try:
@@ -805,7 +827,7 @@ def test_real_queue_timeout(binary: Path, model: str, gguf: str,
         tr.check("504 identifies the timeout",
                  "timed out" in victim.get("body", ""),
                  victim.get("body", ""))
-        tr.check("504 arrives after ~1s, not instantly", dt >= 0.8,
+        tr.check("504 arrives after the timeout, not instantly", dt >= 0.25,
                  f"took {dt:.2f}s")
     finally:
         server.stop()
@@ -1027,6 +1049,7 @@ def main():
             test_multipart_wav_decodes(base_url, tr, endpoint)
         for endpoint in ("transcribe", "inference"):
             test_multipart_wav_reaches_inference(base_url, tr, endpoint)
+        test_multipart_filenameless_part(base_url, tr)
         test_malformed_wav_huge_frame_count(base_url, tr)
 
         print("\nTesting WebSocket control frames:")
