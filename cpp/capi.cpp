@@ -1,12 +1,14 @@
 // capi.cpp — shared C API shell for libstarling_ggml.
 //
 // Implements the C API declared in cpp/include/starling_ggml.h. Dispatches
-// load/free/transcribe on a per-model basis (parakeet-tdt now; moss in Phase 2).
-// Every entry is exception-fenced: a C++ exception never crosses the boundary;
-// it's caught and stored in last_error.
+// load/free/transcribe through the central model table
+// (lib/model_registry.hpp); adding a model is one registry row, not another
+// if-chain here. Every entry is exception-fenced: a C++ exception never
+// crosses the boundary; it's caught and stored in last_error.
 
 #include "starling_ggml.h"
 
+#include "lib/model_registry.hpp"
 #include "runtime/graph.hpp"  // global_backend, shutdown_backend, shutting_down
 
 #include <cstdlib>
@@ -14,6 +16,9 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+
+// The internal model table (cpp/lib/model_registry.hpp), aliased for brevity.
+namespace lib = starling::ggml::lib;
 
 // The opaque context: a tagged variant over the per-model handles. Only one
 // model kind is active per context (selected at load). Defined at global scope
@@ -26,10 +31,12 @@ struct starling_ggml_ctx {
 
 namespace {
 
-// ---- per-model internal entry points (defined in capi_parakeet.cpp etc.) ----
+// ---- parakeet debug-passthrough entry points (capi_parakeet.cpp) ----
+// Only the mel/encode/decode/decode_ids introspection entries used by the
+// _pub wrappers below; every model's load/free/decode trio (parakeet's
+// included) is declared once, next to the registry table in
+// lib/model_registry.cpp.
 extern "C" {
-void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_parakeet_free(void * handle);
 float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
                                    int * out_T, const char ** err_out);
 float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t n,
@@ -38,22 +45,6 @@ char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n
                                      const char ** err_out);
 int64_t * starling_ggml_parakeet_decode_ids(void * handle, const float * pcm, int64_t n,
                                             int64_t * out_n, const char ** err_out);
-void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_moss_free(void * handle);
-char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
-                                 const char ** err_out);
-void * starling_ggml_ark_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_ark_free(void * handle);
-char * starling_ggml_ark_decode(void * handle, const float * pcm, int64_t n,
-                                const char ** err_out);
-void * starling_ggml_higgs_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_higgs_free(void * handle);
-char * starling_ggml_higgs_decode(void * handle, const float * pcm, int64_t n,
-                                  const char ** err_out);
-void * starling_ggml_hojo_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_hojo_free(void * handle);
-char * starling_ggml_hojo_decode(void * handle, const float * pcm, int64_t n,
-                                 const char ** err_out);
 }
 
 std::mutex g_err_mutex;
@@ -93,22 +84,13 @@ const char * starling_ggml_backend_name(void) { return backend_name_for_build();
 // --------------------------------------------------------------------------- //
 starling_ggml_ctx * starling_ggml_load(starling_ggml_model model,
                                        const char * gguf_path) {
-    const char* err = nullptr;
-    void* handle = nullptr;
-    if (model == STARLING_GGML_PARAKEET_TDT) {
-        handle = starling_ggml_parakeet_load(gguf_path, &err);
-    } else if (model == STARLING_GGML_MOSS) {
-        handle = starling_ggml_moss_load(gguf_path, &err);
-    } else if (model == STARLING_GGML_ARK) {
-        handle = starling_ggml_ark_load(gguf_path, &err);
-    } else if (model == STARLING_GGML_HIGGS) {
-        handle = starling_ggml_higgs_load(gguf_path, &err);
-    } else if (model == STARLING_GGML_HOJO) {
-        handle = starling_ggml_hojo_load(gguf_path, &err);
-    } else {
+    const lib::ModelDescriptor* d = lib::find_model(model);
+    if (!d) {
         set_global_error("starling_ggml_load: unsupported model kind");
         return nullptr;
     }
+    const char* err = nullptr;
+    void* handle = d->load_fn(gguf_path, &err);
     if (!handle) {
         set_global_error(err ? err : "starling_ggml_load: failed (no message)");
         return nullptr;
@@ -122,16 +104,8 @@ starling_ggml_ctx * starling_ggml_load(starling_ggml_model model,
 void starling_ggml_free(starling_ggml_ctx * ctx) {
     if (!ctx) return;
     if (ctx->model) {
-        if (ctx->kind == STARLING_GGML_PARAKEET_TDT)
-            starling_ggml_parakeet_free(ctx->model);
-        else if (ctx->kind == STARLING_GGML_MOSS)
-            starling_ggml_moss_free(ctx->model);
-        else if (ctx->kind == STARLING_GGML_ARK)
-            starling_ggml_ark_free(ctx->model);
-        else if (ctx->kind == STARLING_GGML_HIGGS)
-            starling_ggml_higgs_free(ctx->model);
-        else if (ctx->kind == STARLING_GGML_HOJO)
-            starling_ggml_hojo_free(ctx->model);
+        if (const lib::ModelDescriptor* d = lib::find_model(ctx->kind))
+            d->free_fn(ctx->model);
     }
     delete ctx;
 }
@@ -156,69 +130,29 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
         set_global_error("starling_ggml_transcribe_pcm: null context");
         return nullptr;
     }
-    if (ctx->kind == STARLING_GGML_PARAKEET_TDT) {
-        // parakeet-tdt is a 16 kHz model; resample upstream if needed. We only
-        // warn (not fail) on a mismatch so a 16k caller passing sample_rate=0
-        // still works.
-        if (sample_rate != 0 && sample_rate != 16000) {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg),
-                "starling_ggml_transcribe_pcm: parakeet expects 16 kHz, got %d", sample_rate);
-            set_global_error(msg);
-            return nullptr;
-        }
-        const char* err = nullptr;
-        char* r = starling_ggml_parakeet_decode(ctx->model, samples, n, &err);
-        if (!r) { ctx->last_error = err ? err : "transcribe failed"; set_global_error(ctx->last_error); }
-        return r;
+    const lib::ModelDescriptor* d = lib::find_model(ctx->kind);
+    if (!d) {
+        ctx->last_error = "starling_ggml_transcribe_pcm: unsupported model kind";
+        set_global_error(ctx->last_error);
+        return nullptr;
     }
-    if (ctx->kind == STARLING_GGML_MOSS) {
-        if (sample_rate != 0 && sample_rate != 16000) {
-            ctx->last_error = "starling_ggml_transcribe_pcm: MOSS expects 16 kHz";
-            set_global_error(ctx->last_error);
-            return nullptr;
-        }
-        const char* err = nullptr;
-        char* r = starling_ggml_moss_decode(ctx->model, samples, n, &err);
-        if (!r) { ctx->last_error = err ? err : "MOSS transcribe failed"; set_global_error(ctx->last_error); }
-        return r;
+    // Every engine consumes 16 kHz mono; resample upstream if needed. We only
+    // reject (not resample) on a mismatch, and tolerate sample_rate=0 so a
+    // 16k caller that doesn't know the rate still works.
+    if (sample_rate != 0 && sample_rate != 16000) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), d->rate_error_fmt, sample_rate);
+        if (d->rate_error_in_ctx) ctx->last_error = msg;
+        set_global_error(msg);
+        return nullptr;
     }
-    if (ctx->kind == STARLING_GGML_ARK) {
-        if (sample_rate != 0 && sample_rate != 16000) {
-            ctx->last_error = "starling_ggml_transcribe_pcm: ARK expects 16 kHz";
-            set_global_error(ctx->last_error);
-            return nullptr;
-        }
-        const char* err = nullptr;
-        char* r = starling_ggml_ark_decode(ctx->model, samples, n, &err);
-        if (!r) { ctx->last_error = err ? err : "ARK transcribe failed"; set_global_error(ctx->last_error); }
-        return r;
+    const char* err = nullptr;
+    char* r = d->decode_fn(ctx->model, samples, n, &err);
+    if (!r) {
+        ctx->last_error = err ? err : d->decode_fallback;
+        set_global_error(ctx->last_error);
     }
-    if (ctx->kind == STARLING_GGML_HIGGS) {
-        if (sample_rate != 0 && sample_rate != 16000) {
-            ctx->last_error = "starling_ggml_transcribe_pcm: HIGGS expects 16 kHz";
-            set_global_error(ctx->last_error);
-            return nullptr;
-        }
-        const char* err = nullptr;
-        char* r = starling_ggml_higgs_decode(ctx->model, samples, n, &err);
-        if (!r) { ctx->last_error = err ? err : "HIGGS transcribe failed"; set_global_error(ctx->last_error); }
-        return r;
-    }
-    if (ctx->kind == STARLING_GGML_HOJO) {
-        if (sample_rate != 0 && sample_rate != 16000) {
-            ctx->last_error = "starling_ggml_transcribe_pcm: HOJO expects 16 kHz";
-            set_global_error(ctx->last_error);
-            return nullptr;
-        }
-        const char* err = nullptr;
-        char* r = starling_ggml_hojo_decode(ctx->model, samples, n, &err);
-        if (!r) { ctx->last_error = err ? err : "HOJO transcribe failed"; set_global_error(ctx->last_error); }
-        return r;
-    }
-    ctx->last_error = "starling_ggml_transcribe_pcm: unsupported model kind";
-    set_global_error(ctx->last_error);
-    return nullptr;
+    return r;
 }
 
 void starling_ggml_free_string(char * s) {

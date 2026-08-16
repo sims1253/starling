@@ -6,6 +6,8 @@
 
 #include "server.hpp"
 
+#include "lib/model_registry.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -64,33 +66,37 @@ const char* phase_str(Phase p) {
 } // namespace
 
 // ---- model slug ↔ enum ----------------------------------------------------
+// Derived from the central model table (lib/model_registry.hpp): adding a
+// model is one registry row, and the slug mapping, supported check, and
+// --version list all follow. starling-serve links the library statically, so
+// it can include the internal header; nothing is added to the public
+// starling_ggml.h.
 starling_ggml_model slug_to_model(const std::string& slug) {
-    if (slug == "parakeet") return STARLING_GGML_PARAKEET_TDT;
-    if (slug == "moss")     return STARLING_GGML_MOSS;
-    if (slug == "ark")      return STARLING_GGML_ARK;
-    if (slug == "higgs")    return STARLING_GGML_HIGGS;
-    if (slug == "hojo")     return STARLING_GGML_HOJO;
-    return (starling_ggml_model)0;
+    const starling::ggml::lib::ModelDescriptor* d =
+        starling::ggml::lib::find_model_by_slug(slug);
+    return d ? d->kind : (starling_ggml_model)0;
 }
 
 const char* model_to_slug(starling_ggml_model m) {
-    switch (m) {
-    case STARLING_GGML_PARAKEET_TDT: return "parakeet";
-    case STARLING_GGML_MOSS:         return "moss";
-    case STARLING_GGML_ARK:          return "ark";
-    case STARLING_GGML_HIGGS:        return "higgs";
-    case STARLING_GGML_HOJO:         return "hojo";
-    }
-    return "unknown";
+    const starling::ggml::lib::ModelDescriptor* d =
+        starling::ggml::lib::find_model(m);
+    return d ? d->slug : "unknown";
 }
 
 bool is_supported_model(const std::string& slug) {
     return slug_to_model(slug) != (starling_ggml_model)0;
 }
 
-// Build the supported-models list string for --version.
+// Build the supported-models list string for --version (registry order).
 std::string supported_models_str() {
-    std::string s = "parakeet moss ark higgs hojo";
+    size_t n = 0;
+    const starling::ggml::lib::ModelDescriptor* regs =
+        starling::ggml::lib::model_registry(&n);
+    std::string s;
+    for (size_t i = 0; i < n; ++i) {
+        if (i) s += ' ';
+        s += regs[i].slug;
+    }
     return s;
 }
 
