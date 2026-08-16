@@ -21,6 +21,11 @@ struct AudioEncoding {
 bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
                               AudioEncoding& out, std::string& err);
 
+// Read a weight tensor as f32 (BF16/F32 only; any other dtype fails loudly:
+// empty return + err set — never a silent zero-fill).
+std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name,
+                                      std::string& err);
+
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
 size_t encoder_replay_cache_size();
