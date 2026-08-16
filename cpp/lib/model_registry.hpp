@@ -5,9 +5,12 @@
 // places: the load/free/transcribe if-chains in capi.cpp plus the slug
 // mapping and supported-list string in serve/server.cpp. Now a model brings
 // its own implementation (cpp/<model>/, with capi_<model>.cpp exposing the
-// three entry points below) plus ONE row in model_registry.cpp, and
-// everything else — C-API dispatch, serve slug mapping, --version's model
-// list — is derived from the table.
+// three entry points below) plus ONE contiguous addition in
+// model_registry.cpp — the three entry-point declarations and the kRegistry
+// row, side by side in that file. The public enum kind is added to
+// starling_ggml.h with the usual ABI bump (the Python binding's expected
+// version follows). Everything else — C-API dispatch, serve slug mapping,
+// --version's model list — is derived from the table.
 //
 // The registry lives in the library's internal namespace. serve links
 // starling_ggml statically and includes this header directly; nothing here

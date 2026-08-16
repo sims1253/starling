@@ -32,8 +32,12 @@ shared 16 kHz guard). The C API's `load`/`free`/`transcribe_pcm` dispatch
 public `starling_ggml.h` stays flat and unchanged (ABI 3).
 
 Adding a model = its `cpp/<model>/` implementation (with the three
-`capi_<model>.cpp` entry points) + ONE registry row. No other per-model edits
-anywhere in the tree.
+`capi_<model>.cpp` entry points) + one contiguous addition in
+`cpp/lib/model_registry.cpp`: the three entry-point declarations and the
+`kRegistry` row, side by side. The public `starling_ggml_model` enum kind is
+added to `starling_ggml.h` with the usual ABI bump (the Python binding's
+`_EXPECTED_ABI_VERSION` follows). No other per-model edits anywhere in the
+tree.
 
 ## Correctness contract
 

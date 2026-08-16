@@ -13,6 +13,9 @@ namespace starling::ggml::lib {
 namespace {
 
 // Per-model internal entry points (defined in cpp/<model>/capi_<model>.cpp).
+// Part of the per-model addition: a new engine adds its three declarations
+// here plus its row in kRegistry below — both edits sit side by side in this
+// file. (The public enum kind arrives with the starling_ggml.h ABI bump.)
 // Parakeet's extra debug passthroughs (mel/encode/decode_ids) stay private to
 // capi.cpp, which is their only caller.
 extern "C" {
