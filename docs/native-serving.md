@@ -66,10 +66,12 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 | `--warmup` | off | Capture CUDA graphs on startup |
 | `--no-eager-load` | off | Defer model load to first request |
 | `--idle-timeout <s>` | `0` (never) | Shut down after N seconds idle |
+| `--request-timeout-seconds <s>` | `600` | Fail queued requests after N s waiting for the engine (`504`); same flag as the Python server |
 | `--stream-chunk-seconds <s>` | `12.0` | Fixed WS stream window |
 | `--stream-overlap-seconds <s>` | `3.0` | Overlap between windows |
 | `--min-chunk-seconds <s>` | `5.0` | Min audio before first partial |
 | `--partial-interval-seconds <s>` | `3.0` | Min gap between partials |
+| `--max-stream-seconds <s>` | `60.0` | Per-WS-connection audio buffer cap (0 = unlimited) |
 | `--version` | — | Print version + ABI + backend, exit |
 | `--abi-version` | — | Print ABI version integer, exit |
 
@@ -101,8 +103,11 @@ Phase drives the UI: `unloaded → loading → ready → busy`.
 Accepts raw WAV bytes (or multipart/form-data). **Audio must be 16 kHz** —
 there is no C++ resampler, so WAVs at other sample rates are rejected with
 `400` and a `sample rate mismatch` error (the Python server resamples via
-scipy instead). Payloads that aren't valid WAV are treated as raw mono
-PCM16 @ 16 kHz little-endian. Returns:
+scipy instead). WAV parsing is bounded by the actual payload size: a header
+whose claimed frame count exceeds what the payload can hold (crafted or
+truncated) is rejected with `400` and a `malformed audio payload` error — it
+is never reinterpreted as raw PCM. Payloads without RIFF/WAVE magic are
+treated as raw mono PCM16 @ 16 kHz little-endian. Returns:
 
 ```json
 {"text":"hello world","segments":[{"text":"hello world","start_s":0.0,"end_s":2.5}],"duration_s":2.5,"request_id":"..."}
@@ -132,9 +137,24 @@ receive JSON messages:
 - `{"type":"pong"}` — in response to `{"type":"ping"}`
 - `{"type":"reset_ack"}` — in response to `{"type":"reset"}`
 
+**Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
+would push the session's buffered audio past the cap is refused. The server
+emits one error frame:
+
+```json
+{"type":"error","message":"stream buffer limit reached (60.000000 s buffered); audio ignored until reset"}
+```
+
+and then ignores all further audio frames for that session (no more partials,
+no crash, memory bounded). The client sends `{"type":"reset"}` to clear the
+session and start accepting audio again. The cap bounds per-connection memory:
+without it a client (or a buggy loop) streaming forever grows the rolling
+buffer without limit.
+
 Control frames (JSON text):
 - `{"type":"commit"}` — finalize all buffered audio (returns final)
-- `{"type":"reset"}` — discard buffer without finalizing (returns reset_ack)
+- `{"type":"reset"}` — discard buffer without finalizing (returns reset_ack;
+  also re-enables audio after a buffer-cap error)
 - `{"type":"ping"}` — heartbeat (returns pong)
 
 ## Architecture

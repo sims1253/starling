@@ -164,6 +164,15 @@ if(STARLING_GGML_TESTS)
       target_link_libraries(${test_name} PRIVATE Threads::Threads)
     endif()
 
+    # The audio_parser_test covers the pure WAV/multipart parsers in
+    # cpp/serve/audio.cpp (issue #12 hardening) — no model, CPU-safe.
+    if(test_name STREQUAL "audio_parser_test")
+      target_sources(${test_name} PRIVATE
+          ${CMAKE_SOURCE_DIR}/cpp/serve/audio.cpp)
+      target_include_directories(${test_name} PRIVATE
+          ${CMAKE_SOURCE_DIR}/cpp/serve)
+    endif()
+
     set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   endforeach()
 endif()

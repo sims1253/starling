@@ -62,12 +62,19 @@ static void usage(const char* prog) {
         "  --warmup           Warm up CUDA graphs on startup\n"
         "  --no-eager-load    Defer model load to first request\n"
         "  --idle-timeout <s> Shut down after N seconds idle (0 = never, default 0)\n"
+        "  --request-timeout-seconds <s> Fail queued requests after N s waiting for\n"
+        "                     the engine (0 = never, default 600; same flag as the\n"
+        "                     Python server)\n"
         "\n"
         "Streaming:\n"
         "  --stream-chunk-seconds <s>    Fixed stream window (default 12.0)\n"
         "  --stream-overlap-seconds <s>  Overlap between windows (default 3.0)\n"
         "  --min-chunk-seconds <s>       Min audio before first partial (default 5.0)\n"
         "  --partial-interval-seconds <s> Min gap between partials (default 3.0)\n"
+        "  --max-stream-seconds <s>      Per-connection audio buffer cap in s\n"
+        "                     (0 = unlimited, default 60). A frame that would\n"
+        "                     exceed it is rejected with an error frame and the\n"
+        "                     session ignores audio until it is reset\n"
         "\n"
         "Introspection:\n"
         "  --version          Print version + ABI version + backend, then exit\n"
@@ -85,6 +92,8 @@ struct Args {
     bool warmup = false;
     bool eager_load = true;
     double idle_timeout = 0.0;
+    double request_timeout = 600.0;
+    double max_stream_seconds = 60.0;
     double stream_chunk = 12.0;
     double stream_overlap = 3.0;
     double min_chunk = 5.0;
@@ -134,6 +143,8 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
         else if (arg == "--idle-timeout")  a.idle_timeout = next_double("--idle-timeout");
+        else if (arg == "--request-timeout-seconds") a.request_timeout = next_double("--request-timeout-seconds");
+        else if (arg == "--max-stream-seconds") a.max_stream_seconds = next_double("--max-stream-seconds");
         else if (arg == "--stream-chunk-seconds")   a.stream_chunk = next_double("--stream-chunk-seconds");
         else if (arg == "--stream-overlap-seconds") a.stream_overlap = next_double("--stream-overlap-seconds");
         else if (arg == "--min-chunk-seconds")      a.min_chunk = next_double("--min-chunk-seconds");
@@ -265,6 +276,8 @@ int main(int argc, char** argv) {
     cfg.stream_overlap_seconds = args.stream_overlap;
     cfg.min_chunk_seconds = args.min_chunk;
     cfg.partial_interval = args.partial_interval;
+    cfg.max_stream_seconds = args.max_stream_seconds;
+    cfg.request_timeout_seconds = args.request_timeout;
 
     // shared_ptr: the detached /warmup worker captures it and must outlive
     // main()'s reference if a warmup is still running at shutdown.
@@ -355,33 +368,61 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // Check body size.
+        // Extract the audio payload FIRST: cpp-httplib parses
+        // multipart/form-data bodies itself into req.form.files (req.body
+        // stays empty for them), so the body-empty check below must not run
+        // before the form has been consulted. Selection order mirrors
+        // audio::extract_multipart_payload: "audio", then "file", then any
+        // file part. Raw bodies carry the bytes directly.
+        std::string payload;
+        bool is_multipart = req.is_multipart_form_data();
+        if (is_multipart) {
+            if (req.form.has_file("audio")) {
+                payload = req.form.get_file("audio").content;
+            } else if (req.form.has_file("file")) {
+                payload = req.form.get_file("file").content;
+            } else {
+                for (const auto& [name, file] : req.form.files) {
+                    (void)name;
+                    if (!file.content.empty()) {
+                        payload = file.content;
+                        break;
+                    }
+                }
+            }
+        } else {
+            payload = req.body;
+        }
+
+        // Check payload size.
         size_t max_bytes = static_cast<size_t>(server->config().max_upload_mb) * 1024 * 1024;
-        if (req.body.size() > max_bytes) {
+        if (payload.size() > max_bytes) {
             send_json(res, "{\"error\":\"request body too large\"}", 413);
             return;
         }
-        if (req.body.empty()) {
+        if (payload.empty()) {
             send_json(res, "{\"error\":\"empty request body\"}", 400);
             return;
-        }
-
-        // Extract audio payload (multipart or raw).
-        std::string payload = req.body;
-        std::string ctype = req.get_header_value("content-type");
-        if (ctype.find("multipart/form-data") != std::string::npos) {
-            payload = serve::audio::extract_multipart_payload(req.body, ctype);
-            if (payload.empty()) {
-                send_json(res, "{\"error\":\"empty upload\"}", 400);
-                return;
-            }
         }
 
         // Decode audio.
         std::vector<float> samples;
         int sr = 0;
+        bool looks_like_wav = payload.size() >= 12
+            && (payload.compare(0, 4, "RIFF") == 0
+                || payload.compare(0, 4, "RF64") == 0
+                || payload.compare(0, 4, "RIFX") == 0)
+            && payload.compare(8, 4, "WAVE") == 0;
         bool decoded = serve::audio::wav_bytes_to_float32(payload, samples, sr);
         if (!decoded) {
+            // A payload with a RIFF/WAVE magic that fails WAV decoding (e.g. a
+            // header claiming more frames than the payload holds, or a
+            // truncated data chunk) is malformed: fail fast with 400 rather
+            // than reinterpreting header bytes as raw PCM16.
+            if (looks_like_wav) {
+                send_json(res, "{\"error\":\"malformed audio payload\",\"text\":\"\"}", 400);
+                return;
+            }
             // Try raw PCM16.
             samples = serve::audio::pcm16_to_float32(payload);
             sr = 16000;
@@ -480,9 +521,12 @@ int main(int argc, char** argv) {
 
     // ---- WS /stream ----
     svr.WebSocket("/stream",
-        [&server](const httplib::Request& req,
-                  httplib::ws::WebSocket& ws) {
+        [&server, &cfg](const httplib::Request&,
+                        httplib::ws::WebSocket& ws) {
             serve::StreamSession session(server.get());
+            // Sent once when the per-connection buffer cap trips; re-armed on
+            // reset so a fresh dictation gets a fresh error if it overflows.
+            bool cap_error_sent = false;
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
@@ -535,6 +579,7 @@ int main(int argc, char** argv) {
                         continue;
                     } else if (type == "reset") {
                         session.reset();
+                        cap_error_sent = false;
                         ws.send("{\"type\":\"reset_ack\"}");
                         continue;
                     } else {
@@ -547,12 +592,28 @@ int main(int argc, char** argv) {
                 }
 
                 if (rr == httplib::ws::ReadResult::Binary) {
-                    // Audio data.
-                    if (msg.size() >= 12 && msg.substr(0, 4) == "RIFF"
-                        && msg.substr(8, 4) == "WAVE") {
-                        session.append_wav(msg);
-                    } else {
-                        session.append_pcm(msg);
+                    // Audio data. Enforce the per-connection buffer cap
+                    // (--max-stream-seconds): a frame that would exceed it is
+                    // refused, reported once as an error frame, and the
+                    // session stops accepting audio until it is reset.
+                    if (!session.overflowed()) {
+                        if (msg.size() >= 12 && msg.substr(0, 4) == "RIFF"
+                            && msg.substr(8, 4) == "WAVE") {
+                            session.append_wav(msg);
+                        } else {
+                            session.append_pcm(msg);
+                        }
+                    }
+                    if (session.overflowed()) {
+                        if (!cap_error_sent) {
+                            cap_error_sent = true;
+                            std::ostringstream ss;
+                            ss << "{\"type\":\"error\",\"message\":\"stream buffer"
+                               << " limit reached (" << cfg.max_stream_seconds
+                               << " s buffered); audio ignored until reset\"}";
+                            ws.send(ss.str());
+                        }
+                        continue;
                     }
 
                     double now = static_cast<double>(

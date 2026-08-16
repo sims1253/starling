@@ -236,6 +236,7 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
             kSampleRate, cfg.stream_chunk_seconds, cfg.stream_overlap_seconds,
             cfg.min_chunk_seconds, cfg.partial_interval);
     }
+    max_buffer_seconds_ = cfg.max_stream_seconds;
 }
 
 TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
@@ -259,12 +260,20 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
 }
 
 void StreamSession::append_pcm(const std::string& bytes) {
+    if (overflow_) return;  // capped: refuse audio until reset()
     const size_t nbytes = bytes.size();
     if (nbytes == 0) return;
     size_t nsamples = nbytes / 2;
     // Drop odd trailing byte.
     if (nbytes % 2 == 1) nsamples = (nbytes - 1) / 2;
     if (nsamples == 0) return;
+    if (max_buffer_seconds_ > 0.0
+        && buffered_seconds()
+               + static_cast<double>(nsamples) / kSampleRate
+             > max_buffer_seconds_) {
+        overflow_ = true;
+        return;
+    }
     const auto* src = reinterpret_cast<const int16_t*>(bytes.data());
     size_t old = samples_.size();
     samples_.resize(old + nsamples);
@@ -275,6 +284,7 @@ void StreamSession::append_pcm(const std::string& bytes) {
 }
 
 void StreamSession::append_wav(const std::string& bytes) {
+    if (overflow_) return;  // capped: refuse audio until reset()
     // Check for RIFF/WAVE header.
     if (bytes.size() < 12 || bytes.substr(0, 4) != "RIFF"
         || bytes.substr(8, 4) != "WAVE") {
@@ -299,6 +309,13 @@ void StreamSession::append_wav(const std::string& bytes) {
         return;
     }
     if (!decoded.empty()) {
+        if (max_buffer_seconds_ > 0.0
+            && buffered_seconds()
+                   + static_cast<double>(decoded.size()) / kSampleRate
+                 > max_buffer_seconds_) {
+            overflow_ = true;
+            return;
+        }
         size_t old = samples_.size();
         samples_.resize(old + decoded.size());
         std::copy(decoded.begin(), decoded.end(), samples_.begin() + old);
@@ -322,13 +339,13 @@ void StreamSession::maybe_trim_samples() {
 
 std::optional<std::string> StreamSession::stream_step(double now) {
     if (!chunker_) return std::nullopt;
-    auto tx = make_transcribe_fn(nullptr);
+    TranscribeFn tx = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
     return chunker_->step(samples_, now, tx);
 }
 
 std::string StreamSession::stream_flush() {
     if (!chunker_) return "";
-    auto tx = make_transcribe_fn(nullptr);
+    TranscribeFn tx = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
     return chunker_->flush(samples_, tx);
 }
 
@@ -336,6 +353,7 @@ void StreamSession::reset() {
     samples_.clear();
     last_partial_ts_ = 0.0;
     trimmed_samples_ = 0;
+    overflow_ = false;
     if (chunker_) chunker_->reset();
 }
 
