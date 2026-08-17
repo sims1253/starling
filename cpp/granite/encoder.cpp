@@ -25,6 +25,15 @@
 // On GPU this is ONE captured ReplayGraph keyed on the stacked-mel length
 // (LRU-bounded); on CPU / debug it is the one-shot build. All rounding
 // boundaries follow the bf16 oracle (f32 elementwise, bf16 between ops).
+//
+// Divergence probe: STARLING_GRANITE_ONLY=<stage> truncates the build at the
+// named stage and makes that node the graph's REAL output (the moss L0_STAGE
+// pattern — intermediate capture readback is NOT a numerical oracle, it
+// produced garbage during the port). Stages: melin, in, ffn, ffr, ffu, ffs,
+// ffm (ff1's LN / raw norm / up / silu / down), ff1, attnm (raw attention),
+// attn, cn, cu, cg, cd, cb, convm (conv LN / up / GLU / depthwise / BN /
+// raw module), conv, ff2, post. The stage values land in the
+// STARLING_GRANITE_DUMP_ENC file and transcription stops with an error.
 #include "encoder.hpp"
 
 #include "runtime/backend.hpp"
@@ -60,6 +69,17 @@ constexpr float kMaskNeg = -3.3895313892515355e38f;
 // override it).
 constexpr float kBnEps = 1e-5f;
 
+// STARLING_GRANITE_ONLY probe state. `hit` marks the stage that truncated the
+// build; stored in the caller-owned slot (the LRU entry / stack frame that
+// outlives the graph build).
+struct StageStop {
+    const char* name = nullptr;
+    bool hit = false;
+};
+inline bool stage_wants(const char* only, const char* stage) {
+    return only && std::strcmp(only, stage) == 0;
+}
+
 // Build the per-T host constants backing the graph's constant inputs.
 EncScratch make_scratch(const Config& c, int64_t T) {
     const auto& ec = c.encoder;
@@ -94,12 +114,20 @@ EncScratch make_scratch(const Config& c, int64_t T) {
 
 // ---- block pieces (all take/return [hidden, T] bf16) -----------------------
 
+// ff = LN -> up -> SiLU -> down (all biased).
 ggml_tensor* conformer_ff(ggml_context* c, const ModelLoader& ml,
-                          const std::string& p, ggml_tensor* x, float eps) {
+                          const std::string& p, ggml_tensor* x, float eps,
+                          StageStop* stop) {
     ggml_tensor* h = lib::layer_norm_bf16(c, ml, x, p + "_norm", eps);
+    if (stage_wants(stop->name, "ffn")) { stop->hit = true; return h; }
+    if (stage_wants(stop->name, "ffr")) { stop->hit = true; return ggml_norm(c, f32(c, x), eps); }
     h = lib::linear_bf16(c, ml, h, p + "_up", true);
+    if (stage_wants(stop->name, "ffu")) { stop->hit = true; return h; }
     h = bf16(c, ggml_silu(c, f32(c, h)));
-    return lib::linear_bf16(c, ml, h, p + "_down", true);
+    if (stage_wants(stop->name, "ffs")) { stop->hit = true; return h; }
+    h = lib::linear_bf16(c, ml, h, p + "_down", true);
+    if (stage_wants(stop->name, "ffm")) { stop->hit = true; return h; }
+    return h;
 }
 
 // Block-local Shaw relative-position attention (pre-norm inside).
@@ -133,10 +161,12 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
         q = bf16(c, ggml_concat(c, f32(c, q), zq, 1));
         kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
     }
-    // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden).
-    ggml_tensor* k = ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0);
-    ggml_tensor* v = ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
-                                  (size_t) hidden * kv->nb[0]);
+    // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden). The strided
+    // half-views go through cont() (a value-exact copy) — reshape_4d below
+    // asserts contiguity.
+    ggml_tensor* k = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0));
+    ggml_tensor* v = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
+                                               (size_t) hidden * kv->nb[0]));
     // [hidden, T_pad] -> [D, H, CS, nblk].
     auto to_blocks = [&](ggml_tensor* z) {
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
@@ -158,8 +188,9 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     ggml_tensor* pos = bf16(c, ggml_mul_mat(c, rep, qc));             // [r, H*nblk, c]
     pos = bf16(c, ggml_scale(c, f32(c, pos), scale));
     // (r, H*nblk, c) -> (r, H, nblk, c) -> (r, c, H, nblk), matching sc.
+    // (ggml_permute is scatter-style: old dim i lands at position i_k.)
     pos = ggml_reshape_4d(c, pos, CS, H, nblk, CS);
-    pos = ggml_cont(c, ggml_permute(c, pos, 0, 3, 1, 2));
+    pos = ggml_cont(c, ggml_permute(c, pos, 0, 2, 3, 1));
 
     ggml_tensor* tot = lib::addb(c, sc, pos);
     if (s.pad > 0) {
@@ -184,9 +215,11 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
 // -> pw down. The depthwise conv is a 15-tap shift-multiply-accumulate (ggml's
 // im2col conv is unvalidated under CUDA-graph capture in this build; pure
 // elementwise ops are not), accumulated in f32 and rounded to bf16 once —
-// the nn.Conv1d bf16 rounding boundary.
+// the nn.Conv1d bf16 rounding boundary. NOTE: the pad is (K/2, K/2) — left
+// AND right (a right-only pad shifts the whole signal and was the port's
+// transcript-breaking bug).
 ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
-                         ggml_tensor* x, const EncScratch& s) {
+                         ggml_tensor* x, const EncScratch& s, StageStop* stop) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const int64_t C = ec.conv_inner, T = x->ne[1], K = ec.conv_kernel;
@@ -194,20 +227,26 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
 
     ggml_tensor* h = lib::layer_norm_bf16(c, ml, x, p + "conv_norm",
                                           ec.layer_norm_eps);
+    if (stage_wants(stop->name, "cn")) { stop->hit = true; return h; }
     ggml_tensor* up = lib::linear_bf16(c, ml, h, p + "conv_up", true);  // [2C, T]
+    if (stage_wants(stop->name, "cu")) { stop->hit = true; return up; }
     // GLU over channels: a = rows [0, C), b = rows [C, 2C); a * sigmoid(b).
-    ggml_tensor* a = ggml_view_2d(c, up, C, T, up->nb[1], 0);
-    ggml_tensor* b = ggml_view_2d(c, up, C, T, up->nb[1], (size_t) C * up->nb[0]);
+    // The strided half-views go through cont() (value-exact) so the
+    // elementwise ops below get contiguous inputs.
+    ggml_tensor* a = ggml_cont(c, ggml_view_2d(c, up, C, T, up->nb[1], 0));
+    ggml_tensor* b = ggml_cont(c, ggml_view_2d(c, up, C, T, up->nb[1],
+                                               (size_t) C * up->nb[0]));
     ggml_tensor* g = lib::mulb(c, a, bf16(c, ggml_sigmoid(c, f32(c, b))));  // [C, T]
+    if (stage_wants(stop->name, "cg")) { stop->hit = true; return g; }
 
     // Depthwise: zero-pad (K/2, K/2) in f32, then sum_k w[k, :] .* shifted rows.
     int64_t zne[2] = {C, K / 2};
     ggml_tensor* z7 = graph_input_tensor(c, GGML_TYPE_F32, 2, zne,
                                          s.zeros7.data(),
                                          s.zeros7.size() * sizeof(float));
-    ggml_tensor* gp = ggml_concat(c, f32(c, g), z7, 1);
-    gp = ggml_concat(c, gp, z7, 1);                                    // [C, T+K-1] f32
-    ggml_tensor* w = weight(c, ml, p + "conv_depth");                  // [K, C] k-major
+    ggml_tensor* gp = ggml_concat(c, z7, f32(c, g), 1);                // left pad
+    gp = ggml_concat(c, gp, z7, 1);                                    // right pad → [C, T+K-1]
+    ggml_tensor* w = weight(c, ml, p + "conv_depth.weight");           // [C, K] k-major
     ggml_tensor* acc = nullptr;
     for (int64_t k = 0; k < K; ++k) {
         ggml_tensor* col = ggml_view_2d(c, w, C, 1, w->nb[1],
@@ -218,6 +257,7 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
         acc = acc ? ggml_add(c, acc, term) : term;
     }
     ggml_tensor* dw = bf16(c, acc);
+    if (stage_wants(stop->name, "cd")) { stop->hit = true; return dw; }
 
     // Eval BatchNorm: y = ((x - mean) * invstd) * weight + bias with
     // invstd = 1 / sqrt(var + eps) per channel (f32 math, bf16 store).
@@ -239,6 +279,7 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
     t = ggml_mul(c, t, f32(c, bnw));
     t = ggml_add(c, t, f32(c, bnb));
     ggml_tensor* sb = bf16(c, t);
+    if (stage_wants(stop->name, "cb")) { stop->hit = true; return sb; }
 
     sb = bf16(c, ggml_silu(c, f32(c, sb)));
     return lib::linear_bf16(c, ml, sb, p + "conv_down", true);
@@ -246,21 +287,38 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
 
 // One conformer block + the mid-CTC hook.
 ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
-                             ggml_tensor* x, const EncScratch& s) {
+                             ggml_tensor* x, const EncScratch& s,
+                             StageStop* stop) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const std::string p = "enc.blk." + std::to_string(li) + ".";
     // x += 0.5 * ff(x): 0.5 is an exact power of two.
     auto half_ff = [&](const char* ff) {
-        ggml_tensor* y = conformer_ff(c, ml, p + ff, x, ec.layer_norm_eps);
+        ggml_tensor* y = conformer_ff(c, ml, p + ff, x, ec.layer_norm_eps, stop);
+        if (stop->hit) return y;
         y = bf16(c, ggml_scale(c, f32(c, y), 0.5f));
         return lib::addb(c, x, y);
     };
     x = half_ff("ff1");
-    x = lib::addb(c, x, shaw_attention(c, m, li, x, s));
-    x = lib::addb(c, x, conv_module(c, m, li, x, s));
+    if (stop->hit) return x;
+    if (stage_wants(stop->name, "ff1")) { stop->hit = true; return x; }
+    {
+        ggml_tensor* a = shaw_attention(c, m, li, x, s);
+        if (stage_wants(stop->name, "attnm")) { stop->hit = true; return a; }
+        x = lib::addb(c, x, a);
+    }
+    if (stage_wants(stop->name, "attn")) { stop->hit = true; return x; }
+    {
+        ggml_tensor* v = conv_module(c, m, li, x, s, stop);
+        if (stop->hit) return v;
+        x = lib::addb(c, x, v);
+    }
+    if (stage_wants(stop->name, "conv")) { stop->hit = true; return x; }
     x = half_ff("ff2");
+    if (stop->hit) return x;
+    if (stage_wants(stop->name, "ff2")) { stop->hit = true; return x; }
     x = lib::layer_norm_bf16(c, ml, x, p + "post_norm", ec.layer_norm_eps);
+    if (stage_wants(stop->name, "post")) { stop->hit = true; return x; }
     if ((int) li + 1 == (int) ec.mid_layer) {
         // Self-conditioned mid CTC: x += out_mid(softmax(out(x))).
         ggml_tensor* mid = lib::linear_bf16(c, ml, x, "enc.out", true);   // [348, T]
@@ -275,17 +333,18 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
 // [160, T] bf16; returns [output_dim, N] f32. When `enc_capture` is non-null
 // the encoder's last hidden state is additionally read back (divergence dump).
 ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* mel_in,
-                         const EncScratch& s, std::vector<float>* enc_capture) {
+                         const EncScratch& s, std::vector<float>* enc_capture,
+                         StageStop* stop) {
     const auto& ec = m.config.encoder;
     ggml_tensor* x = lib::linear_bf16(c, m.loader, mel_in, "enc.input_linear", true);
-    for (uint32_t li = 0; li < ec.n_layers; ++li)
-        x = conformer_block(c, m, (int) li, x, s);
+    if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
+    if (stage_wants(stop->name, "in")) { stop->hit = true; return f32(c, x); }
+    for (uint32_t li = 0; li < ec.n_layers; ++li) {
+        x = conformer_block(c, m, (int) li, x, s, stop);
+        if (stop->hit) return f32(c, x);
+    }
     if (enc_capture) capture_graph_output(f32(c, x), enc_capture);
     return f32(c, build_projector(c, m, x, s));
-}
-
-bool debug_enabled() {
-    return lib::debug_enabled("STARLING_GRANITE_DEBUG");
 }
 
 } // namespace
@@ -307,6 +366,7 @@ struct EncoderReplayEntry {
     GraphInputPool pool;
     EncScratch scratch;  // host constants backing graph inputs; stable for the
                          // ReplayGraph's lifetime (never resized after build)
+    StageStop stop;      // STARLING_GRANITE_ONLY probe state (stable storage)
     std::unique_ptr<ReplayGraph> graph;
     ggml_bf16_t* mel_buf = nullptr;
     std::vector<float> enc_capture;
@@ -333,24 +393,41 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
     const int64_t nblk15 = (T + pc.window_size - 1) / pc.window_size;
     const int64_t N = nblk15 * pc.num_queries;
     const char* dump_env = std::getenv("STARLING_GRANITE_DUMP_ENC");
+    if (const char* ms = std::getenv("STARLING_GRANITE_DUMP_MELSTK")) {
+        if (FILE* f = std::fopen(ms, "wb")) {
+            std::fwrite(mel.data.data(), sizeof(ggml_bf16_t), mel.data.size(), f);
+            std::fclose(f);
+        }
+    }
+    auto write_stage_dump = [&](const std::vector<float>& v) {
+        if (dump_env) {
+            if (FILE* f = std::fopen(dump_env, "wb")) {
+                std::fwrite(v.data(), sizeof(float), v.size(), f);
+                std::fclose(f);
+            }
+        }
+    };
 
     // CPU + debug diagnostic path: one-shot build.
-    if (!global_backend().is_gpu() || debug_enabled()) {
+    if (!global_backend().is_gpu() || lib::debug_enabled("STARLING_GRANITE_DEBUG")) {
         EncScratch s = make_scratch(model.config, T);
         std::vector<float> enc_out;
+        StageStop stop{std::getenv("STARLING_GRANITE_ONLY")};
         bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
             int64_t mne[2] = {ec.input_dim, T};
             ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
                                                      mel.data.data(),
                                                      mel.data.size() * sizeof(mel.data[0]));
-            return build_fused(c, model, mel_in, s, dump_env ? &enc_out : nullptr);
+            return build_fused(c, model, mel_in, s, dump_env ? &enc_out : nullptr, &stop);
         }, out.data);
         if (!ok) { err = "GRANITE encoder graph execution failed"; return false; }
-        if (dump_env && !enc_out.empty()) {
-            if (FILE* f = std::fopen(dump_env, "wb")) {
-                std::fwrite(enc_out.data(), sizeof(float), enc_out.size(), f);
-                std::fclose(f);
-            }
+        write_stage_dump(enc_out);
+        if (stop.hit) {
+            // Stage-only probe: the graph output IS the probed stage; dump it
+            // host-side and stop the transcription here.
+            write_stage_dump(out.data);
+            err = "GRANITE stage-only probe (STARLING_GRANITE_ONLY)";
+            return false;
         }
         out.n_tokens = N;
         out.width = pc.output_dim;
@@ -370,6 +447,7 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         [&](EncoderReplayEntry& entry) {
             entry.T = T;
             entry.scratch = make_scratch(model.config, T);
+            entry.stop.name = std::getenv("STARLING_GRANITE_ONLY");
             entry.mel_buf = reinterpret_cast<ggml_bf16_t*>(entry.pool.alloc_bytes(
                 (size_t) ec.input_dim * T * sizeof(ggml_bf16_t)));
             std::memcpy(entry.mel_buf, mel.data.data(),
@@ -381,7 +459,8 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                         entry.mel_buf,
                         (size_t) ec.input_dim * entry.T * sizeof(ggml_bf16_t));
                     return build_fused(c, model, mel_in, entry.scratch,
-                                       dump_env ? &entry.enc_capture : nullptr);
+                                       dump_env ? &entry.enc_capture : nullptr,
+                                       &entry.stop);
                 });
         });
     std::memcpy(e.mel_buf, mel.data.data(),
@@ -393,11 +472,11 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         err = "GRANITE fused encoder+projector replay failed";
         return false;
     }
-    if (dump_env && !e.enc_capture.empty()) {
-        if (FILE* f = std::fopen(dump_env, "wb")) {
-            std::fwrite(e.enc_capture.data(), sizeof(float), e.enc_capture.size(), f);
-            std::fclose(f);
-        }
+    write_stage_dump(e.enc_capture);
+    if (e.stop.hit) {
+        write_stage_dump(tmp);
+        err = "GRANITE stage-only probe (STARLING_GRANITE_ONLY)";
+        return false;
     }
     out.data = std::move(tmp);
     out.n_tokens = N;
