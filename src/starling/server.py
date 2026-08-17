@@ -63,8 +63,20 @@ log = logging.getLogger("starling.server")
 # (overridden with the release tag by the release workflow).
 try:
     SERVER_VERSION = package_version("starling")
-except PackageNotFoundError:  # running from a source tree without an install
-    SERVER_VERSION = "0.1.0"
+except PackageNotFoundError:
+    # Running from a source tree without an install: read the project version
+    # straight out of pyproject.toml so this path cannot drift on a bump.
+    SERVER_VERSION = "0.0.0+unknown"
+    try:
+        import re
+        from pathlib import Path
+
+        _pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        _m = re.search(r'^version\s*=\s*"([^"]+)"', _pyproject.read_text(), re.M)
+        if _m:
+            SERVER_VERSION = _m.group(1)
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Constants

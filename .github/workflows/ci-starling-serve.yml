@@ -33,10 +33,18 @@ jobs:
       - name: Build (CPU)
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          cmake --build build -j --target starling-serve stream_session_test
+          cmake --build build -j --target starling-serve stream_session_test \
+            loader_guard_test higgs_dtype_guard_test
 
       - name: C++ unit tests (serve logic, no GPU/model)
         run: ./build/stream_session_test
+
+      # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
+      # higgs_dtype_guard_test synthesizes its own GGUF and always runs.
+      - name: C++ loader/dtype guard tests
+        run: |
+          ./build/loader_guard_test
+          ./build/higgs_dtype_guard_test
 
       - name: Smoke test --version
         run: |

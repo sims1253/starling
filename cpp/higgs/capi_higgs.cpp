@@ -31,9 +31,13 @@ thread_local std::string g_load_error;
 // Warmup transcriptions (serve layer) and raw ctypes callers (the Python
 // binding releases the GIL around transcribe_pcm) would race a real request
 // through that state. Serialize every transcription in the engine itself with
-// one mutex held across the whole decode. It is a leaf lock — nothing inside
-// the decode takes another lock — so it cannot deadlock against the
-// serve-layer serial queues, which keep their request-ordering role.
+// one mutex held across the whole decode; the guarantee is decode-vs-decode
+// exclusivity. Locks nested inside the decode (g_backend_mutex via
+// ensure_weights_realized, pocketfft's internal mutexes on the mel path) are
+// safe because acquisition is strictly one-directional — serve serial queue
+// -> decode -> backend/FFT — and nothing holding an inner lock calls back
+// into the higgs decode. starling_ggml_higgs_free against an in-flight decode
+// remains unguarded, matching existing serve-layer model lifetimes.
 std::mutex g_decode_mutex;
 
 struct HiggsCtx {
