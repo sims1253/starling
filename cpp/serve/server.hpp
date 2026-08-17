@@ -47,6 +47,8 @@ constexpr double kWarmupSeconds        = 5.0;
 constexpr int    kMaxWaiters           = 8;
 constexpr int    kMaxUploadMB          = 256;
 constexpr double kRequestTimeoutS      = 600.0;
+// Per-WS-connection rolling buffer cap (audio beyond the finalized boundary).
+constexpr double kDefaultMaxStreamS    = 60.0;
 
 // ---- model slug ↔ enum ----------------------------------------------------
 // Maps the CLI slug to the C-API model enum. Returns 0 (invalid)
@@ -71,6 +73,7 @@ struct ServerConfig {
     double partial_interval        = kDefaultPartialInt;
     double stream_chunk_seconds    = kDefaultStreamChunk;
     double stream_overlap_seconds  = kDefaultStreamOverlap;
+    double max_stream_seconds      = kDefaultMaxStreamS;  // 0 = unlimited
     double request_timeout_seconds = kRequestTimeoutS;
     int    max_upload_mb           = kMaxUploadMB;
 };

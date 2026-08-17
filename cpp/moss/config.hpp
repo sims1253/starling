@@ -9,6 +9,11 @@ namespace starling::ggml::moss {
 struct FrontendConfig {
     uint32_t sample_rate = 16000, n_fft = 640, win_length = 640;
     uint32_t hop_length = 160, n_mels = 128, power = 2;
+    // Present so the shared mel adapter (lib::make_mel_policy) can read it
+    // like every other engine's FrontendConfig; moss never caps the waveform
+    // (cap_n_samples=false — the windowing stage owns truncation), so the
+    // value is never consulted and no GGUF key maps to it.
+    uint32_t n_samples = 480000;
     bool center = true;
     std::string pad_mode = "reflect", mel_scale = "slaney", mel_norm = "slaney";
     std::string log = "log10", output_dtype = "bf16";

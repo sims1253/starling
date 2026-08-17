@@ -15,6 +15,13 @@
 
 namespace starling::serve::audio {
 
+// Decode in bounded batches so no single allocation scales with the header's
+// (untrusted) frame count.
+constexpr drwav_uint64 kWavDecodeBatchFrames = 16384;
+// No real-world upload carries more channels than this; a fmt chunk claiming
+// more is crafted (it would also scale the batch buffer by channels).
+constexpr uint32_t kWavMaxChannels = 64;
+
 bool wav_bytes_to_float32(const std::string& wav_bytes,
                           std::vector<float>& out, int& sr) {
     drwav wav;
@@ -25,32 +32,57 @@ bool wav_bytes_to_float32(const std::string& wav_bytes,
     uint64_t total_frames = wav.totalPCMFrameCount;
     uint32_t channels = wav.channels;
 
-    if (channels == 0 || total_frames == 0) {
+    // The header's totalPCMFrameCount is derived from the data-chunk size
+    // field, which is untrusted input: a crafted header claiming millions of
+    // frames must not drive the allocation. Derive the maximum frame count
+    // from the actual payload length and reject headers that overclaim (a
+    // truncated or lying data-chunk size is a malformed file).
+    uint32_t bytes_per_frame =
+        ((wav.bitsPerSample + 7) / 8) * channels;
+    if (channels == 0 || channels > kWavMaxChannels || total_frames == 0
+        || bytes_per_frame == 0) {
+        drwav_uninit(&wav);
+        return false;
+    }
+    uint64_t max_frames = wav_bytes.size() / bytes_per_frame;
+    if (total_frames > max_frames) {
         drwav_uninit(&wav);
         return false;
     }
 
-    // Decode as interleaved int16, then convert to mono float32.
-    std::vector<drwav_int16> interleaved(total_frames * channels);
-    drwav_uint64 read = drwav_read_pcm_frames_s16(
-        &wav, total_frames, interleaved.data());
+    out.clear();
+    out.reserve(static_cast<size_t>(total_frames));
+
+    // Decode as interleaved int16 in fixed-size batches, then convert to mono
+    // float32.
+    std::vector<drwav_int16> interleaved;
+    interleaved.resize(static_cast<size_t>(kWavDecodeBatchFrames) * channels);
+    uint64_t decoded_frames = 0;
+    while (decoded_frames < total_frames) {
+        uint64_t want = std::min<uint64_t>(kWavDecodeBatchFrames,
+                                           total_frames - decoded_frames);
+        drwav_uint64 read = drwav_read_pcm_frames_s16(
+            &wav, want, interleaved.data());
+        if (read == 0) break;  // payload exhausted before the header's count
+        size_t old = out.size();
+        out.resize(old + static_cast<size_t>(read));
+        if (channels == 1) {
+            for (drwav_uint64 i = 0; i < read; ++i)
+                out[old + i] = static_cast<float>(interleaved[i]) / 32768.0f;
+        } else {
+            // Mix down to mono by averaging channels.
+            for (drwav_uint64 i = 0; i < read; ++i) {
+                int sum = 0;
+                for (uint32_t c = 0; c < channels; ++c)
+                    sum += interleaved[i * channels + c];
+                out[old + i] = static_cast<float>(sum) / (channels * 32768.0f);
+            }
+        }
+        decoded_frames += read;
+    }
     drwav_uninit(&wav);
 
-    if (read == 0) return false;
-
-    out.resize(read);
-    if (channels == 1) {
-        for (drwav_uint64 i = 0; i < read; ++i)
-            out[i] = static_cast<float>(interleaved[i]) / 32768.0f;
-    } else {
-        // Mix down to mono by averaging channels.
-        for (drwav_uint64 i = 0; i < read; ++i) {
-            int sum = 0;
-            for (uint32_t c = 0; c < channels; ++c)
-                sum += interleaved[i * channels + c];
-            out[i] = static_cast<float>(sum) / (channels * 32768.0f);
-        }
-    }
+    if (out.empty()) return false;
     return true;
 }
 
@@ -122,21 +154,26 @@ std::string extract_multipart_payload(const std::string& body,
         if (next == std::string::npos) break;
         // The part is body[part_start..next), but strip the trailing CRLF.
         size_t part_end = next;
-        if (part_end >= 2 && body[part_end - 2] == '\r' && body[part_end - 1] == '\n')
+        if (part_end >= part_start + 2
+            && body[part_end - 2] == '\r' && body[part_end - 1] == '\n')
             part_end -= 2;
         std::string raw_part = body.substr(part_start, part_end - part_start);
         // Split headers from body (blank line separates them).
         size_t header_end = raw_part.find("\r\n\r\n");
-        if (header_end == std::string::npos)
+        size_t sep_len = 4;  // "\r\n\r\n"
+        if (header_end == std::string::npos) {
             header_end = raw_part.find("\n\n");
+            sep_len = 2;  // "\n\n"
+        }
         std::string headers, payload;
         if (header_end == std::string::npos) {
             payload = raw_part;
         } else {
             headers = raw_part.substr(0, header_end);
-            size_t body_start = header_end;
-            if (raw_part[body_start] == '\r') body_start++;
-            if (body_start < raw_part.size() && raw_part[body_start] == '\n') body_start++;
+            // Skip the FULL separator: the header/body blank line is 4 bytes
+            // for CRLFCRLF (2 for LFLF). Skipping only 2 left every payload
+            // prefixed with a stray "\r\n", which broke WAV RIFF sniffing.
+            size_t body_start = std::min(header_end + sep_len, raw_part.size());
             payload = raw_part.substr(body_start);
         }
 
@@ -203,7 +240,7 @@ std::string extract_multipart_payload(const std::string& body,
         return "";
     };
 
-    auto score = [&](const std::string& headers, const std::string& payload) -> int {
+    auto score = [&](const std::string& headers, const std::string& /*payload*/) -> int {
         std::string cd = get_header_value(headers, "content-disposition");
         std::string name = get_disp_param(cd, "name");
         if (!name.empty()) {
@@ -225,6 +262,7 @@ std::string extract_multipart_payload(const std::string& body,
         size_t sep = p.find('\x01');
         std::string headers = p.substr(0, sep);
         std::string payload = p.substr(sep + 1);
+        if (payload.empty()) continue;  // an empty field can't be the upload
         int sc = score(headers, payload);
         if (sc > best_score) {
             best_score = sc;

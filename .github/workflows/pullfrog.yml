@@ -22,11 +22,17 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        # actions/checkout v6.1.0 (pinned per issue #10; pullfrog/pullfrog
+        # itself is referenced by the vendor-documented @v0 moving tag).
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           fetch-depth: 1
+          persist-credentials: false
       - name: Run agent
-        uses: pullfrog/pullfrog@v0
+        # pullfrog/pullfrog v0 (0657d542f2e34565c6254d5c84581313e631cd90).
+        # Pinned to the reviewed commit: the action runs with id-token: write
+        # and provider secrets, and the moving v0 tag could be retargeted.
+        uses: pullfrog/pullfrog@0657d542f2e34565c6254d5c84581313e631cd90
         with:
           prompt: ${{ inputs.prompt }}
         env:

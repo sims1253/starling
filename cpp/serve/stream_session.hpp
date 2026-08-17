@@ -108,6 +108,15 @@ public:
     // Append WAV bytes (decoded via dr_wav).
     void append_wav(const std::string& bytes);
 
+    // True when a frame exceeded the per-connection buffer cap
+    // (config.max_stream_seconds): the frame was refused and every further
+    // append is a no-op until reset(). The cap bounds the LIVE rolling
+    // buffer (memory): finalized windows are trimmed from the buffer, so
+    // long dictation sessions without commits keep memory bounded without
+    // tripping the cap. The WS layer reports overflow to the client as an
+    // error frame.
+    bool overflowed() const { return overflow_; }
+
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.
     std::optional<std::string> stream_step(double now);
 
@@ -122,6 +131,10 @@ public:
     // Build the chunked-streaming transcribe callback.
     TranscribeFn make_transcribe_fn(RequestContext* ctx);
 
+    // Override the transcribe callback (unit tests inject a fake; production
+    // uses the server-backed make_transcribe_fn).
+    void set_transcribe_fn(TranscribeFn fn) { custom_tx_ = std::move(fn); }
+
 private:
     void maybe_trim_samples();
 
@@ -129,6 +142,9 @@ private:
     std::vector<float> samples_;
     double last_partial_ts_ = 0.0;
     int64_t trimmed_samples_ = 0;
+    double max_buffer_seconds_ = 0.0;  // from config; 0 = unlimited
+    bool overflow_ = false;
+    TranscribeFn custom_tx_;  // when set, used instead of the server callback
     std::unique_ptr<ChunkStreamer> chunker_;
 };
 
