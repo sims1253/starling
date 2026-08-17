@@ -462,8 +462,14 @@ struct SpecState {
 };
 
 std::unordered_map<const QwenDecodeSpec*, SpecState>& spec_states() {
-    static std::unordered_map<const QwenDecodeSpec*, SpecState> m;
-    return m;
+    // Deliberately leaked: entries are torn down by the registered
+    // decode-cache clearers during shutdown_backend(), which runs from an
+    // atexit handler — that handler is registered BEFORE this static is
+    // constructed, so LIFO destroys the map FIRST and the clearers would
+    // read freed SpecStates (the exit-time "double free or corruption";
+    // ASan: heap-use-after-free in the DeviceCache clearer).
+    static auto* m = new std::unordered_map<const QwenDecodeSpec*, SpecState>();
+    return *m;
 }
 SpecState& state_for(const QwenDecodeSpec& spec) {
     return spec_states()[&spec];

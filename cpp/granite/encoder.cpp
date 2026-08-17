@@ -366,18 +366,21 @@ struct EncoderReplayEntry {
     GraphInputPool pool;
     EncScratch scratch;  // host constants backing graph inputs; stable for the
                          // ReplayGraph's lifetime (never resized after build)
-    StageStop stop;      // STARLING_GRANITE_ONLY probe state (stable storage)
     std::unique_ptr<ReplayGraph> graph;
     ggml_bf16_t* mel_buf = nullptr;
     std::vector<float> enc_capture;
 };
-std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>> g_encoder_cache;
+// Deliberately leaked pointer (qwen_decode's spec_states() rationale): the
+// atexit shutdown clears it via the decode-cache clearer before static
+// destruction would otherwise run, and a namespace-static unique_ptr would
+// be destroyed BEFORE that handler (LIFO), turning the clearer into a
+// use-after-free.
+LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>* g_encoder_cache = nullptr;
 std::once_flag g_encoder_once;
 } // namespace
 
 size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;
-}
+    return g_encoder_cache ? g_encoder_cache->size() : 0;}
 
 bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                               AudioEmbeds& out, std::string& err) {
@@ -408,8 +411,12 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         }
     };
 
-    // CPU + debug diagnostic path: one-shot build.
-    if (!global_backend().is_gpu() || lib::debug_enabled("STARLING_GRANITE_DEBUG")) {
+    // CPU + debug diagnostic path: one-shot build. Stage probes also force
+    // this path — a truncated probe graph must never enter the ReplayGraph
+    // LRU, where it would poison later normal transcriptions at the same
+    // mel length (pullfrog review).
+    if (!global_backend().is_gpu() || lib::debug_enabled("STARLING_GRANITE_DEBUG") ||
+        std::getenv("STARLING_GRANITE_ONLY")) {
         EncScratch s = make_scratch(model.config, T);
         std::vector<float> enc_out;
         StageStop stop{std::getenv("STARLING_GRANITE_ONLY")};
@@ -436,22 +443,22 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 
     // GPU: captured per-T graph; the mel is the only varying input.
     std::call_once(g_encoder_once, [] {
-        register_decode_cache_clearer([] { g_encoder_cache.reset(); });
+        register_decode_cache_clearer([] { delete g_encoder_cache; g_encoder_cache = nullptr; });
     });
     if (!g_encoder_cache)
-        g_encoder_cache = std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>>(
-            new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(replay_cache_size()));
+        g_encoder_cache = new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(
+            replay_cache_size());
 
     ShapeKey key{T};
     EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.T = T;
             entry.scratch = make_scratch(model.config, T);
-            entry.stop.name = std::getenv("STARLING_GRANITE_ONLY");
             entry.mel_buf = reinterpret_cast<ggml_bf16_t*>(entry.pool.alloc_bytes(
                 (size_t) ec.input_dim * T * sizeof(ggml_bf16_t)));
             std::memcpy(entry.mel_buf, mel.data.data(),
                         (size_t) ec.input_dim * T * sizeof(ggml_bf16_t));
+            StageStop probe_stop{nullptr};  // probes never reach this path
             entry.graph = std::make_unique<ReplayGraph>(global_backend(),
                 [&](ggml_context* c) -> ggml_tensor* {
                     int64_t mne[2] = {ec.input_dim, entry.T};
@@ -460,7 +467,7 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                         (size_t) ec.input_dim * entry.T * sizeof(ggml_bf16_t));
                     return build_fused(c, model, mel_in, entry.scratch,
                                        dump_env ? &entry.enc_capture : nullptr,
-                                       &entry.stop);
+                                       &probe_stop);
                 });
         });
     std::memcpy(e.mel_buf, mel.data.data(),
@@ -473,11 +480,6 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         return false;
     }
     write_stage_dump(e.enc_capture);
-    if (e.stop.hit) {
-        write_stage_dump(tmp);
-        err = "GRANITE stage-only probe (STARLING_GRANITE_ONLY)";
-        return false;
-    }
     out.data = std::move(tmp);
     out.n_tokens = N;
     out.width = pc.output_dim;
