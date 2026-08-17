@@ -370,11 +370,17 @@ struct EncoderReplayEntry {
     ggml_bf16_t* mel_buf = nullptr;
     std::vector<float> enc_capture;
 };
-// Deliberately leaked pointer (qwen_decode's spec_states() rationale): the
-// atexit shutdown clears it via the decode-cache clearer before static
-// destruction would otherwise run, and a namespace-static unique_ptr would
-// be destroyed BEFORE that handler (LIFO), turning the clearer into a
-// use-after-free.
+// Deliberately leaked pointer, mirroring qwen_decode's spec_states(): the
+// ONLY teardown path is the decode-cache clearer registered at first use
+// (delete + null), keeping a single shutdown route instead of racing a
+// static destructor against it. NOTE the hazard that motivated leaking
+// spec_states() does NOT apply here: that map is a function-local static
+// initialized at first decode — AFTER std::atexit(atexit_shutdown)
+// registers at backend creation — so LIFO destroyed it before the handler
+// (the real use-after-free). This namespace-scope pointer is
+// const-initialized at load, before any atexit call, so its destructor
+// would run after the handler; the leak is consistency, not a UAF fix
+// (pullfrog review).
 LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>* g_encoder_cache = nullptr;
 std::once_flag g_encoder_once;
 } // namespace
