@@ -14,7 +14,7 @@ byte-identical to eager `transformers` — same accuracy, fewer round trips.
 
 All do speech-to-text.
 
-- [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) — encoder + 1B LLM decoder. Optional self-speculative path drafting from the encoder's CTC head.
+- [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) — CTC conformer encoder + BLIP2 Q-Former projector + granite-4.0-1b decoder. The in-tree ggml engine (`starling-ggml-granite`, greedy path) runs natively via starling-serve; the Python path adds the optional self-speculative decoding drafting from the encoder's CTC head.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) — non-autoregressive. One bidirectional forward: CTC conformer draft + blank slots + bidirectional granite-4.0-1b editor refinement. No decode loop.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — FastConformer + TDT transducer (no LLM). GPU-side mel + chunking for hour-long audio.
 - [`nvidia/parakeet-unified-en-0.6b`](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) — Unified FastConformer-RNN-T. NeMo-free port: the `.nemo` checkpoint is loaded directly (no `nemo_toolkit`), the encoder/prediction-net/joint are hand-built in PyTorch, and the encoder + greedy RNN-T decode are captured into CUDA graphs.
@@ -323,10 +323,10 @@ and cohere chunk internally and return a single whole-utterance segment.
 
 `starling-serve` is a self-contained native binary that serves the GGML
 engines behind the same HTTP/WS API — no Python, no torch, one static
-executable per platform (CUDA, ROCm, Vulkan, Metal, CPU). It covers the five
-GGML-ported models (`parakeet`, `moss`, `ark`, `higgs`, `hojo`); the Python
-server above remains the path for the CUDA-megakernel-only models (granite,
-parakeet_unified, qwen3, cohere, audex).
+executable per platform (CUDA, ROCm, Vulkan, Metal, CPU). It covers the six
+GGML-ported models (`parakeet`, `moss`, `ark`, `higgs`, `hojo`, `granite`);
+the Python server above remains the path for the CUDA-megakernel-only models
+(parakeet_unified, qwen3, cohere, audex).
 
 ```bash
 cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON   # or VULKAN/METAL/HIP
