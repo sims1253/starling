@@ -6,6 +6,10 @@
 //       T_FULLT_MINUS_1  (moss/ark)  T = fullT - 1 = S/H
 //       T_CEIL_S_OVER_H  (higgs)     T = ceil(S/H)
 //       T_FLOOR_S_OVER_H (hojo)      T = S/H
+//       T_FULLT          (granite)   T = fullT (torchaudio center=True keeps
+//                                        every frame; the odd-frame drop and
+//                                        the 80->160 pair-stack are
+//                                        engine-side, in cpp/granite/mel.cpp)
 //   * n_samples truncation: none (moss), after the S<2 check with a >0 guard
 //     (ark/higgs), or unconditionally before the checks (hojo).
 //   * global-max scope: all computed M*fullT frames with a flat split
@@ -31,7 +35,7 @@ struct MelPolicy {
     double mel_floor = 1e-10, dynamic_range = 8.0;
     double normalization_offset = 4.0, normalization_divisor = 4.0;
 
-    enum TRule { T_FULLT_MINUS_1, T_CEIL_S_OVER_H, T_FLOOR_S_OVER_H };
+    enum TRule { T_FULLT_MINUS_1, T_CEIL_S_OVER_H, T_FLOOR_S_OVER_H, T_FULLT };
     TRule t_rule = T_FULLT_MINUS_1;
 
     // n_samples truncation of the raw waveform before the STFT.
