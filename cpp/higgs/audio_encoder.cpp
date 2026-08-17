@@ -279,10 +279,22 @@ ggml_tensor* build_projector(ggml_context* ctx, const HiggsModel& model,
 // only the encoder layers + projector linears run as graphs.
 // ---------------------------------------------------------------------------
 
-std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name) {
-    ggml_tensor* t = ml.tensor(name);
-    if (!t) return {};
+// Read a weight tensor as f32. BF16 and F32 convert exactly; any other dtype
+// means an unexpected GGUF (e.g. an f16-profile file on the host-conv path),
+// and zero-filling it would silently corrupt the weights — reject loudly
+// instead: report the type and return an empty vector with `err` set so the
+// caller aborts.
+std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name,
+                                      std::string& err) {
+    // Realize BEFORE the lookup: on GPU, realize_weights repoints the loader's
+    // name map at freshly allocated device tensors, so a pointer fetched
+    // earlier would be a buffer-less stale CPU tensor.
     ensure_weights_realized(ml);
+    ggml_tensor* t = ml.tensor(name);
+    if (!t) {
+        err = std::string("Higgs GGUF missing tensor: ") + name;
+        return {};
+    }
     size_t n = (size_t) ggml_nelements(t);
     std::vector<float> out(n);
     if (t->type == GGML_TYPE_BF16) {
@@ -291,6 +303,13 @@ std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name) {
         for (size_t i = 0; i < n; ++i) out[i] = ggml_bf16_to_fp32(raw[i]);
     } else if (t->type == GGML_TYPE_F32) {
         ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+    } else {
+        std::fprintf(stderr,
+            "higgs: tensor '%s' has unsupported dtype %s (expected BF16 or F32); "
+            "refusing to zero-fill\n", name, ggml_type_name(t->type));
+        err = std::string("Higgs tensor '") + name + "' has unsupported dtype " +
+              ggml_type_name(t->type) + " (expected BF16 or F32)";
+        return {};
     }
     return out;
 }
@@ -300,12 +319,16 @@ std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name) {
 // order) for a regular conv; for depthwise OC==IC and the IC axis is 1 (weight
 // [C, 1, K]). Returns [OC, OL] f32 (oc-contiguous: element (oc,t) at oc*OL+t),
 // matching the next op's expected [IC, L] feat-major input. GELU uses exact erf.
+// An empty return means a weight read failed and `err` is set.
 namespace {
 std::vector<float> host_conv1d(const ModelLoader& ml, const std::vector<float>& in,
                                int64_t IC, int64_t L, const std::string& wname,
-                               int stride, bool depthwise, bool gelu) {
-    std::vector<float> wf = read_tensor_to_f32(ml, (wname + ".weight").c_str());
-    std::vector<float> bf = read_tensor_to_f32(ml, (wname + ".bias").c_str());
+                               int stride, bool depthwise, bool gelu,
+                               std::string& err) {
+    std::vector<float> wf = read_tensor_to_f32(ml, (wname + ".weight").c_str(), err);
+    if (wf.empty()) return {};
+    std::vector<float> bf = read_tensor_to_f32(ml, (wname + ".bias").c_str(), err);
+    if (bf.empty()) return {};
     const int64_t OC = depthwise ? IC : (int64_t) bf.size();
     const int64_t K = 3, p = 1;
     const int64_t OL = (L + 2 * p - K) / stride + 1;
@@ -389,6 +412,17 @@ bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
     const int64_t mel_T = mel.n_frames;
     // conv2 stride-2 downsamples time: T_enc = (mel_T + 1) // 2.
     const int64_t T_enc = (mel_T + 1) / 2;
+    // build_encoder_layers slices the first T_enc rows off the absolute
+    // positional-embedding table; an overrun would read past
+    // enc.positional_emb. The loader rejects metadata whose worst-case extent
+    // exceeds enc.max_source_positions; this guards the per-chunk runtime
+    // value against the same limit in case that invariant is ever broken.
+    if (T_enc > (int64_t) ec.max_source_positions) {
+        err = "Higgs encoder time extent " + std::to_string(T_enc) +
+              " (mel_T=" + std::to_string(mel_T) + ") exceeds enc.max_source_positions " +
+              std::to_string(ec.max_source_positions);
+        return false;
+    }
     const float* mel_f32_ptr = mel.f32.data();
 
     // CPU + debug diagnostic path: host conv front-end + host avg_pool + host
@@ -400,11 +434,13 @@ bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
         // conv1 (s1) + GELU.
         std::vector<float> c1 = host_conv1d(model.loader, mel.f32, ec.num_mel_bins,
                                             mel_T, "enc.conv1", /*stride=*/1,
-                                            /*depthwise=*/false, /*gelu=*/true);
+                                            /*depthwise=*/false, /*gelu=*/true, err);
+        if (c1.empty()) return false;
         // conv2 (s2) + GELU.
         std::vector<float> c2 = host_conv1d(model.loader, c1, ec.d_model,
                                             mel_T, "enc.conv2", /*stride=*/2,
-                                            /*depthwise=*/false, /*gelu=*/true);
+                                            /*depthwise=*/false, /*gelu=*/true, err);
+        if (c2.empty()) return false;
         // c2 is [d_model=1280, T_enc] feat-major (oc-contig). The encoder layers
         // consume [d_model, T_enc] (d-contig, element (d,t) at t*D+d): transpose.
         std::vector<float> layers_in((size_t) ec.d_model * T_enc);

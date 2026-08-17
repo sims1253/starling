@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Cross-platform reproducible environment rebuild for starling.
 
-Replaces ``scripts/setup_env.sh`` so the same setup works on Linux/macOS and on
+Replaces the old bash-only ``setup_env.sh`` (now in ``scripts/attic/``) so the
+same setup works on Linux/macOS and on
 native Windows (where bash and ``.venv/bin/python`` are unavailable -- the
 Windows venv interpreter lives at ``.venv/Scripts/python.exe``).
 

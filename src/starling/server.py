@@ -34,6 +34,7 @@ import base64
 from collections.abc import Callable
 import email.policy
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import io
 import json
 import logging
@@ -54,6 +55,28 @@ from typing import Any, Optional
 import numpy as np
 
 log = logging.getLogger("starling.server")
+
+# Single source of truth for every Python-reported version string (the FastAPI
+# app version and the stdlib Server: header): the pyproject.toml project
+# version, so the two can never drift apart again. The native starling-serve
+# binary is versioned separately via its STARLING_SERVE_VERSION cmake variable
+# (overridden with the release tag by the release workflow).
+try:
+    SERVER_VERSION = package_version("starling")
+except PackageNotFoundError:
+    # Running from a source tree without an install: read the project version
+    # straight out of pyproject.toml so this path cannot drift on a bump.
+    SERVER_VERSION = "0.0.0+unknown"
+    try:
+        import re
+        from pathlib import Path
+
+        _pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        _m = re.search(r'^version\s*=\s*"([^"]+)"', _pyproject.read_text(), re.M)
+        if _m:
+            SERVER_VERSION = _m.group(1)
+    except OSError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -454,12 +477,11 @@ class MossBackend(ModelBackend):
             model, processor, max_cache_len=2048, encoder_mode="cudagraph",
         )
         self.processor = processor
-        self._proc_call = processor  # the MossProcessor is callable on a wav
 
     def _build(self, wav_np: np.ndarray) -> dict:
         import torch
 
-        inp = self._proc_call(wav_np.astype("float32"))
+        inp = self.processor(wav_np.astype("float32"))  # MossProcessor is callable on a wav
         return {
             k: (v.cuda() if isinstance(v, torch.Tensor) else v)
             for k, v in inp.items()
@@ -907,20 +929,6 @@ class StarlingServer:
             samples = _resample_audio(samples, sr, SAMPLE_RATE)
         return samples
 
-    def transcribe_bytes_sync(
-        self, wav_bytes: bytes, request_id: Optional[str] = None
-    ) -> TranscribeResult:
-        self._ensure_loaded()
-        samples = self.decode_wav_bytes(wav_bytes)
-        return self._run_queued_sync(samples, request_id)
-
-    def transcribe_pcm_sync(
-        self, pcm16_bytes: bytes, request_id: Optional[str] = None
-    ) -> TranscribeResult:
-        self._ensure_loaded()
-        samples = _pcm16_bytes_to_float32(pcm16_bytes)
-        return self._run_queued_sync(samples, request_id)
-
     def _run_queued_sync(
         self, samples: np.ndarray, request_id: Optional[str], *, streaming: bool = False
     ) -> TranscribeResult:
@@ -1036,10 +1044,9 @@ def _transcribe_payload_sync(
         # Malformed/truncated WAV or unsupported encoding from the decoder.
         # Map to 400 (client error) instead of propagating as a 500 / dead socket.
         return 400, {"error": "malformed audio payload", "text": ""}
-    # Lazily load the backend before queueing inference (mirrors the ordering in
-    # transcribe_bytes_sync). Done here, outside the malformed-audio handler, so
-    # a valid request to an unloaded server triggers load() rather than crashing
-    # inside _run_queued_sync -> _serial_run.
+    # Lazily load the backend before queueing inference. Done here, outside the
+    # malformed-audio handler, so a valid request to an unloaded server triggers
+    # load() rather than crashing inside _run_queued_sync -> _serial_run.
     server._ensure_loaded()
     try:
         result = server._run_queued_sync(samples, request_id)
@@ -1284,7 +1291,7 @@ def create_app(
             await asyncio.to_thread(server.load)
         yield
 
-    app = FastAPI(title="starling-server", version="2.0.0", lifespan=_lifespan)
+    app = FastAPI(title="starling-server", version=SERVER_VERSION, lifespan=_lifespan)
     app.state.starling_server = server  # type: ignore[attr-defined]
 
     # Strong references for fire-and-forget background tasks. asyncio only holds
@@ -1446,10 +1453,8 @@ def create_app(
                 bdata = msg.get("bytes")
                 if not bdata:
                     continue
-                if bdata[:4] == b"RIFF" and bdata[8:12] == b"WAVE":
-                    sess.append_wav(bdata)
-                else:
-                    sess.append_pcm(bdata)
+                # append_wav itself sniffs RIFF/WAVE vs raw PCM16.
+                sess.append_wav(bdata)
 
                 now = time.monotonic()
                 if sess.chunker is not None:
@@ -1781,10 +1786,8 @@ def _serve_stream_session(
                 else:
                     _ws_send_json(wfile, {"type": "error", "message": f"unknown type {mtype!r}"})
                     continue
-            if payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
-                sess.append_wav(payload)
-            else:
-                sess.append_pcm(payload)
+            # append_wav itself sniffs RIFF/WAVE vs raw PCM16.
+            sess.append_wav(payload)
 
             now = time.monotonic()
             if sess.chunker is not None:
@@ -1835,7 +1838,7 @@ def _build_stdlib_handler(server: StarlingServer):
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
             log.debug("http %s - %s", self.address_string(), fmt % args)
 
-        server_version = "starling-server/2.0"
+        server_version = f"starling-server/{SERVER_VERSION}"
         protocol_version = "HTTP/1.1"
 
         def _send_json(self, status: int, obj: dict) -> None:
@@ -1987,8 +1990,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--max-chunk-seconds",
         type=float,
         default=DEFAULT_MAX_CHUNK_SECONDS,
-        help=f"max audio chunk length per transcription for chunked backends "
-             f"(default {DEFAULT_MAX_CHUNK_SECONDS}s; ignored by parakeet)",
+        help=f"max audio chunk length per transcription for chunked backends, "
+             f"including parakeet (default {DEFAULT_MAX_CHUNK_SECONDS}s)",
     )
     p.add_argument(
         "--min-chunk-seconds",
@@ -2020,6 +2023,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--no-speculative",
         action="store_true",
         help="granite-only: disable self-speculative decoding",
+    )
+    p.add_argument(
+        "--use-fused-llm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use the fused LLM megakernel path (default; --no-use-fused-llm "
+             "selects the unfused reference path)",
     )
     p.add_argument(
         "--encoder-mode",
@@ -2144,7 +2154,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         speculative=not args.no_speculative,
         warmup=args.warmup,
         encoder_mode=args.encoder_mode,
-        use_fused_llm=True,
+        use_fused_llm=args.use_fused_llm,
         attn_impl=args.attn_impl,
         graph_mode=args.graph_mode or profile_graph_mode,
         file_graph_min_seconds=args.file_graph_min_seconds,
