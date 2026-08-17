@@ -382,9 +382,14 @@ int main(int argc, char** argv) {
         std::string payload;
         bool is_multipart = req.is_multipart_form_data();
         if (is_multipart) {
-            if (req.form.has_file("audio")) {
+            // Every branch requires non-empty content: an empty "audio" part
+            // must not shadow a populated "file" part (same rule as the
+            // parity parser, which skips empty parts when scoring).
+            if (req.form.has_file("audio")
+                && !req.form.get_file("audio").content.empty()) {
                 payload = req.form.get_file("audio").content;
-            } else if (req.form.has_file("file")) {
+            } else if (req.form.has_file("file")
+                       && !req.form.get_file("file").content.empty()) {
                 payload = req.form.get_file("file").content;
             } else {
                 for (const auto& [name, file] : req.form.files) {
@@ -588,6 +593,9 @@ int main(int argc, char** argv) {
                            << dur << "}],\"duration_s\":" << dur << "}";
                         ws.send(ss.str());
                         session.reset();
+                        // reset() re-enables audio (clears the buffer cap);
+                        // re-arm the one-shot error frame with it.
+                        cap_error_sent = false;
                         continue;
                     } else if (type == "ping") {
                         ws.send("{\"type\":\"pong\"}");

@@ -75,7 +75,9 @@ jobs:
         # multipart WAV parsing, the WAV frame-count bounds, the WS stream
         # cap, and request/response shapes.
         run: |
-          pip install --quiet requests numpy websockets
+          # Pinned, py3.10-compatible (the ubuntu-22.04 system python):
+          # exact versions keep the suite reproducible.
+          pip install --quiet "requests==2.32.5" "numpy==2.2.6" "websockets==15.0.1"
           python tests/test_native_serve.py --binary "$PWD/build/starling-serve"
 
   # ---------------------------------------------------------------------------
@@ -143,7 +145,9 @@ jobs:
 
       - name: Real-model integration suite
         run: |
-          pip install --quiet requests numpy websockets
+          # Pinned, py3.10-compatible (the ubuntu-22.04 system python):
+          # exact versions keep the suite reproducible.
+          pip install --quiet "requests==2.32.5" "numpy==2.2.6" "websockets==15.0.1"
           python tests/test_native_serve.py --binary "$PWD/build/starling-serve" \
             --gguf "$PWD/model.gguf" --audio "$PWD/clip.wav" \
             --expected-text "$EXPECTED_TEXT"

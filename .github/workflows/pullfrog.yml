@@ -29,7 +29,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Run agent
-        uses: pullfrog/pullfrog@v0
+        # pullfrog/pullfrog v0 (0657d542f2e34565c6254d5c84581313e631cd90).
+        # Pinned to the reviewed commit: the action runs with id-token: write
+        # and provider secrets, and the moving v0 tag could be retargeted.
+        uses: pullfrog/pullfrog@0657d542f2e34565c6254d5c84581313e631cd90
         with:
           prompt: ${{ inputs.prompt }}
         env:

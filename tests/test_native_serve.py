@@ -190,9 +190,11 @@ class ServeProc:
         for t in self._drain_threads:
             t.start()
         if not _wait_for_port(host, port, timeout=start_timeout):
+            tail = "\n".join(list(self.log)[-30:])
+            self.stop()  # don't orphan the child (it holds the port/model)
             raise RuntimeError(
                 f"server did not start on {host}:{port} within {start_timeout}s\n"
-                + "\n".join(list(self.log)[-30:]))
+                + tail)
 
     def _drain(self, stream):
         try:
@@ -416,6 +418,24 @@ def test_multipart_filenameless_part(base_url: str, tr: TestResults):
              f"got {r.status_code}: {data}")
 
 
+def test_multipart_empty_named_part_shadowing(base_url: str, tr: TestResults):
+    """An EMPTY "audio" part must not shadow a populated "file" part.
+
+    Mirrors test_multipart_blank_part in the C++ parser suite: selection
+    requires non-empty content (regression from PR review).
+    """
+    samples = np.zeros(1600, dtype=np.float32)
+    wav = make_wav(samples, sr=16000)
+    r = requests.post(f"{base_url}/transcribe",
+                      files={"audio": ("empty.wav", b"", "audio/wav"),
+                             "file": ("clip.wav", wav, "audio/wav")},
+                      timeout=30)
+    data = r.json()
+    tr.check("empty 'audio' part does not shadow 'file' part",
+             r.status_code == 503 and data.get("error") == "model not loaded",
+             f"got {r.status_code}: {data}")
+
+
 def test_malformed_wav_huge_frame_count(base_url: str, tr: TestResults):
     """A WAV header claiming billions of frames fails fast with 400.
 
@@ -431,7 +451,6 @@ def test_malformed_wav_huge_frame_count(base_url: str, tr: TestResults):
     w += b"ds64" + put("<I", 28) + put("<QQQ", 100, 8, 0x100000000) + put("<I", 0)
     w += b"fmt " + put("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
     w += b"data" + put("<I", 0xFFFFFFFF) + b"\x01" * 8
-    w = w[:4] + put("<I", len(w) - 8) + w[8:]
 
     t0 = time.monotonic()
     r = requests.post(f"{base_url}/transcribe", data=w,
@@ -714,7 +733,8 @@ def test_real_cancel_queued(base_url: str, tr: TestResults,
     # then queue the victim behind it.
     if not _wait_busy_via_health(base_url, 30.0):
         tr.check("cancel test: anchor in flight", False, "server never busy")
-        t_anchor.join()
+        requests.delete(f"{base_url}/inference/cancel-anchor", timeout=5)
+        t_anchor.join(timeout=120)
         return
     t_victim = threading.Thread(target=post_victim)
     t_victim.start()
@@ -1050,6 +1070,7 @@ def main():
         for endpoint in ("transcribe", "inference"):
             test_multipart_wav_reaches_inference(base_url, tr, endpoint)
         test_multipart_filenameless_part(base_url, tr)
+        test_multipart_empty_named_part_shadowing(base_url, tr)
         test_malformed_wav_huge_frame_count(base_url, tr)
 
         print("\nTesting WebSocket control frames:")
