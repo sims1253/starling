@@ -2,6 +2,10 @@
 #
 # This verifies the native serving layer compiles and --version / --abi-version
 # work. Full GPU builds (CUDA/Vulkan/Metal) are verified in the release workflow.
+#
+# The `e2e-real-model` job runs the full HTTP/WS integration suite (real
+# transcription round trips) against the CPU build. It is GATED (off by
+# default) — see the comment block on that job for why.
 
 name: CI starling-serve
 
@@ -13,6 +17,7 @@ on:
       - 'cpp/tests/**'
       - 'CMakeLists.txt'
       - 'third_party/httplib.h'
+      - 'tests/test_native_serve.py'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
@@ -20,23 +25,34 @@ on:
       - 'cpp/tests/**'
       - 'CMakeLists.txt'
       - 'third_party/httplib.h'
+      - 'tests/test_native_serve.py'
       - '.github/workflows/ci-starling-serve.yml'
+  workflow_dispatch:
+    inputs:
+      run-e2e-real-model:
+        description: 'Run the real-model E2E suite (downloads a GGUF)'
+        type: boolean
+        default: false
 
 jobs:
   build-cpu:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Build (CPU)
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          cmake --build build -j --target starling-serve stream_session_test
+          cmake --build build -j --target starling-serve stream_session_test audio_parser_test
 
       - name: C++ unit tests (serve logic, no GPU/model)
-        run: ./build/stream_session_test
+        run: |
+          ./build/stream_session_test
+          ./build/audio_parser_test
 
       - name: Smoke test --version
         run: |
@@ -53,3 +69,85 @@ jobs:
           sleep 1
           curl -sf http://127.0.0.1:18181/health | grep -q '"model":"parakeet"'
           kill %1 2>/dev/null || true
+
+      - name: Transport-contract integration tests (placeholder model)
+        # Full HTTP/WS contract suite without a real model: health, errors,
+        # multipart WAV parsing, the WAV frame-count bounds, the WS stream
+        # cap, and request/response shapes.
+        run: |
+          # Pinned, py3.10-compatible (the ubuntu-22.04 system python):
+          # exact versions keep the suite reproducible.
+          pip install --quiet "requests==2.32.5" "numpy==2.2.6" "websockets==15.0.1"
+          python tests/test_native_serve.py --binary "$PWD/build/starling-serve"
+
+  # ---------------------------------------------------------------------------
+  # Real-model E2E — GATED, OFF BY DEFAULT.
+  #
+  # This job downloads the smallest real GGUF (parakeet-tdt-0.6b-v3 q8_0) and
+  # runs the full suite incl. true transcription round trips (issue #22).
+  # A 1–2 s clip on a 0.6B q8_0 CPU decode is a correctness test, not a perf
+  # test — the CPU-safe-CI constraint is respected.
+  #
+  # WHY IT IS GATED (flagged per the issue; do not silently un-gate):
+  #   1. As of this change, the CPU build's ENGINE deadlocks inside the first
+  #      real transcription (all threads in futex wait, 0% CPU, health stays
+  #      responsive; reproduces on master with tdt-0.6b-v3-q8_0.gguf — a
+  #      pre-existing engine bug, out of scope for the serving-layer PR).
+  #      Un-gating this job would hang CI until that is fixed.
+  #   2. The documented HF repo (starling/parakeet-tdt-0.6b-v3-gguf,
+  #      docs/native-serving.md) is not publicly resolvable yet; pin the
+  #      GGUF_REV revision below once it is.
+  # Enable explicitly: workflow_dispatch with run-e2e-real-model=true (after
+  # the engine fix + published GGUF), then flip the `if:` to enable on PRs.
+  # ---------------------------------------------------------------------------
+  e2e-real-model:
+    needs: build-cpu
+    if: github.event_name == 'workflow_dispatch' && inputs.run-e2e-real-model
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      HF_REPO: starling/parakeet-tdt-0.6b-v3-gguf
+      GGUF_FILE: parakeet-tdt-0.6b-v3-q8_0.gguf
+      # PIN ME: revision of HF_REPO to pin the cache + download against.
+      # Placeholder "main" until the repo publishes (see comment above).
+      GGUF_REV: main
+      # Pinned sample clip (11.3 s, 16 kHz mono PCM16) + its expected
+      # parakeet-tdt transcript (captured with tdt-0.6b-v3-q8_0).
+      AUDIO_URL: https://raw.githubusercontent.com/ggml-org/whisper.cpp/1fe009caeda75f69bc864d6370b10674e45a92bd/samples/jfk.wav
+      EXPECTED_TEXT: "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build (CPU)
+        run: |
+          cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      # actions/cache v4.3.0 — keyed on the pinned GGUF revision so a pinned
+      # model never re-downloads and a revision bump invalidates the cache.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: model.gguf
+          key: starling-serve-e2e-${{ env.HF_REPO }}-${{ env.GGUF_FILE }}-${{ env.GGUF_REV }}
+
+      - name: Download GGUF (if not cached)
+        run: |
+          if [ -f model.gguf ]; then echo "cached"; exit 0; fi
+          curl -fL --retry 3 -o model.gguf \
+            "https://huggingface.co/${HF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE}"
+
+      - name: Download test clip
+        run: curl -fL --retry 3 -o clip.wav "$AUDIO_URL"
+
+      - name: Real-model integration suite
+        run: |
+          # Pinned, py3.10-compatible (the ubuntu-22.04 system python):
+          # exact versions keep the suite reproducible.
+          pip install --quiet "requests==2.32.5" "numpy==2.2.6" "websockets==15.0.1"
+          python tests/test_native_serve.py --binary "$PWD/build/starling-serve" \
+            --gguf "$PWD/model.gguf" --audio "$PWD/clip.wav" \
+            --expected-text "$EXPECTED_TEXT"

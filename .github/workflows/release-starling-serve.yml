@@ -48,6 +48,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install Vulkan SDK
         run: |
@@ -95,6 +96,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install CUDA toolkit
         run: |
@@ -145,6 +147,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install ROCm / HIP toolkit
         run: |
@@ -198,6 +201,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Apply ggml patches
         # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
@@ -256,6 +260,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Apply ggml patches
         # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
@@ -316,6 +321,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Build starling-serve (Metal)
         run: |

@@ -22,6 +22,14 @@ std::vector<float> pcm16_to_float32(const std::string& bytes);
 // Extract the audio payload from a multipart/form-data body, or return the body
 // unchanged if it's not multipart (raw WAV path). Port of
 // _extract_multipart_payload from server.py.
+//
+// NOTE: the HTTP handler in main.cpp does NOT call this — cpp-httplib parses
+// multipart bodies itself (req.form), and the handler mirrors this function's
+// selection order against the form API. This parser is kept as the documented
+// byte-level parity reference for the Python server's _extract_multipart_payload
+// (and is regression-tested in cpp/tests/audio_parser_test.cpp) for any future
+// path that sees the raw body (e.g. streaming uploads bypassing httplib's form
+// parsing).
 std::string extract_multipart_payload(const std::string& body,
                                       const std::string& content_type);
 
