@@ -108,6 +108,7 @@ file(GLOB STARLING_GGML_MOSS_CPP ${CMAKE_SOURCE_DIR}/cpp/moss/*.cpp)
 file(GLOB STARLING_GGML_ARK_CPP ${CMAKE_SOURCE_DIR}/cpp/ark/*.cpp)
 file(GLOB STARLING_GGML_HIGGS_CPP ${CMAKE_SOURCE_DIR}/cpp/higgs/*.cpp)
 file(GLOB STARLING_GGML_HOJO_CPP ${CMAKE_SOURCE_DIR}/cpp/hojo/*.cpp)
+file(GLOB STARLING_GGML_GRANITE_CPP ${CMAKE_SOURCE_DIR}/cpp/granite/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
     ${STARLING_GGML_LIB_CPP}
@@ -116,6 +117,7 @@ set(STARLING_GGML_CPP
     ${STARLING_GGML_ARK_CPP}
     ${STARLING_GGML_HIGGS_CPP}
     ${STARLING_GGML_HOJO_CPP}
+    ${STARLING_GGML_GRANITE_CPP}
     ${CMAKE_SOURCE_DIR}/cpp/capi.cpp)
 
 add_library(starling_ggml_core OBJECT ${STARLING_GGML_CPP})
@@ -124,7 +126,7 @@ target_include_directories(starling_ggml_core PUBLIC
     ${CMAKE_SOURCE_DIR}/cpp/include ${CMAKE_SOURCE_DIR}/cpp
     ${CMAKE_SOURCE_DIR}/cpp/runtime ${CMAKE_SOURCE_DIR}/cpp/parakeet
     ${CMAKE_SOURCE_DIR}/cpp/moss ${CMAKE_SOURCE_DIR}/cpp/ark ${CMAKE_SOURCE_DIR}/cpp/higgs
-    ${CMAKE_SOURCE_DIR}/cpp/hojo
+    ${CMAKE_SOURCE_DIR}/cpp/hojo ${CMAKE_SOURCE_DIR}/cpp/granite
     ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_SOURCE_DIR}/third_party/ggml/src ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
 target_compile_definitions(starling_ggml_core PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
