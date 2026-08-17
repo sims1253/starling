@@ -476,8 +476,13 @@ SpecState& state_for(const QwenDecodeSpec& spec) {
 // decode-cache-clearer BEFORE backend teardown.
 DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.device_once, [&st] {
-        register_decode_cache_clearer([&st] { st.device_cache.reset(); });
+    // Capture the map-slot POINTER, not the local reference: the shutdown
+    // clearer runs long after this frame is gone, and a by-reference capture
+    // of `st` dereferences a dead stack slot (the historical exit-time
+    // "double free or corruption" in the decode-cache clearers).
+    SpecState* stp = &st;
+    std::call_once(st.device_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->device_cache.reset(); });
     });
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
@@ -653,8 +658,9 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
 PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                                          std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.prefill_once, [&st] {
-        register_decode_cache_clearer([&st] { st.prefill_cache.reset(); });
+    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
+    std::call_once(st.prefill_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->prefill_cache.reset(); });
     });
     if (!st.prefill_cache)
         st.prefill_cache = std::make_unique<PrefillCache>(replay_cache_size());
@@ -854,8 +860,9 @@ int kstep_K(const QwenDecodeSpec& spec) {
 // a runtime input, so this graph is reused for every decode-step batch.
 KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.kstep_once, [&st] {
-        register_decode_cache_clearer([&st] { st.kstep.clear(); });
+    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
+    std::call_once(st.kstep_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->kstep.clear(); });
     });
     KStepKey key{K};
     auto it = st.kstep.find(key);

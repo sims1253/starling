@@ -86,11 +86,14 @@ def pre_stack_mel(fe: Any, wav: torch.Tensor) -> torch.Tensor:
 
 
 def capture_first_chunk(wav: np.ndarray, chunk_samples: int) -> np.ndarray:
-    """The first server-policy chunk (zero-padded to the full chunk length)."""
-    chunk = wav[:chunk_samples]
-    if len(chunk) < chunk_samples:
-        chunk = np.pad(chunk, (0, chunk_samples - len(chunk)))
-    return chunk
+    """The first server-policy chunk: the leading 30 s, never padded.
+
+    Short/medium go through single-shot unpadded (the server pads only the
+    LAST chunk of audio longer than max_chunk); long's first chunk is exactly
+    30 s. The trailing zero-pad only exists for the FINAL chunk of long audio,
+    which this script does not stage.
+    """
+    return wav[:chunk_samples]
 
 
 def main() -> int:
@@ -151,12 +154,16 @@ def main() -> int:
                 inputs = build_inputs(processor, wav_t)
                 prompt_ids = inputs["input_ids"]
                 mel160 = inputs["input_features"]
-                mel80 = pre_stack_mel(processor.feature_extractor, wav_t)
+                mel80 = pre_stack_mel(processor.audio_processor, wav_t)
 
                 with torch.inference_mode():
-                    # Encoder + projector fire through the hooks; the merged
-                    # embeds are re-derived exactly like the model's
+                    # Drive the audio path so the hooks fire (get_audio_features
+                    # = encoder + projector, the same call the stock forward
+                    # makes); then re-derive the merged embeds exactly like
                     # get_merged_audio_embeddings (byte-exact per pipeline.py).
+                    _ = model.model.get_audio_features(
+                        input_features=mel160.to(model.dtype), return_dict=True
+                    )
                     enc_hidden = captured["encoder_hidden"]
                     audio_embeds = captured["audio_embeds"]
                     mask = prompt_ids == AUDIO_TOKEN_ID

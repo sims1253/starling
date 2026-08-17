@@ -63,7 +63,10 @@ ggml_tensor* bert_attention(ggml_context* c, const ModelLoader& ml,
     const int64_t B = co->ne[3];
     co = ggml_reshape_3d(c, co, H * hd, S, B);
     ggml_tensor* o = lib::linear_bf16(c, ml, co, base + "out", true);
-    return lib::layer_norm_bf16(c, ml, lib::addb(c, qh, o), base + "ln", ln_eps);
+    // LN(input + out): the OUTPUT operand comes first — ggml broadcasts the
+    // second addend onto the first, and layer 0's shared query batch (Bq=1)
+    // must repeat onto the windowed output (B=nblk). Value-commutative.
+    return lib::layer_norm_bf16(c, ml, lib::addb(c, o, qh), base + "ln", ln_eps);
 }
 
 } // namespace
@@ -95,6 +98,18 @@ ggml_tensor* build_projector(ggml_context* c, const GraniteModel& m,
     query = ggml_reshape_2d(c, query, hidden, pc.num_queries);
     ggml_tensor* h = lib::layer_norm_bf16(c, ml, query, "proj.qformer_ln",
                                           pc.layer_norm_eps);
+    // Broadcast the shared queries to per-window rows up front: the reference
+    // runs layer 0's self-attention on the batch-1 query tensor, but that math
+    // is row-independent, so tiling identical rows is value-exact — and it
+    // keeps every qformer matmul on matching batch dims (ggml's mul_mat only
+    // broadcasts the KV side). The repeat runs in f32 (the CUDA REPEAT kernel
+    // is f32/f16-only); the bf16->f32->bf16 round-trip is exact.
+    h = ggml_reshape_3d(c, h, hidden, pc.num_queries, 1);
+    if (nblk > 1) {
+        ggml_tensor* tmpl = ggml_view_3d(c, xw, hidden, pc.num_queries, nblk,
+                                         xw->nb[1], xw->nb[2], 0);
+        h = bf16(c, ggml_repeat(c, f32(c, h), tmpl));
+    }
 
     for (uint32_t i = 0; i < pc.qformer_layers; ++i) {
         const std::string p = "proj.blk." + std::to_string(i) + ".";
