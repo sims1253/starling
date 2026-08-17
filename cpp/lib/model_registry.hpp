@@ -14,8 +14,9 @@
 //
 // The registry lives in the library's internal namespace. serve links
 // starling_ggml statically and includes this header directly; nothing here
-// leaks into the public ABI (starling_ggml.h stays byte-identical and
-// STARLING_GGML_ABI_VERSION stays 3).
+// leaks into the public ABI (starling_ggml.h stays byte-identical, and the
+// registry itself never touches STARLING_GGML_ABI_VERSION — model additions
+// bump it in starling_ggml.h per the usual convention).
 
 #pragma once
 

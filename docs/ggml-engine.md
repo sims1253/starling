@@ -29,7 +29,7 @@ slug, the load/free/decode entry points, and the error-message shape for the
 shared 16 kHz guard). The C API's `load`/`free`/`transcribe_pcm` dispatch
 (`cpp/capi.cpp`) and the serve slug mapping, supported-model check, and
 `--version` model list (`cpp/serve/server.cpp`) are all table lookups; the
-public `starling_ggml.h` stays flat and unchanged (ABI 3).
+public `starling_ggml.h` stays flat and unchanged (ABI 4).
 
 Adding a model = its `cpp/<model>/` implementation (with the three
 `capi_<model>.cpp` entry points) + one contiguous addition in
@@ -57,6 +57,37 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
 - **moss (legacy external CrispASR)**: short is byte-exact; medium/long retain
   the historical normalized-CER gate and single-chunk workaround. This engine
   is deprecated and does not define Starling's in-tree correctness.
+- **granite (in-tree `StarlingGgmlGranite`)**: greedy path only (the
+  self-speculative CTC-drafting path stays Python-side and is byte-identical
+  to greedy by construction). Exact text on short/medium/long against
+  `golden/granite_reference.json`, captured from the stock-numerics Python
+  path by `scripts/make_granite_golden.py` (staged component tensors via
+  `scripts/granite_golden_components.py`). The engine mirrors the Python
+  server's chunk policy for long audio (30 s zero-padded chunks, per-chunk
+  budget clamped to the 640-token cache, whitespace-collapsed join).
+
+### granite engine notes
+
+- **Mel**: the shared `lib/whisper_mel` frontend with the `T_FULLT` rule
+  (torchaudio `center=True` keeps every `S/hop + 1` frame); the odd-frame drop
+  and 80→160 pair-stack are engine-side (`cpp/granite/mel.cpp`).
+- **Encoder**: CTC conformer with block-local Shaw attention. The per-layer
+  `(200, 200, 128)` rel-pos bias is precomputed by the converter (an exact
+  embedding gather) — the bias term lands as ONE extra batched matmul per
+  layer by making the query's within-window position the batch dim. The
+  depthwise conv is a 15-tap shift-multiply-accumulate (ggml's im2col is
+  unvalidated under CUDA-graph capture in this build); the eval BatchNorm
+  recomputes `1/sqrt(var+eps)` in-graph per channel.
+- **Projector**: BLIP2 Q-Former (2 BERT-style layers, erf GELU, LN eps 1e-12);
+  layer 0's self-attention runs once on the shared 3 queries and the
+  cross-attention broadcasts them over the windows.
+- **Decoder**: the shared `lib/qwen_decode` stack via a third trunk variant —
+  `QwenDecodeSpec` with `qkv_bias=false, qk_norm=false`, an UNTIED
+  `llm.lm_head`, and the Granite multipliers (attention scale 0.0078125,
+  embedding ×12.0 applied to the whole merged inputs_embeds at prefill and the
+  embed lookup at decode, residual ×0.22, logits ÷8.0). All spec extensions
+  default to the historical moss/ark op sequence, so the older engines' graphs
+  are unchanged.
 
 ## Backends
 

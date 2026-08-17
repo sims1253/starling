@@ -50,6 +50,51 @@ const char* env(const QwenDecodeSpec& spec, const char* suffix) {
     return std::getenv(name.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Granite-family spec hooks (graph_helpers.hpp for the f32-math/bf16-round
+// discipline). Every helper is skip-when-default, so moss/ark keep the exact
+// historical op sequence — their graphs are unchanged by these extensions.
+// ---------------------------------------------------------------------------
+
+// The lm_head weight name: tied models reuse the embedding table; granite
+// carries a separate llm.lm_head.weight.
+const char* lm_head_name(const QwenDecodeSpec& s) {
+    return s.tied_lm_head ? "llm.embed.weight" : "llm.lm_head.weight";
+}
+
+// Attention softmax scale: explicit (granite's attention_multiplier replaces
+// 1/sqrt(D)) or the historical default.
+float attn_scale(const QwenDecodeSpec& s, int D) {
+    return s.attention_scale > 0.0f ? s.attention_scale
+                                    : 1.0f / std::sqrt((float)D);
+}
+
+// Residual add r + m*y (granite's residual_multiplier); 1.0 keeps addb.
+ggml_tensor* residual_add(ggml_context* c, const QwenDecodeSpec& s,
+                          ggml_tensor* r, ggml_tensor* y) {
+    if (s.residual_multiplier == 1.0f) return addb(c, r, y);
+    // Mirrors stock modeling_granite: t = bf16(y * m); out = bf16(r + t).
+    return addb(c, r, bf16(c, ggml_scale(c, f32(c, y), s.residual_multiplier)));
+}
+
+// Granite's embedding_multiplier: applied to the whole inputs_embeds at
+// prefill and to the embed lookup at decode (modeling_granite.py:397 applies
+// it to the passed-in embeds, audio rows included).
+ggml_tensor* apply_embed_mul(ggml_context* c, const QwenDecodeSpec& s,
+                             ggml_tensor* x) {
+    if (s.embedding_multiplier == 1.0f) return x;
+    return bf16(c, ggml_scale(c, f32(c, x), s.embedding_multiplier));
+}
+
+// Granite's logits_scaling: logits / s after the lm_head GEMM
+// (modeling_granite.py:497). 1/8 is a power of two, so the ggml_scale by the
+// reciprocal is bit-exact vs the reference's division.
+ggml_tensor* apply_logits_scaling(ggml_context* c, const QwenDecodeSpec& s,
+                                  ggml_tensor* logits) {
+    if (s.logits_scaling == 1.0f) return logits;
+    return ggml_scale(c, logits, 1.0f / s.logits_scaling);
+}
+
 // Append `add` new rows of k/v (src layout [heads, add, D] f32) to the cache
 // (layout [heads, old+add, D] bf16).
 void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
@@ -171,8 +216,10 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         k = ggml_reshape_3d(c, k, D, KV, S);
         v = ggml_reshape_3d(c, v, D, KV, S);
 
-        q = rms(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
-        k = rms(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+        if (!m.spec.qkv_bias && m.spec.qk_norm) {
+            q = rms(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
+            k = rms(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+        }
         if (st0 && stage.is("qn")) return ff(c, q);
         if (st0 && stage.is("kn")) return ff(c, k);
 
@@ -226,9 +273,9 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
                                              mask.data(), mask.size() * sizeof(mask[0]));
         if (st0 && stage.is("mask")) return mt;
 
-        // Per-head attention: scores = k^T q / sqrt(D), causal softmax,
+        // Per-head attention: scores = k^T q * scale, causal softmax,
         // context = probs v. Heads concatenated along the feature dim.
-        const float scale = 1.0f / std::sqrt((float)D);
+        const float scale = attn_scale(m.spec, D);
         ggml_tensor* joined = nullptr;
         for (int h = 0; h < H; ++h) {
             int kvh = h / (H / KV);
@@ -248,7 +295,7 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
 
         ggml_tensor* a = lin(c, m.loader, joined, p + "attn.o.weight");       // [hidden, S]
         if (st0 && stage.is("attn")) return ff(c, a);
-        x = addb(c, r, a);
+        x = residual_add(c, m.spec, r, a);
         r = x;
         if (st0 && stage.is("xmid")) return ff(c, x);
 
@@ -259,7 +306,7 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         ggml_tensor* z = mulb(c, si, u);
         ggml_tensor* dn = lin(c, m.loader, z, p + "ffn.down.weight");
         if (st0 && stage.is("down")) return ff(c, dn);
-        x = addb(c, r, dn);
+        x = residual_add(c, m.spec, r, dn);
 
         // Output: concat(flat x, flat k, flat v) so one readback carries all.
         ggml_tensor* flatx = ggml_reshape_1d(c, ff(c, x), lc.hidden * S);
@@ -287,7 +334,13 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
 
 bool forward_legacy(const QwenDecodeCtx& m, const std::vector<float>& input, int64_t S,
                      LlmState& state, std::vector<float>& logits, std::string& e) {
-    std::vector<ggml_bf16_t> x = tobf(input);
+    // Granite's embedding multiplier applies to the layer-0 input (prefill:
+    // the merged embeds; decode: the looked-up row). The host f32 multiply +
+    // tobf round is bit-identical to the in-graph f32-scale + bf16-cast.
+    std::vector<float> entry = input;
+    if (m.spec.embedding_multiplier != 1.0f)
+        for (auto& v : entry) v *= m.spec.embedding_multiplier;
+    std::vector<ggml_bf16_t> x = tobf(entry);
     if (state.layers.empty()) state.layers.resize(m.dims.n_layers);
 
     for (int li = 0; li < (int)m.dims.n_layers; ++li) {
@@ -322,7 +375,8 @@ bool forward_legacy(const QwenDecodeCtx& m, const std::vector<float>& input, int
     }
     state.length += S;
 
-    // Logits for the last token: final RMSNorm, then tied-embedding lm_head.
+    // Logits for the last token: final RMSNorm, then the lm_head (tied to the
+    // embedding table unless the spec carries an untied llm.lm_head.weight).
     std::vector<ggml_bf16_t> last(m.dims.hidden);
     std::copy(x.end() - last.size(), x.end(), last.begin());
     bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
@@ -330,7 +384,8 @@ bool forward_legacy(const QwenDecodeCtx& m, const std::vector<float>& input, int
         ggml_tensor* t = graph_input_tensor(c, GGML_TYPE_BF16, 2, ne,
                                             last.data(), last.size() * sizeof(last[0]));
         t = rms(c, m.loader, t, "llm.final_norm.weight", m.dims.rms_norm_eps);
-        return ff(c, ggml_mul_mat(c, wb(c, m.loader, "llm.embed.weight"), t));
+        ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), t);
+        return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
     if (!ok) e = std::string(m.spec.label) + " lm_head graph failed";
     return ok;
@@ -407,8 +462,14 @@ struct SpecState {
 };
 
 std::unordered_map<const QwenDecodeSpec*, SpecState>& spec_states() {
-    static std::unordered_map<const QwenDecodeSpec*, SpecState> m;
-    return m;
+    // Deliberately leaked: entries are torn down by the registered
+    // decode-cache clearers during shutdown_backend(), which runs from an
+    // atexit handler — that handler is registered BEFORE this static is
+    // constructed, so LIFO destroys the map FIRST and the clearers would
+    // read freed SpecStates (the exit-time "double free or corruption";
+    // ASan: heap-use-after-free in the DeviceCache clearer).
+    static auto* m = new std::unordered_map<const QwenDecodeSpec*, SpecState>();
+    return *m;
 }
 SpecState& state_for(const QwenDecodeSpec& spec) {
     return spec_states()[&spec];
@@ -421,8 +482,13 @@ SpecState& state_for(const QwenDecodeSpec& spec) {
 // decode-cache-clearer BEFORE backend teardown.
 DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.device_once, [&st] {
-        register_decode_cache_clearer([&st] { st.device_cache.reset(); });
+    // Capture the map-slot POINTER, not the local reference: the shutdown
+    // clearer runs long after this frame is gone, and a by-reference capture
+    // of `st` dereferences a dead stack slot (the historical exit-time
+    // "double free or corruption" in the decode-cache clearers).
+    SpecState* stp = &st;
+    std::call_once(st.device_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->device_cache.reset(); });
     });
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
@@ -472,7 +538,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     q = ggml_reshape_3d(c, q, D, H, S);
     k = ggml_reshape_3d(c, k, D, KV, S);
     v = ggml_reshape_3d(c, v, D, KV, S);
-    if (!m.spec.qkv_bias) {
+    if (!m.spec.qkv_bias && m.spec.qk_norm) {
         q = rms(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
         k = rms(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
     }
@@ -541,7 +607,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     //     unchanged; produces [hidden, S] via permute+reshape.
     //   - per-head (<env>_PERHEAD=1): the H-iteration loop, identical op
     //     sequence to layer_legacy.
-    const float scale = 1.0f / std::sqrt((float)D);
+    const float scale = attn_scale(m.spec, D);
     ggml_tensor* joined;
     if (!env(m.spec, "_PERHEAD")) {
         // scores = K^T Q / sqrt(D) over all heads (GQA broadcast KV->H).
@@ -572,7 +638,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     }
 
     ggml_tensor* a = lin(c, m.loader, joined, p + "attn.o.weight");
-    ggml_tensor* x = addb(c, r, a);
+    ggml_tensor* x = residual_add(c, m.spec, r, a);
     r = x;
     n = rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
     ggml_tensor* g = lin(c, m.loader, n, p + "ffn.gate.weight");
@@ -580,7 +646,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     ggml_tensor* si = bf(c, ggml_silu(c, ff(c, g)));
     ggml_tensor* z = mulb(c, si, u);
     ggml_tensor* dn = lin(c, m.loader, z, p + "ffn.down.weight");
-    x = addb(c, r, dn);
+    x = residual_add(c, m.spec, r, dn);
     return x;  // [hidden, S] bf16
 }
 
@@ -598,8 +664,9 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
 PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                                          std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.prefill_once, [&st] {
-        register_decode_cache_clearer([&st] { st.prefill_cache.reset(); });
+    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
+    std::call_once(st.prefill_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->prefill_cache.reset(); });
     });
     if (!st.prefill_cache)
         st.prefill_cache = std::make_unique<PrefillCache>(replay_cache_size());
@@ -629,6 +696,7 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                     int64_t xne[2] = {lc.hidden, S};
                     ggml_tensor* x = graph_input_tensor(c, GGML_TYPE_BF16, 2, xne,
                         entry.xb_buf, (size_t)S * lc.hidden * sizeof(ggml_bf16_t));
+                    x = apply_embed_mul(c, m.spec, x);
                     int64_t pne[1] = {S};
                     ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, pne,
                         pos_buf, (size_t)S * sizeof(int32_t));
@@ -644,7 +712,8 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                     ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                                      (size_t)(S - 1) * x->nb[1]);
                     ggml_tensor* n = rms(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
-                    return ff(c, ggml_mul_mat(c, wb(c, m.loader, "llm.embed.weight"), n));
+                    ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+                    return ff(c, apply_logits_scaling(c, m.spec, lg));
                 });
             return entry;
         });
@@ -672,6 +741,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
             int64_t xne[2] = {lc.hidden, S};
             ggml_tensor* x = graph_input_tensor(c, GGML_TYPE_BF16, 2, xne,
                                                 xb.data(), xb.size() * sizeof(xb[0]));
+            x = apply_embed_mul(c, m.spec, x);
             int64_t pne[1] = {S};
             ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, pne,
                                                     pos.data(), pos.size() * sizeof(int32_t));
@@ -686,7 +756,8 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
             ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                              (size_t)(S - 1) * x->nb[1]);
             ggml_tensor* n = rms(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
-            return ff(c, ggml_mul_mat(c, wb(c, m.loader, "llm.embed.weight"), n));
+            ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+            return ff(c, apply_logits_scaling(c, m.spec, lg));
         }, logits);
         if (!ok) { e = std::string(m.spec.label) + " prefill graph failed"; return false; }
         state.length = S;
@@ -740,6 +811,7 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
         ggml_tensor* id_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                &prev_token, sizeof(int32_t));
         ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), id_t);
+        x = apply_embed_mul(c, m.spec, x);
         ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
@@ -754,7 +826,8 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
                                  cs, sn, mt, kv_mode, idx_t);
         ggml_tensor* n = rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
-        return ff(c, ggml_mul_mat(c, wb(c, m.loader, "llm.embed.weight"), n));
+        ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+        return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
     if (!ok) { e = std::string(m.spec.label) + " decode graph failed"; return false; }
     state.length = past + S;
@@ -793,8 +866,9 @@ int kstep_K(const QwenDecodeSpec& spec) {
 // a runtime input, so this graph is reused for every decode-step batch.
 KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
     SpecState& st = state_for(m.spec);
-    std::call_once(st.kstep_once, [&st] {
-        register_decode_cache_clearer([&st] { st.kstep.clear(); });
+    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
+    std::call_once(st.kstep_once, [stp] {
+        register_decode_cache_clearer([stp] { stp->kstep.clear(); });
     });
     KStepKey key{K};
     auto it = st.kstep.find(key);
@@ -843,6 +917,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
             }
 
             ggml_tensor* embed_w = clone_weight(c, m.loader, "llm.embed.weight");
+            // Untied models carry a separate lm_head; tied models keep using
+            // the embedding clone (identical single node, moss/ark unchanged).
+            ggml_tensor* head_w = m.spec.tied_lm_head
+                ? embed_w
+                : clone_weight(c, m.loader, "llm.lm_head.weight");
 
             // Chain K steps in-graph: tok = prev-token; each step's argmax feeds
             // the next step's embed (get_rows), all on device.
@@ -851,6 +930,7 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
             tok_nodes.reserve((size_t)K);
             for (int j = 0; j < K; ++j) {
                 ggml_tensor* x = ggml_get_rows(c, embed_w, tok);                     // [hidden, 1]
+                x = apply_embed_mul(c, m.spec, x);
                 ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t[(size_t)j]);  // [D, 1]
                 ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos_t[(size_t)j]);
                 for (int li = 0; li < (int)lc.n_layers; ++li)
@@ -858,7 +938,9 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                                          dc->k[li], dc->v[li], cs, sn, mask_t[(size_t)j],
                                          /*kv_mode=*/2, pos_t[(size_t)j]);
                 ggml_tensor* n = rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
-                ggml_tensor* logits = ggml_mul_mat(c, embed_w, n);                  // [vocab, 1]
+                // Argmax is invariant under the positive logits_scaling, so the
+                // K-step graph skips the division (no logits are read back).
+                ggml_tensor* logits = ggml_mul_mat(c, head_w, n);                  // [vocab, 1]
                 ggml_tensor* tj = ggml_argmax(c, logits);                            // i32 [1]
                 // CUDA concat is F32-only; token ids < 2^24 so (float)tok is exact.
                 tok_nodes.push_back(ggml_cast(c, tj, GGML_TYPE_F32));

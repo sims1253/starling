@@ -72,6 +72,7 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
     switch (p.t_rule) {
         case MelPolicy::T_FULLT_MINUS_1:  T = fullT - 1; break;
         case MelPolicy::T_CEIL_S_OVER_H:  T = (S + H - 1) / H; break;
+        case MelPolicy::T_FULLT:          T = fullT; break;
         default:                          T = S / H; break;
     }
     std::vector<float> logmel(M * fullT);

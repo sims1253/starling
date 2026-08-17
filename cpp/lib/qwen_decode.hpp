@@ -19,15 +19,25 @@
 
 namespace starling::ggml::lib {
 
-// The moss/ark decode-stack differences. qkv_bias selects the projection
-// family: true = Qwen2.5 trunk (biased q/k/v addressed by BASE name "attn.q"
-// etc., no q_norm/k_norm); false = Qwen3 trunk (bias-free over full weight
-// names "attn.q.weight", per-head q_norm/k_norm after the reshape).
+// The moss/ark/granite decode-stack differences. qkv_bias selects the
+// projection family: true = Qwen2.5 trunk (biased q/k/v addressed by BASE name
+// "attn.q" etc., no q_norm/k_norm); false = bias-free over full weight names
+// "attn.q.weight" (Qwen3 trunk with per-head q_norm/k_norm, or granite with
+// them off via qk_norm). The granite-family fields below default so the
+// moss/ark graphs stay byte-identical: qk_norm is consulted only in the
+// bias-free branch, the multipliers use skip-when-default (the op sequence is
+// untouched), and tied_lm_head keeps llm.embed.weight as the head.
 struct QwenDecodeSpec {
     bool qkv_bias;
     const char* env;           // env-var prefix, e.g. "STARLING_MOSS"
     const char* label;         // error/log label, e.g. "MOSS"
     const char* stage_prefix;  // L0-probe dump filename prefix
+    bool qk_norm = true;       // per-head q_norm/k_norm (moss; granite: off)
+    bool tied_lm_head = true;  // lm_head == llm.embed (granite is untied)
+    float attention_scale = 0.0f;       // 0 -> 1/sqrt(head_dim) (granite: 0.0078125)
+    float embedding_multiplier = 1.0f;  // hidden = embeds * m at prefill AND decode
+    float residual_multiplier = 1.0f;   // residual + m*y, attn and mlp (granite: 0.22)
+    float logits_scaling = 1.0f;        // logits / s after lm_head (granite: 8.0)
 };
 
 // The config fields the decode graphs are shaped by.

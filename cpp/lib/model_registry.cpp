@@ -39,6 +39,10 @@ void * starling_ggml_hojo_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_hojo_free(void * handle);
 char * starling_ggml_hojo_decode(void * handle, const float * pcm, int64_t n,
                                  const char ** err_out);
+void * starling_ggml_granite_load(const char * gguf_path, const char ** err_out);
+void   starling_ggml_granite_free(void * handle);
+char * starling_ggml_granite_decode(void * handle, const float * pcm, int64_t n,
+                                    const char ** err_out);
 }
 
 // One row per engine, in starling_ggml_model enum order (serve's
@@ -82,6 +86,12 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: HOJO expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "HOJO transcribe failed" },
+    { STARLING_GGML_GRANITE, "granite",
+      starling_ggml_granite_load, starling_ggml_granite_free,
+      starling_ggml_granite_decode,
+      "starling_ggml_transcribe_pcm: GRANITE expects 16 kHz",
+      /*rate_error_in_ctx=*/true,
+      "GRANITE transcribe failed" },
 };
 
 static_assert([] {
