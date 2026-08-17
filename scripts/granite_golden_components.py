@@ -14,11 +14,12 @@ at a time, so divergence can be localized during porting:
   inputs_embeds     merged multimodal embeddings pre-multiplier (1, T, 2048)
   prefill_logits    first-step logits (lm_head / logits_scaling) (1, 1, 100353)
 
-For medium/long the stages are captured on the FIRST 30 s chunk of the server
-chunk policy (zero-padded to the full chunk length, exactly what the engine
-sees); the end-to-end ids of that chunk are re-captured and asserted equal to
-``golden/granite_reference.json`` so the staged tensors correspond to the exact
-decode the ggml port must match.
+For medium/long the stages are captured on the FIRST 30 s window of the
+server chunk policy, UNPADDED (short/medium go through single-shot; long's
+first chunk is exactly 30 s — the server zero-pads only the FINAL chunk,
+which this script does not stage); the end-to-end ids of that chunk are
+re-captured and asserted equal to ``golden/granite_reference.json`` so the
+staged tensors correspond to the exact decode the ggml port must match.
 
 Usage (from the repo root, GPU):
     uv run python scripts/granite_golden_components.py
@@ -225,7 +226,7 @@ def main() -> int:
                     "chunk": {
                         "index": 0,
                         "seconds": chunk_seconds,
-                        "padded": seconds > CHUNK_SECONDS,
+                        "fixture_exceeds_chunk": seconds > CHUNK_SECONDS,
                     },
                     "mel_frontend": {
                         "sample_rate": SAMPLE_RATE,
