@@ -255,7 +255,11 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
         c->err = e.what();
         report(err_out, c->err);
     } catch (...) {
-        report(err_out, "unknown exception transcribing GRANITE audio");
+        // Same ownership rule as the std::exception branch: report() would
+        // hand *err_out a pointer into a temporary std::string that dies at
+        // the end of the statement, and capi.cpp reads it after we return.
+        c->err = "unknown exception transcribing GRANITE audio";
+        report(err_out, c->err);
     }
     return nullptr;
 }

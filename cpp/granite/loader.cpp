@@ -120,6 +120,7 @@ bool GraniteModel::load(const char* path, std::string& err) {
     POS(c.encoder.context_size, "enc.context_size");
     POS(c.encoder.output_dim, "enc.output_dim");
     POS(c.projector.window_size, "proj.window_size");
+    POS(c.projector.downsample_rate, "proj.downsample_rate");
     POS(c.projector.num_queries, "proj.num_queries");
     POS(c.projector.qformer_layers, "proj.qformer_layers");
     POS(c.projector.qformer_heads, "proj.qformer_heads");
