@@ -402,6 +402,49 @@ def test_starling_ggml_hojo_text_parity(starling_ggml_hojo_engine, name: str) ->
 
 
 # --------------------------------------------------------------------------- #
+# In-tree granite-speech-4.1-2b C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_granite_available() -> bool:
+    try:
+        from engines import StarlingGgmlGranite
+        return StarlingGgmlGranite().available
+    except Exception:
+        return False
+
+@pytest.fixture(scope="module")
+def starling_ggml_granite_engine():
+    if not _starling_ggml_granite_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_GRANITE_MODEL unavailable")
+    from engines import StarlingGgmlGranite
+    engine = StarlingGgmlGranite()
+    engine.load()
+    yield engine
+    engine.close()
+
+@pytest.mark.skipif(not _starling_ggml_granite_available(),
+                    reason="in-tree libstarling_ggml or granite GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_granite_text_parity(starling_ggml_granite_engine, name: str) -> None:
+    """The in-tree C API returns the golden granite transcript.
+
+    Gates Starling's own torchaudio mel (odd-drop + pair stack) -> CTC
+    conformer encoder (block-local Shaw attention, mid-stack self-conditioned
+    CTC) -> BLIP2 Q-Former projector -> Granite-4.0-1b decoder (bias-free, no
+    qk-norm, untied lm_head, granite multipliers) pipeline including the serve
+    chunk policy for long audio, against the stock-numerics reference captured
+    by scripts/make_granite_golden.py (golden/granite_reference.json). Asserts
+    exact text parity with no tolerance.
+    """
+    golden = json.loads((GOLDEN / "granite_reference.json").read_text())
+    golden_text = golden["fixtures"][name]["text"].rstrip()
+    out = starling_ggml_granite_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree GRANITE transcript mismatch on {name}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Wave G regression: MOSS K-step decode must not access the KV cache / RoPE
 # tables past max_cache when a block's remaining token budget < K.
 # --------------------------------------------------------------------------- #
