@@ -27,7 +27,8 @@ extern "C" {
 //   2 — added STARLING_GGML_HIGGS (bosonai/higgs-audio-v3-stt).
 //   3 — added STARLING_GGML_HOJO (HojoAI/Hojo-ASR-V1).
 //   4 — added STARLING_GGML_GRANITE (ibm-granite/granite-speech-4.1-2b).
-#define STARLING_GGML_ABI_VERSION 4
+//   5 — added STARLING_GGML_QWEN3 (Qwen/Qwen3-ASR-1.7B-hf).
+#define STARLING_GGML_ABI_VERSION 5
 
 // ABI / build introspection --------------------------------------------------
 
@@ -49,6 +50,7 @@ typedef enum {
     STARLING_GGML_HIGGS        = 4,  // bosonai/higgs-audio-v3-stt
     STARLING_GGML_HOJO         = 5,  // HojoAI/Hojo-ASR-V1
     STARLING_GGML_GRANITE      = 6,  // ibm-granite/granite-speech-4.1-2b
+    STARLING_GGML_QWEN3        = 7,  // Qwen/Qwen3-ASR-1.7B-hf
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------
