@@ -276,7 +276,7 @@ Endpoints (FastAPI when available, stdlib fallback):
 | `GET  /` `/health`        | liveness + `phase` (`loading_weights`/`warming_up`/`ready`) and `queue_depth` |
 | `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
 | `POST /transcribe`        | raw WAV bytes -> same shape as `/inference` |
-| `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202 Accepted) |
+| `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202, or 409 when the model is not loaded) |
 | `DELETE /inference/<id>`  | cancel a queued or running request by its `X-Request-Id` |
 | `WS   /stream`            | real-time streaming dictation |
 

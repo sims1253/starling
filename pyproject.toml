@@ -35,6 +35,11 @@ dev = [
     "pytest",
     "requests",
     "websockets",
+    # The server prefers the FastAPI transport when importable; the CPU-only
+    # server tests exercise its routes (stdlib fallback runs unconditionally),
+    # so the dev/CI env carries both.
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.scripts]
