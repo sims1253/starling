@@ -57,13 +57,9 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
     const int64_t chunk = 2 * (int64_t) cfg.frontend.n_window;
     const int64_t T_pad = (T + chunk - 1) / chunk * chunk;
     out.data.assign((size_t) M * T_pad, ggml_bf16_t{0});
-    out.f32.assign((size_t) M * T_pad, 0.0f);
-    for (int64_t m = 0; m < M; ++m) {
+    for (int64_t m = 0; m < M; ++m)
         std::memcpy(out.data.data() + (size_t) m * T_pad,
                     mo.bf16.data() + (size_t) m * T, (size_t) T * sizeof(ggml_bf16_t));
-        for (int64_t t = 0; t < T; ++t)
-            out.f32[(size_t) m * T_pad + t] = mo.f32[(size_t) m * T + t];
-    }
     out.n_mels = M;
     out.n_frames = T_pad;
     out.valid_frames = T;

@@ -91,7 +91,9 @@ std::string fix_char_repeats(const std::string& s, size_t thresh) {
     return res;
 }
 
-// fix_pattern_repeats: collapse any pattern (1..max_len bytes) repeated
+// fix_pattern_repeats: collapse any pattern (1..max_len BYTES vs the Python
+// oracle's 20 characters — degenerate multibyte repeats longer than 20 bytes
+// would collapse differently; unreachable on realistic transcripts) repeated
 // `thresh` or more times consecutively to a single copy, recursing on the
 // remainder. Literal port of the Qwen3-ASR library post-processing.
 std::string fix_pattern_repeats(const std::string& s, size_t thresh, size_t max_len = 20) {

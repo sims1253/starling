@@ -9,11 +9,10 @@
 namespace starling::ggml::qwen3 {
 struct MelFeatures {
     // Chunk-padded mel, FEAT-major: element (m, t) at m*n_frames + t (time
-    // innermost — the [T_pad, 128] ggml layout), bf16 + f32. n_frames is the
-    // padded frame count (multiple of 100); valid_frames is the real frame
-    // count T before the zero pad.
+    // innermost — the [T_pad, 128] ggml layout), bf16. n_frames is the padded
+    // frame count (multiple of 100); valid_frames is the real frame count T
+    // before the zero pad.
     std::vector<ggml_bf16_t> data;
-    std::vector<float> f32;
     int64_t n_mels = 128, n_frames = 0, valid_frames = 0;
 };
 // Whisper-style log-mel (n_fft=400, hop=160, 128 bins, drop-last-frame rule)
