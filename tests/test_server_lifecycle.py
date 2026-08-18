@@ -86,6 +86,7 @@ def test_qwen3_backend_load_reuses_loaded_model(monkeypatch) -> None:  # noqa: A
     model_sentinel = object()
     processor_sentinel = object()
     constructs: list[tuple[Any, Any, dict[str, Any]]] = []
+    loader_calls: list[dict[str, Any]] = []
 
     class _FakeMegaPipeline:
         def __init__(self, model: Any, processor: Any, **kwargs: Any) -> None:
@@ -96,25 +97,29 @@ def test_qwen3_backend_load_reuses_loaded_model(monkeypatch) -> None:  # noqa: A
         def from_pretrained(cls, **_kwargs: Any) -> NoReturn:
             raise AssertionError("from_pretrained() must not be called (double load)")
 
+    def fake_load_model_and_processor(**kwargs: Any) -> tuple[Any, Any]:
+        loader_calls.append(kwargs)
+        return model_sentinel, processor_sentinel
+
     fake_pkg = types.ModuleType("starling.qwen3")
     fake_loader = types.ModuleType("starling.qwen3.loader")
-    fake_loader.load_model_and_processor = (
-        lambda **kwargs: (model_sentinel, processor_sentinel)
-    )
+    fake_loader.load_model_and_processor = fake_load_model_and_processor
     fake_pipeline = types.ModuleType("starling.qwen3.pipeline")
     fake_pipeline.MegaPipeline = _FakeMegaPipeline
     monkeypatch.setitem(sys.modules, "starling.qwen3", fake_pkg)
     monkeypatch.setitem(sys.modules, "starling.qwen3.loader", fake_loader)
     monkeypatch.setitem(sys.modules, "starling.qwen3.pipeline", fake_pipeline)
 
+    # Non-default values so forwarding regressions cannot hide behind defaults.
     backend = Qwen3Backend(
-        ServerConfig(model="qwen3", encoder_mode="eager", use_fused_llm=False)
+        ServerConfig(model="qwen3", attn_impl="sdpa", encoder_mode="eager", use_fused_llm=False)
     )
     backend.load()
 
     assert backend.pipe is not None and backend.pipe.built
     assert backend.processor is processor_sentinel
     assert len(constructs) == 1  # the model was loaded exactly once
+    assert loader_calls == [{"attn_impl": "sdpa"}]  # --attn-impl forwarded
     model, processor, kwargs = constructs[0]
     assert model is model_sentinel
     assert processor is processor_sentinel
@@ -301,6 +306,31 @@ def test_fastapi_warmup_route_rejects_unloaded_model() -> None:
     body = json.loads(response.body)
     assert body["error"] == "model not loaded"
     assert body["phase"] == "unloaded"
+
+
+def test_fastapi_warmup_route_dispatches_warmup_when_loaded() -> None:
+    """Loaded server: the endpoint answers 202 and the fire-and-forget task
+    really runs warmup. The scenario keeps the loop alive until the dispatched
+    task completes, so asyncio.run() cannot cancel it mid-flight."""
+    pytest.importorskip("fastapi")
+
+    server = StarlingServer(backend=_FakeBackend(), _loaded=True)
+    warmup_calls: list[None] = []
+    server.warmup = lambda: warmup_calls.append(None)  # type: ignore[method-assign]
+    app = create_app(server=server, load_on_startup=False)
+
+    async def scenario() -> Any:
+        response = await _warmup_route(app).endpoint()
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        await asyncio.gather(*pending)
+        return response
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 202
+    body = json.loads(response.body)
+    assert body["status"] == "warmup started"
+    assert len(warmup_calls) == 1
 
 
 def _stdlib_handler_for(server: StarlingServer, path: str) -> Any:  # noqa: ANN001
