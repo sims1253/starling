@@ -9,7 +9,8 @@ parakeet-server-compatible interface:
   * ``GET  /health``          - health alias
   * ``POST /inference``       - multipart/raw WAV upload -> ``{text, segments, duration_s, request_id}``
   * ``POST /transcribe``      - raw WAV bytes -> same shape as /inference
-  * ``POST /warmup``          - pre-capture CUDA graphs on a silent clip (idempotent; 202)
+  * ``POST /warmup``          - pre-capture CUDA graphs on a silent clip (idempotent;
+                                202, or 409 when the model is not loaded)
   * ``DELETE /inference/<id>``- cancel a queued request by ``X-Request-Id``
   * ``WS   /stream``          - real-time streaming dictation
 
@@ -509,8 +510,16 @@ class Qwen3Backend(ModelBackend):
         from .qwen3.loader import load_model_and_processor
         from .qwen3.pipeline import MegaPipeline
 
+        # Construct from the pair loaded above (granite-style) -- NOT
+        # MegaPipeline.from_pretrained(), which would discard it and re-load
+        # the model a second time with default attn/encoder settings.
         model, processor = load_model_and_processor(attn_impl=self.config.attn_impl)
-        self.pipe = MegaPipeline.from_pretrained()
+        self.pipe = MegaPipeline(
+            model,
+            processor,
+            encoder_mode=self.config.encoder_mode,
+            use_fused_llm=self.config.use_fused_llm,
+        )
         self.processor = processor
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
@@ -805,6 +814,14 @@ class StarlingServer:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _loaded: bool = False
 
+    # Serializes load() calls only. The (potentially minutes-long) model load
+    # must NOT run under ``_lock``: the health accessors (``loaded`` /
+    # ``queue_depth`` / ``is_busy`` / ``phase``) take ``_lock``, and on the
+    # FastAPI transport they run on the event loop -- a load holding ``_lock``
+    # freezes the whole server, health checks included. ``_lock`` stays
+    # dedicated to request-queue bookkeeping, which is only ever held briefly.
+    _load_lock: threading.Lock = field(default_factory=threading.Lock)
+
     # --- request queueing -------------------------------------------------
     _n_waiters: int = 0
     _requests: dict[str, "RequestContext"] = field(default_factory=dict)
@@ -841,9 +858,12 @@ class StarlingServer:
     def load(self) -> None:
         """Build the backend, load the model, and optionally warm up graphs.
 
-        Idempotent: a second call is a no-op. Thread-safe.
+        Idempotent: a second call is a no-op. Thread-safe. The model load runs
+        under ``_load_lock`` only (see the field comment): concurrent callers
+        serialize here, while ``_lock`` (and thus the health accessors) never
+        wait behind the load.
         """
-        with self._lock:
+        with self._load_lock:
             if self._loaded:
                 return
             self._phase = "loading_weights"
@@ -855,8 +875,12 @@ class StarlingServer:
             t0 = time.perf_counter()
             log.info("loading %s model ...", self.config.model)
             backend.load()
-            self.backend = backend
-            self._loaded = True
+            # Publish under ``_lock`` so ``loaded`` never observes a backend
+            # that is still being constructed; the write itself is what makes
+            # queued inference safe to proceed.
+            with self._lock:
+                self.backend = backend
+                self._loaded = True
             self._phase = "loaded"
             log.info("%s model loaded in %.1fs", self.config.model, time.perf_counter() - t0)
 
@@ -866,7 +890,14 @@ class StarlingServer:
             self._phase = "ready"
 
     def warmup(self) -> None:
-        """Capture CUDA graphs on a short silent clip (no-op if not loaded or already warming)."""
+        """Capture CUDA graphs on a short silent clip (no-op if not loaded or already warming).
+
+        Best-effort by policy: warmup is a graph-capture optimization, so a
+        failure (e.g. an OOM during capture) is logged and swallowed -- the
+        weights are loaded and the server stays usable, graphs just capture
+        lazily on the first request. Without the reset, /health would report
+        ``warming_up`` forever after a single failed warmup.
+        """
         if not self._loaded or self.backend is None:
             return
         # Dedup: if another thread is already capturing graphs, no-op. The flag
@@ -883,13 +914,21 @@ class StarlingServer:
             log.info("warming up CUDA graphs on %.1fs silent clip ...", WARMUP_SECONDS)
             n = int(WARMUP_SECONDS * SAMPLE_RATE)
             dummy = np.zeros(n, dtype=np.float32)
-            with with_gpu_lock(
-                session=GPU_LOCK_SESSION,
-                model=_gpu_lock_model(self.config.model),
-                eta_min=GPU_LOCK_ETA_MIN,
-                note="warmup",
-            ):
-                self._transcribe_np(dummy)
+            try:
+                with with_gpu_lock(
+                    session=GPU_LOCK_SESSION,
+                    model=_gpu_lock_model(self.config.model),
+                    eta_min=GPU_LOCK_ETA_MIN,
+                    note="warmup",
+                ):
+                    self._transcribe_np(dummy)
+            except Exception:
+                log.exception(
+                    "warmup failed; continuing without pre-captured graphs "
+                    "(they will capture on the first request)"
+                )
+                self._phase = "ready"
+                return
             self._phase = "ready"
             log.info("warmup complete")
         finally:
@@ -1348,6 +1387,12 @@ def create_app(
 
     @app.post("/warmup")
     async def warmup_route() -> JSONResponse:
+        # Warming up an unloaded model would silently no-op, so reject with 409
+        # instead of the misleading 202 "warmup started".
+        if not server.loaded:
+            return JSONResponse(
+                {"error": "model not loaded", "phase": server.phase()}, status_code=409
+            )
         task = asyncio.create_task(asyncio.to_thread(server.warmup))
         # Retain a strong reference until completion (see _background_tasks).
         _background_tasks.add(task)
@@ -1862,6 +1907,13 @@ def _build_stdlib_handler(server: StarlingServer):
                 return
 
             if self.path == "/warmup":
+                # Mirror the FastAPI route: reject instead of a 202 that would
+                # silently no-op on an unloaded model.
+                if not server.loaded:
+                    self._send_json(
+                        409, {"error": "model not loaded", "phase": server.phase()}
+                    )
+                    return
                 threading.Thread(target=server.warmup, daemon=True).start()
                 self._send_json(202, {"status": "warmup started", "phase": server.phase()})
                 return
