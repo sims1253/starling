@@ -71,6 +71,7 @@ MODEL_LABELS = {
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
     "audex": "nemotron-labs-audex-2b",
+    "s1": "s1-mini (text normalizer)",
 }
 
 
@@ -139,6 +140,16 @@ def run_grid(
                 audio = fixtures[length]
                 audio_s = len(audio) / mkfx.SAMPLE_RATE
                 ref = REFERENCE_TRANSCRIPTS[length]
+                if model == "s1":
+                    # Text normalizer: no audio semantics. The fixture tier
+                    # selects the transcript; "audio_s" becomes the INPUT WORD
+                    # count so RTFx reads normalized words/s, and there is no
+                    # tiled-LibriSpeech reference to compute WER against.
+                    from engines import _s1_transcripts
+
+                    n_words = len(_s1_transcripts()[length].split())
+                    audio_s = float(n_words)
+                    ref = None
                 engine_batches = batches if engine.supports_batch else [1]
                 for B in engine_batches:
                     rec = _run_cell(
@@ -196,8 +207,8 @@ def _run_cell(
     vram = _vram_gb()
     # one transcript for WER (B copies are identical; take the first)
     hyp = probe[0] if engine.supports_batch and B > 1 else engine.transcribe(audio, B=1)[0]
-    wer = wer_pct(ref, hyp)
-    cer = cer_pct(ref, hyp)
+    wer = wer_pct(ref, hyp) if ref is not None else None
+    cer = cer_pct(ref, hyp) if ref is not None else None
     rtfx = audio_s / (ms / 1000.0) if ms > 0 else float("inf")
     sequential = B > 1 and not engine.supports_batch
     return {
@@ -212,8 +223,8 @@ def _run_cell(
         "ms_max": round(max(timing_samples), 1),
         "rtfx": round(rtfx, 1),
         "vram_gb": round(vram, 2),
-        "wer_pct": round(wer, 2),
-        "cer_pct": round(cer, 2),
+        "wer_pct": round(wer, 2) if wer is not None else None,
+        "cer_pct": round(cer, 2) if cer is not None else None,
         "sequential": sequential,
         "reps": reps,
         "transcript_head": hyp[:80],
@@ -226,10 +237,12 @@ def _print_cell(rec: dict) -> None:
         print(f"  {rec['length']:6s} B={rec['batch']:<2d}{note}: SKIPPED ({rec['skipped']})")
         return
     note = " (Bx1 sequential)" if rec["sequential"] else ""
+    wer = rec["wer_pct"]
+    wer_s = f"{wer:5.2f}%" if wer is not None else "  n/a"  # text models: no ref
     print(
         f"  {rec['length']:6s} B={rec['batch']:<2d}{note}: "
         f"{rec['ms']:7.0f}ms ± {rec.get('ms_stdev', 0):5.1f}  RTFx {rec['rtfx']:5.1f}x  "
-        f"WER {rec['wer_pct']:5.2f}%  VRAM {rec['vram_gb']:4.1f}GB"
+        f"WER {wer_s}  VRAM {rec['vram_gb']:4.1f}GB"
     )
 
 
@@ -425,8 +438,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs,audex; "
-                         "qwen3/higgs/audex are auto-gated on availability)")
+                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs,audex,s1; "
+                         "qwen3/higgs/audex/s1 are auto-gated on availability; "
+                         "s1 is text-in/text-out: fixture tiers select transcripts "
+                         "and RTFx reads normalized words/s)")
     ap.add_argument("--engines", default="starling,stock",
                     help="comma list of engine families: starling,stock,crispasr,"
                          "parakeet.cpp,starling-batched,starling-spec,"
@@ -508,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
     for (model, length, B), cells in by_cell.items():
         s, k = cells.get("starling"), cells.get("stock transformers")
         if s and k and not s.get("skipped") and not k.get("skipped"):
+            if s["wer_pct"] is None or k["wer_pct"] is None:
+                continue  # text models (s1): no shared WER reference
             if abs(s["wer_pct"] - k["wer_pct"]) > 1.0:
                 drift.append((model, length, B, s["wer_pct"], k["wer_pct"]))
     if drift:

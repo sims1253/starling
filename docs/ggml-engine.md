@@ -134,6 +134,42 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   a unique argmax. Skip-when-default, so the moss/ark/granite graphs stay
   byte-identical.
 
+### s1 engine notes (first text-to-text engine)
+
+S1-mini (`superwhisper/s1-mini`, 0.6B Qwen3 decoder-only) has **no audio
+front-end** — `cpp/s1/` is loader + LLM binding + C-API shell only, and its
+registry row is the first with a `normalize_fn` (the PCM `decode_fn` is a
+stub that points callers at `starling_ggml_normalize_text` / `POST
+/normalize`; `starling_ggml.h` ABI 6 adds the enum kind + the text entry
+point).
+
+- **Tokenizer**: the first engine that ENCODES. `lib/bpe_tokenizer` gained a
+  byte-level BPE encoder over the GGUF merge table: special-token longest
+  match first, then the Qwen pre-tokenizer regex hand-rolled over codepoints
+  (`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
+  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+` — note Qwen splits
+  digits individually), then lowest-rank pair merging. ASCII input is exact;
+  non-ASCII is classified L except a small explicit punctuation set (see
+  `bpe_tokenizer.cpp`). The decoder half is unchanged for every engine.
+- **Prompt**: the chat template is baked in the GGUF as prefix/suffix id
+  arrays around the runtime-encoded user content (`[Styling: s] [Structure:
+  t] [Context: c]\n<transcript>`), including the `enable_thinking=False`
+  assistant prefix `<think>\n\n</think>\n\n`. Both boundaries are pre-token
+  splits, so prefix + encode(content) + suffix is token-identical to encoding
+  the rendered string (asserted at conversion time).
+- **Decoder**: the shared `lib/qwen_decode` stock Qwen3 spec (identical to
+  qwen3's modulo env/label/dims: 28 layers, hidden 1024, GQA 16Q/8KV,
+  head_dim 128) with `argmax_low_ties` on, plus the `eos2_token_id`
+  extension: s1's generation_config stops on BOTH `<|im_end|>` (151645) and
+  `<|endoftext|>` (151643), so `GenerateParams` carries an optional second
+  stop id (default -1 — the older engines' stop behavior is unchanged).
+- **Correctness**: byte-exact vs stock transformers on the short/medium/long
+  fixture tiers and 15/16 control-matrix cells; the one divergent cell
+  (semi-casual/lists/general) hits an EXACT bf16 tie between `' so'` and
+  `','` (stock-eager top-2 f32 gap 0.0000) — the winner is argmax tie-break
+  order, not numerics (both fast paths pick the same side; the diff is one
+  comma, CER < 1%). Documented + gated in `benchmarks/s1/bench_normalize.py`.
+
 ## Backends
 
 The in-tree runtime selects compute through **ggml's device registry**

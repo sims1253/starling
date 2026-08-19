@@ -161,18 +161,21 @@ static void test_model_mapping() {
     CHECK(slug_to_model("ark") == STARLING_GGML_ARK);
     CHECK(slug_to_model("higgs") == STARLING_GGML_HIGGS);
     CHECK(slug_to_model("hojo") == STARLING_GGML_HOJO);
+    CHECK(slug_to_model("s1") == STARLING_GGML_S1);
     CHECK(slug_to_model("unknown") == (starling_ggml_model)0);
 
     CHECK(is_supported_model("parakeet") == true);
     CHECK(is_supported_model("hojo") == true);
+    CHECK(is_supported_model("s1") == true);
     CHECK(is_supported_model("unknown") == false);
 
     CHECK(std::string(model_to_slug(STARLING_GGML_PARAKEET_TDT)) == "parakeet");
     CHECK(std::string(model_to_slug(STARLING_GGML_HOJO)) == "hojo");
+    CHECK(std::string(model_to_slug(STARLING_GGML_S1)) == "s1");
 
     // Exact equality pins the registry-derived ordering (a reordered or
     // duplicated row would change it).
-    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3");
+    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3 s1");
 }
 
 // ---- ChunkStreamer::rebase -------------------------------------------------

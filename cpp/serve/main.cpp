@@ -192,6 +192,73 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
+// ---- flat JSON string-field extraction (POST /normalize) ------------------
+// Extracts a top-level "key": "value" string field from a flat JSON object
+// (the /normalize request shape: string fields only, no nesting). Escapes
+// (\", \\, \n, \t, \uXXXX) are decoded; \u escapes encode a UTF-8 BMP
+// codepoint. Returns false when the field is absent or malformed.
+static bool json_get_string(const std::string& body, const std::string& key,
+                            std::string& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = body.find(needle);
+    while (pos != std::string::npos) {
+        size_t q = body.find_first_not_of(" \t\r\n", pos + needle.size());
+        if (q == std::string::npos || body[q] != ':') {
+            pos = body.find(needle, pos + 1);
+            continue;
+        }
+        q = body.find_first_not_of(" \t\r\n", q + 1);
+        if (q == std::string::npos || body[q] != '"') return false;
+        ++q;
+        out.clear();
+        while (q < body.size()) {
+            char c = body[q];
+            if (c == '"') return true;
+            if (c != '\\') { out += c; ++q; continue; }
+            if (++q >= body.size()) return false;
+            char e = body[q];
+            switch (e) {
+            case '"':  out += '"';  break;
+            case '\\': out += '\\'; break;
+            case '/':  out += '/';  break;
+            case 'n':  out += '\n'; break;
+            case 'r':  out += '\r'; break;
+            case 't':  out += '\t'; break;
+            case 'b':  out += '\b'; break;
+            case 'f':  out += '\f'; break;
+            case 'u': {
+                if (q + 4 >= body.size()) return false;
+                unsigned cp = 0;
+                for (int i = 1; i <= 4; ++i) {
+                    char h = body[q + i];
+                    cp <<= 4;
+                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                    else return false;
+                }
+                if (cp < 0x80) out += (char)cp;
+                else if (cp < 0x800) {
+                    out += (char)(0xc0 | (cp >> 6));
+                    out += (char)(0x80 | (cp & 63));
+                } else {
+                    out += (char)(0xe0 | (cp >> 12));
+                    out += (char)(0x80 | ((cp >> 6) & 63));
+                    out += (char)(0x80 | (cp & 63));
+                }
+                q += 4;
+                break;
+            }
+            default: return false;
+            }
+            ++q;
+        }
+        return false;  // unterminated string
+    }
+    return false;  // key absent
+}
+
+
 // ---- idle-timeout monitor -------------------------------------------------
 static std::atomic<bool> g_should_exit{false};
 static std::atomic<time_t> g_last_activity{0};
@@ -521,6 +588,98 @@ int main(int argc, char** argv) {
 
     svr.Post("/transcribe", handle_transcribe);
     svr.Post("/inference", handle_transcribe);
+
+    // ---- POST /normalize (text models: s1) ----
+    // Body: JSON {"transcript": "...", "styling": "...?, "structure": "...?,
+    //             "context": "...?"} — control fields optional (trained
+    // defaults). Response: {"text": "...", "request_id": "..."}.
+    svr.Post("/normalize", [&server](
+            const httplib::Request& req, httplib::Response& res) {
+        g_last_activity.store(std::time(nullptr));
+        if (!server->is_text_model()) {
+            send_json(res,
+                "{\"error\":\"model has no text path (audio models use /transcribe)\"}",
+                400);
+            return;
+        }
+        if (req.body.empty()) {
+            send_json(res, "{\"error\":\"empty request body\"}", 400);
+            return;
+        }
+        size_t max_bytes = static_cast<size_t>(server->config().max_upload_mb) * 1024 * 1024;
+        if (req.body.size() > max_bytes) {
+            send_json(res, "{\"error\":\"request body too large\"}", 413);
+            return;
+        }
+        std::string transcript, styling, structure, context;
+        if (!json_get_string(req.body, "transcript", transcript)) {
+            send_json(res, "{\"error\":\"missing or malformed 'transcript' field\"}", 400);
+            return;
+        }
+        json_get_string(req.body, "styling", styling);    // optional
+        json_get_string(req.body, "structure", structure);
+        json_get_string(req.body, "context", context);
+
+        std::string rid = req.get_header_value("x-request-id");
+        if (rid.empty()) rid = req.get_header_value("x-correlation-id");
+        if (rid.empty()) {
+            std::ostringstream ss;
+            ss << std::hex << std::time(nullptr) << "-"
+               << std::this_thread::get_id();
+            rid = ss.str();
+        } else if (rid[0] == '#') {
+            send_json(res, "{\"error\":\"invalid request id\"}", 400);
+            return;
+        }
+
+        auto* ctx = server->register_request(rid);
+        if (!ctx) {
+            send_json(res,
+                R"({"error":"request id already active","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                409);
+            return;
+        }
+
+        std::string err;
+        auto text = server->normalize_text(
+            transcript, styling, structure, context, ctx, &err);
+        server->finish_request(ctx);
+
+        if (err == "server busy") {
+            std::ostringstream ss;
+            ss << "{\"error\":\"server busy\",\"text\":\"\",\"queue_depth\":"
+               << server->queue_depth() << ",\"request_id\":\"" << json_escape(rid) << "\"}";
+            send_json(res, ss.str(), 503);
+            return;
+        }
+        if (err == "cancelled") {
+            send_json(res,
+                R"({"error":"cancelled","text":"","request_id":")" + json_escape(rid) + "\"}",
+                499);
+            return;
+        }
+        if (err == "request timed out") {
+            send_json(res,
+                R"({"error":"request timed out","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                504);
+            return;
+        }
+        if (!err.empty()) {
+            std::ostringstream ss;
+            ss << "{\"error\":\"" << json_escape(err)
+               << "\",\"text\":\"\",\"request_id\":\"" << json_escape(rid) << "\"}";
+            send_json(res, ss.str(), 400);
+            return;
+        }
+
+        std::ostringstream ss;
+        ss << "{\"text\":\"" << json_escape(text)
+           << "\",\"request_id\":\"" << json_escape(rid) << "\"}";
+        send_json(res, ss.str(), 200);
+    });
+
 
     // ---- DELETE /inference/<id> ----
     svr.Delete(R"(/inference/(.*))",
