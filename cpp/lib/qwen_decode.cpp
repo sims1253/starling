@@ -1019,7 +1019,7 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                     ggml_tensor* row = ggml_reshape_2d(c, rounded, 1, rounded->ne[0]);
                     ggml_tensor* mval = ggml_get_rows(c, row, any);                // [1, 1]
                     ggml_tensor* dlt = ggml_sub(c, rounded, mval);                 // [vocab, 1]
-                    dlt = ggml_scale(c, dlt, 1048576.0f);                         // (max-x) * 2^20
+                    dlt = ggml_scale(c, dlt, 1048576.0f);
                     // t = 1 + (x - max) * 2^20: 1 at the max, hugely negative
                     // everywhere below it -> clamp to the 0/1 mask.
                     dlt = ggml_clamp(c, ggml_add(c, dlt, one_t), 0.0f, 1.0f);        // 0/1 mask

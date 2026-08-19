@@ -13,10 +13,11 @@
 // GELU). ln_post (biased LayerNorm) closes the encoder; the projector is
 // Linear(1024 -> 1024) + erf GELU + Linear(1024 -> 2048).
 //
-// The conv stack uses ggml_conv_2d (im2col + GEMM) with F32 operands — the
-// ark audio-encoder pattern; the CUDA im2col asserts F32 data and an in-graph
-// bf16->f16 pool conversion trips CUDA-graph capture. Every bf16 value is
-// exact through the F16 im2col (values live far inside f16 range/precision).
+// The conv stack is an explicit F32 im2col + F32 GEMM (see conv_step):
+// ggml_conv_2d's F16 im2col lands the GEMM on ggml's batched F16 cuBLAS
+// path, which accumulates in F16 — a systematic ~1-ulp-of-bf16 error on a
+// quarter of the outputs. With F32 operands the GEMM accumulates in F32
+// (bf16 inputs are exact in both).
 // The windowed attention is batched over (heads, windows) in three matmuls:
 // the reference splits the packed sequence per window and attends within;
 // padded tail rows of the last window are masked additively (finite -bf16max

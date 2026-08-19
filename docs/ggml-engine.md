@@ -113,9 +113,9 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   13 per full chunk) are gathered into a packed sequence and padded to whole
   104-row attention windows (n_window_infer 800 = 8 chunks), where 24 layers
   run full (non-causal) batched attention — biased MHA 16 heads x 64 —
-  masked + trimmed on the tail. The convs use `ggml_conv_2d` with F32
-  operands (the ark pattern; every bf16 value is exact through the F16
-  im2col). The window-pad tail duplicates row 0 — its values never reach a
+  masked + trimmed on the tail. The convs are an explicit F32 im2col + F32
+  GEMM (`conv_step`): `ggml_conv_2d`'s F16 im2col lands the GEMM on the
+  F16-accumulating cuBLAS path. The window-pad tail duplicates row 0 — its values never reach a
   valid row (masked as keys, row-local ops) — which avoids a concat
   entirely; the valid-row gather runs on an F32 copy because this ggml
   build's CPU get_rows bf16 kernel writes f32 rows into the bf16 destination.
@@ -126,11 +126,13 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   spec shape as moss — plus the `argmax_low_ties` extension: torch reads the
   lm_head output stored as bf16 and keeps the FIRST index on exact ties,
   while raw f32 logits and ggml's CUDA argmax (warp-order ties) can pick the
-  other side of a tie; the extension bf16-rounds the greedy logits and adds a
-  column-index delta (2^-30 * col, far below any bf16 ulp gap between
-  distinct contending values) in the K-step graph so ties resolve to the
-  lowest index deterministically. Skip-when-default, so the moss/ark/granite
-  graphs stay byte-identical.
+  other side of a tie; the extension bf16-rounds the greedy logits, the host
+  picks keep-first-index on the exact ties, and the K-step graph masks the
+  rounded logits by equality with their max (ggml_argmax's VALUE is
+  order-independent) and weights the masked columns by a descending column
+  iota (`vocab - col`, exact integers < 2^24), making the lowest tied column
+  a unique argmax. Skip-when-default, so the moss/ark/granite graphs stay
+  byte-identical.
 
 ## Backends
 
