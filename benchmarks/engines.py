@@ -1533,6 +1533,48 @@ def _starling_ggml_granite_keys() -> list[str]:
     return []
 
 
+STARLING_GGML_QWEN3_MODEL = Path(os.environ.get(
+    "STARLING_GGML_QWEN3_MODEL",
+    str(REPO_ROOT / "models" / "qwen3-asr-1.7b-bf16-exact.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlQwen3(Engine):
+    """Starling's in-tree Qwen/Qwen3-ASR-1.7B-hf ggml engine (ctypes)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "qwen3", supports_batch=False)
+        self._model = None
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_QWEN3_MODEL.exists()
+        except Exception:
+            return False
+
+    def _load(self) -> None:
+        from starling._ggml import QWEN3, GgmlModel
+        self._model = GgmlModel(QWEN3, str(STARLING_GGML_QWEN3_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        pcm = np.ascontiguousarray(audio, dtype=np.float32)
+        return self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
+
+
+def _starling_ggml_qwen3_keys() -> list[str]:
+    if StarlingGgmlQwen3().available:
+        return ["starling-ggml-qwen3"]
+    return []
+
+
 class GgmlMoss(Engine):
     """ggml/CUDA Moss engine: CrispASR's moss-transcribe backend.
 
@@ -1887,7 +1929,8 @@ def available_keys() -> list[str]:
             + _ggml_parakeet_keys() + _ggml_moss_keys()
             + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys()
             + _starling_ggml_ark_keys() + _starling_ggml_higgs_keys()
-            + _starling_ggml_hojo_keys() + _starling_ggml_granite_keys())
+            + _starling_ggml_hojo_keys() + _starling_ggml_granite_keys()
+            + _starling_ggml_qwen3_keys())
 
 
 def build_engines(

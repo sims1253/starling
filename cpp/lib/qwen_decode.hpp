@@ -38,6 +38,16 @@ struct QwenDecodeSpec {
     float embedding_multiplier = 1.0f;  // hidden = embeds * m at prefill AND decode
     float residual_multiplier = 1.0f;   // residual + m*y, attn and mlp (granite: 0.22)
     float logits_scaling = 1.0f;        // logits / s after lm_head (granite: 8.0)
+    // torch reads the lm_head output stored as bf16 and its argmax keeps the
+    // FIRST index on exact ties; the raw f32 logits (host pick) and ggml's
+    // CUDA argmax (warp-order ties) both disagree on such ties. When set, the
+    // greedy picks round the logits to bf16 first; the host keeps the first
+    // index on the exact ties that creates, and the K-step graph masks the
+    // rounded logits by equality with their max and weights the masked
+    // columns by a descending column iota, making the lowest tied column a
+    // unique argmax (order-independent) (qwen3; off keeps moss/ark/granite
+    // byte-identical).
+    bool argmax_low_ties = false;
 };
 
 // The config fields the decode graphs are shaped by.

@@ -19,7 +19,7 @@ All do speech-to-text.
 - [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — FastConformer + TDT transducer (no LLM). GPU-side mel + chunking for hour-long audio.
 - [`nvidia/parakeet-unified-en-0.6b`](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) — Unified FastConformer-RNN-T. NeMo-free port: the `.nemo` checkpoint is loaded directly (no `nemo_toolkit`), the encoder/prediction-net/joint are hand-built in PyTorch, and the encoder + greedy RNN-T decode are captured into CUDA graphs.
 - [`OpenMOSS-Team/MOSS-Transcribe-preview-2B`](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-preview-2B) — Qwen3-omni MoE encoder + Qwen3 decoder.
-- [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — Whisper-style windowed-attention encoder + Qwen3 decoder.
+- [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — Whisper-style windowed-attention encoder + Qwen3 decoder. The in-tree ggml engine (`starling-ggml-qwen3`, greedy path) runs natively via starling-serve.
 - [`AutoArk-AI/ARK-ASR-3B`](https://huggingface.co/AutoArk-AI/ARK-ASR-3B) — Whisper encoder + MLP adapter + Qwen2.5 decoder.
 - [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — first seq2seq encoder-decoder: 48-layer FastConformer encoder + 8-layer Transformer decoder (self + cross attention).
 - [`bosonai/higgs-audio-v3-stt`](https://huggingface.co/bosonai/higgs-audio-v3-stt) — Whisper-large-v3 mel + MLP projector + Qwen3-1.7B decoder. The CUDA megakernel (encoder kept eager) runs under its own `.venv-higgs` (transformers 4.51) because the model's `trust_remote_code` modeling breaks under transformers 5.13; the in-tree ggml engine (`starling-ggml-higgs`, full Whisper encoder + avg pool + MLP projector + Qwen3 decoder with qk_norm) runs from the main environment and is byte-exact against the golden on short/medium/long.
@@ -323,10 +323,10 @@ and cohere chunk internally and return a single whole-utterance segment.
 
 `starling-serve` is a self-contained native binary that serves the GGML
 engines behind the same HTTP/WS API — no Python, no torch, one static
-executable per platform (CUDA, ROCm, Vulkan, Metal, CPU). It covers the six
-GGML-ported models (`parakeet`, `moss`, `ark`, `higgs`, `hojo`, `granite`);
-the Python server above remains the path for the CUDA-megakernel-only models
-(parakeet_unified, qwen3, cohere, audex).
+executable per platform (CUDA, ROCm, Vulkan, Metal, CPU). It covers the seven
+GGML-ported models (`parakeet`, `moss`, `ark`, `higgs`, `hojo`, `granite`,
+`qwen3`); the Python server above remains the path for the
+CUDA-megakernel-only models (parakeet_unified, cohere, audex).
 
 ```bash
 cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON   # or VULKAN/METAL/HIP

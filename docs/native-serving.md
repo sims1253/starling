@@ -59,7 +59,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3 |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -190,6 +190,7 @@ Hosted on HuggingFace, one repo per model:
 | higgs-audio-v3-stt | `starling/higgs-audio-v3-stt-gguf` | bf16-exact |
 | hojo-asr-v1 | `starling/hojo-asr-v1-gguf` | bf16-exact |
 | granite-speech-4.1-2b | `starling/granite-speech-4.1-2b-gguf` | bf16-exact |
+| qwen3-asr-1.7b | `starling/qwen3-asr-1.7b-gguf` | bf16-exact |
 
 Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0.gguf`).
 
@@ -209,6 +210,7 @@ Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0
 | higgs | `scripts/convert_higgs_gguf.py` |
 | hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |
+| qwen3 | `scripts/convert_qwen3_gguf.py` |
 
 ## Release artifacts
 

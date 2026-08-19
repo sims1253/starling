@@ -29,7 +29,7 @@ slug, the load/free/decode entry points, and the error-message shape for the
 shared 16 kHz guard). The C API's `load`/`free`/`transcribe_pcm` dispatch
 (`cpp/capi.cpp`) and the serve slug mapping, supported-model check, and
 `--version` model list (`cpp/serve/server.cpp`) are all table lookups; the
-public `starling_ggml.h` stays flat and unchanged (ABI 4).
+public `starling_ggml.h` stays flat and unchanged (ABI 5).
 
 Adding a model = its `cpp/<model>/` implementation (with the three
 `capi_<model>.cpp` entry points) + one contiguous addition in
@@ -65,6 +65,15 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   `scripts/granite_golden_components.py`). The engine mirrors the Python
   server's chunk policy for long audio (30 s zero-padded chunks, per-chunk
   budget clamped to the 640-token cache, whitespace-collapsed join).
+- **qwen3 (in-tree `StarlingGgmlQwen3`)**: greedy path. Exact text on
+  short/medium/long against `golden/qwen3_reference.json`, captured from the
+  stock-numerics Python path by `scripts/make_qwen3_golden.py` (staged
+  component tensors via `scripts/qwen3_golden_components.py`). The engine
+  mirrors the Python server's chunk policy for long audio (contiguous 30 s
+  chunks, the last chunk passed through SHORT, per-chunk budget
+  min(200, ceil(dur*5)+32), whitespace-collapsed join) and the
+  `transcription_only` text extraction (the `<asr_text>` marker split with the
+  Qwen3-ASR library's repetition fix, ported in `capi_qwen3.cpp`).
 
 ### granite engine notes
 
@@ -88,6 +97,42 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   embed lookup at decode, residual ×0.22, logits ÷8.0). All spec extensions
   default to the historical moss/ark op sequence, so the older engines' graphs
   are unchanged.
+
+### qwen3 engine notes
+
+- **Mel**: the shared `lib/whisper_mel` frontend with the `T_FULLT_MINUS_1`
+  rule (the extractor computes the mel over `stft[..., :-1]`, i.e. drops the
+  trailing frame), slaney filterbank baked by the converter; engine-side,
+  clips under 8000 samples are zero-padded first and the mel axis is then
+  zero-padded (mel value 0.0, NOT silence-mel — those frames leak into valid
+  conv outputs through the 3-wide kernels) to a multiple of 100 frames
+  (`cpp/qwen3/mel.cpp`).
+- **Encoder**: per 100-frame chunk three GELU 3x3/stride-2 conv2d layers
+  (480 channels) + a bias-free Linear(7680 -> 1024) + a converter-baked
+  sinusoidal position table; the valid post-CNN rows (triple ceil-halving,
+  13 per full chunk) are gathered into a packed sequence and padded to whole
+  104-row attention windows (n_window_infer 800 = 8 chunks), where 24 layers
+  run full (non-causal) batched attention — biased MHA 16 heads x 64 —
+  masked + trimmed on the tail. The convs are an explicit F32 im2col + F32
+  GEMM (`conv_step`): `ggml_conv_2d`'s F16 im2col lands the GEMM on the
+  F16-accumulating cuBLAS path. The window-pad tail duplicates row 0 — its values never reach a
+  valid row (masked as keys, row-local ops) — which avoids a concat
+  entirely; the valid-row gather runs on an F32 copy because this ggml
+  build's CPU get_rows bf16 kernel writes f32 rows into the bf16 destination.
+- **Projector**: Linear(1024 -> 1024) + erf GELU + Linear(1024 -> 2048), all
+  biased.
+- **Decoder**: the shared `lib/qwen_decode` stack in its stock Qwen3 variant
+  (`qkv_bias=false, qk_norm=true`, TIED lm_head, no multipliers) — the same
+  spec shape as moss — plus the `argmax_low_ties` extension: torch reads the
+  lm_head output stored as bf16 and keeps the FIRST index on exact ties,
+  while raw f32 logits and ggml's CUDA argmax (warp-order ties) can pick the
+  other side of a tie; the extension bf16-rounds the greedy logits, the host
+  picks keep-first-index on the exact ties, and the K-step graph masks the
+  rounded logits by equality with their max (ggml_argmax's VALUE is
+  order-independent) and weights the masked columns by a descending column
+  iota (`vocab - col`, exact integers < 2^24), making the lowest tied column
+  a unique argmax. Skip-when-default, so the moss/ark/granite graphs stay
+  byte-identical.
 
 ## Backends
 

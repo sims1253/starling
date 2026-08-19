@@ -19,6 +19,7 @@ model, mirroring the `models/` directory layout in the starling repository.
 | `higgs-audio-v3-bf16-exact.gguf` | bosonai/higgs-audio-v3-stt | bf16-exact | ~5.0 GB |
 | `hojo-asr-v1-bf16-exact.gguf` | HojoAI/Hojo-ASR-V1 | bf16-exact | ~11.2 GB |
 | `granite-speech-4.1-2b-bf16-exact.gguf` | ibm-granite/granite-speech-4.1-2b | bf16-exact | ~4.8 GB |
+| `qwen3-asr-1.7b-bf16-exact.gguf` | Qwen/Qwen3-ASR-1.7B-hf | bf16-exact | ~4.1 GB |
 
 ## Quantization strategy
 
@@ -46,7 +47,7 @@ fields when they are present:
 
 - `starling.numeric_profile` — accepted values: `bf16_exact`, `f16`
   (parakeet, moss, ark, higgs); `mixed_f32_bf16_exact`, `bf16_exact`, `f16`
-  (hojo); `bf16_exact` (granite).
+  (hojo); `bf16_exact` (granite, qwen3).
 - `starling.format_version` — must be `1`.
 
 The parakeet loader does not validate these fields; the other model loaders
