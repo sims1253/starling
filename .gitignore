@@ -75,3 +75,5 @@ cmake-build-*/
 /starling-serve*
 artifacts/
 *.tensors.json
+
+dbg/

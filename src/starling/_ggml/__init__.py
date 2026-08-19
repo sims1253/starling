@@ -20,6 +20,7 @@ Example::
 
 from ._native import (
     ARK,
+    AUDEX,
     GRANITE,
     HIGGS,
     HOJO,
@@ -33,6 +34,7 @@ from ._native import (
 
 __all__ = [
     "ARK",
+    "AUDEX",
     "GRANITE",
     "HIGGS",
     "HOJO",

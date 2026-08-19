@@ -47,6 +47,10 @@ void * starling_ggml_qwen3_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_qwen3_free(void * handle);
 char * starling_ggml_qwen3_decode(void * handle, const float * pcm, int64_t n,
                                   const char ** err_out);
+void * starling_ggml_audex_load(const char * gguf_path, const char ** err_out);
+void   starling_ggml_audex_free(void * handle);
+char * starling_ggml_audex_decode(void * handle, const float * pcm, int64_t n,
+                                  const char ** err_out);
 }
 
 // One row per engine, in starling_ggml_model enum order (serve's
@@ -102,6 +106,12 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: QWEN3 expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "QWEN3 transcribe failed" },
+    { STARLING_GGML_AUDEX, "audex",
+      starling_ggml_audex_load, starling_ggml_audex_free,
+      starling_ggml_audex_decode,
+      "starling_ggml_transcribe_pcm: AUDEX expects 16 kHz",
+      /*rate_error_in_ctx=*/true,
+      "AUDEX transcribe failed" },
 };
 
 static_assert([] {
