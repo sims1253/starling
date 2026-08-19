@@ -41,10 +41,12 @@ struct QwenDecodeSpec {
     // torch reads the lm_head output stored as bf16 and its argmax keeps the
     // FIRST index on exact ties; the raw f32 logits (host pick) and ggml's
     // CUDA argmax (warp-order ties) both disagree on such ties. When set, the
-    // greedy picks round the logits to bf16 first and the K-step argmax adds
-    // a column-index delta (2^-30 * col, far below any bf16 ulp gap between
-    // distinct contending values) so ties resolve to the lowest index
-    // deterministically (qwen3; off keeps moss/ark/granite byte-identical).
+    // greedy picks round the logits to bf16 first; the host keeps the first
+    // index on the exact ties that creates, and the K-step graph masks the
+    // rounded logits by equality with their max and weights the masked
+    // columns by a descending column iota, making the lowest tied column a
+    // unique argmax (order-independent) (qwen3; off keeps moss/ark/granite
+    // byte-identical).
     bool argmax_low_ties = false;
 };
 
