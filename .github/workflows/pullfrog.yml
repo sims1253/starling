@@ -29,10 +29,17 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Run agent
-        # pullfrog/pullfrog v0 (0657d542f2e34565c6254d5c84581313e631cd90).
-        # Pinned to the reviewed commit: the action runs with id-token: write
-        # and provider secrets, and the moving v0 tag could be retargeted.
-        uses: pullfrog/pullfrog@0657d542f2e34565c6254d5c84581313e631cd90
+        # pullfrog/pullfrog v0 (c4d0ca6f15d12382ddd20d2010bc596b405f42f0).
+        # Pinned to a reviewed commit per issue #10: the action runs with
+        # id-token: write and provider secrets, and the moving v0 tag could
+        # be retargeted. NOTE the ref only pins this thin wrapper (action.yml
+        # contract + the post: cleanup step) — the agent itself is pulled
+        # from npm at runtime regardless. A SHA pin WITHOUT an updater is the
+        # one combination pullfrog's docs say to avoid (the cleanup step
+        # freezes; a future incompatible cleanup hook fails every run after
+        # the agent finished), so .github/dependabot.yml keeps this SHA and
+        # the checkout pin below fresh (weekly github-actions bumps).
+        uses: pullfrog/pullfrog@c4d0ca6f15d12382ddd20d2010bc596b405f42f0
         with:
           prompt: ${{ inputs.prompt }}
         env:
