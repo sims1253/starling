@@ -123,7 +123,14 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   biased.
 - **Decoder**: the shared `lib/qwen_decode` stack in its stock Qwen3 variant
   (`qkv_bias=false, qk_norm=true`, TIED lm_head, no multipliers) — the same
-  spec shape as moss.
+  spec shape as moss — plus the `argmax_low_ties` extension: torch reads the
+  lm_head output stored as bf16 and keeps the FIRST index on exact ties,
+  while raw f32 logits and ggml's CUDA argmax (warp-order ties) can pick the
+  other side of a tie; the extension bf16-rounds the greedy logits and adds a
+  column-index delta (2^-30 * col, far below any bf16 ulp gap between
+  distinct contending values) in the K-step graph so ties resolve to the
+  lowest index deterministically. Skip-when-default, so the moss/ark/granite
+  graphs stay byte-identical.
 
 ## Backends
 

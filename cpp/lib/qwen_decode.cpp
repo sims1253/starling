@@ -441,6 +441,7 @@ struct KStepGraph {
     std::vector<int32_t> host_pos;              // [K]
     std::vector<std::vector<float>> host_mask;   // [K]
     std::vector<float> cap_tokens;               // [K] (i32 reinterpreted as f32 bytes)
+    std::vector<float> host_iota;                // [vocab] argmax tie-break deltas (bf16-tie mode)
 };
 
 // ONE captured K-step graph per K (start_past is a runtime input, so a single
@@ -835,6 +836,23 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
 }
 
 // ===========================================================================
+// Greedy pick under the bf16-tie mode: round the logits to bf16 (the
+// reference reads the lm_head output stored as bf16) and keep the FIRST
+// index on the exact ties that creates — argmax_low otherwise.
+int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
+    if (!s.argmax_low_ties) return argmax_low(x);
+    auto bf = [](float v) {
+        return ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
+    };
+    int32_t best = 0;
+    float bv = bf(x[0]);
+    for (int32_t i = 1; i < (int32_t) x.size(); ++i) {
+        const float v = bf(x[i]);
+        if (v > bv) { bv = v; best = i; }
+    }
+    return best;
+}
+
 // K-step multistep decode (captured ReplayGraph).
 //
 // Captures K consecutive decode steps into ONE ReplayGraph with the per-step
@@ -890,6 +908,22 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
 
     KStepGraph* raw = kg.get();
     const int64_t mc = lc.max_cache;
+    // bf16-tie mode: constant [vocab] column-index deltas, added to the
+    // bf16-rounded logits before the in-graph argmax so exact ties resolve
+    // to the LOWEST index (torch semantics) instead of ggml's warp order.
+    // delta = col * 2^-30; at col 151936 that is ~1.4e-4, three orders below
+    // the smallest bf16 ulp gap between distinct contending logits.
+    if (m.spec.argmax_low_ties) {
+        const ggml_tensor* ew = m.loader.tensor("llm.embed.weight");
+        const int64_t vocab = ew ? ew->ne[1] : 0;
+        if (vocab <= 0) {
+            e = std::string(m.spec.label) + " K-step needs llm.embed.weight for the argmax delta";
+            return nullptr;
+        }
+        kg->host_iota.resize((size_t) vocab);
+        for (int64_t col = 0; col < vocab; ++col)
+            kg->host_iota[(size_t) col] = (float) ((double) col * 0x1p-30);
+    }
     raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(global_backend(),
         [&](ggml_context* c) -> ggml_tensor* {
             int64_t one[1] = {1};
@@ -923,6 +957,15 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                 ? embed_w
                 : clone_weight(c, m.loader, "llm.lm_head.weight");
 
+            // Constant argmax tie-break deltas (only allocated under the
+            // flag; one input shared by all K steps).
+            ggml_tensor* iota = nullptr;
+            if (!raw->host_iota.empty()) {
+                int64_t vw[2] = {(int64_t) raw->host_iota.size(), 1};
+                iota = graph_input_tensor(c, GGML_TYPE_F32, 2, vw,
+                                          raw->host_iota.data(),
+                                          raw->host_iota.size() * sizeof(float));
+            }
             // Chain K steps in-graph: tok = prev-token; each step's argmax feeds
             // the next step's embed (get_rows), all on device.
             ggml_tensor* tok = prev_tok_t;
@@ -941,6 +984,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
                 ggml_tensor* logits = ggml_mul_mat(c, head_w, n);                  // [vocab, 1]
+                if (iota) {
+                    // bf16-round (the reference's storage boundary), then the
+                    // column delta orders exact ties toward the lowest index.
+                    logits = ggml_add(c, f32(c, bf16(c, logits)), iota);
+                }
                 ggml_tensor* tj = ggml_argmax(c, logits);                            // i32 [1]
                 // CUDA concat is F32-only; token ids < 2^24 so (float)tok is exact.
                 tok_nodes.push_back(ggml_cast(c, tj, GGML_TYPE_F32));
@@ -1027,7 +1075,7 @@ bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
     bool ok = dbg ? forward_legacy(m, i.data, i.n_tokens, o.state, o.logits, e)
                   : forward_prefill(m, i.data, i.n_tokens, o.state, o.logits, e);
     if (!ok) return false;
-    o.first_token = argmax_low(o.logits);
+    o.first_token = spec_argmax(m.spec, o.logits);
     // <env>_DUMP_LOGITS=<file> dumps prefill logits.
     if (const char* fp = env(m.spec, "_DUMP_LOGITS")) {
         if (FILE* f = std::fopen(fp, "wb")) {
@@ -1060,7 +1108,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             if (!forward_prefill(m, i.data, i.n_tokens, state, o.prefill_logits, e))
                 return false;
         }
-        int32_t prev = argmax_low(o.prefill_logits);
+        int32_t prev = spec_argmax(m.spec, o.prefill_logits);
         o.ids.push_back(prev);
         const bool use_kstep = global_backend().is_gpu() &&
                                !env(m.spec, "_NOKSTEP");
@@ -1109,7 +1157,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 std::vector<float> dl;
                 double s0 = timing ? (double)std::chrono::steady_clock::now().time_since_epoch().count() : 0.0;
                 if (!forward_decode(m, prev, state.length, state, dl, e)) return false;
-                prev = argmax_low(dl);
+                prev = spec_argmax(m.spec, dl);
                 o.ids.push_back(prev);
                 if (timing) {
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1146,7 +1194,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
 
             std::vector<float> logits;
             if (!forward_legacy(m, one.data, 1, p.state, logits, e)) return false;
-            prev = argmax_low(logits);
+            prev = spec_argmax(m.spec, logits);
             o.ids.push_back(prev);
             if (prev == op.eos_token_id) { o.hit_eos = true; break; }
         }

@@ -34,6 +34,7 @@ const lib::QwenDecodeSpec kSpec = {
     /*embedding_multiplier=*/1.0f,
     /*residual_multiplier=*/1.0f,
     /*logits_scaling=*/1.0f,
+    /*argmax_low_ties=*/true,
 };
 
 lib::QwenDecodeCtx decode_ctx(const Qwen3Model& m) {

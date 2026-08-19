@@ -106,19 +106,21 @@ EncScratch make_scratch(const Config& c, int64_t T) {
     const int64_t r = T % chunk;
     const int64_t nc = (T + chunk - 1) / chunk;
     s.nc = nc;
-    const int64_t full_chunks = r == 0 ? nc : nc - 1;
-    const int64_t last_rows = r == 0 ? full_rows : post_cnn(r);
-    s.L = full_chunks * full_rows + last_rows;
+    // Packed length: 13 rows per full chunk plus the triple-halved tail of a
+    // PARTIAL last chunk (r == 0 means every chunk is full — the last chunk
+    // is not an extra one).
+    s.L = r == 0 ? nc * full_rows : (nc - 1) * full_rows + post_cnn(r);
     // Window size: n_window_ratio = n_window_infer / chunk = 8 chunks worth
-    // of the LARGEST per-chunk post-CNN length (get_audio_cu_seqlens).
-    const int64_t max_rows = full_chunks > 0 ? full_rows : last_rows;
+    // of the LARGEST per-chunk post-CNN length (get_audio_cu_seqlens): 13
+    // whenever a full chunk exists, else the lone partial chunk's length.
+    const int64_t max_rows = (r == 0 || nc > 1) ? full_rows : post_cnn(r);
     s.W = max_rows * (ec.n_window_infer / chunk);
     s.nW = s.L / s.W + (s.L % s.W != 0 ? 1 : 0);
     s.rem = s.L % s.W;
     s.pad = s.nW * s.W - s.L;
     s.valid_indices.reserve((size_t) (s.L + s.pad));
     for (int64_t ch = 0; ch < nc; ++ch) {
-        const int64_t rows = (r != 0 && ch + 1 == nc) ? last_rows : full_rows;
+        const int64_t rows = (r != 0 && ch + 1 == nc) ? post_cnn(r) : full_rows;
         for (int64_t t = 0; t < rows; ++t)
             s.valid_indices.push_back((int32_t) (ch * full_rows + t));
     }
@@ -208,13 +210,27 @@ ggml_tensor* windowed_layer(ggml_context* c, const Qwen3Model& m, int li,
     return x;
 }
 
-// One GELU conv2d k3/s2/p1 step: conv (F32 operands, ark pattern) + bias,
-// bf16 round, erf GELU. Takes/returns [time, freq, 480, nc]; bf16 in, bf16
-// out.
+// One GELU conv2d k3/s2/p1 step: im2col + GEMM, all F32, + bias, bf16 round,
+// erf GELU. Takes/returns [time, freq, 480, nc]; bf16 in, bf16 out. Built
+// explicitly over ggml_conv_2d because the latter's F16 im2col puts the GEMM
+// on ggml's batched F16 cuBLAS path, which accumulates in F16 (COMPUTE_16F)
+// — a ~1-ulp-of-bf16 systematic error on a quarter of the outputs. With an
+// F32 im2col and F32 weights the GEMM accumulates in F32 (bf16 inputs are
+// exact in both), leaving only reduction-order noise far below the bf16
+// rounding boundary.
 ggml_tensor* conv_step(ggml_context* c, const ModelLoader& ml, const char* wname,
                        const char* bname, ggml_tensor* y) {
-    ggml_tensor* w = f32(c, weight(c, ml, wname));
-    ggml_tensor* conv = ggml_conv_2d(c, w, f32(c, y), 2, 2, 1, 1, 1, 1);
+    ggml_tensor* w = f32(c, weight(c, ml, wname));            // [KW,KH,IC,OC]
+    ggml_tensor* x = f32(c, y);                                // [W,H,IC,N]
+    ggml_tensor* im2 = ggml_im2col(c, w, x, 2, 2, 1, 1, 1, 1, true,
+                                   GGML_TYPE_F32);             // [K, OW, OH, N]
+    const int64_t K = im2->ne[0];
+    ggml_tensor* im2_2d = ggml_reshape_2d(c, im2, K,
+                                          im2->ne[3] * im2->ne[2] * im2->ne[1]);
+    ggml_tensor* w2 = ggml_reshape_2d(c, w, K, w->ne[3]);
+    ggml_tensor* conv = ggml_mul_mat(c, im2_2d, w2);           // [spatial, OC]
+    conv = ggml_reshape_4d(c, conv, im2->ne[1], im2->ne[2], im2->ne[3], w->ne[3]);
+    conv = ggml_cont(c, ggml_permute(c, conv, 0, 1, 3, 2));   // [OW, OH, OC, N]
     ggml_tensor* b = f32(c, weight(c, ml, bname));
     int64_t OC = conv->ne[2];
     int64_t bne[4] = {1, 1, OC, 1};

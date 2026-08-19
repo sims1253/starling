@@ -90,12 +90,12 @@ def transcribe_chunk(pipe: Any, processor: Any, wav: torch.Tensor, budget: int) 
 
 
 def load_fixture(path: Path) -> torch.Tensor:
-    """(1, n) float32 16 kHz waveform on cuda."""
+    """(1, n) float32 16 kHz waveform on cpu (build_inputs moves to cuda)."""
     samples, sr = sf.read(str(path))
     assert sr == SAMPLE_RATE, f"fixture {path} is {sr} Hz"
     if samples.ndim > 1:
         samples = samples[:, 0]
-    return torch.from_numpy(samples.astype("float32")).unsqueeze(0).contiguous().to("cuda")
+    return torch.from_numpy(samples.astype("float32")).unsqueeze(0).contiguous()
 
 
 def main() -> int:

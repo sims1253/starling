@@ -67,7 +67,6 @@ def main() -> int:
         handle = encoder.register_forward_hook(enc_hook)
         try:
             wav, sr = load_wav(str(FIXTURES / "short.wav"))
-            wav = wav.to("cuda")
             inputs = build_inputs(processor, wav, sr=sr)
             input_ids = inputs["input_ids"]
             feats = inputs["input_features"]
