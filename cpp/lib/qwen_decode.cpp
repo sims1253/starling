@@ -910,7 +910,7 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
 
     KStepGraph* raw = kg.get();
     const int64_t mc = lc.max_cache;
-    // bf16-tie mode: constant [vocab] descending column iota (vocab-1-col,
+    // bf16-tie mode: constant [vocab] descending column iota (vocab - col,
     // exactly representable: vocab < 2^24). The per-step pick multiplies the
     // equality-mask of the bf16-rounded logits' max by this iota, so the
     // FIRST tied column becomes a unique maximum — an order-independent
@@ -926,8 +926,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
             return nullptr;
         }
         kg->host_iota.resize((size_t) vocab);
+        // vocab - col (>= 1 for every masked column): a vocab-1-col iota would
+        // weight the LAST column at exactly 0 — the unmasked floor — and a
+        // greedy win by that column would degenerate into a multi-way tie.
         for (int64_t col = 0; col < vocab; ++col)
-            kg->host_iota[(size_t) col] = (float) (vocab - 1 - col);
+            kg->host_iota[(size_t) col] = (float) (vocab - col);
         kg->host_one = 1.0f;
     }
     raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(global_backend(),
