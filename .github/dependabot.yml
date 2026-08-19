@@ -1,0 +1,11 @@
+# Dependabot keeps the pinned GitHub Actions SHAs fresh (issue #10 posture):
+# pullfrog/pullfrog and actions/checkout are commit-pinned for reviewability,
+# which without an updater freezes pullfrog's post: cleanup step at the pinned
+# revision (docs.pullfrog.com/versioning) — weekly bumps avoid both that and a
+# stale checkout.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
