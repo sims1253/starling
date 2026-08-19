@@ -77,3 +77,4 @@ artifacts/
 *.tensors.json
 
 dbg/
+.hf-cache
