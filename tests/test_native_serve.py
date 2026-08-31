@@ -234,6 +234,102 @@ class ServeProc:
             print(f"    | {line}")
 
 
+# ---- POST /normalize (text models: s1) ---------------------------------------
+
+def test_normalize_endpoints(binary: Path, tr: TestResults):
+    """Transport contract for the text path, on placeholder servers.
+
+    The parser runs before the model-loaded check, so a /dev/null GGUF
+    distinguishes the outcomes a regression can flip: a correctly parsed body
+    reaches the engine path and answers 503 "model not loaded", a parse
+    failure answers 400. The embedded-key cases pin json_get_string's
+    string-awareness (PR #38 review): a "key": value sequence inside a
+    string value must never shadow the real top-level field.
+    """
+    # (1) audio-slug server: /normalize answers 400 "no text path".
+    audio_port = _free_port()
+    audio_server = ServeProc(binary, "parakeet", "/dev/null", "127.0.0.1",
+                             audio_port, eager=False)
+    # (2) s1 placeholder: parser behavior without a loaded model.
+    s1_port = _free_port()
+    s1_server = ServeProc(binary, "s1", "/dev/null", "127.0.0.1", s1_port,
+                          eager=False)
+    try:
+        url = f"http://127.0.0.1:{audio_port}/normalize"
+        r = requests.post(url, data=json.dumps({"transcript": "hi"}), timeout=5)
+        tr.check("normalize audio model -> 400 no text path",
+                 r.status_code == 400 and "no text path" in r.json().get("error", ""),
+                 f"{r.status_code} {r.text[:120]}")
+
+        url = f"http://127.0.0.1:{s1_port}/normalize"
+
+        def post(body: dict | str, headers: dict | None = None):
+            data = body if isinstance(body, str) else json.dumps(body)
+            return requests.post(url, data=data, headers=headers, timeout=5)
+
+        # Empty body -> 400.
+        r = post("")
+        tr.check("normalize empty body -> 400",
+                 r.status_code == 400 and "empty" in r.json().get("error", ""),
+                 f"{r.status_code} {r.text[:120]}")
+
+        # Missing transcript -> 400.
+        r = post({"styling": "casual"})
+        tr.check("normalize missing transcript -> 400",
+                 r.status_code == 400 and "transcript" in r.json().get("error", ""),
+                 f"{r.status_code} {r.text[:120]}")
+
+        # Valid body on a placeholder -> parses, reaches the engine path,
+        # answers 503 model-not-loaded.
+        r = post({"transcript": "um hello world"})
+        tr.check("normalize valid body on placeholder -> 503 model not loaded",
+                 r.status_code == 503 and "not loaded" in r.json().get("error", ""),
+                 f"{r.status_code} {r.text[:120]}")
+
+        # Embedded "context": "email" inside the transcript value must not
+        # shadow the real top-level control: identical outcome to the same
+        # request without the embedded text.
+        hijack_body = {
+            "transcript": 'he said "context": "email" loudly so schedule it',
+            "context": "general",
+        }
+        clean_body = {
+            "transcript": "he said loudly so schedule it",
+            "context": "general",
+        }
+        r_hijack = post(hijack_body)
+        r_clean = post(clean_body)
+        tr.check("normalize embedded key does not hijack (same outcome)",
+                 r_hijack.status_code == r_clean.status_code == 503
+                 and r_hijack.json().get("error") == r_clean.json().get("error"),
+                 f"hijack={r_hijack.status_code} clean={r_clean.status_code} "
+                 f"({r_hijack.text[:80]})")
+
+        # A "transcript": <non-string> sequence inside ANOTHER value must be
+        # skipped in favor of the real transcript: the pre-hardening parser
+        # matched the embedded key first, failed on the non-string value, and
+        # answered 400; the string-aware parser finds the real field -> 503.
+        r = post('{"note": "see \\"transcript\\": 123", "transcript": "um hi"}')
+        tr.check("normalize embedded non-string key skipped -> 503",
+                 r.status_code == 503, f"{r.status_code} {r.text[:120]}")
+
+        # Nested-object keys are not top-level fields (styling stays absent
+        # -> defaults; body still parses -> 503).
+        r = post('{"transcript": "um hi", "meta": {"styling": "pirate"}}')
+        tr.check("normalize nested-object key ignored -> 503",
+                 r.status_code == 503, f"{r.status_code} {r.text[:120]}")
+
+        # '#' request ids are reserved for internal queue tickets (same rule
+        # as /transcribe).
+        r = post({"transcript": "um hi"}, headers={"X-Request-Id": "#123"})
+        tr.check("normalize '#' request id -> 400",
+                 r.status_code == 400 and "invalid request id" in r.json().get("error", ""),
+                 f"{r.status_code} {r.text[:120]}")
+    finally:
+        audio_server.stop()
+        s1_server.stop()
+
+
 # ---- default-mode tests (no model: /dev/null placeholder GGUF) --------------
 
 def test_health(base_url: str, tr: TestResults):
@@ -693,7 +789,6 @@ def test_real_server_busy(base_url: str, tr: TestResults, samples: np.ndarray):
         # the anchor decodes finished too fast. Retry with a bigger barrage.
         n = 24
         barrier = threading.Barrier(n)
-    busy = results.count(503)
     ok = results.count(200)
     tr.check("concurrent barrage hits 503 server busy", saw_busy,
              f"statuses={sorted(set(results))}")
@@ -1072,6 +1167,9 @@ def main():
         test_multipart_filenameless_part(base_url, tr)
         test_multipart_empty_named_part_shadowing(base_url, tr)
         test_malformed_wav_huge_frame_count(base_url, tr)
+        if not args.no_server:
+            print("\nTesting POST /normalize (text-path transport, placeholders):")
+            test_normalize_endpoints(args.binary, tr)
 
         print("\nTesting WebSocket control frames:")
         test_websocket_control_frames(args.host, args.port, tr)

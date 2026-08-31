@@ -707,6 +707,13 @@ int main(int argc, char** argv) {
                 504);
             return;
         }
+        if (err == "model not loaded") {
+            send_json(res,
+                R"({"error":"model not loaded","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                503);
+            return;
+        }
         if (!err.empty()) {
             std::ostringstream ss;
             ss << "{\"error\":\"" << json_escape(err)
