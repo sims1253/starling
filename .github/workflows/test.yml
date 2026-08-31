@@ -46,7 +46,7 @@ jobs:
 
       - name: Install uv
         # astral-sh/setup-uv v3.2.4
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
