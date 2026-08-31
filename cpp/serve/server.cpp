@@ -160,17 +160,28 @@ void StarlingServer::warmup() {
         if (warmup_done_ || warmup_in_progress_) return;
         warmup_in_progress_ = true;
     }
-    std::fprintf(stderr,
-        "[starling-serve] warming up on %.1fs silent clip ...\n",
-        kWarmupSeconds);
-    int n = static_cast<int>(kWarmupSeconds * kSampleRate);
-    std::vector<float> dummy(n, 0.0f);
     std::string err;
-    // Warmup is a transcribe of silence — captures CUDA graphs etc. It takes
-    // a serial-queue ticket (blocking) so it can't overlap a real request.
-    // do_transcribe sets phase Busy→Ready internally.
-    auto result = do_transcribe(dummy.data(), n, nullptr, &err, QueuePolicy::Block);
-    (void)result;
+    // Warmup runs one real inference — captures CUDA graphs etc. It takes a
+    // serial-queue ticket (blocking) so it can't overlap a real request;
+    // run_with_turn sets phase Busy→Ready internally. Text models warm up on
+    // a probe transcript; audio models on a silent clip.
+    if (is_text_model()) {
+        std::fprintf(stderr, "[starling-serve] warming up on probe text ...\n");
+        auto text = normalize_text(
+            "um this is a warmup transcript with like forty two tokens in it",
+            "", "", "", nullptr, &err);
+        (void)text;
+    } else {
+        std::fprintf(stderr,
+            "[starling-serve] warming up on %.1fs silent clip ...\n",
+            kWarmupSeconds);
+        int n = static_cast<int>(kWarmupSeconds * kSampleRate);
+        std::vector<float> dummy(n, 0.0f);
+        auto result = do_transcribe(dummy.data(), n, nullptr, &err, QueuePolicy::Block);
+        (void)result;
+    }
+    if (!err.empty())
+        std::fprintf(stderr, "[starling-serve] warmup error: %s\n", err.c_str());
     {
         std::lock_guard<std::mutex> lk(warmup_mutex_);
         warmup_in_progress_ = false;
@@ -220,6 +231,22 @@ TranscribeResult StarlingServer::transcribe_pcm(
 TranscribeResult StarlingServer::do_transcribe(
     const float* samples, int64_t n, RequestContext* ctx, std::string* err,
     QueuePolicy policy) {
+    std::string text;
+    if (!run_with_turn(ctx, policy, [&] {
+            return starling_ggml_transcribe_pcm(model_, samples, n, kSampleRate);
+        }, &text, err))
+        return {};
+
+    TranscribeResult result;
+    result.text = std::move(text);
+    result.duration_s = static_cast<double>(n) / kSampleRate;
+    result.segments.push_back({result.text, 0.0, result.duration_s});
+    return result;
+}
+
+bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
+                                   const std::function<char*()>& engine_call,
+                                   std::string* out_text, std::string* err) {
     // Acquire the serial queue position. Every caller gets a ticket —
     // anonymous ones (warmup, WS streaming) get a synthesized id so they
     // queue like everyone else instead of racing the engine.
@@ -228,7 +255,7 @@ TranscribeResult StarlingServer::do_transcribe(
         std::unique_lock<std::mutex> lk(mutex_);
         if (n_waiters_ >= kMaxWaiters) {
             if (err) *err = "server busy";
-            return {};
+            return false;
         }
         if (req_id.empty()) req_id = "#anon-" + std::to_string(next_anon_id_++);
         request_order_.push_back(req_id);
@@ -249,14 +276,14 @@ TranscribeResult StarlingServer::do_transcribe(
             if (ctx && ctx->cancelled.load()) {
                 leave_queue();
                 if (err) *err = "cancelled";
-                return {};
+                return false;
             }
             if (policy == QueuePolicy::SkipIfBusy) {
                 // Anonymous latency-sensitive caller (WS streaming chunk):
                 // don't park on the queue — report busy and retry later.
                 leave_queue();
                 if (err) *err = "server busy";
-                return {};
+                return false;
             }
             double timeout = cfg_.request_timeout_seconds;
             if (timeout > 0) {
@@ -265,7 +292,7 @@ TranscribeResult StarlingServer::do_transcribe(
                 if (elapsed >= timeout) {
                     leave_queue();
                     if (err) *err = "request timed out";
-                    return {};
+                    return false;
                 }
             }
             queue_cv_.wait_for(lk, std::chrono::milliseconds(100));
@@ -279,15 +306,14 @@ TranscribeResult StarlingServer::do_transcribe(
         request_order_.pop_front();
         queue_cv_.notify_all();
         if (err) *err = "cancelled";
-        return {};
+        return false;
     }
 
     phase_.store(Phase::Busy);
     if (ctx) ctx->running.store(true);
 
-    // Run the transcribe (the C engine is synchronous).
-    char* result_text = starling_ggml_transcribe_pcm(
-        model_, samples, n, kSampleRate);
+    // Run the engine call (the C engine is synchronous).
+    char* result_text = engine_call();
 
     if (ctx) ctx->running.store(false);
     phase_.store(Phase::Ready);
@@ -311,21 +337,50 @@ TranscribeResult StarlingServer::do_transcribe(
     if (cancel_won) {
         if (result_text) starling_ggml_free_string(result_text);
         if (err) *err = "cancelled";
-        return {};
+        return false;
     }
 
     if (!result_text) {
         const char* emsg = starling_ggml_last_error(model_);
-        if (err) *err = emsg ? emsg : "transcribe failed";
-        return {};
+        if (err) *err = emsg ? emsg : "engine call failed";
+        return false;
     }
 
-    TranscribeResult result;
-    result.text = result_text;
+    if (out_text) *out_text = result_text;
     starling_ggml_free_string(result_text);
-    result.duration_s = static_cast<double>(n) / kSampleRate;
-    result.segments.push_back({result.text, 0.0, result.duration_s});
-    return result;
+    return true;
+}
+
+std::string StarlingServer::normalize_text(
+    const std::string& transcript, const std::string& styling,
+    const std::string& structure, const std::string& context,
+    RequestContext* ctx, std::string* err, QueuePolicy policy) {
+    if (!loaded_.load() || !model_) {
+        load();
+        if (!loaded_.load() || !model_) {
+            if (err) *err = "model not loaded";
+            return {};
+        }
+    }
+    if (!is_text_model()) {
+        if (err) *err = "model '" + cfg_.model_slug + "' has no text path";
+        return {};
+    }
+    std::string text;
+    const char* s = styling.empty() ? nullptr : styling.c_str();
+    const char* st = structure.empty() ? nullptr : structure.c_str();
+    const char* cx = context.empty() ? nullptr : context.c_str();
+    if (!run_with_turn(ctx, policy, [&] {
+            return starling_ggml_normalize_text(model_, transcript.c_str(), s, st, cx);
+        }, &text, err))
+        return {};
+    return text;
+}
+
+bool StarlingServer::is_text_model() const {
+    const starling::ggml::lib::ModelDescriptor* d =
+        starling::ggml::lib::find_model(slug_to_model(cfg_.model_slug));
+    return d && d->normalize_fn != nullptr;
 }
 
 bool StarlingServer::loaded() const { return loaded_.load(); }

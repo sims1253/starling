@@ -159,6 +159,36 @@ void starling_ggml_free_string(char * s) {
     if (s) std::free(s);
 }
 
+char * starling_ggml_normalize_text(starling_ggml_ctx * ctx,
+                                    const char * transcript,
+                                    const char * styling,
+                                    const char * structure,
+                                    const char * context) {
+    if (!ctx || !ctx->model) {
+        set_global_error("starling_ggml_normalize_text: null context");
+        return nullptr;
+    }
+    const lib::ModelDescriptor* d = lib::find_model(ctx->kind);
+    if (!d) {
+        ctx->last_error = "starling_ggml_normalize_text: unsupported model kind";
+        set_global_error(ctx->last_error);
+        return nullptr;
+    }
+    if (!d->normalize_fn) {
+        ctx->last_error = std::string("starling_ggml_normalize_text: model '")
+                          + d->slug + "' has no text path";
+        set_global_error(ctx->last_error);
+        return nullptr;
+    }
+    const char* err = nullptr;
+    char* r = d->normalize_fn(ctx->model, transcript, styling, structure, context, &err);
+    if (!r) {
+        ctx->last_error = err ? err : "S1 normalize failed";
+        set_global_error(ctx->last_error);
+    }
+    return r;
+}
+
 // --------------------------------------------------------------------------- //
 // Internal mel-test passthrough (not in the public header; used by the Phase 1a
 // validation script). Exposed so the Python binding can call it via ctypes.

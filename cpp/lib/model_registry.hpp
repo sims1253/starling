@@ -33,6 +33,11 @@ using ModelLoadFn   = void * (*)(const char * gguf_path, const char ** err_out);
 using ModelFreeFn   = void   (*)(void * handle);
 using ModelDecodeFn = char * (*)(void * handle, const float * pcm, int64_t n,
                                  const char ** err_out);
+// Text-in/text-out models (s1): normalize one raw transcript under the given
+// styling/structure/context controls. Null for the audio engines.
+using ModelNormalizeFn = char * (*)(void * handle, const char * transcript,
+                                    const char * styling, const char * structure,
+                                    const char * context, const char ** err_out);
 
 struct ModelDescriptor {
     starling_ggml_model kind;  // public enum value (starling_ggml.h)
@@ -56,6 +61,10 @@ struct ModelDescriptor {
     const char * rate_error_fmt;
     bool rate_error_in_ctx;
     const char * decode_fallback;
+
+    // Text-in/text-out path (s1). Null for the audio engines; appended after
+    // the historical fields so existing rows' positional init is unchanged.
+    ModelNormalizeFn normalize_fn = nullptr;
 };
 
 // The table, one row per model in enum order. |out_n| receives the row count.
