@@ -29,7 +29,8 @@ extern "C" {
 //   4 — added STARLING_GGML_GRANITE (ibm-granite/granite-speech-4.1-2b).
 //   5 — added STARLING_GGML_QWEN3 (Qwen/Qwen3-ASR-1.7B-hf).
 //   6 — added STARLING_GGML_S1 (superwhisper/s1-mini) + the text-in entry
-//       point starling_ggml_normalize_text.
+//       point starling_ggml_normalize_text, and STARLING_GGML_AUDEX
+//       (nvidia/Nemotron-Labs-Audex-2B).
 #define STARLING_GGML_ABI_VERSION 6
 
 // ABI / build introspection --------------------------------------------------
@@ -54,6 +55,7 @@ typedef enum {
     STARLING_GGML_GRANITE      = 6,  // ibm-granite/granite-speech-4.1-2b
     STARLING_GGML_QWEN3        = 7,  // Qwen/Qwen3-ASR-1.7B-hf
     STARLING_GGML_S1           = 8,  // superwhisper/s1-mini (text normalizer)
+    STARLING_GGML_AUDEX        = 9,  // nvidia/Nemotron-Labs-Audex-2B
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------

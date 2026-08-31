@@ -148,6 +148,7 @@ HOJO = 5
 GRANITE = 6
 QWEN3 = 7
 S1 = 8
+AUDEX = 9
 
 
 class GgmlModel:

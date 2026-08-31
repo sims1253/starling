@@ -27,6 +27,11 @@ namespace starling::ggml::lib {
 // moss/ark graphs stay byte-identical: qk_norm is consulted only in the
 // bias-free branch, the multipliers use skip-when-default (the op sequence is
 // untouched), and tied_lm_head keeps llm.embed.weight as the head.
+
+// MLP activation family: the stock silu-gated gate/up/down trunk, or
+// Nemotron's plain squared-ReLU up/down MLP (no gate tensor at all).
+enum class QwenMlpAct { kSiluGated, kRelu2Plain };
+
 struct QwenDecodeSpec {
     bool qkv_bias;
     const char* env;           // env-var prefix, e.g. "STARLING_MOSS"
@@ -48,6 +53,15 @@ struct QwenDecodeSpec {
     // unique argmax (order-independent) (qwen3; off keeps moss/ark/granite
     // byte-identical).
     bool argmax_low_ties = false;
+    // Nemotron's MLP is up -> relu(x)^2 -> down (F.relu(x).pow(2): relu is
+    // exact, one bf16 round after the square), with no gate projection. The
+    // default keeps the historical silu-gated sequence byte-identical.
+    QwenMlpAct mlp_activation = QwenMlpAct::kSiluGated;
+    // Nemotron normalizes with F.rms_norm: normalize AND affine in f32, ONE
+    // bf16 round at the end. The default is the Llama-style two-round
+    // discipline (round after the rsqrt, round again after the weight mul)
+    // the stack was built on (moss/ark/granite/qwen3 byte-identity).
+    bool rms_norm_single_round = false;
 };
 
 // The config fields the decode graphs are shaped by.

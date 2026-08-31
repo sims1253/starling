@@ -490,6 +490,51 @@ def test_starling_ggml_qwen3_text_parity(starling_ggml_qwen3_engine, name: str) 
 
 
 # --------------------------------------------------------------------------- #
+# In-tree Nemotron-Labs-Audex-2B C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_audex_available() -> bool:
+    try:
+        from engines import StarlingGgmlAudex
+        return StarlingGgmlAudex().available
+    except Exception:
+        return False
+
+@pytest.fixture(scope="module")
+def starling_ggml_audex_engine():
+    if not _starling_ggml_audex_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_AUDEX_MODEL unavailable")
+    from engines import StarlingGgmlAudex
+    engine = StarlingGgmlAudex()
+    engine.load()
+    yield engine
+    engine.close()
+
+@pytest.mark.skipif(not _starling_ggml_audex_available(),
+                    reason="in-tree libstarling_ggml or audex GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_audex_text_parity(starling_ggml_audex_engine, name: str) -> None:
+    """The in-tree C API returns the golden audex transcript.
+
+    Gates Starling's own whisper-style mel (128 bins, drop-last-frame rule,
+    fixed 3000-frame clips) -> conv1d frontend + learned positional table +
+    full-attention encoder (32 layers, 20 heads) -> avg-pooler (750 tokens)
+    -> RMSNorm/relu2 projector -> Nemotron-Dense decoder (bias-free GQA,
+    untied lm_head, relu2 MLP, single-round RMSNorm) pipeline including the
+    serve chunk policy for long audio and the quote-extraction text cleanup,
+    against the stock-numerics reference captured by
+    scripts/make_audex_golden.py (golden/audex_reference.json). Asserts exact
+    text parity with no tolerance.
+    """
+    golden = json.loads((GOLDEN / "audex_reference.json").read_text())
+    golden_text = golden["fixtures"][name]["text"].rstrip()
+    out = starling_ggml_audex_engine._run_one(FIXTURES[name]).rstrip()
+    assert out == golden_text, (
+        f"in-tree AUDEX transcript mismatch on {name}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Wave G regression: MOSS K-step decode must not access the KV cache / RoPE
 # tables past max_cache when a block's remaining token budget < K.
 # --------------------------------------------------------------------------- #

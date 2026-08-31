@@ -77,6 +77,14 @@ inline ggml_tensor* rms(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
     y = bf16(c, y);
     return mulb(c, y, bf16(c, weight(c, ml, n)));
 }
+// F.rms_norm semantics (Nemotron): normalize AND affine in f32, ONE bf16
+// round at the end — vs rms's Llama-style round after the rsqrt.
+inline ggml_tensor* rms_single(ggml_context* c, const ModelLoader& ml,
+                               ggml_tensor* x, const std::string& n, float eps) {
+    ggml_tensor* y = ggml_rms_norm(c, f32(c, x), eps);
+    y = ggml_mul(c, y, f32(c, weight(c, ml, n)));
+    return bf16(c, y);
+}
 // Exact (erf) GELU under both disciplines.
 inline ggml_tensor* gelu_erf_bf16(ggml_context* c, ggml_tensor* x) {
     return bf16(c, ggml_gelu_erf(c, f32(c, x)));

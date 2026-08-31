@@ -74,6 +74,15 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   min(200, ceil(dur*5)+32), whitespace-collapsed join) and the
   `transcription_only` text extraction (the `<asr_text>` marker split with the
   Qwen3-ASR library's repetition fix, ported in `capi_qwen3.cpp`).
+- **audex (in-tree `StarlingGgmlAudex`)**: greedy path. Exact text on
+  short/medium/long against `golden/audex_reference.json`, captured from the
+  stock-numerics Python path by `scripts/make_audex_golden.py` (staged
+  component tensors via `scripts/audex_golden_components.py`). The engine
+  mirrors the Python server's chunk policy for long audio (contiguous 30 s
+  chunks — exactly one 750-token clip each, the tail zero-padded to a full
+  clip at the mel level, per-chunk budget min(200, ceil(dur*5)+32),
+  whitespace-collapsed join) and the `_decode_response` quote extraction
+  (first-to-last single-quote span, ported in `capi_audex.cpp`).
 
 ### granite engine notes
 
@@ -133,6 +142,39 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   iota (`vocab - col`, exact integers < 2^24), making the lowest tied column
   a unique argmax. Skip-when-default, so the moss/ark/granite graphs stay
   byte-identical.
+
+### audex engine notes
+
+- **Mel**: the shared `lib/whisper_mel` frontend with the `T_FULLT_MINUS_1`
+  rule and the `MAX_KEPT_FRAMES` max scope — the eager WhisperFeatureExtractor
+  drops the trailing STFT frame (`stft[..., :-1]`) BEFORE the global
+  max-clamp, so the normalization max runs over the kept 3000 frames only.
+  Every clip is zero-padded to the full 30 s / 480000 samples
+  (padding="max_length") BEFORE the mel, so the frame count (3000) — and with
+  it every downstream encoder shape — is fixed (`cpp/audex/mel.cpp`).
+- **Encoder**: the stock Qwen2AudioEncoder (whisper-large-v3 shaped) with
+  fixed shapes: two GELU Conv1d k3/p1 layers over time (stride 1 then 2:
+  3000 -> 1500), the LEARNED (1500, 1280) positional table, 32 pre-norm
+  layers of FULL bidirectional attention (no mask — the reference attends
+  padded tail frames like any other; 20 heads x 64, biased q/v/out with a
+  bias-free k, the query pre-scaled by 0.125 at projection), an avg-pooler
+  halving 1500 -> 750 (even/odd strided views, f32 pair average, one bf16
+  round), and the final biased LayerNorm. The convs are an explicit F32
+  im2col + F32 GEMM (the qwen3 `conv_step` pattern with a degenerate H axis);
+  as with qwen3, a GEMM formulation cannot bitwise-match cuDNN conv in
+  general — parity holds on the gated fixtures.
+- **Projector**: single-round RMSNorm(1280, eps 1e-5) -> bias-free fc1
+  (-> 4096) -> relu(x)^2 (relu exact, one bf16 round after the square) ->
+  bias-free fc2 (-> 2048).
+- **Decoder**: the shared `lib/qwen_decode` stack in a new Nemotron-Dense
+  variant (`qkv_bias=false, qk_norm=false`, UNTIED lm_head, no multipliers,
+  `argmax_low_ties`) plus TWO skip-when-default spec extensions: the
+  `mlp_activation=relu2_plain` MLP (up -> relu^2 -> down, no gate tensor) and
+  `rms_norm_single_round` (Nemotron normalizes with `F.rms_norm` — normalize
+  AND affine in f32, ONE bf16 round at the end — vs the stack's historical
+  Llama-style round-after-rsqrt; the two disciplines differ on ~25% of
+  elements, verified empirically against `torch.nn.functional.rms_norm`).
+  Defaults keep the moss/ark/granite/qwen3 graphs byte-identical.
 
 ### s1 engine notes (first text-to-text engine)
 
