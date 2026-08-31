@@ -169,6 +169,17 @@ point).
   `','` (stock-eager top-2 f32 gap 0.0000) — the winner is argmax tie-break
   order, not numerics (both fast paths pick the same side; the diff is one
   comma, CER < 1%). Documented + gated in `benchmarks/s1/bench_normalize.py`.
+- **OOD inputs and the limits of byte-exactness**: an 80-case synthetic fuzz
+  (random word-salad transcripts, fillers, numbers, tabs/caps edges,
+  near-cap lengths) diverges from stock greedy on ~40-50% of cases — every
+  sampled divergence was verified tie-class: at the first differing token,
+  the fast path picked stock's literal #2 and the top-2 f32 gap was <= 0.125
+  at logit magnitude ~20 — i.e. at or below ONE bf16 ULP (ULP(20) = 0.125),
+  unresolvable in bf16. One flip cascades into a wholly different
+  continuation on OOD input (the model is uncertain there; realistic ASR
+  transcripts — like the fixtures — have decisive argmax and stay
+  byte-exact). Byte-exactness is therefore a property of in-distribution
+  prompts, not arbitrary text; the parity gates run on the fixtures.
 
 ## Backends
 
