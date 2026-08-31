@@ -22,7 +22,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        # actions/checkout v6.1.0 (pinned per issue #10; pullfrog/pullfrog
+        # actions/checkout v7.0.1 (pinned per issue #10; pullfrog/pullfrog
         # itself is referenced by the vendor-documented @v0 moving tag).
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
