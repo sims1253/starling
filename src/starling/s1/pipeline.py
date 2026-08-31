@@ -280,6 +280,14 @@ class NormalizePipeline:
         if self.use_fused_llm:
             self.llm = self._get_multistep_llm(self._steps_for_prompt(T))
         res = self.llm.generate(inputs_embeds, max_new_tokens=max_new_tokens)
+        # Truncate at the FIRST stop token (either EOS id) so every decode
+        # path honors the same contract: S1MultiStepLLMMega already stops on
+        # both; the LLMMega fallback is configured with a single eos, and a
+        # <|endoftext|> there would otherwise keep generating.
+        stop = (res.ids[0] == EOS_TOKEN_IDS[0]) | (res.ids[0] == EOS_TOKEN_IDS[1])
+        if bool(stop.any()):
+            keep = int(stop.nonzero()[0, 0]) + 1
+            res.ids = res.ids[:, :keep]
         text = self.tokenizer.decode(res.ids[0], skip_special_tokens=True)
         return text, res.ids
 

@@ -194,14 +194,54 @@ static std::string json_escape(const std::string& s) {
 
 // ---- flat JSON string-field extraction (POST /normalize) ------------------
 // Extracts a top-level "key": "value" string field from a flat JSON object
-// (the /normalize request shape: string fields only, no nesting). Escapes
-// (\", \\, \n, \t, \uXXXX) are decoded; \u escapes encode a UTF-8 BMP
-// codepoint. Returns false when the field is absent or malformed.
+// (the /normalize request shape: string fields, no nesting). A single pass
+// first marks every byte's in-string state and nesting depth, so a `"key"`
+// sequence INSIDE a string value (e.g. a transcript that literally contains
+// "context": "email") or inside a nested object can never be mistaken for a
+// top-level field. A candidate only qualifies when it starts outside any
+// string at depth 1, the previous non-whitespace char is `{` or `,`, and the
+// next non-whitespace char is `:`. Escapes (\", \\, \n, \t, \uXXXX) are
+// decoded; \u escapes encode a UTF-8 BMP codepoint. Returns false when the
+// field is absent or malformed.
 static bool json_get_string(const std::string& body, const std::string& key,
                             std::string& out) {
+    // Pass 1: in-string/escape state + enclosing depth per byte.
+    std::vector<uint8_t> in_str(body.size(), 0);
+    std::vector<int> depth(body.size(), 0);
+    bool str = false, esc = false;
+    int d = 0;
+    for (size_t i = 0; i < body.size(); ++i) {
+        in_str[i] = str ? 1 : 0;
+        depth[i] = d;
+        char c = body[i];
+        if (str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') str = false;
+            continue;
+        }
+        if (c == '"') str = true;
+        else if (c == '{' || c == '[') ++d;
+        else if (c == '}' || c == ']') --d;
+    }
+
     const std::string needle = "\"" + key + "\"";
     size_t pos = body.find(needle);
     while (pos != std::string::npos) {
+        // Qualify: outside any string, top-level object, after '{' or ','.
+        if (in_str[pos] || depth[pos] != 1) {
+            pos = body.find(needle, pos + 1);
+            continue;
+        }
+        // find_last_not_of starts AT the given index; pass pos-1 so the
+        // needle's own opening quote is not the "previous" char.
+        size_t prev = pos > 0 ? body.find_last_not_of(" \t\r\n", pos - 1)
+                              : std::string::npos;
+        if (prev == std::string::npos ||
+            (body[prev] != '{' && body[prev] != ',')) {
+            pos = body.find(needle, pos + 1);
+            continue;
+        }
         size_t q = body.find_first_not_of(" \t\r\n", pos + needle.size());
         if (q == std::string::npos || body[q] != ':') {
             pos = body.find(needle, pos + 1);
@@ -210,6 +250,7 @@ static bool json_get_string(const std::string& body, const std::string& key,
         q = body.find_first_not_of(" \t\r\n", q + 1);
         if (q == std::string::npos || body[q] != '"') return false;
         ++q;
+        // Pass 2: decode the value string with escapes.
         out.clear();
         while (q < body.size()) {
             char c = body[q];

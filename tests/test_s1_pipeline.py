@@ -1,11 +1,13 @@
-"""S1-mini pipeline gates: golden byte-exactness + prompt-contract behavior.
+"""S1-mini pipeline gates: golden byte-exactness on the GPU path.
 
 The goldens under ``golden/s1/`` are the eager stock-transformers path (the
 model-card quickstart) on the transcript fixtures; the CUDA-graph
 ``NormalizePipeline`` must reproduce the generated token ids EXACTLY (greedy
 is deterministic; the graph changes only timing).
 
-GPU-gated: skips when CUDA or the HF snapshot is unavailable.
+GPU-gated: skips when CUDA or the HF snapshot is unavailable. The CPU-only
+prompt-contract tests (control line, chunking, budget formula) live in
+tests/test_s1_config.py, which CI runs on every platform.
 
 Run with:  uv run pytest tests/test_s1_pipeline.py -q
 """
@@ -40,45 +42,6 @@ def _pipeline():
 
 
 # --------------------------------------------------------------------- #
-# CPU-only: prompt contract
-# --------------------------------------------------------------------- #
-def test_control_line_validates_values() -> None:
-    from starling.s1.config import control_line
-
-    assert control_line() == (
-        "[Styling: semi-formal] [Structure: prose] [Context: general]")
-    assert control_line("casual", "lists", "email") == (
-        "[Styling: casual] [Structure: lists] [Context: email]")
-    with pytest.raises(ValueError):
-        control_line(styling="pirate")
-    with pytest.raises(ValueError):
-        control_line(structure="table")
-    with pytest.raises(ValueError):
-        control_line(context="meeting")
-
-
-def test_chunk_transcript_short_input_passthrough() -> None:
-    from starling.s1.pipeline import chunk_transcript
-
-    t = "um so like one two three"
-    assert chunk_transcript(t, max_words=600) == [t]
-    # no-punctuation run longer than the budget splits at word boundaries
-    long_t = " ".join(["word"] * 10)
-    parts = chunk_transcript(long_t, max_words=4)
-    assert parts == ["word word word word", "word word word word", "word word"]
-    # punctuated text splits at sentence boundaries when they fit the budget
-    assert chunk_transcript("a b. c d. e f.", max_words=2) == ["a b.", "c d.", "e f."]
-    # ... and falls back to word windows when a sentence exceeds the budget
-    assert chunk_transcript("a b. c d.", max_words=1) == ["a", "b.", "c", "d."]
-
-
-def test_max_new_tokens_formula() -> None:
-    from starling.s1.config import max_new_tokens_for
-
-    assert max_new_tokens_for(100) == 162  # 1.3*100 + 32
-
-
-# --------------------------------------------------------------------- #
 # GPU: byte-exact vs golden
 # --------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
@@ -94,12 +57,17 @@ def pipeline():
 @pytest.mark.parametrize("tier", ["short", "medium", "long"])
 def test_generated_ids_match_golden(pipeline, tier: str) -> None:
     """The CUDA-graph pipeline reproduces the stock greedy ids exactly."""
-
     from starling.s1.golden import GREEDY_IDS, load_golden
 
     ref_ids = load_golden(GREEDY_IDS.format(tier=tier))  # 1-D generated ids
     _, ids = pipeline.normalize(fx.LENGTH_TIERS[tier])
     n = ids.shape[1]
+    # Length pin: a dropped trailing stop token would otherwise pass the
+    # prefix compare (the EOS decodes to nothing under skip_special_tokens).
+    assert n == ref_ids.numel(), (
+        f"{tier}: generated {n} tokens, golden has {ref_ids.numel()} "
+        "(truncated stop token?)"
+    )
     assert (ids[0][:n] == ref_ids[:n]).all(), (
         f"{tier}: generated ids diverge from golden "
         f"({int((ids[0][:n] != ref_ids[:n]).sum())}/{n} mismatched)"

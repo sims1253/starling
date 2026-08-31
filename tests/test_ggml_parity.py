@@ -734,16 +734,19 @@ def test_starling_ggml_s1_text_parity(starling_ggml_s1_engine, tier: str) -> Non
                     reason="in-tree libstarling_ggml (ABI 6) or s1 GGUF unavailable")
 def test_starling_ggml_s1_control_matrix(starling_ggml_s1_engine) -> None:
     """Every trained control combination (4 styling x 2 structure x 2
-    context) produces output on the trained path (no hallucination-shaped
-    degenerate output: non-empty or the documented empty-for-filler case),
-    and unknown control values are rejected with a clear error."""
+    context) produces non-degenerate output on the trained path (the
+    transcript has real content, so an empty return IS the
+    hallucination-shaped degenerate case), and unknown control values are
+    rejected with a clear error."""
     import s1_transcripts as fx  # noqa: E402  (tests/fixtures on sys.path)
 
     n = 0
     for transcript, styling, structure, context in fx.CONTROL_MATRIX:
         out = starling_ggml_s1_engine.normalize_text(
             transcript, styling, structure, context)
-        assert isinstance(out, str)
+        assert isinstance(out, str) and out.strip(), (
+            f"degenerate (empty) output for {styling}/{structure}/{context}"
+        )
         n += 1
     assert n == 16
 
