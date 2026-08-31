@@ -12,7 +12,8 @@ byte-identical to eager `transformers` — same accuracy, fewer round trips.
 
 ## Models
 
-All do speech-to-text.
+All do speech-to-text, except the last: a text-to-text post-processor for
+ASR output.
 
 - [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) — CTC conformer encoder + BLIP2 Q-Former projector + granite-4.0-1b decoder. The in-tree ggml engine (`starling-ggml-granite`, greedy path) runs natively via starling-serve; the Python path adds the optional self-speculative decoding drafting from the encoder's CTC head.
 - [`ibm-granite/granite-speech-4.1-2b-nar`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b-nar) — non-autoregressive. One bidirectional forward: CTC conformer draft + blank slots + bidirectional granite-4.0-1b editor refinement. No decode loop.
@@ -30,6 +31,8 @@ The autoregressive models (granite, moss, qwen3, ark, higgs, audex, cohere, hojo
 encoder + LLM-decoder pattern where the decode loop is the bottleneck. Parakeet
 is a transducer; granite-nar is a single bidirectional pass.
 
+- [`superwhisper/s1-mini`](https://huggingface.co/superwhisper/s1-mini) — **text-to-text**: a 0.6B Qwen3 decoder-only normalizer that rewrites raw ASR transcripts as clean written text (fills fillers, resolves self-corrections, punctuation/truecasing, numbers/emails under a `[Styling|Structure|Context]` control line). No audio front-end — the input embedding is a plain token lookup, so both the CUDA pipeline (`starling.s1.NormalizePipeline`, reusing the qwen3 track's K-step captured decode with a dual-EOS stop) and the in-tree ggml engine (`starling-ggml-s1`, the first engine with a C++ BPE **encoder** + a text path via `starling-serve`'s `POST /normalize`) are byte-exact against stock transformers on all fixture tiers. Apache 2.0 with a naming clause ("S1-mini by Superwhisper").
+
 ## Benchmark
 
 Two scripts, each the single source of truth for its slice. Both support
@@ -38,12 +41,17 @@ Two scripts, each the single source of truth for its slice. Both support
 - **`benchmarks/bench_all.py`** — latency/RTFx grid. Sweeps model × engine ×
   audio length × batch size on tiled-LibriSpeech fixtures. Engines: `starling`,
   `stock`, `crispasr`, `parakeet.cpp`, `starling-ggml`, `starling-batched`
-  (granite/qwen3), `starling-spec` (granite).
+  (granite/qwen3), `starling-spec` (granite). s1 runs here too (`--models s1`):
+  fixture tiers select transcripts, RTFx reads normalized words/s.
 - **`benchmarks/bench_leaderboard.py`** — accuracy grid. Reproduces the
   [Open ASR Leaderboard](https://huggingface.co/spaces/hf-audio/open_asr_leaderboard)
   English short-form methodology (Whisper `EnglishTextNormalizer` +
   `kaldialign` WER, `merge_compounds=True`, unweighted mean across 7 datasets).
   A real WER budget lets future non-byte-exact optimizations land safely.
+- **`benchmarks/s1/bench_normalize.py`** — s1-mini's dedicated suite:
+  latency/throughput per engine, byte-exact parity vs stock, curated quality
+  cases, and the full 16-combination control matrix (styling × structure ×
+  context). Splices the `BENCH:S1` block below.
 
 ```
 uv run python benchmarks/bench_all.py --update-readme
@@ -177,6 +185,37 @@ median ± standard deviation across repetitions.
 | nemotron-labs-audex-2b     | starling           | 60x         | 57x   | 66x          | 49x          | 60x                 | 55x                 | 48x          |
 | nemotron-labs-audex-2b     | stock transformers | 9x          | 8x    | 10x          | 7x           | 9x                  | 8x                  | 8x           |
 <!-- BENCH:WER:END -->
+
+<!-- BENCH:S1:START -->
+**s1-mini** — normalization latency / throughput (ms, words/s)
+
+Text-in/text-out: fixture tiers are raw transcripts;
+words/s = input words normalized per second (higher is faster).
+bf16, model load + graph capture excluded, single RTX 5090.
+
+| tier   | engine             | ms           |   words/s |
+|--------|--------------------|--------------|-----------|
+| short  | starling           | 120±5ms      |       149 |
+| short  | stock transformers | 533±15ms     |        34 |
+| short  | starling-ggml      | 102±16ms     |       176 |
+| medium | starling           | 239±28ms     |       318 |
+| medium | stock transformers | 4065±388ms   |        19 |
+| medium | starling-ggml      | 411±8ms      |       185 |
+| long   | starling           | 595±47ms     |       417 |
+| long   | stock transformers | 17017±1376ms |        15 |
+| long   | starling-ggml      | 1253±22ms    |       198 |
+
+**s1-mini** — accuracy (vs stock transformers greedy)
+
+| tier   | starling   | starling-ggml   |
+|--------|------------|-----------------|
+| short  | byte-exact | byte-exact      |
+| medium | byte-exact | byte-exact      |
+| long   | byte-exact | byte-exact      |
+
+Control matrix (4 styling x 2 structure x 2 context): starling_exact: 15/16, starling-ggml_exact: 15/16
+Curated quality cases: 5/5 expected outputs matched
+<!-- BENCH:S1:END -->
 
 *All models use 50 clips/dataset. Parakeet, ark, and qwen3 previously capped at
 10 because their graphed pipelines accumulated one CUDA graph per distinct clip

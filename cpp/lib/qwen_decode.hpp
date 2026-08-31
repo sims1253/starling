@@ -91,7 +91,16 @@ struct GenerateResult {
 };
 // greedy_generate controls. Model bundles keep their own GenerateOptions
 // (default max_cache_len differs per model) and convert.
-struct GenerateParams { int32_t max_new_tokens; int32_t max_cache_len; int32_t eos_token_id; };
+struct GenerateParams {
+    int32_t max_new_tokens;
+    int32_t max_cache_len;
+    int32_t eos_token_id;
+    // Optional secondary stop id (s1's generation_config stops on BOTH
+    // <|im_end|> and <|endoftext|>). -1 (the default, also when a model
+    // bundle aggregate-initializes only three fields) disables it, keeping
+    // the moss/ark/granite/qwen3 stop behavior byte-identical.
+    int32_t eos2_token_id = -1;
+};
 
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t max_cache_len,
                  PrefillResult& o, std::string& e);

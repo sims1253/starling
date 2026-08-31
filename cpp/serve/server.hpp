@@ -10,7 +10,9 @@
 //   GET    /health          → { model, loaded, phase, queue_depth, busy }
 //   POST   /transcribe      → multipart/raw WAV → { text, segments, duration_s, request_id }
 //   POST   /inference       → alias for /transcribe
-//   POST   /warmup          → idempotent silent-clip warmup (202)
+//   POST   /normalize       → text models only (s1): { transcript, styling?,
+//                             structure?, context? } → { text, request_id }
+//   POST   /warmup          → idempotent warmup (silent clip / probe text)
 //   DELETE /inference/<id>  → cancel a queued/in-flight request by X-Request-Id
 //   WS     /stream          → real-time streaming dictation
 //
@@ -130,6 +132,19 @@ public:
                                      RequestContext* ctx, std::string* err,
                                      QueuePolicy policy = QueuePolicy::Block);
 
+    // Synchronous text normalization (s1). Same serial-queue discipline as
+    // transcribe_pcm. Empty control strings select the trained defaults.
+    // Returns the normalized text, or sets *err on failure.
+    std::string normalize_text(const std::string& transcript,
+                               const std::string& styling,
+                               const std::string& structure,
+                               const std::string& context,
+                               RequestContext* ctx, std::string* err,
+                               QueuePolicy policy = QueuePolicy::Block);
+
+    // True when the resident model has a text path (registry normalize_fn).
+    bool is_text_model() const;
+
     // Cancel a queued/in-flight request by id. Returns true if found.
     bool cancel_request(const std::string& id);
 
@@ -180,6 +195,14 @@ private:
     TranscribeResult do_transcribe(const float* samples, int64_t n,
                                     RequestContext* ctx, std::string* err,
                                     QueuePolicy policy);
+
+    // Internal: take a serial-queue ticket, wait for the turn, run
+    // engine_call (returning a malloc'd string owned by the caller policy
+    // below), release the turn, and map failures to *err. Returns the
+    // engine's string via out_text. Shared by the audio and text paths.
+    bool run_with_turn(RequestContext* ctx, QueuePolicy policy,
+                       const std::function<char*()>& engine_call,
+                       std::string* out_text, std::string* err);
 };
 
 } // namespace starling::serve

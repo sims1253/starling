@@ -110,6 +110,11 @@ def _resolve_symbols(lib: ctypes.CDLL) -> bool:
         ]
         lib.starling_ggml_free_string.argtypes = [ctypes.POINTER(ctypes.c_char)]
         lib.starling_ggml_free_string.restype = None
+        lib.starling_ggml_normalize_text.restype = ctypes.POINTER(ctypes.c_char)
+        lib.starling_ggml_normalize_text.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ]
     except (AttributeError, OSError):
         return False
     # ABI check: refuse to load a mismatched .so (prevents cryptic arg
@@ -142,7 +147,8 @@ HIGGS = 4
 HOJO = 5
 GRANITE = 6
 QWEN3 = 7
-AUDEX = 8
+S1 = 8
+AUDEX = 9
 
 
 class GgmlModel:
@@ -221,6 +227,33 @@ class GgmlModel:
             lib.starling_ggml_free_string(
                 ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char)))
         return ids
+
+    def normalize_text(
+        self,
+        transcript: str,
+        styling: str | None = None,
+        structure: str | None = None,
+        context: str | None = None,
+    ) -> str:
+        """Normalize one raw ASR transcript with a text model (s1).
+
+        ``None`` controls select the trained defaults (semi-formal/prose/
+        general); unknown values are rejected by the engine.
+        """
+        ptr = self._lib.starling_ggml_normalize_text(
+            self._ctx,
+            transcript.encode("utf-8"),
+            styling.encode("utf-8") if styling is not None else None,
+            structure.encode("utf-8") if structure is not None else None,
+            context.encode("utf-8") if context is not None else None,
+        )
+        if not ptr:
+            err = self._last_error()
+            raise RuntimeError(f"starling_ggml_normalize_text failed: {err}")
+        raw = ctypes.cast(ptr, ctypes.c_char_p).value
+        text = (raw or b"").decode("utf-8", "replace")
+        self._lib.starling_ggml_free_string(ptr)
+        return text
 
     def close(self) -> None:
         if getattr(self, "_ctx", None):

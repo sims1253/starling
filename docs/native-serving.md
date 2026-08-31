@@ -59,7 +59,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, audex |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, s1, audex |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -120,7 +120,29 @@ model not loaded, `504` queue timeout, `500` other engine failures.
 
 ### `POST /warmup`
 
-Idempotent silent-clip warmup (CUDA graph capture). Returns `202`.
+Idempotent warmup (CUDA graph capture): a silent clip for audio models, a
+probe transcript for text models (s1). Returns `202`.
+
+### `POST /normalize` (s1 only)
+
+Text-in/text-out path for the normalizer. JSON body:
+
+```json
+{"transcript":"so um i need to send the the report by uh friday","styling":"semi-formal","structure":"prose","context":"general"}
+```
+
+`transcript` is required; the control fields are optional (defaults
+`semi-formal`/`prose`/`general`) and must come from the trained sets —
+unknown values are rejected with `400` (the card warns off-spec controls make
+the model hallucinate). Prompts over ~1,000 tokens (the trained input max)
+are rejected with `400`; chunk long transcripts at sentence boundaries
+first. Returns:
+
+```json
+{"text":"So I need to send the report by Friday.","request_id":"..."}
+```
+
+Audio models answer `400` ("model has no text path") — use `/transcribe`.
 
 ### `DELETE /inference/<id>`
 
@@ -212,6 +234,7 @@ Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0
 | hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |
 | qwen3 | `scripts/convert_qwen3_gguf.py` |
+| s1 | `scripts/convert_s1_gguf.py` |
 | audex | `scripts/convert_audex_gguf.py` |
 
 ## Release artifacts

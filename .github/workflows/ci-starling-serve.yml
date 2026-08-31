@@ -38,8 +38,8 @@ jobs:
   build-cpu:
     runs-on: ubuntu-22.04
     steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
           persist-credentials: false
@@ -124,8 +124,8 @@ jobs:
       AUDIO_URL: https://raw.githubusercontent.com/ggml-org/whisper.cpp/1fe009caeda75f69bc864d6370b10674e45a92bd/samples/jfk.wav
       EXPECTED_TEXT: "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
     steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
           persist-credentials: false
@@ -135,9 +135,9 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
-      # actions/cache v4.3.0 — keyed on the pinned GGUF revision so a pinned
+      # actions/cache v6.1.0 — keyed on the pinned GGUF revision so a pinned
       # model never re-downloads and a revision bump invalidates the cache.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: model.gguf
           key: starling-serve-e2e-${{ env.HF_REPO }}-${{ env.GGUF_FILE }}-${{ env.GGUF_REV }}

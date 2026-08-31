@@ -87,7 +87,10 @@ std::string extract_transcription(std::string raw) {
     raw = strip_ws(raw);
     const size_t q1 = raw.find('\'');
     const size_t q2 = raw.rfind('\'');
-    if (q1 != std::string::npos && q2 > q1)
+    // `.+` semantics: the oracle regex needs at least one char between the
+    // quotes — adjacent quotes ('') must fall through to the raw text, not
+    // return an empty transcript.
+    if (q1 != std::string::npos && q2 > q1 + 1)
         return strip_ws(raw.substr(q1 + 1, q2 - q1 - 1));
     return raw;
 }

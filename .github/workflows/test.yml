@@ -39,14 +39,14 @@ jobs:
 
     steps:
       - name: Checkout
-        # actions/checkout v4.2.2
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Install uv
-        # astral-sh/setup-uv v3.2.4
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39
+        # astral-sh/setup-uv v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -65,7 +65,9 @@ jobs:
         # No CUDA, no model loading, no network: verifies slug->backend
         # routing, CLI arg parsing, config plumbing, cancellation/error
         # paths, and the CPU-only robustness/lifecycle regressions.
-        run: uv run python -m pytest tests/test_server_routing.py tests/test_server_robustness.py tests/test_server_lifecycle.py -q
+        # test_s1_config.py: pure-Python s1 prompt-contract tests (control
+        # line, chunking, budget formula) — no model, no goldens.
+        run: uv run python -m pytest tests/test_server_routing.py tests/test_server_robustness.py tests/test_server_lifecycle.py tests/test_s1_config.py -q
 
       - name: Import smoke (kernel backend dispatches per-OS)
         # Only call have_triton() + get_backend_name() (NOT get_backend()) --

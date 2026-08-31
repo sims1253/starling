@@ -1068,8 +1068,8 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
 // up to K tokens, stopping at EOS / max_new_tokens. `prev` in=out (token
 // entering / last emitted); `past` advances by the steps actually consumed.
 bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
-               int32_t eos, int max_new_tokens, std::vector<int32_t>& ids,
-               bool& hit_eos, std::string& e) {
+               int32_t eos, int32_t eos2, int max_new_tokens,
+               std::vector<int32_t>& ids, bool& hit_eos, std::string& e) {
     KStepGraph* kg = get_or_build_kstep(m, K, e);
     if (!kg) return false;
     const int64_t mc = m.dims.max_cache;
@@ -1115,7 +1115,7 @@ bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
         ids.push_back(tok);
         prev = tok;
         past += 1;
-        if (tok == eos) { hit_eos = true; break; }
+        if (tok == eos || tok == eos2) { hit_eos = true; break; }
     }
     return true;
 }
@@ -1205,7 +1205,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 const int Kk = std::min(K, remaining);
                 double s0 = timing ? (double)std::chrono::steady_clock::now().time_since_epoch().count() : 0.0;
                 if (!run_kstep(m, prev, state.length, Kk, op.eos_token_id,
-                               op.max_new_tokens, o.ids, hit, e))
+                               op.eos2_token_id, op.max_new_tokens, o.ids, hit, e))
                     return false;
                 if (timing) {
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1226,7 +1226,9 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
                     dec_sum += (s1 - s0) * 1e-6; ++dec_n;
                 }
-                if (prev == op.eos_token_id) { o.hit_eos = true; break; }
+                if (prev == op.eos_token_id || prev == op.eos2_token_id) {
+                    o.hit_eos = true; break;
+                }
             }
         }
         if (timing) {
@@ -1259,7 +1261,9 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             if (!forward_legacy(m, one.data, 1, p.state, logits, e)) return false;
             prev = spec_argmax(m.spec, logits);
             o.ids.push_back(prev);
-            if (prev == op.eos_token_id) { o.hit_eos = true; break; }
+            if (prev == op.eos_token_id || prev == op.eos2_token_id) {
+                o.hit_eos = true; break;
+            }
         }
     }
     // <env>_DUMP_IDS=<file> dumps generated ids (i32).

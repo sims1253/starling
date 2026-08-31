@@ -28,7 +28,9 @@ extern "C" {
 //   3 — added STARLING_GGML_HOJO (HojoAI/Hojo-ASR-V1).
 //   4 — added STARLING_GGML_GRANITE (ibm-granite/granite-speech-4.1-2b).
 //   5 — added STARLING_GGML_QWEN3 (Qwen/Qwen3-ASR-1.7B-hf).
-//   6 — added STARLING_GGML_AUDEX (nvidia/Nemotron-Labs-Audex-2B).
+//   6 — added STARLING_GGML_S1 (superwhisper/s1-mini) + the text-in entry
+//       point starling_ggml_normalize_text, and STARLING_GGML_AUDEX
+//       (nvidia/Nemotron-Labs-Audex-2B).
 #define STARLING_GGML_ABI_VERSION 6
 
 // ABI / build introspection --------------------------------------------------
@@ -52,7 +54,8 @@ typedef enum {
     STARLING_GGML_HOJO         = 5,  // HojoAI/Hojo-ASR-V1
     STARLING_GGML_GRANITE      = 6,  // ibm-granite/granite-speech-4.1-2b
     STARLING_GGML_QWEN3        = 7,  // Qwen/Qwen3-ASR-1.7B-hf
-    STARLING_GGML_AUDEX        = 8,  // nvidia/Nemotron-Labs-Audex-2B
+    STARLING_GGML_S1           = 8,  // superwhisper/s1-mini (text normalizer)
+    STARLING_GGML_AUDEX        = 9,  // nvidia/Nemotron-Labs-Audex-2B
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------
@@ -95,8 +98,20 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
                                     const float * samples, int64_t n,
                                     int sample_rate);
 
-// Free a string returned by starling_ggml_transcribe_pcm (no-op on NULL).
+// Free a string returned by starling_ggml_transcribe_pcm or
+// starling_ggml_normalize_text (no-op on NULL).
 void starling_ggml_free_string(char * s);
+
+// Normalize one raw ASR transcript with a text model (s1). Returns a
+// malloc'd UTF-8 string the caller frees with starling_ggml_free_string, or
+// NULL on error. The control arguments accept NULL for their defaults
+// (styling="semi-formal", structure="prose", context="general"); unknown
+// values are rejected — the model was only trained on the shipped sets.
+char * starling_ggml_normalize_text(starling_ggml_ctx * ctx,
+                                    const char * transcript,
+                                    const char * styling,
+                                    const char * structure,
+                                    const char * context);
 
 #ifdef __cplusplus
 } // extern "C"

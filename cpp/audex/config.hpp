@@ -9,7 +9,9 @@
 // 20 heads x 64, FULL bidirectional attention (no mask -- padded tail
 // frames attend like any other), erf-GELU FFN 1280 -> 5120 -> 1280 ->
 // avg-pooler halving 1500 -> 750 -> final biased LayerNorm). The projector
-// is RMSNorm(1280, eps 1e-5, F.rms_norm single-round) -> fc1 1280 -> 4096
+// is RMSNorm(1280, eps 1e-5 — the hand-written NemotronDenseAudexRMSNorm:
+// f32 normalize + affine, one bf16 round, i.e. the single-round discipline)
+// -> fc1 1280 -> 4096
 // -> relu(x)^2 -> fc2 -> 2048 (all bias-free). The decoder is a
 // Nemotron-Dense 2B trunk: 28 layers, bias-free GQA 16Q/8KV head_dim 128,
 // hidden 2048, relu2 MLP (up -> relu^2 -> down, NO gate), UNTIED lm_head,

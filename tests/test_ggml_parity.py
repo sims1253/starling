@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -719,3 +720,82 @@ def test_starling_ggml_parakeet_idstream_parity(
             f"ggml={out_nb[first:first + 8]} golden={golden_nb[first:first + 8]} "
             f"(raw id len ggml={len(out_ids)} golden={len(golden_ids)})"
         )
+
+
+# --------------------------------------------------------------------------- #
+# S1-mini (superwhisper/s1-mini) — text normalizer parity (ABI 6, slug "s1").
+# --------------------------------------------------------------------------- #
+STARLING_GGML_S1_MODEL = Path(os.environ.get(
+    "STARLING_GGML_S1_MODEL",
+    str(_REPO_ROOT / "models" / "s1-mini-bf16-exact.gguf"),
+)).expanduser()
+
+
+def _starling_ggml_s1_available() -> bool:
+    try:
+        from starling._ggml import available
+        return available() and STARLING_GGML_S1_MODEL.exists()
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="module")
+def starling_ggml_s1_engine():
+    if not _starling_ggml_s1_available():
+        pytest.skip("in-tree libstarling_ggml (ABI 6) or s1 GGUF unavailable")
+    from starling._ggml import S1, GgmlModel
+
+    engine = GgmlModel(S1, str(STARLING_GGML_S1_MODEL))
+    yield engine
+    engine.close()
+
+
+@pytest.mark.skipif(not _starling_ggml_s1_available(),
+                    reason="in-tree libstarling_ggml (ABI 6) or s1 GGUF unavailable")
+@pytest.mark.parametrize("tier", ["short", "medium", "long"])
+def test_starling_ggml_s1_text_parity(starling_ggml_s1_engine, tier: str) -> None:
+    """The in-tree C engine returns the stock greedy normalization text.
+
+    Gates the whole text path: C++ BPE encode (Qwen pre-tokenizer regex +
+    byte-level merges) + baked chat template + plain embedding lookup +
+    Qwen3 trunk greedy decode stopping on <|im_end|> OR <|endoftext|>, against
+    the eager stock golden captured by starling.s1.golden (which runs the
+    model-card quickstart verbatim). Asserts exact text parity.
+    """
+    from starling.s1.golden import GREEDY_TEXT, load_golden_text
+
+    sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
+    import s1_transcripts as fx  # noqa: E402
+
+    golden_text = load_golden_text(GREEDY_TEXT.format(tier=tier))
+    out = starling_ggml_s1_engine.normalize_text(fx.LENGTH_TIERS[tier])
+    assert out == golden_text, (
+        f"in-tree S1 normalization mismatch on {tier}:\n"
+        f"  golden: {golden_text!r}\n  ggml:   {out!r}"
+    )
+
+
+@pytest.mark.skipif(not _starling_ggml_s1_available(),
+                    reason="in-tree libstarling_ggml (ABI 6) or s1 GGUF unavailable")
+def test_starling_ggml_s1_control_matrix(starling_ggml_s1_engine) -> None:
+    """Every trained control combination (4 styling x 2 structure x 2
+    context) produces non-degenerate output on the trained path (the
+    transcript has real content, so an empty return IS the
+    hallucination-shaped degenerate case), and unknown control values are
+    rejected with a clear error."""
+    import s1_transcripts as fx  # noqa: E402  (tests/fixtures on sys.path)
+
+    n = 0
+    for transcript, styling, structure, context in fx.CONTROL_MATRIX:
+        out = starling_ggml_s1_engine.normalize_text(
+            transcript, styling, structure, context)
+        assert isinstance(out, str) and out.strip(), (
+            f"degenerate (empty) output for {styling}/{structure}/{context}"
+        )
+        n += 1
+    assert n == 16
+
+    for bad in ({"styling": "pirate"}, {"structure": "table"}, {"context": "space"}):
+        with pytest.raises(RuntimeError, match="unknown"):
+            starling_ggml_s1_engine.normalize_text(
+                "hello", bad.get("styling"), bad.get("structure"), bad.get("context"))

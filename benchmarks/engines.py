@@ -1575,6 +1575,148 @@ def _starling_ggml_qwen3_keys() -> list[str]:
     return []
 
 
+# ====================================================================== #
+# S1-mini (superwhisper/s1-mini) — text normalizer (no audio front-end)
+# ====================================================================== #
+_S1_TRANSCRIPTS: dict[str, str] | None = None
+
+
+def _s1_transcripts() -> dict[str, str]:
+    """The s1 transcript fixtures, loaded by file path (the tests package is
+    not importable from the benchmark scripts' working set)."""
+    global _S1_TRANSCRIPTS
+    if _S1_TRANSCRIPTS is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "s1_transcripts", REPO_ROOT / "tests" / "fixtures" / "s1_transcripts.py")
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        _S1_TRANSCRIPTS = dict(mod.LENGTH_TIERS)
+    return _S1_TRANSCRIPTS
+
+
+def _s1_tier_transcript(audio: np.ndarray) -> str:
+    """Map the bench grid's audio-fixture tier to the s1 transcript fixture.
+
+    The shared grid is audio-shaped; s1 is text-in/text-out, so its engines
+    key the transcript by the fixture's duration tier (short/medium/long).
+    """
+    dur = len(audio) / 16000.0
+    tier = "short" if dur < 10.0 else ("medium" if dur < 30.0 else "long")
+    return _s1_transcripts()[tier]
+
+
+def _s1_available() -> bool:
+    try:
+        import starling.s1  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+class S1Starling(Engine):
+    """starling CUDA-graph pipeline for S1-mini (K-step captured decode)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling", "s1", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.s1.pipeline import NormalizePipeline
+
+        self.pipe = NormalizePipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        text, _ = self.pipe.normalize(_s1_tier_transcript(audio))
+        return text
+
+
+class S1Stock(Engine):
+    """Stock ``model.generate`` reference for S1-mini (the model-card path)."""
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "s1", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.s1.config import SYSTEM_PROMPT, control_line, max_new_tokens_for
+        from starling.s1.loader import load_model_and_tokenizer
+
+        self._system = SYSTEM_PROMPT
+        self._control_line = control_line
+        self._budget = max_new_tokens_for
+        self.model, self.tok = load_model_and_tokenizer(attn_impl="eager")
+
+    def _release(self) -> None:
+        self.model = self.tok = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        transcript = _s1_tier_transcript(audio)
+        messages = [
+            {"role": "system", "content": self._system},
+            {"role": "user", "content": f"{self._control_line()}\n{transcript}"},
+        ]
+        text = self.tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False)
+        inputs = self.tok(text, return_tensors="pt").to(self.model.device)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs, max_new_tokens=self._budget(inputs.input_ids.shape[1]),
+                do_sample=False)
+        ids = out[0][inputs.input_ids.shape[1]:]
+        return self.tok.decode(ids, skip_special_tokens=True)
+
+
+STARLING_GGML_S1_MODEL = Path(os.environ.get(
+    "STARLING_GGML_S1_MODEL",
+    str(REPO_ROOT / "models" / "s1-mini-bf16-exact.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlS1(Engine):
+    """Starling's in-tree S1-mini ggml engine (ctypes, text path)."""
+
+    def __init__(self) -> None:
+        super().__init__("starling-ggml", "s1", supports_batch=False)
+        self._model = None
+
+    @property
+    def available(self) -> bool:
+        try:
+            from starling._ggml import available as _sggml_available
+            return _sggml_available() and STARLING_GGML_S1_MODEL.exists()
+        except Exception:
+            return False
+
+    def _load(self) -> None:
+        from starling._ggml import S1, GgmlModel
+        self._model = GgmlModel(S1, str(STARLING_GGML_S1_MODEL))
+
+    def _release(self) -> None:
+        if self._model is not None:
+            self._model.close()
+            self._model = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        return self._model.normalize_text(_s1_tier_transcript(audio))
+
+
+def _s1_keys() -> list[str]:
+    if _s1_available():
+        return ["starling-s1", "stock-s1"]
+    return []
+
+
+def _starling_ggml_s1_keys() -> list[str]:
+    if StarlingGgmlS1().available:
+        return ["starling-ggml-s1"]
+    return []
+
+
 STARLING_GGML_AUDEX_MODEL = Path(os.environ.get(
     "STARLING_GGML_AUDEX_MODEL",
     str(REPO_ROOT / "models" / "audex-2b-bf16-exact.gguf"),
@@ -1965,14 +2107,15 @@ def _higgs_keys() -> list[str]:
 
 def available_keys() -> list[str]:
     """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
-    return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys()
+    return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys() + _s1_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys()
             + _ggml_parakeet_keys() + _ggml_moss_keys()
             + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys()
             + _starling_ggml_ark_keys() + _starling_ggml_higgs_keys()
             + _starling_ggml_hojo_keys() + _starling_ggml_granite_keys()
-            + _starling_ggml_qwen3_keys() + _starling_ggml_audex_keys())
+            + _starling_ggml_qwen3_keys() + _starling_ggml_s1_keys()
+            + _starling_ggml_audex_keys())
 
 
 def build_engines(
@@ -2024,6 +2167,10 @@ def build_engines(
                 chosen[mdl].append(StarlingGgmlHiggs())
             elif mdl == "hojo":
                 chosen[mdl].append(StarlingGgmlHojo())
+            elif mdl == "s1":
+                chosen[mdl].append(StarlingGgmlS1())
+            elif mdl == "audex":
+                chosen[mdl].append(StarlingGgmlAudex())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,
@@ -2035,6 +2182,9 @@ def build_engines(
             chosen[mdl].append(cls())
         elif mdl == "higgs":
             cls = HiggsStarling if fam == "starling" else HiggsStock
+            chosen[mdl].append(cls())
+        elif mdl == "s1":
+            cls = S1Starling if fam == "starling" else S1Stock
             chosen[mdl].append(cls())
         else:
             chosen[mdl].append(ENGINE_REGISTRY[key]())

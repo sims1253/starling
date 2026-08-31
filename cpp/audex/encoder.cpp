@@ -14,7 +14,10 @@
 // heads x 64, biased erf-GELU FFN 1280 -> 5120 -> 1280. The avg-pooler
 // halves 1500 -> 750 (pairs averaged in f32, one bf16 round — torch
 // avg_pool1d's acc-type kernel) and the final biased LayerNorm closes the
-// encoder. The projector is F.rms_norm-style RMSNorm(1280, eps 1e-5) ->
+// encoder. The projector's norm is the hand-written
+// NemotronDenseAudexRMSNorm (f32 normalize + f32 affine, ONE bf16 round at
+// the return — numerically the F.rms_norm single-round discipline; only the
+// decoder trunk's NemotronDenseRMSNorm literally calls F.rms_norm) ->
 // bias-free fc1 1280 -> 4096 -> relu(x)^2 -> bias-free fc2 -> 2048.
 //
 // The conv stack is an explicit F32 im2col + F32 GEMM (see conv1d_step),
