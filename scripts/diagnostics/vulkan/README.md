@@ -73,9 +73,10 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    ne[2]*nb[2] via the contiguous-copy path, descriptor ranges sized to
    ggml_nbytes, ALIGNED gated on 8-divisible strides) — cache-view bf16
    back to fp-epsilon, moss + granite stage ids byte-identical CPU-vs-
-   Vulkan on the default hot path. The two residual `test_batched_mulmat`
-   "FAIL" lines are the f16-STORAGE-noise class (maxdiff 0.04, identical
-   with and without striding and present in the plain f16 control) — see 4.
+   Vulkan on the default hot path. The two f16 `test_batched_mulmat`
+   probes carry the documented f16-STORAGE-noise class (maxdiff 0.04,
+   identical with and without striding and present in the plain f16
+   control) and gate at 5e-2; bf16/f32 probes gate at 2e-2 — see 4.
 
 4. **Known numeric classes that remain (not correctness bugs).** f16-stored
    operands show ~4e-2 storage noise vs CPU (the encoder-stage drift in the
