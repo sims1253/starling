@@ -77,8 +77,14 @@ def map_key(src: str) -> str | None:
 
     # Subsampling output projection (Linear).
     # transformers: encoder.pre_encoder.out.weight / .bias
+    #               encoder.subsampling.linear.weight / .bias
     if s.startswith("encoder.pre_encoder.out."):
         return "encoder.pre_encode.out." + s[len("encoder.pre_encoder.out."):]
+    if s.startswith("encoder.subsampling.linear."):
+        return "encoder.pre_encode.out." + s[len("encoder.subsampling.linear."):]
+    # transformers: encoder.subsampling.layers.{i}.{weight,bias}
+    if s.startswith("encoder.subsampling.layers."):
+        return "encoder.pre_encode.conv." + s[len("encoder.subsampling.layers."):]
 
     # ---- conformer layers ----
     # transformers: encoder.conformer_encoder.layers.{i}.{...}
@@ -89,6 +95,25 @@ def map_key(src: str) -> str | None:
                 "encoder.layers."):
         if s.startswith(pfx):
             tail = s[len(pfx):]
+            # The HF rel-pos attention and conv BatchNorm names inside each
+            # conformer layer, translated to the NeMo names (in parentheses)
+            # the C++ engine reads:
+            #   q_proj        -> linear_q        k_proj -> linear_k
+            #   v_proj        -> linear_v        o_proj -> linear_out
+            #   relative_k_proj -> linear_pos
+            #   bias_u/bias_v -> pos_bias_u/pos_bias_v
+            #   conv.norm.*   -> conv.batch_norm.*
+            for old, new in (
+                ("self_attn.q_proj.", "self_attn.linear_q."),
+                ("self_attn.k_proj.", "self_attn.linear_k."),
+                ("self_attn.v_proj.", "self_attn.linear_v."),
+                ("self_attn.o_proj.", "self_attn.linear_out."),
+                ("self_attn.relative_k_proj.", "self_attn.linear_pos."),
+                ("self_attn.bias_u", "self_attn.pos_bias_u"),
+                ("self_attn.bias_v", "self_attn.pos_bias_v"),
+                ("conv.norm.", "conv.batch_norm."),
+            ):
+                tail = tail.replace(old, new)
             # The conformer layer internal naming matches NeMo for most tensors.
             # Some transformers versions rename modules; handle known renames:
             # feed_forward1 → feed_forward1, self_attn → self_attn, etc.
@@ -111,6 +136,20 @@ def map_key(src: str) -> str | None:
     # Also handle the direct naming (no "prediction." infix in some versions).
     if s.startswith("decoder.embed."):
         return "decoder.prediction.embed." + s[len("decoder.embed."):]
+
+    # The flat HF decoder naming (the engine reads the NeMo-style names):
+    #   decoder.embedding.weight          -> decoder.prediction.embed.weight
+    #   decoder.lstm.weight_ih_l0 ...      -> decoder.prediction.dec_rnn.lstm.*
+    #   decoder.decoder_projector.{w,b}    -> joint.pred.{w,b}     (pred->joint proj)
+    #   joint.head.{w,b}                   -> joint.joint_net.2.{w,b} (output proj)
+    if s.startswith("decoder.embedding."):
+        return "decoder.prediction.embed." + s[len("decoder.embedding."):]
+    if s.startswith("decoder.lstm."):
+        return "decoder.prediction.dec_rnn.lstm." + s[len("decoder.lstm."):]
+    if s.startswith("decoder.decoder_projector."):
+        return "joint.pred." + s[len("decoder.decoder_projector."):]
+    if s.startswith("joint.head."):
+        return "joint.joint_net.2." + s[len("joint.head."):]
 
     # ---- joint network ----
     # transformers: joint.encoder_joint.{i}.weight / .bias  (encoder proj)
@@ -223,11 +262,17 @@ def extract_mel_filterbank(processor: Any) -> tuple[np.ndarray, np.ndarray, dict
 # KV metadata
 # ---------------------------------------------------------------------------
 def resolve_config_attr(config: Any, *keys: str) -> Any:
-    for key in keys:
-        if hasattr(config, key):
-            val = getattr(config, key)
-            if val is not None:
-                return val
+    # Search the config itself first, then its sub-configs: transformers >= 5
+    # moved the encoder/decoder attributes of ParakeetTDTConfig into nested
+    # configs (encoder_config.hidden_size etc.) and renamed some
+    # (num_decoder_layers for decoder_num_layers).
+    sub_configs = [getattr(config, a, None) for a in ("encoder_config", "decoder_config")]
+    for cfg in (config, *[sc for sc in sub_configs if sc is not None]):
+        for key in keys:
+            if hasattr(cfg, key):
+                val = getattr(cfg, key)
+                if val is not None:
+                    return val
     raise AttributeError(f"config missing required attribute (checked: {', '.join(keys)})")
 
 
@@ -249,11 +294,12 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], prof
     w.add_key_value("parakeet.preprocessor.log_zero_guard", frontend["log_zero_guard"], V.FLOAT32)
 
     # ---- encoder ----
-    d_model = resolve_config_attr(config, "d_model")
+    d_model = resolve_config_attr(config, "d_model", "hidden_size")
     n_layers = resolve_config_attr(config, "encoder_layers", "num_hidden_layers", "n_layers")
-    pred_out = resolve_config_attr(config, "encoder_hidden_size", "output_hidden_size")
+    pred_out = resolve_config_attr(config, "encoder_hidden_size", "output_hidden_size",
+                                   "decoder_hidden_size")
     n_heads = resolve_config_attr(config, "encoder_attention_heads", "num_attention_heads")
-    ff_dim = resolve_config_attr(config, "encoder_feedforward_dim")
+    ff_dim = resolve_config_attr(config, "encoder_feedforward_dim", "intermediate_size")
     conv_kernel = resolve_config_attr(config, "conv_kernel_size")
     sub_channels = resolve_config_attr(config, "subsampling_conv_channels")
     w.add_key_value("parakeet.encoder.d_model", d_model, V.UINT32)
@@ -268,12 +314,14 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], prof
 
     # ---- decoder (prediction net) ----
     pred_hidden = resolve_config_attr(config, "decoder_hidden_size", "pred_hidden")
-    pred_rnn_layers = resolve_config_attr(config, "decoder_num_layers", "pred_rnn_layers")
+    pred_rnn_layers = resolve_config_attr(config, "decoder_num_layers",
+                                          "num_decoder_layers", "pred_rnn_layers")
     w.add_key_value("parakeet.decoder.pred_hidden", pred_hidden, V.UINT32)
     w.add_key_value("parakeet.decoder.pred_rnn_layers", pred_rnn_layers, V.UINT32)
 
     # ---- joint ----
-    joint_hidden = resolve_config_attr(config, "joint_hidden_size", "joint_hidden")
+    joint_hidden = resolve_config_attr(config, "joint_hidden_size", "joint_hidden",
+                                       "decoder_hidden_size")
     w.add_key_value("parakeet.joint.joint_hidden", joint_hidden, V.UINT32)
     w.add_string("parakeet.joint.activation", "relu")
 
@@ -281,6 +329,12 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], prof
     max_symbols = resolve_config_attr(config, "max_symbols_per_step", "max_symbols")
     vocab_size = resolve_config_attr(config, "vocab_size")
     blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
+    # The engine's parakeet.vocab_size EXCLUDES the blank id (vocab_p1 =
+    # vocab_size + 1 == embedding rows), while transformers' ParakeetTDTConfig
+    # .vocab_size includes it (embed rows == blank_id + 1). The reference GGUF
+    # records 8192 for a 8193-row embedding.
+    assert blank_id == vocab_size - 1, (blank_id, vocab_size)
+    vocab_size = blank_id
     w.add_key_value("parakeet.decoding.max_symbols", max_symbols, V.UINT32)
     w.add_key_value("parakeet.vocab_size", vocab_size, V.UINT32)
     w.add_key_value("parakeet.blank_id", blank_id, V.UINT32)
@@ -345,6 +399,18 @@ def main() -> int:
     # Extract tokenizer pieces.
     print("[convert_parakeet] extracting tokenizer pieces ...")
     pieces = extract_tokenizer_pieces(processor)
+    # The engine's detokenizer drops blank emissions because pieces.size() ==
+    # vocab_size (blank-EXCLUDED; see capi_parakeet.cpp's decode_ids note), so
+    # truncate the piece table at the blank id.
+    blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
+    if len(pieces) not in (blank_id, blank_id + 1):
+        sys.exit(
+            f"unexpected tokenizer piece count {len(pieces)} for blank_id "
+            f"{blank_id}: expected {blank_id} (blank excluded) or "
+            f"{blank_id + 1} (blank still attached)"
+        )
+    if len(pieces) > blank_id:
+        pieces = pieces[:blank_id]
     print(f"  {len(pieces)} pieces")
 
     # Write GGUF.
@@ -370,13 +436,41 @@ def main() -> int:
         if gguf_name is None:
             continue
 
-        # Convert to numpy in the right dtype.
-        if args.dtype == "bf16":
+        # Convert to numpy in the right dtype. Mirroring the reference f16
+        # GGUF layout (the layout the engine's conv path is built around —
+        # conformer.cpp casts the pointwise conv weights to F16 in-graph):
+        #   * conv weights (subsampling / pointwise / depthwise)  -> F16
+        #     (ggml_conv_2d im2col types the activations after the weight; a
+        #      BF16 weight produces BF16 activations, which the CPU backend's
+        #      mul_mat wdata path rejects)
+        #   * linear / embedding weights                            -> BF16
+        #   * every bias, LayerNorm/BatchNorm parameter, BN running
+        #     stat and positional vector                           -> F32
+        def tensor_kind(name: str) -> str:
+            if (name.endswith(".bias") or ".bias_" in name          # LSTM b_ih/b_hh
+                    or ".norm_" in name or name.startswith("norm_")
+                    or ".conv.batch_norm." in name or "pos_bias_" in name
+                    or name in ("preprocessor.featurizer.fb",
+                                "preprocessor.featurizer.window")
+                    # PredictionNet::ensure_embed_host_ D2H-reads the embedding
+                    # table as F32 (prediction.cpp).
+                    or name == "decoder.prediction.embed.weight"):
+                return "f32"
+            if (".conv." in name or name.endswith("_conv.weight")
+                    or ".depthwise_conv." in name):
+                return "f16"
+            return "bf16"
+        kind = tensor_kind(gguf_name)
+        if args.dtype == "bf16" and kind == "bf16":
             if tensor.dtype != torch.bfloat16:
                 tensor = tensor.to(torch.bfloat16)
             a = np.ascontiguousarray(tensor.view(torch.uint16).numpy())
             w.add_tensor(gguf_name, a, raw_shape=a.shape,
                         raw_dtype=gguf.GGMLQuantizationType.BF16)
+        elif kind == "f16":
+            a = np.ascontiguousarray(tensor.to(torch.float16).numpy())
+            w.add_tensor(gguf_name, a, raw_shape=a.shape,
+                        raw_dtype=gguf.GGMLQuantizationType.F16)
         else:
             a = np.ascontiguousarray(tensor.float().numpy())
             w.add_tensor(gguf_name, a)
