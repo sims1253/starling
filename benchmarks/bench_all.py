@@ -90,7 +90,7 @@ def _cuda_sync() -> None:
 
 def _cuda_reset_peak() -> None:
     if torch.cuda.is_available():
-        _cuda_reset_peak()
+        torch.cuda.reset_peak_memory_stats()
 
 
 def _time_samples_ms(fn, *, warmup: int, reps: int) -> list[float]:
