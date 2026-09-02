@@ -18,7 +18,8 @@ The keep patterns cover all nine engines' tensor names (dry-run verified),
 and the numeric_profile is honestly relabeled to the quant — which the
 LOADERS gate: only parakeet's loader accepts an arbitrary profile today,
 so quantized files currently LOAD on parakeet only. The other engines
-(granite/qwen3/audex/hojo/moss/ark/higgs) validate starling.numeric_profile
+(granite/qwen3/audex/hojo/moss/ark/higgs/s1) validate
+starling.numeric_profile
 and refuse; relaxing those gates is a deliberate engine-side decision.
 Validated end-to-end on parakeet (0.0% fixture WER at q8_0/q5_0/q4_0).
 
@@ -40,10 +41,6 @@ from gguf.lazy import LazyNumpyTensor
 from gguf.quants import quantize
 from gguf.constants import GGML_QUANT_SIZES
 
-# Substrings covering every non-matmul tensor family across the engines'
-# GGUFs (checked against cpp/*/loader.cpp require-lists and the converters):
-# conv kernels (enc.conv1..3, conv_out, audio.conv2d1..3, conv_up/conv_depth/
-# conv_down, pointwise/depthwise, subsampling), norms, BatchNorm (bn_*,
 # Substrings covering every non-matmul tensor family across the engines'
 # GGUFs (checked against cpp/*/loader.cpp require-lists and the converters,
 # then dry-run over all nine engine GGUFs):
