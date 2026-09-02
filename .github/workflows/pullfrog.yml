@@ -39,7 +39,7 @@ jobs:
         # freezes; a future incompatible cleanup hook fails every run after
         # the agent finished), so .github/dependabot.yml keeps this SHA and
         # the checkout pin below fresh (weekly github-actions bumps).
-        uses: pullfrog/pullfrog@7ba9425d187df30638b003d6cee67f3d36023243
+        uses: pullfrog/pullfrog@v0
         with:
           prompt: ${{ inputs.prompt }}
         env:
