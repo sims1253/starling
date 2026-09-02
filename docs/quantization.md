@@ -221,6 +221,61 @@ calibration-hungry — a production imatrix for the 25-language v3 wants
 Granary-scale coverage, not 10 MLS minutes. This is the miniaturized version
 of exactly the multilingual-calibration story Granary exists for.
 
+## Language-coverage dynamics (FLEURS, controlled experiment)
+
+How much does the calibration language mix matter, and does covering all 25
+languages cost English? Three imatrices with EQUAL per-language budgets
+(12 FLEURS train clips each: English-only, English+German, all 25 languages
+— 197,830 observations for the 25-language matrix), evaluated on FLEURS test
+clips the calibration never touched (en/de: 50 clips, others: 8). All
+absolute numbers are FLEURS-domain with jiwer normalization — the f32 row is
+the reference, not a leaderboard.
+
+25-language mean WER (Δ vs the f32 mean of 13.90):
+
+| calibration → | EN only | EN + DE | all 25 |
+|---------------|---------|---------|--------|
+| q4_k_m        | 13.79 (−0.11) — flat regardless |
+| q2_k          | 16.96 (+3.06) | 16.70 (+2.80) | **16.47 (+2.57)** |
+| iq2_xxs+shrink| 26.40 (+12.50) | 25.61 (+11.71) | **25.18 (+11.28)** |
+
+English and German specifically:
+
+| model        | calib | wer_en | Δen  | wer_de | Δde  |
+|--------------|-------|--------|------|--------|------|
+| iq2_xxs+shrk | EN    | 6.94   | +0.51| 8.79   | **+3.74** |
+| iq2_xxs+shrk | EN+DE | 7.12   | +0.69| 7.72   | +2.67 |
+| iq2_xxs+shrk | 25    | 7.46   | +1.03| 7.93   | +2.88 |
+| q2_k         | 25    | 6.37   | −0.06| 6.08   | +1.03 |
+
+Takeaways:
+
+- **Coverage ordering is real and monotone**: the 25-language mean improves
+  EN-only → EN+DE → all-25 at both bit levels. Small per step (~0.3–0.8),
+  consistent everywhere.
+- **English pays essentially nothing for full coverage** (≤ +1.0 WER at the
+  worst level, within 50-clip noise). There is no English-vs-coverage
+  tradeoff here: ship the 25-language-calibrated quant.
+- **German wants to be in the calibration set** (iq2_xxs: +3.74 EN-only vs
+  +2.7–2.9 when included), matching the MLS result.
+- **2 bits are an EN/major-language trade**: the iq2_xxs mean gap is carried
+  by the tail languages — Lithuanian/Latvian/Slovenian/Romanian/Finnish/
+  Swedish degrade +14–29 points over f32 with ANY calibration (the 25-lang
+  matrix trims only 2–4 of those points). Those languages need q2_k (+2.6
+  mean, evenly spread) or q4_k_m (free). For an EN+DE deployment, iq2_xxs
+  at 325 MB stays within ~+1/+3 points of f32 on exactly those languages.
+
+Caveats: 8 test clips per non-EN/DE language (per-language σ ≈ ±5 points —
+read the means and the en/de columns, not single cells), and the imatrix
+budgets are minutes-per-language, far below what Granary-scale audio would
+give the 25-language matrix.
+
+Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
+HTTP range reads on the parquet shards (~100 MB per config instead of the
+2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
+clips to collection/eval — the datasets-library streaming path accumulates
+multi-GB per config and stalled repeatedly next to a loaded model.
+
 Takeaways:
 
 - **q4_k_m is free**: 704 MB (28% of F32) with zero measurable loss on noisy

@@ -50,6 +50,13 @@ def main() -> int:
                     help="additionally evaluate N German clips from the MLS "
                          "de_de test split (streamed, human transcripts; "
                          "v3 is multilingual so quant levels must hold DE)")
+    ap.add_argument("--fleurs-eval", action="append", default=[], metavar="CFG:N",
+                    help="additionally evaluate mean WER over N test clips "
+                         "of google/fleurs CFG (repeatable), e.g. de_de:60")
+    ap.add_argument("--corpus", action="append", default=[], metavar="DIR",
+                    help="evaluate wavs+txt sidecars from a fleurs_download "
+                         "corpus dir; one mean-WER column per "
+                         "<config>_<split> prefix")
     ap.add_argument("--json", default=None, help="optional JSON output path")
     args = ap.parse_args()
 
@@ -67,6 +74,33 @@ def main() -> int:
     else:
         def noised(audio):
             return audio
+
+    fleurs_evals: dict[str, list[tuple]] = {}
+    if args.fleurs_eval:
+        from fleurs_util import fleurs_clips
+        for spec in args.fleurs_eval:
+            cfg, _, n = spec.partition(":")
+            fleurs_evals[cfg] = [
+                (audio, text) for _, audio, text in fleurs_clips({cfg: int(n)}, split="test")
+            ]
+            print(f"[fleurs-eval] {cfg}: {len(fleurs_evals[cfg])} test clips")
+
+    corpus_evals: dict[str, list[tuple]] = {}
+    if args.corpus:
+        import numpy as np
+        import soundfile as sf
+        for cdir in args.corpus:
+            for wav in sorted(Path(cdir).expanduser().glob("*.wav")):
+                txt = wav.with_suffix(".txt")
+                if not txt.exists():
+                    continue
+                prefix = wav.stem.rsplit("_", 1)[0]  # <config>_<split>
+                audio, sr = sf.read(str(wav), dtype="float32", always_2d=False)
+                assert sr == 16000, f"{wav} at {sr} Hz"
+                corpus_evals.setdefault(prefix, []).append(
+                    (np.ascontiguousarray(audio), txt.read_text().strip()))
+        for prefix, clips_ in corpus_evals.items():
+            print(f"[corpus] {prefix}: {len(clips_)} clips")
 
     rows = []
     de_clips: list[tuple] = []
@@ -126,6 +160,14 @@ def main() -> int:
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in de_clips]
                 row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
+            for cfg, clips_ in fleurs_evals.items():
+                wers = [wer_pct(ref, eng.transcribe(audio)[0])
+                        for audio, ref in clips_]
+                row["wer"][f"fleurs_{cfg}"] = round(sum(wers) / len(wers), 2)
+            for prefix, clips_ in corpus_evals.items():
+                wers = [wer_pct(ref, eng.transcribe(audio)[0])
+                        for audio, ref in clips_]
+                row["wer"][prefix] = round(sum(wers) / len(wers), 2)
         finally:
             eng.close()
         rows.append(row)
@@ -136,8 +178,10 @@ def main() -> int:
         return 1
 
     cols = list(tiers)
-    if any("mls_de" in r["wer"] for r in rows):
-        cols.append("mls_de")
+    for r in rows:  # extra columns (mls_de, fleurs_*) in first-seen order
+        for k in r["wer"]:
+            if k not in cols:
+                cols.append(k)
     hdr = f"{'model':<16} {'MB':>7} " + " ".join(f"{'wer_' + t:>10}" for t in cols)
     print("\n" + hdr)
     print("-" * len(hdr))
@@ -148,7 +192,7 @@ def main() -> int:
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=2))
         print(f"\nwrote {args.json}")
-    if de_clips:
+    if de_clips or fleurs_evals:
         # datasets>=5 streaming leaves a thread that crashes interpreter
         # finalization; flush everything, then exit hard.
         sys.stdout.flush()
