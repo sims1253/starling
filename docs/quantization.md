@@ -270,6 +270,34 @@ read the means and the en/de columns, not single cells), and the imatrix
 budgets are minutes-per-language, far below what Granary-scale audio would
 give the 25-language matrix.
 
+## Does more calibration data help? (volume saturation)
+
+No — not at fixed coverage, for this model. Scaling the EN+DE calibration
+from 12 to 60 clips per language (15k → 76k observations, same split and
+balance) moved nothing beyond eval noise:
+
+| model   | calib volume | wer_de | wer_en |
+|---------|--------------|--------|--------|
+| q2_k    | 12/lang      | 6.78   | 6.11   |
+| q2_k    | 60/lang      | 7.13   | 5.70   |
+| iq2_xxs | 12/lang      | 7.72   | 7.12   |
+| iq2_xxs | 60/lang      | 8.43   | 7.25   |
+
+(f32 references: DE 5.05, EN 6.43; 50-clip evals, σ ≈ ±0.9.)
+
+The mechanism is visible in the matrices themselves: the per-channel
+importance vectors of the 12-clip and 60-clip imatrices agree at **0.993
+mean cosine across all 275 tensors** — the activation statistics saturate at
+roughly a dozen clips per language, so the quantizer makes the same block-
+scale decisions either way. The remaining low-bit gaps (DE ≈ +2.7 at
+iq2_xxs, ≈ +1 at q2_k) are the inherent error of that bit width for those
+languages, not a calibration-data deficit. What does move them: more bits
+(q4_k_m is free), or *different* data — calibration audio matched to the
+deployment domain, since FLEURS's read-speech distribution is itself part of
+the residual gap. By the same saturation argument, the tail languages'
++14–29-point iq2_xxs degradation is bit-width-driven too; the remedy is the
+quant level, not more calibration clips.
+
 Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
 HTTP range reads on the parquet shards (~100 MB per config instead of the
 2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
