@@ -13,7 +13,9 @@
 #include "moss/tokenizer.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -31,8 +33,10 @@ static void stat(const char* stage, const std::vector<float>& v) {
         uint32_t b; memcpy(&b, &x, 4);
         mix = (mix ^ b) * 1099511628211ull;
     }
+    float f0 = v.size() > 0 ? v[0] : 0.0f, f1 = v.size() > 1 ? v[1] : 0.0f,
+          f2 = v.size() > 2 ? v[2] : 0.0f;
     printf("%-14s n=%-7zu sum=%-14.4f maxabs=%-10.6g fnv=%016llx first=%g %g %g\n",
-           stage, v.size(), sum, mx, (unsigned long long)mix, v[0], v[1], v[2]);
+           stage, v.size(), sum, mx, (unsigned long long)mix, f0, f1, f2);
 }
 
 int main() {
@@ -44,13 +48,18 @@ int main() {
     FILE* f = fopen("tests/fixtures/short.wav", "rb");
     if (!f) { fprintf(stderr, "no fixture wav\n"); return 2; }
     // read wav via soundfile-less minimal RIFF parse: find data chunk, 16-bit mono 16k
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_END) != 0) { fprintf(stderr, "seek failed\n"); return 2; }
+    long sz = ftell(f);
+    if (sz <= 12) { fprintf(stderr, "bad wav size\n"); fclose(f); return 2; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fprintf(stderr, "seek failed\n"); return 2; }
     std::vector<unsigned char> wav(sz);
-    fread(wav.data(), 1, sz, f); fclose(f);
+    if (fread(wav.data(), 1, sz, f) != (size_t)sz) { fprintf(stderr, "short read\n"); fclose(f); return 2; }
+    fclose(f);
     size_t off = 12;
     std::vector<float> pcm;
-    while (off + 8 < (size_t)sz) {
+    while (off + 8 <= (size_t)sz) {
         unsigned clen = wav[off+4] | (wav[off+5]<<8) | (wav[off+6]<<16) | ((unsigned)wav[off+7]<<24);
+        if (off + 8 + clen > (size_t)sz) { fprintf(stderr, "chunk overruns file\n"); return 2; }
         if (!memcmp(wav.data()+off, "data", 4)) {
             for (size_t i = 0; i + 1 < clen; i += 2) {
                 short s = wav[off+8+i] | (wav[off+8+i+1]<<8);
@@ -76,18 +85,25 @@ int main() {
 
     auto prompt = moss::build_transcribe_prompt(m.config, 743);
     moss::InputsEmbeds ie;
-    if (const char* ov = getenv("STAGE_CMP_EMBEDS")) {
+    if (const char* ov = std::getenv("STAGE_CMP_EMBEDS")) {
         FILE* g = fopen(ov, "rb");
+        if (!g) { fprintf(stderr, "cannot open %s\n", ov); return 2; }
         fseek(g, 0, SEEK_END); long gs = ftell(g); fseek(g, 0, SEEK_SET);
+        if (gs <= 0 || gs % 4 != 0) { fprintf(stderr, "bad embeds size %ld\n", gs); fclose(g); return 2; }
         ie.data.resize(gs / 4);
-        fread(ie.data.data(), 4, gs / 4, g); fclose(g);
+        if (fread(ie.data.data(), 4, gs / 4, g) != (size_t)(gs / 4)) { fprintf(stderr, "short embeds read\n"); fclose(g); return 2; }
+        fclose(g);
         ie.n_tokens = (int64_t)prompt.ids.size(); ie.width = m.config.llm.hidden;
         stat("inputs_embeds(OVR)", ie.data);
     } else {
         if (!moss::build_inputs_embeds(m, prompt, adap, ie, e)) { fprintf(stderr, "embeds: %s\n", e.c_str()); return 2; }
         stat("inputs_embeds", ie.data);
-        FILE* d = fopen("/tmp/embeds_dump.f32", "wb");
-        fwrite(ie.data.data(), 4, ie.data.size(), d); fclose(d);
+        const char* dump = std::getenv("STAGE_CMP_DUMP");
+        std::string dp = dump && *dump ? dump : "/tmp/embeds_dump.f32";
+        FILE* d = fopen(dp.c_str(), "wb");
+        if (!d) { fprintf(stderr, "cannot open %s for dump\n", dp.c_str()); return 2; }
+        if (fwrite(ie.data.data(), 4, ie.data.size(), d) != ie.data.size()) { fprintf(stderr, "short dump write\n"); fclose(d); return 2; }
+        fclose(d);
     }
 
     moss::PrefillResult pf;

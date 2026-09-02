@@ -11,9 +11,9 @@ LIBS="build/third_party/ggml/src/libggml.so build/third_party/ggml/src/libggml-b
       build/third_party/ggml/src/ggml-vulkan/libggml-vulkan.so.0 build/third_party/ggml/src/libggml-cpu.so.0"
 RPATH="-Wl,-rpath,$PWD/build/third_party/ggml/src -Wl,-rpath,$PWD/build/third_party/ggml/src/ggml-vulkan"
 
-$GXX -O2 -std=c++17 $INC -o /tmp/test_bf16_gemv test_bf16_gemv.cpp $LIBS $RPATH
-$GXX -O2 -std=c++17 $INC -o /tmp/test_ops      test_ops.cpp       $LIBS $RPATH
-$GXX -O2 -std=c++17 $INC -o /tmp/stage_cmp     stage_cmp.cpp      build/libstarling_ggml.so $LIBS $RPATH
+$GXX -O2 -std=c++17 $INC -o /tmp/test_bf16_gemv scripts/diagnostics/vulkan/test_bf16_gemv.cpp $LIBS $RPATH
+$GXX -O2 -std=c++17 $INC -o /tmp/test_ops      scripts/diagnostics/vulkan/test_ops.cpp       $LIBS $RPATH
+$GXX -O2 -std=c++17 $INC -o /tmp/stage_cmp     scripts/diagnostics/vulkan/stage_cmp.cpp      build/libstarling_ggml.so $LIBS $RPATH
 ```
 
 Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.

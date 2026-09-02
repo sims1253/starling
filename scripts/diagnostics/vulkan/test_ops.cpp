@@ -7,8 +7,11 @@
 #include "ggml-impl.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static ggml_backend_t cpu, vk;
@@ -30,11 +33,16 @@ bool run(ggml_backend_t backend, F build, std::vector<float>& out) {
             std::vector<float> v(ggml_nelements(l));
             for (size_t j = 0; j < v.size(); ++j) v[j] = (float)((j % 199) + (j / 199) * 0.125) / 199.0f - 0.5f;  // injective: no argmax ties
             ggml_backend_tensor_set(l, v.data(), 0, v.size() * 4);
-        } else if (l->type == GGML_TYPE_I64 || l->type == GGML_TYPE_I32) {
+        } else if (l->type == GGML_TYPE_I64) {
             int64_t n2 = ggml_nelements(l);
             std::vector<int64_t> v(n2);
             for (int64_t j = 0; j < n2; ++j) v[j] = (j * 5) % 13;  // valid row ids
-            ggml_backend_tensor_set(l, v.data(), 0, n2 * ggml_type_size(l->type));
+            ggml_backend_tensor_set(l, v.data(), 0, n2 * sizeof(int64_t));
+        } else if (l->type == GGML_TYPE_I32) {
+            int64_t n2 = ggml_nelements(l);
+            std::vector<int32_t> v(n2);
+            for (int64_t j = 0; j < n2; ++j) v[j] = (int32_t)((j * 5) % 13);
+            ggml_backend_tensor_set(l, v.data(), 0, n2 * sizeof(int32_t));
         } else if (l->type == GGML_TYPE_BF16) {
             std::vector<ggml_bf16_t> v(ggml_nelements(l));
             for (size_t j = 0; j < v.size(); ++j) v[j] = ggml_fp32_to_bf16(((j * 37) % 199) / 199.0f - 0.5f);
@@ -67,27 +75,32 @@ bool run(ggml_backend_t backend, F build, std::vector<float>& out) {
     return true;
 }
 
+static int g_failures = 0;
+
 static void cmp(const char* name, auto build) {
     std::vector<float> a, b;
     bool ok1 = run(cpu, build, a), ok2 = run(vk, build, b);
-    if (!ok1 || !ok2) { printf("%-28s RUN FAILED\n", name); return; }
+    if (!ok1 || !ok2) { printf("%-28s RUN FAILED\n", name); ++g_failures; return; }
     double md = 0; size_t arg_a = 0, arg_b = 0;
     for (size_t i = 0; i < a.size(); ++i) {
         md = std::max(md, (double)std::fabs(a[i] - b[i]));
         if (a[i] > a[arg_a]) arg_a = i;
         if (b[i] > b[arg_b]) arg_b = i;
     }
-    printf("%-28s maxdiff=%-12.6g argmax %s(%zu vs %zu) n=%zu\n", name, md,
-           arg_a == arg_b ? "OK" : "DIFF", arg_a, arg_b, a.size());
+    bool ok = md <= 1e-4 && arg_a == arg_b;
+    if (!ok) ++g_failures;
+    printf("%-28s maxdiff=%-12.6g argmax %s(%zu vs %zu) n=%zu%s\n", name, md,
+           arg_a == arg_b ? "OK" : "DIFF", arg_a, arg_b, a.size(), ok ? "" : "  <-- FAIL");
 }
 
 int main() {
     cpu = ggml_backend_cpu_init();
     ggml_backend_dev_t vkdev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        auto ty = ggml_backend_dev_type(ggml_backend_dev_get(i));
-        if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) { vkdev = ggml_backend_dev_get(i); break; }
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (std::string(ggml_backend_dev_name(d)) == "Vulkan0") { vkdev = d; break; }
     }
+    if (!vkdev) { printf("no Vulkan0 device\n"); return 1; }
     vk = ggml_backend_dev_init(vkdev, nullptr);
     printf("device: %s\n", ggml_backend_dev_name(vkdev));
 
@@ -160,11 +173,12 @@ int main() {
         ggml_tensor* dst  = ggml_view_3d(c, cache, HD, 1, H, cache->nb[1], cache->nb[2], 5 * cache->nb[1]);
         return ggml_cpy(c, row, dst); });
     // set_rows: the K/V cache write-back op.
+    if (g_failures) printf("%d probe(s) FAILED\n", g_failures);
     cmp("set_rows into bf16 cache", [](ggml_context* c) {
         ggml_tensor* cache = ggml_new_tensor_3d(c, GGML_TYPE_BF16, HD, P, H);
         ggml_tensor* x    = ggml_new_tensor_3d(c, GGML_TYPE_F32, HD, 2, H);
         ggml_tensor* ids  = ggml_new_tensor_1d(c, GGML_TYPE_I64, 2);
         return ggml_set_rows(c, cache, x, ids); });
 
-    return 0;
+    return g_failures ? 1 : 0;
 }

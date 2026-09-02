@@ -7,7 +7,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 int main() {
@@ -44,7 +46,8 @@ int main() {
     };
 
     std::vector<float> ref, got;
-    if (!run(ggml_backend_cpu_init(), ref, GGML_TYPE_BF16)) { printf("CPU run failed\n"); return 1; }
+    ggml_backend_t cpube = ggml_backend_cpu_init();
+    if (!run(cpube, ref, GGML_TYPE_BF16)) { printf("CPU run failed\n"); return 1; }
 
     // Pick the first Vulkan device.
     ggml_backend_dev_t vkdev = nullptr;
@@ -57,6 +60,8 @@ int main() {
     printf("device: %s\n", ggml_backend_dev_name(vkdev));
     ggml_backend_t vk = ggml_backend_dev_init(vkdev, nullptr);
     if (!run(vk, got, GGML_TYPE_BF16)) { printf("VULKAN run failed\n"); return 1; }
+    double bf16_md = 0;
+    for (int i = 0; i < N; ++i) bf16_md = std::max(bf16_md, (double)std::fabs(ref[i] - got[i]));
     std::vector<float> got_f32y;
     if (!run(vk, got_f32y, GGML_TYPE_F32)) { printf("VULKAN f32y run failed\n"); return 1; }
     { double md = 0; for (int i = 0; i < N; ++i) md = std::max(md, (double)std::fabs(ref[i] - got_f32y[i]));
@@ -100,12 +105,12 @@ int main() {
             ggml_cgraph* gf = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf, cst);
             ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(vk));
-            ggml_gallocr_alloc_graph(ga, gf);
+            if (!ggml_gallocr_alloc_graph(ga, gf)) { printf("alloc failed\n"); ggml_gallocr_free(ga); ggml_free(ctx); return; }
             std::vector<uint8_t> raw(srcv.size() * (from == GGML_TYPE_F32 ? 4 : 2));
             if (from == GGML_TYPE_F32) memcpy(raw.data(), srcv.data(), raw.size());
             else for (int i = 0; i < K; ++i) { ggml_bf16_t b = ggml_fp32_to_bf16(srcv[i]); memcpy(raw.data()+2*i, &b, 2); }
             ggml_backend_tensor_set(src, raw.data(), 0, raw.size());
-            ggml_backend_graph_compute(vk, gf);
+            if (ggml_backend_graph_compute(vk, gf) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); ggml_gallocr_free(ga); ggml_free(ctx); return; }
             std::vector<float> outv(K);
             if (to == GGML_TYPE_F32) {
                 ggml_backend_tensor_get(cst, outv.data(), 0, K*4);
@@ -127,5 +132,11 @@ int main() {
         cast_test(GGML_TYPE_F32, GGML_TYPE_BF16, sv);
         cast_test(GGML_TYPE_BF16, GGML_TYPE_F32, sv);
     }
-    return maxdiff > 1e-2;
+    // The bf16-staged path must be float-exact (bf16->f32 upcast is
+    // lossless); the f16-storage control's ~4e-3 noise is informational.
+    bool pass = bf16_md <= 1e-5;
+    printf("bf16-staged maxdiff=%.6g -> %s (control %.6g informational)\n",
+           bf16_md, pass ? "PASS" : "FAIL", maxdiff);
+    (void)maxdiff;
+    return pass ? 0 : 1;
 }
