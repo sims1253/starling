@@ -92,7 +92,14 @@ const std::vector<Level> kLevels = {
     {"q4_k_m", GGML_TYPE_Q4_K,  GGML_TYPE_Q6_K,  true},
     {"q3_k_m", GGML_TYPE_Q3_K,  GGML_TYPE_Q5_K,  true},
     {"q2_k",   GGML_TYPE_Q2_K,  GGML_TYPE_Q4_K,  true},
-    {"iq4_xs", GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_XS, false},
+    // IQ formats below ~2.6 bpw REQUIRE an importance matrix (ggml refuses
+    // without one) — they only exist as calibrated builds.
+    {"iq2_s",   GGML_TYPE_IQ2_S,   GGML_TYPE_IQ2_S,   false},
+    {"iq2_xs",  GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_XS,  false},
+    {"iq2_xxs", GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, false},
+    {"iq1_m",   GGML_TYPE_IQ1_M,   GGML_TYPE_IQ1_M,   false},
+    {"iq1_s",   GGML_TYPE_IQ1_S,   GGML_TYPE_IQ1_S,   false},
+    {"iq4_xs",  GGML_TYPE_IQ4_XS,  GGML_TYPE_IQ4_XS,  false},
 };
 
 bool parse_type(const std::string& s, ggml_type* out) {
@@ -101,7 +108,9 @@ bool parse_type(const std::string& s, ggml_type* out) {
         {"q8_0", GGML_TYPE_Q8_0}, {"q6_k", GGML_TYPE_Q6_K},
         {"q5_k", GGML_TYPE_Q5_K}, {"q4_k", GGML_TYPE_Q4_K},
         {"q3_k", GGML_TYPE_Q3_K}, {"q2_k", GGML_TYPE_Q2_K},
-        {"iq4_xs", GGML_TYPE_IQ4_XS},
+        {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq2_s", GGML_TYPE_IQ2_S},
+        {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq2_xxs", GGML_TYPE_IQ2_XXS},
+        {"iq1_m", GGML_TYPE_IQ1_M}, {"iq1_s", GGML_TYPE_IQ1_S},
         {"q5_0", GGML_TYPE_Q5_0}, {"q4_0", GGML_TYPE_Q4_0},
         {"f16", GGML_TYPE_F16},   {"f32", GGML_TYPE_F32},
     };
@@ -136,10 +145,15 @@ bool is_candidate(const std::string& name, int64_t n_dims) {
     return true;
 }
 
-bool shrink_eligible(const std::string& name, int64_t /*n_dims*/) {
-    if (name.rfind("preprocessor.", 0) == 0) return false;
-    if (name.find("embed") != std::string::npos) return false;
-    return true;
+bool shrink_eligible(const std::string& name, int64_t n_dims) {
+    // Only conv WEIGHTS. They are the bulk of the kept residue (~300 MB for
+    // parakeet) and the engine consumes them through F16 paths anyway
+    // (pointwise convs are ggml_cast to F16, depthwise/subsampling convs take
+    // F16 kernels). Everything else stays F32: 1-D biases/norms/BN stats feed
+    // ggml_add/ggml_mul broadcasts which reject mixed dtypes, pos_bias_u/v
+    // likewise, and the embedding table is a raw host read.
+    return n_dims >= 3 && name.find("conv") != std::string::npos &&
+           ends_with(name, ".weight");
 }
 
 // Largest type in {requested, q8_0} whose block size divides the row length;
@@ -293,6 +307,28 @@ int main(int argc, char** argv) {
     std::unique_ptr<std::regex> bump_re;
     if (!use_recipe && level->has_bump)
         bump_re.reset(new std::regex(kBumpRegex));
+
+    // IQ formats refuse to quantize without an importance matrix — check the
+    // resolved types up front rather than deep inside ggml_quantize_chunk.
+    {
+        std::vector<ggml_type> used;
+        if (use_recipe) {
+            used.push_back(recipe.def);
+            for (const auto& r : recipe.rules) used.push_back(r.second);
+        } else {
+            used.push_back(level->base);
+            if (level->has_bump) used.push_back(level->bump);
+        }
+        for (ggml_type t : used) {
+            if (ggml_quantize_requires_imatrix(t) && args.imatrix.empty()) {
+                std::fprintf(stderr,
+                    "error: %s requires an importance matrix; pass --imatrix "
+                    "(collect one with STARLING_IMATRIX, see docs/quantization.md)\n",
+                    type_name(t));
+                return 1;
+            }
+        }
+    }
 
     // imatrix (optional).
     starling::ggml::ImatrixMap imap;

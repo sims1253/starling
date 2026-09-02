@@ -41,6 +41,9 @@ def main() -> int:
     ap.add_argument("--tiers", default="short,medium,long")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--wavs", default=None, help="optional dir of 16 kHz mono wavs/flacs")
+    ap.add_argument("--mls-de", type=int, default=None, metavar="N",
+                    help="additionally collect over N German clips from the "
+                         "MLS de_de test split (multilingual calibration)")
     args = ap.parse_args()
 
     model = Path(args.model).expanduser()
@@ -83,6 +86,34 @@ def main() -> int:
                 print(f"[skip] {p.name}: {sr} Hz != 16000 (resample first)")
                 continue
             clips.append((f"wav:{p.name}", np.ascontiguousarray(audio)))
+
+    if args.mls_de:
+        import numpy as np
+        from datasets import load_dataset
+        ds = load_dataset("facebook/multilingual_librispeech", "german",
+                          split="test", streaming=True)
+        n = 0
+        for i, ex in enumerate(ds):
+            if i >= args.mls_de:
+                break
+            aud = ex["audio"]
+            if hasattr(aud, "get_all_samples"):  # datasets>=5 lazy decoder
+                s = aud.get_all_samples()
+                array, sr = s.data.numpy(), int(s.sample_rate)  # [ch, n]
+            else:
+                array, sr = aud["array"], int(aud["sampling_rate"])
+            array = np.asarray(array, dtype=np.float32)
+            if array.ndim == 2:  # mono arrives as [1, n]
+                array = array[0] if array.shape[0] in (1, 2) else array.reshape(-1)
+            if sr != 16000:  # MLS opus decodes at 48 kHz
+                import torch
+                import torchaudio.functional as AF
+                array = AF.resample(torch.from_numpy(array), sr, 16000).numpy()
+                sr = 16000
+            assert sr == 16000, f"MLS clip at {sr} Hz"
+            clips.append((f"mls-de:{i}", np.ascontiguousarray(array)))
+            n += 1
+        print(f"[mls-de] added {n} German calibration clips")
 
     print(f"collecting over {len(clips)} clips -> {out}")
     eng.load()

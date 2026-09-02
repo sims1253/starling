@@ -137,8 +137,11 @@ self_attn\.linear_k\.weight$   q5_k
 ^decoder\.prediction\.dec_rnn\. q8_0
 ```
 
-`--shrink-f16` additionally stores the kept tensors (except the embedding and
-mel constants) as F16 for a further size cut at negligible accuracy cost.
+`--shrink-f16` additionally stores the kept CONV WEIGHTS (~300 MB for
+parakeet) as F16 — they are consumed through F16 paths anyway (the pointwise
+convs are `ggml_cast` to F16, the depthwise/subsampling convs take F16
+kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
+`ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
@@ -177,24 +180,57 @@ Clean audio — every level down to q2_k is lossless here:
 (*) a different word than the f32 row errs — sample noise at this fixture
 size, not a level effect.
 
+The size floor (`--shrink-f16` stores the ~300 MB of conv weights at F16;
+everything below ~2.1 bpw is IQ territory and REQUIRES the imatrix):
+
+| model                  |   MB | % of F32 | clean s/m | 5 dB s/m |
+|------------------------|------|----------|-----------|----------|
+| q2_k +imx              |  574 |    23%   | 0.0 / 0.0 | 8.7 / 8.7|
+| iq2_xs +imx            |  494 |    20%   | —         | 0.0 / 8.7|
+| iq2_xxs +imx           |  477 |    19%   | —         | 0.0 / 8.7|
+| iq1_m +imx             |  456 |    18%   | 0.0 / 10.1| 13.0 / 17.4|
+| **iq2_xxs +imx +shrink** | **325** | **13%** | **0.0 / 0.0** | 0.0 / 8.7 |
+| iq1_s +imx +shrink     |  292 |    12%   | —         | 26.1 (cliff) |
+
+The usable floor for this model is **iq2_xxs + imatrix + conv-shrink at
+325 MB (13% of F32)**, which stays within single-word noise of F32 on both
+clean and 5 dB-noised fixtures. IQ1 territory (≈1.6–1.75 bpw encoder) starts
+dropping words even on clean audio — the cliff, measured.
+
+## German (MLS de test, 40 clips / ~10 min, human transcripts)
+
+v3 is multilingual, so a quant level must hold German too. f32's baseline on
+these audiobook clips is 13.0% WER; the table shows the calibration-mix
+effect at the low end (imx = English fixtures only; imx2 = fixtures + the
+same 40 German clips):
+
+| model                  | wer_mls_de | note |
+|------------------------|------------|------|
+| f32                    | 13.02      | baseline |
+| q4_k_m                 | 12.72      | holds German |
+| q2_k +imx (EN-only)    | 15.30      | +2.3 over f32 |
+| q2_k +imx2 (EN+DE)     | 15.78      | mix barely matters here |
+| iq2_xxs +imx +shrink   | 29.38      | EN-only calibration breaks DE |
+| iq2_xxs +imx2 +shrink  | **20.38**  | +9 pts recovered by DE clips |
+
+Two lessons: (1) at 2 bits, **calibration-data diversity is part of quality**
+— English-only importance matrices silently cost 16 German WER points, and
+adding ten minutes of German audio recovered nine of them (English fixtures
+stayed perfect throughout); (2) the remaining gap to f32 at iq2_xxs is
+calibration-hungry — a production imatrix for the 25-language v3 wants
+Granary-scale coverage, not 10 MLS minutes. This is the miniaturized version
+of exactly the multilingual-calibration story Granary exists for.
+
 Takeaways:
 
-- **q4_k_m is free**: 704 MB (28% of F32) with zero measurable loss even on
-  degraded audio. This matches the community GGUF results for parakeet
-  (handy-computer's uncalibrated K-quants sit within ~0.05 WER points of F16
-  on LibriSpeech test-clean).
+- **q4_k_m is free**: 704 MB (28% of F32) with zero measurable loss on noisy
+  English AND German. This matches the community GGUF results for parakeet.
 - **At 2 bits, calibration is decisive**: uniform q2_k breaks down
   (30%/17%) while the imatrix-weighted q2_k matches f32 exactly at the same
-  574 MB. That is the "dynamic quant" value proposition, reproduced on an
-  ASR model with Starling's own tooling.
-- Recipes work as the sensitivity-sweep mechanism
-  (`benchmarks/recipes/parakeet-q2-attn3.recipe`: attention one notch above
-  the q2_k base) — on these fixtures the plain q2_k+imx mix held up best,
-  but the point of recipes is running exactly these experiments on real
-  corpora (Granary / Open-ASR-Leaderboard sets) per model family.
-- German verification is still open: v3 covers 25 European languages, and
-  per-language quant deltas need a multilingual eval set (Common Voice DE,
-  VoxPopuli) — the harness extension is the natural next step.
+  574 MB, and the calibrated floor reaches 325 MB (13% of F32) before the
+  IQ1 cliff.
+- **At the floor, calibration data must be multilingual** (see the German
+  table): an English-only imatrix cost 16 German WER points at iq2_xxs.
 
 ## Extending to the other engines
 
@@ -206,3 +242,12 @@ model family needs:
    never cast those weights), and
 2. its host-read tensors (embeddings, folded norms) added to the keep rules
    in `cpp/tools/starling_quantize.cpp` if their names do not already match.
+
+Concrete next target — **audex-2b** (where 2-bit savings are worth ~4 GB):
+the weights are `nvidia/Nemotron-Labs-Audex-2B` and the converter exists, but
+the audex loader's header guard (`cpp/audex/loader.cpp`,
+`check_gguf_header(..., {"bf16_exact"}, ...)`) rejects every other numeric
+profile, so the steps are: convert an f32 base, extend the guard's allowlist
+to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
+tensors (same analysis parakeet got), then run this same sweep. moss-2b and
+qwen3-asr-1.7b follow the same recipe.

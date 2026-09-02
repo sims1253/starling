@@ -46,6 +46,10 @@ def main() -> int:
                     help="add deterministic gaussian noise at this SNR to "
                          "every tier (harder inputs discriminate quant levels; "
                          "the reference text is unchanged)")
+    ap.add_argument("--mls-de", type=int, default=None, metavar="N",
+                    help="additionally evaluate N German clips from the MLS "
+                         "de_de test split (streamed, human transcripts; "
+                         "v3 is multilingual so quant levels must hold DE)")
     ap.add_argument("--json", default=None, help="optional JSON output path")
     args = ap.parse_args()
 
@@ -65,6 +69,34 @@ def main() -> int:
             return audio
 
     rows = []
+    de_clips: list[tuple] = []
+    if args.mls_de:
+        import numpy as np
+        from datasets import load_dataset
+        ds = load_dataset("facebook/multilingual_librispeech", "german",
+                          split="test", streaming=True)
+        for i, ex in enumerate(ds):
+            if i >= args.mls_de:
+                break
+            aud = ex["audio"]
+            if hasattr(aud, "get_all_samples"):  # datasets>=5 lazy decoder
+                s = aud.get_all_samples()
+                array, sr = s.data.numpy(), int(s.sample_rate)  # [ch, n]
+            else:
+                array, sr = aud["array"], int(aud["sampling_rate"])
+            array = np.asarray(array, dtype=np.float32)
+            if array.ndim == 2:  # mono arrives as [1, n]
+                array = array[0] if array.shape[0] in (1, 2) else array.reshape(-1)
+            if sr != 16000:  # MLS opus decodes at 48 kHz
+                import torch
+                import torchaudio.functional as AF
+                array = AF.resample(torch.from_numpy(array), sr, 16000).numpy()
+                sr = 16000
+            assert sr == 16000, f"MLS clip at {sr} Hz"
+            de_clips.append((np.ascontiguousarray(array), ex["transcript"]))
+        print(f"[mls-de] {len(de_clips)} German clips "
+              f"(~{sum(len(a) for a, _ in de_clips) / 16000 / 60:.1f} min)")
+
     for spec in args.models:
         label, sep, path = spec.partition("=")
         if not sep:
@@ -90,6 +122,10 @@ def main() -> int:
                 ref = REFERENCE_TRANSCRIPTS[tier]
                 row["wer"][tier] = round(wer_pct(ref, hyp), 2)
                 row["cer"][tier] = round(cer_pct(ref, hyp), 2)
+            if de_clips:
+                wers = [wer_pct(ref, eng.transcribe(audio)[0])
+                        for audio, ref in de_clips]
+                row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
         finally:
             eng.close()
         rows.append(row)
@@ -99,16 +135,24 @@ def main() -> int:
         print("no models evaluated")
         return 1
 
-    hdr = f"{'model':<16} {'MB':>7} " + " ".join(f"{'wer_' + t:>10}" for t in tiers)
+    cols = list(tiers)
+    if any("mls_de" in r["wer"] for r in rows):
+        cols.append("mls_de")
+    hdr = f"{'model':<16} {'MB':>7} " + " ".join(f"{'wer_' + t:>10}" for t in cols)
     print("\n" + hdr)
     print("-" * len(hdr))
     for r in rows:
         print(f"{r['model']:<16} {r['mb']:>7.1f} "
-              + " ".join(f"{r['wer'][t]:>10.2f}" for t in tiers))
+              + " ".join(f"{r['wer'].get(t, float('nan')):>10.2f}" for t in cols))
 
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=2))
         print(f"\nwrote {args.json}")
+    if de_clips:
+        # datasets>=5 streaming leaves a thread that crashes interpreter
+        # finalization; flush everything, then exit hard.
+        sys.stdout.flush()
+        os._exit(0)
     return 0
 
 
