@@ -1,7 +1,7 @@
 # Vulkan-backend diagnostics (ggml bf16-activation work)
 
 Debug harnesses used to bisect the Vulkan backend's bf16-activation gap on
-the AMD Ryzen 5 5650U / RADV RENOIR iGPU notebook (2026-09-02). Build from
+the AMD Ryzen 5 5650U / RADV RENOIR iGPU notebook (2026-09-02/03). Build from
 the repo root against the built ggml shared libraries:
 
 ```bash
@@ -9,12 +9,19 @@ GXX=g++
 INC="-I third_party/ggml/include -I third_party/ggml/src -I cpp -I cpp/include"
 LIBS="build/third_party/ggml/src/libggml.so build/third_party/ggml/src/libggml-base.so \
       build/third_party/ggml/src/ggml-vulkan/libggml-vulkan.so.0 build/third_party/ggml/src/libggml-cpu.so.0"
-RPATH="-Wl,-rpath,$PWD/build/third_party/ggml/src -Wl,-rpath,$PWD/build/third_party/ggml/src/ggml-vulkan"
+RPATH="-Wl,-rpath,$PWD/build/third_party/ggml/src -Wl,-rpath,$PWD/build/third_party/ggml/src/ggml-vulkan -Wl,-rpath,$PWD/build"
 
-$GXX -O2 -std=c++17 $INC -o /tmp/test_bf16_gemv scripts/diagnostics/vulkan/test_bf16_gemv.cpp $LIBS $RPATH
-$GXX -O2 -std=c++17 $INC -o /tmp/test_ops      scripts/diagnostics/vulkan/test_ops.cpp       $LIBS $RPATH
-$GXX -O2 -std=c++17 $INC -o /tmp/stage_cmp     scripts/diagnostics/vulkan/stage_cmp.cpp      build/libstarling_ggml.so $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/test_bf16_gemv      scripts/diagnostics/vulkan/test_bf16_gemv.cpp      $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/test_ops            scripts/diagnostics/vulkan/test_ops.cpp            $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/test_bmm            scripts/diagnostics/vulkan/test_batched_mulmat.cpp $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp           scripts/diagnostics/vulkan/stage_cmp.cpp           build/libstarling_ggml.so $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp_granite   scripts/diagnostics/vulkan/stage_cmp_granite.cpp   build/libstarling_ggml.so $LIBS $RPATH
 ```
+
+(zsh does not word-split unquoted variables — use `${=INC}` / `${=LIBS}`
+`${=RPATH}` or spell the flags inline. Compile with
+`env -u LD_LIBRARY_PATH g++ ...`; the ZCode AppImage exports an
+LD_LIBRARY_PATH that breaks the compiler's own internals.)
 
 Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
 
@@ -40,32 +47,62 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    silently NaNs every frequency past index 0 on BOTH backends and
    vacuously "passes").
 
-3. **Composite prefill still diverges.** `stage_cmp` runs the moss engine
-   stage-by-stage (mel -> encoder -> adapter -> inputs_embeds -> prefill
-   logits -> ids) and prints per-stage FNV/sums. With patch 0009: mel is
-   byte-identical; the encoder drifts slightly (f16-accumulation class);
-   and even when the CPU run's inputs_embeds are force-fed into the Vulkan
-   run (`STAGE_CMP_EMBEDS=/tmp/embeds_dump.f32`, byte-equal FNV), prefill
-   logits are completely different and decode degenerates to repetition.
-   With every constituent op verified exact, the divergence lives in the
-   engines' composite prefill execution on Vulkan (ReplayGraph
-   orchestration / persistent-state interaction / an op combination the
-   probes do not replicate). Reproduce:
+3. **RESOLVED — the composite prefill divergence was the wide batched
+   mul_mat on a batch-strided (KV-cache view) operand.** `stage_cmp` /
+   `stage_cmp_granite` run the moss/granite engines stage-by-stage (mel ->
+   encoder -> merged embeds -> prefill logits -> ids) and print per-stage
+   FNV/sums. Even with byte-equal force-fed embeds (`STAGE_CMP_EMBEDS=
+   /tmp/embeds_dump.f32`; the CPU run writes the dump) prefill logits were
+   garbage and decode degenerated to repetition, while the SAME graph with
+   per-head attention (`STARLING_MOSS_PERHEAD=1` — needs `_NOKSTEP=1`, the
+   per-head K-step graph overflows kGraphSize) and the legacy per-layer
+   path (`STARLING_MOSS_DUMP_LAYERS=`, which routes llm_prefill through
+   forward_legacy) were exact. That split exonerated the ReplayGraph
+   orchestration and pinned the default batched attention
+   (`mul_mat(kall[D,K,KV] bf16, q[D,S,H] bf16)` with GQA broadcast) —
+   specifically its `kall`: the kv_mode=0 prefill assembles it as
+   `ggml_cpy(k, view_3d(cache_k[D,max_cache,KV], ...))`, whose RESULT is a
+   [D,S,KV] view with batch stride nb[2] = D*max_cache != D*S.
+   ggml-vulkan passed the shader `stride_batch_x = ne00*ne01` (the
+   contiguous assumption), so every kv batch except 0 read the wrong
+   (zeroed) cache slots: heads mapped to kv 0 were exact, everything else
+   attended to all-zero keys. `test_batched_mulmat` reproduces this in
+   isolation (CACHE-VIEW probes: maxdiff 15.9 bf16 / 161.5 f32, only
+   batches >= kv 1 wrong) and verifies the fix (patch 0010: pass the real
+   nb[2]-derived stride for in-place operands, fold-guard nb[3] ==
+   ne[2]*nb[2] via the contiguous-copy path, descriptor ranges sized to
+   ggml_nbytes, ALIGNED gated on 8-divisible strides) — cache-view bf16
+   back to fp-epsilon, moss + granite stage ids byte-identical CPU-vs-
+   Vulkan on the default hot path. The two residual `test_batched_mulmat`
+   "FAIL" lines are the f16-STORAGE-noise class (maxdiff 0.04, identical
+   with and without striding and present in the plain f16 control) — see 4.
 
-   ```bash
-   STARLING_GGML_DEVICE=cpu      /tmp/stage_cmp              # writes /tmp/embeds_dump.f32
-   STARLING_GGML_DEVICE=Vulkan0  /tmp/stage_cmp              # encoder drift visible
-   STARLING_GGML_DEVICE=Vulkan0 STAGE_CMP_EMBEDS=/tmp/embeds_dump.f32 /tmp/stage_cmp
-   ```
+4. **Known numeric classes that remain (not correctness bugs).** f16-stored
+   operands show ~4e-2 storage noise vs CPU (the encoder-stage drift in the
+   non-pinned stage_cmp runs); bf16 operands are exact. The Vulkan
+   prefill logits sit within the same band as CPU's own
+   batched-vs-per-head attention difference (fp-order), ids identical.
+
+## Reproduce the moss stage comparison
+
+```bash
+STARLING_GGML_DEVICE=cpu      /tmp/stage_cmp              # writes /tmp/embeds_dump.f32
+STARLING_GGML_DEVICE=Vulkan0 STAGE_CMP_EMBEDS=/tmp/embeds_dump.f32 /tmp/stage_cmp
+```
+
+The plain (non-OVR) run OVERWRITES the dump — run CPU last before any OVR
+comparison. granite: same with `/tmp/stage_cmp_granite` and
+`/tmp/embeds_dump_granite.f32`.
 
 ## Next steps
 
-- Instrument the per-layer prefill logits inside `lib::forward_prefill`
-  (dump after layer 1, 2, ...) to find the first diverging layer on
-  Vulkan; compare against CPU with identical merged embeds.
-- Check whether the first prefill ReplayGraph's captured state (persistent
-  KV buffers + `add_graph_root` write-backs) interacts badly with the
-  Vulkan submission model (one-shot re-run vs replay).
 - Parakeet (no qwen_decode stack) runs on Vulkan but terminates TDT decode
   early — suspect f16-accumulating pipelines on matrix-core-less devices;
   try forcing f32acc pipelines.
+- higgs wrong output on CPU (byte-exact on CUDA per repo docs) — same
+  dtype-discipline family; the repo's staged golden-component probes are
+  the tool (golden files are dev-machine artifacts, not in git).
+- Optional upstream follow-up: ggml_vk_mul_mat_id_q_f16 /
+  ggml_vk_mul_mat_vec_id_q_f16 (MoE expert matmuls) still derive batch
+  strides from the contiguous assumption; no starling engine feeds them a
+  batch-strided operand, but the 0010 fix pattern applies.
