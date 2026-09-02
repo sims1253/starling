@@ -77,12 +77,12 @@ def map_key(src: str) -> str | None:
 
     # Subsampling output projection (Linear).
     # transformers: encoder.pre_encoder.out.weight / .bias
-    # transformers >= 5.13: encoder.subsampling.linear.weight / .bias
+    #               encoder.subsampling.linear.weight / .bias
     if s.startswith("encoder.pre_encoder.out."):
         return "encoder.pre_encode.out." + s[len("encoder.pre_encoder.out."):]
     if s.startswith("encoder.subsampling.linear."):
         return "encoder.pre_encode.out." + s[len("encoder.subsampling.linear."):]
-    # transformers >= 5.13: encoder.subsampling.layers.{i}.{weight,bias}
+    # transformers: encoder.subsampling.layers.{i}.{weight,bias}
     if s.startswith("encoder.subsampling.layers."):
         return "encoder.pre_encode.conv." + s[len("encoder.subsampling.layers."):]
 
@@ -95,8 +95,9 @@ def map_key(src: str) -> str | None:
                 "encoder.layers."):
         if s.startswith(pfx):
             tail = s[len(pfx):]
-            # transformers >= 5.13 renames the rel-pos attention and the conv
-            # BatchNorm inside each conformer layer (NeMo names in parentheses):
+            # The HF rel-pos attention and conv BatchNorm names inside each
+            # conformer layer, translated to the NeMo names (in parentheses)
+            # the C++ engine reads:
             #   q_proj        -> linear_q        k_proj -> linear_k
             #   v_proj        -> linear_v        o_proj -> linear_out
             #   relative_k_proj -> linear_pos
@@ -136,7 +137,7 @@ def map_key(src: str) -> str | None:
     if s.startswith("decoder.embed."):
         return "decoder.prediction.embed." + s[len("decoder.embed."):]
 
-    # transformers >= 5.13 flattens the decoder and renames the joint head:
+    # The flat HF decoder naming (the engine reads the NeMo-style names):
     #   decoder.embedding.weight          -> decoder.prediction.embed.weight
     #   decoder.lstm.weight_ih_l0 ...      -> decoder.prediction.dec_rnn.lstm.*
     #   decoder.decoder_projector.{w,b}    -> joint.pred.{w,b}     (pred->joint proj)
@@ -402,6 +403,12 @@ def main() -> int:
     # vocab_size (blank-EXCLUDED; see capi_parakeet.cpp's decode_ids note), so
     # truncate the piece table at the blank id.
     blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
+    if len(pieces) not in (blank_id, blank_id + 1):
+        sys.exit(
+            f"unexpected tokenizer piece count {len(pieces)} for blank_id "
+            f"{blank_id}: expected {blank_id} (blank excluded) or "
+            f"{blank_id + 1} (blank still attached)"
+        )
     if len(pieces) > blank_id:
         pieces = pieces[:blank_id]
     print(f"  {len(pieces)} pieces")
