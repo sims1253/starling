@@ -22,7 +22,11 @@ namespace {
 
 constexpr int kDefaultThreads = 8;
 
-std::mutex g_backend_mutex;
+// Recursive on purpose: run_graph() holds this mutex across the model's
+// build lambda, and some builders legitimately re-enter global_backend()
+// inside it (e.g. RelPosAttention's flash-vs-manual gate). A plain mutex
+// self-deadlocks the CPU path there.
+std::recursive_mutex g_backend_mutex;
 std::unique_ptr<Backend> g_backend;
 std::atomic<bool> g_shutting_down{false};
 std::atomic<bool> g_atexit_registered{false};
@@ -50,12 +54,12 @@ void set_num_threads(int n_threads) {
     g_num_threads.store(n_threads < 1 ? 1 : n_threads);
     g_threads_set.store(true);
     // Also apply to an already-created backend.
-    std::lock_guard<std::mutex> lk(g_backend_mutex);
+    std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
     if (g_backend) g_backend->set_n_threads(g_num_threads.load());
 }
 
 Backend& global_backend() {
-    std::lock_guard<std::mutex> lk(g_backend_mutex);
+    std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
     if (g_backend) return *g_backend;
     int n = g_threads_set.load() ? g_num_threads.load() : kDefaultThreads;
     g_backend = std::make_unique<Backend>(n);
@@ -73,7 +77,7 @@ Backend& global_backend() {
 
 bool run_graph(const std::function<ggml_tensor*(ggml_context*)>& build,
                std::vector<float>& out) {
-    std::lock_guard<std::mutex> lk(g_backend_mutex);
+    std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
     return g_backend ? g_backend->compute(build, out) : false;
 }
 
@@ -96,7 +100,7 @@ void shutdown_backend() {
     // 2. Reset the global Backend (frees its device buffers + captured CUDA
     //    graphs + the ggml_cuda_graph instances).
     {
-        std::lock_guard<std::mutex> lk(g_backend_mutex);
+        std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
         g_backend.reset();
     }
 }

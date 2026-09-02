@@ -10,6 +10,7 @@
 
 #include "lib/model_registry.hpp"
 #include "runtime/graph.hpp"  // global_backend, shutdown_backend, shutting_down
+#include "runtime/imatrix.hpp"  // ImatrixCollector (imatrix_flush_pub)
 
 #include <cstdlib>
 #include <cstring>
@@ -252,6 +253,13 @@ int64_t * starling_ggml_parakeet_decode_ids_pub(starling_ggml_ctx * ctx,
     int64_t* r = starling_ggml_parakeet_decode_ids(ctx->model, pcm, n, out_n, &err);
     if (!r) set_global_error(err ? err : "decode_ids failed");
     return r;
+}
+
+// Flush the activation-importance collector (STARLING_IMATRIX mode) to disk
+// NOW instead of at process exit. The ctypes drivers call this before freeing
+// the model so a teardown crash can never eat the collection.
+void starling_ggml_imatrix_flush_pub(void) {
+    starling::ggml::ImatrixCollector::instance().flush();
 }
 
 } // extern "C"

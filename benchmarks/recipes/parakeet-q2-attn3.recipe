@@ -1,0 +1,12 @@
+# Example starling-quantize recipe: a q2_k base with the attention
+# projections a notch higher, FFN at the base, and the 640-row joint/LSTM
+# linears on their automatic q8_0 fallback (block-size rule).
+#
+#   ./build/starling-quantize --input models/parakeet-tdt-0.6b-v3-f32.gguf \
+#       --output models/parakeet-tdt-0.6b-v3-recipe-attn3.gguf \
+#       --recipe benchmarks/recipes/parakeet-q2-attn3.recipe \
+#       --imatrix models/parakeet-tdt-0.6b-v3.imx.bin
+#
+# Patterns are ECMAScript regexes matched with first-match-wins.
+default q2_k
+self_attn\.linear_[qvko]\.weight$ q3_k

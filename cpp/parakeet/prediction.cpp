@@ -64,11 +64,14 @@ void PredictionNet::ensure_embed_host_() const {
     ensure_weights_realized(ml_);
     ggml_tensor* emb = ml_.tensor("decoder.prediction.embed.weight");
     assert(emb && "missing decoder.prediction.embed.weight");
-    embed_host_.resize((size_t)vocab_p1_ * H_);
-    // Read the (F32) embedding table row-major: ggml row i == embedding of id i,
-    // ne[0]=H fastest.
+    // The table may carry vocab_size rows (the checkpoint's layout: blank IS
+    // the last SentencePiece piece) or vocab_size + 1 (converter-padded).
+    // Fetch what exists row-major and zero-fill the remainder so a phantom
+    // last-token lookup stays in bounds.
+    embed_host_.assign((size_t)vocab_p1_ * H_, 0.0f);
+    const int64_t rows = emb->ne[1] < (int64_t)vocab_p1_ ? emb->ne[1] : (int64_t)vocab_p1_;
     ggml_backend_tensor_get(emb, embed_host_.data(), 0,
-                            (size_t)vocab_p1_ * H_ * sizeof(float));
+                            (size_t)rows * H_ * sizeof(float));
 }
 
 void PredictionNet::step(int32_t token_id, bool is_sos,

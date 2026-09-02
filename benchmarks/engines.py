@@ -1260,6 +1260,18 @@ STARLING_GGML_PARAKEET_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
+def _starling_ggml_parakeet_model() -> Path:
+    """Model path, re-reading ``STARLING_GGML_PARAKEET_MODEL`` at each use.
+
+    The module-level constant is frozen at import; this helper lets one
+    process sweep several GGUFs (the quantization WER runs) without spawning
+    a worker per model.
+    """
+    return Path(os.environ.get(
+        "STARLING_GGML_PARAKEET_MODEL",
+        str(STARLING_GGML_PARAKEET_MODEL))).expanduser()
+
+
 class StarlingGgmlParakeet(Engine):
     """Starling's OWN in-tree ggml engine (libstarling_ggml).
 
@@ -1283,14 +1295,14 @@ class StarlingGgmlParakeet(Engine):
     def available(self) -> bool:
         try:
             from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_PARAKEET_MODEL.exists()
+            return _sggml_available() and _starling_ggml_parakeet_model().exists()
         except Exception:
             return False
 
     # -- lifecycle ---------------------------------------------------------
     def _load(self) -> None:
         from starling._ggml import GgmlModel, PARAKEET_TDT
-        self._model = GgmlModel(PARAKEET_TDT, str(STARLING_GGML_PARAKEET_MODEL))
+        self._model = GgmlModel(PARAKEET_TDT, str(_starling_ggml_parakeet_model()))
 
     def _release(self) -> None:
         if self._model is not None:

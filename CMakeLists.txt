@@ -193,6 +193,37 @@ set_target_properties(starling_ggml PROPERTIES
 
 
 # --------------------------------------------------------------------------- #
+# starling-quantize: the calibrated-quantization CLI for Starling GGUFs.
+#
+# Post-processes an f32/f16/bf16 GGUF into a quantized one (k-quants + q8_0),
+# optionally weighted by an importance matrix collected on calibration audio
+# (STARLING_IMATRIX via the engine). See docs/quantization.md.
+option(STARLING_QUANTIZE "Build the starling-quantize GGUF quantizer CLI" ON)
+if(STARLING_QUANTIZE)
+  add_executable(starling-quantize ${CMAKE_SOURCE_DIR}/cpp/tools/starling_quantize.cpp)
+  target_include_directories(starling-quantize PRIVATE
+      ${CMAKE_SOURCE_DIR}/cpp
+      ${CMAKE_SOURCE_DIR}/cpp/runtime
+      ${CMAKE_SOURCE_DIR}/third_party/ggml/include
+      ${CMAKE_SOURCE_DIR}/third_party/ggml/src)
+  target_link_libraries(starling-quantize PRIVATE ggml)
+  set_target_properties(starling-quantize PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+  # mel_dump: debug aid — dump the engine mel features of a wav (see
+  # docs/quantization.md and the converter's mel contract).
+  add_executable(mel_dump ${CMAKE_SOURCE_DIR}/cpp/tools/mel_dump.cpp
+      $<TARGET_OBJECTS:starling_ggml_core>)
+  target_include_directories(mel_dump PRIVATE
+      ${CMAKE_SOURCE_DIR}/cpp
+      ${CMAKE_SOURCE_DIR}/cpp/runtime ${CMAKE_SOURCE_DIR}/cpp/parakeet
+      ${CMAKE_SOURCE_DIR}/third_party/ggml/include)
+  target_link_libraries(mel_dump PRIVATE ggml)
+  set_target_properties(mel_dump PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+
+# --------------------------------------------------------------------------- #
 # starling-serve: the native HTTP/WebSocket serving binary.
 #
 # A self-contained executable that wraps libstarling_ggml behind the same
