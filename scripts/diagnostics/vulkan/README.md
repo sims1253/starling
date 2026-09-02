@@ -32,7 +32,13 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    soft_max_ext with mask, rope, argmax, casts f32<->bf16, get_rows(bf16),
    set_rows into a bf16 cache, cache view+cpy write-back, GEMV T=1/7,
    wide matmul T=64/512, 3-D KV-cache-shaped batched GEMV — all maxdiff at
-   fp-epsilon, argmax-equal.
+   fp-epsilon, argmax-equal. Notes: the leaf-seed pattern is injective so
+   the argmax probe compares whole 32-bit indices without backend
+   tie-break differences (tie order differs between backends by design —
+   the engines' argmax_low_ties exists for that); rope uses the pinned
+   ggml_rope_ext signature (mode, not a rope_type arg — a shifted call
+   silently NaNs every frequency past index 0 on BOTH backends and
+   vacuously "passes").
 
 3. **Composite prefill still diverges.** `stage_cmp` runs the moss engine
    stage-by-stage (mel -> encoder -> adapter -> inputs_embeds -> prefill

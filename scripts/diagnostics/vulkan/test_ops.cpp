@@ -28,7 +28,7 @@ bool run(ggml_backend_t backend, F build, std::vector<float>& out) {
         ggml_tensor* l = gf->leafs[i];
         if (l->type == GGML_TYPE_F32) {
             std::vector<float> v(ggml_nelements(l));
-            for (size_t j = 0; j < v.size(); ++j) v[j] = ((j * 37) % 199) / 199.0f - 0.5f;
+            for (size_t j = 0; j < v.size(); ++j) v[j] = (float)((j % 199) + (j / 199) * 0.125) / 199.0f - 0.5f;  // injective: no argmax ties
             ggml_backend_tensor_set(l, v.data(), 0, v.size() * 4);
         } else if (l->type == GGML_TYPE_I64 || l->type == GGML_TYPE_I32) {
             int64_t n2 = ggml_nelements(l);
@@ -44,12 +44,24 @@ bool run(ggml_backend_t backend, F build, std::vector<float>& out) {
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { printf("  compute failed\n"); ggml_gallocr_free(ga); ggml_free(ctx); return false; }
     // Read result as f32 (cast bf16 outputs).
     size_t n = ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) ggml_backend_tensor_get(t, out.data(), 0, n * 4);
-    else {
+    if (t->type == GGML_TYPE_F32) {
+        out.resize(n);
+        ggml_backend_tensor_get(t, out.data(), 0, n * 4);
+    } else if (t->type == GGML_TYPE_BF16) {
+        out.resize(n);
         std::vector<ggml_bf16_t> b(n);
         ggml_backend_tensor_get(t, b.data(), 0, n * 2);
         for (size_t j = 0; j < n; ++j) out[j] = ggml_bf16_to_fp32(b[j]);
+    } else if (t->type == GGML_TYPE_I32) {
+        // argmax-style integer results: compare whole 32-bit indices via
+        // the float vector (bit-exact roundtrip for |v| < 2^24).
+        out.resize(n);
+        std::vector<int32_t> iv(n);
+        ggml_backend_tensor_get(t, iv.data(), 0, n * 4);
+        for (size_t j = 0; j < n; ++j) out[j] = (float)iv[j];
+    } else {
+        printf("  unhandled output type %s\n", ggml_type_name(t->type));
+        return false;
     }
     ggml_gallocr_free(ga); ggml_free(ctx);
     return true;
@@ -105,7 +117,7 @@ int main() {
     cmp("rope(f32 q)", [](ggml_context* c) {
         ggml_tensor* q = ggml_new_tensor_3d(c, GGML_TYPE_F32, HD, H, T);
         ggml_tensor* pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
-        return ggml_rope_ext(c, q, pos, nullptr, HD, 2, 0, GGML_ROPE_TYPE_NORMAL, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f); });
+        return ggml_rope_ext(c, q, pos, nullptr, HD, GGML_ROPE_TYPE_NORMAL, 32768, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); });
 
     cmp("argmax(f32)", [](ggml_context* c) {
         ggml_tensor* x = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1000);
