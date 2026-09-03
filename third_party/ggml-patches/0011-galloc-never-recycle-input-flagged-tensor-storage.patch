@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Thu, 3 Sep 2026 20:10:00 +0200
+Subject: [PATCH] galloc: never recycle INPUT-flagged tensor storage
+
+ggml_gallocr's live-range reuse frees a tensor's chunk for reuse the
+moment its last in-graph consumer has been walked (n_children and
+n_views both zero), and only GGML_TENSOR_FLAG_OUTPUT nodes are exempt
+("graph outputs are never freed"). GGML_TENSOR_FLAG_INPUT affects
+allocation ORDER only — an input leaf's chunk is still recycled after
+its last read and can be handed to late intermediates.
+
+That breaks the alloc-once / compute-many contract: a caller that
+allocates a cgraph once (ggml_gallocr_alloc_graph), uploads its input
+tensors, and then computes the SAME cgraph repeatedly (re-uploading
+only the varying inputs) silently reads garbage from replay #2 — the
+tail of compute #1 writes intermediates over the once-seeded inputs,
+and every later compute re-reads the poison.
+
+This is exactly the parakeet TDT K-step decoder failure on Vulkan
+(WER 60.9-87.0% on the tiled fixtures, tokens correct until the first
+replay boundary, then f32-bit-pattern garbage in the decode ring —
+e.g. the i32 duration table slot read back as 0x40000000, the raw
+bytes of the f32 dur_final that compute #1's tail wrote there; full
+trace in scripts/diagnostics/vulkan/README.md). Evidence that pinned
+it: the dispatch streams of replay #1 vs #2 are byte-identical (same
+buffers/offsets/ranges) while the device bytes differ; the aliased
+offsets are visible in the dispatch log (dur_final's add lands inside
+dur_tbl's chunk); and re-uploading every once-seeded input before each
+replay cures it even WITHOUT this patch (discriminating control).
+The moss/qwen K-step graph survives only because its engine
+re-uploads its constant inputs before every replay. Upstream master
+has the same INPUT/OUTPUT asymmetry (not filed upstream — repo
+policy).
+
+Fix, mirroring the OUTPUT exemption in both reuse paths:
+
+  - ggml_gallocr_free_node: never free GGML_TENSOR_FLAG_INPUT nodes;
+  - ggml_gallocr_allocate_node's parent-reuse path: never reuse an
+    INPUT-flagged parent in place (checked one level through
+    view_src, like the existing OUTPUT check).
+
+Cost: input chunks stay pinned until the end of one alloc pass —
+bounded by the total size of galloc-owned inputs; chunks are all
+released at the next reserve/alloc_graph pass regardless. Graphs that
+re-upload inputs every compute (llama.cpp-style) are unaffected
+besides the negligible peak-memory delta.
+
+Verified on RADV RENOIR (Ryzen 5 5650U iGPU): parakeet TDT multistep
+decode at K=2 and K=16 now produces the exact CPU transcript on the
+short/medium/long fixtures (bf16 + q8_0) with the once-per-utterance
+input seeding; moss + granite stage comparators, test_ops and the
+batched-mulmat harness all unchanged.
+
+starling-issue: vulkan backend unlock
+---
+ src/ggml-alloc.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/ggml-alloc.c b/src/ggml-alloc.c
+index a71838e..6cd954a 100644
+--- a/src/ggml-alloc.c
++++ b/src/ggml-alloc.c
+@@ -648,6 +648,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+                     continue;
+                 }
+ 
++                // [starling 0011] inputs cannot be reused in-place either: an
++                // elementwise op taking over its input leaf's storage is safe
++                // within one compute, but clobbers data a caller may have
++                // uploaded once for repeated computes of the same cgraph.
++                if (parent->flags & GGML_TENSOR_FLAG_INPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_INPUT)) {
++                    AT_PRINTF("not reusing parent %s for %s as it is an input\n", parent->name, node->name);
++                    continue;
++                }
++
+                 if (!ggml_are_same_layout(node, parent)) {
+                     AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
+                     continue;
+@@ -695,6 +704,18 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
+         return;
+     }
+ 
++    // [starling 0011] graph inputs are never freed for reuse either. The
++    // gallocr contract for a caller that computes the SAME cgraph repeatedly
++    // (alloc once via ggml_gallocr_alloc_graph, set inputs, N x compute) is
++    // that input storage stays valid across computes: an input leaf's chunk
++    // recycled after its last in-graph read gets clobbered by late
++    // intermediates of compute #1, and every subsequent compute re-reads the
++    // garbage. Mirrors the OUTPUT exemption above.
++    if (node->flags & GGML_TENSOR_FLAG_INPUT) {
++        AT_PRINTF("not freeing input %s\n", node->name);
++        return;
++    }
++
+     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+     int buffer_id = hn->buffer_id;
+     struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
