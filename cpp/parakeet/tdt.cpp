@@ -19,6 +19,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace starling::ggml::parakeet {
@@ -29,6 +30,32 @@ namespace starling::ggml::parakeet {
 static bool tdt_serial_forced() {
     const char* e = std::getenv("STARLING_GGML_TDT_SERIAL");
     return e && e[0] == '1';
+}
+
+// The K-step multistep graph replays ONE captured cgraph per K decode steps.
+// On the Vulkan backend every replay AFTER the first reads parts of the graph
+// state stale/garbage (deterministic: the ring frames jump to f32-bit-pattern
+// values like 1073741824.0 while the device-cache leaves read back correct —
+// full trace + the ggml-vulkan scheduling-bug analysis in
+// scripts/diagnostics/vulkan/README.md), corrupting the TDT frame chain and
+// terminating decode early (WER 61-87% on fixtures, tokens correct until the
+// first replay boundary). Both multistep sub-paths (device-resident D1 and
+// the host round-trip baseline) are affected; a single-replay graph (K >=
+// steps) is exact, as are the serial and per-step fused paths. Until the
+// ggml-vulkan bug is patched, gate the multistep capture off on Vulkan and
+// decode through the serial loop with the per-step FUSED graph below (still
+// one host<-device sync per step; ~10-20ms per utterance on the 5650U iGPU
+// vs the broken path). STARLING_GGML_TDT_KSTEP_FORCE=1 re-enables it (for
+// re-validation after an upstream/ggml-vulkan fix).
+static bool tdt_multistep_available() {
+    if (!global_backend().is_gpu()) return false;
+    if (tdt_serial_forced()) return false;
+    const std::string dev = global_backend().device_name();
+    if (dev.rfind("Vulkan", 0) == 0 &&
+        std::getenv("STARLING_GGML_TDT_KSTEP_FORCE") == nullptr) {
+        return false;
+    }
+    return true;
 }
 
 std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
@@ -44,10 +71,11 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
     // ONE CUDA graph and sync once per K steps instead of once per step. The
     // serial loop below is launch/sync-bound; this collapses ~T syncs to ~T/K.
     // Byte-exact with the serial loop (emits EVERY token, including blanks, to
-    // match the golden id stream). On CPU, when the serial path is forced, or
-    // if capture fails, tdt_greedy_multistep returns nullopt and we fall through
-    // to the serial loop. Mirrors parakeet.cpp's tdt.cpp dispatch.
-    if (global_backend().is_gpu() && !tdt_serial_forced()) {
+    // match the golden id stream). On CPU, when the serial path is forced, on
+    // Vulkan (see tdt_multistep_available), or if capture fails,
+    // tdt_greedy_multistep returns nullopt and we fall through to the serial
+    // loop. Mirrors parakeet.cpp's tdt.cpp dispatch.
+    if (tdt_multistep_available()) {
         // Safety ceiling on encoder length (protects against an unbounded-length
         // capture on extraordinarily long audio); override with
         // STARLING_GGML_TDT_KSTEP_MAX_T (a value < T forces the serial path).

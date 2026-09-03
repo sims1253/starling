@@ -14,6 +14,7 @@ RPATH="-Wl,-rpath,$PWD/build/third_party/ggml/src -Wl,-rpath,$PWD/build/third_pa
 $GXX -O2 -std=c++20 $INC -o /tmp/test_bf16_gemv      scripts/diagnostics/vulkan/test_bf16_gemv.cpp      $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/test_ops            scripts/diagnostics/vulkan/test_ops.cpp            $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/test_bmm            scripts/diagnostics/vulkan/test_batched_mulmat.cpp $LIBS $RPATH
+$GXX -O1 -std=c++20 $INC -o /tmp/test_kstep_replay   scripts/diagnostics/vulkan/test_kstep_replay.cpp   $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp           scripts/diagnostics/vulkan/stage_cmp.cpp           build/libstarling_ggml.so $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp_granite   scripts/diagnostics/vulkan/stage_cmp_granite.cpp   build/libstarling_ggml.so $LIBS $RPATH
 ```
@@ -84,6 +85,40 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    prefill logits sit within the same band as CPU's own
    batched-vs-per-head attention difference (fp-order), ids identical.
 
+5. **Parakeet TDT early-termination root-caused to a ggml-vulkan
+   intra-graph stale-read scheduling bug; worked around engine-side.**
+   Parakeet ran on Vulkan but stopped transcribing early (WER 60.9-87.0%
+   on the tiled fixtures vs 0.0% CPU; bf16 and q8_0 alike). Bisect:
+   `GGML_VK_DISABLE_F16` (f32acc pipelines — hypothesis falsified),
+   `GGML_VK_DISABLE_FUSION` / `GGML_VK_DISABLE_GRAPH_OPTIMIZE`,
+   `GGML_VK_SERIALIZE_SUBMISSIONS` / `GGML_VK_DISABLE_ASYNC`,
+   `GGML_VK_MAX_NODES_PER_SUBMIT` both directions: no effect. The serial
+   TDT loop (`STARLING_GGML_TDT_SERIAL=1`) and the serial+fused path
+   (`STARLING_GGML_TDT_KSTEP_MAX_T=1`) are EXACT on Vulkan; a single-replay
+   K-step graph (`STARLING_GGML_TDT_KSTEP=96` on the short fixture) is
+   exact too — every replay AFTER the first of the SAME captured K-step
+   cgraph corrupts (both the device-resident add_graph_root sub-path at
+   K<=16 and the host round-trip baseline at K>16). `STARLING_GGML_TDT_KSTEP_DEBUG=1`
+   traces it precisely: replay 1's ring is sane and the device-cache
+   leaves read back correct (frame=26, write-back cpys fine), then replay
+   2's ring frames jump to f32-bit-pattern garbage (1073741824.0 =
+   float(0x40000000), dur_final = 1065353216.0 = float(0x3F800000) bits)
+   — i.e. ops read OTHER tensors' bytes / pre-write buffer state.
+   `test_kstep_replay` (new) shrinks the class to a 21-node no-replay
+   graph: an ARGMAX over a [64]-row reads zeros on Vulkan while its input
+   tensor is byte-identical to the CPU reference by the end of the
+   compute — a graph-shape-dependent execution-ordering/read violation in
+   ggml-vulkan's batch/semaphore choreography (isolated argmax, with or
+   without a view, is correct). **Workaround (this repo):** tdt.cpp gates
+   the K-step multistep capture off on Vulkan* devices and decodes via
+   the serial loop + per-step fused graph (exact; one host<-device sync
+   per step). `STARLING_GGML_TDT_KSTEP_FORCE=1` re-enables it for
+   re-validation after a ggml-vulkan fix. Validation: short/medium/long
+   fixtures now produce the full tiled transcripts on Vulkan (bf16 +
+   q8_0); the long tier differs from CPU by one punctuation token
+   (~0.7% WER; fp-tie class, same family as the encoder drift), vs
+   79.6% before.
+
 ## Reproduce the moss stage comparison
 
 ```bash
@@ -97,9 +132,13 @@ comparison. granite: same with `/tmp/stage_cmp_granite` and
 
 ## Next steps
 
-- Parakeet (no qwen_decode stack) runs on Vulkan but terminates TDT decode
-  early — suspect f16-accumulating pipelines on matrix-core-less devices;
-  try forcing f32acc pipelines.
+- **ggml-vulkan scheduling bug (finding 5):** root-cause the stale-read
+  violation in ggml_vk_build_graph / ggml_vk_compute_forward's batch +
+  semaphore choreography using test_kstep_replay as the entry point, patch
+  ggml (patch 0011 candidate), then drop the tdt.cpp Vulkan gate (validate
+  with STARLING_GGML_TDT_KSTEP_FORCE=1 + the fixtures). The moss/qwen K-step
+  graphs (bf16 activations, no tiny i32 get_rows chains) do NOT trigger it
+  and stay on the multistep path.
 - higgs wrong output on CPU (byte-exact on CUDA per repo docs) — same
   dtype-discipline family; the repo's staged golden-component probes are
   the tool (golden files are dev-machine artifacts, not in git).
