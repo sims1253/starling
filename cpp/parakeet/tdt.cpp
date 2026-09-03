@@ -33,28 +33,31 @@ static bool tdt_serial_forced() {
 }
 
 // The K-step multistep graph replays ONE captured cgraph per K decode steps.
-// On the Vulkan backend every replay AFTER the first reads parts of the graph
-// state stale/garbage (deterministic: the ring frames jump to f32-bit-pattern
-// values like 1073741824.0 while the device-cache leaves read back correct —
-// full trace + the ggml-vulkan scheduling-bug analysis in
-// scripts/diagnostics/vulkan/README.md), corrupting the TDT frame chain and
-// terminating decode early (WER 61-87% on fixtures, tokens correct until the
-// first replay boundary). Both multistep sub-paths (device-resident D1 and
-// the host round-trip baseline) are affected; a single-replay graph (K >=
-// steps) is exact, as are the serial and per-step fused paths. Until the
-// ggml-vulkan bug is patched, gate the multistep capture off on Vulkan and
-// decode through the serial loop with the per-step FUSED graph below (still
-// one host<-device sync per step; ~10-20ms per utterance on the 5650U iGPU
-// vs the broken path). STARLING_GGML_TDT_KSTEP_FORCE=1 re-enables it (for
-// re-validation after an upstream/ggml-vulkan fix).
+// On the Vulkan backend every replay AFTER the first computes parts of the
+// graph state from garbage (deterministic: the ring frames jump to
+// f32-bit-pattern values like 1073741824.0 while the device-cache leaves
+// read back correct — full trace in scripts/diagnostics/vulkan/README.md),
+// corrupting the TDT frame chain and terminating decode early (WER 61-87%
+// on fixtures, tokens correct until the first replay boundary). Both
+// multistep sub-paths (device-resident D1 and the host round-trip baseline)
+// are affected; a single-replay graph (K >= steps) is exact, as are the
+// serial and per-step fused paths. The mechanism inside ggml-vulkan is not
+// yet identified (f16acc/fusion/graph-optimize/submission-batching knobs
+// are all excluded). Until it is patched, gate the multistep capture off on
+// Vulkan and decode through the serial loop with the per-step FUSED graph
+// below (still one host<-device sync per step; ~10-20ms per utterance on
+// the 5650U iGPU vs the broken path). STARLING_GGML_TDT_KSTEP_FORCE=1
+// re-enables it (value-checked like tdt_serial_forced, so =0 keeps the
+// safe default) — for re-validation after a ggml-vulkan fix.
+static bool tdt_multistep_forced() {
+    const char* e = std::getenv("STARLING_GGML_TDT_KSTEP_FORCE");
+    return e && e[0] == '1';
+}
 static bool tdt_multistep_available() {
     if (!global_backend().is_gpu()) return false;
     if (tdt_serial_forced()) return false;
     const std::string dev = global_backend().device_name();
-    if (dev.rfind("Vulkan", 0) == 0 &&
-        std::getenv("STARLING_GGML_TDT_KSTEP_FORCE") == nullptr) {
-        return false;
-    }
+    if (dev.rfind("Vulkan", 0) == 0 && !tdt_multistep_forced()) return false;
     return true;
 }
 
