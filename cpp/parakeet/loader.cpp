@@ -6,6 +6,8 @@
 
 #include "loader.hpp"
 
+#include "compat.hpp"
+
 #include <cstdlib>
 
 namespace starling::ggml::parakeet {
@@ -34,6 +36,9 @@ bool ParakeetModel::load(const char* gguf_path, std::string& err) {
         err = loader.last_error();
         return false;
     }
+    // Normalize community GGUF dialects (parakeet.cpp / transcribe.cpp
+    // naming) onto the native contract before any config is read.
+    if (!apply_community_dialect_compat(loader, err)) return false;
     const ModelLoader& ml = loader;
     Config& c = config;
 

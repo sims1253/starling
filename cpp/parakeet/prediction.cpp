@@ -64,14 +64,24 @@ void PredictionNet::ensure_embed_host_() const {
     ensure_weights_realized(ml_);
     ggml_tensor* emb = ml_.tensor("decoder.prediction.embed.weight");
     assert(emb && "missing decoder.prediction.embed.weight");
-    // The table may carry vocab_size rows (the checkpoint's layout: blank IS
-    // the last SentencePiece piece) or vocab_size + 1 (converter-padded).
-    // Fetch what exists row-major and zero-fill the remainder so a phantom
-    // last-token lookup stays in bounds.
+    // The table may carry vocab rows (the checkpoint's layout: blank IS the
+    // last SentencePiece piece) or vocab_size + 1 (converter-padded), and it
+    // may be stored F32 or any quantized dtype (community GGUFs keep it F16
+    // or quantized). Fetch what exists row-major and convert through ggml's
+    // type traits (dequantizing every CPU-supported type); zero-fill the
+    // remainder so a phantom last-token lookup stays in bounds.
     embed_host_.assign((size_t)vocab_p1_ * H_, 0.0f);
     const int64_t rows = emb->ne[1] < (int64_t)vocab_p1_ ? emb->ne[1] : (int64_t)vocab_p1_;
-    ggml_backend_tensor_get(emb, embed_host_.data(), 0,
-                            (size_t)rows * H_ * sizeof(float));
+    const size_t n = (size_t)rows * H_;
+    if (emb->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(emb, embed_host_.data(), 0, n * sizeof(float));
+    } else {
+        const auto* traits = ggml_get_type_traits(emb->type);
+        GGML_ASSERT(traits->to_float && "unsupported embedding dtype");
+        std::vector<char> raw(ggml_nbytes(emb));
+        ggml_backend_tensor_get(emb, raw.data(), 0, raw.size());
+        traits->to_float(raw.data(), embed_host_.data(), (int64_t)n);
+    }
 }
 
 void PredictionNet::step(int32_t token_id, bool is_sos,

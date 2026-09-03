@@ -9,6 +9,32 @@ model-agnostic and intended for the larger engines (audex-2b,
 moss-transcribe-2b, qwen3-asr-1.7b) where halving VRAM actually changes what
 fits on a local machine.
 
+## Community-GGUF compat
+
+The parakeet engine also **loads community GGUFs directly** — there is no
+single "standard" parakeet GGUF, so the loader (via
+`cpp/parakeet/compat.cpp`) recognizes and normalizes the two dialects found
+in the wild, zero-copy:
+
+- **parakeet.cpp / CrispASR naming** (e.g. `cstr/parakeet-tdt-0.6b-v3-GGUF`):
+  `decoder.lstm.N.w_ih` / `encoder.layers.N.attn.q.weight` /
+  `encoder.pre.*` tensors and flat `parakeet.*` KV, with embedded mel
+  tensors. Pure name-alias + KV remap.
+- **transcribe.cpp naming** (e.g. `handy-computer/parakeet-tdt-0.6b-v3-gguf`):
+  `enc.blocks.N.*` / `pred.lstm.N.{Wx,Wh,bias}` tensors with a FUSED LSTM
+  bias, `stt.*` KV, and no filterbank tensor. The compat layer synthesizes
+  the slaney mel filterbank + hann window from the `stt.frontend.*`
+  metadata (bit-identical to the converter-embedded one) and splits the
+  fused bias (bias_ih = fused, bias_hh = 0 — the two only ever sum).
+
+The vocab/blank/durations conventions are reconciled against the joint
+head's geometry (`[vocab | blank | durations]`), and the prediction
+embedding is fetched dtype-agnostically (F32/F16/BF16 or any quant type via
+ggml's type-traits dequant — community files store it F16 or quantized).
+Accepted: cstr F16, handy Q8_0 and Q4_K_M all transcribe the fixtures
+verbatim (0.00% WER). Quantized community files run through the same
+`mul_mat` dequant paths as starling's own quants.
+
 ## Pipeline
 
 ```
