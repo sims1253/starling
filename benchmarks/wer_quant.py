@@ -37,6 +37,18 @@ from engines import StarlingGgmlParakeet  # noqa: E402
 from wer import REFERENCE_TRANSCRIPTS, cer_pct, wer_pct  # noqa: E402
 
 
+def _bootstrap_ci(values: list[float], n: int = 1000, seed: int = 0):
+    """95% percentile bootstrap CI of the mean (None when too few samples)."""
+    if len(values) < 5:
+        return None
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(values, dtype=np.float64)
+    means = rng.choice(arr, size=(n, len(arr)), replace=True).mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return round(float(lo), 2), round(float(hi), 2)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--models", nargs="+", required=True,
@@ -148,7 +160,8 @@ def main() -> int:
             continue
 
         row = {"model": label, "path": str(p), "mb": round(p.stat().st_size / 1e6, 1),
-               "wer": {}, "cer": {}}
+               "wer": {}, "cer": {}, "wer_ci": {}}
+        per_clip: dict[str, list[float]] = {}
         try:
             eng.load()
             for tier in tiers:
@@ -160,14 +173,19 @@ def main() -> int:
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in de_clips]
                 row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
+                per_clip["mls_de"] = wers
             for cfg, clips_ in fleurs_evals.items():
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in clips_]
                 row["wer"][f"fleurs_{cfg}"] = round(sum(wers) / len(wers), 2)
+                per_clip[f"fleurs_{cfg}"] = wers
             for prefix, clips_ in corpus_evals.items():
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in clips_]
                 row["wer"][prefix] = round(sum(wers) / len(wers), 2)
+                per_clip[prefix] = wers
+            for col, wers in per_clip.items():
+                row["wer_ci"][col] = _bootstrap_ci(wers, seed=hash(col) % 2**31)
         finally:
             eng.close()
         rows.append(row)
@@ -188,6 +206,17 @@ def main() -> int:
     for r in rows:
         print(f"{r['model']:<16} {r['mb']:>7.1f} "
               + " ".join(f"{r['wer'].get(t, float('nan')):>10.2f}" for t in cols))
+
+    ci_cols = [c for c in cols if any(r["wer_ci"].get(c) for r in rows)]
+    if ci_cols:
+        print("\n95% bootstrap CIs (mean [lo–hi]):\n")
+        for c in ci_cols:
+            print(f"  {c}:")
+            for r in rows:
+                ci = r["wer_ci"].get(c)
+                if ci:
+                    print(f"    {r['model']:<16} {r['wer'][c]:>6.2f} "
+                          f"[{ci[0]:.2f}–{ci[1]:.2f}]")
 
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=2))

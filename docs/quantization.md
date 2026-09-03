@@ -298,11 +298,44 @@ the residual gap. By the same saturation argument, the tail languages'
 +14–29-point iq2_xxs degradation is bit-width-driven too; the remedy is the
 quant level, not more calibration clips.
 
-Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
-HTTP range reads on the parquet shards (~100 MB per config instead of the
-2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
-clips to collection/eval — the datasets-library streaming path accumulates
-multi-GB per config and stalled repeatedly next to a loaded model.
+## Confidence-interval re-run (300 EN/DE clips, 48 per tail language)
+
+The tables above use 50-clip EN/DE and 8-clip-per-language cells, so
+sub-point differences there are noise (σ ≈ ±0.9 and ±5 respectively). This
+re-run on 300/48 clips with bootstrap CIs confirms the big claims and
+corrects two small ones. (`wer_quant.py` now reports mean [95% CI] whenever
+a column has ≥5 clips.)
+
+EN/DE at 300 clips (f32: DE 5.30 [4.45–6.14], EN 6.50 [5.59–7.44]):
+
+| model        | wer_de                  | wer_en                  |
+|--------------|-------------------------|-------------------------|
+| q4_k_m       | 5.32 [4.51–6.15]        | 6.57 [5.70–7.54]        |
+| q2_k +imx25  | 5.99 [5.04–6.90]        | 6.39 [5.56–7.31]        |
+| q2_k +imxENDE| 6.55 [5.65–7.55]        | 6.15 [5.33–7.03]        |
+| iq2xxs +imxEN| 9.45 [8.29–10.66]       | 8.11 [7.15–9.24]        |
+| iq2xxs +imxENDE | 9.20 [8.08–10.34]    | 7.77 [6.83–8.81]        |
+| iq2xxs +imx25| 9.30 [8.14–10.49]       | 8.38 [7.36–9.57]        |
+
+What survives, now with statistical teeth:
+
+- **q4_k_m is free** for both languages (Δ ≤ 0.07) — bulletproof.
+- **q2_k: English free, German +0.7–1.25**, tail languages +4–7 on the worst
+  (lt 22.5→29.1 [26.1–32.2], sl →30.2, ro →17.5 — CIs separate from f32).
+  25-language mean 16.90 vs f32's 14.00 (+2.90 at 48 clips/lang, matching
+  the +2.57 the 8-clip sample estimated).
+- **iq2_xxs is decisively an EN/DE trade**: German +4.0 (bigger than the
+  50-clip sample suggested — small samples biased toward easy clips), and
+  the tail is catastrophic with CIs fully separated from f32: sl 24.9→53.4
+  [47.0–59.9], lv →47.1, lt →45.5, mt →46.1, hu →35.6, sk →27.6 (25-lang
+  mean 26.39 vs 14.00).
+
+What gets **corrected**: the 50-clip read that "German wants to be in the
+calibration set" (+1 pt at iq2_xxs) does not survive — EN-only / EN+DE /
+all-25 land at 9.45 / 9.20 / 9.30 German with fully overlapping CIs, and
+English likewise. At these bit widths the calibration LANGUAGE MIX for
+EN/DE is not a measurable lever once the matrix exists at all; the effects
+that matter are calibrated-vs-uniform (huge) and the bit width itself.
 
 Takeaways:
 
@@ -334,3 +367,9 @@ profile, so the steps are: convert an f32 base, extend the guard's allowlist
 to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
 tensors (same analysis parakeet got), then run this same sweep. moss-2b and
 qwen3-asr-1.7b follow the same recipe.
+
+Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
+HTTP range reads on the parquet shards (~100 MB per config instead of the
+2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
+clips to collection/eval — the datasets-library streaming path accumulates
+multi-GB per config and stalled repeatedly next to a loaded model.
