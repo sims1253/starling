@@ -24,9 +24,22 @@ model, mirroring the `models/` directory layout in the starling repository.
 
 ## Quantization strategy
 
-- **q8_0** (recommended default): Halves VRAM with negligible WER delta.
+- **q4_k_m** (calibrated, recommended): no measurable WER loss vs f32 on
+  clean/noisy English, 300-clip English/German, and 48-clip-per-language
+  evaluations across the other languages — at 28% of the f32 size.
+- **q8_0**: conservative default for byte-parity worriers; also lossless in
+  every measurement.
+- **q2_k / iq2_xxs+shrink16**: size-constrained tiers; see
+  `docs/quantization.md` for the measured multilingual trade-offs
+  (iq2_xxs is an English-first trade, q2_k is the even option).
+- All calibrated quants share one importance matrix collected over 24 of
+  the 25 supported languages (FLEURS train, 48 clips/language); the matrix
+  itself ships in the repo for downstream re-quantization and recipes.
 - **bf16-exact**: Byte-exact parity with the Python reference. For users with
   VRAM to spare who want maximum accuracy.
+
+Released at [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf)
+(move to the `starling` org once it exists).
 
 ## Usage with starling-serve
 
