@@ -394,6 +394,34 @@ to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
 tensors (same analysis parakeet got), then run this same sweep. moss-2b and
 qwen3-asr-1.7b follow the same recipe.
 
+## Ours vs the community quants (matched levels, 300-clip EN/DE with CIs)
+
+Head-to-head against handy-computer's transcribe.cpp-dialect ladder through
+the compat layer — same engine, same eval, so it compares the pipelines
+(converter + calibration + tensor policy) end to end:
+
+| level | handy MB | ours MB | EN / DE verdict |
+|-------|----------|---------|-----------------|
+| baseline | 1256 (F16) | 2508 (F32) | identical (6.48/5.30 vs 6.50/5.30) — converter + compat parity |
+| q8_0   | 740 | 906 | identical |
+| q6_k   | 610 | 777 | identical |
+| q5_k_m | 549 | 740 | identical |
+| q4_k_m | 485 | 704 | identical (ours 6.41/5.31, handy 6.62/5.13 — CIs overlap fully) |
+| q4_k_m + shrink16 | — | 553 | identical (5.31 [4.55–6.15] / 6.46 [5.63–7.35]) |
+
+Their files are smaller at the same level name because their policy also
+quantizes the embedding and keeps convs F16; `--shrink-f16` closes most of
+that gap (the remainder is the exactness-motivated F32 embedding). Tail
+languages at q4_k_m (48 clips/lang): ours 14.15 vs handy 14.62 vs f32 14.00
+mean — a small consistent edge (sk 12.2→10.4, cs 13.4→11.5), borderline
+individual noise.
+
+**Verdict**: at ≥ Q4 both pipelines sit at the level's quality ceiling —
+parity, not improvement. Our ladder's value is everything BELOW Q4, which
+the community repos don't ship: q3_k_m/q2_k/iq2_xxs (634/574/325 MB) exist
+only calibrated (uniform q2_k collapses to 30%/17% where the calibrated
+build matches f32), plus the published imatrix for custom recipes.
+
 Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
 HTTP range reads on the parquet shards (~100 MB per config instead of the
 2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
