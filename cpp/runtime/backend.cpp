@@ -186,6 +186,59 @@ void Backend::register_capture(ggml_tensor* t, std::vector<float>* dst) {
     if (t_pending_captures) t_pending_captures->push_back({t, dst});
 }
 
+// ---------------------------------------------------------------------------
+// Dtype-correct readback conversion. run_graph / ReplayGraph hand callers a
+// std::vector<float> for the graph output AND every capture, so a non-F32
+// output tensor must be converted elementwise (the higgs encoder returns a
+// BF16 pooled tensor; reading n*sizeof(float) bytes from it copied HALF the
+// tensor and left the rest of the vector uninitialized — the "CPU-only
+// higgs garbage output" bug). I32/F32 are bit-compatible (the K-step token
+// rings rely on the i32-bits-in-float trick); F16/BF16 convert; anything
+// else fails loudly rather than silently miscasting.
+// ---------------------------------------------------------------------------
+static void raw_bytes_to_f32(ggml_type type, const void* raw, size_t nbytes,
+                             std::vector<float>& out) {
+    switch (type) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_I32: {
+        out.resize(nbytes / 4);
+        std::memcpy(out.data(), raw, nbytes);
+        return;
+    }
+    case GGML_TYPE_BF16: {
+        size_t n = nbytes / 2;
+        out.resize(n);
+        const ggml_bf16_t* b = (const ggml_bf16_t*) raw;
+        for (size_t i = 0; i < n; ++i) out[i] = ggml_bf16_to_fp32(b[i]);
+        return;
+    }
+    case GGML_TYPE_F16: {
+        size_t n = nbytes / 2;
+        out.resize(n);
+        const ggml_fp16_t* h = (const ggml_fp16_t*) raw;
+        for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(h[i]);
+        return;
+    }
+    default:
+        GGML_ABORT("run_graph/ReplayGraph readback of unsupported output type %s",
+                   ggml_type_name(type));
+    }
+}
+
+// Sync readback of one tensor, converted to f32.
+static void tensor_get_f32(ggml_backend_t backend, const ggml_tensor* t,
+                           std::vector<float>& out) {
+    size_t nbytes = ggml_nbytes(t);
+    if (t->type == GGML_TYPE_F32) {
+        out.resize((size_t)ggml_nelements(t));
+        ggml_backend_tensor_get(t, out.data(), 0, nbytes);
+        return;
+    }
+    std::vector<char> raw(nbytes);
+    ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
+    raw_bytes_to_f32(t->type, raw.data(), nbytes, out);
+}
+
 bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                       std::vector<float>& out) {
     // 1. Build in a no_alloc=true metadata context.
@@ -271,15 +324,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         }
     }
     if (ok) {
-        // 6. Read back the output + captures.
-        size_t n = (size_t)ggml_nelements(out_t);
-        out.resize(n);
-        ggml_backend_tensor_get(out_t, out.data(), 0, n * ggml_element_size(out_t));
-        for (const auto& c : pcap) {
-            size_t cn = (size_t)ggml_nelements(c.t);
-            c.dst->resize(cn);
-            ggml_backend_tensor_get(c.t, c.dst->data(), 0, cn * sizeof(float));
-        }
+        // 6. Read back the output + captures (converted to f32 whatever the
+        // tensor dtype; see raw_bytes_to_f32).
+        tensor_get_f32(impl_->backend, out_t, out);
+        for (const auto& c : pcap) tensor_get_f32(impl_->backend, c.t, *c.dst);
     }
     pin.clear(); pcap.clear();
     ggml_free(ctx);
@@ -347,6 +395,8 @@ void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<flo
         ggml_fp16_to_fp32_row((const ggml_fp16_t*)raw.data(), out.data(), n);
     }
 }
+
+
 
 // --------------------------------------------------------------------------- //
 // ReplayGraph
@@ -481,20 +531,42 @@ const void* ReplayGraph::input_host(size_t i) const {
 
 void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
                                            ggml_tensor* out_t,
-                                           void* out_host, size_t out_nbytes) {
+                                           std::vector<float>& out) {
     // Async D2H for the output, then async D2H for each capture, then ONE sync.
     // Collapses N syncs (each ~150-200us on WSL2) into one. The async variant
     // runs on the backend stream so copies queue behind the graph launch.
+    // Non-F32 tensors read back into staging buffers and convert to f32 after
+    // the sync (see raw_bytes_to_f32): the callers' vectors are float.
+    const size_t out_nbytes = ggml_nbytes(out_t);
+    std::vector<char> out_raw;
+    void* out_host = out.data();
+    if (out_t->type != GGML_TYPE_F32) {
+        out_raw.resize(out_nbytes);
+        out_host = out_raw.data();
+    }
     ggml_backend_tensor_get_async(impl->backend, out_t, out_host, 0, out_nbytes);
-    for (const auto& c : captures_) {
+    std::vector<std::vector<char>> cap_raw(captures_.size());
+    for (size_t ci = 0; ci < captures_.size(); ++ci) {
+        auto& c = captures_[ci];
+        if (!c.second) continue;
         size_t cn = (size_t)ggml_nelements(c.first);
-        if (c.second) {
-            c.second->resize(cn);
-            ggml_backend_tensor_get_async(impl->backend, c.first,
-                                          c.second->data(), 0, cn * sizeof(float));
+        size_t cbytes = ggml_nbytes(c.first);
+        c.second->resize(cn);
+        void* dst = c.second->data();
+        if (c.first->type != GGML_TYPE_F32) {
+            cap_raw[ci].resize(cbytes);
+            dst = cap_raw[ci].data();
         }
+        ggml_backend_tensor_get_async(impl->backend, c.first, dst, 0, cbytes);
     }
     ggml_backend_synchronize(impl->backend);
+    if (out_t->type != GGML_TYPE_F32)
+        raw_bytes_to_f32(out_t->type, out_raw.data(), out_nbytes, out);
+    for (size_t ci = 0; ci < captures_.size(); ++ci) {
+        auto& c = captures_[ci];
+        if (c.second && c.first->type != GGML_TYPE_F32)
+            raw_bytes_to_f32(c.first->type, cap_raw[ci].data(), ggml_nbytes(c.first), *c.second);
+    }
 }
 
 bool ReplayGraph::compute(std::vector<float>& out) {
@@ -513,9 +585,8 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     }
     if (!ok) return false;
     const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
-    size_t n = (size_t)ggml_nelements(out_);
-    out.resize(n);
-    readback_async_then_sync(impl, out_, out.data(), n * ggml_element_size(out_));
+    out.resize((size_t)ggml_nelements(out_));
+    readback_async_then_sync(impl, out_, out);
     if (t_on) {
         const int64_t t_rb1 = ggml_time_us();
         std::fprintf(stderr,

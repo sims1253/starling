@@ -436,6 +436,11 @@ bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
                                             mel_T, "enc.conv1", /*stride=*/1,
                                             /*depthwise=*/false, /*gelu=*/true, err);
         if (c1.empty()) return false;
+        // BF16 oracle boundary conv1 -> conv2: the fused-graph path stores the
+        // GELU output as BF16 (gelu_erf_bf16) and the reference model runs
+        // bf16, so the host loop must round at the same boundary (ark's host
+        // path does the same).
+        for (auto& v : c1) v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
         // conv2 (s2) + GELU.
         std::vector<float> c2 = host_conv1d(model.loader, c1, ec.d_model,
                                             mel_T, "enc.conv2", /*stride=*/2,
@@ -448,6 +453,9 @@ bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
             for (int64_t d = 0; d < (int64_t) ec.d_model; ++d)
                 layers_in[(size_t) t * ec.d_model + d] =
                     c2[(size_t) d * T_enc + t];
+        // BF16 oracle boundary conv2 -> layers (the graph path's g2 is BF16
+        // before the transpose/cast).
+        for (auto& v : layers_in) v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
         int64_t T_avg = 0, T_proj = 0;
         std::vector<float> body_out, enc_out;
         const char* dump_enc = std::getenv("STARLING_HIGGS_DUMP_ENC");
