@@ -315,7 +315,11 @@ The mechanism is visible in the matrices themselves: the per-channel
 importance vectors of the 12-clip and 60-clip imatrices agree at **0.993
 mean cosine across all 275 tensors** — the activation statistics saturate at
 roughly a dozen clips per language, so the quantizer makes the same block-
-scale decisions either way. The remaining low-bit gaps (DE ≈ +2.7 at
+scale decisions either way. A kitchen-sink matrix over EVERY training clip
+on disk (1,224 FLEURS wavs across three corpora + LibriSpeech fixtures +
+MLS German audiobooks, 838k observations — extra domains included) confirms
+the same: q2_k 6.06/6.50 and iq2_xxs 9.20/8.41 DE/EN vs the production
+matrix's 6.03/6.36 and 9.38/8.39, all within noise. The remaining low-bit gaps (DE ≈ +2.7 at
 iq2_xxs, ≈ +1 at q2_k) are the inherent error of that bit width for those
 languages, not a calibration-data deficit. What does move them: more bits
 (q4_k_m is free), or *different* data — calibration audio matched to the
