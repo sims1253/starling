@@ -134,11 +134,13 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    localized the corruption between the encoder layers and the projector;
    per-layer LAYER_CUT probes showed all 32 layers + avg_pool agree between
    backends; a trusted output-tensor probe of the LN stage matched — and
-   exposed the mechanism: run_graph read `n * sizeof(float)` bytes out of
-   the BF16 `pooled` graph output, copying HALF the tensor and leaving the
-   rest of the caller's vector uninitialized (the higgs code even documents
-   a "run_graph converts the BF16 graph output to f32 on readback"
-   conversion that never existed). Three-part fix: (a) Backend::compute and
+   exposed the mechanism: run_graph's output path copied the BF16
+   `pooled` tensor's 2n bytes raw into the low half of the 4n-byte f32
+   vector — every second float garbage bits, no over-read (and the old
+   capture paths sized reads cn*sizeof(float), a true over-read for
+   2-byte-type captures). The higgs code even documents a "run_graph
+   converts the BF16 graph output to f32 on readback" conversion that
+   never existed. Three-part fix: (a) Backend::compute and
    ReplayGraph now convert non-F32 outputs/captures elementwise (F16/BF16
    convert; I32/F32 stay bit-compatible — the K-step token rings rely on
    that); (b) the higgs host conv front-end rounds at the two BF16 oracle

@@ -1173,10 +1173,19 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
         int32_t prev = spec_argmax(m.spec, o.prefill_logits);
         o.ids.push_back(prev);
+        // Engines whose reference stops on a SECONDARY token as well
+        // (eos2_token_id: higgs <|im_end|>, s1's dual stop) also stop when
+        // the PREFILL argmax itself is a stop token (near-silence input) —
+        // the single-stop engines (moss/ark/granite/qwen3) never did, so the
+        // gate is eos2 != -1 to keep their decode behavior byte-identical.
+        const bool prefill_stop = op.eos2_token_id != -1 &&
+                                  (prev == op.eos_token_id || prev == op.eos2_token_id);
         const bool use_kstep = global_backend().is_gpu() &&
                                !env(m.spec, "_NOKSTEP");
         double dec_sum = 0.0; int dec_n = 0;
-        if (use_kstep) {
+        if (prefill_stop) {
+            o.hit_eos = true;
+        } else if (use_kstep) {
             const int K = kstep_K(m.spec);
             for (int n = 1; n < op.max_new_tokens;) {
                 bool hit = false;

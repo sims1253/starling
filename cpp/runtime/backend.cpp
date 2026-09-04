@@ -189,10 +189,12 @@ void Backend::register_capture(ggml_tensor* t, std::vector<float>* dst) {
 // ---------------------------------------------------------------------------
 // Dtype-correct readback conversion. run_graph / ReplayGraph hand callers a
 // std::vector<float> for the graph output AND every capture, so a non-F32
-// output tensor must be converted elementwise (the higgs encoder returns a
-// BF16 pooled tensor; reading n*sizeof(float) bytes from it copied HALF the
-// tensor and left the rest of the vector uninitialized — the "CPU-only
-// higgs garbage output" bug). I32/F32 are bit-compatible (the K-step token
+// output tensor must be converted elementwise. The old output path read
+// nbytes and copied a BF16 tensor's 2n bytes raw into the low half of the
+// 4n-byte vector — every second float garbage bits (the "CPU-only higgs
+// garbage output" bug; no over-read); the old CAPTURE paths sized the read
+// cn*sizeof(float), a true over-read for any 2-byte-type capture. I32/F32
+// are bit-compatible (the K-step token
 // rings rely on the i32-bits-in-float trick); F16/BF16 convert; anything
 // else fails loudly rather than silently miscasting.
 // ---------------------------------------------------------------------------

@@ -57,16 +57,10 @@ bool greedy_generate(const HiggsModel& m, const InputsEmbeds& inputs,
     lib::InputsEmbeds li{inputs.data, inputs.n_tokens, inputs.width};
     lib::GenerateResult lo;
     if (!lib::greedy_generate(decode_ctx(m), li, p, lo, err)) return false;
-    // Leading-EOS: the shared stack's hot path eos-checks only decode-step
-    // tokens, but the deleted port also stopped when the PREFILL argmax
-    // itself was eos/im_end (near-silence input). Preserve that: truncate to
-    // the leading stop token and flag hit_eos.
-    if (!lo.ids.empty() && (lo.ids[0] == op.eos_token_id || lo.ids[0] == op.im_end_id)) {
-        out.ids.assign(1, lo.ids[0]);
-        out.hit_eos = true;
-        out.prefill_logits = std::move(lo.prefill_logits);
-        return true;
-    }
+    // Leading-EOS (near-silence input): the shared stack stops on a
+    // prefill-argmax stop token for eos2 engines (qwen_decode.cpp's
+    // prefill_stop gate) — the deleted port's behavior, at its old cost
+    // (no wasted max_new_tokens decode).
     out.ids = std::move(lo.ids);
     out.hit_eos = lo.hit_eos;
     out.prefill_logits = std::move(lo.prefill_logits);
