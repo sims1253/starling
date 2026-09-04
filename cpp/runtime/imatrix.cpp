@@ -47,7 +47,10 @@ bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
     if (w->name[0] == '\0') return false;
     if (x->type != GGML_TYPE_F32) return false;
 
-    if (ask) return true;  // force this node onto the CPU backend under sched
+    if (ask) return true;  // observe this node — NOTE: the callback does NOT
+                           // control placement (sched decides in split_graph);
+                           // host-side reads are sound because collection
+                           // pins STARLING_GGML_DEVICE=cpu
 
     // x is [K, N] row-major with K == w->ne[0] (the weight's input-channel
     // count). Accumulate x[k, j]^2 over all columns j.

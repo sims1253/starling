@@ -85,8 +85,10 @@ constexpr size_t kGraphSize = 32768;  // max nodes in one ggml_cgraph (bumped fo
                                           // the moss K-step multistep decode graph)
 
 // The ggml_backend_sched_eval_callback trampoline feeding the ImatrixCollector
-// (see imatrix.hpp). Returned interest forces the observed node onto the CPU
-// backend, where its activations are readable host-side.
+// (see imatrix.hpp). NOTE: returning true does NOT force the node onto the
+// CPU backend — the sched consults the callback only for batching/
+// observation; placement is decided without it. Host-side activation reads
+// are sound because the collect tool pins STARLING_GGML_DEVICE=cpu.
 bool imatrix_eval_cb(ggml_tensor* t, bool ask, void* /*user_data*/) {
     return ImatrixCollector::instance().observe(t, ask);
 }
