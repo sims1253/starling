@@ -181,7 +181,7 @@ private:
     bool alloc_internal();
     void readback_async_then_sync(struct Backend::Impl* impl,
                                   ggml_tensor* out_t,
-                                  void* out_host, size_t out_nbytes);
+                                  std::vector<float>& out);
 };
 
 } // namespace starling::ggml
