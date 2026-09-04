@@ -427,3 +427,17 @@ HTTP range reads on the parquet shards (~100 MB per config instead of the
 2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
 clips to collection/eval — the datasets-library streaming path accumulates
 multi-GB per config and stalled repeatedly next to a loaded model.
+
+## Speed (CPU, medium fixture, 3-run mean after warmup)
+
+| build | RTFx | note |
+|-------|------|------|
+| f32 (2508 MB) | 12.9× | |
+| q4_k_m (704 MB) | 11.9× | −8% |
+| q2_k (574 MB) | 14.2× | +10% |
+| iq2_xxs+shrink16 (325 MB) | 7.5× | −42% (IQ vec-dot kernels are CPU-compute-bound) |
+
+The quants' value is size/VRAM, not CPU speed: k-quants are roughly
+speed-neutral on this encoder, and the IQ formats trade inference speed for
+bytes. When both matter, q3_k_m occupies the middle. GPU behavior may
+differ (bandwidth-bound, mmvq paths) — untested on this hardware.
