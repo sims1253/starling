@@ -162,7 +162,8 @@ class Engine:
         self._release()
         self._loaded = False
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _release(self) -> None:
         pass
@@ -293,7 +294,8 @@ class GraniteStarlingBatched(Engine):
         res = transcribe_long_batched(pipe, self.processor, tiled, 16000)
         text = res.text.strip()
         del pipe
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # transcribe_long_batched concatenates chunk texts with spaces; the B
         # identical chunks all produced `text` -> replicate it B times.
         return [text] * B
@@ -618,7 +620,8 @@ class Qwen3StarlingBatched(Engine):
                                max_batch_size=B, max_cache_len=4096)
         texts = pipe.transcribe_batch(feats, ids, masks, max_new_tokens=400)
         del pipe
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return texts
 
 
@@ -2183,6 +2186,10 @@ def build_engines(
                 chosen[mdl].append(StarlingGgmlS1())
             elif mdl == "audex":
                 chosen[mdl].append(StarlingGgmlAudex())
+            elif mdl == "granite":
+                chosen[mdl].append(StarlingGgmlGranite())
+            elif mdl == "qwen3":
+                chosen[mdl].append(StarlingGgmlQwen3())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

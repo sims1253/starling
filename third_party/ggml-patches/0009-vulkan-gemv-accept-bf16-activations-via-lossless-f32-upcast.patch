@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Tue, 2 Sep 2026 19:55:00 +0200
+Subject: [PATCH] vulkan/gemv: accept BF16 activations via lossless f32 upcast
+
+ggml_vk_mul_mat_vec_q_f16 asserts b_type in {F32, F16, Q8_1}, so any graph
+that feeds BF16 activations into a single-token mul_mat (the LLM decode
+step of engines keeping torch's bf16 hidden-state discipline) aborts at the
+first GEMV on the Vulkan backend.
+
+Upcast a contiguous BF16 y into the prealloc staging buffer with the
+existing contig_cpy_bf16_f32 pipeline (bf16->f32 is exact, so numerics are
+unchanged) and run the existing mul_mat_vec_bf16_f32_f32 pipeline. The
+conversion re-runs on every dispatch: the y tensor's buffer is refreshed
+between graph replays, so a cached conversion could go stale.
+
+Verified on RADV RENOIR (Ryzen 5650U iGPU) with an isolated CPU-vs-Vulkan
+harness: mul_mat(BF16 [128,64], BF16 [128,1]) maxdiff 3.6e-07 vs CPU
+(float-epsilon; tighter than the f16-storage control's 4e-03). Wide
+matmuls (ne11 large) already have a bf16xbf16 pipeline and are unaffected.
+
+Note: the starling engines' decode graphs additionally exercise composite
+prefill paths that still diverge on Vulkan — see the PR discussion; this
+patch only makes the GEMV op itself correct and assert-free.
+
+starling-issue: vulkan backend unlock (partial)
+---
+ src/ggml-vulkan/ggml-vulkan.cpp | 38 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index c1d86aaa..860f6919 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -9550,7 +9550,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
+     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
+ 
+-    const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
++    // [starling 0009] Losslessly upcast a contiguous BF16 activation
++    // vector (y) to F32 so the GEMV pipelines -- which only accept
++    // F32/F16/Q8_1 for y -- can run. bf16->f32 is exact, numerics
++    // unchanged.
++    const bool y_bf16_f32 = src1->type == GGML_TYPE_BF16 && !y_non_contig;
++    const bool f16_f32_kernel = src1->type == GGML_TYPE_F32 || y_bf16_f32;
+     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
+@@ -9570,7 +9575,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+ 
+     if (dmmv == nullptr) {
+         // Fall back to f16 dequant mul mat
+-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
++        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, y_bf16_f32 ? GGML_TYPE_F32 : src1->type, ne11, ne20, ne00);
+         quantize_y = false;
+     }
+ 
+@@ -9610,7 +9615,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_size_x = x_sz;
+             ggml_vk_preallocate_buffers(ctx, subctx);
+         }
+-        if ((qy_needs_dequant || quantize_y) && ctx->prealloc_size_y < y_sz) {
++        if ((qy_needs_dequant || quantize_y || y_bf16_f32) && ctx->prealloc_size_y < y_sz) {
+             ctx->prealloc_size_y = y_sz;
+             ggml_vk_preallocate_buffers(ctx, subctx);
+         }
+@@ -9625,6 +9630,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         if (quantize_y) {
+             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
+         }
++        if (y_bf16_f32) {
++            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_contig_cpy_bf16_f32, 1);
++        }
+     }
+ 
+     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+@@ -9638,7 +9646,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         d_X = d_Qx;
+         GGML_ASSERT(qx_sz == x_sz);
+     }
+-    if (qy_needs_dequant || quantize_y) {
++    if (qy_needs_dequant || quantize_y || y_bf16_f32) {
+         d_Y = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+     } else {
+         d_Y = d_Qy;
+@@ -9679,6 +9687,18 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_decode_vector_staging = false;
+         }
+     }
++    if (y_bf16_f32) {
++        // [starling 0009] Always (re)convert: the y tensor's buffer is
++        // refreshed between graph replays, so a cached conversion could
++        // go stale. bf16->f32 is lossless.
++        if (ctx->prealloc_y_need_sync) {
++            ggml_vk_sync_buffers(ctx, subctx);
++        }
++        ggml_vk_cpy_to_contiguous(ctx, subctx, ctx->device->pipeline_contig_cpy_bf16_f32, src1, d_Qy, d_Y);
++        ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_contig_cpy_bf16_f32.get();
++        ctx->prealloc_y_last_tensor_used = src1;
++        ctx->prealloc_y_last_decode_vector_staging = false;
++    }
+ 
+     // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
+     uint32_t stride_batch_x = batch_n ? 0 : ne00*ne01;
+@@ -9750,7 +9770,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     if (x_non_contig) {
+         ctx->prealloc_x_need_sync = true;
+     }
+-    if (y_non_contig || quantize_y) {
++    if (y_non_contig || quantize_y || y_bf16_f32) {
+         ctx->prealloc_y_need_sync = true;
+     }
+ }

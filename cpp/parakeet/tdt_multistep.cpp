@@ -776,6 +776,26 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
             int32_t duriv; std::memcpy(&duriv, kg->cap_dbg_dur_i32_f.data(), sizeof(int32_t));
             std::fprintf(stderr, "[tdt_multistep] replay: tok[0]=%d dur_idx=%d dur_i32=%d one=%.3f dur_final=%.3f frame[0]=%.1f\n",
                          tokens[0], di, duriv, kg->cap_dbg_one_f[0], kg->cap_dbg_dur_final_f[0], frames_f[0]);
+            // Full K-step ring + the boundary state (D1: the device-cache
+            // leaves the add_graph_root cpys wrote). The K-step-vs-serial
+            // divergence on Vulkan shows up here as the ring's frames
+            // jumping to f32-bit-pattern garbage (e.g. 1073741824.0) on the
+            // SECOND+ replay of the same graph while the dc leaves
+            // themselves read back correct — see the diagnostics README.
+            std::fprintf(stderr, "[tdt_multistep]   ring tok:");
+            for (int j = 0; j < K; ++j) std::fprintf(stderr, " %d", tokens[j]);
+            std::fprintf(stderr, "  frame:");
+            for (int j = 0; j < K; ++j) std::fprintf(stderr, " %.1f", frames_f[j]);
+            std::fprintf(stderr, "\n");
+            if (kg->device_resident && kg->dc) {
+                int32_t fr = -1, lt = -1;
+                ggml_backend_tensor_get(kg->dc->frame, &fr, 0, sizeof(int32_t));
+                ggml_backend_tensor_get(kg->dc->last_tok, &lt, 0, sizeof(int32_t));
+                float cc0 = 0.0f;
+                ggml_backend_tensor_get(kg->dc->cc, &cc0, 0, sizeof(float));
+                std::fprintf(stderr, "[tdt_multistep]   post-replay dc: frame=%d last_tok=%d cc[0]=%.6f\n",
+                             fr, lt, cc0);
+            }
         }
 
         // STARLING: emit EVERY token (including blanks); stop at the first step

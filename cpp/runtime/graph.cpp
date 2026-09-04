@@ -22,10 +22,12 @@ namespace {
 
 constexpr int kDefaultThreads = 8;
 
-// Recursive on purpose: run_graph() holds this mutex across the model's
-// build lambda, and some builders legitimately re-enter global_backend()
-// inside it (e.g. RelPosAttention's flash-vs-manual gate). A plain mutex
-// self-deadlocks the CPU path there.
+// Recursive because run_graph() holds this mutex across Backend::compute() —
+// and compute's BUILD lambda may legitimately call global_backend() again
+// (e.g. parakeet/ark's rel-pos attention probe is_gpu() to pick the flash
+// path). A plain std::mutex self-deadlocks there on the CPU backend, where
+// the one-shot run_graph path is the only encoder route (GPU builds go
+// through ReplayGraph, which does not hold the mutex).
 std::recursive_mutex g_backend_mutex;
 std::unique_ptr<Backend> g_backend;
 std::atomic<bool> g_shutting_down{false};
