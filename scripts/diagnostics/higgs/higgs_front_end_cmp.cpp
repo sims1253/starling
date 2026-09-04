@@ -1,6 +1,10 @@
 // Higgs conv front-end comparator: replicates the TWO front-ends of
 // cpp/higgs/audio_encoder.cpp side by side on the SAME backend and compares
-// them stage by stage:
+// them stage by stage. With the engine's BF16 oracle boundaries applied on
+// both sides, the expected residual is +-1 bf16 ulp accumulation tie-flips
+// (host conv accumulates in f64, the graph conv in f32; values landing on
+// opposite sides of a bf16 rounding boundary flip by one ulp) — the engine
+// tolerates this class, and the fixed CPU path produces correct transcripts.
 //   host   — host_conv1d (f64 accumulation, f32 GELU) x2 + transpose (the
 //            CPU / debug path);
 //   graph  — ggml_conv_1d + bias + gelu_erf_bf16 + permute/cont/f32 (the
@@ -110,12 +114,17 @@ int main() {
     // ---- host front-end (engine CPU path) ----
     std::vector<float> c1 = host_conv1d(m.loader, mel.f32, ec.num_mel_bins, mel_T, "enc.conv1", 1, e);
     if (c1.empty()) { fprintf(stderr, "conv1: %s\n", e.c_str()); return 2; }
+    // BF16 oracle boundary conv1 -> conv2 (mirrors the fixed engine path and
+    // the graph path's gelu_erf_bf16 store).
+    for (auto& v : c1) v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
     std::vector<float> c2 = host_conv1d(m.loader, c1, ec.d_model, mel_T, "enc.conv2", 2, e);
     if (c2.empty()) { fprintf(stderr, "conv2: %s\n", e.c_str()); return 2; }
     std::vector<float> layers_in((size_t) ec.d_model * T_enc);
     for (int64_t t = 0; t < T_enc; ++t)
         for (int64_t d = 0; d < (int64_t) ec.d_model; ++d)
             layers_in[(size_t) t * ec.d_model + d] = c2[(size_t) d * T_enc + t];
+    // BF16 oracle boundary conv2 -> layers (same).
+    for (auto& v : layers_in) v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
 
     // ---- graph front-end (engine GPU path), run one-shot on THIS backend ----
     std::vector<float> g_layers_in, g_c1, g_c2;
