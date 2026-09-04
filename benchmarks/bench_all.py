@@ -78,6 +78,21 @@ MODEL_LABELS = {
 # ---------------------------------------------------------------------- #
 # timing
 # ---------------------------------------------------------------------- #
+def _cuda_sync() -> None:
+    """Synchronize the GPU when one is present.
+
+    bench_all must also run on CUDA-less hosts (CPU/Vulkan ggml-only sweeps),
+    where torch.cuda.synchronize() raises "Found no NVIDIA driver".
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _cuda_reset_peak() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
 def _time_samples_ms(fn, *, warmup: int, reps: int) -> list[float]:
     """Wall-time samples for ``fn`` after warmup, synchronized around each run.
 
@@ -87,13 +102,13 @@ def _time_samples_ms(fn, *, warmup: int, reps: int) -> list[float]:
     """
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    _cuda_sync()
     samples = []
     for _ in range(reps):
-        torch.cuda.synchronize()
+        _cuda_sync()
         t0 = time.perf_counter()
         fn()
-        torch.cuda.synchronize()
+        _cuda_sync()
         samples.append((time.perf_counter() - t0) * 1000.0)
     return samples
 
@@ -198,7 +213,7 @@ def _run_cell(
         }
         return rec
 
-    torch.cuda.reset_peak_memory_stats()
+    _cuda_reset_peak()
     timing_samples = _time_samples_ms(
         lambda: engine.transcribe(audio, B=B), warmup=warmup, reps=reps,
     )

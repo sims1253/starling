@@ -53,26 +53,6 @@ DEFAULT_OUTPUT = REPO / "models" / "parakeet-tdt-0.6b-v3-bf16-exact.gguf"
 # NeMo model, so the state_dict keys have a "model." prefix and slightly different
 # nesting. This table handles the most common patterns; unmapped keys raise.
 
-# Conformer-internal renames: transformers names the attention projections
-# *_proj and the conv norm `norm`, while the engine (and NeMo) use linear_* /
-# pos_bias_* / batch_norm.
-_CONFORMER_TAIL_RENAMES = [
-    ("self_attn.q_proj.", "self_attn.linear_q."),
-    ("self_attn.k_proj.", "self_attn.linear_k."),
-    ("self_attn.v_proj.", "self_attn.linear_v."),
-    ("self_attn.o_proj.", "self_attn.linear_out."),
-    ("self_attn.relative_k_proj.", "self_attn.linear_pos."),
-    ("self_attn.bias_u", "self_attn.pos_bias_u"),
-    ("self_attn.bias_v", "self_attn.pos_bias_v"),
-    ("conv.norm.", "conv.batch_norm."),
-]
-
-def _map_conformer_tail(tail: str) -> str:
-    for old, new in _CONFORMER_TAIL_RENAMES:
-        if old in tail:
-            return tail.replace(old, new)
-    return tail
-
 def map_key(src: str) -> str | None:
     """Map a transformers state_dict key to the GGUF tensor name.
 
@@ -84,46 +64,7 @@ def map_key(src: str) -> str | None:
     if s.startswith("model."):
         s = s[len("model."):]
 
-    # Bookkeeping buffers are never written.
-    if s.endswith(".num_batches_tracked"):
-        return None
-
-    # ---- transformers >= 5.x flat naming (ParakeetForTDT) ----
-    if s.startswith("encoder.subsampling."):
-        tail = s[len("encoder.subsampling."):]
-        # The ModuleList is [conv0, ReLU, dw2, pw3, ReLU, dw5, pw6, ReLU,
-        # linear]; the Conv2d indices already equal the engine's
-        # encoder.pre_encode.conv.{0,2,3,5,6} slots and the ReLUs have no
-        # parameters, so a straight index passthrough is exact.
-        if tail.startswith("layers."):
-            idx, sep, rest = tail[len("layers."):].partition(".")
-            if not idx.isdigit():
-                return None
-            return f"encoder.pre_encode.conv.{idx}.{rest}"
-        if tail.startswith("linear."):
-            return "encoder.pre_encode.out." + tail[len("linear."):]
-        return None
-    if s.startswith("encoder.layers."):
-        parts = s.split(".", 3)
-        if len(parts) < 4:
-            return None
-        return "encoder.layers." + parts[2] + "." + _map_conformer_tail(parts[3])
-    if s.startswith("decoder.embedding."):
-        return "decoder.prediction.embed." + s[len("decoder.embedding."):]
-    if s.startswith("decoder.lstm."):
-        # weight_ih_l0 / weight_hh_l1 / bias_*: same tails the engine reads
-        # under decoder.prediction.dec_rnn.lstm.*.
-        return "decoder.prediction.dec_rnn.lstm." + s[len("decoder.lstm."):]
-    if s.startswith("decoder.decoder_projector."):
-        # transformers folds the pred->joint projection into the decoder; the
-        # engine applies the same layer as joint.pred on the LSTM output.
-        return "joint.pred." + s[len("decoder.decoder_projector."):]
-    if s.startswith("encoder_projector."):
-        return "joint.enc." + s[len("encoder_projector."):]
-    if s.startswith("joint.head."):
-        return "joint.joint_net.2." + s[len("joint.head."):]
-
-    # ---- subsampling (ConvSubsampler, older naming) ----
+    # ---- subsampling (ConvSubsampler) ----
     # transformers: encoder.pre_encoder.conv_layers.model.{i}.weight
     #          or: encoder.pre_encoder.conv.model.{i}.weight
     # GGUF: encoder.pre_encode.conv.{i}.weight
@@ -136,8 +77,14 @@ def map_key(src: str) -> str | None:
 
     # Subsampling output projection (Linear).
     # transformers: encoder.pre_encoder.out.weight / .bias
+    #               encoder.subsampling.linear.weight / .bias
     if s.startswith("encoder.pre_encoder.out."):
         return "encoder.pre_encode.out." + s[len("encoder.pre_encoder.out."):]
+    if s.startswith("encoder.subsampling.linear."):
+        return "encoder.pre_encode.out." + s[len("encoder.subsampling.linear."):]
+    # transformers: encoder.subsampling.layers.{i}.{weight,bias}
+    if s.startswith("encoder.subsampling.layers."):
+        return "encoder.pre_encode.conv." + s[len("encoder.subsampling.layers."):]
 
     # ---- conformer layers ----
     # transformers: encoder.conformer_encoder.layers.{i}.{...}
@@ -148,6 +95,25 @@ def map_key(src: str) -> str | None:
                 "encoder.layers."):
         if s.startswith(pfx):
             tail = s[len(pfx):]
+            # The HF rel-pos attention and conv BatchNorm names inside each
+            # conformer layer, translated to the NeMo names (in parentheses)
+            # the C++ engine reads:
+            #   q_proj        -> linear_q        k_proj -> linear_k
+            #   v_proj        -> linear_v        o_proj -> linear_out
+            #   relative_k_proj -> linear_pos
+            #   bias_u/bias_v -> pos_bias_u/pos_bias_v
+            #   conv.norm.*   -> conv.batch_norm.*
+            for old, new in (
+                ("self_attn.q_proj.", "self_attn.linear_q."),
+                ("self_attn.k_proj.", "self_attn.linear_k."),
+                ("self_attn.v_proj.", "self_attn.linear_v."),
+                ("self_attn.o_proj.", "self_attn.linear_out."),
+                ("self_attn.relative_k_proj.", "self_attn.linear_pos."),
+                ("self_attn.bias_u", "self_attn.pos_bias_u"),
+                ("self_attn.bias_v", "self_attn.pos_bias_v"),
+                ("conv.norm.", "conv.batch_norm."),
+            ):
+                tail = tail.replace(old, new)
             # The conformer layer internal naming matches NeMo for most tensors.
             # Some transformers versions rename modules; handle known renames:
             # feed_forward1 → feed_forward1, self_attn → self_attn, etc.
@@ -170,6 +136,20 @@ def map_key(src: str) -> str | None:
     # Also handle the direct naming (no "prediction." infix in some versions).
     if s.startswith("decoder.embed."):
         return "decoder.prediction.embed." + s[len("decoder.embed."):]
+
+    # The flat HF decoder naming (the engine reads the NeMo-style names):
+    #   decoder.embedding.weight          -> decoder.prediction.embed.weight
+    #   decoder.lstm.weight_ih_l0 ...      -> decoder.prediction.dec_rnn.lstm.*
+    #   decoder.decoder_projector.{w,b}    -> joint.pred.{w,b}     (pred->joint proj)
+    #   joint.head.{w,b}                   -> joint.joint_net.2.{w,b} (output proj)
+    if s.startswith("decoder.embedding."):
+        return "decoder.prediction.embed." + s[len("decoder.embedding."):]
+    if s.startswith("decoder.lstm."):
+        return "decoder.prediction.dec_rnn.lstm." + s[len("decoder.lstm."):]
+    if s.startswith("decoder.decoder_projector."):
+        return "joint.pred." + s[len("decoder.decoder_projector."):]
+    if s.startswith("joint.head."):
+        return "joint.joint_net.2." + s[len("joint.head."):]
 
     # ---- joint network ----
     # transformers: joint.encoder_joint.{i}.weight / .bias  (encoder proj)
@@ -206,7 +186,10 @@ def map_key(src: str) -> str | None:
         return "joint.enc." + s[len("encoder.proj."):]
 
     # ---- known non-weight keys to skip ----
-    # (running_mean/var ARE needed for batch_norm; handled above.)
+    # Actually, running_mean/var ARE needed for batch_norm. Don't skip them.
+    # Only skip num_batches_tracked.
+    if s.endswith(".num_batches_tracked"):
+        return None
 
     # If it starts with known prefixes but we couldn't map it, raise.
     if any(s.startswith(p) for p in ("encoder.", "decoder.", "joint.")):
@@ -279,26 +262,17 @@ def extract_mel_filterbank(processor: Any) -> tuple[np.ndarray, np.ndarray, dict
 # KV metadata
 # ---------------------------------------------------------------------------
 def resolve_config_attr(config: Any, *keys: str) -> Any:
-    """Resolve a config value by any of ``keys``.
-
-    transformers >= 5.x nests the encoder hyperparameters in a separate
-    ``encoder_config`` dict (hidden_size / num_hidden_layers / ...) instead of
-    flat NeMo-style names, so after the flat lookup each key is also tried
-    against that nested dict.
-    """
-    for key in keys:
-        if hasattr(config, key):
-            val = getattr(config, key)
-            if val is not None:
-                return val
-    enc = getattr(config, "encoder_config", None)
-    if enc is not None:
+    # Search the config itself first, then its sub-configs: transformers >= 5
+    # moved the encoder/decoder attributes of ParakeetTDTConfig into nested
+    # configs (encoder_config.hidden_size etc.) and renamed some
+    # (num_decoder_layers for decoder_num_layers).
+    sub_configs = [getattr(config, a, None) for a in ("encoder_config", "decoder_config")]
+    for cfg in (config, *[sc for sc in sub_configs if sc is not None]):
         for key in keys:
-            if isinstance(enc, dict):
-                if enc.get(key) is not None:
-                    return enc[key]
-            elif getattr(enc, key, None) is not None:
-                return getattr(enc, key)
+            if hasattr(cfg, key):
+                val = getattr(cfg, key)
+                if val is not None:
+                    return val
     raise AttributeError(f"config missing required attribute (checked: {', '.join(keys)})")
 
 
@@ -340,8 +314,8 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], prof
 
     # ---- decoder (prediction net) ----
     pred_hidden = resolve_config_attr(config, "decoder_hidden_size", "pred_hidden")
-    pred_rnn_layers = resolve_config_attr(config, "decoder_num_layers", "num_decoder_layers",
-                                          "pred_rnn_layers")
+    pred_rnn_layers = resolve_config_attr(config, "decoder_num_layers",
+                                          "num_decoder_layers", "pred_rnn_layers")
     w.add_key_value("parakeet.decoder.pred_hidden", pred_hidden, V.UINT32)
     w.add_key_value("parakeet.decoder.pred_rnn_layers", pred_rnn_layers, V.UINT32)
 
@@ -352,23 +326,20 @@ def add_metadata(w: gguf.GGUFWriter, config: Any, frontend: dict[str, Any], prof
     w.add_string("parakeet.joint.activation", "relu")
 
     # ---- decoding / vocab ----
-    # The engine's joint layout is [vocab_size tokens | blank | durations]:
-    # token_count = vocab_size + 1 (blank is its own logit slot past the
-    # pieces) and blank_id points at that slot. transformers counts the blank
-    # INSIDE config.vocab_size, so subtract it back out.
     max_symbols = resolve_config_attr(config, "max_symbols_per_step", "max_symbols")
     vocab_size = resolve_config_attr(config, "vocab_size")
     blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
-    if blank_id == vocab_size - 1:
-        vocab_size = blank_id
+    # The engine's parakeet.vocab_size EXCLUDES the blank id (vocab_p1 =
+    # vocab_size + 1 == embedding rows), while transformers' ParakeetTDTConfig
+    # .vocab_size includes it (embed rows == blank_id + 1). The reference GGUF
+    # records 8192 for a 8193-row embedding.
+    assert blank_id == vocab_size - 1, (blank_id, vocab_size)
+    vocab_size = blank_id
     w.add_key_value("parakeet.decoding.max_symbols", max_symbols, V.UINT32)
     w.add_key_value("parakeet.vocab_size", vocab_size, V.UINT32)
     w.add_key_value("parakeet.blank_id", blank_id, V.UINT32)
 
     # ---- TDT durations ----
-    # Written verbatim, INCLUDING a leading 0: the joint head carries one logit
-    # per config duration (head size == vocab_size + 1 + len(durations)), and
-    # the engine's decode loop handles skip==0 via its max_symbols guard.
     durations = list(resolve_config_attr(config, "durations"))
     w.add_key_value("parakeet.tdt.durations", durations, V.ARRAY, V.INT32)
 
@@ -428,6 +399,18 @@ def main() -> int:
     # Extract tokenizer pieces.
     print("[convert_parakeet] extracting tokenizer pieces ...")
     pieces = extract_tokenizer_pieces(processor)
+    # The engine's detokenizer drops blank emissions because pieces.size() ==
+    # vocab_size (blank-EXCLUDED; see capi_parakeet.cpp's decode_ids note), so
+    # truncate the piece table at the blank id.
+    blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
+    if len(pieces) not in (blank_id, blank_id + 1):
+        sys.exit(
+            f"unexpected tokenizer piece count {len(pieces)} for blank_id "
+            f"{blank_id}: expected {blank_id} (blank excluded) or "
+            f"{blank_id + 1} (blank still attached)"
+        )
+    if len(pieces) > blank_id:
+        pieces = pieces[:blank_id]
     print(f"  {len(pieces)} pieces")
 
     # Write GGUF.
@@ -438,13 +421,8 @@ def main() -> int:
     profile = "bf16_exact" if args.dtype == "bf16" else "f32_exact"
     add_metadata(w, config, frontend_params, profile)
 
-    # Tokenizer pieces (STRING array KV). The blank must NOT be a piece: the
-    # engine's detokenizer emits pieces[id] for any id < len(pieces), and ids
-    # >= vocab_size (blank included) must fall through and be dropped.
+    # Tokenizer pieces (STRING array KV).
     V = gguf.GGUFValueType
-    blank_id = resolve_config_attr(config, "blank_token_id", "blank_id")
-    if pieces and blank_id == len(pieces) - 1:
-        pieces = pieces[:-1]
     w.add_key_value("parakeet.tokenizer.pieces", pieces, V.ARRAY, V.STRING)
 
     # Mel filterbank + window tensors.
@@ -458,13 +436,41 @@ def main() -> int:
         if gguf_name is None:
             continue
 
-        # Convert to numpy in the right dtype.
-        if args.dtype == "bf16":
+        # Convert to numpy in the right dtype. Mirroring the reference f16
+        # GGUF layout (the layout the engine's conv path is built around —
+        # conformer.cpp casts the pointwise conv weights to F16 in-graph):
+        #   * conv weights (subsampling / pointwise / depthwise)  -> F16
+        #     (ggml_conv_2d im2col types the activations after the weight; a
+        #      BF16 weight produces BF16 activations, which the CPU backend's
+        #      mul_mat wdata path rejects)
+        #   * linear / embedding weights                            -> BF16
+        #   * every bias, LayerNorm/BatchNorm parameter, BN running
+        #     stat and positional vector                           -> F32
+        def tensor_kind(name: str) -> str:
+            if (name.endswith(".bias") or ".bias_" in name          # LSTM b_ih/b_hh
+                    or ".norm_" in name or name.startswith("norm_")
+                    or ".conv.batch_norm." in name or "pos_bias_" in name
+                    or name in ("preprocessor.featurizer.fb",
+                                "preprocessor.featurizer.window")
+                    # PredictionNet::ensure_embed_host_ D2H-reads the embedding
+                    # table as F32 (prediction.cpp).
+                    or name == "decoder.prediction.embed.weight"):
+                return "f32"
+            if (".conv." in name or name.endswith("_conv.weight")
+                    or ".depthwise_conv." in name):
+                return "f16"
+            return "bf16"
+        kind = tensor_kind(gguf_name)
+        if args.dtype == "bf16" and kind == "bf16":
             if tensor.dtype != torch.bfloat16:
                 tensor = tensor.to(torch.bfloat16)
             a = np.ascontiguousarray(tensor.view(torch.uint16).numpy())
             w.add_tensor(gguf_name, a, raw_shape=a.shape,
                         raw_dtype=gguf.GGMLQuantizationType.BF16)
+        elif kind == "f16":
+            a = np.ascontiguousarray(tensor.to(torch.float16).numpy())
+            w.add_tensor(gguf_name, a, raw_shape=a.shape,
+                        raw_dtype=gguf.GGMLQuantizationType.F16)
         else:
             a = np.ascontiguousarray(tensor.float().numpy())
             w.add_tensor(gguf_name, a)
