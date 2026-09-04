@@ -84,6 +84,44 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    prefill logits sit within the same band as CPU's own
    batched-vs-per-head attention difference (fp-order), ids identical.
 
+5. **RESOLVED — parakeet TDT early-termination was ggml's gallocr
+   recycling INPUT tensor storage (patch 0011), not a Vulkan bug.** The
+   K-step multistep graph seeds its constant inputs (enc_proj, duration
+   table, masks) ONCE per utterance and replays the same cgraph per K
+   decode steps — a contract ggml's allocator silently broke:
+   GGML_TENSOR_FLAG_INPUT only affects allocation ORDER, and the
+   live-range reuse (free_node when n_children/n_views hit zero)
+   recycled an input's chunk after its LAST IN-GRAPH READ, handing it
+   to late intermediates. Compute #1's tail then wrote f32 values over
+   the once-seeded i32 tables (dispatch log: dur_final's add lands at
+   byte 270880 inside dur_tbl's chunk), and every replay #2+ re-read
+   the poison: the gathered i32 = raw f32 bytes (0x40000000 = 2.0f)
+   inflated by the i32->f32 VALUE cast to 1073741824.0 — the exact
+   ring-garbage signature. Four-way confirmation: (a) the dispatch
+   streams of replay #1 vs #2 are byte-identical while the device
+   bytes differ (no dispatch-state bug); (b) the aliased offsets are
+   visible in the -DGGML_VULKAN_DEBUG dispatch dump; (c) patch 0011
+   (ggml-alloc.c: never free/reuse-in-place INPUT-flagged nodes,
+   mirroring the OUTPUT exemption) cures it with the once-per-utterance
+   seeding intact; (d) the discriminating control — WITHOUT the patch,
+   re-uploading every once-seeded input before each replay also cures
+   it. Every earlier symptom follows: both multistep sub-paths corrupt
+   identically (both seed once), removing the tiny debug captures
+   worsened it (one_t was INPUT+OUTPUT and thus protected — dropping
+   its capture un-protected it), single-replay graphs are exact, all
+   GGML_VK_* knobs were irrelevant, and the moss/qwen K-step survived
+   because its engine re-uploads its constants every replay (an
+   accidental defense). Upstream master has the same INPUT/OUTPUT
+   asymmetry (not filed upstream — repo policy). The PR #45 Vulkan
+   gate on the multistep path is reverted by the patch-0011 PR; the
+   K=48/K=128 "CUDA-graph topology defect" inexactness documented at
+   tdt_multistep.cpp's kstep notes is plausibly the same gallocr bug
+   at other shapes — worth re-checking on the CUDA machine with 0011
+   applied. Validation after 0011 + un-gate: K=2/K=16/default
+   multistep produce the exact CPU transcript on short/medium/long
+   (bf16 + q8_0); moss/granite stage ids, test_ops, test_bmm all
+   unchanged.
+
 ## Reproduce the moss stage comparison
 
 ```bash
@@ -97,9 +135,10 @@ comparison. granite: same with `/tmp/stage_cmp_granite` and
 
 ## Next steps
 
-- Parakeet (no qwen_decode stack) runs on Vulkan but terminates TDT decode
-  early — suspect f16-accumulating pipelines on matrix-core-less devices;
-  try forcing f32acc pipelines.
+- **CUDA machine follow-ups:** run tests/test_ggml_parity.py over PRs
+  #43/#44/#45/#46 (the gate), and re-check the K-step K-sweep with patch
+  0011 applied — the K=48/K=128 "topology-defect" inexactness may have
+  been the same gallocr input-reuse bug (finding 5).
 - higgs wrong output on CPU (byte-exact on CUDA per repo docs) — same
   dtype-discipline family; the repo's staged golden-component probes are
   the tool (golden files are dev-machine artifacts, not in git).

@@ -19,6 +19,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace starling::ggml::parakeet {
@@ -30,6 +31,17 @@ static bool tdt_serial_forced() {
     const char* e = std::getenv("STARLING_GGML_TDT_SERIAL");
     return e && e[0] == '1';
 }
+
+// The K-step multistep graph seeds its constant inputs (enc_proj, duration
+// table, masks) ONCE per utterance and replays the same cgraph per K decode
+// steps. That contract is what ggml patch 0011 makes sound: the gallocr's
+// live-range reuse used to recycle input storage after the last in-graph
+// read, so replay #2+ re-read the late intermediates that compute #1's tail
+// wrote over the constant tables (the early-termination bug PR #45 gated
+// off on Vulkan — full story in scripts/diagnostics/vulkan/README.md).
+// With 0011, inputs are pinned like outputs and the multistep path is exact
+// on every backend (validated on Vulkan with the multistep path forced at
+// K=2 and K=16).
 
 std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc_proj,
@@ -45,8 +57,8 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
     // serial loop below is launch/sync-bound; this collapses ~T syncs to ~T/K.
     // Byte-exact with the serial loop (emits EVERY token, including blanks, to
     // match the golden id stream). On CPU, when the serial path is forced, or
-    // if capture fails, tdt_greedy_multistep returns nullopt and we fall through
-    // to the serial loop. Mirrors parakeet.cpp's tdt.cpp dispatch.
+    // if capture fails, tdt_greedy_multistep returns nullopt and we fall
+    // through to the serial loop. Mirrors parakeet.cpp's tdt.cpp dispatch.
     if (global_backend().is_gpu() && !tdt_serial_forced()) {
         // Safety ceiling on encoder length (protects against an unbounded-length
         // capture on extraordinarily long audio); override with
