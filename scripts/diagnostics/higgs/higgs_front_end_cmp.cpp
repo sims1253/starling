@@ -67,15 +67,32 @@ static std::vector<float> host_conv1d(const ModelLoader& ml, const std::vector<f
     return y;  // [OC, OL] oc-contig, GELU applied
 }
 
+// bf16 ulp of v (8-bit significand -> 7 fraction bits).
+static float bf16_ulp_of(float v) {
+    float a = std::fabs(v);
+    if (!(a > 1e-30f)) return 1e-30f;  // zero/denormal floor
+    int e; std::frexp(a, &e);          // a = m * 2^e, m in [0.5, 1)
+    return std::ldexp(1.0f, e - 8);    // ulp = 2^(e-1-7)
+}
 static void cmp(const char* name, const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size()) { printf("%-14s SIZE %zu vs %zu\n", name, a.size(), b.size()); return; }
-    double md = 0; size_t at = 0;
+    double md = 0; size_t at = 0; double worst_ulp = 0, worst_d = 0;
     for (size_t i = 0; i < a.size(); ++i) {
         double d = std::fabs((double) a[i] - (double) b[i]);
         if (d > md) { md = d; at = i; }
+        float ulp = bf16_ulp_of(std::max(std::fabs(a[i]), std::fabs(b[i])));
+        double r = d / (double) ulp;
+        if (r > worst_ulp) { worst_ulp = r; worst_d = d; }
     }
-    printf("%-14s n=%-8zu maxdiff=%-12.6g at=%zu (host=%g graph=%g)%s\n",
-           name, a.size(), md, at, a[at], b[at], md > 1e-2 ? "  <-- DIVERGES" : "");
+    // Mixed gate. The expected residual has two shapes: +-1-ulp tie-flips on
+    // large values (f64-acc host vs f32-acc graph conv), and tiny absolute
+    // accumulation noise (<1e-3) on near-zero values — pure-relative gates
+    // misfire on the latter (a 5e-5 diff on a 2e-4 element is hundreds of
+    // bf16 ulps yet benign). Flag only when the diff is BOTH >4 ulps relative
+    // AND >2e-3 absolute.
+    printf("%-14s n=%-8zu maxdiff=%-12.6g at=%zu (host=%g graph=%g) worst=%0.1f ulps%s\n",
+           name, a.size(), md, at, a[at], b[at], worst_ulp,
+           (worst_ulp > 4.0 && worst_d > 2e-3) ? "  <-- DIVERGES" : "");
 }
 
 int main() {
