@@ -22,6 +22,7 @@
 #include "runtime/graph.hpp"
 #include "lib/graph_helpers.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
