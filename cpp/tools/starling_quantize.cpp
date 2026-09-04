@@ -92,8 +92,11 @@ const std::vector<Level> kLevels = {
     {"q4_k_m", GGML_TYPE_Q4_K,  GGML_TYPE_Q6_K,  true},
     {"q3_k_m", GGML_TYPE_Q3_K,  GGML_TYPE_Q5_K,  true},
     {"q2_k",   GGML_TYPE_Q2_K,  GGML_TYPE_Q4_K,  true},
-    // IQ formats below ~2.6 bpw REQUIRE an importance matrix (ggml refuses
-    // without one) — they only exist as calibrated builds.
+    // IQ formats below ~2.6 bpw exist only as calibrated builds in practice:
+    // ggml REFUSES to quantize IQ2_XXS / IQ2_XS / IQ1_S without an importance
+    // matrix (ggml_quantize_requires_imatrix). IQ2_S and IQ1_M accept a null
+    // matrix but are meaningfully better with one — keep --imatrix mandatory
+    // for the whole IQ range here.
     {"iq2_s",   GGML_TYPE_IQ2_S,   GGML_TYPE_IQ2_S,   false},
     {"iq2_xs",  GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_XS,  false},
     {"iq2_xxs", GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, false},
@@ -429,6 +432,16 @@ int main(int argc, char** argv) {
                 if (it != imap.end() && it->second.values.size() == (size_t)k) {
                     im = it->second.values.data();
                     imatrix_hits++;
+                }
+                if (ggml_quantize_requires_imatrix(want) && im == nullptr) {
+                    // ggml_quantize_chunk GGML_ABORTs (release builds too)
+                    // for the imatrix-mandatory types on a null matrix —
+                    // fail cleanly instead, naming the tensor.
+                    std::fprintf(stderr,
+                                 "error: %s requires an imatrix entry but %s "
+                                 "has none matching its row width %lld\n",
+                                 type_name(want), name.c_str(), (long long)k);
+                    return 1;
                 }
                 if (qinit.insert(want).second) ggml_quantize_init(want);
                 const int64_t nrows = (int64_t)ggml_nelements(t) / (k > 0 ? k : 1);

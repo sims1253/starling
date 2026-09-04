@@ -24,7 +24,9 @@ in the wild, zero-copy:
   `enc.blocks.N.*` / `pred.lstm.N.{Wx,Wh,bias}` tensors with a FUSED LSTM
   bias, `stt.*` KV, and no filterbank tensor. The compat layer synthesizes
   the slaney mel filterbank + hann window from the `stt.frontend.*`
-  metadata (bit-identical to the converter-embedded one) and splits the
+  metadata (bit-identical, max-abs 0.0, to this repo's converter-embedded tensor;
+the synthesis reproduces the librosa-fallback numerics, which matched the
+cached-filterbank path here) and splits the
   fused bias (bias_ih = fused, bias_hh = 0 — the two only ever sum).
 
 The vocab/blank/durations conventions are reconciled against the joint
@@ -243,8 +245,9 @@ Two lessons: (1) at 2 bits, **calibration-data diversity is part of quality**
 — English-only importance matrices silently cost 16 German WER points, and
 adding ten minutes of German audio recovered nine of them (English fixtures
 stayed perfect throughout); (2) the remaining gap to f32 at iq2_xxs is
-calibration-hungry — a production imatrix for the 25-language v3 wants
-Granary-scale coverage, not 10 MLS minutes. This is the miniaturized version
+NOT calibration-hungry — the volume study below (and the kitchen-sink run)
+show more audio does not close it; Granary-scale audio buys language
+COVERAGE, not volume. This is the miniaturized version
 of exactly the multilingual-calibration story Granary exists for.
 
 ## Language-coverage dynamics (FLEURS, controlled experiment)
@@ -282,8 +285,9 @@ Takeaways:
 - **English pays essentially nothing for full coverage** (≤ +1.0 WER at the
   worst level, within 50-clip noise). There is no English-vs-coverage
   tradeoff here: ship the 25-language-calibrated quant.
-- **German wants to be in the calibration set** (iq2_xxs: +3.74 EN-only vs
-  +2.7–2.9 when included), matching the MLS result.
+- **German wants to be in the calibration set** at iq2_xxs (+3.74 EN-only
+  vs +2.7–2.9 included) per these 50-clip reads — superseded by the
+  300-clip CI re-run below, which found the calibration mix not measurable.
 - **2 bits are an EN/major-language trade**: the iq2_xxs mean gap is carried
   by the tail languages — Lithuanian/Latvian/Slovenian/Romanian/Finnish/
   Swedish degrade +14–29 points over f32 with ANY calibration (the 25-lang
@@ -316,11 +320,12 @@ importance vectors of the 12-clip and 60-clip imatrices agree at **0.993
 mean cosine across all 275 tensors** — the activation statistics saturate at
 roughly a dozen clips per language, so the quantizer makes the same block-
 scale decisions either way. A kitchen-sink matrix over EVERY training clip
-on disk (1,224 FLEURS wavs across three corpora + LibriSpeech fixtures +
-MLS German audiobooks, 838k observations — extra domains included) confirms
+on disk (1,224 FLEURS wavs across three
+corpora, plus LibriSpeech fixtures and MLS German audiobooks as extra
+domains; 838k observations) confirms
 the same: q2_k 6.06/6.50 and iq2_xxs 9.20/8.41 DE/EN vs the production
 matrix's 6.03/6.36 and 9.38/8.39, all within noise. The remaining low-bit gaps (DE ≈ +2.7 at
-iq2_xxs, ≈ +1 at q2_k) are the inherent error of that bit width for those
+iq2_xxs, ≈ +1.7–2.1 at q2_k per this table's rows) are the inherent error of that bit width for those
 languages, not a calibration-data deficit. What does move them: more bits
 (q4_k_m is free), or *different* data — calibration audio matched to the
 deployment domain, since FLEURS's read-speech distribution is itself part of
@@ -411,11 +416,18 @@ the compat layer — same engine, same eval, so it compares the pipelines
 | q6_k   | 610 | 777 | identical |
 | q5_k_m | 549 | 740 | identical |
 | q4_k_m | 485 | 704 | identical (ours 6.41/5.31, handy 6.62/5.13 — CIs overlap fully) |
-| q4_k_m + shrink16 | — | 553 | identical (5.31 [4.55–6.15] / 6.46 [5.63–7.35]) |
+| q4_k_m + shrink16 | — | 553 | identical (EN 6.46 [5.63–7.35] / DE 5.31 [4.55–6.15]) |
+
+(The `ours` column measures the released artifacts, quantized with the
+production imatrix; the CI re-run table's q4_k_m row measured the earlier
+uniform-build research file — both f32-equivalent, hence the small EN/DE
+wiggles between the tables.)
 
 Their files are smaller at the same level name because their policy also
 quantizes the embedding and keeps convs F16; `--shrink-f16` closes most of
-that gap (the remainder is the exactness-motivated F32 embedding). Tail
+that gap; the remainder is mostly the `_M` bump mixes (Q6_K attention /
+down-projection groups vs their uniform Q4) plus the exactness-motivated
+F32 embedding (~18 MB). Tail
 languages at q4_k_m (48 clips/lang): ours 14.15 vs handy 14.62 vs f32 14.00
 mean — a small consistent edge (sk 12.2→10.4, cs 13.4→11.5), borderline
 individual noise.
@@ -439,9 +451,10 @@ multi-GB per config and stalled repeatedly next to a loaded model.
 | f32 (2508 MB) | 12.9× | |
 | q4_k_m (704 MB) | 11.9× | −8% |
 | q2_k (574 MB) | 14.2× | +10% |
+| q3_k_m (634 MB) | 11.1× | between q4 and iq2, as expected |
 | iq2_xxs+shrink16 (325 MB) | 7.5× | −42% (IQ vec-dot kernels are CPU-compute-bound) |
 
 The quants' value is size/VRAM, not CPU speed: k-quants are roughly
 speed-neutral on this encoder, and the IQ formats trade inference speed for
-bytes. When both matter, q3_k_m occupies the middle. GPU behavior may
+bytes. When both matter, q3_k_m is the measured middle (11.1×). GPU behavior may
 differ (bandwidth-bound, mmvq paths) — untested on this hardware.

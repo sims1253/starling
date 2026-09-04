@@ -29,6 +29,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+
+# The in-process model sweep is CPU-sound only: on GPU builds the K-step
+# replay caches outlive eng.close() and would replay against the previous
+# model's freed weight buffers. Pin unless the caller overrides.
+os.environ.setdefault("STARLING_GGML_DEVICE", "cpu")
 sys.path.insert(0, str(REPO_ROOT / "tests" / "fixtures"))
 
 import make_fixtures as mkfx  # noqa: E402
@@ -175,6 +180,8 @@ def main() -> int:
                 row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
                 per_clip["mls_de"] = wers
             for cfg, clips_ in fleurs_evals.items():
+                if not clips_:  # a config that failed to stream; warned above
+                    continue
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in clips_]
                 row["wer"][f"fleurs_{cfg}"] = round(sum(wers) / len(wers), 2)
@@ -185,7 +192,9 @@ def main() -> int:
                 row["wer"][prefix] = round(sum(wers) / len(wers), 2)
                 per_clip[prefix] = wers
             for col, wers in per_clip.items():
-                row["wer_ci"][col] = _bootstrap_ci(wers, seed=hash(col) % 2**31)
+                import zlib
+                row["wer_ci"][col] = _bootstrap_ci(
+                    wers, seed=zlib.crc32(col.encode()) % 2**31)
         finally:
             eng.close()
         rows.append(row)

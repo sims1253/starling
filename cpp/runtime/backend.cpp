@@ -127,6 +127,9 @@ struct Backend::Impl {
         sched = ggml_backend_sched_new(backends, bufs, n,
                                        (int)kGraphSize,
                                        /*parallel=*/false, /*op_offload=*/true);
+        // In the vendored ggml the eval callback gates observation only, not
+        // backend placement; host-side activation reads are sound because
+        // collection runs pin STARLING_GGML_DEVICE=cpu.
         if (sched && ImatrixCollector::enabled()) {
             ggml_backend_sched_set_eval_callback(sched, imatrix_eval_cb, nullptr);
         }

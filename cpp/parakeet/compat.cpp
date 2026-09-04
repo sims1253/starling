@@ -197,19 +197,34 @@ bool normalize_vocab(ModelLoader& ml, const std::string& kv_vocab_key,
     const int64_t v_layout = head->ne[1] - 1 - n_dur;
     if (v_layout <= 0) { err = "compat: implausible joint layout"; return false; }
 
-    int64_t kv_vocab = v_layout;
-    ml.kv_int(kv_vocab_key, kv_vocab);  // absent -> kv_int returns false, keeps default
-    if (kv_vocab == v_layout + 1) {
-        // dialect counts the blank inside vocab; the engine does not
-        ml.add_kv_int("parakeet.vocab_size", v_layout);
-    } else {
-        ml.add_kv_int("parakeet.vocab_size", v_layout);
+    int64_t kv_vocab = -1;
+    ml.kv_int(kv_vocab_key, kv_vocab);  // -1 when the dialect omits it
+    // Tripwire: a vocab count that matches NEITHER convention means the
+    // dialect was mis-detected (e.g. a wrong durations array) — refuse
+    // rather than silently trusting geometry.
+    if (kv_vocab != -1 && kv_vocab != v_layout && kv_vocab != v_layout + 1) {
+        err = "compat: dialect vocab_size " + std::to_string(kv_vocab) +
+              " matches neither layout convention (expected " +
+              std::to_string(v_layout) + " or " + std::to_string(v_layout + 1) +
+              "); refusing to guess";
+        return false;
     }
+    ml.add_kv_int("parakeet.vocab_size", v_layout);
 
-    // pieces: drop the trailing blank token when present
+    // pieces: expect the blank-inclusive or blank-excluded spelling, and
+    // REFUSE anything else — a silently missing/mis-sized token array yields
+    // empty transcripts for every utterance (detokenize drops out-of-range
+    // ids) with no error anywhere.
     std::vector<std::string> pieces;
-    if (ml.kv_arr_str(pieces_key, pieces) && (int64_t)pieces.size() == v_layout + 1)
-        pieces.pop_back();
+    if (!ml.kv_arr_str(pieces_key, pieces) ||
+        ((int64_t)pieces.size() != v_layout && (int64_t)pieces.size() != v_layout + 1)) {
+        err = "compat: " + pieces_key + " missing or sized " +
+              std::to_string(pieces.size()) + " (expected " +
+              std::to_string(v_layout) + " or " + std::to_string(v_layout + 1) + ")";
+        return false;
+    }
+    if ((int64_t)pieces.size() == v_layout + 1)
+        pieces.pop_back();  // drop the trailing blank piece
     ml.add_kv_arr_str("parakeet.tokenizer.pieces", pieces);
 
     int64_t blank = v_layout;

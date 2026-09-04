@@ -10,9 +10,11 @@
 //
 // Enable by setting STARLING_IMATRIX=<output-path> in the environment before
 // the engine loads: backend.cpp then routes every graph through
-// ggml_backend_sched with an eval callback (see backend.cpp), which forces
-// observed nodes onto the CPU backend — collection mode trades speed for
-// visibility and is not meant for serving.
+// ggml_backend_sched with an eval callback, which observes each node's
+// activations. NOTE: in the vendored ggml the callback only gates
+// observation, not backend placement — host-side activation reads are sound
+// because the collection drivers pin STARLING_GGML_DEVICE=cpu. Collection
+// mode trades speed for visibility and is not meant for serving.
 //
 // The map is flushed at process exit (std::atexit) and after an explicit
 // starling_ggml_imatrix_flush() C-API call; writing touches no ggml state so

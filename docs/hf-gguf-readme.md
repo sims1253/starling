@@ -44,8 +44,11 @@ Released at [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholz
 ## Usage with starling-serve
 
 ```bash
-# Download a GGUF file:
-hf download starling/parakeet-tdt-0.6b-v3-gguf \
+# Download a GGUF file (the calibrated quant ladder lives at
+# scholzmx/parakeet-tdt-0.6b-v3-gguf — q8_0, q6_k, q5_k_m, q4_k_m,
+# q4_k_s, q4_k_m-shrink16, q3_k_m, q2_k, iq2_xxs-imx-shrink16, plus the
+# importance matrix for custom recipes):
+hf download scholzmx/parakeet-tdt-0.6b-v3-gguf \
   parakeet-tdt-0.6b-v3-q8_0.gguf \
   --local-dir ./models
 

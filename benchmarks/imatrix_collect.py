@@ -62,6 +62,10 @@ def main() -> int:
     # graph build and flushes at process exit.
     os.environ["STARLING_IMATRIX"] = str(out.resolve())
     os.environ["STARLING_GGML_PARAKEET_MODEL"] = str(model.resolve())
+    # Collection is only sound with the engine on its CPU backend: the
+    # eval-callback path reads activation memory host-side. Pin it unless the
+    # caller explicitly overrides.
+    os.environ.setdefault("STARLING_GGML_DEVICE", "cpu")
 
     import make_fixtures as mkfx
     from engines import StarlingGgmlParakeet
