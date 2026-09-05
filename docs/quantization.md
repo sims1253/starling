@@ -174,12 +174,44 @@ kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
 All numbers from `benchmarks/wer_quant.py` on the CPU path (the Vulkan fast
-path has a known output discrepancy on this RADV iGPU independent of
-quantization — F32 degrades there too; see the PR notes). The fixtures repeat
+path has a known premature-termination bug on this RADV iGPU independent of
+quantization — F32 truncates there too; retested and characterized after the
+#47 multistep fix, see "Vulkan fast-path retest (post-#47)" below). The fixtures repeat
 one utterance, so read the deltas against the f32 row, not as leaderboard
 WERs. The imatrix was collected over the same three fixtures (single speaker,
 ~1.5 min audio — deliberately minimal; real calibration would use an hour of
 diverse audio, e.g. Granary-derived clips).
+
+### Vulkan fast-path retest (post-#47, 2026-09-05)
+
+Retested at the merged-#39 build (includes #47's galloc INPUT-reuse patch,
+binaries rebuilt to the branch tip): the fast path is still wrong for F32,
+but the failure is now precisely characterized — **premature termination,
+not acoustic corruption**.
+
+- Fixtures, f32, same binary, one model per process: CPU
+  `0.00/0.00/0.00` vs `STARLING_GGML_DEVICE=Vulkan0`
+  `60.87/86.96/0.00` (short/medium/long). Single-model runs sidestep the
+  in-process sweep's replay-cache hazard, so these numbers are sound.
+- Repetition sweep (base utterance 7.4 s, k× no gap): k=1–5 emit only the
+  opening phrase ("Well, I don't wish to see it any more,") and stop — the
+  WERs reconcile exactly as deletions (short 13/21 words → 60.87, medium
+  55/63 → 86.96). k=6 (44.6 s) through 10: complete, correct transcripts
+  (long = WER 0.00).
+- Real clips (fleurs_test bg_bg, 8–19 s, 8/8 truncated): correct-prefix
+  truncation after ~5–8 words, WER 72–89 — not a repeated-utterance
+  artifact.
+- Prefix sweep (1–7.4 s of the base): partial audio yields correct partial
+  transcripts — encoder/weights compute fine; only the stop decision is
+  wrong.
+
+Pattern: single-window decode (input below ~40 s, bracketed 37.2–44.6 s)
+stops after the first K-step batch; longer audio, which takes the
+segmented/composite path, completes. The termination logic to start from is
+the K-step loop in `cpp/parakeet/tdt_multistep.cpp` (patch 0011's
+territory: galloc INPUT storage reuse). GPU sweeps and GPU ladder speed
+numbers stay blocked on this fix; the CPU pin in the benchmark drivers
+remains mandatory.
 
 Clean audio — every level down to q2_k is lossless here:
 
@@ -457,4 +489,5 @@ multi-GB per config and stalled repeatedly next to a loaded model.
 The quants' value is size/VRAM, not CPU speed: k-quants are roughly
 speed-neutral on this encoder, and the IQ formats trade inference speed for
 bytes. When both matter, q3_k_m is the measured middle (11.1×). GPU behavior may
-differ (bandwidth-bound, mmvq paths) — untested on this hardware.
+differ (bandwidth-bound, mmvq paths) — unmeasurable on this hardware while the
+Vulkan fast-path truncation bug stands (see the post-#47 retest note above).
