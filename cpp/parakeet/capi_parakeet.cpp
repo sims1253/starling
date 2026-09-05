@@ -66,12 +66,12 @@ extern "C" {
 // an opaque handle (caller wraps in starling_ggml_ctx) or nullptr on error.
 void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out) {
     // Exception-fenced like every sibling capi TU (capi.cpp's contract: a
-    // C++ exception never crosses the boundary): the body realizes ~1.2 GB
-    // of weights onto the device and builds the persistent compute objects,
-    // any of which can throw (bad_alloc, GpuMel/Encoder construction).
-    auto ctx = std::make_unique<ParakeetCtx>();
-    ctx->model = std::make_unique<starling::ggml::parakeet::ParakeetModel>();
+    // C++ exception never crosses the boundary): the ctx/model construction,
+    // the ~1.2 GB weight realize and the persistent compute objects can all
+    // throw (bad_alloc, GpuMel/Encoder construction).
     try {
+        auto ctx = std::make_unique<ParakeetCtx>();
+        ctx->model = std::make_unique<starling::ggml::parakeet::ParakeetModel>();
         if (!ctx->model->load(gguf_path, ctx->err)) {
             report_error(err_out, ctx->err.c_str());
             return nullptr;
@@ -96,6 +96,7 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
         ctx->joint = std::make_unique<starling::ggml::parakeet::Joint>(
             ctx->model->loader, ctx->model->config);
         if (err_out) *err_out = nullptr;
+        return ctx.release();
     } catch (const std::exception& e) {
         report_error(err_out, e.what());
         return nullptr;
@@ -103,7 +104,6 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
         report_error(err_out, "unknown exception loading parakeet model");
         return nullptr;
     }
-    return ctx.release();
 }
 
 void starling_ggml_parakeet_free(void * handle) {
