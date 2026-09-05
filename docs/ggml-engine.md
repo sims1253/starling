@@ -259,6 +259,18 @@ Built with `-DGGML_VULKAN=ON` (`third_party/ggml/src/ggml-vulkan/`). Select
 with `STARLING_GGML_DEVICE=Vulkan0`. Targets the Intel/AMD/ARM GPUs CUDA can't
 reach. Same graph-replay path as CUDA/Metal.
 
+In-tree ggml patches 0009/0010/0011 (GEMV bf16 upcast, batch-strided
+mul_mat, galloc INPUT-storage reuse) carry the Vulkan-correctness story;
+the per-finding root-cause record is `scripts/diagnostics/vulkan/README.md`.
+Known upstream gap, deliberately NOT patched here: the `mul_mat_id`
+(MoE dispatch) variants `ggml_vk_mul_mat_id_q_f16`/`_f16` still hardcode
+contiguous batch strides (`ne00*ne01` / `ne10*ne11`) and fall back to
+`nb[0]`, which is not a batch stride at all — the same two defects patch
+0010 removed from `mul_mat`. Starling's engines never emit `mul_mat_id`
+(no MoE models), so it is untriggered; a MoE engine would need the same
+nb[2]-derived-stride treatment before its KV-cache views are trustworthy
+on Vulkan.
+
 ### HIP (AMD) / SYCL (Intel)
 Supported by ggml's registry; selected the same way when ggml is built with
 `-DGGML_HIP=ON` / `-DGGML_SYCL=ON`.
