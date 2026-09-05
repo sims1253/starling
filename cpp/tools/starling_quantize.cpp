@@ -374,6 +374,9 @@ int main(int argc, char** argv) {
                          use_recipe ? args.recipe.c_str() : args.quant.c_str());
         gguf_set_val_str(out, "starling.quant.calibration",
                          args.imatrix.empty() ? "uniform" : "imatrix");
+        // The source's numeric profile no longer describes this file; audex
+        // (and the engines following it) gate loads on the profile string.
+        gguf_set_val_str(out, "starling.numeric_profile", "quantized");
     }
 
     std::unordered_set<ggml_type> qinit;

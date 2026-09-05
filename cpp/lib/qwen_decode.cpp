@@ -62,6 +62,15 @@ const char* lm_head_name(const QwenDecodeSpec& s) {
     return s.tied_lm_head ? "llm.embed.weight" : "llm.lm_head.weight";
 }
 
+// lm_head GEMM under gemm_act's quantized-weight rule (see graph_helpers.hpp):
+// bf16 activations against unquantized heads, F32 against block-quantized
+// ones (ggml's quantized matmul asserts F32 src1).
+ggml_tensor* lm_head_gemm(ggml_context* c, const ModelLoader& ml,
+                          const QwenDecodeSpec& s, ggml_tensor* x) {
+    ggml_tensor* w = wb(c, ml, lm_head_name(s));
+    return ggml_mul_mat(c, w, gemm_act(c, w, x));
+}
+
 // Attention softmax scale: explicit (granite's attention_multiplier replaces
 // 1/sqrt(D)) or the historical default.
 float attn_scale(const QwenDecodeSpec& s, int D) {
@@ -408,7 +417,7 @@ bool forward_legacy(const QwenDecodeCtx& m, const std::vector<float>& input, int
         ggml_tensor* t = graph_input_tensor(c, GGML_TYPE_BF16, 2, ne,
                                             last.data(), last.size() * sizeof(last[0]));
         t = spec_rms(c, m.spec, m.loader, t, "llm.final_norm.weight", m.dims.rms_norm_eps);
-        ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), t);
+        ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, t);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
     if (!ok) e = std::string(m.spec.label) + " lm_head graph failed";
@@ -735,7 +744,7 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                     ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                                      (size_t)(S - 1) * x->nb[1]);
                     ggml_tensor* n = spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
-                    ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+                    ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
                     return ff(c, apply_logits_scaling(c, m.spec, lg));
                 });
             return entry;
@@ -779,7 +788,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
             ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                              (size_t)(S - 1) * x->nb[1]);
             ggml_tensor* n = spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
-            ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+            ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
             return ff(c, apply_logits_scaling(c, m.spec, lg));
         }, logits);
         if (!ok) { e = std::string(m.spec.label) + " prefill graph failed"; return false; }
@@ -849,7 +858,7 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
                                  cs, sn, mt, kv_mode, idx_t);
         ggml_tensor* n = spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
-        ggml_tensor* lg = ggml_mul_mat(c, wb(c, m.loader, lm_head_name(m.spec)), n);
+        ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
     if (!ok) { e = std::string(m.spec.label) + " decode graph failed"; return false; }
@@ -1018,7 +1027,7 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                 ggml_tensor* n = spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
-                ggml_tensor* logits = ggml_mul_mat(c, head_w, n);                  // [vocab, 1]
+                ggml_tensor* logits = ggml_mul_mat(c, head_w, gemm_act(c, head_w, n));  // [vocab, 1]
                 ggml_tensor* am_in = logits;
                 if (iota) {
                     // bf16-round (the reference's storage boundary), then the
