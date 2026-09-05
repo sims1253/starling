@@ -263,13 +263,16 @@ In-tree ggml patches 0009/0010/0011 (GEMV bf16 upcast, batch-strided
 mul_mat, galloc INPUT-storage reuse) carry the Vulkan-correctness story;
 the per-finding root-cause record is `scripts/diagnostics/vulkan/README.md`.
 Known upstream gap, deliberately NOT patched here: the `mul_mat_id`
-(MoE dispatch) variants `ggml_vk_mul_mat_id_q_f16`/`_f16` still hardcode
-contiguous batch strides (`ne00*ne01` / `ne10*ne11`) and fall back to
-`nb[0]`, which is not a batch stride at all — the same two defects patch
-0010 removed from `mul_mat`. Starling's engines never emit `mul_mat_id`
-(no MoE models), so it is untriggered; a MoE engine would need the same
-nb[2]-derived-stride treatment before its KV-cache views are trustworthy
-on Vulkan.
+(MoE dispatch) variants `ggml_vk_mul_mat_id_q_f16` (wide) and
+`ggml_vk_mul_mat_vec_id_q_f16` (GEMV) still hardcode contiguous batch
+strides (`ne00*ne01` / `ne10*ne11`) for in-place operands, and the wide
+variant also falls back to `nb[0]`, which is not a batch stride at all —
+the same two defects patch 0010 removed from `mul_mat`. (The GEMV
+variant's y-stride fallback is already `nb[2]`-derived; its x batch
+stride is hardcoded inline in the push constants with no fallback.)
+Starling's engines never emit `mul_mat_id` (no MoE models), so it is
+untriggered; a MoE engine would need the same nb[2]-derived-stride
+treatment before its KV-cache views are trustworthy on Vulkan.
 
 ### HIP (AMD) / SYCL (Intel)
 Supported by ggml's registry; selected the same way when ggml is built with
