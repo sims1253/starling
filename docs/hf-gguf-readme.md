@@ -64,7 +64,8 @@ fields when they are present:
 
 - `starling.numeric_profile` — accepted values: `bf16_exact`, `f16`
   (parakeet, moss, ark, higgs); `mixed_f32_bf16_exact`, `bf16_exact`, `f16`
-  (hojo); `bf16_exact` (granite, qwen3, audex).
+  (hojo); `bf16_exact` (granite, qwen3, s1); `bf16_exact`, `quantized`
+  (audex).
 - `starling.format_version` — must be `1`.
 
 The parakeet loader does not validate these fields; the other model loaders

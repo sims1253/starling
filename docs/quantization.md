@@ -448,12 +448,21 @@ The audit found the existing name/shape rules sufficient — `enc.conv1/2`
 cast), `enc.pos_embed` and the mel constants (no `.weight` suffix) are all
 kept automatically; `llm.lm_head.weight` and every encoder/projector/trunk
 linear are plain `ggml_mul_mat` and quantize freely (363 of 719 tensors).
+The conv keep rule is load-bearing: the conv GEMM
+(`cpp/audex/encoder.cpp`, the im2col matmul) takes its activation straight
+from the F32 im2col buffer with no `gemm_act`, so a future rule change
+that quantized conv weights would fail at eval time (the im2col/quantized
+matmul assert), not at load — nothing at graph-build time enforces it.
 The loader allowlist gained `"quantized"`, and the quantizer now stamps
-`starling.numeric_profile=quantized` instead of inheriting the source's
-exact-profile string.
+`starling.numeric_profile=quantized` when it actually quantized at least
+one tensor, instead of inheriting the source's exact-profile string (a
+degenerate all-kept run is numerically identical to the source, so it
+keeps the inherited profile).
 
 **The surprise**: ggml's quantized matmul asserts F32 activations
-(`GGML_ASSERT(src1->type == GGML_TYPE_F32)`, ggml-cpu.c:1401), and the
+(`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in the quantized branch of
+`ggml_compute_forward_mul_mat`,
+`third_party/ggml/src/ggml-cpu/ggml-cpu.c`), and the
 qwen-trunk/audex graphs feed **bf16** activations into every weight GEMM.
 Fix: `gemm_act()` (graph_helpers.hpp) upcasts the activation to F32 only
 when the weight is block-quantized — bf16 is exact in f32, so the

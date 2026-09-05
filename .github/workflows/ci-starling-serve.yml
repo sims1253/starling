@@ -48,7 +48,8 @@ jobs:
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
-            audio_parser_test loader_guard_test higgs_dtype_guard_test
+            audio_parser_test loader_guard_test higgs_dtype_guard_test \
+            audex_loader_guard_test
 
       - name: C++ unit tests (serve logic, no GPU/model)
         run: |
@@ -56,11 +57,13 @@ jobs:
           ./build/audio_parser_test
 
       # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
-      # higgs_dtype_guard_test synthesizes its own GGUF and always runs.
+      # higgs_dtype_guard_test and audex_loader_guard_test synthesize their
+      # own GGUFs and always run (audex's real-file smoke SKIPs when absent).
       - name: C++ loader/dtype guard tests
         run: |
           ./build/loader_guard_test
           ./build/higgs_dtype_guard_test
+          ./build/audex_loader_guard_test
 
       - name: Smoke test --version
         run: |
