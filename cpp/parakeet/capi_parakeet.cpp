@@ -46,6 +46,17 @@ struct ParakeetCtx {
     std::string err;
 };
 
+// *err_out must remain readable after this TU returns (cpp/capi.cpp copies it
+// into the global error after the call). Every message that lives in
+// call-scoped storage goes through here: ctx->err outlives its unique_ptr on
+// the load-failure path and e.what() dangles once its catch block exits. Same
+// pattern as the g_load_error/report_load_error pairs in the other capi TUs.
+thread_local std::string g_capi_error;
+void report_error(const char** out, const char* msg) {
+    g_capi_error = msg;
+    if (out) *out = g_capi_error.c_str();
+}
+
 } // namespace
 
 extern "C" {
@@ -57,7 +68,7 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
     auto ctx = std::make_unique<ParakeetCtx>();
     ctx->model = std::make_unique<starling::ggml::parakeet::ParakeetModel>();
     if (!ctx->model->load(gguf_path, ctx->err)) {
-        if (err_out) *err_out = ctx->err.c_str();
+        report_error(err_out, ctx->err.c_str());
         return nullptr;
     }
     ctx->mel_const.read_from(ctx->model->loader, ctx->model->config);
@@ -104,7 +115,7 @@ float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
             cpu.compute(pcm, (size_t)n, feats, T);
         }
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return nullptr;
     }
     if (out_T) *out_T = T;
@@ -137,7 +148,7 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
             cpu.compute(pcm, (size_t)n, feats, T_mel);
         }
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return nullptr;
     }
     // 2. encoder + joint.enc projection -> feat-major [640, T'].
@@ -149,7 +160,7 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
             return nullptr;
         }
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return nullptr;
     }
     if (out_T) *out_T = Tp;
@@ -186,7 +197,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
             cpu.compute(pcm, (size_t)n, feats, T_mel);
         }
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return false;
     }
 
@@ -200,7 +211,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
             return false;
         }
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return false;
     }
 
@@ -221,7 +232,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
             (int)c->model->config.blank_id,
             (int)c->model->config.max_symbols);
     } catch (const std::exception& e) {
-        if (err_out) *err_out = e.what();
+        report_error(err_out, e.what());
         return false;
     }
     if (timing) {

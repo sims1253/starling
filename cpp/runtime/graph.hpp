@@ -36,6 +36,11 @@ void register_decode_cache_clearer(std::function<void()> clearer);
 // "Vulkan0", "Metal", ...); unset auto-picks the first GPU/IGPU, else CPU.
 Backend& global_backend();
 
+// The runtime-selected device's name (e.g. "CPU", "Vulkan0", "CUDA0") if the
+// global Backend already exists, else nullptr. Never creates the Backend —
+// use for build-vs-runtime reporting before any model load.
+const char* try_global_backend_device_name();
+
 // Override the worker-thread count (CPU backend). Honored on the next
 // global_backend() creation if called before first use.
 void set_num_threads(int n_threads);

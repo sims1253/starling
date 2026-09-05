@@ -77,6 +77,11 @@ Backend& global_backend() {
     return *g_backend;
 }
 
+const char* try_global_backend_device_name() {
+    std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
+    return g_backend ? g_backend->device_name() : nullptr;
+}
+
 bool run_graph(const std::function<ggml_tensor*(ggml_context*)>& build,
                std::vector<float>& out) {
     std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
