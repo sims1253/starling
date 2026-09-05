@@ -435,6 +435,62 @@ to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
 tensors (same analysis parakeet got), then run this same sweep. moss-2b and
 qwen3-asr-1.7b follow the same recipe.
 
+### Audex-2b port (2026-09-05) — done, with one engine fix the recipe missed
+
+Executed against the bf16_exact base (`models/audex-2b-bf16-exact.gguf`,
+5802 MB, converted from the pinned `77b7e1a` checkpoint) instead of an f32
+base: the quantizer already dequantizes BF16 sources (`to_f32`), the bf16
+file doubles as the exact baseline, and skipping the 8+ GB f32 duplicate
+saves disk and eval RAM on the 14 GB box.
+
+The audit found the existing name/shape rules sufficient — `enc.conv1/2`
+("conv"), `llm.embed.weight` ("embed"; graph-side `ggml_get_rows` + F32
+cast), `enc.pos_embed` and the mel constants (no `.weight` suffix) are all
+kept automatically; `llm.lm_head.weight` and every encoder/projector/trunk
+linear are plain `ggml_mul_mat` and quantize freely (363 of 719 tensors).
+The loader allowlist gained `"quantized"`, and the quantizer now stamps
+`starling.numeric_profile=quantized` instead of inheriting the source's
+exact-profile string.
+
+**The surprise**: ggml's quantized matmul asserts F32 activations
+(`GGML_ASSERT(src1->type == GGML_TYPE_F32)`, ggml-cpu.c:1401), and the
+qwen-trunk/audex graphs feed **bf16** activations into every weight GEMM.
+Fix: `gemm_act()` (graph_helpers.hpp) upcasts the activation to F32 only
+when the weight is block-quantized — bf16 is exact in f32, so the
+F32-accumulated GEMM and trailing bf16 round preserve the numerical
+boundary and only the weight carries quantization noise; unquantized
+weights keep the identical bf16 path (no change for any existing
+artifact). `lin()`/`linear_bf16()` and the five lm_head GEMMs (now
+`lm_head_gemm()`) route through it. moss-2b / qwen3-asr get quantization
+for free once their loaders allowlist the profile.
+
+Fixtures (CPU, one model per process): bf16_exact, q8_0 (3484 MB) and
+q4_k_m (2248 MB) produce **byte-identical transcripts at WER 0.00**;
+uniform q2_k (1668 MB) collapses to garbage tokens — the same calibration
+law as parakeet, so sub-Q4 needs the audex imatrix port (STARLING_IMATRIX
+riding the audex graphs) before it is meaningful.
+
+FLEURS test clips, 8 per language, CPU (mean WER):
+
+| model | MB | en_us | de_de |
+|-------|------|-------|-------|
+| bf16_exact | 5802 | 8.42 | 4.33 |
+| q8_0 | 3484 | 8.42 | 3.19 |
+| q4_k_m | 2248 | 6.49 | 6.38 |
+
+n=8 caveat: q8_0 is per-clip IDENTICAL to exact on EN, and DE moves only
+via one near-tie clip flipping 9.1 → 0.0. q4_k_m's means also move by
+single-clip flips — EN clip 3 (20.0 → 0.0) vs clip 6 (9.1 → 13.6), DE
+clip 5 (0.0 → 13.0) — i.e. 6 of 8 clips per language are byte-identical
+to exact and the mean deltas are within flip noise. The parakeet-grade
+"q4 is free" claim needs the 300-clip run (follow-up; ~2 h of CPU
+transcription at ~30 s/clip). Sub-Q4 needs the audex imatrix port first.
+
+Speed (single run, short/medium fixture): bf16 28.3/38.4 s, q8_0 27.1/33.9 s,
+q4_k_m 28.8/33.4 s — size plays, roughly speed-neutral, as with parakeet.
+GPU untested (the Vulkan fast path is still broken for short inputs; see
+the post-#47 retest note above).
+
 ## Ours vs the community quants (matched levels, 300-clip EN/DE with CIs)
 
 Head-to-head against handy-computer's transcribe.cpp-dialect ladder through
