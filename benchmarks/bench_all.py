@@ -68,9 +68,11 @@ MODEL_LABELS = {
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
     "ark": "ark-asr-3b",
+    "ark06": "ark-asr-0.6b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
     "audex": "nemotron-labs-audex-2b",
+    "voxtral": "voxtral-mini-4b-realtime",
     "s1": "s1-mini (text normalizer)",
 }
 
@@ -453,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,cohere,qwen3,higgs,audex,s1; "
+                         "(granite,parakeet,moss,ark,ark06,cohere,qwen3,higgs,audex,voxtral,s1; "
                          "qwen3/higgs/audex/s1 are auto-gated on availability; "
                          "s1 is text-in/text-out: fixture tiers select transcripts "
                          "and RTFx reads normalized words/s)")

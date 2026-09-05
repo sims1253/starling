@@ -47,7 +47,6 @@ from ..attention import gqa_attention
 
 from .config import (
     EOS_TOKEN_ID,
-    LLM_ATTENTION_SCALE,
     LLM_EMBEDDING_MULTIPLIER,
     LLM_LOGITS_SCALING,
     LLM_RESIDUAL_MULTIPLIER,
@@ -682,7 +681,10 @@ class FusedLLMMega(LLMMega):
         self._head_dim = int(getattr(cfg, "head_dim", cfg.hidden_size // self._n_q_heads))
         self._n_kv_groups = self._n_q_heads // self._n_kv_heads
         # Qwen2.5 numerics (from config; mirrored in starling.ark.config).
-        self._attn_scale = LLM_ATTENTION_SCALE
+        # The attention scale derives from the loaded head_dim (1/sqrt(64) for
+        # the 0.6B decoder, 1/sqrt(128) for the 3B) rather than a module
+        # constant, so both tracks share this decode path.
+        self._attn_scale = self._head_dim ** -0.5
         self._res_mult = LLM_RESIDUAL_MULTIPLIER
         self._rms_eps = LLM_RMS_NORM_EPS
         self._intermediate = int(cfg.intermediate_size)

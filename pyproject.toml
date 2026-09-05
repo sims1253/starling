@@ -28,6 +28,7 @@ dependencies = [
     "torchcodec>=0.14.0",
     "huggingface-hub>=1.0.0",
     "sentencepiece>=0.2.0",
+    "mistral-common>=1.11.7",
 ]
 
 [project.optional-dependencies]

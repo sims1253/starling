@@ -150,7 +150,7 @@ bounding per-append ``np.concatenate`` copying and RAM. 1 second of audio.
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "cohere", "higgs", "audex")
+MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
 
 
 def _gpu_lock_model(slug: str) -> str:
@@ -161,9 +161,11 @@ def _gpu_lock_model(slug: str) -> str:
         "moss": "moss-transcribe-preview-2b",
         "qwen3": "qwen3-asr-1.7b",
         "ark": "ark-asr-3b",
+        "ark06": "ark-asr-0.6b",
         "cohere": "cohere-transcribe-03-2026",
         "higgs": "higgs-audio-v3-stt",
         "audex": "nemotron-labs-audex-2b",
+        "voxtral": "voxtral-mini-4b-realtime",
     }.get(slug, slug)
 
 
@@ -585,6 +587,21 @@ class ArkBackend(ModelBackend):
         return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
+class Ark06Backend(ArkBackend):
+    """ark-asr-0.6b: distilled 0.6B sibling reusing the ark megakernel track.
+
+    Identical transcribe path to :class:`ArkBackend`; only the slug and the
+    pipeline loader (0.6B hub id) differ.
+    """
+
+    slug = "ark06"
+
+    def load(self) -> None:
+        from .ark06.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+
+
 class CohereBackend(ModelBackend):
     """cohere-transcribe-03-2026: seq2seq enc-dec megakernel.
 
@@ -688,6 +705,41 @@ class AudexBackend(ModelBackend):
         return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
+class VoxtralBackend(ModelBackend):
+    """voxtral-mini-4b-realtime: streaming-native encoder + Ministral-3 decoder.
+
+    v1 runs the eager loop that mirrors stock ``generate`` exactly (additive
+    audio injection, per-step 4-embed encoder slices, delay-conditioned
+    AdaRMSNorm precomputed). Sliding-window caches make any audio length
+    single-shot, so unlike the chunked LLM backends the waveform is never
+    split — chunking would break the lockstep audio/text decode. The decode
+    budget is audio-derived (12.5 tokens/s), not the server's token cap.
+    """
+
+    slug = "voxtral"
+
+    def load(self) -> None:
+        from .voxtral.pipeline import VoxtralPipeline
+
+        self.pipe = VoxtralPipeline.from_pretrained()
+
+    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
+        assert self.pipe is not None
+        if samples.ndim != 1:
+            samples = samples.reshape(-1)
+        audio = np.ascontiguousarray(samples, dtype=np.float32)
+        self._check_stopped()
+        text, _ids = self.pipe.transcribe(audio)
+        audio_seconds = len(audio) / SAMPLE_RATE
+        # One whole-utterance segment, like parakeet/cohere: the model emits
+        # text in lockstep with audio positions but exposes no alignment.
+        return TranscribeResult(
+            text=text,
+            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
+            duration_s=audio_seconds,
+        )
+
+
 _BACKENDS: dict[str, type[ModelBackend]] = {
     "granite": GraniteBackend,
     "parakeet": ParakeetBackend,
@@ -695,9 +747,11 @@ _BACKENDS: dict[str, type[ModelBackend]] = {
     "moss": MossBackend,
     "qwen3": Qwen3Backend,
     "ark": ArkBackend,
+    "ark06": Ark06Backend,
     "cohere": CohereBackend,
     "higgs": HiggsBackend,
     "audex": AudexBackend,
+    "voxtral": VoxtralBackend,
 }
 
 
@@ -2022,7 +2076,7 @@ def _run_stdlib_server(server: StarlingServer, host: str, port: int) -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m starling.server",
-        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/cohere/higgs/audex).",
+        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/ark06/cohere/higgs/audex/voxtral).",
     )
     p.add_argument(
         "--model",

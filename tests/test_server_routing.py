@@ -27,6 +27,7 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
 
 from starling.server import (  # noqa: E402
     MODEL_SLUGS,
+    Ark06Backend,
     ArkBackend,
     AudexBackend,
     CohereBackend,
@@ -40,6 +41,7 @@ from starling.server import (  # noqa: E402
     SAMPLE_RATE,
     ServerConfig,
     StarlingServer,
+    VoxtralBackend,
     create_app,
     get_backend,
 )
@@ -48,7 +50,7 @@ from starling.server import (  # noqa: E402
 def test_model_slugs_are_the_supported_set() -> None:
     assert set(MODEL_SLUGS) == {
         "granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark",
-        "cohere", "higgs", "audex",
+        "ark06", "cohere", "higgs", "audex", "voxtral",
     }
 
 
@@ -60,9 +62,11 @@ def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
     assert isinstance(get_backend("moss", cfg), MossBackend)
     assert isinstance(get_backend("qwen3", cfg), Qwen3Backend)
     assert isinstance(get_backend("ark", cfg), ArkBackend)
+    assert isinstance(get_backend("ark06", cfg), Ark06Backend)
     assert isinstance(get_backend("cohere", cfg), CohereBackend)
     assert isinstance(get_backend("higgs", cfg), HiggsBackend)
     assert isinstance(get_backend("audex", cfg), AudexBackend)
+    assert isinstance(get_backend("voxtral", cfg), VoxtralBackend)
 
 
 def test_get_backend_unknown_slug_raises() -> None:
@@ -151,7 +155,7 @@ def test_create_app_reuses_existing_server_without_startup_load() -> None:
     assert app.state.starling_server is server
 
 
-@pytest.mark.parametrize("backend_cls", [MossBackend, Qwen3Backend, ArkBackend, HiggsBackend])
+@pytest.mark.parametrize("backend_cls", [MossBackend, Qwen3Backend, ArkBackend, Ark06Backend, HiggsBackend])
 def test_single_shot_llm_backends_chunk_long_audio(backend_cls) -> None:
     backend = backend_cls(ServerConfig(max_chunk_seconds=1.0, max_new_tokens=200))
     calls: list[tuple[int, int]] = []

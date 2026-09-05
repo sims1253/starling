@@ -727,6 +727,42 @@ class ArkStock(Engine):
 
 
 # ====================================================================== #
+# ARK-ASR-0.6B (distilled 0.6B sibling; reuses the ark megakernel track)
+# ====================================================================== #
+class Ark06Starling(ArkStarling):
+    """starling fused pipeline for ARK-ASR-0.6B (same graphed encoder + K-step
+    graphed decode as the 3B, loading the 0.6B hub id). Byte-identical to eager."""
+
+    def __init__(self) -> None:
+        Engine.__init__(self, "starling", "ark06", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.ark06.pipeline import MegaPipeline
+
+        self.pipe = MegaPipeline.from_pretrained()
+        # Same graphed-prefill choice as the 3B engine (see ArkStarling).
+        self.pipe.set_prefill_use_graph(True)
+
+
+class Ark06Stock(ArkStock):
+    """Stock eager ``model.generate`` reference for ARK-ASR-0.6B.
+
+    Same chat-template drive as the 3B stock path — the same path
+    ``scripts/make_ark06_golden.py`` captures the golden reference with.
+    """
+
+    def __init__(self) -> None:
+        Engine.__init__(self, "stock transformers", "ark06", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.ark06.config import DEFAULT_INSTRUCTION
+        from starling.ark06.loader import load_model_and_processor
+
+        self._instr = DEFAULT_INSTRUCTION
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
+
+
+# ====================================================================== #
 # cohere-transcribe-03-2026  (seq2seq encoder-decoder)
 # ====================================================================== #
 class CohereStarling(Engine):
@@ -960,6 +996,62 @@ class AudexStock(Engine):
             else:
                 texts.append(raw)
         return " ".join(texts)
+
+
+# ====================================================================== #
+# Voxtral-Mini-4B-Realtime  (streaming-native encoder + Ministral-3 decoder)
+# ====================================================================== #
+class VoxtralStarling(Engine):
+    """starling eager pipeline for Voxtral Realtime.
+
+    v1 mirrors stock ``generate`` semantics exactly (additive audio
+    injection, per-step 4-embed encoder slices, precomputed AdaRMSNorm
+    modulation); the CUDA-graph decode path lands on top of the static
+    per-step shapes later. Decode length is audio-derived (12.5 tok/s), so
+    there is no max_new_tokens budget to pass.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("starling", "voxtral", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.voxtral.pipeline import VoxtralPipeline
+
+        self.pipe = VoxtralPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        text, _ids = self.pipe.transcribe(wav)
+        return text
+
+
+class VoxtralStock(Engine):
+    """Stock greedy ``model.generate`` reference for Voxtral Realtime.
+
+    Wraps the track's ``transcribe_stock`` (the same path
+    ``scripts/make_voxtral_golden.py`` captures the golden reference with):
+    processor output fed straight to ``generate`` with the default
+    audio-derived length bound.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("stock transformers", "voxtral", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.voxtral.pipeline import VoxtralPipeline
+
+        self.pipe = VoxtralPipeline.from_pretrained()
+
+    def _release(self) -> None:
+        self.pipe = None
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        text, _ids = self.pipe.transcribe_stock(wav)
+        return text
 
 
 # ====================================================================== #
@@ -2068,10 +2160,14 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "stock-moss": MossStock,
     "starling-ark": ArkStarling,
     "stock-ark": ArkStock,
+    "starling-ark06": Ark06Starling,
+    "stock-ark06": Ark06Stock,
     "starling-cohere": CohereStarling,
     "stock-cohere": CohereStock,
     "starling-audex": AudexStarling,
     "stock-audex": AudexStock,
+    "starling-voxtral": VoxtralStarling,
+    "stock-voxtral": VoxtralStock,
 }
 
 
