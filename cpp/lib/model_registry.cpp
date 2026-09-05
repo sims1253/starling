@@ -58,6 +58,10 @@ void * starling_ggml_audex_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_audex_free(void * handle);
 char * starling_ggml_audex_decode(void * handle, const float * pcm, int64_t n,
                                   const char ** err_out);
+void * starling_ggml_voxtral_load(const char * gguf_path, const char ** err_out);
+void   starling_ggml_voxtral_free(void * handle);
+char * starling_ggml_voxtral_decode(void * handle, const float * pcm, int64_t n,
+                                    const char ** err_out);
 }
 
 // One row per engine, in starling_ggml_model enum order (serve's
@@ -134,6 +138,14 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: ARK expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "ARK transcribe failed" },
+    // Voxtral-Mini-4B-Realtime (Phase 1: load + metadata/tokenizer validation;
+    // decode returns the Phase-2 error until the encoder/decoder graph lands).
+    { STARLING_GGML_VOXTRAL, "voxtral",
+      starling_ggml_voxtral_load, starling_ggml_voxtral_free,
+      starling_ggml_voxtral_decode,
+      "starling_ggml_transcribe_pcm: VOXTRAL expects 16 kHz",
+      /*rate_error_in_ctx=*/true,
+      "VOXTRAL transcribe failed" },
 };
 
 static_assert([] {

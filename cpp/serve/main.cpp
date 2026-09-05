@@ -53,7 +53,7 @@ static void usage(const char* prog) {
         "Usage: %s --model <slug> --gguf <path> [options]\n"
         "\n"
         "Required:\n"
-        "  --model <slug>     Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, audex\n"
+        "  --model <slug>     Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, audex, voxtral\n"
         "  --gguf <path>      Path to the GGUF model file\n"
         "\n"
         "Serving:\n"

@@ -89,12 +89,12 @@ def offline_padded_samples(n_samples: int) -> int:
 def mel_frames(n_samples: int) -> int:
     """Mel-frame count for the offline (padded) waveform.
 
-    The offline mel length follows the STFT convention used by the stock
-    feature extractor call (``center=True``): the padded waveform of
-    ``offline_padded_samples(n)`` samples with hop 160 gives
-    ``mel = 1 + padded // 160`` frames. The padded length is always a
-    multiple of 1280 = 8 hops, so the offline mel length is always
-    ``1 mod 8``.
+    The stock feature extractor runs ``torch.stft(..., center=True)`` (raw
+    ``1 + padded // 160`` frames) but then drops the last TIME frame via
+    ``stft[..., :-1]``, which cancels the +1 exactly (verified against the
+    real extractor on the fixtures): ``mel = padded // 160``. The padded
+    length is always a multiple of 1280 = 8 hops, so the offline mel length
+    is always a multiple of 8.
 
     Args:
         n_samples: Raw waveform sample count.
@@ -102,7 +102,7 @@ def mel_frames(n_samples: int) -> int:
     Returns:
         Offline mel-frame count (includes the streaming pads).
     """
-    return 1 + offline_padded_samples(int(n_samples)) // HOP_LENGTH
+    return offline_padded_samples(int(n_samples)) // HOP_LENGTH
 
 
 def conv_out_len(
@@ -148,8 +148,8 @@ def num_audio_tokens_from_conv2(conv2_len: int) -> int:
     The projector reshapes ``(B, T', 1280) -> (B, T' // 4, 5120)``; a
     trailing partial group of ``T' % 4`` encoder frames is dropped by the
     reshape, so only ``conv2_len // 4`` tokens survive. Offline mel lengths
-    are ``1 mod 8`` (see :func:`mel_frames`), which gives conv2 lengths of
-    ``0 mod 4`` -- no partial group, no dropped frames.
+    are multiples of 8 (see :func:`mel_frames`), which gives conv2 lengths
+    of multiples of 4 -- no partial group, no dropped frames.
 
     Args:
         conv2_len: Conv2 (embedder output) frame count.
@@ -164,7 +164,7 @@ def num_audio_tokens_from_mel(mel_T: int) -> int:
     """Audio-token count from a mel length via the conv chain (exact).
 
     Equivalent to ``conv2_out_len(conv1_out_len(mel_T)) // 4``; for offline
-    mel lengths (``1 mod 8``) this equals ``mel_T // 8`` with no remainder.
+    mel lengths (multiples of 8) this equals ``mel_T // 8`` with no remainder.
 
     Args:
         mel_T: Mel-frame count (post feature extractor).
@@ -264,11 +264,10 @@ def prepare_processor_inputs(
 def check_mel_accounting(mel_T: int) -> dict[str, int]:
     """Cross-check the conv-chain token count against the stock bound.
 
-    For offline mel lengths (``1 mod 8``) the two agree up to the known
-    off-by-one: the stock bound ``ceil(mel/8) = mel//8 + 1`` counts one
-    extra length unit over the exact ``mel//8`` conv-chain tokens. The
-    returned ``"delta"`` is that difference (1 offline; larger only for
-    synthetic non-``1-mod-8`` lengths where padding/partial groups differ).
+    For offline mel lengths (multiples of 8) the two agree exactly:
+    ``ceil(mel/8) == mel//8`` == the conv-chain token count. The returned
+    ``"delta"`` is 0 offline; it grows only for synthetic lengths that are
+    not multiples of 8, where padding/partial groups differ.
 
     Args:
         mel_T: Mel-frame count.

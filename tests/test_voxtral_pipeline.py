@@ -43,11 +43,18 @@ def test_conv2_halves_floor():
         assert vaudio.conv2_out_len(l_in) == want
 
 
-def test_offline_mel_is_one_mod_eight():
-    """Offline mel lengths are 1 mod 8 across realistic clip durations."""
+def test_offline_mel_is_multiple_of_eight():
+    """Offline mel lengths are multiples of 8 across realistic clip durations.
+
+    The stock extractor's ``stft[..., :-1]`` drops the last time frame,
+    cancelling the center=True +1 (verified against the real feature
+    extractor; the fixture mel lengths are 1136/2624/7832).
+    """
     for seconds in (0.5, 1.0, 7.43, 22.3, 30.0, 74.35, 120.0):
         n = int(round(seconds * vcfg.SAMPLE_RATE))
-        assert vaudio.mel_frames(n) % 8 == 1
+        assert vaudio.mel_frames(n) % 8 == 0
+    for n_samples, mel in ((118960, 1136), (356880, 2624), (1189600, 7832)):
+        assert vaudio.mel_frames(n_samples) == mel
 
 
 def test_offline_padding_matches_mistral_common_formula():
@@ -58,30 +65,30 @@ def test_offline_padding_matches_mistral_common_formula():
     assert vaudio.offline_padded_samples(n) == body + 49 * unit
 
 
-@pytest.mark.parametrize("mel_T", [9, 17, 81, 801, 1137, 2625, 7833])
+@pytest.mark.parametrize("mel_T", [8, 16, 80, 800, 1136, 2624, 7832])
 def test_token_accounting_consistent_where_it_matters(mel_T):
-    """Conv-chain tokens == mel//8 and the stock bound is exactly one more.
+    """Conv-chain tokens == mel//8 == the stock bound, exactly.
 
-    Offline mel lengths are 1 mod 8: no partial projector group, no dropped
-    frames, and the stock ``ceil(mel/8)`` bound exceeds the exact count by
-    exactly the one length unit the bound reserves. Non-1-mod-8 inputs are
+    Offline mel lengths are multiples of 8: no partial projector group, no
+    dropped frames, and the stock ``ceil(mel/8)`` bound equals the exact
+    conv-chain count (delta 0). Lengths that are not multiples of 8 are
     synthetic only (never produced offline); the delta is explicit there.
     """
-    assert mel_T % 8 == 1
+    assert mel_T % 8 == 0
     info = vaudio.check_mel_accounting(mel_T)
     assert info["conv1"] == mel_T
     assert info["conv2"] == mel_T // 2
     assert info["conv2"] % 4 == 0, "no partial group offline: reshape drops nothing"
     assert info["tokens"] == mel_T // 8
-    assert info["delta"] == 1
+    assert info["delta"] == 0
 
 
 def test_non_multiple_of_eight_delta_is_explicit():
-    """Synthetic non-1-mod-8 lengths show where padding makes counts differ."""
+    """Synthetic non-multiple-of-8 lengths show where padding makes counts differ."""
     info = vaudio.check_mel_accounting(100)
     # conv2 = 50 -> 12 tokens (2 frames dropped by the reshape); bound = 13.
     assert (info["tokens"], info["stock_bound"]) == (12, 13)
-    assert info["delta"] == 1  # still 1 here; the dropped frames are the risk
+    assert info["delta"] == 1  # the dropped frames are the risk
 
 
 # ---------------------------------------------------------------------------
