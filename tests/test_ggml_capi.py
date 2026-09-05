@@ -28,7 +28,12 @@ import pytest
 from starling._ggml import _native
 
 REPO = Path(__file__).resolve().parent.parent
-PARAKEET_GGUF = REPO / "models" / "parakeet-tdt-0.6b-v3-bf16-exact.gguf"
+# Same override knob as test_ggml_parity.py (benchmarks/engines.py reads it
+# the same way), so hosts that keep the GGUF elsewhere still get the
+# runtime-device assertion instead of a skip.
+PARAKEET_GGUF = Path(os.environ.get(
+    "STARLING_GGML_PARAKEET_MODEL",
+    str(REPO / "models" / "parakeet-tdt-0.6b-v3-bf16-exact.gguf"))).expanduser()
 
 pytestmark = pytest.mark.skipif(not _native.available(),
                                 reason="libstarling_ggml not built")
