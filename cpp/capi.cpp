@@ -84,10 +84,13 @@ const char * starling_ggml_backend_name(void) {
     // compile-time backend family. The device name is latched into a static
     // so the returned pointer outlives the Backend (the header promises a
     // static string, and a caller may hold it across shutdown/reload).
-    if (const char* dev = starling::ggml::try_global_backend_device_name()) {
+    // try_global_backend_device_name() returns the name BY VALUE (copied
+    // under the Backend lock), so a concurrent shutdown cannot free the
+    // string mid-copy.
+    if (auto dev = starling::ggml::try_global_backend_device_name()) {
         std::lock_guard<std::mutex> lk(g_err_mutex);
         static std::string runtime_name;
-        runtime_name = dev;
+        runtime_name = *dev;
         return runtime_name.c_str();
     }
     return backend_name_for_build();

@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 
 namespace starling::ggml {
 namespace {
@@ -77,9 +79,10 @@ Backend& global_backend() {
     return *g_backend;
 }
 
-const char* try_global_backend_device_name() {
+std::optional<std::string> try_global_backend_device_name() {
     std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
-    return g_backend ? g_backend->device_name() : nullptr;
+    if (!g_backend) return std::nullopt;
+    return std::string(g_backend->device_name());  // copy under the lock
 }
 
 bool run_graph(const std::function<ggml_tensor*(ggml_context*)>& build,
