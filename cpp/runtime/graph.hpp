@@ -15,6 +15,8 @@
 #pragma once
 
 #include <functional>
+#include <optional>
+#include <string>
 #include <vector>
 
 struct ggml_context;
@@ -35,6 +37,13 @@ void register_decode_cache_clearer(std::function<void()> clearer);
 // `STARLING_GGML_DEVICE` env var selects the device ("cpu", "CUDA0",
 // "Vulkan0", "Metal", ...); unset auto-picks the first GPU/IGPU, else CPU.
 Backend& global_backend();
+
+// The runtime-selected device's name (e.g. "CPU", "Vulkan0", "CUDA0") if the
+// global Backend already exists, else nullopt. Never creates the Backend —
+// use for build-vs-runtime reporting before any model load. Returns BY
+// VALUE: shutdown_backend() may destroy the Backend concurrently, so a
+// pointer into its device_name_ could dangle mid-copy at the caller.
+std::optional<std::string> try_global_backend_device_name();
 
 // Override the worker-thread count (CPU backend). Honored on the next
 // global_backend() creation if called before first use.

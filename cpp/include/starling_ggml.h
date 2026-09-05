@@ -38,8 +38,11 @@ extern "C" {
 // Returns STARLING_GGML_ABI_VERSION.
 int starling_ggml_abi_version(void);
 
-// Returns a static UTF-8 string naming the active ggml backend at build time
-// (e.g. "cuda", "metal", "vulkan", "cpu"). For diagnostics.
+// Returns a static UTF-8 string naming the ggml device used at RUNTIME
+// (e.g. "CPU", "Vulkan0", "CUDA0" — as selected by STARLING_GGML_DEVICE or
+// auto-pick) once a model load has created the global backend; before the
+// first load it names the compile-time backend family ("cuda", "metal",
+// "vulkan", "cpu"). The pointer stays valid across calls. For diagnostics.
 const char * starling_ggml_backend_name(void);
 
 // Opaque model context. One per loaded model.
