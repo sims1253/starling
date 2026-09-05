@@ -174,12 +174,44 @@ kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
 All numbers from `benchmarks/wer_quant.py` on the CPU path (the Vulkan fast
-path has a known output discrepancy on this RADV iGPU independent of
-quantization — F32 degrades there too; see the PR notes). The fixtures repeat
+path has a known premature-termination bug on this RADV iGPU independent of
+quantization — F32 truncates there too; retested and characterized after the
+#47 multistep fix, see "Vulkan fast-path retest (post-#47)" below). The fixtures repeat
 one utterance, so read the deltas against the f32 row, not as leaderboard
 WERs. The imatrix was collected over the same three fixtures (single speaker,
 ~1.5 min audio — deliberately minimal; real calibration would use an hour of
 diverse audio, e.g. Granary-derived clips).
+
+### Vulkan fast-path retest (post-#47, 2026-09-05)
+
+Retested at the merged-#39 build (includes #47's galloc INPUT-reuse patch,
+binaries rebuilt to the branch tip): the fast path is still wrong for F32,
+but the failure is now precisely characterized — **premature termination,
+not acoustic corruption**.
+
+- Fixtures, f32, same binary, one model per process: CPU
+  `0.00/0.00/0.00` vs `STARLING_GGML_DEVICE=Vulkan0`
+  `60.87/86.96/0.00` (short/medium/long). Single-model runs sidestep the
+  in-process sweep's replay-cache hazard, so these numbers are sound.
+- Repetition sweep (base utterance 7.4 s, k× no gap): k=1–5 emit only the
+  opening phrase ("Well, I don't wish to see it any more,") and stop — the
+  WERs reconcile exactly as deletions (short 13/21 words → 60.87, medium
+  55/63 → 86.96). k=6 (44.6 s) through 10: complete, correct transcripts
+  (long = WER 0.00).
+- Real clips (fleurs_test bg_bg, 8–19 s, 8/8 truncated): correct-prefix
+  truncation after ~5–8 words, WER 72–89 — not a repeated-utterance
+  artifact.
+- Prefix sweep (1–7.4 s of the base): partial audio yields correct partial
+  transcripts — encoder/weights compute fine; only the stop decision is
+  wrong.
+
+Pattern: single-window decode (input below ~40 s, bracketed 37.2–44.6 s)
+stops after the first K-step batch; longer audio, which takes the
+segmented/composite path, completes. The termination logic to start from is
+the K-step loop in `cpp/parakeet/tdt_multistep.cpp` (patch 0011's
+territory: galloc INPUT storage reuse). GPU sweeps and GPU ladder speed
+numbers stay blocked on this fix; the CPU pin in the benchmark drivers
+remains mandatory.
 
 Clean audio — every level down to q2_k is lossless here:
 
@@ -403,6 +435,71 @@ to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
 tensors (same analysis parakeet got), then run this same sweep. moss-2b and
 qwen3-asr-1.7b follow the same recipe.
 
+### Audex-2b port (2026-09-05) — done, with one engine fix the recipe missed
+
+Executed against the bf16_exact base (`models/audex-2b-bf16-exact.gguf`,
+5802 MB, converted from the pinned `77b7e1a` checkpoint) instead of an f32
+base: the quantizer already dequantizes BF16 sources (`to_f32`), the bf16
+file doubles as the exact baseline, and skipping the 8+ GB f32 duplicate
+saves disk and eval RAM on the 14 GB box.
+
+The audit found the existing name/shape rules sufficient — `enc.conv1/2`
+("conv"), `llm.embed.weight` ("embed"; graph-side `ggml_get_rows` + F32
+cast), `enc.pos_embed` and the mel constants (no `.weight` suffix) are all
+kept automatically; `llm.lm_head.weight` and every encoder/projector/trunk
+linear are plain `ggml_mul_mat` and quantize freely (363 of 719 tensors).
+The conv keep rule is load-bearing: the conv GEMM
+(`cpp/audex/encoder.cpp`, the im2col matmul) takes its activation straight
+from the F32 im2col buffer with no `gemm_act`, so a future rule change
+that quantized conv weights would fail at eval time (the im2col/quantized
+matmul assert), not at load — nothing at graph-build time enforces it.
+The loader allowlist gained `"quantized"`, and the quantizer now stamps
+`starling.numeric_profile=quantized` when it actually quantized at least
+one tensor, instead of inheriting the source's exact-profile string (a
+degenerate all-kept run is numerically identical to the source, so it
+keeps the inherited profile).
+
+**The surprise**: ggml's quantized matmul asserts F32 activations
+(`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in the quantized branch of
+`ggml_compute_forward_mul_mat`,
+`third_party/ggml/src/ggml-cpu/ggml-cpu.c`), and the
+qwen-trunk/audex graphs feed **bf16** activations into every weight GEMM.
+Fix: `gemm_act()` (graph_helpers.hpp) upcasts the activation to F32 only
+when the weight is block-quantized — bf16 is exact in f32, so the
+F32-accumulated GEMM and trailing bf16 round preserve the numerical
+boundary and only the weight carries quantization noise; unquantized
+weights keep the identical bf16 path (no change for any existing
+artifact). `lin()`/`linear_bf16()` and the five lm_head GEMMs (now
+`lm_head_gemm()`) route through it. moss-2b / qwen3-asr get quantization
+for free once their loaders allowlist the profile.
+
+Fixtures (CPU, one model per process): bf16_exact, q8_0 (3484 MB) and
+q4_k_m (2248 MB) produce **byte-identical transcripts at WER 0.00**;
+uniform q2_k (1668 MB) collapses to garbage tokens — the same calibration
+law as parakeet, so sub-Q4 needs the audex imatrix port (STARLING_IMATRIX
+riding the audex graphs) before it is meaningful.
+
+FLEURS test clips, 8 per language, CPU (mean WER):
+
+| model | MB | en_us | de_de |
+|-------|------|-------|-------|
+| bf16_exact | 5802 | 8.42 | 4.33 |
+| q8_0 | 3484 | 8.42 | 3.19 |
+| q4_k_m | 2248 | 6.49 | 6.38 |
+
+n=8 caveat: q8_0 is per-clip IDENTICAL to exact on EN, and DE moves only
+via one near-tie clip flipping 9.1 → 0.0. q4_k_m's means also move by
+single-clip flips — EN clip 3 (20.0 → 0.0) vs clip 6 (9.1 → 13.6), DE
+clip 5 (0.0 → 13.0) — i.e. 6 of 8 clips per language are byte-identical
+to exact and the mean deltas are within flip noise. The parakeet-grade
+"q4 is free" claim needs the 300-clip run (follow-up; ~2 h of CPU
+transcription at ~30 s/clip). Sub-Q4 needs the audex imatrix port first.
+
+Speed (single run, short/medium fixture): bf16 28.3/38.4 s, q8_0 27.1/33.9 s,
+q4_k_m 28.8/33.4 s — size plays, roughly speed-neutral, as with parakeet.
+GPU untested (the Vulkan fast path is still broken for short inputs; see
+the post-#47 retest note above).
+
 ## Ours vs the community quants (matched levels, 300-clip EN/DE with CIs)
 
 Head-to-head against handy-computer's transcribe.cpp-dialect ladder through
@@ -457,4 +554,5 @@ multi-GB per config and stalled repeatedly next to a loaded model.
 The quants' value is size/VRAM, not CPU speed: k-quants are roughly
 speed-neutral on this encoder, and the IQ formats trade inference speed for
 bytes. When both matter, q3_k_m is the measured middle (11.1×). GPU behavior may
-differ (bandwidth-bound, mmvq paths) — untested on this hardware.
+differ (bandwidth-bound, mmvq paths) — unmeasurable on this hardware while the
+Vulkan fast-path truncation bug stands (see the post-#47 retest note above).

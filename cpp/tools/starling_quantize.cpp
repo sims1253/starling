@@ -478,6 +478,14 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Stamp only now that the loop has actually quantized something: the
+    // source's numeric profile no longer describes this file, and audex (and
+    // the engines following it) gate loads on the profile string. A degenerate
+    // all-kept run is numerically identical to the source, so it keeps the
+    // inherited profile instead of being mislabeled.
+    if (out && quantized_cnt > 0)
+        gguf_set_val_str(out, "starling.numeric_profile", "quantized");
+
     if (!gguf_write_to_file(out, args.output.c_str(), /*only_meta=*/false)) {
         std::fprintf(stderr, "error: failed to write %s\n", args.output.c_str());
         return 1;
