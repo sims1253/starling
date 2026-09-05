@@ -16,6 +16,8 @@ $GXX -O2 -std=c++20 $INC -o /tmp/test_ops            scripts/diagnostics/vulkan/
 $GXX -O2 -std=c++20 $INC -o /tmp/test_bmm            scripts/diagnostics/vulkan/test_batched_mulmat.cpp $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp           scripts/diagnostics/vulkan/stage_cmp.cpp           build/libstarling_ggml.so $LIBS $RPATH
 $GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp_granite   scripts/diagnostics/vulkan/stage_cmp_granite.cpp   build/libstarling_ggml.so $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/stage_cmp_higgs     scripts/diagnostics/vulkan/stage_cmp_higgs.cpp     build/libstarling_ggml.so $LIBS $RPATH
+$GXX -O2 -std=c++20 $INC -o /tmp/higgs_fe            scripts/diagnostics/higgs/higgs_front_end_cmp.cpp  build/libstarling_ggml.so $LIBS $RPATH
 ```
 
 (zsh does not word-split unquoted variables — use `${=INC}` / `${=LIBS}`
@@ -121,6 +123,38 @@ Run with `STARLING_GGML_DEVICE=Vulkan0` (or `cpu`) and `env -u LD_LIBRARY_PATH`.
    multistep produce the exact CPU transcript on short/medium/long
    (bf16 + q8_0); moss/granite stage ids, test_ops, test_bmm all
    unchanged.
+
+
+6. **RESOLVED — higgs CPU garbage output was a dtype-blind readback in the
+   engine's own Backend::compute/ReplayGraph (plus two follow-ons).** higgs
+   on Vulkan was CORRECT all along (the fused encoder+projector ReplayGraph
+   never round-trips its BF16 pooled tensor through the host), while CPU
+   (and the one-shot debug path on any backend) produced "inaudience"
+   repetition (WER 100%). Bisect: stage comparators (stage_cmp_higgs, new)
+   localized the corruption between the encoder layers and the projector;
+   per-layer LAYER_CUT probes showed all 32 layers + avg_pool agree between
+   backends; a trusted output-tensor probe of the LN stage matched — and
+   exposed the mechanism: run_graph's output path copied the BF16
+   `pooled` tensor's 2n bytes raw into the low half of the 4n-byte f32
+   vector — every second float garbage bits, no over-read (and the old
+   capture paths sized reads cn*sizeof(float), a true over-read for
+   2-byte-type captures). The higgs code even documents a "run_graph
+   converts the BF16 graph output to f32 on readback" conversion that
+   never existed. Three-part fix: (a) Backend::compute and
+   ReplayGraph now convert non-F32 outputs/captures elementwise (F16/BF16
+   convert; I32/F32 stay bit-compatible — the K-step token rings rely on
+   that); (b) the higgs host conv front-end rounds at the two BF16 oracle
+   boundaries (conv1->conv2, conv2->layers) like ark's host path and the
+   graph path's gelu_erf_bf16 stores — without these the 32-layer encoder
+   amplifies the sub-ulp deltas chaotically; (c) higgs's frozen ~600-line
+   LLM port is replaced by the shared lib/qwen_decode stack (spec: untied
+   lm_head + im_end as eos2) — the port's CPU decode fell into a 4-token
+   repetition loop the shared stack does not have. Validation: higgs
+   produces full correct transcripts on short/medium/long on BOTH cpu and
+   Vulkan0 (WER 0% vs 100% before); moss/granite stage ids unchanged;
+   parakeet fixtures (incl. the K-step i32-token-ring captures through the
+   new readback) unchanged; test_ops/test_bmm green. The qwen3/s1/audex
+   llm.cpp files are the same era of ports — worth the same migration.
 
 ## Reproduce the moss stage comparison
 
