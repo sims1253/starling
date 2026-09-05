@@ -23,7 +23,11 @@ import soundfile as sf
 import torch
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-from starling.ark06.config import DEFAULT_INSTRUCTION, MODEL_ID
+from starling.ark06.config import (
+    DEFAULT_INSTRUCTION,
+    MODEL_ID,
+    build_bad_token_ids,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN_REPO = Path("/home/m0hawk/Documents/starling")
@@ -40,6 +44,14 @@ def main() -> int:
         trust_remote_code=True, attn_implementation="eager",
     )
     model.eval()
+
+    # Card-faithful suppression: the 0.6B degenerates into special-token
+    # repetition under plain greedy decode (see the card README section
+    # "build_bad_words_ids"); the ban set below restores the exact reference
+    # transcript. EOS stays emittable so the decode can terminate.
+    bad_ids = sorted(build_bad_token_ids(proc.tokenizer))
+    bad_words_ids = [[i] for i in bad_ids]
+    print(f"bad_words_ids: banning {len(bad_ids)} token ids (eos stays emittable)")
 
     golden: dict[str, dict] = {}
     for fx in ["short", "medium", "long"]:
@@ -60,11 +72,17 @@ def main() -> int:
         T = data["input_ids"].shape[1]
         # warmup once
         with torch.inference_mode():
-            model.generate(**data, max_new_tokens=5, do_sample=False)
+            model.generate(
+                **data, max_new_tokens=5, do_sample=False,
+                bad_words_ids=bad_words_ids,
+            )
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode():
-            out = model.generate(**data, max_new_tokens=200, do_sample=False)
+            out = model.generate(
+                **data, max_new_tokens=200, do_sample=False,
+                bad_words_ids=bad_words_ids,
+            )
         ms = (time.perf_counter() - t0) * 1000
         gen = out[0][T:]
         text = proc.tokenizer.decode(gen, skip_special_tokens=True)

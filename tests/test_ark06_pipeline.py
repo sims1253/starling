@@ -19,8 +19,11 @@ import pytest
 import soundfile as sf
 
 torch = pytest.importorskip("torch")
-if not torch.cuda.is_available():
-    pytest.skip("CUDA required for ARK-ASR-0.6B megakernel tests", allow_module_level=True)
+
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for ARK-ASR-0.6B megakernel tests",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_PATH = REPO_ROOT / "golden" / "ark06_reference.json"
@@ -66,6 +69,7 @@ def _wav(name: str) -> np.ndarray:
     return np.ascontiguousarray(wav, dtype=np.float32)
 
 
+@needs_cuda
 @pytest.mark.parametrize("fixture", ["short", "medium", "long"])
 def test_transcribe_byte_identical_to_golden(pipeline, golden, fixture):
     """The megakernel transcript tokens must match the golden greedy reference."""
@@ -115,6 +119,7 @@ def test_bucket_mel_pads_to_grid_and_caps():
     assert p._bucket_mel(mel) is mel
 
 
+@needs_cuda
 @pytest.mark.parametrize("fixture", ["short", "medium", "long"])
 def test_bucketing_is_text_byte_exact(pipeline, fixture):
     """Shape-bucketing must not change the decoded transcript.
@@ -136,3 +141,63 @@ def test_bucketing_is_text_byte_exact(pipeline, fixture):
     assert buck_text.strip() == ref_text.strip(), (
         f"{fixture}: bucketed transcript differs from the unbucketed reference"
     )
+
+
+# --------------------------------------------------------------------------- #
+# CPU-safe suppression-recipe tests (no model, no CUDA)
+# --------------------------------------------------------------------------- #
+class _MockTokenizer:
+    """Tiny stand-in exposing the tokenizer surface build_bad_token_ids needs."""
+
+    def __init__(self) -> None:
+        self.eos_token_id = 151645
+        self.vocab_size = 163958
+        self.all_special_ids = [151643, 151645, 151665, 151666, 151667, 151668, 151669]
+        self._added = {
+            "<|bicodec_0|>": 151700,
+            "<|bicodec_1|>": 151701,
+            "<regular>": 400,  # starts with "<" but not a bicodec/special token
+            "plain": 500,
+        }
+
+    def get_added_vocab(self):
+        return dict(self._added)
+
+
+def test_build_bad_token_ids_card_recipe_cpu():
+    """The recipe bans chat specials + `<...>` added vocab, minus EOS."""
+    from starling.ark06.config import EOS_TOKEN_ID, build_bad_token_ids
+
+    bad = build_bad_token_ids(_MockTokenizer())
+    # all chat specials except EOS are banned...
+    assert 151643 in bad and 151665 in bad and 151669 in bad
+    # ...the <...> added-vocab tokens are banned (incl. the non-bicodec one:
+    # the card recipe bans by "<...>" shape, not by prefix)...
+    assert 151700 in bad and 151701 in bad and 400 in bad
+    # ...plain added vocab is kept, and EOS must stay emittable.
+    assert 500 not in bad
+    assert EOS_TOKEN_ID not in bad and 151645 not in bad
+
+
+def test_build_bad_token_ids_clamps_vocab_drift_cpu():
+    """Stale ids outside vocab_size are dropped (un-emittable anyway)."""
+    from starling.ark06.config import build_bad_token_ids
+
+    tok = _MockTokenizer()
+    tok.all_special_ids = list(tok.all_special_ids) + [999_999]
+    assert 999_999 not in build_bad_token_ids(tok)
+
+
+def test_bad_penalty_builder_none_path_adds_no_tensors_cpu():
+    """The shared 3B decode path (bad_token_ids=None) allocates nothing."""
+    from starling.ark.llm_mega import LLMMega
+
+    assert LLMMega._build_bad_penalty(None, 163958, torch.float32, "cpu") is None
+    assert LLMMega._build_bad_penalty(set(), 163958, torch.float32, "cpu") is None
+    pen = LLMMega._build_bad_penalty(
+        frozenset({1, 5, 999_999}), 163958, torch.float32, "cpu"
+    )
+    assert pen is not None and pen.shape == (1, 1, 163958)
+    assert pen[0, 0, 1] == torch.finfo(torch.float32).min
+    assert pen[0, 0, 5] == torch.finfo(torch.float32).min
+    assert pen[0, 0, 0] == 0.0  # unbanned rows stay zero

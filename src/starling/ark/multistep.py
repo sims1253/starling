@@ -91,6 +91,7 @@ class MultiStepLLMMega(FusedLLMMega):
         dtype: torch.dtype = torch.bfloat16,
         prefill_use_graph: bool = True,
         graph_pool=None,
+        bad_token_ids: Optional[set[int]] = None,
     ) -> None:
         super().__init__(
             language_model,
@@ -101,6 +102,7 @@ class MultiStepLLMMega(FusedLLMMega):
             dtype=dtype,
             prefill_use_graph=prefill_use_graph,
             graph_pool=graph_pool,
+            bad_token_ids=bad_token_ids,
         )
         self.steps_per_replay = max(1, int(steps_per_replay))
         self.K = self.steps_per_replay

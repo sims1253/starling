@@ -126,6 +126,14 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: AUDEX expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "AUDEX transcribe failed" },
+    // ARK-ASR-0.6B rides the ARK engine unchanged (identical remote modeling
+    // code; every dim comes from ark.* GGUF metadata, validated at load).
+    { STARLING_GGML_ARK06, "ark06",
+      starling_ggml_ark_load, starling_ggml_ark_free,
+      starling_ggml_ark_decode,
+      "starling_ggml_transcribe_pcm: ARK expects 16 kHz",
+      /*rate_error_in_ctx=*/true,
+      "ARK transcribe failed" },
 };
 
 static_assert([] {

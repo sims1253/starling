@@ -31,7 +31,19 @@ const lib::QwenDecodeSpec kSpec = {
 
 lib::QwenDecodeCtx decode_ctx(const ArkModel& m) {
     const auto& lc = m.config.llm;
-    return lib::QwenDecodeCtx{kSpec, m.loader,
+    // Materialize the model's spec once: kSpec plus the GGUF's suppression
+    // list (0.6B carries ark.bad_words_ids; an empty 3B list leaves the
+    // decode byte-identical). Stored on the model because the spec address
+    // keys the process-global decode caches.
+    if (!m.decode_spec_ready) {
+        m.decode_spec = kSpec;
+        m.decode_spec.banned_ids = m.config.bad_words_ids.empty()
+                                       ? nullptr
+                                       : m.config.bad_words_ids.data();
+        m.decode_spec.n_banned = m.config.bad_words_ids.size();
+        m.decode_spec_ready = true;
+    }
+    return lib::QwenDecodeCtx{m.decode_spec, m.loader,
                               {lc.n_layers, lc.hidden, lc.n_heads, lc.n_kv_heads,
                                lc.head_dim, lc.max_cache, lc.rope_theta,
                                lc.rms_norm_eps}};

@@ -92,6 +92,62 @@ END_AUDIO_TOKEN: str = "<|end_of_audio|>"
 AUDIO_TOKEN: str = "<|audio|>"
 
 # ---------------------------------------------------------------------------
+# Greedy-decode token suppression (the model card's bad_words_ids recipe)
+# ---------------------------------------------------------------------------
+# ARK-ASR-0.6B degenerates under plain greedy decode: after ~11 correct words it
+# spirals into repeated special tokens. The card README section
+# "build_bad_words_ids" prescribes suppressing
+#   bad = (all_special_ids ∪ added-vocab tokens "<...>") − {eos_token_id},
+# which restores the exact reference transcript. EOS must remain emittable or
+# the decode can never terminate. Computed lazily from the loaded tokenizer
+# (robust to vocab drift) — no hard-coded id list.
+
+
+def build_bad_token_ids(tokenizer) -> set[int]:
+    """Build the card-recipe ban set from a loaded tokenizer.
+
+    ``bad = (all_special_ids ∪ added-vocab "<...>" tokens) − {eos}``.
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is None:
+        eos = EOS_TOKEN_ID
+    bad: set[int] = set(getattr(tokenizer, "all_special_ids", None) or [])
+    get_added = getattr(tokenizer, "get_added_vocab", None)
+    if callable(get_added):
+        try:
+            added = get_added() or {}
+        except Exception:
+            added = {}
+        for tok_str, tid in added.items():
+            if (
+                isinstance(tok_str, str)
+                and len(tok_str) >= 2
+                and tok_str.startswith("<")
+                and tok_str.endswith(">")
+            ):
+                bad.add(int(tid))
+    else:
+        # Fallback for tokenizer shims exposing only added_tokens_decoder.
+        dec = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        try:
+            items = dec.items()
+        except AttributeError:
+            items = []
+        for tid, tok in items:
+            s = getattr(tok, "content", tok)
+            if isinstance(s, str) and len(s) >= 2 and s.startswith("<") and s.endswith(">"):
+                try:
+                    bad.add(int(tid))
+                except (TypeError, ValueError):
+                    continue
+    # Guard against vocab drift (ids outside the head are un-emittable anyway).
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if isinstance(vocab_size, int) and vocab_size > 0:
+        bad = {i for i in bad if 0 <= i < vocab_size}
+    bad.discard(int(eos))
+    return bad
+
+# ---------------------------------------------------------------------------
 # KV cache sizing
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_CACHE_LEN: int = 4096

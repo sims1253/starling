@@ -468,6 +468,8 @@ struct KStepGraph {
     std::vector<float> host_iota;                // [vocab] descending column iota (bf16-tie mode)
     float host_one = 1.0f;                       // scalar 1.0 for the tie-break mask
     size_t in_iota = 0, in_one = 0;              // constant-input slots (re-set per replay)
+    std::vector<float> host_ban;                 // [vocab] 0 / penalty row (suppression mode)
+    size_t in_ban = 0;                           // constant-input slot (re-set per replay)
 };
 
 // ONE captured K-step graph per K (start_past is a runtime input, so a single
@@ -861,16 +863,25 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
 // Greedy pick under the bf16-tie mode: round the logits to bf16 (the
 // reference reads the lm_head output stored as bf16) and keep the FIRST
 // index on the exact ties that creates — argmax_low otherwise.
+// Suppression (spec.n_banned > 0): banned ids never win, at any step, so
+// they are skipped in the scan (the K-step graph applies the equivalent
+// additive penalty row before its in-graph argmax).
 int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    if (!s.argmax_low_ties) return argmax_low(x);
+    if (!s.argmax_low_ties && s.n_banned == 0) return argmax_low(x);
+    auto is_banned = [&s](int32_t i) {
+        return s.n_banned > 0 &&
+               std::binary_search(s.banned_ids, s.banned_ids + s.n_banned, i);
+    };
     auto bf = [](float v) {
         return ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
     };
     int32_t best = 0;
-    float bv = bf(x[0]);
+    float bv = s.argmax_low_ties ? bf(x[0]) : x[0];
+    if (is_banned(0)) { best = -1; bv = 0.0f; }
     for (int32_t i = 1; i < (int32_t) x.size(); ++i) {
-        const float v = bf(x[i]);
-        if (v > bv) { bv = v; best = i; }
+        if (is_banned(i)) continue;
+        const float v = s.argmax_low_ties ? bf(x[i]) : x[i];
+        if (best < 0 || v > bv) { bv = v; best = i; }
     }
     return best;
 }
@@ -953,6 +964,23 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
             kg->host_iota[(size_t) col] = (float) (vocab - col);
         kg->host_one = 1.0f;
     }
+    // Suppression mode: constant [vocab] additive row, 0.0 for allowed ids
+    // and a huge-negative (finite, bf16-representable) penalty for banned
+    // ones. Applied before the in-graph argmax (and its tie-break chain), so
+    // a banned id can never win a K-step pick; the host spec_argmax skips
+    // the same ids. Empty list -> no tensor, no node: graphs built for the
+    // other engines keep their exact historical op sequence.
+    if (m.spec.n_banned > 0) {
+        const ggml_tensor* ew = m.loader.tensor("llm.embed.weight");
+        const int64_t vocab = ew ? ew->ne[1] : 0;
+        if (vocab <= 0) {
+            e = std::string(m.spec.label) + " K-step needs llm.embed.weight for the ban row";
+            return nullptr;
+        }
+        kg->host_ban.assign((size_t) vocab, 0.0f);
+        for (size_t i = 0; i < m.spec.n_banned; ++i)
+            kg->host_ban[(size_t) m.spec.banned_ids[i]] = -3.0e38f;
+    }
     raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(global_backend(),
         [&](ggml_context* c) -> ggml_tensor* {
             int64_t one[1] = {1};
@@ -1001,6 +1029,16 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                                            &raw->host_one, sizeof(float));
                 raw->in_one = idx++;
             }
+            // Constant suppression penalty row (only under the flag; one
+            // input shared by all K steps — see the host_ban fill above).
+            ggml_tensor* ban_t = nullptr;
+            if (!raw->host_ban.empty()) {
+                int64_t bw[2] = {(int64_t) raw->host_ban.size(), 1};
+                ban_t = graph_input_tensor(c, GGML_TYPE_F32, 2, bw,
+                                           raw->host_ban.data(),
+                                           raw->host_ban.size() * sizeof(float));
+                raw->in_ban = idx++;
+            }
             // Chain K steps in-graph: tok = prev-token; each step's argmax feeds
             // the next step's embed (get_rows), all on device.
             ggml_tensor* tok = prev_tok_t;
@@ -1019,6 +1057,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
                 ggml_tensor* logits = ggml_mul_mat(c, head_w, n);                  // [vocab, 1]
+                if (ban_t)
+                    // Suppression: banned ids drop to -3e38 before the argmax
+                    // (and before the bf16-round/tie chain, whose (x-max)*2^20
+                    // overflow clamps them out of the equality mask).
+                    logits = ggml_add(c, logits, ban_t);
                 ggml_tensor* am_in = logits;
                 if (iota) {
                     // bf16-round (the reference's storage boundary), then the

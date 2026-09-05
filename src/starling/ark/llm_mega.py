@@ -135,6 +135,7 @@ class LLMMega:
         max_prefill_graphs: int = MAX_PREFILL_GRAPHS,
         prefill_use_graph: bool = True,
         graph_pool=None,
+        bad_token_ids: Optional[set[int]] = None,
     ) -> None:
         self.lm = language_model
         self.lm_head = lm_head
@@ -156,6 +157,17 @@ class LLMMega:
 
         self.vocab_size = int(self.config.vocab_size)
         self.num_layers = int(self.config.num_hidden_layers)
+
+        # Optional greedy-suppression mask (the ARK-ASR-0.6B card recipe; the 3B
+        # passes None so its path is bit-identical). Stored as a precomputed
+        # (1, 1, V) -inf penalty row on-device: applying it is a shape-static
+        # add_ captured inside the graph, never a python-set test per step.
+        self.bad_token_ids: Optional[frozenset[int]] = (
+            frozenset(bad_token_ids) if bad_token_ids else None
+        )
+        self._bad_penalty: Optional[torch.Tensor] = self._build_bad_penalty(
+            self.bad_token_ids, self.vocab_size, dtype, device
+        )
 
         # ---- static input / output buffers (fixed addresses for the graph) --
         self.static_input_ids = torch.zeros((1, 1), dtype=torch.int64, device=device)
@@ -204,6 +216,27 @@ class LLMMega:
     # ------------------------------------------------------------------ #
     # internal helpers
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_bad_penalty(
+        bad_token_ids: Optional[frozenset[int]],
+        vocab_size: int,
+        dtype: torch.dtype,
+        device: str,
+    ) -> Optional[torch.Tensor]:
+        """Build the precomputed (1, 1, V) -inf penalty row for a ban set.
+
+        Created ONCE (host-side, outside any graph capture); the captured step
+        only runs ``static_logits.add_(penalty)`` — a shape-static op. Clamps
+        ids to ``[0, vocab_size)`` so vocab drift can never index out of range.
+        """
+        if not bad_token_ids:
+            return None
+        penalty = torch.zeros((1, 1, int(vocab_size)), dtype=dtype, device=device)
+        idx = [int(i) for i in bad_token_ids if 0 <= int(i) < int(vocab_size)]
+        if idx:
+            penalty[0, 0, idx] = torch.finfo(dtype).min
+        return penalty
+
     def _reset_cache_pos(self, n: int) -> None:
         """Reset every layer's ``cumulative_length`` to ``n`` in-place."""
         for layer in self.cache.layers:
@@ -230,6 +263,13 @@ class LLMMega:
         )
         hidden = out.last_hidden_state[:, -1:, :]
         self.static_logits.copy_(self.lm_head(hidden) / LLM_LOGITS_SCALING)
+        # Greedy suppression (0.6B card recipe): add the precomputed -inf row so
+        # banned ids can never win the argmax. None-path: untouched (bit-identical).
+        # This is the graph-captured point: _decode_step_eager runs inside both
+        # the single-step graph and the K-step graph, so the mask is captured as
+        # a shape-static add_ — never a python-set test per step.
+        if self._bad_penalty is not None:
+            self.static_logits.add_(self._bad_penalty)
 
     # ------------------------------------------------------------------ #
     # prefill graph cache eviction
@@ -296,6 +336,11 @@ class LLMMega:
             self._prefill_eager(inputs_embeds, T)
         hidden = self._prefill_last_hidden(T)
         logits = self.lm_head(hidden) / LLM_LOGITS_SCALING
+        if self._bad_penalty is not None:
+            # Prefill argmax is NOT inside a captured graph (runs eager here or
+            # inside the prefill graph whose output we mask post-replay), so a
+            # plain out-of-place add keeps banned ids from becoming token 0.
+            logits = logits + self._bad_penalty
         return logits.argmax(dim=-1)  # (1, 1)
 
     def _prefill_eager(self, inputs_embeds: torch.Tensor, T: int) -> None:
@@ -832,3 +877,8 @@ class FusedLLMMega(LLMMega):
         # (5) lm_head (Qwen2.5 applies no logits scaling; LLM_LOGITS_SCALING=1.0)
         logits = self.lm_head(hidden) / LLM_LOGITS_SCALING
         self.static_logits.copy_(logits)
+        # Same 0.6B greedy suppression as the parent step (captured in-graph;
+        # None-path untouched). This override replaces the parent's
+        # _decode_step_eager, so it must apply the mask itself.
+        if self._bad_penalty is not None:
+            self.static_logits.add_(self._bad_penalty)

@@ -94,6 +94,7 @@ class MegaPipeline:
         shape_bucketing: bool = True,
         mel_bucket_frames: int = 512,
         prefill_use_graph: bool = False,
+        bad_token_ids: Optional[set[int]] = None,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -113,6 +114,11 @@ class MegaPipeline:
         # amortises capture. mel_bucket_frames=1 disables it. See class docstring.
         self.shape_bucketing = bool(shape_bucketing) and int(mel_bucket_frames) > 1
         self.mel_bucket_frames = max(1, int(mel_bucket_frames))
+        # Optional greedy-suppression ban set (the 0.6B subclass passes its
+        # card-recipe set; the 3B default None keeps decode bit-identical).
+        self.bad_token_ids: Optional[frozenset[int]] = (
+            frozenset(bad_token_ids) if bad_token_ids else None
+        )
 
         comps = get_components(model)
         # ONE shared CUDA graph pool for encoder + LLM captures, so LRU eviction
@@ -149,6 +155,7 @@ class MegaPipeline:
                 steps_per_replay=k,
                 prefill_use_graph=self.prefill_use_graph,
                 graph_pool=self._graph_pool,
+                bad_token_ids=self.bad_token_ids,
             )
             self._llms[k] = llm
         self.llm = llm

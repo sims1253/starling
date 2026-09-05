@@ -748,18 +748,43 @@ class Ark06Stock(ArkStock):
     """Stock eager ``model.generate`` reference for ARK-ASR-0.6B.
 
     Same chat-template drive as the 3B stock path — the same path
-    ``scripts/make_ark06_golden.py`` captures the golden reference with.
+    ``scripts/make_ark06_golden.py`` captures the golden reference with —
+    plus the card-recipe ``bad_words_ids`` suppression (the 0.6B degenerates
+    into special-token repetition without it).
     """
 
     def __init__(self) -> None:
         Engine.__init__(self, "stock transformers", "ark06", supports_batch=False)
 
     def _load(self) -> None:
-        from starling.ark06.config import DEFAULT_INSTRUCTION
+        from starling.ark06.config import DEFAULT_INSTRUCTION, build_bad_token_ids
         from starling.ark06.loader import load_model_and_processor
 
         self._instr = DEFAULT_INSTRUCTION
         self.model, self.processor = load_model_and_processor(attn_impl="eager")
+        # Computed once (not per utterance) from the processor tokenizer.
+        self._bad_words_ids = [
+            [i] for i in sorted(build_bad_token_ids(self.processor.tokenizer))
+        ]
+
+    def _run_one(self, audio: np.ndarray) -> str:
+        wav = np.ascontiguousarray(audio, dtype=np.float32)
+        conv = [{"role": "user", "content": [
+            {"type": "audio", "array": wav},
+            {"type": "text", "text": self._instr},
+        ]}]
+        data = self.processor.apply_chat_template(
+            conv, audio_torch_dtype=torch.bfloat16, tokenize=True,
+            return_tensors="pt", add_generation_prompt=True,
+        )
+        data = {k: v.to("cuda") for k, v in data.items()}
+        prompt_len = data["input_ids"].shape[1]
+        out = self.model.generate(
+            **data, max_new_tokens=200, do_sample=False,
+            bad_words_ids=self._bad_words_ids,
+        )
+        gen = out[0][prompt_len:]
+        return self.processor.tokenizer.decode(gen, skip_special_tokens=True)
 
 
 # ====================================================================== #

@@ -59,7 +59,7 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, s1, audex |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, s1, audex |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -230,6 +230,7 @@ Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0
 | parakeet | `scripts/convert_parakeet_gguf.py` |
 | moss | `scripts/convert_moss_gguf.py` |
 | ark | `scripts/convert_ark_gguf.py` |
+| ark06 | `scripts/convert_ark06_gguf.py` |
 | higgs | `scripts/convert_higgs_gguf.py` |
 | hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |

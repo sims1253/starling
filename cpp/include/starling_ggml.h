@@ -31,7 +31,9 @@ extern "C" {
 //   6 — added STARLING_GGML_S1 (superwhisper/s1-mini) + the text-in entry
 //       point starling_ggml_normalize_text, and STARLING_GGML_AUDEX
 //       (nvidia/Nemotron-Labs-Audex-2B).
-#define STARLING_GGML_ABI_VERSION 6
+//   7 — added STARLING_GGML_ARK06 (Audio8/ARK-ASR-0.6B; served by the ARK
+//       engine — same architecture, dims come from GGUF metadata).
+#define STARLING_GGML_ABI_VERSION 7
 
 // ABI / build introspection --------------------------------------------------
 
@@ -56,6 +58,7 @@ typedef enum {
     STARLING_GGML_QWEN3        = 7,  // Qwen/Qwen3-ASR-1.7B-hf
     STARLING_GGML_S1           = 8,  // superwhisper/s1-mini (text normalizer)
     STARLING_GGML_AUDEX        = 9,  // nvidia/Nemotron-Labs-Audex-2B
+    STARLING_GGML_ARK06        = 10, // Audio8/ARK-ASR-0.6B (ARK engine, 0.6B GGUF)
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------

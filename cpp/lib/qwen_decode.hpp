@@ -62,6 +62,16 @@ struct QwenDecodeSpec {
     // discipline (round after the rsqrt, round again after the weight mul)
     // the stack was built on (moss/ark/granite/qwen3 byte-identity).
     bool rms_norm_single_round = false;
+    // Generation suppression: sorted token ids banned from greedy picks (the
+    // model card's bad_words_ids constraint: special and codec ids the
+    // reference never emits). Appended last so existing positional field
+    // initializers (audex sets mlp_activation) stay valid. Points into the
+    // owning model's config storage, which outlives inference; nullptr/0
+    // disables suppression: no masking branch runs and the graphs keep their
+    // exact historical op sequence. The spec ADDRESS keys the process-global
+    // decode caches, so a patched spec must live in the model, not a temp.
+    const int32_t* banned_ids = nullptr;
+    size_t n_banned = 0;
 };
 
 // The config fields the decode graphs are shaped by.
