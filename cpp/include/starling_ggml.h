@@ -82,6 +82,12 @@ void starling_ggml_free(starling_ggml_ctx * ctx);
 // call multiple times, and safe alongside the atexit handler.
 void starling_ggml_shutdown(void);
 
+// Flush the STARLING_IMATRIX activation-importance collector to its output
+// file immediately (idempotent; the collector also flushes at process exit).
+// Call this before teardown in collection runs so the data is on disk no
+// matter how the process ends.
+void starling_ggml_imatrix_flush_pub(void);
+
 // Retrieve the last error message for a context (or the global last-error if
 // ctx is NULL). Returns "" if no error. The pointer is owned by the library
 // and valid until the next call into the library on the same context.

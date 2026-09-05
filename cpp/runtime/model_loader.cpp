@@ -24,6 +24,7 @@ ModelLoader::ModelLoader() = default;
 ModelLoader::~ModelLoader() {
     // The ggml context owns the weight tensors; freeing it frees them all.
     if (ctx_) ggml_free(ctx_);
+    if (compat_ctx_) ggml_free(compat_ctx_);
     if (gguf_ctx_) gguf_free(gguf_ctx_);
 }
 
@@ -156,6 +157,53 @@ std::vector<std::string> ModelLoader::tensor_names() const {
     names.reserve(tensors_.size());
     for (const auto& kv : tensors_) names.push_back(kv.first);
     return names;
+}
+
+// ---- community-dialect compat ---------------------------------------------
+void ModelLoader::add_tensor_alias(const char* alias, const char* existing) {
+    auto it = tensors_.find(existing);
+    if (it != tensors_.end()) tensors_[alias] = it->second;
+}
+
+void ModelLoader::add_owned_tensor(const char* name, const std::vector<float>& data,
+                                   int64_t ne0, int64_t ne1) {
+    if (!compat_ctx_) {
+        // Small scratch context for compat-fabricated tensors (mel
+        // filterbank/window, zero bias rows). Freed with the loader.
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8 + (1 << 20),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        compat_ctx_ = ggml_init(params);
+    }
+    ggml_tensor* t = (ne1 > 1) ? ggml_new_tensor_2d(compat_ctx_, GGML_TYPE_F32, ne0, ne1)
+                               : ggml_new_tensor_1d(compat_ctx_, GGML_TYPE_F32, ne0);
+    if (!t || (size_t)ggml_nelements(t) != data.size()) return;
+    std::memcpy(t->data, data.data(), data.size() * sizeof(float));
+    ggml_set_name(t, name);
+    tensors_[name] = t;
+}
+
+void ModelLoader::add_kv_int(const std::string& key, int64_t v) {
+    GgufValue val; val.kind = GgufValue::Kind::k_int; val.i = v;
+    kv_[key] = std::move(val);
+}
+void ModelLoader::add_kv_float(const std::string& key, double v) {
+    GgufValue val; val.kind = GgufValue::Kind::k_float; val.f = v;
+    kv_[key] = std::move(val);
+}
+void ModelLoader::add_kv_str(const std::string& key, const std::string& v) {
+    GgufValue val; val.kind = GgufValue::Kind::k_str; val.s = v;
+    kv_[key] = std::move(val);
+}
+void ModelLoader::add_kv_arr_int(const std::string& key, const std::vector<int64_t>& v) {
+    GgufValue val; val.kind = GgufValue::Kind::k_arr_int; val.arr_i = v;
+    kv_[key] = std::move(val);
+}
+void ModelLoader::add_kv_arr_str(const std::string& key, const std::vector<std::string>& v) {
+    GgufValue val; val.kind = GgufValue::Kind::k_arr_str; val.arr_s = v;
+    kv_[key] = std::move(val);
 }
 
 bool ModelLoader::realize_weights(Backend& backend) {

@@ -79,8 +79,27 @@ public:
     // models also call it up-front at load to surface missing tensors early.
     bool realize_weights(Backend& backend);
 
+    // ---- community-dialect compat (see cpp/parakeet/compat.cpp) ----------
+    // Register an additional lookup name for an already-present tensor
+    // (zero-copy: both names map to the same ggml_tensor*).
+    void add_tensor_alias(const char* alias, const char* existing);
+
+    // Register a compat-owned F32 tensor (1-D or 2-D) copied from `data`.
+    // Used for the transcribe.cpp dialect's synthesized mel filterbank/window
+    // and the zero side of its fused LSTM-bias split. Owned until destruction.
+    void add_owned_tensor(const char* name, const std::vector<float>& data,
+                          int64_t ne0, int64_t ne1);
+
+    // Synthesize KV entries (existing keys are overwritten).
+    void add_kv_int(const std::string& key, int64_t v);
+    void add_kv_float(const std::string& key, double v);
+    void add_kv_str(const std::string& key, const std::string& v);
+    void add_kv_arr_int(const std::string& key, const std::vector<int64_t>& v);
+    void add_kv_arr_str(const std::string& key, const std::vector<std::string>& v);
+
 private:
     ggml_context* ctx_ = nullptr;          // owns the weight tensors
+    ggml_context* compat_ctx_ = nullptr;   // compat-fabricated tensors (see compat.cpp)
     gguf_context* gguf_ctx_ = nullptr;      // the gguf_init_from_file handle
     std::unordered_map<std::string, ggml_tensor*> tensors_;
     std::unordered_map<std::string, GgufValue> kv_;

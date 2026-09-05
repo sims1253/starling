@@ -12,6 +12,7 @@
 #include "backend.hpp"
 
 #include "graph.hpp"
+#include "imatrix.hpp"
 #include "model_loader.hpp"
 
 #include "ggml.h"
@@ -83,6 +84,15 @@ thread_local std::vector<ggml_tensor*>*    t_pending_roots = nullptr;
 constexpr size_t kGraphSize = 32768;  // max nodes in one ggml_cgraph (bumped for
                                           // the moss K-step multistep decode graph)
 
+// The ggml_backend_sched_eval_callback trampoline feeding the ImatrixCollector
+// (see imatrix.hpp). NOTE: returning true does NOT force the node onto the
+// CPU backend — the sched consults the callback only for batching/
+// observation; placement is decided without it. Host-side activation reads
+// are sound because the collect tool pins STARLING_GGML_DEVICE=cpu.
+bool imatrix_eval_cb(ggml_tensor* t, bool ask, void* /*user_data*/) {
+    return ImatrixCollector::instance().observe(t, ask);
+}
+
 } // namespace
 
 // --------------------------------------------------------------------------- //
@@ -92,8 +102,41 @@ struct Backend::Impl {
     ggml_backend_t backend = nullptr;       // primary (GPU or CPU)
     ggml_backend_t cpu_backend = nullptr;   // CPU fallback for GPU offload
     ggml_gallocr_t galloc = nullptr;        // persistent, reused across one-shot computes
-    ggml_backend_sched_t sched = nullptr;   // lazy; only built if an op needs CPU offload
-    bool use_sched = false;                  // true iff a GPU backend is active
+    ggml_backend_sched_t sched = nullptr;   // lazy; GPU op offload + imatrix collection
+    bool use_sched = false;                 // true iff a GPU backend is active
+
+    // Create the sched on first need: {GPU, CPU} when a GPU is active, the
+    // lone CPU backend otherwise (a duplicated entry would confuse sched's
+    // backend list). When imatrix collection is enabled the eval callback is
+    // attached so every MUL_MAT with a named weight src[0] is observed.
+    ggml_backend_sched_t ensure_sched() {
+        if (sched) return sched;
+        ggml_backend_t backends[2];
+        ggml_backend_buffer_type_t bufs[2];
+        int n = 0;
+        backends[n] = backend;
+        bufs[n] = ggml_backend_get_default_buffer_type(backend);
+        ++n;
+        if (use_sched) {
+            backends[n] = cpu_backend;
+            bufs[n] = ggml_backend_get_default_buffer_type(cpu_backend);
+            ++n;
+        }
+        // NOTE: the 4th arg is the graph size in NODES (see ggml-backend.h),
+        // not bytes — the historical code here passed tensor_overhead()*
+        // kGraphSize, which only worked because this branch never executed
+        // (no unsupported ops on the CUDA builds).
+        sched = ggml_backend_sched_new(backends, bufs, n,
+                                       (int)kGraphSize,
+                                       /*parallel=*/false, /*op_offload=*/true);
+        // In the vendored ggml the eval callback gates observation only, not
+        // backend placement; host-side activation reads are sound because
+        // collection runs pin STARLING_GGML_DEVICE=cpu.
+        if (sched && ImatrixCollector::enabled()) {
+            ggml_backend_sched_set_eval_callback(sched, imatrix_eval_cb, nullptr);
+        }
+        return sched;
+    }
 };
 
 Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 1 : n_threads) {
@@ -287,8 +330,8 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
 
     // 3. Allocate (persistent gallocr path, or sched fallback if some op is
-    //    unsupported by the primary backend).
-    bool need_sched = false;
+    // unsupported by the primary backend / imatrix collection is active).
+    bool need_sched = ImatrixCollector::enabled();
     if (impl_->use_sched) {
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             if (!ggml_backend_supports_op(impl_->backend, ggml_graph_node(gf, i))) {
@@ -310,19 +353,13 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
             ok = (ggml_backend_graph_compute(impl_->backend, gf) == GGML_STATUS_SUCCESS);
         }
     } else {
-        if (!impl_->sched) {
-            ggml_backend_buffer_type_t bufs[2] = {
-                ggml_backend_get_default_buffer_type(impl_->backend),
-                ggml_backend_get_default_buffer_type(impl_->cpu_backend)};
-            impl_->sched = ggml_backend_sched_new(&impl_->backend, bufs, 2,
-                                                  ggml_tensor_overhead()*kGraphSize,
-                                                  /*parallel=*/false, /*op_offload=*/true);
-        }
-        ggml_backend_sched_reset(impl_->sched);
-        if (ggml_backend_sched_alloc_graph(impl_->sched, gf)) {
+        ggml_backend_sched_t sched = impl_->ensure_sched();
+        if (!sched) { ggml_free(ctx); return false; }
+        ggml_backend_sched_reset(sched);
+        if (ggml_backend_sched_alloc_graph(sched, gf)) {
             for (const auto& in : pin)
                 if (in.t->data) ggml_backend_tensor_set(in.t, in.host, 0, in.nbytes);
-            ok = (ggml_backend_sched_graph_compute(impl_->sched, gf) == GGML_STATUS_SUCCESS);
+            ok = (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS);
         }
     }
     if (ok) {
@@ -482,8 +519,8 @@ ReplayGraph::ReplayGraph(Backend& backend,
 
 bool ReplayGraph::alloc_internal() {
     // Decide sched vs gallocr (same logic as Backend::compute).
-    need_sched_ = false;
-    if (backend_.is_gpu()) {
+    need_sched_ = ImatrixCollector::enabled();
+    if (backend_.is_gpu() && !need_sched_) {
         for (int i = 0; i < ggml_graph_n_nodes(gf_); ++i) {
             if (!ggml_backend_supports_op(backend_.handle(), ggml_graph_node(gf_, i))) {
                 need_sched_ = true; break;
@@ -496,18 +533,11 @@ bool ReplayGraph::alloc_internal() {
         if (!galloc_) galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_.handle()));
         return ggml_gallocr_alloc_graph(galloc_, gf_);
     }
-    // sched path (rare; uses the Backend's shared sched).
-    if (!backend_.impl_->sched) {
-        ggml_backend_t backends[2] = {backend_.handle(), backend_.impl_->cpu_backend};
-        ggml_backend_buffer_type_t bufs[2] = {
-            ggml_backend_get_default_buffer_type(backend_.handle()),
-            ggml_backend_get_default_buffer_type(backend_.impl_->cpu_backend)};
-        backend_.impl_->sched = ggml_backend_sched_new(backends, bufs, 2,
-                                                       ggml_tensor_overhead()*kGraphSize,
-                                                       /*parallel=*/false, /*op_offload=*/true);
-    }
-    ggml_backend_sched_reset(backend_.impl_->sched);
-    return ggml_backend_sched_alloc_graph(backend_.impl_->sched, gf_);
+    // sched path (GPU op offload, or imatrix collection on any device).
+    ggml_backend_sched_t sched = backend_.impl_->ensure_sched();
+    if (!sched) return false;
+    ggml_backend_sched_reset(sched);
+    return ggml_backend_sched_alloc_graph(sched, gf_);
 }
 
 ReplayGraph::~ReplayGraph() {

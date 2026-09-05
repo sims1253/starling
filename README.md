@@ -33,6 +33,31 @@ is a transducer; granite-nar is a single bidirectional pass.
 
 - [`superwhisper/s1-mini`](https://huggingface.co/superwhisper/s1-mini) — **text-to-text**: a 0.6B Qwen3 decoder-only normalizer that rewrites raw ASR transcripts as clean written text (fills fillers, resolves self-corrections, punctuation/truecasing, numbers/emails under a `[Styling|Structure|Context]` control line). No audio front-end — the input embedding is a plain token lookup, so both the CUDA pipeline (`starling.s1.NormalizePipeline`, reusing the qwen3 track's K-step captured decode with a dual-EOS stop) and the in-tree ggml engine (`starling-ggml-s1`, the first engine with a C++ BPE **encoder** + a text path via `starling-serve`'s `POST /normalize`) are byte-exact against stock transformers on all fixture tiers. Apache 2.0 with a naming clause ("S1-mini by Superwhisper").
 
+## Calibrated quantization
+
+The native ggml engines support in-tree GGUF quantization — the ASR analogue
+of "dynamic quants": llama.cpp-style block quants (Q8_0/K-quants/IQ4_XS)
+weighted by an **importance matrix collected on real audio**, plus
+regex-recipes for per-tensor sensitivity sweeps, verified by WER.
+
+- `build/starling-quantize` — the quantizer CLI (`--quant q4_k_m`,
+  `--imatrix`, `--recipe`, `--list`).
+- `benchmarks/imatrix_collect.py` — runs the engine over calibration audio
+  with `STARLING_IMATRIX` set; every weight-side matmul contributes
+  per-channel activation importance.
+- `benchmarks/wer_quant.py` — WER sweep of GGUF variants against the f32
+  baseline (`--snr-db` for noise-hardened tiers).
+
+Parakeet-tdt-0.6b-v3 as the proof of concept (CPU path, fixture deltas —
+full tables in `docs/quantization.md`): **q4_k_m is free** (704 MB, 28% of
+F32, zero measurable WER loss even on 5 dB-noised audio), and at 2 bits the
+calibration is decisive — uniform q2_k degrades to 30%/17% WER while the
+imatrix-weighted q2_k **matches F32 exactly** at the same 574 MB. The
+pipeline is model-agnostic by construction and aimed at the larger engines
+(audex-2b, moss-2b, qwen3-asr-1.7b) where quantization actually changes what
+fits on a local machine. See `docs/quantization.md` for the full pipeline,
+the keep-list of tensors that must stay exact, and the results tables.
+
 ## Benchmark
 
 Two scripts, each the single source of truth for its slice. Both support
