@@ -1056,8 +1056,8 @@ def _transcribe_payload_sync(
     # Lazily load the backend before queueing inference. Done here, outside the
     # malformed-audio handler, so a valid request to an unloaded server triggers
     # load() rather than crashing inside _run_queued_sync -> _serial_run.
-    server._ensure_loaded()
     try:
+        server._ensure_loaded()
         result = server._run_queued_sync(samples, request_id)
     except _Busy:
         return 503, {
@@ -1071,6 +1071,9 @@ def _transcribe_payload_sync(
         return 504, {"error": "request timed out", "text": ""}
     except _DuplicateRequest:
         return 409, {"error": "request id already active", "text": ""}
+    except Exception:
+        log.exception("transcription failed (request_id=%s)", request_id)
+        return 500, {"error": "transcription failed", "text": "", "request_id": request_id}
     response = result.to_dict()
     response["request_id"] = request_id
     return 200, response
@@ -1179,7 +1182,10 @@ class StreamSession:
 
     def stream_flush(self) -> str:
         """Finalize all buffered audio (on commit) and return the full text."""
-        return self.chunker.flush(self.samples, self._tx)
+        text = self.chunker.flush(self.samples, self._tx)
+        if text is None:
+            raise _Busy("stream commit incomplete; retry with buffered audio retained")
+        return text
 
     def _maybe_trim_samples(self) -> None:
         """Drop the chunker's committed prefix from the rolling buffer.
@@ -1991,7 +1997,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--profile",
         choices=["file", "realtime", "batch", "accuracy"],
         default="file",
-        help="named serving profile (default file)",
+        help="named serving profile; realtime and batch allow numerical tolerance (default file)",
     )
     p.add_argument(
         "--max-chunk-seconds",
@@ -2059,7 +2065,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--sdpa-attention", action="store_true",
-        help="enable the nearly byte-exact shared SDPA attention path",
+        help="enable shared SDPA attention (requires --tolerance-mode)",
     )
     p.add_argument(
         "--fp8-weights", action="store_true",
@@ -2067,7 +2073,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--tolerance-mode", action="store_true",
-        help="allow validated non-byte-exact optimizations",
+        help="allow optimizations that change floating-point rounding",
     )
     p.add_argument(
         "--max-upload-mb", type=float, default=DEFAULT_MAX_UPLOAD_BYTES / (1024 * 1024),
@@ -2133,7 +2139,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         )
         profile_graph_mode = "graphed"
     elif args.profile == "realtime":
-        opt_flags = OptFlags(sdpa_attention=True)
+        opt_flags = OptFlags(tolerance_mode=True, sdpa_attention=True)
         profile_graph_mode = "graphed"
     else:
         opt_flags = OptFlags()
@@ -2143,6 +2149,8 @@ def run(argv: Optional[list[str]] = None) -> int:
         raise SystemExit("--fp8-weights requires --tolerance-mode (or --profile batch)")
     if args.fp8_weights and args.model not in fp8_models:
         raise SystemExit("--fp8-weights is currently implemented only for granite and moss")
+    if args.sdpa_attention and not (args.tolerance_mode or opt_flags.tolerance_mode):
+        raise SystemExit("--sdpa-attention requires --tolerance-mode (or a performance profile)")
     if args.sdpa_attention:
         opt_flags.sdpa_attention = True
     if args.tolerance_mode:

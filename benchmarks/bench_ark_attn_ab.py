@@ -28,7 +28,7 @@ def make_decode(backend: str):
         k = self._k
         hd = self._head_dim; n_q = self._n_q_heads; n_kv = self._n_kv_heads
         qkv_split = [n_q*hd, n_kv*hd, n_kv*hd]; inter = self._intermediate
-        flags = {"manual": OptFlags(), "sdpa": OptFlags(sdpa_attention=True),
+        flags = {"manual": OptFlags(), "sdpa": OptFlags(sdpa_attention=True, tolerance_mode=True),
                  "fp8": OptFlags(fp8_attention=True, tolerance_mode=True)}[backend]
         hidden = self._embed(self.static_input_ids) * 1.0
         cos, sin = self._rotary(hidden, position_ids=self.static_position_ids)

@@ -1,20 +1,6 @@
 name: tests
 
-# CPU-safe cross-platform CI.
-#
-# Starling's heavy GPU work (model byte-exactness, benchmarks, CUDA-graph
-# capture) needs an RTX 5090 / sm_120 and stays out of CI -- it is run manually
-# on the benchmark box. This workflow runs ONLY the CPU-safe subset:
-#
-#   * tests/test_server_routing.py -- pure, GPU-free slug->backend routing,
-#     CLI parsing, config plumbing (no model loaded, no CUDA).
-#   * tests/test_server_robustness.py -- CPU-only regressions for the
-#     robustness fixes (fakes; no GPU, no model, no network).
-#   * an import smoke test of starling._kernels, proving the backend dispatch
-#     resolves correctly on each OS (triton on Linux, torch on Windows).
-#
-# The matrix runs both Linux and Windows to guard the kernel-backend
-# abstraction that landed with cross-platform support (src/starling/_kernels/).
+# CPU regressions run on Linux and Windows; model/GPU checks run separately.
 
 on:
   push:
@@ -72,7 +58,8 @@ jobs:
           tests/test_server_routing.py tests/test_server_robustness.py
           tests/test_server_lifecycle.py tests/test_stream_chunk.py
           tests/test_s1_config.py tests/test_autotune.py tests/test_flags.py
-          tests/test_fp4_quantization.py
+          tests/test_fp4_quantization.py tests/test_ablation_checks.py
+          tests/test_kernel_selection.py tests/test_gpu_runner.py
           tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
           tests/test_ggml_patches.py
 
@@ -80,10 +67,5 @@ jobs:
         if: runner.os == 'Linux'
         run: uv run python -m pytest tests/test_gpu_session.py tests/test_gpu_lock.py -q
 
-      - name: Import smoke (kernel backend dispatches per-OS)
-        # Only call have_triton() + get_backend_name() (NOT get_backend()) --
-        # both are pure (no backend import, no torch import) and safe on a
-        # CUDA-less runner. Expected output:
-        #   ubuntu : backend: triton  triton: True
-        #   windows: backend: torch   triton: False
+      - name: Kernel backend import smoke
         run: uv run python -c "import starling._kernels as K; print('backend:', K.get_backend_name(), 'triton:', K.have_triton())"

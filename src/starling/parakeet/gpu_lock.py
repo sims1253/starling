@@ -70,7 +70,6 @@ def acquire_gpu_lock(
     gs = GpuSession(
         session=session, model=model, eta_min=eta_min, note=note,
         wait=wait, poll_sec=poll_sec, max_wait_sec=max_wait_sec,
-        install_signal_handlers=False,
     )
     gs.acquire()  # raises GpuLockBusy / GpuLockTimeout on contention
     owner_id = gs.owner_id or ""
@@ -95,7 +94,6 @@ def spawn_gpu_subprocess(args, *, owner_id: str | None = None, **popen_kwargs):
     # then close the parent's reference. The child remains the kernel owner.
     gs = GpuSession(
         session="native-subprocess", model="external", note="auto child lock",
-        install_signal_handlers=False,
     )
     gs.acquire()
     try:

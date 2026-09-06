@@ -1,15 +1,6 @@
-"""Correctness gate for the feature-flag infrastructure.
+"""Flag validation, scoped overrides, and GPU pipeline smoke tests.
 
-Verifies that:
-* Default flags preserve byte-exactness (``tolerance_mode=False``,
-  ``batched_encoder=False``, ``multistep_graph=True``).
-* The ``flags()`` context manager scopes overrides correctly and restores on
-  exit.
-* ``batched_encoder=True`` without ``tolerance_mode=True`` raises (guard).
-* The pipeline wires ``multistep_graph`` to the correct decoder class.
-* End-to-end: default-flags ``MegaPipeline`` produces byte-exact golden tokens.
-
-Run with:  uv run pytest tests/test_flags.py -q
+Run with: uv run pytest tests/test_flags.py -q
 """
 
 from __future__ import annotations
@@ -43,21 +34,10 @@ def _golden_generated() -> torch.Tensor:
     return load_golden("greedy_ids.pt")[0, 271:]
 
 
-# --------------------------------------------------------------------------- #
-# Tolerance helpers for the transformers 5.14 SDPA kernel-path drift.
-#
-# transformers 5.14 changed the SDPA kernel reduction order (commit 6f075c5631);
-# over the ~100-token granite decode the default-flags MegaPipeline (multi-step
-# graph) now diverges from the freshly-recaptured golden (model.generate) at token
-# 38. The drift is a single punctuation BPE token whose greedy re-segmentation
-# cascades (token-id match rate ~0.39) but the decoded TRANSCRIPT is semantically
-# identical (difflib similarity ~0.95; only comma placement differs). WER on real
-# audio is unchanged (3.18% == 3.18%), so this is benign kernel drift, NOT a
-# starling bug. These gates catch a real regression (garbled output scores <0.3
-# similarity / diverges at token 0-5) while passing on the benign drift.
-# --------------------------------------------------------------------------- #
-_LONG_DECODE_PREFIX_FLOOR = 30  # drift begins at token 38; >=30 proves correct wiring
-_LONG_DECODE_TRANSCRIPT_FLOOR = 0.90  # benign drift ~0.95; garbage <0.5
+# Historical fixture thresholds tolerate the observed long-decode drift.
+# This is a smoke check, not token parity or a corpus-level accuracy gate.
+_LONG_DECODE_PREFIX_FLOOR = 30
+_LONG_DECODE_TRANSCRIPT_FLOOR = 0.90
 
 
 def _leading_match_len(actual: torch.Tensor, expected: torch.Tensor) -> int:
@@ -84,81 +64,44 @@ def _golden_response_text() -> str:
 # --------------------------------------------------------------------------- #
 # flag defaults + validation
 # --------------------------------------------------------------------------- #
-def test_default_flags_preserve_byte_exactness():
-    """Default flags must be the byte-exact safe baseline."""
+def test_default_flags():
+    """Approximate paths require explicit opt-in."""
     f = OptFlags()
-    assert f.multistep_graph is True, "multistep_graph defaults True (byte-exact)"
+    assert f.multistep_graph is True, "multistep_graph defaults True"
     assert f.batched_encoder is False, "batched_encoder defaults False"
     assert f.tolerance_mode is False, "tolerance_mode defaults False"
-    # New decode-attention flags: fused_qkv is byte-exact (on by default); the
-    # attention-backend flags that break byte-exactness are off by default.
-    assert f.fused_qkv is True, "fused_qkv defaults True (byte-exact)"
+    assert f.fused_qkv is True, "fused_qkv defaults True"
     assert f.sdpa_attention is False, "sdpa_attention defaults False"
     assert f.flash_attention is False, "flash_attention defaults False"
     assert f.fp8_attention is False, "fp8_attention defaults False"
     assert f.fp8_weights is False, "fp8_weights defaults False (requires tolerance)"
-    # Ablation flags (wiki-driven). The two byte-exact decode folds default on;
-    # every other experimental flag defaults off so the baseline stays exact.
-    assert f.rope_alloc_free is True, "rope_alloc_free defaults True (byte-exact)"
-    assert f.lm_head_scale_fold is True, "lm_head_scale_fold defaults True (byte-exact)"
+    assert f.rope_alloc_free is True, "rope_alloc_free defaults True"
+    assert f.lm_head_scale_fold is True, "lm_head_scale_fold defaults True"
     assert f.gemm_epilogue_fusion is False, "gemm_epilogue_fusion defaults False (experimental)"
-    assert f.chunk_prefill_overlap is True, "chunk_prefill_overlap defaults True (byte-exact)"
+    assert f.chunk_prefill_overlap is True, "chunk_prefill_overlap defaults True"
     assert f.nvfp4_weights is False, "nvfp4_weights defaults False (requires tolerance)"
     assert f.nvfp4_lm_head_only is False, "nvfp4_lm_head_only defaults False (requires tolerance)"
 
 
-def test_nvfp4_weights_requires_tolerance():
-    """nvfp4_weights=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(nvfp4_weights=True, tolerance_mode=False)
+@pytest.mark.parametrize("name", [
+    "batched_encoder", "sdpa_attention", "flash_attention", "fp8_attention",
+    "fp8_weights", "gemm_epilogue_fusion", "nvfp4_weights", "nvfp4_lm_head_only",
+])
+def test_approximate_path_requires_tolerance(name):
+    with pytest.raises(ValueError, match=f"{name}=True requires tolerance_mode=True"):
+        OptFlags(**{name: True})
+    assert getattr(OptFlags(tolerance_mode=True, **{name: True}), name)
 
 
-def test_nvfp4_lm_head_only_requires_tolerance():
-    """nvfp4_lm_head_only=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(nvfp4_lm_head_only=True, tolerance_mode=False)
-
-
-def test_batched_encoder_requires_tolerance():
-    """batched_encoder=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(batched_encoder=True, tolerance_mode=False)
-
-
-def test_flash_attention_requires_tolerance():
-    """flash_attention=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(flash_attention=True, tolerance_mode=False)
-
-
-def test_fp8_attention_requires_tolerance():
-    """fp8_attention=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(fp8_attention=True, tolerance_mode=False)
+@pytest.mark.parametrize("name", [
+    "fp8_weights", "nvfp4_weights", "nvfp4_lm_head_only", "gemm_epilogue_fusion",
+])
+def test_weight_paths_enable_fused_qkv(name):
+    assert OptFlags(tolerance_mode=True, fused_qkv=False, **{name: True}).fused_qkv
 
 
 def test_fp8_attention_implies_flash():
-    """fp8_attention=True should force flash_attention on (shared SDPA path)."""
-    f = OptFlags(fp8_attention=True, tolerance_mode=True)
-    assert f.flash_attention is True, "fp8_attention must enable flash_attention"
-
-
-def test_fp8_weights_requires_tolerance():
-    """fp8_weights=True without tolerance_mode must raise."""
-    with pytest.raises(ValueError, match="tolerance_mode"):
-        OptFlags(fp8_weights=True, tolerance_mode=False)
-
-
-def test_fp8_weights_implies_fused_qkv():
-    """fp8_weights reads the pre-concatenated qkv/gate-up weights -> forces fused_qkv."""
-    f = OptFlags(fp8_weights=True, tolerance_mode=True, fused_qkv=False)
-    assert f.fused_qkv is True, "fp8_weights must enable fused_qkv"
-
-
-def test_batched_encoder_with_tolerance_ok():
-    """batched_encoder=True WITH tolerance_mode=True is valid."""
-    f = OptFlags(batched_encoder=True, tolerance_mode=True)
-    assert f.batched_encoder is True
+    assert OptFlags(fp8_attention=True, tolerance_mode=True).flash_attention
 
 
 # --------------------------------------------------------------------------- #
@@ -228,23 +171,11 @@ def test_pipeline_multistep_graph_wiring():
 
 
 # --------------------------------------------------------------------------- #
-# end-to-end: default flags -> byte-exact golden match
+# end-to-end smoke test
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_default_flags_end_to_end_byte_exact():
-    """A default-flags MegaPipeline (multistep on) must reproduce the golden decode.
-
-    transformers 5.14 SDPA kernel-path drift (commit 6f075c5631) makes the
-    default-flags multi-step pipeline diverge from the model.generate golden at
-    token 38 over this ~100-token decode. The drift is a single punctuation BPE
-    token whose greedy re-segmentation cascades (token-id match rate ~0.39) but the
-    decoded transcript is semantically identical (similarity ~0.95; only commas
-    differ) and WER on real audio is unchanged. So the end-to-end gate is now a
-    strong leading-prefix token match (>=30, proving correct wiring) plus a
-    transcript-similarity floor (>=0.90, catching garbled output). The flag-default
-    checks in test_default_flags_preserve_byte_exactness still assert the safe
-    baseline config byte-exactly. See the module docstring for the full rationale.
-    """
+def test_default_flags_end_to_end_smoke():
+    """Check the fixture's leading tokens and normalized text similarity."""
     from starling.granite.pipeline import MegaPipeline
     from starling.granite.audio import build_inputs, load_sample_audio
 
@@ -273,22 +204,3 @@ def test_default_flags_end_to_end_byte_exact():
         f"transcript similarity {sim:.3f} < {_LONG_DECODE_TRANSCRIPT_FLOOR}: "
         f"golden={_golden_response_text()[:100]!r} ours={text[:100]!r}"
     )
-
-
-if __name__ == "__main__":
-    test_default_flags_preserve_byte_exactness()
-    print("[manual] test_default_flags_preserve_byte_exactness PASSED")
-    test_batched_encoder_requires_tolerance()
-    print("[manual] test_batched_encoder_requires_tolerance PASSED")
-    test_batched_encoder_with_tolerance_ok()
-    print("[manual] test_batched_encoder_with_tolerance_ok PASSED")
-    test_flags_context_restores()
-    print("[manual] test_flags_context_restores PASSED")
-    test_flags_context_partial_override()
-    print("[manual] test_flags_context_partial_override PASSED")
-    test_flags_context_restores_on_exception()
-    print("[manual] test_flags_context_restores_on_exception PASSED")
-    test_pipeline_multistep_graph_wiring()
-    print("[manual] test_pipeline_multistep_graph_wiring PASSED")
-    test_default_flags_end_to_end_byte_exact()
-    print("[manual] test_default_flags_end_to_end_byte_exact PASSED")

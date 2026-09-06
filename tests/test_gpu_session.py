@@ -60,7 +60,7 @@ def _poll_until_free(lock_dir: Path, uuid: str, timeout: float = 5.0) -> bool:
     while time.time() < deadline:
         try:
             with GpuSession(session="probe", lock_dir=str(lock_dir),
-                            uuid=uuid, wait=False, install_signal_handlers=False):
+                            uuid=uuid, wait=False):
                 return True
         except GpuLockBusy:
             time.sleep(0.05)
@@ -82,7 +82,7 @@ def test_flock_serializes_concurrent_acquirers(tmp_path) -> None:
     def worker():
         barrier.wait()  # release all threads together to maximize contention
         with GpuSession(session="w", lock_dir=str(tmp_path), uuid=uuid,
-                        max_wait_sec=30, install_signal_handlers=False):
+                        max_wait_sec=30):
             t1 = time.monotonic()
             time.sleep(0.20)
             t2 = time.monotonic()
@@ -111,8 +111,7 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
     holder = _holder_script(textwrap.dedent("""
         lock_dir = sys.argv[1]
         uuid = sys.argv[2]
-        with GpuSession(session="holder", lock_dir=lock_dir, uuid=uuid,
-                        install_signal_handlers=False) as s:
+        with GpuSession(session="holder", lock_dir=lock_dir, uuid=uuid) as s:
             child = s.spawn(["sleep", "60"])
             print("HOLDER", os.getpid(), flush=True)
             print("CHILD", child.pid, flush=True)
@@ -144,8 +143,7 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
         # Lock is held by the holder.
         with pytest.raises(GpuLockBusy):
             with GpuSession(session="probe", lock_dir=str(tmp_path),
-                            uuid="uuid-orphan", wait=False,
-                            install_signal_handlers=False):
+                            uuid="uuid-orphan", wait=False):
                 pass
 
         # Kill the Python parent ONLY. The native sleep child survives and
@@ -155,8 +153,7 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
         time.sleep(0.2)
         with pytest.raises(GpuLockBusy):
             with GpuSession(session="probe", lock_dir=str(tmp_path),
-                            uuid="uuid-orphan", wait=False,
-                            install_signal_handlers=False):
+                            uuid="uuid-orphan", wait=False):
                 pass
 
         # Now kill the native child -> its fd closes -> flock releases.
@@ -176,15 +173,14 @@ def test_native_child_inherits_flock_fd(tmp_path) -> None:
 def test_graceful_parent_release_keeps_inherited_child_lock(tmp_path) -> None:
     """Closing the parent's fd must not explicitly unlock the child's flock."""
     session = GpuSession(session="parent", lock_dir=str(tmp_path),
-                         uuid="uuid-graceful", install_signal_handlers=False)
+                         uuid="uuid-graceful")
     session.acquire()
     child = session.spawn(["sleep", "60"])
     try:
         session.release()
         with pytest.raises(GpuLockBusy):
             with GpuSession(session="probe", lock_dir=str(tmp_path),
-                            uuid="uuid-graceful", wait=False,
-                            install_signal_handlers=False):
+                            uuid="uuid-graceful", wait=False):
                 pass
     finally:
         child.kill()
@@ -225,9 +221,9 @@ def test_lock_key_distinguishes_different_gpus(monkeypatch) -> None:
     from starling.gpu import session
     monkeypatch.setattr(session, "_query_gpu_uuids",
                         lambda: ["GPU-AAAA", "GPU-BBBB"])
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-AAAA")
     k0 = session._resolve_lock_key()
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-BBBB")
     k1 = session._resolve_lock_key()
     assert k0 == "GPU-AAAA"
     assert k1 == "GPU-BBBB"
@@ -267,8 +263,7 @@ def test_missing_flock_fails_closed_unless_explicitly_disabled(
 # --------------------------------------------------------------------------- #
 def test_token_v2_schema_roundtrip(tmp_path) -> None:
     with GpuSession(session="rt", model="parakeet", eta_min=7, note="hello",
-                    lock_dir=str(tmp_path), uuid="uuid-rt",
-                    install_signal_handlers=False) as s:
+                    lock_dir=str(tmp_path), uuid="uuid-rt") as s:
         token = s.read_token()
     assert token is not None, "no token written under the flock"
     assert token["v"] == 2
@@ -360,8 +355,7 @@ def test_runner_exec_under_lock(tmp_path) -> None:
         # While the child runs, the lock is held for its lifetime.
         with pytest.raises(GpuLockBusy):
             with GpuSession(session="probe", lock_dir=str(tmp_path),
-                            uuid="uuid-runner", wait=False,
-                            install_signal_handlers=False):
+                            uuid="uuid-runner", wait=False):
                 pass
 
         proc.wait(timeout=15)
@@ -381,7 +375,7 @@ def test_runner_allows_nested_legacy_lock_without_deadlock(tmp_path) -> None:
         lock_dir = sys.argv[1]
         uuid = sys.argv[2]
         with GpuSession(session="nested", lock_dir=lock_dir, uuid=uuid,
-                        max_wait_sec=1, install_signal_handlers=False):
+                        max_wait_sec=1):
             print("NESTED_OK", flush=True)
     """))
     runner_loader = textwrap.dedent(f"""
@@ -440,3 +434,109 @@ def test_released_session_can_be_collected(tmp_path):
     del session
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("cvd", ["", "-1", "1", "1,0"])
+def test_empty_cuda_selection_fails_closed(cvd):
+    from starling.gpu.session import _resolve_lock_key
+
+    with pytest.raises(RuntimeError, match="selects no GPU"):
+        _resolve_lock_key(cvd, ["GPU-AAAA"])
+
+
+@pytest.mark.parametrize("cvd", ["0,-1,0", "0,1,0", "GPU-A"])
+def test_cuda_visibility_truncation_and_uuid_prefix(cvd):
+    from starling.gpu.session import _resolve_lock_key
+
+    assert _resolve_lock_key(cvd, ["GPU-AAAA"]) == "GPU-AAAA"
+
+
+@pytest.mark.parametrize("cvd", ["0", "1", "0,-1,1"])
+def test_multi_gpu_ordinals_require_uuid(cvd):
+    from starling.gpu.session import _resolve_lock_key
+
+    with pytest.raises(RuntimeError, match="ordinal order is ambiguous"):
+        _resolve_lock_key(cvd, ["GPU-AAAA", "GPU-BBBB"])
+
+
+@pytest.mark.parametrize("cvd", ["GPU-A", "GPU-UNKNOWN", "0-1", "MIG-GPU-A/1/2"])
+def test_ambiguous_or_unsupported_cuda_selection_fails_closed(cvd):
+    from starling.gpu.session import _resolve_lock_key
+
+    with pytest.raises(RuntimeError, match="ambiguous|Unsupported"):
+        _resolve_lock_key(cvd, ["GPU-AAAA", "GPU-AAAB"])
+
+
+@pytest.mark.parametrize("cvd", ["0", "GPU-AAAA", ""])
+def test_failed_discovery_never_uses_alias_as_lock_key(cvd):
+    from starling.gpu.session import _resolve_lock_key
+
+    with pytest.raises(RuntimeError, match="Cannot discover GPU UUIDs"):
+        _resolve_lock_key(cvd, [])
+
+
+def test_disabled_session_spawns_without_flock(tmp_path, monkeypatch):
+    from starling.gpu import session
+
+    monkeypatch.setenv("STARLING_GPU_LOCK_DISABLE", "1")
+    monkeypatch.setattr(session, "fcntl", None)
+    lock = GpuSession(session="disabled", lock_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match="before acquire"):
+        lock.spawn([sys.executable, "-c", "pass"])
+    with lock:
+        child = lock.spawn([sys.executable, "-c", "print('child')"],
+                           stdout=subprocess.PIPE, text=True)
+        output, _ = child.communicate(timeout=10)
+        assert child.returncode == 0
+        assert output.strip() == "child"
+        assert lock.lock_path is None
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("previous", [signal.SIG_IGN, lambda signum, frame: None])
+def test_session_preserves_application_signal_handlers(tmp_path, previous):
+    original = signal.signal(signal.SIGTERM, previous)
+    try:
+        with GpuSession(session="signals", uuid="GPU-SIGNAL", lock_dir=str(tmp_path)):
+            assert signal.getsignal(signal.SIGTERM) is previous
+        assert signal.getsignal(signal.SIGTERM) is previous
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+@pytest.mark.parametrize("same_file", [False, True])
+def test_stale_inherited_descriptor_cannot_bypass_holder(tmp_path, monkeypatch, same_file):
+    with GpuSession(session="holder", uuid="GPU-STALE", lock_dir=str(tmp_path),
+                    heartbeat=False) as holder:
+        # A stale FD number can refer to another file or to a separate open
+        # description of the lock file. Neither conveys the holder's flock.
+        path = holder.lock_path if same_file else tmp_path / "unrelated"
+        stale_fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        monkeypatch.setenv("STARLING_GPU_LOCK_FD", str(stale_fd))
+        monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "GPU-STALE")
+        contender = GpuSession(session="contender", uuid="GPU-STALE",
+                               lock_dir=str(tmp_path), wait=False, heartbeat=False)
+        try:
+            with pytest.raises(GpuLockBusy):
+                contender.acquire()
+            assert contender._fd is None
+            os.fstat(stale_fd)  # rejection closes only the attempted duplicate
+        finally:
+            contender.release()
+            os.close(stale_fd)
+
+
+def test_inherited_unlocked_file_is_locked_before_acceptance(tmp_path, monkeypatch):
+    path = tmp_path / "starling-gpu-GPU-UNLOCKED.flock"
+    inherited_fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    monkeypatch.setenv("STARLING_GPU_LOCK_FD", str(inherited_fd))
+    monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "GPU-UNLOCKED")
+    try:
+        with GpuSession(session="borrower", uuid="GPU-UNLOCKED", lock_dir=str(tmp_path)):
+            monkeypatch.delenv("STARLING_GPU_LOCK_FD")
+            with pytest.raises(GpuLockBusy):
+                with GpuSession(session="probe", uuid="GPU-UNLOCKED",
+                                lock_dir=str(tmp_path), wait=False):
+                    pass
+    finally:
+        os.close(inherited_fd)

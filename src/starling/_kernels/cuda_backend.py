@@ -1,34 +1,8 @@
-"""CUDA C++ kernel backend for cross-platform fused decode kernels.
+"""CUDA C++ fused kernels compiled from ``cuda/backend.cu``.
 
-This is the **third** backend, selected automatically where triton is
-unavailable (Windows) but a CUDA toolkit + compiler is present.  It gives
-Windows the same fused-kernel performance as Linux's Triton path: the kernels
-are compiled from ``cuda/backend.cu`` via
-:func:`torch.utils.cpp_extension.load_inline` on first use (JIT, cached under
-``~/.cache/starling``), then reused.
-
-Why a CUDA backend at all?
---------------------------
-On the torch (stock-PyTorch) backend the three elementwise kernels are correct
-and byte-exact, but unfused -- each issues 3-4 separate kernels.  Across a
-28-layer Moss decode step that costs ~0.85 ms/step (see
-``benchmarks/bench_kernels.py``), and the fp8 dequant-GEMV is 6-16x slower than
-the Triton fused version.  The CUDA backend closes both gaps with single-launch
-fused kernels, recovering full Linux/Triton performance on Windows.
-
-Compilation
------------
-The first ``import``/call triggers a one-time nvcc compile (10-60 s depending on
-the machine); the shared object is cached, so subsequent runs are instant.  If
-compilation fails (no CUDA toolkit / no compiler), :func:`get_backend` falls
-back to the torch backend automatically (see ``__init__.py``).  On Linux the
-triton backend remains the default (faster autotuning, no first-run compile).
-
-Backend selection
------------------
-* Linux + triton        -> triton (default, max perf)
-* Windows + CUDA toolkit -> cuda (full perf; this module)
-* Windows, no toolkit    -> torch (correctness; slower fp8)
+The dispatcher initializes this extension before returning the CUDA backend.
+Direct imports compile on the first operation. PyTorch caches the build in
+``STARLING_CUDA_BUILD_DIR`` or ``~/.cache/starling/cuda_ext``.
 """
 
 from __future__ import annotations

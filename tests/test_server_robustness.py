@@ -47,7 +47,7 @@ from starling.server import (  # noqa: E402
 )
 from starling.stream_chunk import (  # noqa: E402
     ChunkStreamer,
-    _FLUSH_TAIL_MAX_RETRIES,
+    _FLUSH_MAX_RETRIES,
 )
 
 
@@ -703,7 +703,7 @@ def _chunker() -> ChunkStreamer:
 
 def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:  # noqa: ANN001
     """tx returning None then succeeding commits the tail text."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
 
     calls = {"n": 0}
@@ -722,59 +722,32 @@ def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:  
     assert chunker.boundary == len(samples)  # tail finalized
 
 
-def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
-    """Always-busy tx: committed text returned WITHOUT the tail, warning logged."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
-    chunker = _chunker()
-
-    calls = {"n": 0}
-
-    def tx(_window: np.ndarray) -> None:
-        calls["n"] += 1
-        return None  # always busy
-
-    # Pre-seed some committed text so we can assert it survives the dropped tail.
-    chunker.committed = ["already", "committed"]
-
-    samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    with caplog.at_level("WARNING", logger="starling.stream_chunk"):
-        out = chunker.flush(samples, tx)
-
-    assert out == "already committed"  # tail dropped, committed kept
-    assert calls["n"] == _FLUSH_TAIL_MAX_RETRIES  # bounded retry count
-    assert any("dropped untranscribed tail" in rec.message for rec in caplog.records)
-
-
-def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
-    """A tx returning '' (silence) is a success: boundary advances, no warning.
-
-    Any non-None result -- including an empty string -- must be treated as
-    successful, advancing the boundary to len(samples) and NOT emitting the
-    busy/dropped-tail warning. Pre-seeded committed text survives unchanged.
-    """
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+def test_flush_retains_tail_when_always_busy(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
     chunker.committed = ["already", "committed"]
-
-    calls = {"n": 0}
-
-    def tx(_window: np.ndarray) -> str:
-        calls["n"] += 1
-        return ""  # silence transcribed to no words (still a success)
-
+    calls = []
     samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    with caplog.at_level("WARNING", logger="starling.stream_chunk"):
-        out = chunker.flush(samples, tx)
+    assert chunker.flush(samples, lambda window: calls.append(len(window))) is None
+    assert len(calls) == _FLUSH_MAX_RETRIES
+    assert chunker.boundary == 0
+    assert chunker.committed == ["already", "committed"]
+    assert chunker.flush(samples, lambda window: "tail text") == "already committed tail text"
+    assert chunker.boundary == len(samples)
 
-    assert out == "already committed"  # committed kept, empty tail added nothing
-    assert calls["n"] == 1  # exactly one tx call (success, no retries)
-    assert chunker.boundary == len(samples)  # tail finalized
-    assert not any("dropped untranscribed tail" in rec.message for rec in caplog.records)
+
+def test_flush_accepts_empty_string_result(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
+    chunker = _chunker()
+    chunker.committed = ["already", "committed"]
+    samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+    assert chunker.flush(samples, lambda window: "") == "already committed"
+    assert chunker.boundary == len(samples)
 
 
 def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:  # noqa: ANN001
     """The retry loop must be bounded: flush returns in finite time, not hang."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
     samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
 
@@ -789,7 +762,7 @@ def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:  # noqa: ANN
     t.start()
     # Generous but finite: if flush were unbounded this would time out.
     assert done.wait(timeout=5.0), "flush hung instead of bounding retries"
-    assert result["out"] == ""
+    assert result["out"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1084,3 +1057,63 @@ def test_http_aliases_accept_wav_uploads(transport, path, multipart, monkeypatch
     assert status == 200
     assert response["text"] == "accepted"
     assert response["request_id"] == "upload-id"
+
+
+@pytest.mark.parametrize("transport", ["stdlib", "fastapi"])
+@pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_http_engine_errors_are_json(transport, stage, error_type, monkeypatch, caplog):
+    import asyncio
+    import http.client
+    import json
+    from starling import server as module
+
+    server = StarlingServer()
+    monkeypatch.setattr(server, "_ensure_loaded", lambda: None)
+
+    def fail(*args):
+        raise error_type("private engine details")
+
+    monkeypatch.setattr(server, stage, fail)
+    body = _wav_bytes(np.zeros(160, dtype=np.float32))
+    headers = {"content-type": "audio/wav", "content-length": str(len(body)),
+               "x-request-id": "failed-request"}
+    if transport == "stdlib":
+        httpd = module.ThreadingHTTPServer(("127.0.0.1", 0), module._build_stdlib_handler(server))
+        thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01})
+        thread.start()
+        connection = http.client.HTTPConnection(*httpd.server_address, timeout=5)
+        try:
+            connection.request("POST", "/inference", body, headers)
+            response = connection.getresponse()
+            status, content_type, payload = response.status, response.getheader("Content-Type"), response.read()
+        finally:
+            connection.close()
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+    else:
+        pytest.importorskip("fastapi")
+        app = module.create_app(server=server, load_on_startup=False)
+        messages = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        asyncio.run(app({"type": "http", "asgi": {"version": "3.0"},
+                         "http_version": "1.1", "method": "POST", "scheme": "http",
+                         "path": "/inference", "query_string": b"", "root_path": "",
+                         "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                        receive, send))
+        status = messages[0]["status"]
+        content_type = dict(messages[0]["headers"])[b"content-type"].decode()
+        payload = b"".join(message.get("body", b"") for message in messages[1:])
+    assert status == 500
+    assert content_type == "application/json"
+    assert json.loads(payload) == {"error": "transcription failed", "text": "",
+                                   "request_id": "failed-request"}
+    record = next(record for record in caplog.records if "failed-request" in record.message)
+    assert record.exc_info[1].args == ("private engine details",)

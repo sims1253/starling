@@ -268,9 +268,9 @@ full 50 with flat VRAM and RTFx no longer capture-bound (parakeet 526–1104×, 
 Starling runs on **Linux** and **native Windows** (no WSL2 needed). The fused
 decode kernels live behind a backend dispatch in `src/starling/_kernels/`, so
 the same model code runs unchanged on both OSes — it just picks a different
-kernel backend. All three backends are **byte-exact** on the default decode
-path (verified by `tests/test_kernel_backends.py` and the per-model golden
-tests run under each backend).
+kernel backend. `tests/test_kernel_backends.py` checks elementwise operations
+for exact equality and RoPE/quantized operations with numerical tolerances.
+Model fixture checks do not establish parity across every backend or GPU.
 
 The dispatch (`auto`) selects the fastest backend available, in this order:
 
@@ -296,9 +296,10 @@ The dispatch (`auto`) selects the fastest backend available, in this order:
 
 Select the backend explicitly with the `STARLING_KERNEL_BACKEND` env var
 (`auto` | `triton` | `cuda` | `torch`) before importing model modules.
-`auto` resolves to `triton` (if importable) → `cuda` (if a CUDA GPU is
-visible) → `torch`. On Windows + CUDA toolkit that means full speed with no
-code changes.
+`auto` tries `triton`, then CUDA when a GPU is visible, then `torch`. CUDA
+compilation happens during backend resolution; if it fails, automatic selection
+uses `torch`. An explicit backend request reports initialization errors.
+`get_backend_name()` resolves the backend and reports the one actually in use.
 
 Set up either platform with the same command (a cross-platform Python entry
 point):
@@ -363,7 +364,7 @@ Profiles provide supported defaults for the main workloads:
 | `file` (default) | one-shot files | adaptive graphs, strict flags |
 | `realtime` | low-latency dictation | graphed recurring windows + SDPA |
 | `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus graph-safe fused fp8 weights on granite/moss |
-| `accuracy` | strict/reference output | adaptive graphs, strict byte-exact flags |
+| `accuracy` | baseline numerical behavior | adaptive graphs, approximate options disabled |
 
 Model selection is workload-dependent: parakeet has the lowest realtime
 latency, moss has the best measured leaderboard WER, qwen3 is a strong
