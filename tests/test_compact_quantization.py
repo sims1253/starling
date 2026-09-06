@@ -116,3 +116,23 @@ def test_embedding_rejects_unvalidated_recipe_precision(quantize, dtype):
     with pytest.raises(subprocess.CalledProcessError) as error:
         quantize(f"default q8_0\n^decoder\\.prediction\\.embed\\.weight$ {dtype}\n")
     assert "embedding recipe supports only q8_0 or f32" in error.value.stderr
+
+
+@pytest.mark.parametrize("pattern", [r".*", r"^decoder\."])
+@pytest.mark.parametrize("dtype", ["q8_0", "q6_k"])
+def test_broad_embedding_rules_obey_first_match_precedence(quantize, pattern, dtype):
+    broad = f"default q8_0\n{pattern} {dtype}\n"
+    override = r"^decoder\.prediction\.embed\.weight$ f32" + "\n"
+    # A later exact rule cannot override an earlier broad match.
+    if dtype == "q8_0":
+        result = quantize(broad + override)
+        assert result[EMBED][:2] == (gguf.GGMLQuantizationType.Q8_0, 4 * 640 // 32 * 34)
+        assert result["other.embed.weight"][0] == gguf.GGMLQuantizationType.F32
+    else:
+        with pytest.raises(subprocess.CalledProcessError) as error:
+            quantize(broad + override)
+        assert "embedding recipe supports only q8_0 or f32" in error.value.stderr
+    # Putting F32 first preserves the source payload as well as its dtype/size.
+    baseline = quantize("default q8_0\n")
+    protected = quantize(override + broad)
+    assert protected[EMBED] == baseline[EMBED]

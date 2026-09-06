@@ -206,8 +206,23 @@ and a separate output filename. To reproduce the baseline, replace
 Start from the original floating-point model. The quantizer cannot decode
 an already quantized source. Recipe rules use first-match precedence:
 place any F32 or Q8_0 precision overrides before the compact rules.
-An embedding rule must match explicitly; `default q8_0` alone keeps it.
-The embedding rule accepts Q8_0 or F32; other types fail with an error.
+Any regex rule that matches the embedding opts it in, including broad rules
+such as `.* q8_0` or `^decoder\. q8_0`. This changes older custom recipes
+whose broad rules previously left embeddings untouched. A first matching
+Q6_K or other unsupported type now fails with an error; only Q8_0 and F32
+are accepted. `default q8_0` alone still keeps the source embedding dtype.
+
+To preserve an F32 source embedding while applying a broad rule, put its
+exact F32 override first. An override after the broad rule has no effect:
+
+```text
+default q8_0
+^decoder\.prediction\.embed\.weight$ f32
+^decoder\. q6_k
+```
+
+This override stores F32; it does not preserve the storage dtype of an F16
+or BF16 source embedding.
 The embedding has no collected importance entry because the engine reads
 it on the host. Q8_0 does not require one.
 
