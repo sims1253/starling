@@ -60,16 +60,24 @@ def acquire_gpu_lock(
     wait: bool = True,
     poll_sec: float = 0.2,
     max_wait_sec: float = 600.0,
+    uuid: str | None = None,
 ) -> str:
     """Acquire the GPU lock; return an opaque ``owner_id`` token.
 
     Delegates to :class:`GpuSession`. Raises :class:`GpuLockBusy` if a fresh
     lock is held and ``wait=False``. The returned token must be passed to
     :func:`release_gpu_lock`.
+
+    ``uuid`` is the physical device key, as in ``GpuSession(uuid=...)`` and
+    ``starling-gpu-run --uuid``. For devices without NVIDIA discovery, pass the
+    same stable key at every acquisition, including nested calls. The key does
+    not select a device: callers must select the matching device in their
+    backend and change the key if they change that selection. Omitting it uses
+    NVIDIA discovery, even when a parent supplied an inherited lock.
     """
     gs = GpuSession(
         session=session, model=model, eta_min=eta_min, note=note,
-        wait=wait, poll_sec=poll_sec, max_wait_sec=max_wait_sec,
+        wait=wait, poll_sec=poll_sec, max_wait_sec=max_wait_sec, uuid=uuid,
     )
     gs.acquire()  # raises GpuLockBusy / GpuLockTimeout on contention
     owner_id = gs.owner_id or ""
@@ -122,10 +130,13 @@ def release_gpu_lock(owner_id: str | None = None) -> bool:
 
 
 @contextmanager
-def with_gpu_lock(*, session: str, model: str, eta_min: int = 5, note: str = ""):
+def with_gpu_lock(
+    *, session: str, model: str, eta_min: int = 5, note: str = "",
+    uuid: str | None = None,
+):
     """Context-manager wrapper around :func:`acquire_gpu_lock`/`release_gpu_lock`."""
     owner_id = acquire_gpu_lock(
-        session=session, model=model, eta_min=eta_min, note=note)
+        session=session, model=model, eta_min=eta_min, note=note, uuid=uuid)
     try:
         yield
     finally:

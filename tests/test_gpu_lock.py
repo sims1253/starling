@@ -120,3 +120,42 @@ def test_dead_holder_releases_the_lock_immediately(tmp_path, monkeypatch) -> Non
     # we can acquire immediately with no stale-file stealing.
     owner = gpu_lock.acquire_gpu_lock(session="after", model="m", wait=False)
     gpu_lock.release_gpu_lock(owner)
+
+
+def test_explicit_changed_device_does_not_borrow_inherited_lock(tmp_path, monkeypatch):
+    from starling.gpu.session import GpuSession
+
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    with GpuSession(session="runner", uuid="device-a") as parent:
+        monkeypatch.setenv("STARLING_GPU_LOCK_FD", str(parent._fd))
+        monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "device-a")
+        monkeypatch.setenv("STARLING_GPU_LOCK_OWNER", parent.owner_id)
+        with GpuSession(session="other-holder", uuid="device-b"):
+            with pytest.raises(gpu_lock.GpuLockBusy):
+                gpu_lock.acquire_gpu_lock(
+                    session="changed-device", model="test", uuid="device-b", wait=False,
+                )
+        owner = gpu_lock.acquire_gpu_lock(
+            session="changed-device", model="test", uuid="device-b", wait=False,
+        )
+        try:
+            assert owner != parent.owner_id
+            with pytest.raises(gpu_lock.GpuLockBusy):
+                with GpuSession(session="probe", uuid="device-b", wait=False):
+                    pass
+        finally:
+            gpu_lock.release_gpu_lock(owner)
+
+
+def test_legacy_adapter_without_key_does_not_trust_inherited_identity(tmp_path, monkeypatch):
+    from starling.gpu.session import GpuSession
+
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr("starling.gpu.session._query_gpu_uuids", lambda: [])
+    with GpuSession(session="runner", uuid="device-a") as parent:
+        monkeypatch.setenv("STARLING_GPU_LOCK_FD", str(parent._fd))
+        monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "device-a")
+        with pytest.raises(RuntimeError, match="Cannot discover GPU UUIDs"):
+            gpu_lock.acquire_gpu_lock(session="unknown-device", model="test", wait=False)
