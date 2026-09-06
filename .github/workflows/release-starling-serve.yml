@@ -208,9 +208,7 @@ jobs:
           persist-credentials: false
 
       - name: Apply ggml patches
-        # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
-        # to the System32 WSL stub on Windows and skip patching (warning-only
-        # there). The script is idempotent; CMake's own run becomes a no-op.
+        # Validate early with Git Bash; CMake repeats this check before building.
         shell: bash
         run: bash scripts/apply_ggml_patches.sh
 
@@ -268,9 +266,7 @@ jobs:
           persist-credentials: false
 
       - name: Apply ggml patches
-        # Explicit Git Bash invocation — CMake's find_program(bash) can resolve
-        # to the System32 WSL stub on Windows and skip patching (warning-only
-        # there). The script is idempotent; CMake's own run becomes a no-op.
+        # Validate early with Git Bash; CMake repeats this check before building.
         shell: bash
         run: bash scripts/apply_ggml_patches.sh
 

@@ -134,7 +134,7 @@ index 860f691..bdc0628 100644
      const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
  
 @@ -9700,19 +9727,22 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
-         ctx->prealloc_y_last_decode_vector_staging = false;
+         ctx->prealloc_y_last_k_padded = false;
      }
  
 -    // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride
