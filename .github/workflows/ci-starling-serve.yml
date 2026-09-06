@@ -53,7 +53,8 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            audex_loader_guard_test model_lifetime_test starling-quantize
+            audex_loader_guard_test model_lifetime_test starling-quantize \
+            parakeet_compact_engine_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -77,7 +78,10 @@ jobs:
           ./build/audex_loader_guard_test
           ./build/model_lifetime_test
 
-      - name: Model lifetime sanitizers
+      - name: Quantized Parakeet prediction and joint CPU regression
+        run: ./build/parakeet_compact_engine_test
+
+      - name: Model lifetime and quantized decoding sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1
@@ -89,8 +93,9 @@ jobs:
             '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
             '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
             '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
-          cmake --build build-sanitized -j2 --target model_lifetime_test
+          cmake --build build-sanitized -j2 --target model_lifetime_test parakeet_compact_engine_test
           ./build-sanitized/model_lifetime_test
+          ./build-sanitized/parakeet_compact_engine_test
 
       - name: Smoke test --version
         run: |
