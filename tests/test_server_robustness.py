@@ -756,7 +756,7 @@ def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
 
 @pytest.mark.parametrize("path", ["/inference", "/transcribe"])
 @pytest.mark.parametrize("multipart", [False, True])
-def test_http_aliases_accept_wav_uploads( path, multipart, monkeypatch):
+def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
     import asyncio
     import json
     from starling import server as module
@@ -799,7 +799,7 @@ def test_http_aliases_accept_wav_uploads( path, multipart, monkeypatch):
 
 @pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
-def test_http_engine_errors_are_json( stage, error_type, monkeypatch, caplog):
+def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
     import asyncio
     import json
     from starling import server as module
