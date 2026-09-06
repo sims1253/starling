@@ -18,6 +18,8 @@ on:
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
+      - 'tests/test_compact_quantization.py'
+      - 'benchmarks/recipes/**'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
@@ -26,6 +28,8 @@ on:
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
+      - 'tests/test_compact_quantization.py'
+      - 'benchmarks/recipes/**'
       - '.github/workflows/ci-starling-serve.yml'
   workflow_dispatch:
     inputs:
@@ -49,7 +53,14 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            audex_loader_guard_test model_lifetime_test
+            audex_loader_guard_test model_lifetime_test starling-quantize
+
+      - name: Quantizer storage and recipe regressions
+        env:
+          STARLING_QUANTIZE_BIN: ${{ github.workspace }}/build/starling-quantize
+        run: |
+          pip install --quiet "numpy==2.2.6" "gguf==0.19.0" "pytest==8.4.2"
+          python -m pytest tests/test_compact_quantization.py -q
 
       - name: C++ unit tests (serve logic, no GPU/model)
         run: |

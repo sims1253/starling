@@ -22,6 +22,7 @@ quantization (and catching gross breakage, e.g. a mis-quantized tensor class).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -75,6 +76,9 @@ def main() -> int:
                          "corpus dir; one mean-WER column per "
                          "<config>_<split> prefix")
     ap.add_argument("--json", default=None, help="optional JSON output path")
+    ap.add_argument("--include-clips", action="store_true",
+                    help="include ordered references, hypotheses, and per-clip "
+                         "WER in JSON for paired corpus comparisons")
     args = ap.parse_args()
 
     tiers = [t.strip() for t in args.tiers.split(",") if t.strip()]
@@ -121,7 +125,7 @@ def main() -> int:
                 audio, sr = sf.read(str(wav), dtype="float32", always_2d=False)
                 assert sr == 16000, f"{wav} at {sr} Hz"
                 corpus_evals.setdefault(prefix, []).append(
-                    (np.ascontiguousarray(audio), reference))
+                    (np.ascontiguousarray(audio), reference, wav.name))
         for prefix, clips_ in corpus_evals.items():
             print(f"[corpus] {prefix}: {len(clips_)} clips")
 
@@ -172,6 +176,27 @@ def main() -> int:
         row = {"model": label, "path": str(p), "mb": round(p.stat().st_size / 1e6, 1),
                "wer": {}, "cer": {}, "wer_ci": {}}
         per_clip: dict[str, list[float]] = {}
+        if args.include_clips:
+            row["clips"] = {}
+
+        def evaluate_clips(column, clips):
+            wers = []
+            records = []
+            for index, clip in enumerate(clips):
+                audio, reference = clip[:2]
+                hypothesis = eng.transcribe(audio)[0]
+                value = wer_pct(reference, hypothesis)
+                wers.append(value)
+                if args.include_clips:
+                    records.append({"id": clip[2] if len(clip) > 2 else f"{column}:{index}",
+                                    "audio_sha256": hashlib.sha256(audio.tobytes()).hexdigest(),
+                                    "reference": reference, "hypothesis": hypothesis,
+                                    "wer": value})
+            row["wer"][column] = round(sum(wers) / len(wers), 2)
+            per_clip[column] = wers
+            if args.include_clips:
+                row["clips"][column] = records
+
         try:
             eng.load()
             for tier in tiers:
@@ -180,20 +205,11 @@ def main() -> int:
                 row["wer"][tier] = round(wer_pct(ref, hyp), 2)
                 row["cer"][tier] = round(cer_pct(ref, hyp), 2)
             if de_clips:
-                wers = [wer_pct(ref, eng.transcribe(audio)[0])
-                        for audio, ref in de_clips]
-                row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
-                per_clip["mls_de"] = wers
+                evaluate_clips("mls_de", de_clips)
             for cfg, clips_ in fleurs_evals.items():
-                wers = [wer_pct(ref, eng.transcribe(audio)[0])
-                        for audio, ref in clips_]
-                row["wer"][f"fleurs_{cfg}"] = round(sum(wers) / len(wers), 2)
-                per_clip[f"fleurs_{cfg}"] = wers
+                evaluate_clips(f"fleurs_{cfg}", clips_)
             for prefix, clips_ in corpus_evals.items():
-                wers = [wer_pct(ref, eng.transcribe(audio)[0])
-                        for audio, ref in clips_]
-                row["wer"][prefix] = round(sum(wers) / len(wers), 2)
-                per_clip[prefix] = wers
+                evaluate_clips(prefix, clips_)
             for col, wers in per_clip.items():
                 import zlib
                 row["wer_ci"][col] = _bootstrap_ci(

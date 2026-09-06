@@ -1,0 +1,4 @@
+# Parakeet TDT v3: Q8_0 embedding with the existing IQ2_XXS tensor policy.
+# Requires --imatrix; use --shrink-f16 to match the documented size study.
+default iq2_xxs
+^decoder\.prediction\.embed\.weight$ q8_0

@@ -13,6 +13,44 @@ import fleurs_util
 import wer_quant
 
 
+def test_corpus_json_retains_ordered_clips_for_paired_comparisons(monkeypatch, tmp_path):
+    import hashlib
+    import json
+    import soundfile as sf
+
+    model = tmp_path / "model.gguf"
+    model.touch()
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for index, reference in enumerate(("one two", "three four")):
+        wav = corpus / f"en_us_test_{index}.wav"
+        sf.write(wav, np.zeros(1600, dtype=np.float32), 16000)
+        wav.with_suffix(".txt").write_text(reference)
+    hypotheses = iter(("one", "three four", "one two", "three"))
+    monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
+        available=True, load=lambda: None, close=lambda: None,
+        transcribe=lambda audio: [next(hypotheses)]))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["wer_quant", "--tiers", "", "--models",
+                                      f"first={model}", f"second={model}",
+                                      "--corpus", str(corpus), "--include-clips",
+                                      "--json", str(output)])
+    assert wer_quant.main() == 0
+    row, second = json.loads(output.read_text())
+    audio_hash = hashlib.sha256(np.zeros(1600, dtype=np.float32).tobytes()).hexdigest()
+    assert row["clips"]["en_us_test"] == [
+        {"id": "en_us_test_0.wav", "audio_sha256": audio_hash,
+         "reference": "one two", "hypothesis": "one", "wer": 50.0},
+        {"id": "en_us_test_1.wav", "audio_sha256": audio_hash,
+         "reference": "three four", "hypothesis": "three four", "wer": 0.0},
+    ]
+    assert row["wer"]["en_us_test"] == 25.0
+    first_clips, second_clips = row["clips"]["en_us_test"], second["clips"]["en_us_test"]
+    assert [(c["id"], c["audio_sha256"], c["reference"]) for c in first_clips] == [
+        (c["id"], c["audio_sha256"], c["reference"]) for c in second_clips]
+    assert [c["wer"] for c in second_clips] == [0.0, 50.0]
+
+
 def test_variants_receive_identical_noise_regardless_of_model_order(monkeypatch, tmp_path):
     models = [tmp_path / name for name in ("a.gguf", "b.gguf")]
     for path in models:
