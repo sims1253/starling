@@ -1,13 +1,51 @@
 #include "loader.hpp"
 #include <cstdio>
+#include <string>
 #include <vector>
 
+#include "ggml.h"
 #include "lib/loader_kit.hpp"
 namespace starling::ggml::voxtral {
 namespace {
 // GGUF-metadata helpers shared across the engines (lib/loader_kit.hpp).
 using lib::f32;
 using lib::str;
+
+// Tensor-shape equation: `name` must have exactly the ggml dims in `want`.
+// (GGUF stores row-major [out, in]; ggml exposes ne innermost-first, so a
+// Linear(out <- in) weight reads ne0=in, ne1=out, and a Conv1d(OC, IC, K)
+// weight reads ne0=K, ne1=IC, ne2=OC.) Presence is established by the
+// require() pass; a missing tensor here is still a loud error.
+bool shape_eq(const ModelLoader& m, const char* name,
+              std::initializer_list<int64_t> want, std::string& err) {
+    ggml_tensor* t = m.tensor(name);
+    if (!t) {
+        err = std::string("VOXTRAL GGUF missing required tensor: ") + name;
+        return false;
+    }
+    bool ok = (int) want.size() == ggml_n_dims(t);
+    int i = 0;
+    for (int64_t w : want) {
+        if (ok && t->ne[i] != w) ok = false;
+        ++i;
+    }
+    if (!ok) {
+        std::string got;
+        for (int j = 0; j < ggml_n_dims(t); ++j) {
+            if (j) got += ",";
+            got += std::to_string(t->ne[j]);
+        }
+        std::string want_s;
+        for (int64_t w : want) {
+            if (!want_s.empty()) want_s += ",";
+            want_s += std::to_string(w);
+        }
+        err = std::string("VOXTRAL GGUF shape mismatch on ") + name +
+              " (ggml dims [" + got + "], want [" + want_s + "])";
+        return false;
+    }
+    return true;
+}
 } // namespace
 
 int64_t offline_padded_samples(int64_t n_samples) {
@@ -140,34 +178,22 @@ bool VoxtralModel::load(const char* path, std::string& err) {
     POS(c.llm.time_embedding_dim, "llm.time_embedding_dim");
     POS(c.llm.ada_bottleneck, "llm.ada_bottleneck");
 #undef POS
-    // Attention projects to heads*head_dim = 2048, NOT the hidden 1280.
-    if ((int64_t) c.encoder.n_heads * c.encoder.head_dim != 2048) {
-        err = "VOXTRAL GGUF enc attention width != 32*64 (heads*head_dim)";
-        return false;
-    }
-    if (c.encoder.d_model != 1280) {
-        err = "VOXTRAL GGUF enc.d_model != 1280";
-        return false;
-    }
-    if (c.llm.hidden != 3072) {
-        err = "VOXTRAL GGUF llm.hidden_size != 3072";
-        return false;
-    }
-    // GQA trunk: the q/o projections span n_heads*head_dim = 4096 and the
-    // kv projections n_kv_heads*head_dim = 1024 -- both wider/narrower than
-    // the hidden 3072, so no hidden == heads*head_dim check applies here
-    // (unlike the ark/qwen trunks; same pattern as the voxtral encoder,
-    // whose 32*64 = 2048 attention width exceeds its hidden 1280).
-    if ((int64_t) c.llm.n_heads * c.llm.head_dim != 4096) {
-        err = "VOXTRAL GGUF llm q width != 32*128 (num_heads*head_dim)";
-        return false;
-    }
-    if ((int64_t) c.llm.n_kv_heads * c.llm.head_dim != 1024) {
-        err = "VOXTRAL GGUF llm kv width != 8*128 (num_kv_heads*head_dim)";
-        return false;
-    }
+    // Attention projects to heads*head_dim (the encoder is full MHA: the
+    // attribute_map folds num_key_value_heads into num_attention_heads, and
+    // the checkpoint's q/k/v rows confirm it). The hidden width is NOT the
+    // attention width; every relation below is an equation between metadata
+    // fields and the actual tensor shapes, so any consistent dims validate.
+    const int64_t AW = (int64_t) c.encoder.n_heads * c.encoder.head_dim;
+    const int64_t QW = (int64_t) c.llm.n_heads * c.llm.head_dim;
+    const int64_t KVW = (int64_t) c.llm.n_kv_heads * c.llm.head_dim;
     if (c.llm.n_heads % c.llm.n_kv_heads != 0) {
         err = "VOXTRAL GGUF llm.num_heads must be a multiple of llm.num_kv_heads";
+        return false;
+    }
+    // The projector groups downsample encoder frames: input == d_model * ds.
+    if ((int64_t) c.projector.input_size !=
+        (int64_t) c.encoder.d_model * c.projector.downsample) {
+        err = "VOXTRAL GGUF proj.input_size != enc.d_model * proj.downsample";
         return false;
     }
     if (c.frontend.n_fft != 400 || c.frontend.win_length != 400 ||
@@ -176,43 +202,73 @@ bool VoxtralModel::load(const char* path, std::string& err) {
         return false;
     }
 
-    // Require every expected tensor so a structural change fails loudly.
-    for (const char* n : {"enc.conv1.weight", "enc.conv1.bias",
-                          "enc.conv2.weight", "enc.conv2.bias",
-                          "enc.final_norm.weight",
-                          "proj.fc0.weight", "proj.fc2.weight",
-                          "llm.embed.weight", "llm.final_norm.weight",
-                          "llm.t_cond"})
-        if (!lib::require(m, n, "VOXTRAL", err)) return false;
+    // Require every expected tensor so a structural change fails loudly, then
+    // check each weight's shape against the metadata relations above.
+    const int64_t Dm = c.encoder.d_model, Fm = c.encoder.ffn_dim;
+    const int64_t H = c.llm.hidden, I = c.llm.intermediate;
+    const int64_t V = c.llm.vocab, Ad = c.llm.ada_bottleneck;
+    const int64_t Pm = c.encoder.num_mel_bins, Po = c.projector.output_size;
+#define SHAPE(name, ...) do { if (!shape_eq(m, name, {__VA_ARGS__}, err)) return false; } while (0)
+    SHAPE("enc.conv1.weight", 3, Pm, Dm);
+    SHAPE("enc.conv1.bias", Dm);
+    SHAPE("enc.conv2.weight", 3, Dm, Dm);
+    SHAPE("enc.conv2.bias", Dm);
+    SHAPE("enc.final_norm.weight", Dm);
+    SHAPE("proj.fc0.weight", (int64_t) c.projector.input_size, Po);
+    SHAPE("proj.fc2.weight", Po, Po);
+    SHAPE("llm.embed.weight", H, V);
+    SHAPE("llm.final_norm.weight", H);
+    SHAPE("llm.t_cond", (int64_t) c.llm.time_embedding_dim);
     // Encoder layers: attn_norm(w), attn.q(w+b), attn.k(w),
     // attn.v(w+b), attn.o(w+b), ffn_norm(w), ffn.gate(w), ffn.up(w),
-    // ffn.down(w+b) = 13 each.
+    // ffn.down(w+b) = 13 each. The q/k/v rows are the metadata attention
+    // width AW (full MHA: kv heads == q heads), o cols are AW, gate/up rows
+    // are the ffn width Fm, down cols are Fm.
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
         char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn.q.weight",
-                                 "attn.q.bias", "attn.k.weight", "attn.v.weight",
-                                 "attn.v.bias", "attn.o.weight", "attn.o.bias",
-                                 "ffn_norm.weight", "ffn.gate.weight",
-                                 "ffn.up.weight", "ffn.down.weight",
-                                 "ffn.down.bias"}) {
-            std::snprintf(n, sizeof n, "enc.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "VOXTRAL", err)) return false;
-        }
+        std::snprintf(n, sizeof n, "enc.blk.%u.", i);
+        const std::string pre = n;
+#define LSHAPE(tail, ...) do { \
+            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+        } while (0)
+        LSHAPE("attn_norm.weight", Dm);
+        LSHAPE("attn.q.weight", Dm, AW);
+        LSHAPE("attn.q.bias", AW);
+        LSHAPE("attn.k.weight", Dm, AW);
+        LSHAPE("attn.v.weight", Dm, AW);
+        LSHAPE("attn.v.bias", AW);
+        LSHAPE("attn.o.weight", AW, Dm);
+        LSHAPE("attn.o.bias", Dm);
+        LSHAPE("ffn_norm.weight", Dm);
+        LSHAPE("ffn.gate.weight", Dm, Fm);
+        LSHAPE("ffn.up.weight", Dm, Fm);
+        LSHAPE("ffn.down.weight", Fm, Dm);
+        LSHAPE("ffn.down.bias", Dm);
+#undef LSHAPE
     }
     // LLM layers: attn_norm(w), attn.{q,k,v,o}(w), ffn_norm(w),
     // ffn.{gate,up,down}(w), ada.fc0(w), ada.fc2(w) = 11 each, no biases.
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
         char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn.q.weight",
-                                 "attn.k.weight", "attn.v.weight",
-                                 "attn.o.weight", "ffn_norm.weight",
-                                 "ffn.gate.weight", "ffn.up.weight",
-                                 "ffn.down.weight", "ada.fc0.weight",
-                                 "ada.fc2.weight"}) {
-            std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "VOXTRAL", err)) return false;
-        }
+        std::snprintf(n, sizeof n, "llm.blk.%u.", i);
+        const std::string pre = n;
+#define LSHAPE(tail, ...) do { \
+            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+        } while (0)
+        LSHAPE("attn_norm.weight", H);
+        LSHAPE("attn.q.weight", H, QW);
+        LSHAPE("attn.k.weight", H, KVW);
+        LSHAPE("attn.v.weight", H, KVW);
+        LSHAPE("attn.o.weight", QW, H);
+        LSHAPE("ffn_norm.weight", H);
+        LSHAPE("ffn.gate.weight", H, I);
+        LSHAPE("ffn.up.weight", H, I);
+        LSHAPE("ffn.down.weight", I, H);
+        LSHAPE("ada.fc0.weight", H, Ad);
+        LSHAPE("ada.fc2.weight", Ad, H);
+#undef LSHAPE
     }
+#undef SHAPE
     return true;
 }
 } // namespace starling::ggml::voxtral

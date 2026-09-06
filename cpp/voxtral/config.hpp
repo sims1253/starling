@@ -20,6 +20,9 @@ struct FrontendConfig {
     uint32_t sample_rate = 16000, n_fft = 400, win_length = 400;
     uint32_t hop_length = 160, n_mels = 128, center = 1;
     uint32_t unit_samples = 1280, left_pad_tokens = 32, right_pad_tokens = 17;
+    // Unused: voxtral never truncates the waveform (the offline pad owns
+    // length). Present only for the shared make_mel_policy mapping.
+    uint32_t n_samples = 0;
     float mel_floor = 1e-10f, log_mel_max = 1.5f;
     // Stock: x=(log+4)/4 with floor at (max-8). offset/divisor reproduce it.
     float normalization_offset = 4.0f, normalization_divisor = 4.0f;
