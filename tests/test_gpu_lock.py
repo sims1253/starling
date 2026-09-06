@@ -105,6 +105,8 @@ def test_dead_holder_releases_the_lock_immediately(tmp_path, monkeypatch) -> Non
         os.environ["STARLING_GPU_LOCK_DIR"] = {str(tmp_path)!r}
         sys.path.insert(0, {str(Path(__file__).resolve().parent.parent / "src")!r})
         from starling.parakeet import gpu_lock
+        from starling.gpu import session
+        session._query_gpu_uuids = lambda: ["GPU-SHIM"]
         o = gpu_lock.acquire_gpu_lock(session="dying", model="m", wait=False)
         print("HELD", flush=True)
         # exit immediately -- no release(); simulates a crash / SIGKILL

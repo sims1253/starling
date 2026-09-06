@@ -790,7 +790,12 @@ int main(int argc, char** argv) {
                         double dur = session.buffered_seconds();
                         std::string text;
                         if (dur > 0.0) {
-                            text = session.stream_flush();
+                            auto final = session.stream_flush();
+                            if (!final.has_value()) {
+                                ws.send("{\"type\":\"error\",\"message\":\"server busy\"}");
+                                continue;
+                            }
+                            text = *final;
                         }
                         std::string safe_text = json_escape(text);
                         std::ostringstream ss;

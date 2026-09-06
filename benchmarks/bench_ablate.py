@@ -1,8 +1,8 @@
 """Ablation harness: measure each optimisation flag's marginal benefit.
 
-Sweeps every flag in :class:`OptFlags` on/off against a byte-exact baseline,
-times the granite decode step via CUDA-graph replay (median of N trials), and
-checks byte-exactness against the golden greedy ids. Output is a single
+Sweeps selected :class:`OptFlags` against an all-off baseline and times the
+granite decode step via CUDA-graph replay (median of N trials). An optional
+correctness check compares generated token IDs with the golden fixture. Output is a single
 markdown table showing each flag's marginal speedup and accuracy impact, so
 you can see exactly what each optimisation buys.
 
@@ -61,7 +61,7 @@ DECODE_FLAGS: list[tuple[str, dict]] = [
     ("flash_attention",      dict(flash_attention=True, tolerance_mode=True)),
     ("multistep_graph",      dict(multistep_graph=True)),
     # Experimental paths; evaluate quality alongside speed.
-    ("gemm_epilogue_fusion", dict(gemm_epilogue_fusion=True)),
+    ("gemm_epilogue_fusion", dict(gemm_epilogue_fusion=True, tolerance_mode=True)),
     ("nvfp4_weights",        dict(nvfp4_weights=True, tolerance_mode=True)),
     ("nvfp4_lm_head_only",   dict(nvfp4_lm_head_only=True, tolerance_mode=True)),
 ]
@@ -88,11 +88,10 @@ def _byte_exact(dec, inputs_embeds, golden_ids, T, tokenizer, max_new_tokens=120
             inputs_embeds, max_new_tokens=max_new_tokens,
             eos_token_id=LLM_EOS_TOKEN_ID, tokenizer=tokenizer, capture=False,
         )
-        golden_gen = golden_ids[0, T:T + res.n_tokens]
-        min_len = min(golden_gen.numel(), res.ids.numel())
-        if min_len == 0:
+        golden_gen = golden_ids[0, T:T + max_new_tokens]
+        if golden_gen.numel() == 0:
             return "n/a"
-        return bool(torch.equal(golden_gen[:min_len], res.ids[0, :min_len].cpu()))
+        return bool(torch.equal(golden_gen.cpu(), res.ids[0].cpu()))
     except Exception as e:
         return f"err: {type(e).__name__}"
 
@@ -124,7 +123,7 @@ def bench_decode_step(model, processor, inputs_embeds, golden_ids, combo: dict,
                 "note": str(e)[:80]}
 
     # Correctness check (optional -- see docstring).
-    be = _byte_exact(dec, inputs_embeds, golden_ids, T, tokenizer) if check_byte_exact else "see pytest"
+    be = _byte_exact(dec, inputs_embeds, golden_ids, T, tokenizer) if check_byte_exact else "not checked"
 
     # Capture the decode graph and time its replay.
     next_token = dec.prefill(inputs_embeds)
@@ -150,7 +149,10 @@ def bench_decode_step(model, processor, inputs_embeds, golden_ids, combo: dict,
 
     del dec
     torch.cuda.empty_cache()
-    return {"us_per_step": median(trial_us), "byte_exact": be, "note": ""}
+    dependencies = [name for name, enabled in vars(of).items()
+                    if enabled and not combo.get(name, True) and name != "tolerance_mode"]
+    note = f"also enables {', '.join(dependencies)}" if dependencies else ""
+    return {"us_per_step": median(trial_us), "byte_exact": be, "note": note}
 
 
 def main() -> int:
@@ -195,7 +197,7 @@ def _main_locked(args) -> int:
 
 def _main_decode_step(args, model, processor, inputs_embeds, golden_ids, flag_set) -> int:
     """Decode-step ablation (the default mode)."""
-    # Baseline: every ablatable flag OFF (the strict byte-exact reference).
+    # Baseline: every ablatable flag off.
     print("\nmeasuring baseline (all ablatable flags off) ...", flush=True)
     baseline_combo = {name: False for name, _ in DECODE_FLAGS + LONG_AUDIO_FLAGS}
     baseline_combo["multistep_graph"] = False  # decode_step uses FusedLLMMega

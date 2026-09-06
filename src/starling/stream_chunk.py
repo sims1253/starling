@@ -1,42 +1,23 @@
 """Fixed-window overlapping-chunk streaming for long-form live dictation.
 
-The naive ``/stream`` loop re-transcribes the *entire* growing buffer on every
-partial.  Over a long dictation that is O(N^2) work, the LLM prompt grows without
-bound (a multi-minute utterance overflows any static KV cache), and -- because
-each buffer length is unique -- the CUDA-graph encoder can never reuse a capture.
-
-This module finalizes the buffer in **fixed-length** windows that overlap by a
-small margin:
-
-* Each finalized window is a *constant* mel length, so the adaptive cudagraph
-  encoder captures it once and replays it thereafter.
-* Work is O(N): each second of audio is transcribed a bounded number of times.
-* The prompt per transcribe is bounded by the window, so ``max_cache_len`` is
-  never exceeded regardless of total session length.
-* Consecutive windows overlap, so boundary words are never dropped -- their
-  transcripts are stitched with :func:`stitch_words`.
-
-Stitching has no word timestamps to lean on (MOSS emits one segment per call),
-so it works on the decoded word sequence: consecutive windows share ``overlap``
-seconds of audio and therefore transcribe the same words there.  We align the
-longest common run in that region (``difflib``) and splice, deduping the overlap.
+Full windows overlap so boundary words can be matched with :func:`stitch_words`.
+Matching uses decoded words, without timestamps; it can miss or duplicate words
+when neighboring windows disagree. Each transcription call is bounded by the
+configured window size, including retries when the server is busy.
 """
 
 from __future__ import annotations
 
 import difflib
-import logging
 import re
 import time
 from typing import Callable, Optional
 
 import numpy as np
 
-log = logging.getLogger(__name__)
-
-# Retry/backoff for the final tail window on commit when the transcriber is busy.
-_FLUSH_TAIL_MAX_RETRIES = 5
-_FLUSH_TAIL_BACKOFF_SECONDS = 0.05
+# Bounded retries on commit when the transcriber is busy.
+_FLUSH_MAX_RETRIES = 5
+_FLUSH_BACKOFF_SECONDS = 0.05
 
 _WORD_NORM = re.compile(r"[^\w']+")
 
@@ -143,6 +124,8 @@ class ChunkStreamer:
         finalized = self._finalize_full_windows(samples, tx)
 
         tail_len = len(samples) - self.boundary
+        if tail_len >= self.chunk:  # a full window is still waiting for a retry
+            return " ".join(self.committed) if finalized else None
         throttled = (now - self.last_emit) < self.partial_interval
         # emit if we just finalized, or the (throttled) live tail is long enough
         if not finalized and (throttled or tail_len < self.min):
@@ -159,39 +142,28 @@ class ChunkStreamer:
             ))
         return " ".join(self.committed) if finalized else None
 
-    def flush(self, samples: np.ndarray, tx: TranscribeFn) -> str:
-        """Finalize all remaining audio (on ``commit``) and return the full text.
+    def flush(self, samples: np.ndarray, tx: TranscribeFn) -> Optional[str]:
+        """Commit all audio, or return ``None`` if bounded retries stay busy.
 
-        If the transcribe callback is busy (returns ``None``), the tail window is
-        retried a few times with a short backoff.  If it still cannot be
-        transcribed, the tail is dropped and a warning is logged -- committed
-        text is still returned so the caller receives the bulk of the dictation.
+        Completed windows remain committed. The caller must retain the audio
+        and retry commit after ``None``; only a string result is final.
         """
-        self._finalize_full_windows(samples, tx)
-        tail = samples[self.boundary :]
-        if len(tail) > 0:
-            text = None
-            for attempt in range(_FLUSH_TAIL_MAX_RETRIES):
+        for attempt in range(_FLUSH_MAX_RETRIES):
+            self._finalize_full_windows(samples, tx)
+            tail = samples[self.boundary :]
+            if len(tail) == 0:
+                return " ".join(self.committed)
+            if len(tail) < self.chunk:
                 text = tx(tail)
                 if text is not None:
-                    break
-                time.sleep(_FLUSH_TAIL_BACKOFF_SECONDS)
-            if text is not None:
-                # Any non-None result is a success, including an empty string
-                # (silence transcribed to no words). stitch_words is a no-op for
-                # empty ``new`` (returns committed unchanged), and we still
-                # advance the boundary so this tail isn't retried.
-                self.committed = stitch_words(
-                    self.committed, text.split(), max_overlap=self.max_overlap_words
-                )
-                self.boundary = len(samples)
-            else:
-                log.warning(
-                    "flush: dropped untranscribed tail (%d samples) after %d "
-                    "retries; transcriber remained busy",
-                    len(tail), _FLUSH_TAIL_MAX_RETRIES,
-                )
-        return " ".join(self.committed)
+                    self.committed = stitch_words(
+                        self.committed, text.split(), max_overlap=self.max_overlap_words
+                    )
+                    self.boundary = len(samples)
+                    return " ".join(self.committed)
+            if attempt + 1 < _FLUSH_MAX_RETRIES:
+                time.sleep(_FLUSH_BACKOFF_SECONDS)
+        return None
 
     def reset(self) -> None:
         self.committed = []

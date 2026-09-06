@@ -150,7 +150,7 @@ static void test_chunk_streamer_flush() {
 
     // 0.5s of audio → flush should return the text.
     std::vector<float> samples(8000, 0.0f);
-    std::string text = cs.flush(samples, tx);
+    auto text = cs.flush(samples, tx);
     CHECK(text == "flushed");
 }
 
@@ -291,7 +291,7 @@ static void test_stream_session_buffer_trim() {
     // Commit finalizes the remaining tail (4000 live samples past the
     // boundary, starting at abs index 36000+12000=48000 -> value 3000).
     calls.clear();
-    std::string text = session.stream_flush();
+    auto text = session.stream_flush();
     // Five transcribes total (4 windows + tail), each returning "w";
     // single-word texts never dedup (min_match=2) so they space-join.
     CHECK(text == "w w w w w");
@@ -317,17 +317,12 @@ static void test_stream_session_busy_retry() {
     auto r = cs.step(samples, 1.0, busy);
     CHECK(!r.has_value());          // busy: nothing emitted
     CHECK(cs.boundary() == 0);      // boundary unchanged (retry later)
-    // step made exactly two attempts: the finalize window + the live tail
-    // (tail >= min_ with partial_interval 0).
-    CHECK(call_count == 2);
+    CHECK(call_count == 1);
 
-    // flush retries the tail kMaxRetries (5) times, then drops it with the
-    // boundary still unchanged — the audio stays buffered for a later retry.
-    std::string text = cs.flush(samples, busy);
-    CHECK(text.empty());
+    auto text = cs.flush(samples, busy);
+    CHECK(!text.has_value());
     CHECK(cs.boundary() == 0);
-    // 1 finalize attempt + 5 tail retries.
-    CHECK(call_count == 2 + 1 + 5);
+    CHECK(call_count == 1 + 5);
 
     // End-to-end through StreamSession: busy transcriber → no emission, and
     // the buffered audio is neither trimmed nor lost.
@@ -339,9 +334,57 @@ static void test_stream_session_busy_retry() {
     CHECK(!rs.has_value());
     CHECK(session.buffered_seconds() == 1.5);
     CHECK(session.live_seconds() == 1.5);
-    std::string fs = session.stream_flush();
-    CHECK(fs.empty());
+    auto fs = session.stream_flush();
+    CHECK(!fs.has_value());
     CHECK(session.buffered_seconds() == 1.5);
+    session.set_transcribe_fn([](const float*, int64_t n) -> std::optional<std::string> {
+        CHECK(n <= 16000);
+        return "retained audio";
+    });
+    CHECK(session.stream_flush() == "retained audio");
+    CHECK(session.buffered_seconds() == 1.5);
+}
+
+static void test_bounded_retry_recovery() {
+    for (bool flush : {false, true}) {
+        ChunkStreamer cs(1, 12, 2, 5, 0);
+        std::vector<float> samples(30);
+        for (int i = 0; i < 30; ++i) samples[i] = static_cast<float>(i);
+        std::vector<std::pair<int, int>> calls;
+        TranscribeFn tx = [&](const float* data, int64_t n) -> std::optional<std::string> {
+            calls.emplace_back(static_cast<int>(*data), static_cast<int>(n));
+            return calls.size() == 1 ? std::nullopt
+                                    : std::optional<std::string>("hello world");
+        };
+        if (flush) {
+            CHECK(cs.flush(samples, tx) == "hello world");
+            CHECK(cs.boundary() == 30);
+        } else {
+            CHECK(!cs.step(samples, 1, tx).has_value());
+            CHECK(calls.size() == 1);
+            CHECK(cs.step(samples, 2, tx) == "hello world");
+        }
+        const std::vector<std::pair<int, int>> expected = {{0, 12}, {0, 12}, {10, 12}, {20, 10}};
+        CHECK(calls == expected);
+    }
+
+    ChunkStreamer cs(1, 12, 2, 5, 0);
+    std::vector<float> samples(30);
+    for (int i = 0; i < 30; ++i) samples[i] = static_cast<float>(i);
+    int first_window_calls = 0;
+    bool busy = true;
+    TranscribeFn tx = [&](const float* data, int64_t n) -> std::optional<std::string> {
+        CHECK(n <= 12);
+        if (*data == 0) ++first_window_calls;
+        if (busy && *data == 10) return std::nullopt;
+        return "hello world";
+    };
+    CHECK(!cs.flush(samples, tx).has_value());
+    CHECK(cs.boundary() == 10);
+    busy = false;
+    CHECK(cs.flush(samples, tx) == "hello world");
+    CHECK(first_window_calls == 1);
+    CHECK(cs.boundary() == 30);
 }
 
 // ---- main -----------------------------------------------------------------
@@ -358,6 +401,7 @@ int main() {
     test_chunk_streamer_rebase();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
+    test_bounded_retry_recovery();
     test_model_mapping();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);

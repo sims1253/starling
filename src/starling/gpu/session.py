@@ -1,47 +1,11 @@
-"""flock-based cross-process GPU lock with native-child awareness (Task 1).
+"""Cross-process GPU isolation using an inherited POSIX flock descriptor.
 
-The previous lock (``starling.parakeet.gpu_lock``) used an ``O_CREAT|O_EXCL``
-file keyed by the ``CUDA_VISIBLE_DEVICES`` string and recorded only the *Python
-parent* PID. Two hazards followed:
+The lock survives a parent's exit while a native child still holds its inherited
+FD. Closing the last FD releases it; token timestamps are observability only.
+Use CUDA GPU UUIDs for unambiguous device selection on multi-GPU hosts.
 
-1. **Orphaned native children.** Starling's benchmark engines spawn native GPU
-   processes (``CrispASR``/``ParakeetCpp``/``GgmlParakeet`` — see
-   ``benchmarks/engines.py``). When the Python parent died, the old lock was
-   released while the native child still held VRAM, so a second benchmark would
-   start on a contended GPU and the two corrupted each other's numbers.
-2. **Keying by ``CUDA_VISIBLE_DEVICES``.** ``CVD=0`` and unset on a single-GPU
-   box refer to the same device but produced *different* lock files.
-
-This module fixes both:
-
-* Mutual exclusion is a POSIX ``fcntl.flock(LOCK_EX)`` on
-  ``<dir>/starling-gpu-<key>.flock``. ``flock`` is associated with the *open
-  file description*, so it is held as long as ANY process holds an fd on it —
-  and it is released **automatically on process death / fd close** (no stale
-  lock files to steal).
-* The flock fd is opened *inheritable* (``os.set_inheritable(True)``) and passed
-  to native children via :meth:`GpuSession.spawn` (``pass_fds``). A native child
-  therefore keeps the lock held for its whole lifetime even if the Python parent
-  is SIGKILLed — closing hazard #1.
-* The lock key is the **GPU UUID** actually visible (``nvidia-smi``), so every
-  spelling of "this GPU" (``CVD=0`` / unset / ``CVD=0,1`` on a one-GPU host)
-  maps to one file — closing hazard #2. Multi-GPU visibility fails closed until
-  per-device ordered lock acquisition is implemented, preventing partial-set
-  overlap from silently corrupting measurements.
-
-A v2 JSON token is written into the flock file for observability. The kernel
-flock is authoritative; stale metadata is never used to kill a holder because
-an inherited native child may remain valid after its Python parent exits.
-
-This module is **stdlib-only** (no ``starling`` package import, no torch) so it
-can be loaded directly by ``importlib.util.spec_from_file_location`` in
-subprocess holders, keeping the test suite hermetic and GPU-free.
-
-Environment knobs:
-* ``STARLING_GPU_LOCK_DISABLE=1`` — make every session a no-op (hermetic opt-out).
-* ``STARLING_GPU_LOCK_DIR``       — directory for the ``.flock`` files.
-* ``STARLING_GPU_LOCK_FORCE=1``   — retained compatibility knob; takeover is
-  intentionally refused unless a future design can prove the holder is dead.
+STARLING_GPU_LOCK_DISABLE=1 explicitly disables isolation.
+STARLING_GPU_LOCK_DIR overrides the directory containing lock files.
 """
 
 from __future__ import annotations
@@ -52,7 +16,6 @@ except ImportError:  # native Windows: import remains safe; acquire fails closed
     fcntl: types.ModuleType | None = None  # type: ignore[assignment]
 import json
 import os
-import signal
 import socket
 import subprocess
 import tempfile
@@ -60,9 +23,7 @@ import threading
 import time
 import types
 import uuid as _uuid
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
 
 from typing_extensions import Self
 
@@ -71,11 +32,6 @@ TOKEN_VERSION = 2
 TOKEN_SCHEMA = "starling.gpu.session"
 
 HEARTBEAT_SEC = 5.0  # how often an in-process holder refreshes observability
-
-# A previously-installed signal handler as returned by ``signal.getsignal``: a
-# callable taking ``(signum, frame)``, the ``SIG_DFL``/``SIG_IGN`` integers, or
-# ``None`` (no handler installed yet).
-_SignalHandler = Callable[[int, Any], Any] | int | None
 
 _QUERY_CACHE: list[str] | None = None
 
@@ -117,68 +73,56 @@ def _query_gpu_uuids() -> list[str]:
     return list(uuids)
 
 
-def _parse_cvd(cvd: str | None) -> list[int] | None:
-    """Parse ``CUDA_VISIBLE_DEVICES`` into a sorted list of indices.
-
-    Returns ``None`` for unset/empty ("all GPUs"). Supports comma lists and
-    ``M-N`` ranges (the CUDA format). Invalid entries are dropped.
-    """
-    if cvd is None:
-        return None
-    cvd = cvd.strip()
-    if cvd == "":
-        return None
-    indices: list[int] = []
-    for part in cvd.split(","):
-        part = part.strip()
-        if part == "":
-            continue
-        if "-" in part:  # range "M-N"
-            lo, _, hi = part.partition("-")
-            try:
-                lo_i, hi_i = int(lo), int(hi)
-            except ValueError:
-                continue
-            indices.extend(range(lo_i, hi_i + 1))
-        else:
-            try:
-                indices.append(int(part))
-            except ValueError:
-                # CUDA also allows UUID-as-CVD; we only support integer indices
-                # here (UUIDs come from nvidia-smi directly).
-                continue
-    return sorted(set(indices)) if indices else None
-
-
 def _resolve_lock_key(
     cvd: str | None = None,
     uuids: list[str] | None = None,
 ) -> str:
-    """Collapse the visible-device set into one stable lock key.
+    """Resolve CUDA visibility without guessing CUDA's device ordering.
 
-    On a one-GPU box, ``CVD=0`` / unset / ``CVD=0,1`` all select that single
-    GPU and so collapse to the same key. With no nvidia-smi, we fall back to a
-    sanitized ``CVD`` string (preserving the old behaviour) so the lock still
-    works on a GPU-less/CPU machine.
+    CUDA ordinals can differ from nvidia-smi ordering. On multi-GPU hosts,
+    require UUID selection until runtime-based ordinal discovery is available.
+    Invalid indices terminate visibility, as specified by CUDA.
     """
     if cvd is None:
         cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if uuids is None:
         uuids = _query_gpu_uuids()
-    indices = _parse_cvd(cvd)
     if not uuids:
-        # No GPU discovery: key on the (sanitized) CVD string so CPU-only boxes
-        # still get a deterministic, contention-aware lock.
-        raw = (cvd if cvd is not None and cvd != "" else "default")
-        return raw.replace("/", "_").replace(",", "-").replace(":", "_")
-    if indices is None:
-        chosen = list(uuids)
+        raise RuntimeError(
+            "Cannot discover GPU UUIDs with nvidia-smi; supply an explicit "
+            "GpuSession uuid/--uuid shared by all users of this device, or "
+            "set STARLING_GPU_LOCK_DISABLE=1 with external serialization."
+        )
+    chosen = []
+    if cvd is None:
+        chosen = uuids
     else:
-        chosen = [uuids[i] for i in indices if 0 <= i < len(uuids)]
-        if not chosen:  # every index was out of range -> treat as "all"
-            chosen = list(uuids)
-    # de-dup + sort -> stable, order-independent key
-    return ",".join(sorted(set(chosen)))
+        for part in cvd.split(","):
+            if part.startswith("GPU-"):
+                matches = [u for u in uuids if u.startswith(part)]
+                if len(matches) != 1:
+                    raise RuntimeError(f"Unknown or ambiguous CUDA GPU UUID: {part!r}")
+                device = matches[0]
+            elif part.isascii() and part.isdigit():
+                index = int(part)
+                if index >= len(uuids):
+                    break
+                if len(uuids) > 1:
+                    raise RuntimeError(
+                        "CUDA ordinal order is ambiguous on multi-GPU hosts; "
+                        "set CUDA_VISIBLE_DEVICES to a GPU UUID from nvidia-smi."
+                    )
+                device = uuids[index]
+            elif part == "" or part == "-1":
+                break
+            else:
+                raise RuntimeError(f"Unsupported CUDA_VISIBLE_DEVICES entry: {part!r}")
+            if device in chosen:
+                raise RuntimeError("CUDA_VISIBLE_DEVICES selects the same GPU twice")
+            chosen.append(device)
+    if not chosen:
+        raise RuntimeError("CUDA_VISIBLE_DEVICES selects no GPU")
+    return ",".join(sorted(chosen))
 
 
 def _sanitize(key: str) -> str:
@@ -243,9 +187,7 @@ class GpuSession:
         wait: bool = True,
         poll_sec: float = 0.2,
         max_wait_sec: float = 600.0,
-        install_signal_handlers: bool = False,
         heartbeat: bool = True,
-        force: bool | None = None,
     ) -> None:
         self.session = session
         self.model = model
@@ -256,13 +198,7 @@ class GpuSession:
         self.wait = wait
         self.poll_sec = poll_sec
         self.max_wait_sec = max_wait_sec
-        self._want_signal_handlers = install_signal_handlers
         self._want_heartbeat = heartbeat
-        # Retained as an accepted compatibility argument. Automatic takeover is
-        # deliberately unsupported because stale metadata cannot prove that an
-        # inherited native child has stopped valid GPU work.
-        self.force = bool(force or os.environ.get("STARLING_GPU_LOCK_FORCE", "") == "1")
-
         self._fd: int | None = None
         self._path: Path | None = None
         self._key: str | None = None
@@ -274,7 +210,6 @@ class GpuSession:
         self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
         self._token_lock = threading.Lock()
-        self._old_handlers: dict[int, _SignalHandler] = {}
 
     # -- introspection -----------------------------------------------------
     def read_token(self) -> dict | None:
@@ -334,8 +269,15 @@ class GpuSession:
         if inherited_fd is not None and inherited_key == key:
             try:
                 self._fd = os.dup(int(inherited_fd))
-            except (OSError, ValueError):
-                self._fd = None
+                if not os.path.samestat(os.fstat(self._fd), path.stat()):
+                    raise ValueError("inherited GPU descriptor names a different file")
+                # Environment metadata may outlive its descriptor. Verify both
+                # file identity and ownership before treating it as our lock.
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, ValueError, OverflowError):
+                if self._fd is not None:
+                    os.close(self._fd)
+                    self._fd = None
             if self._fd is not None:
                 self._path = path
                 # This duplicate is intentionally only a nested reference. The
@@ -360,8 +302,6 @@ class GpuSession:
             self._write_token()
             if self._want_heartbeat:
                 self._start_heartbeat()
-            if self._want_signal_handlers:
-                self._install_signal_handlers()
         except BaseException:
             self.release()
             raise
@@ -375,7 +315,6 @@ class GpuSession:
             self._fd = None
             return
         self._stop_heartbeat()
-        self._restore_signal_handlers()
         # Do NOT issue LOCK_UN: spawned children share this open-file
         # description, and an explicit unlock would release their lock too.
         # Closing our fd drops only our reference; flock releases naturally
@@ -395,8 +334,11 @@ class GpuSession:
         The child keeps the lock held for its whole lifetime even if this
         process is killed. ``pass_fds`` is merged with any caller-supplied fds.
         """
-        if not self._acquired or self._fd is None:
+        if not self._acquired:
             raise RuntimeError("GpuSession.spawn before acquire()")
+        if self._disabled:
+            return subprocess.Popen(args, **popen_kwargs)
+        assert self._fd is not None
         env = dict(popen_kwargs.pop("env", os.environ))
         env["STARLING_GPU_LOCK_FD"] = str(self._fd)
         env["STARLING_GPU_LOCK_KEY"] = self._key or ""
@@ -487,37 +429,3 @@ class GpuSession:
         self._hb_thread = None
         if t is not None and t.is_alive():
             t.join(timeout=2 * HEARTBEAT_SEC)
-
-    def _install_signal_handlers(self) -> None:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                prev = signal.getsignal(sig)
-            except (ValueError, OSError):
-                continue
-            self._old_handlers[sig] = prev
-            try:
-                signal.signal(sig, self._make_handler(sig))
-            except (ValueError, OSError):
-                # not in main thread / unsupported -> skip gracefully
-                pass
-
-    def _make_handler(self, sig):
-        def handler(signum, frame):
-            try:
-                self.release()
-            finally:
-                prev = self._old_handlers.get(signum)
-                if callable(prev):
-                    cast(Callable[[int, Any], Any], prev)(signum, frame)
-                else:
-                    signal.signal(signum, signal.SIG_DFL)
-                    os.kill(os.getpid(), signum)
-        return handler
-
-    def _restore_signal_handlers(self) -> None:
-        for sig, prev in list(self._old_handlers.items()):
-            try:
-                signal.signal(sig, prev)
-            except (ValueError, OSError, TypeError):
-                pass
-        self._old_handlers.clear()
