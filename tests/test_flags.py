@@ -203,6 +203,7 @@ def test_flags_context_restores_on_exception():
 # --------------------------------------------------------------------------- #
 # pipeline wiring: multistep_graph selects the right decoder
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_pipeline_multistep_graph_wiring():
     """multistep_graph=True -> MultiStepLLMMega; False -> FusedLLMMega."""
     from starling.granite.pipeline import MegaPipeline
@@ -229,6 +230,7 @@ def test_pipeline_multistep_graph_wiring():
 # --------------------------------------------------------------------------- #
 # end-to-end: default flags -> byte-exact golden match
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_default_flags_end_to_end_byte_exact():
     """A default-flags MegaPipeline (multistep on) must reproduce the golden decode.
 

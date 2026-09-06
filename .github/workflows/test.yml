@@ -71,7 +71,8 @@ jobs:
           uv run python -m pytest -q
           tests/test_server_routing.py tests/test_server_robustness.py
           tests/test_server_lifecycle.py tests/test_stream_chunk.py
-          tests/test_s1_config.py tests/test_autotune.py
+          tests/test_s1_config.py tests/test_autotune.py tests/test_flags.py
+          tests/test_fp4_quantization.py
           tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
           tests/test_ggml_patches.py
 

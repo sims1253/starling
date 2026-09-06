@@ -156,17 +156,16 @@ def test_concurrent_runs_wait_for_lock_and_finish_idempotently(project):
             child.wait(timeout=5)
 
 
-def test_stale_lock_fails_after_bounded_wait(project, tmp_path):
+def test_stale_lock_fails_after_bounded_wait(project):
     repo, _ = series(project, [{"a": "a patched\n"}])
     lock = repo / ".git" / "starling-patches.lock"
     lock.mkdir()
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    sleep = fake_bin / "sleep"
-    sleep.write_text("#!/usr/bin/env bash\nexit 0\n")
-    sleep.chmod(0o755)
-    env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ["PATH"])
-    result = run(project, env=env)
+    # A shell function avoids Windows PATH conversion and executable lookup.
+    result = subprocess.run(
+        [BASH, "-c", 'sleep() { :; }; source "$1"', "patch-test",
+         (project / "scripts" / SCRIPT.name).as_posix()],
+        capture_output=True, text=True, timeout=10,
+    )
     assert result.returncode != 0
     assert "if no patch process is running" in result.stderr
     assert lock.exists()

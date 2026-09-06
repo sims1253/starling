@@ -46,10 +46,13 @@ without changes. Apply patches in filename order: 0008 depends on 0002, and
 0010 depends on 0009. Successful application alone does not establish runtime
 parity; CUDA and other accelerator changes require tests on those backends.
 
-Upgrade checks on Linux: the CPU engine, C API library, and native server build;
-the native unit tests and 45 HTTP/WebSocket contract checks pass. Parakeet
-Q8_0 reproduces the short fixture transcript. CUDA compilation and runtime
-parity remain unverified on this machine, which has no CUDA toolkit or GPU.
+Upgrade checks on Linux: CPU and Vulkan engines, C API libraries, and native
+servers build. Native unit tests and 45 HTTP/WebSocket contract checks pass.
+Vulkan BF16 GEMV, batched/cache-view matmul, op, and mask probes pass on RADV
+RENOIR. Parakeet Q8_0 reproduces the short fixture transcript on two consecutive
+calls on both CPU and Vulkan; CPU also passes with llamafile enabled. CUDA
+compilation and runtime parity remain unverified on this machine, which has
+no CUDA toolkit or GPU.
 
 ## Model registry (adding an engine)
 
