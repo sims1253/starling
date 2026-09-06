@@ -115,11 +115,9 @@ jobs:
   # A 1–2 s clip on a 0.6B q8_0 CPU decode is a correctness test, not a perf
   # test — the CPU-safe-CI constraint is respected.
   #
-  # Keep this opt-in until a downloadable GGUF and immutable revision are
-  # configured below. The earlier CPU inference hang no longer reproduces
-  # with the updated ggml pin: local Parakeet Q8 HTTP/WS smoke tests pass.
-  # Enable explicitly with workflow_dispatch after setting the fixture pin;
-  # normal PRs still exercise the placeholder-model transport contract.
+  # Run explicitly with workflow_dispatch. The published Parakeet Q8 fixture
+  # is pinned below; normal PRs exercise the placeholder-model transport
+  # contract without downloading model weights.
   # ---------------------------------------------------------------------------
   e2e-real-model:
     needs: build-cpu
@@ -127,11 +125,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
-      HF_REPO: starling/parakeet-tdt-0.6b-v3-gguf
+      HF_REPO: scholzmx/parakeet-tdt-0.6b-v3-gguf
       GGUF_FILE: parakeet-tdt-0.6b-v3-q8_0.gguf
-      # PIN ME: revision of HF_REPO to pin the cache + download against.
-      # Placeholder "main" until the repo publishes (see comment above).
-      GGUF_REV: main
+      GGUF_REV: 96402b32bd374742aa1da3c66af30aa64cea3fdb
       # Pinned sample clip (11.3 s, 16 kHz mono PCM16) + its expected
       # parakeet-tdt transcript (captured with tdt-0.6b-v3-q8_0).
       AUDIO_URL: https://raw.githubusercontent.com/ggml-org/whisper.cpp/1fe009caeda75f69bc864d6370b10674e45a92bd/samples/jfk.wav

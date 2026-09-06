@@ -1,7 +1,9 @@
-# Starling GGUF Model Files
+# GGUF model files
 
-Pre-converted GGUF files for the native `starling-serve` binary. One repo per
-model, mirroring the `models/` directory layout in the starling repository.
+The native `starling-serve` binary loads GGUF model files. The published
+Parakeet files are at
+[`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf).
+See [native serving](native-serving.md) for build and conversion instructions.
 
 ## Naming convention
 
@@ -9,10 +11,15 @@ model, mirroring the `models/` directory layout in the starling repository.
 <model-slug>-<quant>.gguf
 ```
 
+These naming examples are not a download catalog. Sizes are approximate and
+vary with conversion settings; check the release files for available names
+and sizes. A `bf16-exact` filename does not guarantee identical output on
+every backend or input.
+
 | File | Model | Quantization | Size (approx) |
 |------|-------|-------------|----------------|
 | `parakeet-tdt-0.6b-v3-bf16-exact.gguf` | nvidia/parakeet-tdt-0.6b-v3 | bf16-exact | ~1.2 GB |
-| `parakeet-tdt-0.6b-v3-q8_0.gguf` | nvidia/parakeet-tdt-0.6b-v3 | q8_0 | ~0.6 GB |
+| `parakeet-tdt-0.6b-v3-q8_0.gguf` | nvidia/parakeet-tdt-0.6b-v3 | q8_0 | ~0.91 GB |
 | `moss-transcribe-preview-2b-bf16-exact.gguf` | OpenMOSS-Team/MOSS-Transcribe-preview-2B | bf16-exact | ~4.5 GB |
 | `ark-asr-3b-bf16-exact.gguf` | AutoArk-AI/ARK-ASR-3B | bf16-exact | ~7.0 GB |
 | `ark-asr-3b-q8_0.gguf` | AutoArk-AI/ARK-ASR-3B | q8_0 | ~4.3 GB |
@@ -22,24 +29,24 @@ model, mirroring the `models/` directory layout in the starling repository.
 | `qwen3-asr-1.7b-bf16-exact.gguf` | Qwen/Qwen3-ASR-1.7B-hf | bf16-exact | ~4.1 GB |
 | `audex-2b-bf16-exact.gguf` | nvidia/Nemotron-Labs-Audex-2B | bf16-exact | ~5.8 GB |
 
-## Quantization strategy
+## Parakeet quantization results
 
-- **q4_k_m** (calibrated, recommended): no measurable WER loss vs f32 on
-  clean/noisy English, 300-clip English/German, and 48-clip-per-language
-  evaluations across the other languages — at 28% of the f32 size.
-- **q8_0**: conservative default for byte-parity worriers; also lossless in
-  every measurement.
-- **q2_k / iq2_xxs+shrink16**: size-constrained tiers; see
-  `docs/quantization.md` for the measured multilingual trade-offs
-  (iq2_xxs is an English-first trade, q2_k is the even option).
-- All calibrated quants share one importance matrix collected over 24 of
-  the 25 supported languages (FLEURS train, 48 clips/language); the matrix
-  itself ships in the repo for downstream re-quantization and recipes.
-- **bf16-exact**: Byte-exact parity with the Python reference. For users with
-  VRAM to spare who want maximum accuracy.
+The results here apply to Parakeet TDT 0.6B v3. On the recorded 300-clip
+English and German evaluations, q4_k_m uses 704 MB (28% of F32) and differs
+from F32 by at most 0.07 WER percentage points. These samples do not establish
+lossless quantization across all languages or recordings.
 
-Released at [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf)
-(move to the `starling` org once it exists).
+Q8_0 matched the F32 WER in the recorded clean and noisy English tests.
+Q2_K and IQ2_XXS with `shrink16` save more memory but can lose accuracy,
+especially outside English. The calibrated Parakeet variants use an
+importance matrix collected from 24 of the model's 25 supported languages,
+with 48 FLEURS training clips per language. The release includes the matrix
+for custom quantization recipes.
+
+See [quantization results](quantization.md) for per-language measurements,
+confidence intervals, calibration details, and lower-bit tradeoffs.
+Compare a candidate file on your own audio before choosing it. Neither a
+quantization label nor a `bf16-exact` filename establishes maximum accuracy.
 
 ## Usage with starling-serve
 
@@ -58,18 +65,22 @@ starling-serve --model parakeet --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf -
 
 ## Verification
 
-Every converted file records `starling.format_version` (currently `1`) and
-`starling.numeric_profile` metadata. On load, `starling-serve` validates these
-fields when they are present:
+Starling converters write `starling.format_version` and
+`starling.numeric_profile` metadata. The Parakeet loader does not validate
+these fields. The other model loaders check them when present and reject
+unsupported values:
 
-- `starling.numeric_profile` — accepted values: `bf16_exact`, `f16`
-  (parakeet, moss, ark, higgs); `mixed_f32_bf16_exact`, `bf16_exact`, `f16`
-  (hojo); `bf16_exact` (granite, qwen3, s1); `bf16_exact`, `quantized`
-  (audex).
-- `starling.format_version` — must be `1`.
+| Model | Accepted `starling.numeric_profile` values |
+| --- | --- |
+| MOSS, ARK, Higgs | `bf16_exact`, `f16` |
+| Hojo | `mixed_f32_bf16_exact`, `bf16_exact`, `f16` |
+| Granite, Qwen3, S1 | `bf16_exact` |
+| Audex | `bf16_exact`, `quantized` |
 
-The parakeet loader does not validate these fields; the other model loaders
-reject unsupported values at load time with a clear error.
+For these loaders, `starling.format_version` must be `1` when present.
+These checks establish format compatibility, not transcript accuracy or
+output parity. Use the fixture and corpus tests described in
+[benchmarks](benchmarks.md) to measure output differences.
 
-`starling-serve --abi-version` prints the binary's compiled-in GGML C-API ABI
-version. It describes the binary only — it does not inspect the GGUF file.
+`starling-serve --abi-version` prints the binary's compiled-in GGML C API ABI
+version. It does not inspect a GGUF file.

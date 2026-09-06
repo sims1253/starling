@@ -1,21 +1,21 @@
-# Native Serving Layer: starling-serve
+# Native server: starling-serve
 
-A self-contained native binary that wraps `libstarling_ggml` behind the audio
-endpoints used by the Python `starling.server`. Client-visible differences
-are listed under "API contract":
+`starling-serve` runs GGUF models behind an HTTP and WebSocket API. It uses
+`libstarling_ggml` and does not require Python, PyTorch, Transformers, or Triton.
+GPU builds still need the platform's driver and runtime libraries.
 
-```typescript
-// Before (Python subprocess):
-spawn("python", ["-m", "starling.server", "--model", slug, ...])
-
-// After (native binary):
-spawn("starling-serve", ["--model", slug, "--gguf", ggufPath, "--port", "8181"])
-```
-
-No Python, no torch, no transformers, no triton — just a single static binary
-per platform.
+Start with [build](#build) and [usage](#usage), or see
+[release artifacts](#release-artifacts) for binary prerequisites. The
+[API contract](#api-contract) covers differences from `starling.server`.
 
 ## Build
+
+Run these commands from a checkout with submodules initialized. You need
+CMake 3.18 or later, a C++17 compiler, Git, and Bash (Git Bash on Windows).
+CMake validates and applies the ggml patches during configuration.
+GPU builds also need the matching development toolkit: CUDA, ROCm, the Vulkan
+SDK, or Apple's Metal tools. Choose one backend below and start with a fresh
+`build` directory. If you keep several builds, give each a separate directory.
 
 ```bash
 # CPU-only (development / smoke tests):
@@ -42,7 +42,7 @@ cmake --build build -j --target starling-serve
 ```
 
 On Windows, add `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` to statically link
-the CRT (no VC++ redistributable dependency).
+the CRT across the build. This does not bundle GPU runtime libraries.
 
 ## Usage
 
@@ -54,6 +54,11 @@ starling-serve --abi-version
 # Serve a model:
 starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 ```
+
+The built executable is `build/starling-serve` (`build/Release/starling-serve.exe`
+with a multi-configuration Windows generator). Replace `starling-serve` in the
+examples with that path, or add its directory to `PATH`. The optional `--warmup`
+flag runs a warmup at startup; omit the square brackets when using it.
 
 ### CLI flags
 
@@ -72,8 +77,8 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 | `--min-chunk-seconds <s>` | `5.0` | Min audio before first partial |
 | `--partial-interval-seconds <s>` | `3.0` | Min gap between partials |
 | `--max-stream-seconds <s>` | `60.0` | Per-WS-connection LIVE buffer cap in s (0 = unlimited); see `WS /stream` |
-| `--version` | — | Print version + ABI + backend, exit |
-| `--abi-version` | — | Print ABI version integer, exit |
+| `--version` | n/a | Print version + ABI + backend, exit |
+| `--abi-version` | n/a | Print ABI version integer, exit |
 
 ## API contract
 
@@ -89,7 +94,7 @@ for these differences:
   also supports `parakeet_unified` and `cohere`. Native `s1` exposes the
   additional `POST /normalize` text endpoint.
 - **Request ids**: `X-Request-Id` values starting with `#` are rejected
-  with `400` — the prefix is reserved for the server's internal queue
+  with `400`: the prefix is reserved for the server's internal queue
   tickets. The Python server accepts them.
 - **Phase names**: `unloaded → loading → ready → busy` here; the Python
   server reports `loading_weights` and `warming_up` during startup.
@@ -106,12 +111,12 @@ Phase drives the UI: `unloaded → loading → ready → busy`.
 
 ### `POST /transcribe` / `POST /inference`
 
-Accepts raw WAV bytes (or multipart/form-data). **Audio must be 16 kHz** —
-there is no C++ resampler, so WAVs at other sample rates are rejected with
+Accepts raw WAV bytes (or multipart/form-data). **Audio must be 16 kHz**. The native server has no resampler, so WAVs at other
+sample rates are rejected with
 `400` and a `sample rate mismatch` error (the Python server resamples via
 scipy instead). WAV parsing is bounded by the actual payload size: a header
 whose claimed frame count exceeds what the payload can hold (crafted or
-truncated) is rejected with `400` and a `malformed audio payload` error — it
+truncated) is rejected with `400` and a `malformed audio payload` error: it
 is never reinterpreted as raw PCM. Payloads without RIFF/WAVE magic are
 treated as raw mono PCM16 @ 16 kHz little-endian. Returns:
 
@@ -138,8 +143,8 @@ Text-in/text-out path for the normalizer. JSON body:
 ```
 
 `transcript` is required; the control fields are optional (defaults
-`semi-formal`/`prose`/`general`) and must come from the trained sets —
-unknown values are rejected with `400` (the card warns off-spec controls make
+`semi-formal`/`prose`/`general`) and must come from the trained sets. Unknown
+values are rejected with `400` (the card warns off-spec controls make
 the model hallucinate). Prompts over ~1,000 tokens (the trained input max)
 are rejected with `400`; chunk long transcripts at sentence boundaries
 first. Returns:
@@ -148,7 +153,7 @@ first. Returns:
 {"text":"So I need to send the report by Friday.","request_id":"..."}
 ```
 
-Audio models answer `400` ("model has no text path") — use `/transcribe`.
+Audio models answer `400` ("model has no text path"): use `/transcribe`.
 
 ### `DELETE /inference/<id>`
 
@@ -159,11 +164,11 @@ Cancels a queued or in-flight request by request ID.
 Real-time streaming dictation. Send binary frames (raw PCM16 or WAV) and
 receive JSON messages:
 
-- `{"type":"partial","text":"...","start_s":0.0,"end_s":12.5}` — growing partial
-- `{"type":"final","text":"...","segments":[...],"duration_s":12.5}` — on commit
-- `{"type":"error","message":"..."}` — on error
-- `{"type":"pong"}` — in response to `{"type":"ping"}`
-- `{"type":"reset_ack"}` — in response to `{"type":"reset"}`
+- `{"type":"partial","text":"...","start_s":0.0,"end_s":12.5}`: growing partial
+- `{"type":"final","text":"...","segments":[...],"duration_s":12.5}`: on commit
+- `{"type":"error","message":"..."}`: on error
+- `{"type":"pong"}`: in response to `{"type":"ping"}`
+- `{"type":"reset_ack"}`: in response to `{"type":"reset"}`
 
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
 would push the session's live audio buffer past the cap is refused. The
@@ -185,12 +190,13 @@ cap. It only fires when the un-finalized buffer itself grows past the limit
 transcription never succeeds).
 
 Control frames (JSON text):
-- `{"type":"commit"}` — finalize all buffered audio. Returns `final` on success;
+
+- `{"type":"commit"}`: finalize all buffered audio. Returns `final` on success;
   if bounded retries stay busy, returns `{"type":"error","message":"server busy"}`
   and retains the audio. Retry `commit` after a delay.
-- `{"type":"reset"}` — discard buffer without finalizing (returns reset_ack;
+- `{"type":"reset"}`: discard buffer without finalizing (returns reset_ack;
   also re-enables audio after a buffer-cap error)
-- `{"type":"ping"}` — heartbeat (returns pong)
+- `{"type":"ping"}`: heartbeat (returns pong)
 
 ## Architecture
 
@@ -210,26 +216,29 @@ neighboring windows can still omit or duplicate words.
 
 ## Pre-converted GGUF files
 
-Hosted on HuggingFace, one repo per model:
+Download Parakeet weights from
+[`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf).
+The repository includes Q8_0, K-quants, IQ2_XXS, and the importance matrix.
+With the Hugging Face CLI installed:
 
-| Model | HF Repo | Quantizations |
-|-------|---------|---------------|
-| parakeet-tdt-0.6b-v3 | `starling/parakeet-tdt-0.6b-v3-gguf` | bf16-exact, q8_0 |
-| moss-transcribe-preview-2b | `starling/moss-transcribe-preview-2b-gguf` | bf16-exact |
-| ark-asr-3b | `starling/ark-asr-3b-gguf` | bf16-exact, q8_0 |
-| higgs-audio-v3-stt | `starling/higgs-audio-v3-stt-gguf` | bf16-exact |
-| hojo-asr-v1 | `starling/hojo-asr-v1-gguf` | bf16-exact |
-| granite-speech-4.1-2b | `starling/granite-speech-4.1-2b-gguf` | bf16-exact |
-| qwen3-asr-1.7b | `starling/qwen3-asr-1.7b-gguf` | bf16-exact |
-| nemotron-labs-audex-2b | `starling/nemotron-labs-audex-2b-gguf` | bf16-exact |
+```bash
+hf download scholzmx/parakeet-tdt-0.6b-v3-gguf \
+  parakeet-tdt-0.6b-v3-q8_0.gguf --local-dir ./models
+starling-serve --model parakeet \
+  --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf --port 8181
+```
 
-Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0.gguf`).
+The planned `starling/*-gguf` repositories are not public downloads.
+For other models, use the converters below with the original model weights.
+The [GGUF file guide](hf-gguf-readme.md) describes filenames and metadata.
 
-### Quantization strategy (recommendation)
+### Quantization
 
-- **q8_0** as the default download (halves VRAM with negligible WER delta).
-- **bf16-exact** as an opt-in upgrade for users who want byte-exact parity with
-  the Python reference and have VRAM to spare.
+Choose `q8_0` for smaller weights where it is available, or `bf16-exact` for
+reference comparisons. Exact transcript parity depends on the model, backend,
+and input; the filename alone does not guarantee it. See the
+[engine parity notes](ggml-engine.md#correctness-contract) and
+[quantization guide](quantization.md) for measured results.
 
 ### GGUF converters
 
@@ -247,32 +256,38 @@ Naming convention: `<model-slug>-<quant>.gguf` (e.g., `parakeet-tdt-0.6b-v3-q8_0
 
 ## Release artifacts
 
-GitHub release publishes six static binaries + checksums:
+The release workflow packages six executables with SHA-256 checksums in
+`.tar.gz` archives on Linux/macOS and `.zip` archives on Windows. It links
+Starling and ggml into the executable, but does not bundle accelerator runtime
+libraries. These are not fully static binaries.
+
+| Backend | Runtime prerequisites |
+| --- | --- |
+| CUDA | Compatible NVIDIA driver and CUDA runtime/cuBLAS libraries. The workflow builds with CUDA 13.3. |
+| ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow installs ROCm from its `latest` repository. |
+| Vulkan | Vulkan loader and a compatible GPU driver. |
+| Metal | Apple Silicon macOS with the system Metal frameworks. |
+
+The workflow runs startup checks on its build machines, where the development
+toolkits are already installed. Those checks do not establish that the archives
+run on a clean machine. Missing-runtime packaging is tracked in
+[issue #57](https://github.com/sims1253/starling/issues/57).
+
+Choose the executable for your operating system, CPU architecture, and GPU:
 
 | Artifact | Platform | Backend | Notes |
 |----------|----------|---------|-------|
 | `starling-serve-linux-cuda` | Linux x86_64 | CUDA | NVIDIA |
 | `starling-serve-linux-rocm` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
-| `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / ARM |
+| `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
 | `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
 | `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
 | `starling-serve-macos-metal` | macOS arm64 | Metal | Apple Silicon |
 
-### GPU detection
+### GPU selection
 
-Each build variant is compiled for a specific backend (CUDA, ROCm/HIP, Metal,
-Vulkan, or CPU). There is no runtime backend auto-selection: download the
-binary matching the detected platform and GPU. Explicit variant selection is
-more predictable than runtime auto-detection.
-
-## Open questions (resolved)
-
-1. **Quantization strategy**: Default download is q8_0 (halves VRAM, negligible
-   WER delta); bf16-exact is an opt-in upgrade.
-
-2. **GPU detection**: Resolved in favor of explicit variant selection — no
-   runtime backend auto-selection (see above).
-
-3. **Streaming buffer implementation**: Ported to C++ (lower latency, no per-chunk
-   HTTP round-trips). The `ChunkStreamer` is a faithful port of the Python
-   `stream_chunk.py`.
+Each release variant includes a specific GPU backend. Download the variant for
+your platform and GPU; the executable cannot add a backend that was not compiled
+in. Within the build, the runtime chooses the first GPU or integrated GPU.
+Set `STARLING_GGML_DEVICE` to a device name such as `CUDA0`, `Vulkan0`, or `Metal`
+to select it, or to `cpu` to force the CPU backend.

@@ -17,7 +17,7 @@ repo; set ``HF_TOKEN``). Later runs read the cache and need no network.
 Output:
   outputs/leaderboard.json           full structured results
   outputs/leaderboard.md             markdown tables
-  README <!-- BENCH:WER:START/END --> (with --update-readme)
+  docs/benchmarks.md <!-- BENCH:WER:START/END --> (with --update-readme)
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from engines import Engine, SkipCell, build_engines  # noqa: E402
 from wer_leaderboard import score_dataset  # noqa: E402
 
 OUTPUTS = REPO_ROOT / "outputs"
-README = REPO_ROOT / "README.md"
+BENCHMARK_DOC = REPO_ROOT / "docs" / "benchmarks.md"
 START, END = "<!-- BENCH:WER:START -->", "<!-- BENCH:WER:END -->"
 
 MODEL_LABELS = {
@@ -298,7 +298,7 @@ def _aggregate_duplicate_records(results: dict) -> dict:
 
 
 def splice_readme(md_body: str) -> bool:
-    text = README.read_text()
+    text = BENCHMARK_DOC.read_text()
     block = f"{START}\n{md_body}{END}"
     if START in text and END in text:
         pre = text[: text.index(START)]
@@ -313,7 +313,7 @@ def splice_readme(md_body: str) -> bool:
         else:
             new = text.rstrip() + "\n\n" + block + "\n"
     if new != text:
-        README.write_text(new)
+        BENCHMARK_DOC.write_text(new)
         return True
     return False
 
@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--warmup", type=int, default=2,
                     help="untimed warmup runs (graph capture) on the first clip")
     ap.add_argument("--update-readme", action="store_true",
-                    help="splice the WER/RTFx tables into README.md")
+                    help="splice the WER/RTFx tables into docs/benchmarks.md")
     ap.add_argument("--from-json", nargs="*", default=None,
                     help="skip the run; rebuild tables from one or more JSON "
                          "files (merges records across them). With no args, "
@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         if args.update_readme:
             changed = splice_readme(md)
-            print(f"\n[leaderboard] README {'updated' if changed else 'unchanged'}")
+            print(f"\n[leaderboard] docs/benchmarks.md {'updated' if changed else 'unchanged'}")
         return 0
 
     token = os.environ.get("HF_TOKEN")
@@ -435,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update_readme:
         changed = splice_readme(md)
-        print(f"\n[leaderboard] README {'updated' if changed else 'unchanged'}")
+        print(f"\n[leaderboard] docs/benchmarks.md {'updated' if changed else 'unchanged'}")
     return 0
 
 

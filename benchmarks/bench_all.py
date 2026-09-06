@@ -4,10 +4,10 @@ One command sweeps every (model x engine x length x batch) cell of the grid on
 the SAME fixtures and the SAME ground-truth transcript, so RTFx and WER are
 directly comparable across engines. Writes a JSON dump and two markdown tables
 to ``outputs/``, and (with ``--update-readme``) splices the tables into
-``README.md`` between sentinel comments.
+``docs/benchmarks.md`` between sentinel comments.
 
   uv run python benchmarks/bench_all.py                  # run + print + JSON
-  uv run python benchmarks/bench_all.py --update-readme  # also refresh README
+  uv run python benchmarks/bench_all.py --update-readme  # also refresh benchmark docs
 
 Engines
 -------
@@ -58,7 +58,7 @@ from engines import Engine, SkipCell, build_engines  # noqa: E402
 from wer import REFERENCE_TRANSCRIPTS, cer_pct, wer_pct  # noqa: E402
 
 OUTPUTS = REPO_ROOT / "outputs"
-README = REPO_ROOT / "README.md"
+BENCHMARK_DOC = REPO_ROOT / "docs" / "benchmarks.md"
 START, END = "<!-- BENCH:START -->", "<!-- BENCH:END -->"
 
 MODEL_LABELS = {
@@ -388,7 +388,7 @@ class _EngineStub:
 
 def build_markdown(results: dict, engine_map: dict[str, list[Engine]], *,
                    lengths, batches) -> str:
-    """Build the latency/RTFx markdown for the README sentinel block.
+    """Build the latency/RTFx markdown for the benchmark sentinel block.
 
     Emits ONLY the latency/RTFx tables. The tiled-fixture WER is meaningless
     (one utterance repeated N times -- the models don't emit it back exactly N
@@ -410,15 +410,15 @@ def build_markdown(results: dict, engine_map: dict[str, list[Engine]], *,
 
 
 # ---------------------------------------------------------------------- #
-# README splice
+# Benchmark document splice
 # ---------------------------------------------------------------------- #
 def splice_readme(md_body: str) -> bool:
-    """Replace the sentinel-wrapped region in README.md with ``md_body``.
+    """Replace the sentinel-wrapped region in docs/benchmarks.md with ``md_body``.
 
     Returns True if the file changed. Adds the sentinels after the
     ``## Benchmark`` heading if absent.
     """
-    text = README.read_text()
+    text = BENCHMARK_DOC.read_text()
     block = f"{START}\n{md_body}{END}"
     if START in text and END in text:
         pre = text[: text.index(START)]
@@ -433,7 +433,7 @@ def splice_readme(md_body: str) -> bool:
     else:
         new = text.rstrip() + "\n\n## Benchmark\n\n" + block + "\n"
     if new != text:
-        README.write_text(new)
+        BENCHMARK_DOC.write_text(new)
         return True
     return False
 
@@ -468,11 +468,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reps", default=5, type=int, help="timed runs per cell")
     ap.add_argument("--warmup", default=2, type=int, help="untimed warmup runs")
     ap.add_argument("--update-readme", action="store_true",
-                    help="splice the tables into README.md (sentinel-wrapped)")
+                    help="splice the tables into docs/benchmarks.md (sentinel-wrapped)")
     ap.add_argument("--from-json", action="store_true",
-                    help="skip the run; rebuild tables + splice README from "
+                    help="skip the run; rebuild tables + splice benchmark docs from "
                          "outputs/bench_all.json (no GPU needed -- useful to "
-                         "reformat or refresh the README after a table change)")
+                         "reformat or refresh the benchmark docs after a table change)")
     args = ap.parse_args(argv)
 
     warnings.filterwarnings("ignore")
@@ -490,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         if args.update_readme:
             changed = splice_readme(md)
-            print(f"\n[bench] README {'updated' if changed else 'unchanged'}")
+            print(f"\n[bench] docs/benchmarks.md {'updated' if changed else 'unchanged'}")
         return 0
 
     models = _parse_csv(args.models)
@@ -526,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update_readme:
         changed = splice_readme(md)
-        print(f"\n[bench] README {'updated' if changed else 'unchanged'}")
+        print(f"\n[bench] docs/benchmarks.md {'updated' if changed else 'unchanged'}")
 
     # sanity gate: starling is byte-exact with stock, so per-cell WER should
     # match. Flag any cell where they diverge by more than 1 point (a real bug,
