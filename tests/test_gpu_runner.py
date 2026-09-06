@@ -165,3 +165,57 @@ else:
         [sys.executable, "-c", command], capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor inheritance")
+def test_runner_subprocess_helper_preserves_explicit_device_lock(tmp_path, monkeypatch):
+    import signal
+    import socket
+
+    from starling.gpu.session import GpuLockBusy, GpuSession
+
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    parent_socket, child_socket = socket.socketpair()
+    parent_socket.settimeout(15)
+    fd = child_socket.fileno()
+    child_code = (
+        "import os, socket; "
+        f"channel = socket.socket(fileno={fd}); "
+        "channel.sendall(b'R'); "
+        "assert channel.recv(1) == b'X'; "
+        "os.close(int(os.environ['STARLING_GPU_LOCK_FD'])); "
+        "channel.sendall(b'D')"
+    )
+    helper_code = (
+        "import sys; "
+        "from starling.gpu import session; "
+        "session._query_gpu_uuids = lambda: []; "
+        "from starling.parakeet.gpu_lock import spawn_gpu_subprocess; "
+        f"spawn_gpu_subprocess([sys.executable, '-c', {child_code!r}], "
+        f"uuid='device-test', pass_fds=({fd},))"
+    )
+    proc = subprocess.Popen(
+        _runner("--uuid", "device-test") + [sys.executable, "-c", helper_code],
+        pass_fds=(fd,), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    child_socket.close()
+    try:
+        assert parent_socket.recv(1) == b"R"
+        # The runner/helper exits; the child alone must keep the device locked.
+        assert proc.wait(timeout=15) == 0
+        with pytest.raises(GpuLockBusy):
+            with GpuSession(session="probe", uuid="device-test", wait=False):
+                pass
+        parent_socket.sendall(b"X")
+        assert parent_socket.recv(1) == b"D"
+        with GpuSession(session="after", uuid="device-test", wait=False):
+            pass
+    finally:
+        parent_socket.close()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=15)
+        proc.stderr.close()

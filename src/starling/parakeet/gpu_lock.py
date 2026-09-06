@@ -86,22 +86,32 @@ def acquire_gpu_lock(
     return owner_id
 
 
-def spawn_gpu_subprocess(args, *, owner_id: str | None = None, **popen_kwargs):
+def spawn_gpu_subprocess(
+    args, *, owner_id: str | None = None, uuid: str | None = None, **popen_kwargs,
+):
     """Spawn a GPU subprocess that inherits the currently-held lock.
 
     Persistent native benchmark servers must use this instead of bare
     ``subprocess.Popen`` so they keep exclusivity if the Python parent exits.
+
+    Without a local session, ``uuid`` follows :func:`acquire_gpu_lock`: supply
+    the same physical device key as the runner; omission uses NVIDIA discovery.
+    With a local session, an explicit key must match that session. To spawn on
+    another device, acquire its lock first and pass its ``owner_id``. The key
+    identifies the lock only; callers must select the matching backend device.
     """
     sess = _sessions()
     key = owner_id or getattr(_LOCAL, "last_owner", None)
     gs = sess.get(key) if key else None
     if gs is not None:
+        if not gs._disabled and uuid is not None and uuid != gs._key:
+            raise ValueError("Explicit GPU key does not match the held session")
         return gs.spawn(args, **popen_kwargs)
 
     # Standalone engine/test use: acquire solely for the child, pass the fd,
     # then close the parent's reference. The child remains the kernel owner.
     gs = GpuSession(
-        session="native-subprocess", model="external", note="auto child lock",
+        session="native-subprocess", model="external", note="auto child lock", uuid=uuid,
     )
     gs.acquire()
     try:

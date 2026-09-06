@@ -159,3 +159,35 @@ def test_legacy_adapter_without_key_does_not_trust_inherited_identity(tmp_path, 
         monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "device-a")
         with pytest.raises(RuntimeError, match="Cannot discover GPU UUIDs"):
             gpu_lock.acquire_gpu_lock(session="unknown-device", model="test", wait=False)
+
+
+def test_spawn_explicit_key_must_match_local_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr("starling.gpu.session._query_gpu_uuids", lambda: [])
+    owner = gpu_lock.acquire_gpu_lock(session="parent", model="test", uuid="device-a")
+    try:
+        with pytest.raises(ValueError, match="does not match"):
+            gpu_lock.spawn_gpu_subprocess(
+                [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+                owner_id=owner, uuid="device-b",
+            )
+        child = gpu_lock.spawn_gpu_subprocess(
+            [sys.executable, "-c", "pass"], owner_id=owner, uuid="device-a",
+        )
+        assert child.wait(timeout=15) == 0
+    finally:
+        gpu_lock.release_gpu_lock(owner)
+
+
+def test_spawn_without_key_does_not_trust_inherited_identity(tmp_path, monkeypatch):
+    from starling.gpu.session import GpuSession
+
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.setenv("STARLING_GPU_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr("starling.gpu.session._query_gpu_uuids", lambda: [])
+    with GpuSession(session="runner", uuid="device-a") as parent:
+        monkeypatch.setenv("STARLING_GPU_LOCK_FD", str(parent._fd))
+        monkeypatch.setenv("STARLING_GPU_LOCK_KEY", "device-a")
+        with pytest.raises(RuntimeError, match="Cannot discover GPU UUIDs"):
+            gpu_lock.spawn_gpu_subprocess([sys.executable, "-c", "pass"])
