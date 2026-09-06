@@ -1,4 +1,4 @@
-"""A matching prefix must not pass the ablation token-equality check."""
+"""Ablation token equality, decode budgets, and multistep measurement paths."""
 import json
 from types import SimpleNamespace
 

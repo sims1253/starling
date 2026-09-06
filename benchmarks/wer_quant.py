@@ -31,9 +31,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-# The in-process model sweep is CPU-sound only: on GPU builds the K-step
-# replay caches outlive eng.close() and would replay against the previous
-# model's freed weight buffers. Pin unless the caller overrides.
+# Published quantization corpus results use CPU. Model-owned replay caches
+# are released with each model, but GPU corpus parity still needs validation.
+# Keep the measured CPU default unless the caller selects another device.
 os.environ.setdefault("STARLING_GGML_DEVICE", "cpu")
 sys.path.insert(0, str(REPO_ROOT / "tests" / "fixtures"))
 

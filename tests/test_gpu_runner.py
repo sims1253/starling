@@ -195,9 +195,11 @@ def test_runner_subprocess_helper_preserves_explicit_device_lock(tmp_path, monke
         f"spawn_gpu_subprocess([sys.executable, '-c', {child_code!r}], "
         f"uuid='device-test', pass_fds=({fd},))"
     )
+    # A file stays readable even while the child holds its inherited stderr.
+    stderr_file = (tmp_path / "helper-stderr.log").open("w+b")
     proc = subprocess.Popen(
         _runner("--uuid", "device-test") + [sys.executable, "-c", helper_code],
-        pass_fds=(fd,), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        pass_fds=(fd,), stdout=subprocess.DEVNULL, stderr=stderr_file,
     )
     child_socket.close()
     try:
@@ -211,6 +213,10 @@ def test_runner_subprocess_helper_preserves_explicit_device_lock(tmp_path, monke
         assert parent_socket.recv(1) == b"D"
         with GpuSession(session="after", uuid="device-test", wait=False):
             pass
+    except Exception as exc:
+        # pread leaves the shared file offset alone and never waits for EOF.
+        stderr = os.pread(stderr_file.fileno(), 65536, 0).decode(errors="replace")
+        raise AssertionError(f"Runner/helper failed: {exc!r}\nstderr:\n{stderr}") from exc
     finally:
         parent_socket.close()
         try:
@@ -218,4 +224,4 @@ def test_runner_subprocess_helper_preserves_explicit_device_lock(tmp_path, monke
         except ProcessLookupError:
             pass
         proc.wait(timeout=15)
-        proc.stderr.close()
+        stderr_file.close()
