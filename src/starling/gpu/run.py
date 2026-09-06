@@ -4,6 +4,8 @@
 
 Use a CUDA_VISIBLE_DEVICES GPU UUID on multi-GPU hosts. When nvidia-smi is
 unavailable, --uuid supplies a key that all users of the same GPU must share.
+Nested GpuSession, acquire_gpu_lock, and with_gpu_lock calls must pass that
+same key as uuid=KEY. The key declares the device; it does not select it.
 The command replaces this process; its exit closes the lock descriptor.
 """
 

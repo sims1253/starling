@@ -170,6 +170,12 @@ class GpuSession:
             ...  # exclusive GPU access
             child = s.spawn(["parakeet-server", ...])  # inherits the lock
 
+    ``uuid`` supplies a stable physical device key without NVIDIA discovery.
+    All callers using that device must supply the same key, including nested
+    lock consumers. It does not select the backend device. If device selection
+    changes, the caller must supply its new key. Inherited lock metadata never
+    replaces this declaration or automatic device discovery.
+
     The lock is held until the context exits AND every ``s.spawn``-ed child has
     exited (the flock fd is inherited). SIGKILLing this process releases the
     lock only once the native children release their inherited fd.
