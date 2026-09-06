@@ -2601,16 +2601,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
-    { name = "datasets" },
     { name = "einops" },
     { name = "einx" },
     { name = "huggingface-hub" },
-    { name = "jiwer" },
-    { name = "kaldialign" },
     { name = "librosa", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "librosa", version = "1.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "matplotlib", version = "3.11.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -2619,19 +2614,27 @@ dependencies = [
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sentencepiece" },
     { name = "soundfile" },
-    { name = "tabulate" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchcodec" },
     { name = "transformers" },
     { name = "triton", marker = "sys_platform == 'linux'" },
-    { name = "whisper-normalizer" },
 ]
 
 [package.optional-dependencies]
+bench = [
+    { name = "datasets" },
+    { name = "jiwer" },
+    { name = "kaldialign" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tabulate" },
+    { name = "whisper-normalizer" },
+]
 dev = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "jiwer" },
     { name = "pytest" },
     { name = "requests" },
     { name = "uvicorn" },
@@ -2648,16 +2651,17 @@ server = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate" },
-    { name = "datasets", specifier = ">=5.0.0" },
+    { name = "datasets", marker = "extra == 'bench'", specifier = ">=5.0.0" },
     { name = "einops" },
     { name = "einx" },
     { name = "fastapi", marker = "extra == 'server'" },
     { name = "httpx", marker = "extra == 'dev'" },
     { name = "huggingface-hub", specifier = ">=1.0.0" },
-    { name = "jiwer" },
-    { name = "kaldialign", specifier = ">=0.12.0" },
+    { name = "jiwer", marker = "extra == 'bench'" },
+    { name = "jiwer", marker = "extra == 'dev'" },
+    { name = "kaldialign", marker = "extra == 'bench'", specifier = ">=0.12.0" },
     { name = "librosa" },
-    { name = "matplotlib" },
+    { name = "matplotlib", marker = "extra == 'bench'" },
     { name = "numpy" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "requests", marker = "extra == 'dev'" },
@@ -2665,7 +2669,7 @@ requires-dist = [
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "soundfile" },
     { name = "starling", extras = ["server"], marker = "extra == 'dev'" },
-    { name = "tabulate" },
+    { name = "tabulate", marker = "extra == 'bench'" },
     { name = "torch", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchaudio", specifier = ">=2.11", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchcodec", specifier = ">=0.14.0" },
@@ -2673,9 +2677,9 @@ requires-dist = [
     { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6" },
     { name = "uvicorn", marker = "extra == 'server'" },
     { name = "websockets", marker = "extra == 'server'" },
-    { name = "whisper-normalizer", specifier = ">=0.1.12" },
+    { name = "whisper-normalizer", marker = "extra == 'bench'", specifier = ">=0.1.12" },
 ]
-provides-extras = ["server", "dev"]
+provides-extras = ["server", "dev", "bench"]
 
 [[package]]
 name = "sympy"

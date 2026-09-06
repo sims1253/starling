@@ -16,12 +16,6 @@ dependencies = [
     "librosa",
     "einops",
     "einx",
-    "matplotlib",
-    "tabulate",
-    "jiwer",
-    "kaldialign>=0.12.0",
-    "whisper-normalizer>=0.1.12",
-    "datasets>=5.0.0",
     "torchcodec>=0.14.0",
     "huggingface-hub>=1.0.0",
     "sentencepiece>=0.2.0",
@@ -29,7 +23,22 @@ dependencies = [
 
 [project.optional-dependencies]
 server = ["fastapi", "uvicorn", "websockets"]
-dev = ["pytest", "requests", "httpx", "starling[server]"]
+dev = [
+    "pytest",
+    "requests",
+    "httpx",
+    "starling[server]",
+    # CPU quantization-driver tests import the WER scorer.
+    "jiwer",
+]
+bench = [
+    "datasets>=5.0.0",
+    "jiwer",
+    "kaldialign>=0.12.0",
+    "matplotlib",
+    "tabulate",
+    "whisper-normalizer>=0.1.12",
+]
 
 [project.scripts]
 starling-gpu-run = "starling.gpu.run:main"
