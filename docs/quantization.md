@@ -174,26 +174,34 @@ convs are `ggml_cast` to F16, the depthwise/subsampling convs take F16
 kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 `ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
 
-### Experimental compact Parakeet recipe
+### Parakeet embedding and compact recipes
 
-Quality evaluation on 300 English and 300 German test clips is pending.
-This recipe is an opt-in experiment, not a replacement for the released
-IQ2 build. The storage savings below do not establish equal accuracy.
+Two opt-in recipes retain the IQ2_XXS encoder and its importance matrix:
 
-`benchmarks/recipes/parakeet-iq2-compact.recipe` stores the prediction
-embedding as Q8_0 and six 640-wide joint/LSTM matrices as IQ4_NL. IQ4_NL
-uses blocks of 32 elements, so these matrices fit without the Q8_0 fallback.
-The encoder stays IQ2_XXS and requires the same importance matrix as the
-existing IQ2 build. This recipe leaves named levels and their fallback
-rules unchanged. Other model architectures retain the embedding keep-list.
+- `benchmarks/recipes/parakeet-iq2-embedding-q8.recipe` stores the prediction
+  embedding as Q8_0 and preserves every other tensor's existing policy.
+- `benchmarks/recipes/parakeet-iq2-compact.recipe` also stores six 640-wide
+  joint/LSTM matrices as IQ4_NL (32-element blocks, 4.5 bits per weight).
+  This option remains **experimental**: it increased observed word errors
+  in the controlled study below.
+
+Named levels and their fallback rules stay unchanged. Other model
+architectures retain the embedding keep-list.
 
 ```bash
+cmake -B build-cpu -DSTARLING_GGML_SHARED=ON
+cmake --build build-cpu --target starling-quantize starling_ggml -j
 build-cpu/starling-quantize \
   --input models/parakeet-tdt-0.6b-v3-f32.gguf \
   --output models/parakeet-iq2-compact.gguf \
   --recipe benchmarks/recipes/parakeet-iq2-compact.recipe \
   --imatrix models/parakeet-imx-prod-25x48.bin --shrink-f16
 ```
+
+For embedding-only storage, substitute `parakeet-iq2-embedding-q8.recipe`
+and a separate output filename. To reproduce the baseline, replace
+`--recipe ...` with `--quant iq2_xxs`; keep the source, matrix, and
+`--shrink-f16` identical.
 
 Start from the original floating-point model. The quantizer cannot decode
 an already quantized source. Recipe rules use first-match precedence:
@@ -203,16 +211,57 @@ The embedding rule accepts Q8_0 or F32; other types fail with an error.
 The embedding has no collected importance entry because the engine reads
 it on the host. Q8_0 does not require one.
 
-For this model, the embedding saves 15.40 MB and the six linears save
-6.10 MB. The combined tensor saving is 21.51 MB, about 6.6% of the
-325.1 MB IQ2 build. MB here means decimal megabytes.
+The 2026-09-06 CPU study used 300 English and 300 German FLEURS test clips,
+the F32 source, and `parakeet-imx-prod-25x48.bin`. Each model ran in a fresh
+process. Tensor payload comparisons confirmed that only the intended one
+or seven tensors changed. WER is the mean of per-clip WER percentages;
+brackets give 95% bootstrap intervals. MB means decimal megabytes.
 
-For paired quality comparisons, `benchmarks/wer_quant.py --include-clips
---json results.json` retains each corpus group's clip IDs, hashes of decoded
-audio, references, hypotheses, and unrounded per-clip WER. Match the IDs,
-audio hashes, and references across variants, then bootstrap the per-clip WER
-differences separately for each language. Overlap between independent
-confidence intervals does not establish equal quality.
+| variant | MB | EN WER | DE WER |
+|---------|----|--------|--------|
+| released IQ2 + shrink16 | 325.1 | 8.54 [7.59, 9.54] | 9.35 [8.22, 10.51] |
+| Q8 embedding | 309.7 | 8.53 [7.56, 9.51] | 9.35 [8.22, 10.51] |
+| Q8 embedding + IQ4_NL linears | 303.6 | 8.74 [7.67, 9.84] | 9.75 [8.54, 10.93] |
+
+Paired WER differences from the released IQ2 baseline, in percentage points:
+
+| variant | EN delta [95% CI] | DE delta [95% CI] |
+|---------|-------------------|------------------|
+| Q8 embedding | -0.013 [-0.040, 0.000] | 0.000 [0.000, 0.000] |
+| Q8 embedding + IQ4_NL linears | +0.197 [-0.220, +0.638] | +0.394 [-0.020, +0.823] |
+
+Q8 embedding alone saved 15.40 MB. It changed one English hypothesis,
+removing one word error; all German hypotheses matched the baseline.
+The zero German interval reflects this sample's identical outputs, not
+proof of losslessness on other inputs. IQ4_NL saved another 6.10 MB but
+added 18 English and 24 German word errors relative to the baseline.
+Its paired intervals include zero and extend to +0.64 EN / +0.82 DE
+percentage points. Noninferiority is not established. The measured combined
+size is 303.6 MB; [issue #50](https://github.com/sims1253/starling/issues/50)
+had proposed 285 MB.
+
+Reproduce the evaluation with the exact cached corpus identified in the
+[aggregate study record](quantization-compact-eval.json). To populate a
+new cache, the downloader selects the first 300 valid test clips per config;
+check its manifest against the record before treating it as the same sample.
+
+```bash
+uv run --extra bench python benchmarks/fleurs_download.py \
+  --out models/fleurs_test_big_ende --split test --fleurs en_us:300 --fleurs de_de:300
+STARLING_GGML_DEVICE=cpu STARLING_GGML_LIB="$PWD/build-cpu/libstarling_ggml.so" \
+uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
+  --corpus models/fleurs_test_big_ende --models combined=models/parakeet-iq2-compact.gguf \
+  --include-clips --json /tmp/compact.json
+```
+
+Repeat the scoring command separately for baseline and embedding-only files.
+`--include-clips` retains clip IDs, decoded-audio hashes, references,
+hypotheses, and unrounded WER. The paired analysis matched IDs, audio hashes,
+and references, then sampled 300 per-clip WER differences with replacement
+10,000 times per language using NumPy `default_rng(0)`. Its interval is the
+2.5th–97.5th percentile of the resampled means. The aggregate record contains
+input/output hashes, corpus-manifest construction, counts, timings, and the
+incremental combined-minus-embedding comparison; raw transcripts stay local.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 

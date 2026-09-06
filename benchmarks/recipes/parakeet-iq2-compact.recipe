@@ -1,6 +1,7 @@
-# Experimental, opt-in Parakeet TDT v3 compact storage; quality evaluation pending.
-# Requires --imatrix and, for the
-# conv-size reduction, --shrink-f16. Named quant levels remain unchanged.
+# Experimental Parakeet TDT v3 compact storage; observed WER increases in
+# the 300 EN/300 DE study. See docs/quantization.md for the paired intervals.
+# Requires --imatrix and --shrink-f16 to match the documented size study.
+# Named quant levels remain unchanged.
 # Explicit rules preserve first-match precedence; put precision overrides first.
 default iq2_xxs
 ^decoder\.prediction\.embed\.weight$ q8_0

@@ -3,6 +3,7 @@
 Build starling-quantize first, or set STARLING_QUANTIZE_BIN to its location.
 """
 
+import hashlib
 import os
 from pathlib import Path
 import struct
@@ -56,7 +57,8 @@ def quantize(tmp_path):
             command += ["--recipe", str(recipe_path)]
         subprocess.run(command, check=True, capture_output=True, text=True)
         reader = gguf.GGUFReader(str(output))
-        return {t.name: (t.tensor_type, t.n_bytes) for t in reader.tensors}
+        return {t.name: (t.tensor_type, t.n_bytes, hashlib.sha256(t.data.tobytes()).hexdigest())
+                for t in reader.tensors}
 
     return run
 
@@ -65,14 +67,22 @@ def test_compact_recipe_changes_only_embedding_and_six_linears(quantize):
     baseline = quantize()
     compact = quantize((ROOT / "benchmarks/recipes/parakeet-iq2-compact.recipe").read_text())
     types = gguf.GGMLQuantizationType
-    assert baseline[EMBED] == (types.F32, 4 * 640 * 4)
-    assert compact[EMBED] == (types.Q8_0, 4 * 640 // 32 * 34)
+    assert baseline[EMBED][:2] == (types.F32, 4 * 640 * 4)
+    assert compact[EMBED][:2] == (types.Q8_0, 4 * 640 // 32 * 34)
     for name in LINEARS:
-        assert baseline[name] == (types.Q8_0, 4 * 640 // 32 * 34)
-        assert compact[name] == (types.IQ4_NL, 4 * 640 // 32 * 18)
+        assert baseline[name][:2] == (types.Q8_0, 4 * 640 // 32 * 34)
+        assert compact[name][:2] == (types.IQ4_NL, 4 * 640 // 32 * 18)
     for name in ("encoder.weight", "other.embed.weight"):
         assert compact[name] == baseline[name]
-    assert sum(n for _, n in compact.values()) < sum(n for _, n in baseline.values())
+    assert sum(t[1] for t in compact.values()) < sum(t[1] for t in baseline.values())
+
+
+def test_embedding_recipe_preserves_every_other_tensor(quantize):
+    baseline = quantize()
+    result = quantize((ROOT / "benchmarks/recipes/parakeet-iq2-embedding-q8.recipe").read_text())
+    assert result[EMBED][:2] == (gguf.GGMLQuantizationType.Q8_0, 4 * 640 // 32 * 34)
+    for name in baseline.keys() - {EMBED}:
+        assert result[name] == baseline[name]  # dtype, size, and payload hash
 
 
 @pytest.mark.parametrize("arch", ["parakeet_tdt", "moss", ""])
