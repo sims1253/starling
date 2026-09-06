@@ -15,14 +15,19 @@ Two modes:
   ``sdpa_attention``, ``flash_attention``, ``fp8_attention``,
   ``nvfp4_weights``).
 * **long-audio** (``--mode long_audio``): end-to-end wall-clock on a long
-  fixture clip. Use this to ablate pipeline flags (``chunk_prefill_overlap``)
-  and confirm decode-flag benefits translate to end-to-end gains.
+  fixture clip. Use this to ablate pipeline flags (``chunk_prefill_overlap``,
+  ``multistep_graph``). Every run uses greedy decoding. The shared baseline
+  disables all ablatable flags, including multistep graphs; each variant
+  enables one flag and its required dependencies. Results record the baseline
+  flags and decoding mode. Do not compare these timings directly with older
+  long-audio results that used speculative decoding and a multistep baseline.
 
 Usage::
 
     uv run python benchmarks/bench_ablate.py                    # decode-step sweep
     uv run python benchmarks/bench_ablate.py --mode long_audio  # end-to-end sweep
     uv run python benchmarks/bench_ablate.py --flag rope_alloc_free  # one flag
+    uv run python benchmarks/bench_ablate.py --mode long_audio --flag multistep_graph
 """
 
 from __future__ import annotations
@@ -59,7 +64,6 @@ DECODE_FLAGS: list[tuple[str, dict]] = [
     ("fused_qkv",            dict(fused_qkv=True)),
     ("sdpa_attention",       dict(sdpa_attention=True, tolerance_mode=True)),
     ("flash_attention",      dict(flash_attention=True, tolerance_mode=True)),
-    ("multistep_graph",      dict(multistep_graph=True)),
     # Experimental paths; evaluate quality alongside speed.
     ("gemm_epilogue_fusion", dict(gemm_epilogue_fusion=True, tolerance_mode=True)),
     ("nvfp4_weights",        dict(nvfp4_weights=True, tolerance_mode=True)),
@@ -67,6 +71,7 @@ DECODE_FLAGS: list[tuple[str, dict]] = [
 ]
 
 LONG_AUDIO_FLAGS: list[tuple[str, dict]] = [
+    ("multistep_graph",      dict(multistep_graph=True)),
     ("chunk_prefill_overlap", dict(chunk_prefill_overlap=True)),
 ]
 
@@ -155,6 +160,17 @@ def bench_decode_step(model, processor, inputs_embeds, golden_ids, combo: dict,
     return {"us_per_step": median(trial_us), "byte_exact": be, "note": note}
 
 
+def _select_flags(mode: str, flag: str | None) -> list[tuple[str, dict]]:
+    flag_set = DECODE_FLAGS if mode == "decode_step" else LONG_AUDIO_FLAGS
+    if flag is None:
+        return flag_set
+    selected = [(name, override) for name, override in flag_set if name == flag]
+    if not selected:
+        known = ", ".join(name for name, _ in flag_set)
+        raise ValueError(f"flag {flag!r} is not available in {mode}; choose from: {known}")
+    return selected
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["decode_step", "long_audio"], default="decode_step")
@@ -162,6 +178,10 @@ def main() -> int:
     ap.add_argument("--trials", type=int, default=6)
     ap.add_argument("--flag", default=None, help="ablate only this one flag")
     args = ap.parse_args()
+    try:
+        flag_set = _select_flags(args.mode, args.flag)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     from starling.parakeet.gpu_lock import with_gpu_lock
 
@@ -171,10 +191,10 @@ def main() -> int:
         eta_min=30,
         note=f"ablation ({args.mode})",
     ):
-        return _main_locked(args)
+        return _main_locked(args, flag_set)
 
 
-def _main_locked(args) -> int:
+def _main_locked(args, flag_set) -> int:
 
     print("loading granite model + golden artefacts ...", flush=True)
     model = processor = inputs_embeds = golden_ids = None
@@ -182,13 +202,6 @@ def _main_locked(args) -> int:
         model, processor = load_model_and_processor(attn_impl="eager")
         inputs_embeds = load_golden("inputs_embeds.pt").to("cuda", torch.bfloat16)
         golden_ids = load_golden("greedy_ids.pt")
-
-    flag_set = DECODE_FLAGS if args.mode == "decode_step" else LONG_AUDIO_FLAGS
-    if args.flag:
-        flag_set = [(n, o) for n, o in flag_set if n == args.flag]
-        if not flag_set:
-            print(f"unknown flag {args.flag!r}; known: {[n for n, _ in DECODE_FLAGS + LONG_AUDIO_FLAGS]}")
-            return 2
 
     if args.mode == "long_audio":
         return _main_long_audio(args, flag_set)
@@ -267,7 +280,10 @@ def _bench_long_audio(combo: dict, wav: torch.Tensor, sr: int, trials: int = 3) 
     for t in range(trials):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        res = transcribe_long(pipe, processor, wav, sr, chunk_seconds=30.0)
+        # Speculative decoding has its own controller and bypasses the selected
+        # decoder's generate() method. Measure the requested greedy path.
+        res = transcribe_long(pipe, processor, wav, sr, chunk_seconds=30.0,
+                              speculative=False)
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
         if t == 0:
@@ -294,7 +310,6 @@ def _main_long_audio(args, flag_set) -> int:
     print(f"long fixture: {wav_long.numel()/sr:.1f}s ({n_tile} tiles)", flush=True)
 
     baseline_combo = {name: False for name, _ in DECODE_FLAGS + LONG_AUDIO_FLAGS}
-    baseline_combo["multistep_graph"] = True  # long-audio uses the pipeline default
     print("\nmeasuring baseline (all ablatable flags off) ...", flush=True)
     with _restore_flags():
         base = _bench_long_audio(baseline_combo, wav_long, sr, trials=args.trials)
@@ -328,6 +343,7 @@ def _main_long_audio(args, flag_set) -> int:
     OUTPUTS.mkdir(exist_ok=True)
     (OUTPUTS / "ablate_long_audio.json").write_text(json.dumps({
         "mode": "long_audio", "trials": args.trials,
+        "decoding": "greedy", "baseline_flags": vars(OptFlags(**baseline_combo)),
         "baseline_wall_s": base_s, "rows": rows,
     }, indent=2, default=str))
     print(f"\nwrote {OUTPUTS / 'ablate_long_audio.json'}")
