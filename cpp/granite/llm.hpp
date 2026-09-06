@@ -19,5 +19,5 @@ bool greedy_generate(const GraniteModel&, const InputsEmbeds&, const GenerateOpt
                      GenerateResult&, std::string&);
 // Current number of cached per-S prefill graphs (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
-size_t prefill_replay_cache_size();
+size_t prefill_replay_cache_size(const GraniteModel& model);
 } // namespace starling::ggml::granite

@@ -11,10 +11,8 @@ over the WebSocket while printing partial and final results. Exits 0 only if
 every requested check passed; any failed check exits 1, so the script works
 as a smoke gate as well as an interactive client.
 
-Zero third-party deps: HTTP uses :mod:`http.client`, and the WebSocket client
-is a tiny RFC 6455 implementation on a raw socket. This matches the server's
-own zero-dependency stdlib backend, so the client runs in the project venv
-(which has torch/CUDA but no ``requests``/``websockets``).
+The client uses NumPy for audio, :mod:`http.client` for HTTP, and a raw socket
+for WebSocket messages. It works with both the Python and native servers.
 
 Usage::
 

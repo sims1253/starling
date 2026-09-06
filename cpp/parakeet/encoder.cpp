@@ -12,20 +12,13 @@
 namespace starling::ggml::parakeet {
 
 Encoder::Encoder(const ParakeetModel& model)
-    : model_(model), sub_(model.loader, model.config), config_(model.config),
-      replay_cache_(std::make_shared<ReplayCache>(replay_cache_size())) {
-    // The clearer holds no model pointer. If the model has already been freed,
-    // the weak_ptr is expired; otherwise graphs are released before Backend.
-    std::weak_ptr<ReplayCache> weak = replay_cache_;
-    register_decode_cache_clearer([weak]() {
-        if (auto cache = weak.lock()) cache->clear();
-    });
-}
+    : model_(model), sub_(model.loader, model.config), config_(model.config) {}
 
 Encoder::~Encoder() = default;
 
 size_t Encoder::cache_size() const {
-    return replay_cache_ ? replay_cache_->by_T.size() : 0;
+    const auto* cache = model_.loader.find_cache<ReplayCache>();
+    return cache ? cache->by_T.size() : 0;
 }
 
 ggml_tensor* Encoder::build_graph(ggml_context* ctx,
@@ -75,6 +68,8 @@ bool Encoder::encode(const std::vector<float>& mel, int n_mels, int T,
     // shared LruCache (runtime/lru_cache.hpp) — without it each distinct T would
     // pin its own captured graph + private gallocr until the model unloads (the
     // Wave H OOM bug).
+    auto& replay_cache_ = model_.loader.cache<ReplayCache>();
+    if (!replay_cache_) replay_cache_ = std::make_unique<ReplayCache>(replay_cache_size());
     ReplayEntry& e = *replay_cache_->by_T.get_or_init(T,
         [this, &backend, &mel, n_mels, T](ReplayEntry& entry) {
             entry.T = T;

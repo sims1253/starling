@@ -49,8 +49,8 @@ bool greedy_generate(const MossModel& m, const InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const MossModel& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::moss

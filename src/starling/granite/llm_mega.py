@@ -32,11 +32,9 @@ The one wrinkle: ``create_causal_mask`` allocates CPU scalars
 a pre-computed **4D** attention mask (``(1, 1, 1, max_cache_len)``); the masking
 plumbing early-exits and returns a 4D mask as-is.
 
-The warmup steps advance ``cumulative_length`` and scribble garbage K/V into
-slots ``[prefill_len, prefill_len + warmup)``.  We reset the counter back to
-``prefill_len`` before capture *and* before the generate loop so the first real
-decode writes slot ``prefill_len``.  Stale garbage past the current write slot
-is masked out by the 4D mask and overwritten before it is ever read.
+Each warmup resets the cache counter to ``prefill_len`` before writing one
+decode slot. Capture and generation reset it again; future slots remain masked
+until a real decode step writes them.
 """
 
 from __future__ import annotations
@@ -301,6 +299,7 @@ class LLMMega:
         # Warmup advances cumulative_length; we reset before capture so the
         # captured graph starts writing at slot ``prefill_len``.
         for _ in range(self.warmup_iters):
+            self._reset_cache_pos(prefill_len)
             self._decode_step_eager()
         torch.cuda.synchronize()
         self._reset_cache_pos(prefill_len)

@@ -26,6 +26,6 @@ bool encode_audio_and_project(const Qwen3Model& model, const MelFeatures& mel,
 
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const Qwen3Model& model);
 
 } // namespace starling::ggml::qwen3

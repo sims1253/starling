@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,7 +88,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_;
+    std::unique_ptr<Impl> impl_;
     int   n_threads_ = 1;
     std::string device_name_ = "cpu";
 

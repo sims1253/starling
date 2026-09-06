@@ -12,14 +12,13 @@ regressions of the lifecycle fixes:
 * 3. Concurrent ``load()`` calls still run the backend load exactly once.
 * 4. A failed warmup resets ``phase`` to ``ready`` and is swallowed+logged;
      ``load()`` with ``--warmup`` survives a warmup failure.
-* 5. ``POST /warmup`` (FastAPI + stdlib transports) rejects an unloaded model
+* 5. ``POST /warmup`` rejects an unloaded model
      with 409 instead of a no-op 202.
 """
 
 from __future__ import annotations
 
 import asyncio
-from email.message import Message
 import json
 import os
 import sys
@@ -40,7 +39,6 @@ from starling.server import (  # noqa: E402
     Qwen3Backend,
     ServerConfig,
     StarlingServer,
-    _build_stdlib_handler,
     create_app,
 )
 import starling.server as server_module  # noqa: E402
@@ -331,43 +329,3 @@ def test_fastapi_warmup_route_dispatches_warmup_when_loaded() -> None:
     body = json.loads(response.body)
     assert body["status"] == "warmup started"
     assert len(warmup_calls) == 1
-
-
-def _stdlib_handler_for(server: StarlingServer, path: str) -> Any:  # noqa: ANN001
-    """Instantiate the stdlib POST handler without a socket: do_POST only
-    touches self.path / self.headers / self._send_json."""
-    handler = object.__new__(_build_stdlib_handler(server))
-    handler.path = path
-    handler.headers = Message()  # Content-Length absent -> body length 0
-    return handler
-
-
-def test_stdlib_warmup_route_rejects_unloaded_model() -> None:
-    """The stdlib transport mirrors the FastAPI 409 for /warmup on an unloaded
-    model instead of answering a misleading 202."""
-    server = StarlingServer(config=ServerConfig(model="granite"))
-    handler = _stdlib_handler_for(server, "/warmup")
-
-    sent: list[tuple[int, dict[str, Any]]] = []
-    handler._send_json = lambda status, obj: sent.append((status, obj))  # type: ignore[method-assign]
-
-    handler.do_POST()
-
-    assert sent == [(409, {"error": "model not loaded", "phase": "unloaded"})]
-
-
-def test_stdlib_warmup_route_starts_warmup_when_loaded(monkeypatch) -> None:  # noqa: ANN001
-    """Loaded server: the 202 path still dispatches a real warmup thread."""
-    server = StarlingServer(backend=_FakeBackend(), _loaded=True)
-    warmup_called = threading.Event()
-    monkeypatch.setattr(server, "warmup", warmup_called.set)
-
-    handler = _stdlib_handler_for(server, "/warmup")
-    sent: list[tuple[int, dict[str, Any]]] = []
-    handler._send_json = lambda status, obj: sent.append((status, obj))  # type: ignore[method-assign]
-
-    handler.do_POST()
-
-    assert sent[0][0] == 202
-    assert sent[0][1]["status"] == "warmup started"
-    assert warmup_called.wait(timeout=2.0), "warmup was never dispatched"

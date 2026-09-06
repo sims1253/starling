@@ -1,25 +1,9 @@
 # ggml engine — universal backend ASR for Starling
 
-Starling's in-tree `starling-ggml-parakeet` and `starling-ggml-moss` engines
-bring a second, **universal-backend** transcription path alongside the PyTorch
-+ CUDA-graph peak engine. Both are model-tagged entry points in the shared
-`libstarling_ggml` C API and reach any backend ggml supports (NVIDIA CUDA, AMD
-via HIP, Apple Metal, Intel/AMD/ARM via Vulkan, CPU) from one codebase. Legacy
-external `GgmlParakeet` and `GgmlMoss` wrappers remain only for temporary A/B
-comparison and are deprecated pending Phase-4 removal.
-
-The PyTorch engine remains the NVIDIA peak path (CUDAGraph + Triton fused
-kernels, tuned on sm_120). The ggml engines are dispatched alongside it: same
-fixtures, same golden contract, portable. **Correctness:** parakeet-tdt and the
-in-tree MOSS engine return the exact canonical eager token IDs/text on all
-fixtures. MOSS logits retain documented bf16 ULP differences, so its component
-gates use max-abs tolerances while the end-to-end contract is token/text exact.
-The legacy CrispASR MOSS engine remains only a near-exact comparison path.
-**Speed:** the current in-tree Parakeet path is faster than the PyTorch peak on
-short and within ~1.25-1.5x on medium/long. The current in-tree MOSS path is
-within ~1.3x on short/medium and faster on the long synthetic fixture. See the
-maintained README tables; older external-engine measurements are historical
-context only.
+The native engines load GGUF models through the shared `libstarling_ggml` C API.
+They support Parakeet, MOSS, ARK, Higgs, Hojo, Granite, Qwen3, S1, and Audex.
+Backend availability depends on the build; see the README for measured
+performance and the model-specific parity notes below.
 
 ## ggml version and local patches
 
@@ -54,6 +38,25 @@ calls on both CPU and Vulkan; CPU also passes with llamafile enabled. CUDA
 compilation and runtime parity remain unverified on this machine, which has
 no CUDA toolkit or GPU.
 
+## Model and backend lifetime
+
+Each loaded model owns its realized weights, encoder caches, and decoder replay
+state. Two instances of the same model family have separate caches even when
+their tensor shapes match. Freeing a context releases its graphs before its
+weight buffers; the shared backend remains available to other contexts.
+
+Public C API load, inference, free, and shutdown operations are serialized.
+Callers must keep a context alive until its pending calls finish.
+`starling_ggml_shutdown()` releases remaining model resources before the backend
+and is terminal: subsequent loads or inference return an error. Ordinary
+`starling_ggml_free()` allows another model to be loaded. An exit handler performs
+shutdown if the caller does not.
+
+`model_lifetime_test` uses distinct synthetic weights to check instance
+isolation, unload/reload, failure recovery, and teardown. It runs in CPU CI
+with address, undefined-behavior, and leak sanitizers; accelerator replay also
+needs testing on the target backend.
+
 ## Model registry (adding an engine)
 
 Every engine built into `libstarling_ggml` is registered in one place:
@@ -62,15 +65,14 @@ slug, the load/free/decode entry points, and the error-message shape for the
 shared 16 kHz guard). The C API's `load`/`free`/`transcribe_pcm` dispatch
 (`cpp/capi.cpp`) and the serve slug mapping, supported-model check, and
 `--version` model list (`cpp/serve/server.cpp`) are all table lookups; the
-public `starling_ggml.h` stays flat and unchanged (ABI 5).
+public `starling_ggml.h` defines the C interface (ABI 6).
 
 Adding a model = its `cpp/<model>/` implementation (with the three
 `capi_<model>.cpp` entry points) + one contiguous addition in
 `cpp/lib/model_registry.cpp`: the three entry-point declarations and the
 `kRegistry` row, side by side. The public `starling_ggml_model` enum kind is
 added to `starling_ggml.h` with the usual ABI bump (the Python binding's
-`_EXPECTED_ABI_VERSION` follows). No other per-model edits anywhere in the
-tree.
+`_EXPECTED_ABI_VERSION` follows). The dispatch code needs no per-model conditionals.
 
 ## Correctness contract
 

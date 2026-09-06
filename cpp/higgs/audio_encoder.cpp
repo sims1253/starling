@@ -387,17 +387,12 @@ struct ShapeKey {
 struct ShapeKeyHash {
     size_t operator()(const ShapeKey& k) const noexcept { return (size_t) k.mel_T; }
 };
-std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>> g_encoder_cache;
-std::once_flag g_encoder_cache_once;
-void register_encoder_cache_clearer_once() {
-    std::call_once(g_encoder_cache_once, [] {
-        register_decode_cache_clearer([] { g_encoder_cache.reset(); });
-    });
-}
+using EncoderCache = LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>;
 } // namespace
 
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;
+size_t encoder_replay_cache_size(const HiggsModel& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;
 }
 
 bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
@@ -499,14 +494,12 @@ bool encode_audio_and_project(const HiggsModel& model, const MelFeatures& mel,
 
     // --- GPU: captured per-mel_T graph running conv1/gelu/conv2/gelu/layers/
     // avgpool/ln_post/projector end-to-end. The mel is the varying input.
-    register_encoder_cache_clearer_once();
-    if (!g_encoder_cache)
-        g_encoder_cache = std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>>(
-            new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(replay_cache_size()));
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
     const char* dump_enc = std::getenv("STARLING_HIGGS_DUMP_ENC");
     ShapeKey key{mel_T};
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.mel_T = mel_T;
             entry.T_enc = T_enc;

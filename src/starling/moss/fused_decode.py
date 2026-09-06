@@ -33,20 +33,6 @@ from ..flags import get_default_flags
 from .llm_mega import MossLLMMega
 
 
-def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """GQA: repeat KV heads to match Q heads.  (B, n_kv, S, D) -> (B, n_q, S, D).
-
-    Kept for the manual (non-SDPA) attention fallback in
-    :func:`starling.attention.gqa_attention`.
-    """
-    if n_rep == 1:
-        return x
-    B, n_kv, S, D = x.shape
-    return x[:, :, None, :, :].expand(B, n_kv, n_rep, S, D).reshape(
-        B, n_kv * n_rep, S, D
-    )
-
-
 class FusedMossLLMMega(MossLLMMega):
     """CUDA-graph greedy decoder with fused Triton elementwise kernels."""
 

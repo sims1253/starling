@@ -1,5 +1,6 @@
 // capi_moss.cpp — MOSS-Transcribe C API entry points behind the shared shell.
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "audio_encoder.hpp"
 #include "adapter.hpp"
@@ -7,6 +8,7 @@
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <cmath>
 #include <chrono>
@@ -20,58 +22,15 @@
 
 namespace {
 
-thread_local std::string g_load_error;
-
-struct MossCtx {
-    std::unique_ptr<starling::ggml::moss::MossModel> model;
-    starling::ggml::moss::Tokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char ** out, const std::string & message) {
-    if (out) *out = message.c_str();
-}
-
-void report_load_error(const char ** out, const std::string & message) {
-    g_load_error = message;
-    if (out) *out = g_load_error.c_str();
-}
+using MossCtx = starling::ggml::lib::EngineContext<starling::ggml::moss::MossModel, starling::ggml::moss::Tokenizer>;
+using starling::ggml::lib::report;
 
 } // namespace
 
 extern "C" {
 
 void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out) {
-    try {
-        if (!gguf_path || !*gguf_path) {
-            if (err_out) *err_out = "null or empty MOSS GGUF path";
-            return nullptr;
-        }
-        auto ctx = std::make_unique<MossCtx>();
-        ctx->model = std::make_unique<starling::ggml::moss::MossModel>();
-        if (!ctx->model->load(gguf_path, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        if (!ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        // Persist model weights (and force backend creation/its orderly atexit
-        // shutdown registration) across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        // The current one-shot LLM state owns no replay cache, but register a
-        // shutdown hook with the shared cache-clearer protocol so future MOSS
-        // decode caches are released before CUDA backend teardown.
-        starling::ggml::register_decode_cache_clearer([]() {});
-        if (err_out) *err_out = nullptr;
-        return ctx.release();
-    } catch (const std::exception & e) {
-        report_load_error(err_out, e.what());
-    } catch (...) {
-        report_load_error(err_out, "unknown exception loading MOSS model");
-    }
-    return nullptr;
+    return starling::ggml::lib::load_engine<MossCtx>(gguf_path, "MOSS", err_out);
 }
 
 void starling_ggml_moss_free(void * handle) {

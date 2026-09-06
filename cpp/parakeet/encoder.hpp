@@ -51,7 +51,6 @@ private:
     const ParakeetModel& model_;
     Subsampling sub_;
     const Config& config_;
-    std::shared_ptr<ReplayCache> replay_cache_;
 };
 
 } // namespace starling::ggml::parakeet

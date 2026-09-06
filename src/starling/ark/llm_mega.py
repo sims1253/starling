@@ -425,6 +425,7 @@ class LLMMega:
         # Warmup advances cumulative_length; we reset before capture so the
         # captured graph starts writing at slot ``prefill_len``.
         for _ in range(self.warmup_iters):
+            self._reset_cache_pos(prefill_len)
             self._decode_step_eager()
         torch.cuda.synchronize()
         self._reset_cache_pos(prefill_len)

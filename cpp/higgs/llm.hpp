@@ -26,5 +26,5 @@ bool greedy_generate(const HiggsModel& m, const InputsEmbeds& inputs,
                      const GenerateOptions& op, GenerateResult& out, std::string& err);
 // Current number of cached per-S prefill graphs (diagnostic). Zero on CPU /
 // before first GPU prefill.
-size_t prefill_replay_cache_size();
+size_t prefill_replay_cache_size(const HiggsModel& model);
 } // namespace starling::ggml::higgs

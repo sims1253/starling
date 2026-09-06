@@ -8,20 +8,53 @@
 
 #include "model_loader.hpp"
 #include "backend.hpp"
+#include "graph.hpp"
 
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-backend.h"
 
 #include <cstring>
+#include <unordered_set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace starling::ggml {
 
-ModelLoader::ModelLoader() = default;
+namespace {
+std::unordered_set<ModelLoader*> loaders;
+std::unordered_set<ModelLoader*>& live_loaders() { return loaders; }
+}
+
+ModelLoader::ModelLoader() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex());
+    live_loaders().insert(this);
+}
+
+void ModelLoader::release_runtime_resources() {
+    while (!caches_.empty()) caches_.pop_back();
+    if (weight_buffer_) ggml_backend_buffer_free(weight_buffer_);
+    weight_buffer_ = nullptr;
+    if (device_ctx_) {
+        tensors_.swap(host_tensors_);
+        host_tensors_.clear();
+    }
+    for (auto& item : tensors_) item.second->buffer = nullptr;
+    if (device_ctx_) ggml_free(device_ctx_);
+    device_ctx_ = nullptr;
+    realized_ = false;
+}
+
+void ModelLoader::release_all_runtime_resources() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex());
+    for (auto* loader : live_loaders()) loader->release_runtime_resources();
+}
 
 ModelLoader::~ModelLoader() {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex());
+    release_runtime_resources();
+    live_loaders().erase(this);
     // The ggml context owns the weight tensors; freeing it frees them all.
     if (ctx_) ggml_free(ctx_);
     if (compat_ctx_) ggml_free(compat_ctx_);
@@ -29,8 +62,10 @@ ModelLoader::~ModelLoader() {
 }
 
 bool ModelLoader::load(const char* path) {
+    if (ctx_ || gguf_ctx_) { error_ = "model loader is already loaded"; return false; }
+    if (!path || !*path) { error_ = "empty GGUF path"; return false; }
     // gguf_init_params { no_alloc, ctx } — ctx!=NULL means allocate the weight
-    // tensors into a freshly-created ggml_context (zero-copy mmap-backed).
+    // tensors into a freshly-created ggml_context (host-memory-backed).
     gguf_init_params params = {
         /*.no_alloc =*/ false,
         /*.ctx      =*/ &ctx_,
@@ -207,20 +242,23 @@ void ModelLoader::add_kv_arr_str(const std::string& key, const std::vector<std::
 }
 
 bool ModelLoader::realize_weights(Backend& backend) {
+    std::lock_guard<std::recursive_mutex> lock(runtime_mutex());
     if (realized_) return true;
     if (!ctx_) { error_ = "realize_weights: no loaded context"; return false; }
     // On CPU: borrow the loader's memory-backed context zero-copy.
     // On GPU: mirror each weight into a device-side context + upload.
     if (!backend.is_gpu()) {
         // Borrow the loader's memory-backed ggml_context zero-copy. The public
-        // accessors ggml_get_mem_buffer / ggml_get_mem_size give the mmap'd region.
+        // accessors ggml_get_mem_buffer / ggml_get_mem_size give the host region.
         ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(
             ggml_get_mem_buffer(ctx_), ggml_get_mem_size(ctx_));
+        if (!buf) { error_ = "realize_weights: CPU buffer alloc failed"; return false; }
+        weight_buffer_ = buf;
         // Point each tensor's ->buffer at the borrowed buffer.
         for (const auto& kv : tensors_) {
             ggml_tensor* t = kv.second;
             t->buffer = buf;
-            // data pointer already set by the gguf mmap.
+            // data pointer already set by the GGUF allocation.
         }
     } else {
         // GPU: allocate a no_alloc device context, mirror tensors, upload.
@@ -229,26 +267,31 @@ bool ModelLoader::realize_weights(Backend& backend) {
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
-        ggml_context* dev_ctx = ggml_init(params);
-        // Snapshot the CPU tensors (name -> src data) before repointing the map.
-        std::vector<std::pair<std::string, ggml_tensor*>> cpu_tensors;
-        cpu_tensors.reserve(tensors_.size());
-        for (const auto& kv : tensors_) cpu_tensors.emplace_back(kv.first, kv.second);
-        // Repoint the name map at device tensors.
-        for (const auto& kv : cpu_tensors) {
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> dev_ctx_owner(ggml_init(params), ggml_free);
+        ggml_context* dev_ctx = dev_ctx_owner.get();
+        if (!dev_ctx) { error_ = "realize_weights: context alloc failed"; return false; }
+        std::unordered_map<std::string, ggml_tensor*> device_tensors;
+        std::unordered_map<ggml_tensor*, ggml_tensor*> mirrored;
+        // Build replacement tensors without changing the loaded model on failure.
+        for (const auto& kv : tensors_) {
             ggml_tensor* src = kv.second;
-            ggml_tensor* dst = ggml_dup_tensor(dev_ctx, src);
-            ggml_set_name(dst, src->name);
-            tensors_[kv.first] = dst;
+            auto& dst = mirrored[src];
+            if (!dst) { dst = ggml_dup_tensor(dev_ctx, src); ggml_set_name(dst, src->name); }
+            device_tensors[kv.first] = dst;
         }
-        ggml_backend_buffer_t dev_buf = ggml_backend_alloc_ctx_tensors(dev_ctx, backend.handle());
+        std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> dev_buf_owner(
+            ggml_backend_alloc_ctx_tensors(dev_ctx, backend.handle()), ggml_backend_buffer_free);
+        ggml_backend_buffer_t dev_buf = dev_buf_owner.get();
         if (!dev_buf) { error_ = "realize_weights: device alloc failed"; return false; }
-        // Upload each tensor's bytes from the original CPU mmap'd data.
-        for (const auto& kv : cpu_tensors) {
-            ggml_tensor* dst = tensor(kv.first.c_str());
-            if (dst && kv.second->data)
-                ggml_backend_tensor_set(dst, kv.second->data, 0, ggml_nbytes(kv.second));
+        // Aliases share a device tensor; upload each source only once.
+        for (const auto& item : mirrored) {
+            if (item.first->data)
+                ggml_backend_tensor_set(item.second, item.first->data, 0, ggml_nbytes(item.first));
         }
+        tensors_.swap(device_tensors);
+        host_tensors_.swap(device_tensors);
+        device_ctx_ = dev_ctx_owner.release();
+        weight_buffer_ = dev_buf_owner.release();
     }
     realized_ = true;
     return true;

@@ -1,41 +1,5 @@
-// lru_cache.hpp — a generic bounded LRU container for per-shape capture caches.
-//
-// Starling's three per-shape ReplayGraph caches (parakeet Encoder::replay_cache_,
-// moss g_encoder_cache, moss g_prefill_cache) key a captured ReplayGraph on an
-// audio length / mel shape and keep it alive for reuse. Real audio produces a
-// near-continuous length distribution, so WITHOUT eviction every distinct shape
-// permanently pins its own device buffer (the ReplayGraph's private gallocr +
-// captured CUDA graph) until process exit -> unbounded VRAM growth -> OOM. That
-// is the Wave H bug. This helper gives those caches a genuine LRU bound.
-//
-// Mechanics: a doubly-linked list of keys in MRU->LRU order, plus an
-// unordered_map from key -> {list iterator, value}. touch/get/get_or_init splice
-// the accessed node to the front (MRU); a miss at capacity evicts the back
-// (LRU) first. All operations are O(1).
-//
-// Node stability is load-bearing: the value is stored BY VALUE inside the map
-// node, and std::unordered_map guarantees element addresses are stable across
-// other insert/erase. The three caches' ReplayGraph build lambdas capture
-// pointers into the value's GraphInputPool (chunks/valid buffers); those host
-// pointers are registered on the ReplayGraph and re-uploaded every replay, so
-// the value (hence its pool) must not relocate for the ReplayGraph's life. Map
-// node stability guarantees exactly that, until the value is evicted (which
-// destroys its ReplayGraph in the same step). get_or_init therefore places the
-// value in the map FIRST, then hands the caller a stable reference to fill +
-// build against.
-//
-// Eviction safety mid-run: a value is only evicted by trim(), called inside a
-// miss path BEFORE the caller uses the returned entry. The just-inserted entry
-// is MRU, so it is never the trim() victim while the caller holds it; nothing
-// re-enters the cache during a ReplayGraph::compute (the call pattern is fully
-// synchronous: get -> set_input -> compute). Evicting a DIFFERENT (older) entry
-// is harmless to the in-use one: each ReplayGraph owns its own private gallocr
-// (see backend.hpp), so freeing one never touches another's device pointers.
-//
-// Synchronization: NONE. The cache is NOT internally locked. Starling's
-// inference is process-serial (one Backend; callers serialize), so the existing
-// cache sites are unsynchronized and this helper preserves that. Add a mutex at
-// the call site if concurrent callers are ever introduced.
+// Bounded replay caches keep entry addresses stable because captured graphs
+// retain pointers into their input pools. Callers serialize cache access.
 
 #pragma once
 
@@ -48,10 +12,7 @@
 
 namespace starling::ggml {
 
-// Default per-cache capacity. Overridable per-process via the env var below.
-// Chosen to keep realistic within-run reuse warm (the 3 synthetic tiers plus a
-// handful of repeated similar-length utterances) while capping worst-case VRAM
-// at ~16 private gallocrs per cache. See review.md §5 for the bound rationale.
+// Maximum retained shapes per model cache; configurable below.
 constexpr size_t kDefaultReplayCacheSize = 16;
 
 // Process-global cache capacity, read from STARLING_REPLAY_CACHE_SIZE (>=1) on
@@ -101,12 +62,19 @@ public:
         }
         trim();
         lru_.push_front(key);
-        auto ins = map_.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(key),
-            std::forward_as_tuple(lru_.begin(), Value()));
-        init(ins.first->second.second);
-        return &ins.first->second.second;
+        auto inserted = map_.end();
+        try {
+            inserted = map_.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(key),
+                std::forward_as_tuple(lru_.begin(), Value())).first;
+            init(inserted->second.second);
+            return &inserted->second.second;
+        } catch (...) {
+            if (inserted != map_.end()) map_.erase(inserted);
+            lru_.pop_front();
+            throw;
+        }
     }
 
     void clear() {

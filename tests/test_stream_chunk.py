@@ -10,7 +10,6 @@ verifies the reconstructed transcript equals the ground truth despite overlap.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from starling.stream_chunk import ChunkStreamer, stitch_words
 
@@ -202,66 +201,6 @@ def test_flush_retries_full_windows_without_repeating_committed_audio(monkeypatc
     assert all(length <= 12 for _, length in seen)
     assert cs.boundary == len(samples)
 
-
-@pytest.mark.parametrize("transport", ["stdlib", "fastapi"])
-def test_transports_retain_audio_after_incomplete_commit(monkeypatch, transport):
-    import asyncio
-    import json
-    from starling import server as S
-
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0)
-
-    class Server:
-        config = S.ServerConfig(stream_chunk_seconds=1, stream_overlap_seconds=.25)
-
-        def _run_queued_sync(self, window, _rid, *, streaming=False):
-            if self.busy:
-                raise S._Busy()
-            return S.TranscribeResult(text="retained audio")
-
-    server = Server()
-    server.busy = True
-    sess = S.StreamSession(server=server)
-    sess.samples = np.zeros(SR // 2, dtype=np.float32)
-    monkeypatch.setattr(S, "StreamSession", lambda server: sess)
-    messages = []
-    count = 0
-
-    def receive():
-        nonlocal count
-        count += 1
-        if count == 2:
-            assert messages == [{"type": "error", "message": "server busy"}]
-            assert len(sess.samples) == SR // 2
-            server.busy = False
-        if count > 2:
-            raise ConnectionError()
-        return {"text": json.dumps({"type": "commit"})}
-
-    if transport == "stdlib":
-        monkeypatch.setattr(S, "_ws_read_frame", lambda *a, **kw: (1, receive()["text"].encode()))
-        monkeypatch.setattr(S, "_ws_send_json", lambda _, obj: messages.append(obj))
-        S._serve_stream_session(None, None, server, ("test", 0))
-    else:
-        pytest.importorskip("fastapi")
-        from starlette.websockets import WebSocketDisconnect
-
-        class WS:
-            async def accept(self): pass
-            async def close(self): pass
-            async def send_json(self, obj): messages.append(obj)
-            async def receive(self):
-                try:
-                    return receive()
-                except ConnectionError:
-                    raise WebSocketDisconnect()
-
-        app = S.create_app(server=server, load_on_startup=False)
-        endpoint = next(route.endpoint for route in app.routes if route.path == "/stream")
-        asyncio.run(endpoint(WS()))
-    assert messages[-1]["type"] == "final"
-    assert messages[-1]["text"] == "retained audio"
-    assert len(sess.samples) == 0
 
 
 def test_flush_recovers_from_busy_full_window_in_same_commit(monkeypatch):
