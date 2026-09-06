@@ -3,7 +3,6 @@
 Install the benchmark dependencies with `uv sync --locked --extra bench`.
 Use `--extra dev --extra bench` when you also need the test tools.
 
-
 These scripts support `--update-readme` to refresh the tables on this page.
 
 - **`benchmarks/bench_all.py`**: latency/RTFx grid. Sweeps model × engine ×

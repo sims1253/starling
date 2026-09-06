@@ -190,9 +190,9 @@ class Engine:
 class GraniteStarling(Engine):
     """starling fused megakernel pipeline (cudagraph encoder + K-step LLM).
 
-    Uses the chunked ``transcribe_long`` path (the production path the README
-    numbers use): it resets the static KV cache per chunk so peak VRAM is
-    constant and any audio length is transcribable. Short audio = 1 chunk;
+    Uses the chunked ``transcribe_long`` path (the production path used for the
+    numbers in ``docs/benchmarks.md``): it resets the static KV cache per chunk
+    so peak VRAM is constant and any audio length is transcribable. Short audio = 1 chunk;
     longer audio = several chunks concatenated.
     """
 
@@ -224,8 +224,8 @@ class GraniteStarlingSpec(Engine):
     The speculative companion to :class:`GraniteStarling`: drafts tokens from
     the encoder's CTC head and verifies them with the LLM in multi-token
     forwards. Appears as the ``starling (spec)`` column so the latency table
-    carries the speculative-vs-greedy comparison the README describes (spec is
-    slower on short audio, faster on long).
+    carries the speculative-vs-greedy comparison in ``docs/benchmarks.md``
+    (spec is slower on short audio, faster on long).
     """
 
     def __init__(self) -> None:
@@ -288,7 +288,7 @@ class GraniteStarlingBatched(Engine):
         # transcribe_long_batched decodes ONE clip; to time B independent clips
         # we tile the input B times into one B-chunk "long" audio. All B chunks
         # are identical (same transcript), so the per-stream RTFx is the batched
-        # throughput RTFx -- matching how the README batched numbers are derived.
+        # throughput RTFx -- matching the batched numbers in docs/benchmarks.md.
         tiled = wav.repeat(1, B) if B > 1 else wav
         res = transcribe_long_batched(pipe, self.processor, tiled, 16000)
         text = res.text.strip()
