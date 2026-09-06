@@ -12,7 +12,7 @@ spec.loader.exec_module(contract)
 
 
 def inputs():
-    return (ROOT / contract.WORKFLOW).read_text(), {name: (ROOT / name).read_text() for name in contract.DOCS}
+    return (ROOT / contract.WORKFLOW).read_text(encoding="utf-8"), {name: (ROOT / name).read_text(encoding="utf-8") for name in contract.DOCS}
 
 
 def test_current_release_contract():
@@ -54,3 +54,22 @@ def test_coordinated_version_update_passes():
     workflow = workflow.replace(version, '99.1.2').replace(series, '99.1')
     docs = {name: text.replace(series, '99.1') for name, text in docs.items()}
     assert contract.check(workflow, docs) == []
+
+
+@pytest.mark.parametrize("patch_offset", [0, 1])
+def test_release_preflight_checks_executing_workflow_version(monkeypatch, capsys, patch_offset):
+    workflow, _ = inputs()
+    version = re.search(r"CUDA_VERSION: '([^']+)'", workflow).group(1)
+    major, minor, patch = version.split(".")
+    executing = f"{major}.{minor}.{int(patch) + patch_offset}"
+    monkeypatch.setattr("sys.argv", ["check-contract.py", "--executing-cuda-version", executing])
+    result = contract.main()
+    captured = capsys.readouterr()
+    if patch_offset:
+        assert result == 1
+        assert f"Executing workflow CUDA_VERSION={executing!r}" in captured.err
+        assert f"checked-out release CUDA_VERSION={version!r}" in captured.err
+        assert "Dispatch from a workflow ref" in captured.err
+    else:
+        assert result == 0
+        assert captured.err == ""

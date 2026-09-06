@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check CUDA install pins and concrete runtime guidance against the release version."""
+import argparse
 from pathlib import Path
 import re
 import sys
@@ -9,11 +10,17 @@ WORKFLOW = ".github/workflows/release-starling-serve.yml"
 DOCS = ("docs/release-runtime.md", "docs/native-serving.md")
 
 
-def check(workflow: str, docs: dict[str, str]) -> list[str]:
+def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None) -> list[str]:
     errors = []
     versions = re.findall(r"^  CUDA_VERSION: ['\"]?(\d+\.\d+\.\d+)['\"]?\s*$", workflow, re.M)
     if len(versions) != 1:
         return [f"{WORKFLOW}: expected one CUDA_VERSION major.minor.patch in workflow env"]
+    if executing_cuda_version is not None and executing_cuda_version != versions[0]:
+        errors.append(
+            f"Executing workflow CUDA_VERSION={executing_cuda_version!r} differs from "
+            f"the checked-out release CUDA_VERSION={versions[0]!r}. "
+            "Dispatch from a workflow ref with the same CUDA_VERSION as the release tag."
+        )
     series = versions[0].rsplit(".", 1)[0]
 
     # Linux installs a series metapackage; Windows pins the toolkit patch.
@@ -40,7 +47,14 @@ def check(workflow: str, docs: dict[str, str]) -> list[str]:
 
 
 def main() -> int:
-    errors = check((ROOT / WORKFLOW).read_text(), {name: (ROOT / name).read_text() for name in DOCS})
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--executing-cuda-version",
+                        help="CUDA_VERSION from the executing release workflow; "
+                             "must match the checked-out release tag")
+    args = parser.parse_args()
+    errors = check((ROOT / WORKFLOW).read_text(encoding="utf-8"),
+                   {name: (ROOT / name).read_text(encoding="utf-8") for name in DOCS},
+                   args.executing_cuda_version)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

@@ -50,7 +50,9 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
           persist-credentials: false
       - name: Check runtime version guidance
-        run: python3 scripts/release-runtime/check-contract.py
+        run: >-
+          python3 scripts/release-runtime/check-contract.py
+          --executing-cuda-version "$CUDA_VERSION"
 
   # ---------------------------------------------------------------------------
   # Linux Vulkan (cross-vendor GPU path; x86_64 executable)
