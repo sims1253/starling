@@ -24,7 +24,7 @@ inline std::vector<int32_t> build_transcribe_prompt(const Config& c) {
 // Stock total-length bound: ceil(mel_T / 8) (from _prepare_generation_config:
 // num_audio_tokens = ceil(mel_len / audio_length_per_tok), used as the default
 // max_length and hard clamp). Offline the exact conv-chain token count is
-// mel_T/8, one under this bound.
+// mel_T/8, exactly equal to this bound.
 inline int64_t stock_max_length(int64_t mel_T) {
     if (mel_T <= 0) return 1;
     return (mel_T + 8 - 1) / 8;

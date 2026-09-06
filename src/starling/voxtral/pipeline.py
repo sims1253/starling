@@ -464,7 +464,9 @@ class VoxtralPipeline:
         mel_T = int(batch["input_features"].shape[-1])
         cap = generation_cap(prompt_len, mel_T, max_new_tokens)
         self._check_cache_fit(cap)
-        if self.use_precomputed_ada:
+        if cap <= prompt_len:
+            generated = []
+        elif self.use_precomputed_ada:
             generated = self._transcribe_fast(batch, cap)
         else:
             generated = self._transcribe_slow(batch, cap)

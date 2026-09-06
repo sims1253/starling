@@ -31,7 +31,8 @@ using GenerateResult = lib::GenerateResult;
 
 // Defaults are model-specific (max_cache_len 4096, EOS 2).
 struct GenerateOptions {
-    int32_t max_new_tokens = 200, max_cache_len = 4096, eos_token_id = 2;
+    // -1 uses the stock audio-derived cap; nonnegative values limit output.
+    int32_t max_new_tokens = -1, max_cache_len = 4096, eos_token_id = 2;
 };
 
 // Token-embedding lookup over `ids` with audio rows 0..P-1 added (bf16

@@ -231,10 +231,13 @@ def fast_pipe():
 
 
 @pytest.fixture(scope="module")
-def slow_pipe():
+def slow_pipe(fast_pipe):
     from starling.voxtral.pipeline import VoxtralPipeline
 
-    return VoxtralPipeline.from_pretrained(use_precomputed_ada=False)
+    # Both wrappers run sequentially; _frozen_ada restores the shared modules.
+    return VoxtralPipeline(
+        fast_pipe.model, fast_pipe.processor, use_precomputed_ada=False
+    )
 
 
 def _wav(name: str):
@@ -277,3 +280,61 @@ def test_parity_vs_stock_generate(fast_pipe, fixture):
     entry = golden["fixtures"][fixture]
     assert ids[0].tolist() == entry["ids"]
     assert text == entry["text"]
+
+
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("budget", [0, -1])
+def test_zero_budget_skips_model_forward(fast, budget):
+    import numpy as np
+    from starling.voxtral.pipeline import VoxtralPipeline
+
+    pipe = VoxtralPipeline.__new__(VoxtralPipeline)
+    pipe.use_precomputed_ada = fast
+    pipe.max_cache_len = 4096
+    pipe._prepare_batch = lambda wav: {
+        "input_ids": torch.ones(1, 39, dtype=torch.int64),
+        "input_features": torch.zeros(1, 128, 392),
+    }
+    class Tokenizer:
+        def decode(self, ids, **kwargs):
+            assert ids == []
+            return ""
+    pipe.tokenizer = Tokenizer()
+    text, ids = pipe.transcribe(np.zeros(1, dtype=np.float32), max_new_tokens=budget)
+    assert text == "" and ids.shape == (1, 0)
+
+
+def test_golden_capture_with_waveform_reader(monkeypatch, tmp_path):
+    """Exercise the capture entry point with its real waveform-only contract."""
+    import importlib.util
+    import json
+    import numpy as np
+    from starling.voxtral.pipeline import VoxtralPipeline
+
+    spec = importlib.util.spec_from_file_location(
+        "make_voxtral_golden", REPO_ROOT / "scripts" / "make_voxtral_golden.py"
+    )
+    capture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(capture)
+
+    class FakePipe:
+        model = type("Model", (), {"generate": lambda self, **kwargs: None})()
+        def _read_wav_or_array(self, path):
+            return np.zeros(16000, dtype=np.float32)
+        def _prepare_batch(self, wav):
+            assert wav.shape == (16000,)
+            return {"input_ids": torch.ones(1, 39),
+                    "input_features": torch.zeros(1, 128, 496),
+                    "num_delay_tokens": 6}
+        def transcribe_stock(self, path):
+            return " test ", torch.tensor([[123, 2]])
+
+    monkeypatch.setattr(VoxtralPipeline, "from_pretrained", lambda: FakePipe())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    capture.GOLDEN_PATH = tmp_path / "reference.json"
+    assert capture.main() == 0
+    entries = json.loads(capture.GOLDEN_PATH.read_text())["fixtures"]
+    assert set(entries) == {"short", "medium", "long"}
+    assert entries["short"]["seconds"] == 1.0
+    assert entries["short"]["ids"] == [123, 2]
+    assert entries["short"]["text"] == " test "

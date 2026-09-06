@@ -26,6 +26,12 @@
 #include <string>
 #include <vector>
 
+extern "C" {
+void* starling_ggml_voxtral_load(const char*, const char**);
+void starling_ggml_voxtral_free(void*);
+char* starling_ggml_voxtral_decode(void*, const float*, int64_t, const char**);
+}
+
 namespace {
 
 int failures = 0;
@@ -94,6 +100,23 @@ int main(int argc, char** argv) {
         return 1;
     }
     check(true, "tiny GGUF loads (decoder tensors validate)");
+    check(model.loader.tensor("llm.ada_ones") != nullptr,
+          "ada ones exists before weight realization");
+    {
+        // Reject before dereferencing PCM or allocating a large mel tensor.
+        MelFeatures unused;
+        float sample = 0.0f;
+        const size_t limit = (model.config.llm.max_cache - 49) * size_t(1280);
+        check(!compute_log_mel(model.config, model.loader, &sample, limit + 1,
+                               unused, err) && err.find("max_cache_len") != std::string::npos,
+              "over-cap audio rejected before reading PCM", err);
+        Config enlarged = model.config;
+        enlarged.llm.max_cache = 8192;
+        check(!compute_log_mel(enlarged, model.loader, &sample,
+                               (4096 - 49) * size_t(1280) + 1, unused, err)
+              && err.find("mask budget") != std::string::npos,
+              "mask budget checked before reading PCM with enlarged cache", err);
+    }
 
     Tokenizer tok;
     if (!tok.load(model.loader, model.config, err)) {
@@ -168,7 +191,6 @@ int main(int argc, char** argv) {
     }
     check(true, "inputs embeds build (embed + rows 0..P-1)");
     GenerateOptions options;
-    options.max_new_tokens = model.config.max_new_tokens;
     options.max_cache_len = model.config.llm.max_cache;
     options.eos_token_id = model.config.eos_token_id;
     GenerateResult got;
@@ -214,6 +236,38 @@ int main(int argc, char** argv) {
         std::printf("    text=%s\n", got_text.c_str());
     }
 
+    {
+        GenerateResult limited;
+        options.max_new_tokens = 0;
+        check(greedy_generate(model, inputs, audio, mel.n_frames, options, limited, err)
+              && limited.ids.empty(), "zero budget emits no tokens", err);
+        options.max_new_tokens = 1;
+        check(greedy_generate(model, inputs, audio, mel.n_frames, options, limited, err)
+              && limited.ids.size() == 1 && limited.ids[0] == want_ids[0],
+              "one-token budget respects oracle first token", err);
+        options.max_new_tokens = 0;
+        check(greedy_generate(model, inputs, audio, mel.n_frames, options, limited, err)
+              && limited.ids.empty(), "reused result clears previous tokens", err);
+    }
+    {
+        const char* error = nullptr;
+        void* handle = starling_ggml_voxtral_load(
+            (root + "/models/tiny/voxtral-tiny.gguf").c_str(), &error);
+        check(handle != nullptr, "C API loads tiny model", error ? error : "");
+        if (handle) {
+            char* text = starling_ggml_voxtral_decode(handle, pcm.data(), pcm.size(), &error);
+            check(text && std::string(text) == tok.decode(want_ids),
+                  "C API transcribes oracle text", error ? error : "");
+            std::free(text);
+            float sample = 0.0f;
+            text = starling_ggml_voxtral_decode(handle, &sample,
+                (model.config.llm.max_cache - 49) * int64_t(1280) + 1, &error);
+            check(!text && error && std::string(error).find("max_cache_len") != std::string::npos,
+                  "C API rejects over-cap audio before reading PCM");
+            std::free(text);
+            starling_ggml_voxtral_free(handle);
+        }
+    }
     starling::ggml::shutdown_backend();
     std::printf("%s\n", failures ? "ENGINE TEST FAILED" : "ENGINE TEST OK");
     return failures ? 1 : 0;

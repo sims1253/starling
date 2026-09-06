@@ -47,20 +47,6 @@ const lib::QwenDecodeSpec kSpec = {
     /*decode_add=*/true,
 };
 
-// Synthesize the llm.ada_ones leaf (1-D [hidden] f32 ones) the ada branch
-// adds to each layer's modulation (see apply_ada). A no-op when present;
-// owned until loader destruction, so captured prefill graphs keep a stable
-// source. 1-D keeps it at 12 KiB for the real model, inside the compat
-// context's 1 MiB budget. The const_cast follows the mel-constants precedent
-// (mel.cpp): the loader is logically mutated once (synthesis), then read-only.
-void ensure_ada_ones(const VoxtralModel& m) {
-    if (m.loader.tensor("llm.ada_ones")) return;
-    auto& ml = const_cast<ModelLoader&>(m.loader);
-    const int64_t H = m.config.llm.hidden;
-    ml.add_owned_tensor("llm.ada_ones", std::vector<float>((size_t)H, 1.0f),
-                        H, 1);
-}
-
 lib::QwenDecodeCtx decode_ctx(const VoxtralModel& m) {
     const auto& lc = m.config.llm;
     // Materialize the model's spec once. Stored on the model because the
@@ -69,7 +55,6 @@ lib::QwenDecodeCtx decode_ctx(const VoxtralModel& m) {
         m.decode_spec = kSpec;
         m.decode_spec_ready = true;
     }
-    ensure_ada_ones(m);
     return lib::QwenDecodeCtx{m.decode_spec, m.loader,
                               {lc.n_layers, lc.hidden, lc.n_heads, lc.n_kv_heads,
                                lc.head_dim, lc.max_cache, lc.rope_theta,
@@ -121,7 +106,8 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
                      const GenerateOptions& op, GenerateResult& out,
                      std::string& e) {
     const int64_t P = prefill.n_tokens;
-    const int64_t cap = generation_cap(P, mel_T);
+    out = GenerateResult{};
+    const int64_t cap = generation_cap(P, mel_T, op.max_new_tokens);
     // Mirror the pipeline's _check_cache_fit: the cap must fit the static KV.
     if (cap > op.max_cache_len) {
         e = "VOXTRAL total length cap " + std::to_string(cap) +
@@ -139,6 +125,7 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
         e = "VOXTRAL audio rows fewer than the total length cap";
         return false;
     }
+    if (cap <= P) return true;
     const lib::QwenDecodeCtx ctx = decode_ctx(m);
     lib::PrefillResult p;
     if (!lib::llm_prefill(ctx, prefill, op.max_cache_len, p, e)) return false;

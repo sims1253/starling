@@ -416,9 +416,12 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
     std::vector<float> cos_tab((size_t) T_enc * half), sin_tab((size_t) T_enc * half);
     for (int64_t p = 0; p < T_enc; ++p) {
         for (int64_t i = 0; i < half; ++i) {
-            const double inv = std::pow((double) ec.rope_theta,
-                                        -(2.0 * (double) i) / (double) Hd);
-            const double a = (double) p * inv;
+            // Stock computes a float32 power, then reciprocal, then the
+            // position product in float32 before sin/cos. Double precision
+            // here can cross a later bf16 rounding boundary.
+            const float inv = 1.0f / std::pow(ec.rope_theta,
+                                             (2.0f * (float) i) / (float) Hd);
+            const float a = (float) p * inv;
             cos_tab[(size_t) p * half + i] = (float) std::cos(a);
             sin_tab[(size_t) p * half + i] = (float) std::sin(a);
         }

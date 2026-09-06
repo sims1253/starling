@@ -62,7 +62,10 @@ void* starling_ggml_voxtral_load(const char* gguf_path, const char** err_out) {
         }
         // Persist weights + force backend creation (and its orderly atexit
         // shutdown registration) across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
+        if (!ctx->model->loader.realize_weights(starling::ggml::global_backend())) {
+            report_load_error(err_out, ctx->model->loader.last_error());
+            return nullptr;
+        }
         starling::ggml::register_decode_cache_clearer([]() {});
         if (err_out) *err_out = nullptr;
         return ctx.release();
@@ -122,7 +125,6 @@ char* starling_ggml_voxtral_decode(void* handle, const float* pcm, int64_t n,
         }
         auto a3 = now();
         GenerateOptions options;
-        options.max_new_tokens = static_cast<int32_t>(c->model->config.max_new_tokens);
         options.max_cache_len = static_cast<int32_t>(c->model->config.llm.max_cache);
         options.eos_token_id = c->model->config.eos_token_id;
         GenerateResult generated;
@@ -153,7 +155,8 @@ char* starling_ggml_voxtral_decode(void* handle, const float* pcm, int64_t n,
         c->err = e.what();
         report(err_out, c->err);
     } catch (...) {
-        report(err_out, "unknown exception transcribing VOXTRAL audio");
+        c->err = "unknown exception transcribing VOXTRAL audio";
+        report(err_out, c->err);
     }
     return nullptr;
 }

@@ -269,6 +269,10 @@ bool VoxtralModel::load(const char* path, std::string& err) {
 #undef LSHAPE
     }
 #undef SHAPE
+    // Create graph constants BEFORE the first realize_weights() call. Adding
+    // a leaf afterwards leaves a host pointer in an otherwise device graph.
+    loader.add_owned_tensor("llm.ada_ones",
+                            std::vector<float>((size_t) H, 1.0f), H, 1);
     return true;
 }
 } // namespace starling::ggml::voxtral

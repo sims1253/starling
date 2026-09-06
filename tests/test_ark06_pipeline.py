@@ -27,14 +27,7 @@ needs_cuda = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_PATH = REPO_ROOT / "golden" / "ark06_reference.json"
-# Fixtures live in the main starling checkout (the worktree shares the index but
-# not the working-tree untracked files like tests/fixtures).
-MAIN_REPO = Path("/home/m0hawk/Documents/starling")
-FIXTURES = MAIN_REPO / "tests" / "fixtures"
-if not FIXTURES.exists():
-    FIXTURES = REPO_ROOT.parent / "tests" / "fixtures"
-if not FIXTURES.exists():
-    FIXTURES = REPO_ROOT / "tests" / "fixtures"
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
 
 def _load_golden():
@@ -45,7 +38,7 @@ def _load_golden():
 
 
 @pytest.fixture(scope="module")
-def pipeline():
+def pipeline(golden):
     """Build and prewarm the MegaPipeline once for the whole module."""
     from starling.ark06.pipeline import MegaPipeline
 
@@ -87,7 +80,7 @@ def test_transcribe_byte_identical_to_golden(pipeline, golden, fixture):
     )
     # transcript text must also match (decoded from the same token ids)
     golden_text = golden[fixture]["text"]
-    assert text.strip() == golden_text.strip(), f"{fixture}: transcript text mismatch"
+    assert text == golden_text, f"{fixture}: transcript text mismatch"
 
 
 def test_bucket_mel_pads_to_grid_and_caps():
@@ -138,7 +131,7 @@ def test_bucketing_is_text_byte_exact(pipeline, fixture):
         buck_text, _ = pipeline.transcribe(wav, max_new_tokens=200)
     finally:
         pipeline.shape_bucketing = prev
-    assert buck_text.strip() == ref_text.strip(), (
+    assert buck_text == ref_text, (
         f"{fixture}: bucketed transcript differs from the unbucketed reference"
     )
 

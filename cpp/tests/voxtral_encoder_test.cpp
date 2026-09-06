@@ -252,10 +252,13 @@ int main(int argc, char** argv) {
         const double T_enc = ref.number("T_enc", ok_n);
         const auto T = (size_t) T_enc;
         std::vector<float> c_att0(T * T);
-        if (ok_n && c_prob.size() == T * T * 2)
+        if (ok_n && c_prob.size() == T * T * model.config.encoder.n_heads)
             for (size_t i = 0; i < T * T; ++i) c_att0[i] = c_prob[i];
         check_stage("l0 att0 (softmax head 0)", c_att0, s_att0);
     }
+    std::vector<float> all_prob;
+    if (ref.array("att_all0", all_prob))
+        check_stage("l0 attention (all heads)", c_prob, all_prob);
     check_stage("l0 ctx (attn out, pre-o_proj)", c_ctx0, s_ctx0);
     check_stage("l0 a (post-o_proj)", c_a0, s_a0);
     check_stage("l0 ffn (post-ffn-down)", c_ffn0, s_ffn0);

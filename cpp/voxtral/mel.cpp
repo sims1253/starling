@@ -112,6 +112,20 @@ void ensure_mel_constants(const Config& cfg, ModelLoader& ml) {
 
 bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
                      size_t S, MelFeatures& out, std::string& err) {
+    // Check the audio-derived cap before padding or allocating mel/attention.
+    // Quotient/remainder avoids overflowing on a foreign PCM length.
+    const size_t cap = S / 1280 + (S % 1280 != 0) + 49;
+    if (cap > cfg.llm.max_cache) {
+        err = "VOXTRAL total length cap " + std::to_string(cap) +
+              " exceeds max_cache_len " + std::to_string(cfg.llm.max_cache);
+        return false;
+    }
+    // T_enc = 4 * cap: a float32 [T_enc,T_enc] mask reaches
+    // the encoder's 1 GiB budget at cap == 4096.
+    if (cap > 4096) {
+        err = "VOXTRAL audio too long for the encoder mask budget; use shorter audio";
+        return false;
+    }
     ensure_mel_constants(cfg, const_cast<ModelLoader&>(ml));
     // Offline pad: ceil to whole 1280-sample audio tokens, plus the 32 left
     // + 17 right streaming-pad tokens of zeros.

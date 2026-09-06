@@ -17,6 +17,12 @@ proj input == d_model*downsample, per-tensor shapes match the metadata):
        loader-guard decode spot-checks still exercise CONTROL skipping).
   prompt_prefix: [1] + [32]*38 (same shape as the real prefix).
 
+Optional --wide-attention uses encoder width 192 on hidden 128 and decoder
+q-width 192 on hidden 128 to exercise non-square output projections. On the
+CPU backend the wider encoder exposes a softmax rounding discrepancy that
+amplifies past the stage tolerances; keep this as a bisect reproducer for GPU
+verification (do not relax tolerances). The greedy ids still match on CPU.
+
 Reference pipeline (0.5 s synthetic waveform, torch CPU, bf16 wherever the
 C++ oracle rounds):
   pcm (8000 samples) -> offline pad (ceil to 1280 + 49*1280 zeros) ->
@@ -64,10 +70,16 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
+    global N_HEADS, AW, LLM_Q
     ap = argparse.ArgumentParser()
     ap.add_argument("--output", type=Path, default=Path("models/tiny/voxtral-tiny.gguf"))
     ap.add_argument("--ref", type=Path, default=Path("models/tiny/voxtral-tiny-ref.json"))
+    ap.add_argument("--wide-attention", action="store_true",
+                    help="exercise attention widths larger than hidden, as in the real model")
     args = ap.parse_args()
+    if args.wide_attention:
+        N_HEADS, LLM_Q = 3, 12
+        AW = N_HEADS * HEAD_DIM
     torch.manual_seed(0xC0FFEE)
     g = torch.Generator().manual_seed(1234)
 
@@ -168,7 +180,8 @@ def main() -> None:
     ref["embedder"] = h.flatten().tolist()
 
     # RoPE tables + band mask.
-    inv = torch.pow(1000000.0, -2.0 * torch.arange(HEAD_DIM // 2).float() / HEAD_DIM)
+    # Stock rotary uses a float32 power followed by reciprocal.
+    inv = 1.0 / (1000000.0 ** (torch.arange(0, HEAD_DIM, 2).float() / HEAD_DIM))
     pos = torch.arange(T_enc).float().unsqueeze(1) * inv.unsqueeze(0)
     cos, sin = pos.cos(), pos.sin()
     # Stock emb = cat((freqs, freqs)): full-dim tables [T, head_dim].
@@ -222,6 +235,7 @@ def main() -> None:
         att = torch.softmax(att, dim=-1).to(torch.bfloat16)
         if i == 0:
             stages["att0"] = att[0].flatten().tolist()
+            stages["att_all0"] = att.flatten().tolist()
         ctx = (att @ vh).transpose(0, 1).reshape(T_enc, AW)
         if i == 0:
             stages["ctx0"] = ctx.flatten().tolist()

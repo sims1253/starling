@@ -47,7 +47,7 @@ def main() -> int:
 
     for name in FIXTURE_NAMES:
         path = FIXTURES / f"{name}.wav"
-        wav, _sr = pipe._read_wav_or_array(str(path))
+        wav = pipe._read_wav_or_array(str(path))
         batch = pipe._prepare_batch(wav)
         prompt_len = int(batch["input_ids"].shape[1])
         mel_T = int(batch["input_features"].shape[-1])

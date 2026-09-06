@@ -30,10 +30,7 @@ from starling.ark06.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MAIN_REPO = Path("/home/m0hawk/Documents/starling")
-FIXTURES = MAIN_REPO / "tests" / "fixtures"
-if not FIXTURES.exists():
-    FIXTURES = REPO_ROOT / "tests" / "fixtures"
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
 GOLDEN_PATH = REPO_ROOT / "golden" / "ark06_reference.json"
 
 
