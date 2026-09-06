@@ -57,7 +57,7 @@ python scripts/setup_env.py
 Compare kernel backends on a machine that has all three installed:
 
 ```bash
-uv run python benchmarks/bench_kernels.py
+uv run --extra bench python benchmarks/bench_kernels.py
 ```
 
 

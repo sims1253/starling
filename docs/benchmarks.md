@@ -1,5 +1,8 @@
 # Benchmarks
 
+Install the benchmark dependencies with `uv sync --locked --extra bench`.
+Use `--extra dev --extra bench` when you also need the test tools.
+
 
 These scripts support `--update-readme` to refresh the tables on this page.
 
@@ -19,9 +22,9 @@ These scripts support `--update-readme` to refresh the tables on this page.
   context). Splices the `BENCH:S1` block below.
 
 ```
-uv run python benchmarks/bench_all.py --update-readme
-uv run python benchmarks/bench_leaderboard.py                  # capped, fast
-uv run python benchmarks/bench_leaderboard.py --num-samples 0  # full splits
+uv run --extra bench python benchmarks/bench_all.py --update-readme
+uv run --extra bench python benchmarks/bench_leaderboard.py                  # capped, fast
+uv run --extra bench python benchmarks/bench_leaderboard.py --num-samples 0  # full splits
 ```
 
 RTFx = audio_seconds / transcribe_seconds (higher is faster). bf16, model load
