@@ -123,8 +123,10 @@ Kept at the source dtype on purpose:
 - **conv weights** (`conv` in the name): the conformer pointwise convs are
   `ggml_cast` to F16 and reshaped before their matmul, the depthwise/subsampling
   convs go through `ggml_conv_*` — no dequant path.
-- **the prediction embedding** `decoder.prediction.embed.weight`: read as a
-  raw F32 host table (`prediction.cpp`), not a matmul.
+- **the prediction embedding** `decoder.prediction.embed.weight`: the engine
+  expands it into a host F32 table (`prediction.cpp`). An explicit recipe
+  rule can change its storage dtype for `general.architecture=parakeet_tdt`;
+  named levels and recipe defaults keep its source dtype.
 - **batch-norm statistics, norms, biases, pos_bias_u/v**: 1-D host-folded or
   broadcast operands.
 - **mel constants** (`preprocessor.*`): the filterbank/window must stay exact.
@@ -171,6 +173,46 @@ parakeet) as F16 — they are consumed through F16 paths anyway (the pointwise
 convs are `ggml_cast` to F16, the depthwise/subsampling convs take F16
 kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 `ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
+
+### Experimental compact Parakeet recipe
+
+Quality evaluation on 300 English and 300 German test clips is pending.
+This recipe is an opt-in experiment, not a replacement for the released
+IQ2 build. The storage savings below do not establish equal accuracy.
+
+`benchmarks/recipes/parakeet-iq2-compact.recipe` stores the prediction
+embedding as Q8_0 and six 640-wide joint/LSTM matrices as IQ4_NL. IQ4_NL
+uses blocks of 32 elements, so these matrices fit without the Q8_0 fallback.
+The encoder stays IQ2_XXS and requires the same importance matrix as the
+existing IQ2 build. This recipe leaves named levels and their fallback
+rules unchanged. Other model architectures retain the embedding keep-list.
+
+```bash
+build-cpu/starling-quantize \
+  --input models/parakeet-tdt-0.6b-v3-f32.gguf \
+  --output models/parakeet-iq2-compact.gguf \
+  --recipe benchmarks/recipes/parakeet-iq2-compact.recipe \
+  --imatrix models/parakeet-imx-prod-25x48.bin --shrink-f16
+```
+
+Start from the original floating-point model. The quantizer cannot decode
+an already quantized source. Recipe rules use first-match precedence:
+place any F32 or Q8_0 precision overrides before the compact rules.
+An embedding rule must match explicitly; `default q8_0` alone keeps it.
+The embedding rule accepts Q8_0 or F32; other types fail with an error.
+The embedding has no collected importance entry because the engine reads
+it on the host. Q8_0 does not require one.
+
+For this model, the embedding saves 15.40 MB and the six linears save
+6.10 MB. The combined tensor saving is 21.51 MB, about 6.6% of the
+325.1 MB IQ2 build. MB here means decimal megabytes.
+
+For paired quality comparisons, `benchmarks/wer_quant.py --include-clips
+--json results.json` retains each corpus group's clip IDs, hashes of decoded
+audio, references, hypotheses, and unrounded per-clip WER. Match the IDs,
+audio hashes, and references across variants, then bootstrap the per-clip WER
+differences separately for each language. Overlap between independent
+confidence intervals does not establish equal quality.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 

@@ -1,0 +1,9 @@
+# Experimental, opt-in Parakeet TDT v3 compact storage; quality evaluation pending.
+# Requires --imatrix and, for the
+# conv-size reduction, --shrink-f16. Named quant levels remain unchanged.
+# Explicit rules preserve first-match precedence; put precision overrides first.
+default iq2_xxs
+^decoder\.prediction\.embed\.weight$ q8_0
+^decoder\.prediction\.dec_rnn\.lstm\.weight_(ih|hh)_l[01]$ iq4_nl
+^joint\.pred\.weight$ iq4_nl
+^joint\.joint_net\.2\.weight$ iq4_nl

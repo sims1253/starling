@@ -26,7 +26,8 @@
 // consumed via ggml_mul_mat by the engine. Kept at the source dtype:
 //   - conv weights ("conv." in the name) — engine casts/convs them as F16
 //   - the mel filterbank/window ("preprocessor.*")
-//   - the prediction-network embedding (host-side raw F32 table)
+//   - embeddings (Parakeet's prediction embedding can opt in via an explicit
+//     recipe rule; the engine dequantizes its host table through type traits)
 //   - pos_bias_u/v and every 1-D tensor (norms, biases, BN statistics)
 // A candidate whose row length is not a multiple of the block size (e.g. the
 // 640-row joint/LSTM linears vs Q4_K's 256 block) falls back to Q8_0, and to
@@ -38,10 +39,10 @@
 //   self_attn\.linear_q\.weight$ q6_k
 //   ^joint\. q8_0
 // Patterns are ECMAScript regexes matched with std::regex_search, first match
-// wins, applied on top of the same candidate gating as the named levels.
+// wins. An explicit rule can also select Parakeet's prediction embedding;
+// recipe defaults and other architectures retain the embedding keep-list.
 //
-// --shrink-f16 additionally stores the KEPT tensors (except the embedding and
-// preprocessor constants, which must stay exact F32) as F16.
+// --shrink-f16 additionally stores kept convolution weights as F16.
 
 #include "ggml.h"
 #include "gguf.h"
@@ -111,7 +112,8 @@ bool parse_type(const std::string& s, ggml_type* out) {
         {"q8_0", GGML_TYPE_Q8_0}, {"q6_k", GGML_TYPE_Q6_K},
         {"q5_k", GGML_TYPE_Q5_K}, {"q4_k", GGML_TYPE_Q4_K},
         {"q3_k", GGML_TYPE_Q3_K}, {"q2_k", GGML_TYPE_Q2_K},
-        {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq2_s", GGML_TYPE_IQ2_S},
+        {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq4_nl", GGML_TYPE_IQ4_NL},
+        {"iq2_s", GGML_TYPE_IQ2_S},
         {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq2_xxs", GGML_TYPE_IQ2_XXS},
         {"iq1_m", GGML_TYPE_IQ1_M}, {"iq1_s", GGML_TYPE_IQ1_S},
         {"q5_0", GGML_TYPE_Q5_0}, {"q4_0", GGML_TYPE_Q4_0},
@@ -144,7 +146,7 @@ bool is_candidate(const std::string& name, int64_t n_dims) {
     if (!is_linear_weight) return false;           // biases, pos_bias_u/v, ...
     if (name.find("conv") != std::string::npos) return false;       // cast/conv paths
     if (name.rfind("preprocessor.", 0) == 0) return false;          // mel constants
-    if (name.find("embed") != std::string::npos) return false;      // host F32 table
+    if (name.find("embed") != std::string::npos) return false;      // explicit opt-in only
     return true;
 }
 
@@ -154,7 +156,7 @@ bool shrink_eligible(const std::string& name, int64_t n_dims) {
     // (pointwise convs are ggml_cast to F16, depthwise/subsampling convs take
     // F16 kernels). Everything else stays F32: 1-D biases/norms/BN stats feed
     // ggml_add/ggml_mul broadcasts which reject mixed dtypes, pos_bias_u/v
-    // likewise, and the embedding table is a raw host read.
+    // likewise. Embedding precision is controlled separately by recipe rules.
     return n_dims >= 3 && name.find("conv") != std::string::npos &&
            ends_with(name, ".weight");
 }
@@ -354,6 +356,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: failed to open %s\n", args.input.c_str());
         return 1;
     }
+    const int64_t arch_key = gguf_find_key(in, "general.architecture");
+    const bool parakeet = arch_key >= 0 &&
+        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
+        std::strcmp(gguf_get_val_str(in, arch_key), "parakeet_tdt") == 0;
 
     // Output meta context: no_alloc tensors whose ->data we point at owned
     // host buffers until gguf_write_to_file.
@@ -392,6 +398,24 @@ int main(int argc, char** argv) {
 
         // Decide the target type.
         ggml_type want = (ggml_type)t->type;
+        // An explicit rule is required: a recipe's default must not newly
+        // quantize embeddings, which are not observed by the imatrix collector.
+        // Limit this exception to the engine whose host lookup dequantizes.
+        if (use_recipe && parakeet && n_dims == 2 &&
+            name == "decoder.prediction.embed.weight") {
+            for (const auto& rule : recipe.rules) {
+                if (std::regex_search(name, rule.first)) {
+                    if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32) {
+                        std::fprintf(stderr,
+                                     "error: Parakeet embedding recipe supports only q8_0 or f32\n");
+                        return 1;
+                    }
+                    candidates++;
+                    want = compat_type(rule.second, k, (ggml_type)t->type);
+                    break;
+                }
+            }
+        }
         if (is_candidate(name, n_dims)) {
             candidates++;
             if (use_recipe) {
