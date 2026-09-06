@@ -23,7 +23,8 @@ C++ oracle rounds):
   stock-formula mel (torch.stft center=True hann-400, mag^2 with the
   stft[..., :-1] trailing-TIME-frame drop canceling center's +1, log10 clamp
   1e-10, floor (1.5-8), (x+4)/4) -> embedder out -> each encoder layer out ->
-  final norm -> projector rows.
+  final norm -> projector rows -> whole-model text-decoder oracle (baked
+  39-id prompt + additive rows, offline greedy loop to EOS/cap) -> e2e_ids.
 The mel uses torch.stft (not the C++ pocketfft path), so the JSON mel checks
 the C++ frontend end-to-end (window/bank synthesis + STFT + fixed max).
 """
@@ -250,6 +251,168 @@ def main() -> None:
     pr = bf16(0.5 * pr.float() * (1.0 + torch.erf(pr.float() / math.sqrt(2.0))))
     pr = lin(pr, W["proj.fc2.weight"], None)
     ref["projected"] = pr.flatten().tolist()
+
+    # ---- Whole-model text-decoder oracle (E2E greedy ids) ---------------------
+    # Replicates the C++ text stack op-for-op at the tiny dims (2 layers,
+    # hidden 128, 8q/2kv x head_dim 16, inter 256, vocab 512, ada bottleneck
+    # 4, baked t_cond dim 128): the baked 39-id prompt ([1] + [32]*38) with
+    # projected rows 0..38 added, then the offline greedy loop (decode step t
+    # adds row P+t-1), stopping at EOS 2 or the stock cap mel_T//8.
+    # Numeric order mirrors the shared qwen_decode batch path: f32-accumulated
+    # GEMMs with one bf16 round after each linear/scale, exact GELU with a
+    # bf16 round, rope tables in f32 rounded once to bf16 with per-op bf16
+    # rounds through the rotate, two-round RMSNorms, bf16-rounded residual
+    # adds, and a bf16-rounded argmax with first-on-ties.
+    # (The module-level LLM_*/QW/KVW/VOCAB/ADA/TCOND constants above already
+    # carry the tiny decoder dims; this block only adds names for the loop.)
+    PROMPT = [1] + [32] * 38
+    EOS = 2
+
+    def rms2(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+        # Two-round RMSNorm (the text stack's discipline): f32 normalize,
+        # round, affine in the activation dtype, round.
+        y = x.float()
+        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
+        return bf16(bf16(y) * bf16(w))
+
+    def tlin(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        # Bias-free linear: f32-accumulated GEMM over bf16 operands, one
+        # bf16 round (the shared lin() helper's order).
+        return bf16(x.float() @ bf16(w).float().t())
+
+    def gelu_exact(x: torch.Tensor) -> torch.Tensor:
+        return bf16(0.5 * x.float() *
+                    (1.0 + torch.erf(x.float() / math.sqrt(2.0))))
+
+    def silu_bf16(x: torch.Tensor) -> torch.Tensor:
+        return bf16(torch.nn.functional.silu(x.float()))
+
+    # RoPE tables: std::pow-frequency f32 cos/sin rounded once to bf16,
+    # duplicated halves (matches the device tables + legacy host tables).
+    inv = torch.pow(1000000.0, -2.0 * torch.arange(LLM_HD // 2).float() / LLM_HD)
+    tpos = torch.arange(T_enc // DS).float().unsqueeze(1) * inv.unsqueeze(0)
+    tcos = bf16(torch.cat((tpos.cos(), tpos.cos()), dim=-1))
+    tsin = bf16(torch.cat((tpos.sin(), tpos.sin()), dim=-1))
+
+    def tlayer(h: torch.Tensor, i: int, kv_cache: list | None,
+               pos0: int, st: dict | None = None) -> tuple[torch.Tensor, list]:
+        p = f"llm.blk.{i}."
+        r = h
+        n = rms2(h, W[p + "attn_norm.weight"], 1e-5)
+        if st is not None and i == 0:
+            st["tn"] = n.flatten().tolist()
+        q = tlin(n, W[p + "attn.q.weight"])
+        k = tlin(n, W[p + "attn.k.weight"])
+        v = tlin(n, W[p + "attn.v.weight"])
+        T = h.shape[0]
+        # Rotate-half RoPE at ABSOLUTE positions [pos0, pos0+T), per-op bf16
+        # rounds: first = bf16(bf16(x1*cos) - bf16(x2*sin)),
+        # second = bf16(bf16(x2*cos) + bf16(x1*sin)).
+        def rope_abs(z: torch.Tensor) -> torch.Tensor:
+            Hh = z.shape[1] // LLM_HD
+            x = z.view(T, Hh, LLM_HD)
+            x1, x2 = x[..., :LLM_HD // 2], x[..., LLM_HD // 2:]
+            c = tcos[pos0:pos0 + T, :LLM_HD // 2].unsqueeze(1)
+            s = tsin[pos0:pos0 + T, :LLM_HD // 2].unsqueeze(1)
+            r1 = bf16(bf16(x1 * c) - bf16(x2 * s))
+            r2 = bf16(bf16(x2 * c) + bf16(x1 * s))
+            return torch.cat((r1, r2), dim=-1).reshape(T, Hh * LLM_HD)
+        qq, kk = rope_abs(q), rope_abs(k)
+        if kv_cache is not None:
+            kk = torch.cat((kv_cache[0], kk), dim=0)
+            vv0 = torch.cat((kv_cache[1], v), dim=0)
+        else:
+            vv0 = v
+        K = kk.shape[0]
+        # Batched-path scores: f32 GEMM, scale in f32, ONE bf16 round, f32
+        # causal mask add, f32 softmax, bf16 round; context: f32 GEMM, one
+        # bf16 round; heads concatenated (q-width, wider than hidden).
+        qh = qq.view(T, LLM_Q, LLM_HD).transpose(0, 1)  # [Q, T, D]
+        kh = kk.view(K, LLM_KV, LLM_HD).transpose(0, 1)  # [KV, K, D]
+        vh = vv0.view(K, LLM_KV, LLM_HD).transpose(0, 1)
+        rep = LLM_Q // LLM_KV
+        khr = kh.repeat_interleave(rep, dim=0)  # [Q, K, D] GQA broadcast
+        vhr = vh.repeat_interleave(rep, dim=0)
+        # Scores [Q, T, K]: f32 GEMM, scale in f32, ONE bf16 round.
+        sc = bf16(torch.einsum("qkd,qtd->qtk", khr.float(), qh.float()) *
+                  (1.0 / math.sqrt(LLM_HD)))
+        mask = torch.full((T, K), -3.3895313892515355e38)
+        for qi in range(T):
+            for j in range(min(K, pos0 + qi + 1)):
+                mask[qi, j] = 0.0
+        prb = bf16(torch.softmax(sc.float() + mask.unsqueeze(0), dim=-1))
+        ctx = bf16(torch.einsum("qtk,qkd->qtd", prb.float(), vhr.float()))
+        joined = ctx.transpose(0, 1).reshape(T, QW)
+        a = tlin(joined, W[p + "attn.o.weight"])
+        h = bf16(r.float() + a.float())
+        if st is not None and i == 0:
+            st["ta"] = a.flatten().tolist()
+            st["txmid"] = h.flatten().tolist()
+        # MLP branch: post-norm, ada scale, SwiGLU, residual.
+        r = h
+        n = rms2(h, W[p + "ffn_norm.weight"], 1e-5)
+        mod = tlin(gelu_exact(tlin(bf16(W["llm.t_cond"]), W[p + "ada.fc0.weight"])),
+                   W[p + "ada.fc2.weight"])
+        n = bf16(n.float() * (1.0 + mod.float()))
+        if st is not None and i == 0:
+            st["tscaled"] = n.flatten().tolist()
+        g = tlin(n, W[p + "ffn.gate.weight"])
+        u = tlin(n, W[p + "ffn.up.weight"])
+        d = tlin(bf16(silu_bf16(g) * u.float()), W[p + "ffn.down.weight"])
+        if st is not None and i == 0:
+            st["tdown"] = d.flatten().tolist()
+        h = bf16(r.float() + d.float())
+        return h, [kk, vv0]
+
+    def tlogits(h: torch.Tensor) -> torch.Tensor:
+        n = rms2(h[-1:], W["llm.final_norm.weight"], 1e-5)
+        return (n.float() @ bf16(W["llm.embed.weight"]).float().t()).squeeze(0)
+
+    def targmax(logits: torch.Tensor) -> int:
+        b = bf16(logits)
+        best, bv = 0, b[0].item()
+        for idx in range(1, b.numel()):
+            vv = b[idx].item()
+            if vv > bv:
+                best, bv = idx, vv
+        return best
+
+    P = len(PROMPT)
+    cap = (mel_T + 8 - 1) // 8  # stock total-length bound
+    emb = bf16(W["llm.embed.weight"])
+    pre_rows = [pr[j] for j in range(P)]
+    pre = bf16(torch.stack([emb[tok] + row for tok, row in zip(PROMPT, pre_rows)]))
+    ref["e2e_pre"] = pre.flatten().tolist()
+    caches: list | None = None
+    h, per_layer_kv = pre, []
+    pre_hiddens = []
+    # Text layer-0 per-stage bisect dumps (mirror the C++ L0 probe stages):
+    # post-attn-norm (n), post-o-proj pre-residual (a), post-residual (xmid),
+    # post-ffn-norm+ada (scaled), post-down pre-residual (down). Row-major
+    # [T, W] flats, comparable against the probe's [W, T] ggml flats (same
+    # element order: token t occupies [t*W, (t+1)*W)).
+    t0stages: dict[str, list[float]] = {}
+    for i in range(LLM_LAYERS):
+        h, kv = tlayer(h, i, None, 0, t0stages if i == 0 else None)
+        per_layer_kv.append(kv)
+        pre_hiddens.append(h.flatten().tolist())
+    ref["e2e_pre_hiddens"] = pre_hiddens
+    ref.update({"e2e_" + k[1:]: v for k, v in t0stages.items()})
+    ref["e2e_prefill_logits"] = tlogits(h).tolist()
+    gen: list[int] = [targmax(tlogits(h))]
+    while P + len(gen) < cap and gen[-1] != EOS:
+        tok = gen[-1]
+        step = bf16(emb[tok].unsqueeze(0) + pr[P + len(gen) - 1].unsqueeze(0))
+        h = step
+        new_kv = []
+        for i in range(LLM_LAYERS):
+            h, kv = tlayer(h, i, per_layer_kv[i], P + len(gen) - 1)
+            new_kv.append(kv)
+        per_layer_kv = new_kv
+        gen.append(targmax(tlogits(h)))
+    ref["e2e_prompt"] = PROMPT
+    ref["e2e_cap"] = cap
+    ref["e2e_ids"] = gen
 
     # ---- GGUF --------------------------------------------------------------------
     args.output.parent.mkdir(parents=True, exist_ok=True)

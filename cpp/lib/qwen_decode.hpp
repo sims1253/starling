@@ -72,6 +72,21 @@ struct QwenDecodeSpec {
     // decode caches, so a patched spec must live in the model, not a temp.
     const int32_t* banned_ids = nullptr;
     size_t n_banned = 0;
+    // Voxtral's AdaRMSNorm (MLP branch only): h = h * (1 + fc2(gelu(fc0(t_cond))))
+    // per layer, recomputed in-graph from the baked llm.t_cond leaf every
+    // forward (t_cond is fixed per utterance, so this matches the stock
+    // per-step recompute with no host round-trip). Off keeps every other
+    // engine's graph byte-identical: no ada branch runs. The suffixes name
+    // the per-layer ada weights under the layer prefix ("llm.blk.<i>." +
+    // suffix).
+    bool ada_rms_norm = false;
+    const char* ada_fc0_suffix = nullptr;
+    const char* ada_fc2_suffix = nullptr;
+    // Voxtral's additive audio injection: the decode step adds a per-step
+    // [hidden] audio row to the looked-up token embedding (llm_decode_step's
+    // audio_row); prefill embeds get their rows host-side. Off (and a null
+    // row) keeps every other engine's decode graph byte-identical.
+    bool decode_add = false;
 };
 
 // The config fields the decode graphs are shaped by.
@@ -114,6 +129,18 @@ struct GenerateParams {
 
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t max_cache_len,
                  PrefillResult& o, std::string& e);
+// One decode step from the previous token id: embed lookup (+ the per-step
+// audio row when spec.decode_add and audio_row != nullptr), one layer stack
+// pass over the device KV, lm_head logits out. `state.length` is the write
+// position (set by llm_prefill, advanced per step). Voxtral's offline loop
+// drives prefill + this directly (its per-step audio rows cannot ride the
+// shared greedy_generate).
+bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
+                     const float* audio_row, LlmState& state,
+                     std::vector<float>& logits, std::string& e);
+// Greedy pick over host logits under the spec's tie/suppression policy
+// (bf16-round + first-on-ties when argmax_low_ties; banned ids skipped).
+int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x);
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i, const GenerateParams& op,
                      GenerateResult& o, std::string& e);
 // Number of captured per-S prefill graphs for this spec (diagnostic + the
