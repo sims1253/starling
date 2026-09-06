@@ -925,53 +925,41 @@ def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:  # noqa: 
 
 
 def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:  # noqa: ANN001
-    """Two concurrent warmup() calls run the GPU body exactly once.
-
-    The dedup guards *concurrent in-flight* calls. To exercise it reliably we
-    hold the first caller inside the (faked) GPU work on an Event until the
-    second caller has had a chance to observe ``_warmup_in_progress`` and bail.
-    Without this latch the first call can finish and clear the flag before the
-    second checks it, making the assertion race-dependent (the dedup is still
-    correct — it only guarantees dedup while a call is genuinely in flight).
-    """
+    """The second warmup returns while the first is still in GPU work."""
     server, counters = _make_warmable_server(monkeypatch)
-
-    in_gpu_work = threading.Event()  # the fake body sets this when it starts
-    release_gpu_work = threading.Event()  # the test releases it after a beat
-    barrier = threading.Barrier(2)
-
-    real_fake_transcribe = StarlingServer._transcribe_np
+    in_gpu_work = threading.Event()
+    release_gpu_work = threading.Event()
+    second_done = threading.Event()
 
     def blocking_fake_transcribe(self, _samples: np.ndarray, *, _streaming: bool = False) -> TranscribeResult:  # noqa: ANN001, ARG001
-        in_gpu_work.set()  # signal that the first call is inside the GPU work
-        release_gpu_work.wait(timeout=5.0)  # hold until the test releases us
+        in_gpu_work.set()
+        assert release_gpu_work.wait(timeout=10.0), "GPU work was never released"
         counters["transcribe"] += 1
         return TranscribeResult(text="warm")
 
     monkeypatch.setattr(StarlingServer, "_transcribe_np", blocking_fake_transcribe)
 
-    def call_warmup() -> None:
-        barrier.wait()  # line up both threads, then race into warmup()
+    def second_warmup() -> None:
         server.warmup()
+        second_done.set()
 
-    t1 = threading.Thread(target=call_warmup)
-    t2 = threading.Thread(target=call_warmup)
-    t1.start()
-    t2.start()
+    first = threading.Thread(target=server.warmup, daemon=True)
+    second = threading.Thread(target=second_warmup, daemon=True)
+    first.start()
+    try:
+        assert in_gpu_work.wait(timeout=5.0), "first caller never entered GPU work"
+        second.start()
+        assert second_done.wait(timeout=5.0), "second caller did not deduplicate"
+        assert counters["transcribe"] == 0
+    finally:
+        release_gpu_work.set()
+        first.join(timeout=5.0)
+        if second.ident is not None:
+            second.join(timeout=5.0)
 
-    # Wait until one thread has entered the GPU body (flag is now set), then
-    # give the other thread a moment to observe the flag and dedup out.
-    assert in_gpu_work.wait(timeout=5.0), "first caller never entered GPU work"
-    release_gpu_work.set()  # let the in-flight call finish
-
-    t1.join(timeout=10.0)
-    t2.join(timeout=10.0)
-
-    # Restore the original fake so later tests in the session get the simple counter.
-    monkeypatch.setattr(StarlingServer, "_transcribe_np", real_fake_transcribe)
-
-    assert counters["transcribe"] == 1  # deduped: GPU work ran once
-    assert server._warmup_in_progress is False  # flag reset afterward
+    assert not first.is_alive() and not second.is_alive()
+    assert counters["transcribe"] == 1
+    assert server._warmup_in_progress is False
 
 
 def test_warmup_second_call_after_first_completes_runs_again(monkeypatch) -> None:  # noqa: ANN001

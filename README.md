@@ -330,13 +330,22 @@ python -m starling.server --model parakeet --profile realtime --warmup
 python -m starling.server --model moss --profile batch  # SDPA + fused fp8
 ```
 
+On multi-GPU hosts, set `CUDA_VISIBLE_DEVICES` to a full GPU UUID from
+`nvidia-smi -L`, for example `CUDA_VISIBLE_DEVICES=GPU-... python -m starling.server`.
+The process lock rejects numeric masks on these hosts because CUDA ordinals
+can differ from `nvidia-smi` order. Automatic locking also requires working
+NVIDIA discovery. If it fails, inference returns JSON 500 and the server log
+contains the configuration error. `STARLING_GPU_LOCK_DISABLE=1` bypasses this
+lock when GPU access is serialized externally; it is also needed on Windows,
+where POSIX flock is unavailable.
+
 Endpoints (FastAPI when available, stdlib fallback):
 
 | Method + path             | Purpose |
 | ------------------------- | ------- |
 | `GET  /` `/health`        | liveness + `phase` (`loading_weights`/`warming_up`/`ready`) and `queue_depth` |
 | `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
-| `POST /transcribe`        | raw WAV bytes -> same shape as `/inference` |
+| `POST /transcribe`        | multipart or raw WAV -> same shape as `/inference` |
 | `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202, or 409 when the model is not loaded) |
 | `DELETE /inference/<id>`  | cancel a queued or running request by its `X-Request-Id` |
 | `WS   /stream`            | real-time streaming dictation |
@@ -357,12 +366,17 @@ an upstream proxy enforces its own timeout. The API has no authentication, so
 binding a non-loopback `--host` emits a warning and should only be done behind
 an authenticated proxy.
 
+A WebSocket `commit` returns a final transcript only after all buffered audio
+has been transcribed. If retries remain busy, the server sends
+`{"type":"error","message":"server busy"}` and retains the audio. Retry `commit`
+after a delay; use `reset` only to discard the buffered session.
+
 Profiles provide supported defaults for the main workloads:
 
 | profile | intended workload | graph/optimization policy |
 | ------- | ----------------- | ------------------------- |
 | `file` (default) | one-shot files | adaptive graphs, strict flags |
-| `realtime` | low-latency dictation | graphed recurring windows + SDPA |
+| `realtime` | low-latency dictation | graphed recurring windows + tolerance-mode SDPA |
 | `batch` | long-form offline throughput | graphed chunks + tolerance-mode SDPA, plus graph-safe fused fp8 weights on granite/moss |
 | `accuracy` | baseline numerical behavior | adaptive graphs, approximate options disabled |
 

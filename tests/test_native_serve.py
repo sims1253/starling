@@ -653,8 +653,20 @@ def test_websocket_stream_cap(binary: Path, model: str, tr: TestResults):
                 await ws.send(json.dumps({"type": "commit"}))
                 resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
                 data = json.loads(resp)
-                tr.check("ws commit after reset → final",
-                         data.get("type") == "final", str(data))
+                tr.check("ws unavailable model → busy commit error",
+                         data == {"type": "error", "message": "server busy"}, str(data))
+                # An incomplete commit retains the audio: a second commit
+                # must retry it, rather than emitting an empty final.
+                await ws.send(json.dumps({"type": "commit"}))
+                data = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                tr.check("ws failed commit retains audio for retry",
+                         data == {"type": "error", "message": "server busy"}, str(data))
+                await ws.send(json.dumps({"type": "reset"}))
+                await asyncio.wait_for(ws.recv(), timeout=5.0)
+                await ws.send(json.dumps({"type": "commit"}))
+                data = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+                tr.check("ws explicit reset discards pending audio",
+                         data.get("type") == "final" and data.get("text") == "", str(data))
 
         asyncio.run(run())
     except Exception as e:
@@ -960,29 +972,31 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
 
     pcm = pcm16_bytes(samples)
     chunk = 16000 // 2 * 2  # 0.5 s of PCM16 bytes per frame
-    send_seconds = min(6.5, len(samples) / 16000.0)  # > min-chunk (5 s)
 
     async def run():
         uri = f"ws://{host}:{port}/stream"
         async with websockets.connect(uri, max_size=None) as ws:
             frames: list[dict] = []
 
-            async def drain(timeout=0.5):
-                try:
-                    while True:
-                        frames.append(
-                            json.loads(await asyncio.wait_for(ws.recv(),
-                                                              timeout=timeout)))
-                except asyncio.TimeoutError:
-                    pass
-
-            sent = 0.0
-            for off in range(0, int(send_seconds * 16000) * 2, chunk):
+            for off in range(0, len(pcm), chunk):
                 await ws.send(pcm[off: off + chunk])
-                sent += 0.5
-                await drain(0.1)
+            sent = len(samples) / 16000.0
+            await ws.send(json.dumps({"type": "commit"}))
+            deadline = time.monotonic() + 60.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("stream commit did not finish within 60 seconds")
+                final = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                if final.get("type") == "partial":
+                    frames.append(final)
+                    continue
+                if final == {"type": "error", "message": "server busy"}:
+                    await asyncio.sleep(0.05)
+                    await ws.send(json.dumps({"type": "commit"}))
+                    continue
+                break
 
-            await drain(1.0)
             partials = [f for f in frames if f.get("type") == "partial"]
             tr.check("ws streaming produced partials", len(partials) >= 1,
                      f"frames={[f.get('type') for f in frames]}")
@@ -991,8 +1005,6 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
                          len(partials[-1].get("text", "").strip()) > 0,
                          str(partials[-1])[:200])
 
-            await ws.send(json.dumps({"type": "commit"}))
-            final = json.loads(await asyncio.wait_for(ws.recv(), timeout=60.0))
             tr.check("ws commit → final", final.get("type") == "final",
                      str(final)[:200])
             text = final.get("text", "")
@@ -1009,7 +1021,6 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
 
             # reset mid-stream: audio buffered before the reset is discarded.
             await ws.send(pcm[: chunk * 2])  # 1 s of audio
-            await asyncio.sleep(0.2)
             await ws.send(json.dumps({"type": "reset"}))
             resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
             tr.check("ws mid-stream reset → reset_ack",

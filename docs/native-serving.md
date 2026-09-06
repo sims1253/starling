@@ -179,7 +179,9 @@ cap. It only fires when the un-finalized buffer itself grows past the limit
 transcription never succeeds).
 
 Control frames (JSON text):
-- `{"type":"commit"}` — finalize all buffered audio (returns final)
+- `{"type":"commit"}` — finalize all buffered audio. Returns `final` on success;
+  if bounded retries stay busy, returns `{"type":"error","message":"server busy"}`
+  and retains the audio. Retry `commit` after a delay.
 - `{"type":"reset"}` — discard buffer without finalizing (returns reset_ack;
   also re-enables audio after a buffer-cap error)
 - `{"type":"ping"}` — heartbeat (returns pong)
@@ -194,11 +196,11 @@ cpp/serve/
 └── audio.hpp/.cpp      — WAV/PCM decoding (dr_wav) + multipart extraction
 ```
 
-The streaming session logic (`ChunkStreamer` + `StreamSession`) is a faithful C++
-port of `src/starling/stream_chunk.py` and the streaming portions of
-`src/starling/server.py`. The fixed-window overlapping-chunk strategy bounds
-work to O(N), keeps per-transcribe prompts bounded, and enables cudagraph
-encoder reuse.
+The C++ and Python streaming sessions use fixed overlapping windows, including
+during busy retries. Successful windows advance the committed boundary;
+incomplete commits preserve the remaining audio for a later retry. Transcript
+stitching uses matching words rather than timestamps, so disagreements between
+neighboring windows can still omit or duplicate words.
 
 ## Pre-converted GGUF files
 
