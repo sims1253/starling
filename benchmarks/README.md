@@ -1,5 +1,17 @@
 # Benchmarks
 
+Install benchmark and corpus-generation dependencies before running these tools:
+
+```sh
+uv sync --locked --extra bench
+uv run --extra bench python benchmarks/bench_all.py --help
+```
+
+Use `--extra dev --extra bench` when running tests that also download corpora or
+score transcripts. The `dev` extra alone covers the CPU CI suite. Model execution
+still requires the hardware and model files described in the main README.
+`librosa` remains a runtime dependency because the Higgs model imports it.
+
 Maintained entry points:
 
 - `bench_all.py`: unified latency/RTFx regression grid and [benchmark table](../docs/benchmarks.md) source.
