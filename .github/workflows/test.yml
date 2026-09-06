@@ -67,7 +67,18 @@ jobs:
         # paths, and the CPU-only robustness/lifecycle regressions.
         # test_s1_config.py: pure-Python s1 prompt-contract tests (control
         # line, chunking, budget formula) — no model, no goldens.
-        run: uv run python -m pytest tests/test_server_routing.py tests/test_server_robustness.py tests/test_server_lifecycle.py tests/test_s1_config.py -q
+        run: >-
+          uv run python -m pytest -q
+          tests/test_server_routing.py tests/test_server_robustness.py
+          tests/test_server_lifecycle.py tests/test_stream_chunk.py
+          tests/test_s1_config.py tests/test_autotune.py tests/test_flags.py
+          tests/test_fp4_quantization.py
+          tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
+          tests/test_ggml_patches.py
+
+      - name: POSIX GPU lock lifecycle tests
+        if: runner.os == 'Linux'
+        run: uv run python -m pytest tests/test_gpu_session.py tests/test_gpu_lock.py -q
 
       - name: Import smoke (kernel backend dispatches per-OS)
         # Only call have_triton() + get_backend_name() (NOT get_backend()) --

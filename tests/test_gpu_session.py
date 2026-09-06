@@ -401,3 +401,42 @@ def test_runner_allows_nested_legacy_lock_without_deadlock(tmp_path) -> None:
     ], capture_output=True, text=True, timeout=10)
     assert proc.returncode == 0, proc.stderr
     assert "NESTED_OK" in proc.stdout
+
+
+@pytest.mark.parametrize("wait", [False, True])
+def test_failed_acquire_closes_its_descriptor(tmp_path, monkeypatch, wait):
+    from starling.gpu.session import GpuLockTimeout
+
+    with GpuSession(session="holder", lock_dir=str(tmp_path), uuid="busy", heartbeat=False):
+        opened = []
+        real_open = os.open
+
+        def record_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, "open", record_open)
+        contender = GpuSession(session="contender", lock_dir=str(tmp_path), uuid="busy",
+                               wait=wait, max_wait_sec=0, heartbeat=False)
+        with pytest.raises(GpuLockTimeout if wait else GpuLockBusy):
+            contender.acquire()
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
+
+    # The failed object can still be used once the holder leaves.
+    with contender:
+        assert contender.owner_id
+
+
+def test_released_session_can_be_collected(tmp_path):
+    import gc
+    import weakref
+
+    session = GpuSession(session="temporary", lock_dir=str(tmp_path), uuid="collect")
+    with session:
+        reference = weakref.ref(session)
+    del session
+    gc.collect()
+    assert reference() is None

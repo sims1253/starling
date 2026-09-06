@@ -173,7 +173,7 @@ def _gpu_lock_model(slug: str) -> str:
 class ModelBackend:
     """Loads one model pipeline and transcribes 1-D float32 mono audio.
 
-    Subclasses override :meth:`load`, :meth:`transcribe`, and :meth:`prewarm`.
+    Subclasses override :meth:`load` and :meth:`transcribe`.
     Audio arrives as a contiguous float32 numpy array at ``SAMPLE_RATE`` Hz;
     the return is a :class:`TranscribeResult` (text + chunk-level segments).
     Heavy ``torch`` / model imports happen inside :meth:`load` so ``--help``
@@ -199,10 +199,6 @@ class ModelBackend:
 
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         raise NotImplementedError
-
-    def prewarm(self, samples: np.ndarray) -> None:
-        """Default warmup: one transcribe on a short silent clip."""
-        self.transcribe(samples)
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
         """Pick graphed vs eager for the coming transcribe. No-op by default;
@@ -391,9 +387,7 @@ class ParakeetBackend(ModelBackend):
             self._check_stopped()
             texts = self.pipe.transcribe([audio])
             text = texts[0] if texts else ""
-        # Parakeet's TDT decoder has no chunk-window segment contract exposed
-        # here, so we return a single whole-utterance segment (the server's
-        # streaming partials still carve the timeline via the rolling buffer).
+        # Both Parakeet pipelines expose text without chunk timestamps.
         return TranscribeResult(
             text=text,
             segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
@@ -401,7 +395,7 @@ class ParakeetBackend(ModelBackend):
         )
 
 
-class ParakeetUnifiedBackend(ModelBackend):
+class ParakeetUnifiedBackend(ParakeetBackend):
     """parakeet-unified-en-0.6b: NeMo-free megakernel (FastConformer-RNN-T)."""
 
     slug = "parakeet_unified"
@@ -429,27 +423,6 @@ class ParakeetUnifiedBackend(ModelBackend):
                 overlap_seconds=overlap_seconds,
             )
         return self.chunker
-
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
-        assert self.pipe is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        audio = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = len(audio) / SAMPLE_RATE
-        max_chunk_seconds = self._configured_chunk_seconds()
-        if audio_seconds > max_chunk_seconds:
-            text = self._get_chunker().transcribe(
-                audio, sr=SAMPLE_RATE, should_stop=self._check_stopped
-            )
-        else:
-            self._check_stopped()
-            texts = self.pipe.transcribe([audio])
-            text = texts[0] if texts else ""
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
 
 
 class MossBackend(ModelBackend):
@@ -823,7 +796,6 @@ class StarlingServer:
     _load_lock: threading.Lock = field(default_factory=threading.Lock)
 
     # --- request queueing -------------------------------------------------
-    _n_waiters: int = 0
     _requests: dict[str, "RequestContext"] = field(default_factory=dict)
     _request_order: list[str] = field(default_factory=list)
     _queue_changed: threading.Condition = field(init=False, repr=False)
@@ -976,11 +948,10 @@ class StarlingServer:
         deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         ctx = RequestContext(rid, deadline=deadline)
         with self._queue_changed:
-            if self._n_waiters >= MAX_WAITERS:
+            if len(self._requests) >= MAX_WAITERS:
                 raise _Busy()
             if ctx.id in self._requests:
                 raise _DuplicateRequest(ctx.id)
-            self._n_waiters += 1
             self._requests[ctx.id] = ctx
             self._request_order.append(ctx.id)
             self._queue_changed.notify_all()
@@ -988,7 +959,6 @@ class StarlingServer:
             return self._serial_run(ctx, samples, streaming=streaming)
         finally:
             with self._queue_changed:
-                self._n_waiters = max(0, self._n_waiters - 1)
                 self._requests.pop(ctx.id, None)
                 if ctx.id in self._request_order:
                     self._request_order.remove(ctx.id)
@@ -1059,7 +1029,7 @@ class StarlingServer:
 
     def is_busy(self) -> bool:
         with self._lock:
-            return self._n_waiters > 0
+            return bool(self._requests)
 
     def phase(self) -> str:
         with self._lock:
@@ -1404,17 +1374,10 @@ def create_app(
     async def _inference(request):  # noqa: ANN001
         payload = await _decode_inference_body(request)
         if not payload:
-            raise HTTPException(status_code=400, detail="empty upload")
-        rid = _request_id(request)
-        status, response = await asyncio.to_thread(
-            _transcribe_payload_sync, server, payload, rid
-        )
-        return JSONResponse(response, status_code=status)
-
-    async def _transcribe(request):  # noqa: ANN001
-        payload = await _decode_inference_body(request)
-        if not payload:
-            raise HTTPException(status_code=400, detail="empty request body")
+            raise HTTPException(
+                status_code=400,
+                detail="empty upload" if request.url.path == "/inference" else "empty request body",
+            )
         rid = _request_id(request)
         status, response = await asyncio.to_thread(
             _transcribe_payload_sync, server, payload, rid
@@ -1432,10 +1395,9 @@ def create_app(
         )
 
     _inference.__annotations__["request"] = Request
-    _transcribe.__annotations__["request"] = Request
     _abort.__annotations__["request"] = Request
     app.add_api_route("/inference", _inference, methods=["POST"])
-    app.add_api_route("/transcribe", _transcribe, methods=["POST"])
+    app.add_api_route("/transcribe", _inference, methods=["POST"])
     app.add_api_route("/inference/{id}", _abort, methods=["DELETE"])
 
     async def _stream(ws):  # noqa: ANN001
@@ -1926,24 +1888,17 @@ def _build_stdlib_handler(server: StarlingServer):
                 or uuid.uuid4().hex
             )
 
-            if self.path == "/inference":
+            if self.path in ("/inference", "/transcribe"):
                 ctype = self.headers.get("Content-Type", "")
                 if "multipart/form-data" in ctype:
                     payload = _extract_multipart_payload(body, ctype)
                 else:
                     payload = body
                 if not payload:
-                    self._send_json(400, {"error": "empty upload", "text": ""})
+                    error = "empty upload" if self.path == "/inference" else "empty body"
+                    self._send_json(400, {"error": error, "text": ""})
                     return
                 status, response = _transcribe_payload_sync(server, payload, rid)
-                self._send_json(status, response)
-                return
-
-            if self.path == "/transcribe":
-                if not body:
-                    self._send_json(400, {"error": "empty body", "text": ""})
-                    return
-                status, response = _transcribe_payload_sync(server, body, rid)
                 self._send_json(status, response)
                 return
 

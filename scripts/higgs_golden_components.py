@@ -217,8 +217,6 @@ def verify_saved(gdir: Path) -> None:
 def main() -> int:
     from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-    import transcribe as higgs_transcribe  # noqa: E402  (warms the collator cache)
-
     gdir = REPO / "golden"
     gdir.mkdir(exist_ok=True)
     rows: list[tuple[str, str, str, str]] = []

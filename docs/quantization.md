@@ -384,9 +384,11 @@ EN/DE at 300 clips (f32: DE 5.30 [4.45–6.14], EN 6.50 [5.59–7.44]):
 | iq2xxs +imxENDE | 9.20 [8.08–10.34]    | 7.77 [6.83–8.81]        |
 | iq2xxs +imx25| 9.30 [8.14–10.49]       | 8.38 [7.36–9.57]        |
 
-What survives, now with statistical teeth:
+Results from the larger evaluation:
 
-- **q4_k_m is free** for both languages (Δ ≤ 0.07) — bulletproof.
+- **q4_k_m differs by at most 0.07 WER percentage points** in these two
+  language samples. This does not establish lossless quantization for other
+  inputs or languages.
 - **q2_k: English free, German +0.7–1.25**, tail languages +4–7 on the worst
   (lt 22.5→29.1 [26.1–32.2], sl →30.2, ro →17.5 — CIs separate from f32).
   25-language mean 16.90 vs f32's 14.00 (+2.90 at 48 clips/lang, matching
@@ -403,17 +405,6 @@ all-25 land at 9.45 / 9.20 / 9.30 German with fully overlapping CIs, and
 English likewise. At these bit widths the calibration LANGUAGE MIX for
 EN/DE is not a measurable lever once the matrix exists at all; the effects
 that matter are calibrated-vs-uniform (huge) and the bit width itself.
-
-Takeaways:
-
-- **q4_k_m is free**: 704 MB (28% of F32) with zero measurable loss on noisy
-  English AND German. This matches the community GGUF results for parakeet.
-- **At 2 bits, calibration is decisive**: uniform q2_k breaks down
-  (30%/17%) while the imatrix-weighted q2_k matches f32 exactly at the same
-  574 MB, and the calibrated floor reaches 325 MB (13% of F32) before the
-  IQ1 cliff.
-- **At the floor, calibration data must be multilingual** (see the German
-  table): an English-only imatrix cost 16 German WER points at iq2_xxs.
 
 ## Extending to the other engines
 

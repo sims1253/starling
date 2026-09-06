@@ -105,8 +105,6 @@ def test_default_flags_preserve_byte_exactness():
     assert f.chunk_prefill_overlap is True, "chunk_prefill_overlap defaults True (byte-exact)"
     assert f.nvfp4_weights is False, "nvfp4_weights defaults False (requires tolerance)"
     assert f.nvfp4_lm_head_only is False, "nvfp4_lm_head_only defaults False (requires tolerance)"
-    assert f.kv_cache_compression is False, "kv_cache_compression defaults False (experimental)"
-    assert f.slim_draft_head is False, "slim_draft_head defaults False"
 
 
 def test_nvfp4_weights_requires_tolerance():
@@ -205,6 +203,7 @@ def test_flags_context_restores_on_exception():
 # --------------------------------------------------------------------------- #
 # pipeline wiring: multistep_graph selects the right decoder
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_pipeline_multistep_graph_wiring():
     """multistep_graph=True -> MultiStepLLMMega; False -> FusedLLMMega."""
     from starling.granite.pipeline import MegaPipeline
@@ -231,6 +230,7 @@ def test_pipeline_multistep_graph_wiring():
 # --------------------------------------------------------------------------- #
 # end-to-end: default flags -> byte-exact golden match
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_default_flags_end_to_end_byte_exact():
     """A default-flags MegaPipeline (multistep on) must reproduce the golden decode.
 

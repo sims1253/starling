@@ -65,32 +65,25 @@ if(NOT DEFINED GGML_LLAMAFILE)
 endif()
 
 # --------------------------------------------------------------------------- #
-# Apply the in-tree ggml patches BEFORE configuring the submodule so the patched
-# source is what gets compiled. Idempotent: already-applied patches are skipped.
-# (Carried from parakeet.cpp scripts/apply_ggml_patches.sh.)
-#
-# NOTE for Windows CI: invoke `bash scripts/apply_ggml_patches.sh` explicitly
-# under Git Bash first — CMake's find_program(bash) can pick up the stub
-# WSL bash.exe in System32 and silently skip the patches (parakeet.cpp's
-# documented landmine). On Windows a non-zero patch result stays a WARNING
-# (that same bash.exe environment issue can cause spurious failures); on
-# Unix it is FATAL_ERROR — we refuse to silently ship an unpatched ggml.
-# --------------------------------------------------------------------------- #
-find_program(BASH_EXECUTABLE bash)
-if(BASH_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/scripts/apply_ggml_patches.sh")
-  execute_process(
-    COMMAND "${BASH_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/apply_ggml_patches.sh"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    RESULT_VARIABLE _patch_result
-    OUTPUT_VARIABLE _patch_output
-    ERROR_VARIABLE _patch_output)
-  if(NOT _patch_result EQUAL 0)
-    if(WIN32)
-      message(WARNING "ggml patch apply returned ${_patch_result} (skipped on Windows):\n${_patch_output}")
-    else()
-      message(FATAL_ERROR "ggml patch apply failed (rc=${_patch_result}). Refusing to build an unpatched ggml:\n${_patch_output}")
-    endif()
-  endif()
+# Validate/apply the complete patch series before configuring ggml.
+# Prefer Git Bash on Windows over the System32 WSL launcher. An explicit
+# -DBASH_EXECUTABLE remains available for nonstandard installations.
+if(WIN32 AND NOT BASH_EXECUTABLE)
+  find_package(Git REQUIRED)
+  get_filename_component(_git_bin "${GIT_EXECUTABLE}" DIRECTORY)
+  find_program(BASH_EXECUTABLE bash
+    PATHS "${_git_bin}/../bin" "${_git_bin}/../usr/bin"
+    NO_DEFAULT_PATH)
+endif()
+find_program(BASH_EXECUTABLE bash REQUIRED)
+execute_process(
+  COMMAND "${BASH_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/apply_ggml_patches.sh"
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  RESULT_VARIABLE _patch_result
+  OUTPUT_VARIABLE _patch_output
+  ERROR_VARIABLE _patch_error)
+if(NOT _patch_result EQUAL 0)
+  message(FATAL_ERROR "ggml patch validation failed:\n${_patch_output}${_patch_error}")
 endif()
 
 # ggml as a subproject. GGML_STANDALONE auto-detects OFF here, so its

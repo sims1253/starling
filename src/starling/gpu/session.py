@@ -275,8 +275,6 @@ class GpuSession:
         self._hb_stop = threading.Event()
         self._token_lock = threading.Lock()
         self._old_handlers: dict[int, _SignalHandler] = {}
-        self._atexit_registered = False
-        self._borrowed = False
 
     # -- introspection -----------------------------------------------------
     def read_token(self) -> dict | None:
@@ -346,7 +344,6 @@ class GpuSession:
                 # with_gpu_lock cannot release the outer runner's lock. os.dup
                 # returns a non-inheritable fd (PEP 446); spawn() explicitly
                 # marks it inheritable when another native child is launched.
-                self._borrowed = True
                 self._acquired = True
                 self._owner_id = os.environ.get(
                     "STARLING_GPU_LOCK_OWNER", self._owner_id)
@@ -355,27 +352,23 @@ class GpuSession:
         self._path = path
         self._owner_id = _uuid.uuid4().hex
 
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
-        # THE key line: the fd must survive into native children (spawn + exec).
-        # Python (PEP 446) creates non-inheritable fds by default; flip it.
-        os.set_inheritable(fd, True)
-        self._fd = fd
-
-        self._flock_with_contention()
-        self._write_token()
-        if self._want_heartbeat:
-            self._start_heartbeat()
-        if not self._atexit_registered:
-            import atexit
-            atexit.register(self.release)
-            self._atexit_registered = True
-        if self._want_signal_handlers:
-            self._install_signal_handlers()
-        self._acquired = True
+        self._fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.set_inheritable(self._fd, True)
+            self._flock_with_contention()
+            self._acquired = True
+            self._write_token()
+            if self._want_heartbeat:
+                self._start_heartbeat()
+            if self._want_signal_handlers:
+                self._install_signal_handlers()
+        except BaseException:
+            self.release()
+            raise
         return self
 
     def release(self) -> None:
-        if not self._acquired:
+        if not self._acquired and self._fd is None:
             return
         self._acquired = False
         if self._disabled:
@@ -394,7 +387,6 @@ class GpuSession:
             except OSError:
                 pass
             self._fd = None
-        self._borrowed = False
 
     # -- native children ---------------------------------------------------
     def spawn(self, args, **popen_kwargs) -> subprocess.Popen:
@@ -478,6 +470,8 @@ class GpuSession:
                 pass
 
     def _start_heartbeat(self) -> None:
+        self._hb_stop.clear()
+
         def beat():
             while not self._hb_stop.wait(HEARTBEAT_SEC):
                 if not self._acquired:

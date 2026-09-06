@@ -154,7 +154,9 @@ class ChunkStreamer:
             text = tx(samples[self.boundary :])
             if text is None:  # busy on the tail
                 return " ".join(self.committed) if finalized else None
-            return " ".join(self.committed + text.split())
+            return " ".join(stitch_words(
+                self.committed, text.split(), max_overlap=self.max_overlap_words
+            ))
         return " ".join(self.committed) if finalized else None
 
     def flush(self, samples: np.ndarray, tx: TranscribeFn) -> str:

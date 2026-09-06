@@ -127,7 +127,7 @@ def quantize_fp4(w: torch.Tensor):
     if pad:
         flat = F.pad(flat, (0, pad))
     blocks = flat.view(-1, BLOCK_SIZE).to(torch.float32)
-    amax = blocks.amax(dim=-1).abs().clamp(min=1e-12)
+    amax = blocks.abs().amax(dim=-1).clamp(min=1e-12)
     if _HAS_FP8:
         # Round-trip the scale through fp8e4m3 (NVFP4 standard). Keep fp32 copy
         # for portable dequant; the fp8 bytes are what a fused kernel would read.
@@ -229,7 +229,7 @@ def quantize_fp4_packed(w: torch.Tensor):
         raise ValueError(f"K={K} must be a multiple of BLOCK_SIZE={BLOCK_SIZE}")
     w32 = w.float()
     blocks = w32.view(OUT, K // BLOCK_SIZE, BLOCK_SIZE)
-    amax = blocks.amax(dim=-1).abs().clamp(min=1e-12)            # (OUT, K//16)
+    amax = blocks.abs().amax(dim=-1).clamp(min=1e-12)            # (OUT, K//16)
     scales_fp8 = amax.to(_SCALE_DTYPE)                            # (OUT, K//16)
     scales_f32 = scales_fp8.float()
     normed = (blocks / scales_f32.unsqueeze(-1) * 6.0).clamp(-6.0, 6.0)

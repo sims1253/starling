@@ -78,7 +78,9 @@ def main() -> int:
     args = ap.parse_args()
 
     tiers = [t.strip() for t in args.tiers.split(",") if t.strip()]
-    fixtures = mkfx.load_fixtures()
+    if not (tiers or args.corpus or args.fleurs_eval or args.mls_de):
+        ap.error("select at least one fixture tier or corpus")
+    fixtures = mkfx.load_fixtures() if tiers else {}
     if args.snr_db is not None:
         import numpy as np
         rng = np.random.default_rng(0)
@@ -88,9 +90,7 @@ def main() -> int:
             noise = rng.standard_normal(audio.shape).astype(np.float32)
             noise *= signal / (10 ** (args.snr_db / 20))
             return np.clip(audio + noise, -1.0, 1.0).astype(np.float32)
-    else:
-        def noised(audio):
-            return audio
+        fixtures = {tier: noised(fixtures[tier]) for tier in tiers}
 
     fleurs_evals: dict[str, list[tuple]] = {}
     if args.fleurs_eval:
@@ -107,15 +107,21 @@ def main() -> int:
         import numpy as np
         import soundfile as sf
         for cdir in args.corpus:
-            for wav in sorted(Path(cdir).expanduser().glob("*.wav")):
+            wavs = sorted(Path(cdir).expanduser().glob("*.wav"))
+            if not wavs:
+                ap.error(f"{cdir}: no WAV files found")
+            for wav in wavs:
                 txt = wav.with_suffix(".txt")
                 if not txt.exists():
-                    continue
+                    ap.error(f"{wav}: transcript sidecar is missing")
+                reference = txt.read_text().strip()
+                if not reference:
+                    ap.error(f"{wav}: transcript sidecar is empty")
                 prefix = wav.stem.rsplit("_", 1)[0]  # <config>_<split>
                 audio, sr = sf.read(str(wav), dtype="float32", always_2d=False)
                 assert sr == 16000, f"{wav} at {sr} Hz"
                 corpus_evals.setdefault(prefix, []).append(
-                    (np.ascontiguousarray(audio), txt.read_text().strip()))
+                    (np.ascontiguousarray(audio), reference))
         for prefix, clips_ in corpus_evals.items():
             print(f"[corpus] {prefix}: {len(clips_)} clips")
 
@@ -145,6 +151,8 @@ def main() -> int:
                 sr = 16000
             assert sr == 16000, f"MLS clip at {sr} Hz"
             de_clips.append((np.ascontiguousarray(array), ex["transcript"]))
+        if len(de_clips) != args.mls_de:
+            ap.error(f"MLS: requested {args.mls_de} clips, found {len(de_clips)}")
         print(f"[mls-de] {len(de_clips)} German clips "
               f"(~{sum(len(a) for a, _ in de_clips) / 16000 / 60:.1f} min)")
 
@@ -154,15 +162,12 @@ def main() -> int:
             label, path = Path(spec).stem, spec
         p = Path(path).expanduser()
         if not p.exists():
-            print(f"[skip] {label}: {p} does not exist")
-            continue
+            ap.error(f"{label}: {p} does not exist")
 
         os.environ["STARLING_GGML_PARAKEET_MODEL"] = str(p.resolve())
         eng = StarlingGgmlParakeet()
         if not eng.available:
-            print(f"[skip] {label}: engine unavailable "
-                  f"(build/libstarling_ggml.so missing or model rejected)")
-            continue
+            ap.error(f"{label}: native engine unavailable")
 
         row = {"model": label, "path": str(p), "mb": round(p.stat().st_size / 1e6, 1),
                "wer": {}, "cer": {}, "wer_ci": {}}
@@ -170,7 +175,7 @@ def main() -> int:
         try:
             eng.load()
             for tier in tiers:
-                hyp = eng.transcribe(noised(fixtures[tier]))[0]
+                hyp = eng.transcribe(fixtures[tier])[0]
                 ref = REFERENCE_TRANSCRIPTS[tier]
                 row["wer"][tier] = round(wer_pct(ref, hyp), 2)
                 row["cer"][tier] = round(cer_pct(ref, hyp), 2)
@@ -180,8 +185,6 @@ def main() -> int:
                 row["wer"]["mls_de"] = round(sum(wers) / len(wers), 2)
                 per_clip["mls_de"] = wers
             for cfg, clips_ in fleurs_evals.items():
-                if not clips_:  # a config that failed to stream; warned above
-                    continue
                 wers = [wer_pct(ref, eng.transcribe(audio)[0])
                         for audio, ref in clips_]
                 row["wer"][f"fleurs_{cfg}"] = round(sum(wers) / len(wers), 2)

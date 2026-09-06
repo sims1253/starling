@@ -21,6 +21,39 @@ within ~1.3x on short/medium and faster on the long synthetic fixture. See the
 maintained README tables; older external-engine measurements are historical
 context only.
 
+## ggml version and local patches
+
+The submodule is pinned to ggml **v0.23.0**,
+`e91ded11bdcd78c42f9c8d3978ff6686eb4c1226`, the upstream release and default-branch
+head checked on September 6, 2026. The upgrade from v0.22.0 retains all nine
+local patches: upstream has not replaced their behavior.
+
+| Patch | Why it remains |
+| --- | --- |
+| 0001 | CUDA flash attention still needs per-head additive-mask addressing and dispatch. |
+| 0002 | Stable graph UIDs still need the shortcut around per-node replay validation. |
+| 0003 | CPU llamafile dispatch still loops over broadcast batches separately. |
+| 0006 | CUDA PAD still needs bounded grid dimensions with grid-stride iteration. |
+| 0007 | CUDA still lacks the plain LayerNorm + affine fusion used here. |
+| 0008 | Transient UID-zero graphs still need exclusion from CUDA graph capture. |
+| 0009 | Vulkan GEMV still rejects BF16 activations without the F32 staging conversion. |
+| 0010 | Vulkan matmul still assumes contiguous batch strides for in-place operands. |
+| 0011 | The allocator still permits reuse of input storage needed by repeated graph execution. |
+
+Patches 0009 and 0010 use the renamed upstream staging flag
+`prealloc_y_last_k_padded`; their behavior is unchanged. The other seven apply
+without changes. Apply patches in filename order: 0008 depends on 0002, and
+0010 depends on 0009. Successful application alone does not establish runtime
+parity; CUDA and other accelerator changes require tests on those backends.
+
+Upgrade checks on Linux: CPU and Vulkan engines, C API libraries, and native
+servers build. Native unit tests and 45 HTTP/WebSocket contract checks pass.
+Vulkan BF16 GEMV, batched/cache-view matmul, op, and mask probes pass on RADV
+RENOIR. Parakeet Q8_0 reproduces the short fixture transcript on two consecutive
+calls on both CPU and Vulkan; CPU also passes with llamafile enabled. CUDA
+compilation and runtime parity remain unverified on this machine, which has
+no CUDA toolkit or GPU.
+
 ## Model registry (adding an engine)
 
 Every engine built into `libstarling_ggml` is registered in one place:

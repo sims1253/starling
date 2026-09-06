@@ -78,7 +78,10 @@ def test_chunkstreamer_reconstructs_full_transcript():
     now = 0.0
     for end in range(SR // 2, len(samples) + 1, SR // 2):
         now += 0.5
-        cs.step(samples[:end], now, tx)
+        partial = cs.step(samples[:end], now, tx)
+        if partial is not None:
+            expected = [w for w, t in words if t < end / SR]
+            assert partial.split() == expected
     final_text = cs.flush(samples, tx)
     assert final_text.split() == truth, f"reconstructed != truth:\n{final_text}"
 

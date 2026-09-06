@@ -80,8 +80,8 @@ def test_qwen3_backend_load_reuses_loaded_model(monkeypatch) -> None:  # noqa: A
     model a second time with default attn/encoder settings.
 
     The real starling.qwen3 modules are replaced via sys.modules: importing
-    them here would pull transformers (and starling.qwen3's transformers
-    bootstrap) into a CPU-only test process for no coverage gain.
+    them here would load model dependencies into a CPU-only test process
+    for no coverage gain.
     """
     model_sentinel = object()
     processor_sentinel = object()
