@@ -2,15 +2,15 @@
 
 Maintained entry points:
 
-- `bench_all.py` — unified latency/RTFx regression grid and README table source.
-- `bench_leaderboard.py` — real-corpus Open ASR Leaderboard WER/RTFx evaluation.
-- `s1/bench_normalize.py` — s1-mini normalization suite: latency/throughput
+- `bench_all.py`: unified latency/RTFx regression grid and [benchmark table](../docs/benchmarks.md) source.
+- `bench_leaderboard.py`: real-corpus Open ASR Leaderboard WER/RTFx evaluation.
+- `s1/bench_normalize.py`: s1-mini normalization suite: latency/throughput
   per engine, byte-exact parity vs stock, curated quality cases, and the
-  16-cell control matrix (styling × structure × context). README `BENCH:S1`
+  16-cell control matrix (styling × structure × context). [Benchmark](../docs/benchmarks.md) `BENCH:S1`
   table source.
-- `bench_ablate.py` — optimization-flag ablation harness.
-- `wer.py` / `wer_leaderboard.py` — fixture drift gate and real-corpus scoring.
-- `run_leaderboard_all.sh` — orchestrates the maintained per-model leaderboard runs.
+- `bench_ablate.py`: optimization-flag ablation harness.
+- `wer.py` / `wer_leaderboard.py`: fixture drift gate and real-corpus scoring.
+- `run_leaderboard_all.sh`: orchestrates the maintained per-model leaderboard runs.
 
 The remaining `bench_*.py` files are exploratory model/kernel microbenchmarks.
 They are useful for reproducing individual optimization investigations, but are

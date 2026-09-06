@@ -53,7 +53,7 @@ static void usage(const char* prog) {
         "Usage: %s --model <slug> --gguf <path> [options]\n"
         "\n"
         "Required:\n"
-        "  --model <slug>     Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, audex\n"
+        "  --model <slug>     Model slug: %s\n"
         "  --gguf <path>      Path to the GGUF model file\n"
         "\n"
         "Serving:\n"
@@ -80,7 +80,7 @@ static void usage(const char* prog) {
         "  --version          Print version + ABI version + backend, then exit\n"
         "  --abi-version      Print just the ABI version integer, then exit\n"
         "  --help             Show this help\n",
-        prog);
+        prog, serve::supported_models_str().c_str());
 }
 
 // ---- simple arg parser ----------------------------------------------------
