@@ -35,7 +35,6 @@ from starling.gpu.session import GpuLockBusy, GpuSession
 
 __all__ = [
     "LOCK_PATH",
-    "STALE_SEC",
     "GpuLockBusy",
     "GpuSession",
     "acquire_gpu_lock",
@@ -57,10 +56,6 @@ LOCK_PATH = Path(
         str(Path("/tmp") / f"starling-gpu-{_cvdfallback}.flock"),
     )
 )
-# Kept as a constant for any code that reads it; the flock releases on death so
-# age-based staleness no longer applies (heartbeat staleness lives in GpuSession).
-STALE_SEC = 10 * 60
-
 _LOCAL = threading.local()
 
 

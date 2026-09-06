@@ -75,13 +75,7 @@ class LruCache {
 public:
     explicit LruCache(size_t capacity) : capacity_(capacity == 0 ? 1 : capacity) {}
 
-    size_t capacity() const { return capacity_; }
-    void set_capacity(size_t c) {
-        capacity_ = (c == 0) ? 1 : c;
-        trim();
-    }
     size_t size() const { return map_.size(); }
-    bool empty() const { return map_.empty(); }
 
     // On hit: mark MRU and return a pointer to the value (stable until the next
     // non-const operation that evicts THIS key). On miss: return nullptr (the
@@ -113,25 +107,6 @@ public:
             std::forward_as_tuple(lru_.begin(), Value()));
         init(ins.first->second.second);
         return &ins.first->second.second;
-    }
-
-    // Insert/overwrite `key` -> `value`, marking MRU. Evicts LRU first if at
-    // capacity (on a fresh key). Returns a reference to the stored value.
-    template <typename V>
-    Value& put(const Key& key, V&& value) {
-        auto it = map_.find(key);
-        if (it != map_.end()) {
-            it->second.second = std::forward<V>(value);
-            touch(it);
-            return it->second.second;
-        }
-        trim();
-        lru_.push_front(key);
-        auto ins = map_.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(key),
-            std::forward_as_tuple(lru_.begin(), std::forward<V>(value)));
-        return ins.first->second.second;
     }
 
     void clear() {

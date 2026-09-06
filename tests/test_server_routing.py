@@ -105,7 +105,8 @@ def test_cli_arg_parser_rejects_unknown_model() -> None:
         parser.parse_args(["--model", "nope"])
 
 
-def test_parakeet_unified_long_audio_uses_chunker() -> None:
+@pytest.mark.parametrize("backend_type", [ParakeetBackend, ParakeetUnifiedBackend])
+def test_parakeet_long_audio_uses_chunker(backend_type) -> None:
     class _Pipe:
         tokenizer = object()
 
@@ -126,7 +127,7 @@ def test_parakeet_unified_long_audio_uses_chunker() -> None:
             assert should_stop is not None
             return "chunked"
 
-    backend = ParakeetUnifiedBackend(ServerConfig(max_chunk_seconds=1.0))
+    backend = backend_type(ServerConfig(max_chunk_seconds=1.0))
     pipe = _Pipe()
     chunker = _Chunker()
     backend.pipe = pipe

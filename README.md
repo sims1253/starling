@@ -1,14 +1,13 @@
 # Starling
 
-CUDA-graph inference kernels for speech-recognition models, tuned for a single
-RTX 5090 (Blackwell, sm_120). Portable to any Ampere+ NVIDIA GPU.
+Fast local speech recognition with CUDA-graph Python pipelines and native
+ggml engines. The Python kernels are tuned on an RTX 5090; the native engines
+support CPU, CUDA, Metal, Vulkan, and HIP backends.
 
-The stock `transformers` decode loop emits hundreds of tiny kernels per token
-and spends most of its wall time on CPU launch overhead — the GPU sits ~10%
-busy. Starling captures everything replayable into a CUDA graph: decode steps,
-fused RMSNorm/SwiGLU, attention masks, multi-step token loops (autoregressive
-models) or the single bidirectional editor forward (granite-nar). Output is
-byte-identical to eager `transformers` — same accuracy, fewer round trips.
+The Python pipelines capture repeated inference work in CUDA graphs to reduce
+CPU launch overhead. Native engines run through `starling-serve` or the C API.
+Golden fixtures check output parity, and corpus benchmarks measure accuracy
+and throughput. Backend and quantization differences are documented below.
 
 ## Models
 
@@ -48,20 +47,17 @@ regex-recipes for per-tensor sensitivity sweeps, verified by WER.
 - `benchmarks/wer_quant.py` — WER sweep of GGUF variants against the f32
   baseline (`--snr-db` for noise-hardened tiers).
 
-Parakeet-tdt-0.6b-v3 as the proof of concept (CPU path, fixture deltas —
-full tables in `docs/quantization.md`): **q4_k_m is free** (704 MB, 28% of
-F32, zero measurable WER loss even on 5 dB-noised audio), and at 2 bits the
-calibration is decisive — uniform q2_k degrades to 30%/17% WER while the
-imatrix-weighted q2_k **matches F32 exactly** at the same 574 MB. The
-pipeline is model-agnostic by construction and aimed at the larger engines
-(audex-2b, moss-2b, qwen3-asr-1.7b) where quantization actually changes what
-fits on a local machine. See `docs/quantization.md` for the full pipeline,
-the keep-list of tensors that must stay exact, and the results tables.
+Parakeet-tdt-0.6b-v3 is the initial quantization target. On the recorded
+300-clip English and German evaluations, **q4_k_m uses 704 MB (28% of F32)**
+and differs from F32 by at most 0.07 WER percentage points. Lower bit widths
+save more memory but lose accuracy, especially in some languages. The
+fixture-only parity results do not establish corpus-wide parity. See
+[quantization results](docs/quantization.md) for the calibration procedure,
+per-language results, and confidence intervals.
 
 ## Benchmark
 
-Two scripts, each the single source of truth for its slice. Both support
-`--update-readme` to splice tables into the sentinel-wrapped blocks below.
+These scripts support `--update-readme` to refresh the tables below.
 
 - **`benchmarks/bench_all.py`** — latency/RTFx grid. Sweeps model × engine ×
   audio length × batch size on tiled-LibriSpeech fixtures. Engines: `starling`,
@@ -299,7 +295,7 @@ The dispatch (`auto`) selects the fastest backend available, in this order:
   `torch.cuda.CUDAGraph`, which is NVIDIA-only.
 
 Select the backend explicitly with the `STARLING_KERNEL_BACKEND` env var
-(`auto` | `triton` | `cuda` | `torch`) or the `OptFlags.kernel_backend` field.
+(`auto` | `triton` | `cuda` | `torch`) before importing model modules.
 `auto` resolves to `triton` (if importable) → `cuda` (if a CUDA GPU is
 visible) → `torch`. On Windows + CUDA toolkit that means full speed with no
 code changes.

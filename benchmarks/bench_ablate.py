@@ -60,14 +60,10 @@ DECODE_FLAGS: list[tuple[str, dict]] = [
     ("sdpa_attention",       dict(sdpa_attention=True, tolerance_mode=True)),
     ("flash_attention",      dict(flash_attention=True, tolerance_mode=True)),
     ("multistep_graph",      dict(multistep_graph=True)),
-    # The following are under construction / experimental -- they'll show as
-    # "not implemented" if the loader rejects them or no-op if the code path
-    # isn't wired yet.  Keep them here so the table records that explicitly.
+    # Experimental paths; evaluate quality alongside speed.
     ("gemm_epilogue_fusion", dict(gemm_epilogue_fusion=True)),
     ("nvfp4_weights",        dict(nvfp4_weights=True, tolerance_mode=True)),
     ("nvfp4_lm_head_only",   dict(nvfp4_lm_head_only=True, tolerance_mode=True)),
-    ("kv_cache_compression", dict(kv_cache_compression=True)),
-    ("slim_draft_head",      dict(slim_draft_head=True)),
 ]
 
 LONG_AUDIO_FLAGS: list[tuple[str, dict]] = [

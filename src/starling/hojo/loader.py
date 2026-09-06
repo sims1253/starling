@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
-
 from .config import DEFAULT_MODEL_DIR
 
 

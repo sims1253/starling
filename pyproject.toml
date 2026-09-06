@@ -74,10 +74,6 @@ explicit = true
 # PyPI's cu12 wheels (which will not run on Blackwell / sm_120).
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
-# transformers: use PyPI (>= 5.14.1). Earlier releases (5.8.0) did not register
-# the `granite_speech` or `qwen3_asr` model types, requiring a git pin; both are
-# natively registered as of 5.14.1. The qwen3 bootstrap (_tf_bootstrap.py) is
-# now a no-op on 5.14.1 but remains as a fallback for older installs.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

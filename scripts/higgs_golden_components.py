@@ -37,7 +37,6 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "scripts" / "ref"))
 
 NAMES = ("short", "medium", "long")
 STAGES = (
@@ -216,8 +215,6 @@ def verify_saved(gdir: Path) -> None:
 
 def main() -> int:
     from transformers import AutoConfig, AutoModel, AutoTokenizer
-
-    import transcribe as higgs_transcribe  # noqa: E402  (warms the collator cache)
 
     gdir = REPO / "golden"
     gdir.mkdir(exist_ok=True)

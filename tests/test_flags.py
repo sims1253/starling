@@ -105,8 +105,6 @@ def test_default_flags_preserve_byte_exactness():
     assert f.chunk_prefill_overlap is True, "chunk_prefill_overlap defaults True (byte-exact)"
     assert f.nvfp4_weights is False, "nvfp4_weights defaults False (requires tolerance)"
     assert f.nvfp4_lm_head_only is False, "nvfp4_lm_head_only defaults False (requires tolerance)"
-    assert f.kv_cache_compression is False, "kv_cache_compression defaults False (experimental)"
-    assert f.slim_draft_head is False, "slim_draft_head defaults False"
 
 
 def test_nvfp4_weights_requires_tolerance():

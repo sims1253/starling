@@ -95,9 +95,6 @@ class _FakeServer:
         # failure). If None, decode + inference succeed with ``result_text``.
         self._exc = exc
         self._result_text = result_text
-        # a real queue_depth()/registry is not needed for the 400 path
-        self._n_waiters = 0
-        self._lock = threading.Lock()
 
     def decode_wav_bytes(self, _wav_bytes: bytes) -> np.ndarray:
         # Argument mirrors StarlingServer.decode_wav_bytes' signature so this
@@ -813,25 +810,14 @@ def test_flags_applies_override_and_restores() -> None:
     assert flags_mod.get_default_flags().tolerance_mode is original_tol
 
 
-def test_flags_ignores_unknown_keys() -> None:
-    """An unknown override key does not crash (lenient behavior preserved).
-
-    Validates that the nonexistent override is ignored while every *known* field
-    keeps its established prior default (not just one unrelated field).
-    """
-    import dataclasses
-
+def test_flags_reject_unknown_override_without_changing_defaults() -> None:
     from starling import flags as flags_mod
 
     saved = flags_mod.get_default_flags()
-    saved_snapshot = {fld.name: getattr(saved, fld.name) for fld in dataclasses.fields(saved)}
-
-    with flags_mod.flags(nonexistent_flag=True) as f:
-        # The unknown key is filtered out, so every real field equals its prior default.
-        for fld in dataclasses.fields(f):
-            assert getattr(f, fld.name) == saved_snapshot[fld.name], (
-                f"field {fld.name!r} changed when only an unknown key was passed"
-            )
+    with pytest.raises(TypeError, match="multistep_grap"):
+        with flags_mod.flags(multistep_grap=False):
+            pytest.fail("unknown flag was accepted")
+    assert flags_mod.get_default_flags() is saved
 
 
 def test_flags_preserves_all_existing_fields_on_override() -> None:
@@ -1041,3 +1027,60 @@ def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
 
     monkeypatch.setattr(gpu_lock, "acquire_gpu_lock", boom)
     server.warmup()  # must short-circuit before touching the GPU lock
+
+
+@pytest.mark.parametrize("transport", ["stdlib", "fastapi"])
+@pytest.mark.parametrize("path", ["/inference", "/transcribe"])
+@pytest.mark.parametrize("multipart", [False, True])
+def test_http_aliases_accept_wav_uploads(transport, path, multipart, monkeypatch):
+    import asyncio
+    from email.message import Message
+    import json
+    from starling import server as module
+
+    wav = _wav_bytes(np.zeros(160, dtype=np.float32))
+    body = wav
+    content_type = "audio/wav"
+    if multipart:
+        body = (b'--audio-boundary\r\n'
+                b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+                b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
+        content_type = "multipart/form-data; boundary=audio-boundary"
+    server = StarlingServer()
+    monkeypatch.setattr(server, "_ensure_loaded", lambda: None)
+
+    def transcribe(samples, request_id):
+        assert len(samples) == 160
+        assert request_id == "upload-id"
+        return TranscribeResult(text="accepted")
+
+    monkeypatch.setattr(server, "_run_queued_sync", transcribe)
+    headers = {"content-length": str(len(body)), "content-type": content_type,
+               "x-request-id": "upload-id"}
+    if transport == "stdlib":
+        handler = object.__new__(module._build_stdlib_handler(server))
+        handler.path = path
+        handler.headers = Message()
+        for key, value in headers.items():
+            handler.headers[key] = value
+        handler.rfile = io.BytesIO(body)
+        sent = []
+        handler._send_json = lambda status, response: sent.append((status, response))
+        handler.do_POST()
+        status, response = sent[0]
+    else:
+        fastapi = pytest.importorskip("fastapi")
+        app = module.create_app(server=server, load_on_startup=False)
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = fastapi.Request({"type": "http", "method": "POST", "path": path,
+                                   "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                                  receive)
+        route = next(r for r in app.routes if getattr(r, "path", None) == path)
+        result = asyncio.run(route.endpoint(request))
+        status, response = result.status_code, json.loads(result.body)
+    assert status == 200
+    assert response["text"] == "accepted"
+    assert response["request_id"] == "upload-id"

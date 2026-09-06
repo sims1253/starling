@@ -13,18 +13,18 @@ on:
   push:
     branches: [master]
     paths:
-      - 'cpp/serve/**'
-      - 'cpp/tests/**'
+      - 'cpp/**'
       - 'CMakeLists.txt'
-      - 'third_party/httplib.h'
+      - 'third_party/**'
+      - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
-      - 'cpp/serve/**'
-      - 'cpp/tests/**'
+      - 'cpp/**'
       - 'CMakeLists.txt'
-      - 'third_party/httplib.h'
+      - 'third_party/**'
+      - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
       - '.github/workflows/ci-starling-serve.yml'
   workflow_dispatch:

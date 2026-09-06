@@ -16,8 +16,7 @@ The interface is intentionally tiny:
                        that "Bx1 sequential").
     close()         -- free the model + empty the GPU cache
 
-The adapters are LAZY: importing this module costs nothing; the heavy ``torch``
-/ ``transformers`` imports happen inside :meth:`load`.
+Models are loaded lazily by :meth:`Engine.load`.
 
 Adapter families live under :data:`ENGINE_REGISTRY`, keyed by
 ``"{family}-{model}"`` (e.g. ``"starling-granite"``, ``"stock-parakeet"``,
@@ -1275,49 +1274,45 @@ def _starling_ggml_parakeet_model() -> Path:
         str(STARLING_GGML_PARAKEET_MODEL))).expanduser()
 
 
-class StarlingGgmlParakeet(Engine):
-    """Starling's OWN in-tree ggml engine (libstarling_ggml).
+class _StarlingGgml(Engine):
+    """Shared lifecycle and PCM adapter for the model-tagged native C API."""
 
-    Drives Starling's first-party C++/ggml implementation of parakeet-tdt
-    (built from cpp/, the universal-backend sibling to the PyTorch peak path)
-    in-process via ctypes. Byte-exact vs the golden on short/medium/long (the
-    text gate). This is the long-term replacement for :class:`GgmlParakeet`
-    (which drives mudler's external parakeet.cpp); both coexist during the
-    transition so they can be A/B'd.
+    def __init__(self, model: str, native_kind: str, model_path: Path) -> None:
+        super().__init__("starling-ggml", model)
+        self._native_kind = native_kind
+        self._path = model_path
+        self._model = None
 
-    OPTIONAL: the engine activates only if libstarling_ggml loads + the model
-    is present. The pure-Python Starling install keeps working when the C++ is
-    unbuilt (starling._ggml.available() returns False).
-    """
-
-    def __init__(self) -> None:
-        super().__init__("starling-ggml", "parakeet", supports_batch=False)
-        self._model = None  # starling._ggml.GgmlModel
+    def _model_path(self) -> Path:
+        return self._path
 
     @property
     def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and _starling_ggml_parakeet_model().exists()
-        except Exception:
-            return False
+        from starling._ggml import available
+        return available() and self._model_path().exists()
 
-    # -- lifecycle ---------------------------------------------------------
     def _load(self) -> None:
-        from starling._ggml import GgmlModel, PARAKEET_TDT
-        self._model = GgmlModel(PARAKEET_TDT, str(_starling_ggml_parakeet_model()))
+        from starling import _ggml
+        self._model = _ggml.GgmlModel(
+            getattr(_ggml, self._native_kind), str(self._model_path()))
 
     def _release(self) -> None:
         if self._model is not None:
             self._model.close()
             self._model = None
 
-    # -- inference ---------------------------------------------------------
     def _run_one(self, audio: np.ndarray) -> str:
         pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        text = self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000)
-        return text.strip()
+        return self._model.transcribe_pcm(
+            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
+
+
+class StarlingGgmlParakeet(_StarlingGgml):
+    def __init__(self) -> None:
+        super().__init__("parakeet", "PARAKEET_TDT", STARLING_GGML_PARAKEET_MODEL)
+
+    def _model_path(self) -> Path:
+        return _starling_ggml_parakeet_model()
 
     def _run_one_ids(self, audio: np.ndarray) -> list[int]:
         """The raw greedy-TDT id stream (incl. blanks) for strict parity.
@@ -1331,95 +1326,24 @@ class StarlingGgmlParakeet(Engine):
             pcm.ctypes.data_as(_c_float_p), pcm.size, 16000))
 
 
-def _starling_ggml_parakeet_keys() -> list[str]:
-    """Starling's in-tree ggml engine (libstarling_ggml). Skipped if the .so
-    isn't built or the model is absent."""
-    if StarlingGgmlParakeet().available:
-        return ["starling-ggml-parakeet"]
-    return []
-
-# MOSS uses the same shared C API as parakeet; this separate path keeps the
-# model artifact independently configurable during the Phase-2 rollout.
 STARLING_GGML_MOSS_MODEL = Path(os.environ.get(
     "STARLING_GGML_MOSS_MODEL",
     str(REPO_ROOT / "models" / "moss-transcribe-preview-2b-bf16-exact.gguf"),
 )).expanduser()
 
-class StarlingGgmlMoss(Engine):
-    """Starling's in-tree MOSS ggml engine, driven directly through ctypes."""
-
+class StarlingGgmlMoss(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "moss", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_MOSS_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import GgmlModel, MOSS
-        self._model = GgmlModel(MOSS, str(STARLING_GGML_MOSS_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-def _starling_ggml_moss_keys() -> list[str]:
-    if StarlingGgmlMoss().available:
-        return ["starling-ggml-moss"]
-    return []
+        super().__init__("moss", "MOSS", STARLING_GGML_MOSS_MODEL)
 
 
-# ARK-ASR-3B uses the same shared C API as parakeet/moss; this separate path
-# keeps the model artifact independently configurable.
 STARLING_GGML_ARK_MODEL = Path(os.environ.get(
     "STARLING_GGML_ARK_MODEL",
     str(REPO_ROOT / "models" / "ark-asr-3b-bf16-exact.gguf"),
 )).expanduser()
 
-class StarlingGgmlArk(Engine):
-    """Starling's in-tree ARK-ASR-3B ggml engine, driven directly through ctypes."""
-
+class StarlingGgmlArk(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "ark", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_ARK_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import GgmlModel, ARK
-        self._model = GgmlModel(ARK, str(STARLING_GGML_ARK_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-def _starling_ggml_ark_keys() -> list[str]:
-    if StarlingGgmlArk().available:
-        return ["starling-ggml-ark"]
-    return []
+        super().__init__("ark", "ARK", STARLING_GGML_ARK_MODEL)
 
 
 STARLING_GGML_HIGGS_MODEL = Path(os.environ.get(
@@ -1428,40 +1352,9 @@ STARLING_GGML_HIGGS_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
-class StarlingGgmlHiggs(Engine):
-    """Starling's in-tree bosonai/higgs-audio-v3-stt ggml engine (ctypes)."""
-
+class StarlingGgmlHiggs(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "higgs", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_HIGGS_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import GgmlModel, HIGGS
-        self._model = GgmlModel(HIGGS, str(STARLING_GGML_HIGGS_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-
-def _starling_ggml_higgs_keys() -> list[str]:
-    if StarlingGgmlHiggs().available:
-        return ["starling-ggml-higgs"]
-    return []
+        super().__init__("higgs", "HIGGS", STARLING_GGML_HIGGS_MODEL)
 
 
 STARLING_GGML_HOJO_MODEL = Path(os.environ.get(
@@ -1470,40 +1363,9 @@ STARLING_GGML_HOJO_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
-class StarlingGgmlHojo(Engine):
-    """Starling's in-tree HojoAI/Hojo-ASR-V1 ggml engine (ctypes)."""
-
+class StarlingGgmlHojo(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "hojo", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_HOJO_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import GgmlModel, HOJO
-        self._model = GgmlModel(HOJO, str(STARLING_GGML_HOJO_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-
-def _starling_ggml_hojo_keys() -> list[str]:
-    if StarlingGgmlHojo().available:
-        return ["starling-ggml-hojo"]
-    return []
+        super().__init__("hojo", "HOJO", STARLING_GGML_HOJO_MODEL)
 
 
 STARLING_GGML_GRANITE_MODEL = Path(os.environ.get(
@@ -1512,40 +1374,9 @@ STARLING_GGML_GRANITE_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
-class StarlingGgmlGranite(Engine):
-    """Starling's in-tree ibm-granite/granite-speech-4.1-2b ggml engine (ctypes)."""
-
+class StarlingGgmlGranite(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "granite", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_GRANITE_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import GRANITE, GgmlModel
-        self._model = GgmlModel(GRANITE, str(STARLING_GGML_GRANITE_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-
-def _starling_ggml_granite_keys() -> list[str]:
-    if StarlingGgmlGranite().available:
-        return ["starling-ggml-granite"]
-    return []
+        super().__init__("granite", "GRANITE", STARLING_GGML_GRANITE_MODEL)
 
 
 STARLING_GGML_QWEN3_MODEL = Path(os.environ.get(
@@ -1554,40 +1385,9 @@ STARLING_GGML_QWEN3_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
-class StarlingGgmlQwen3(Engine):
-    """Starling's in-tree Qwen/Qwen3-ASR-1.7B-hf ggml engine (ctypes)."""
-
+class StarlingGgmlQwen3(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "qwen3", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_QWEN3_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import QWEN3, GgmlModel
-        self._model = GgmlModel(QWEN3, str(STARLING_GGML_QWEN3_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-
-def _starling_ggml_qwen3_keys() -> list[str]:
-    if StarlingGgmlQwen3().available:
-        return ["starling-ggml-qwen3"]
-    return []
+        super().__init__("qwen3", "QWEN3", STARLING_GGML_QWEN3_MODEL)
 
 
 # ====================================================================== #
@@ -1692,29 +1492,9 @@ STARLING_GGML_S1_MODEL = Path(os.environ.get(
 )).expanduser()
 
 
-class StarlingGgmlS1(Engine):
-    """Starling's in-tree S1-mini ggml engine (ctypes, text path)."""
-
+class StarlingGgmlS1(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "s1", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_S1_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import S1, GgmlModel
-        self._model = GgmlModel(S1, str(STARLING_GGML_S1_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
+        super().__init__("s1", "S1", STARLING_GGML_S1_MODEL)
 
     def _run_one(self, audio: np.ndarray) -> str:
         return self._model.normalize_text(_s1_tier_transcript(audio))
@@ -1726,52 +1506,15 @@ def _s1_keys() -> list[str]:
     return []
 
 
-def _starling_ggml_s1_keys() -> list[str]:
-    if StarlingGgmlS1().available:
-        return ["starling-ggml-s1"]
-    return []
-
-
 STARLING_GGML_AUDEX_MODEL = Path(os.environ.get(
     "STARLING_GGML_AUDEX_MODEL",
     str(REPO_ROOT / "models" / "audex-2b-bf16-exact.gguf"),
 )).expanduser()
 
 
-class StarlingGgmlAudex(Engine):
-    """Starling's in-tree nvidia/Nemotron-Labs-Audex-2B ggml engine (ctypes)."""
-
+class StarlingGgmlAudex(_StarlingGgml):
     def __init__(self) -> None:
-        super().__init__("starling-ggml", "audex", supports_batch=False)
-        self._model = None
-
-    @property
-    def available(self) -> bool:
-        try:
-            from starling._ggml import available as _sggml_available
-            return _sggml_available() and STARLING_GGML_AUDEX_MODEL.exists()
-        except Exception:
-            return False
-
-    def _load(self) -> None:
-        from starling._ggml import AUDEX, GgmlModel
-        self._model = GgmlModel(AUDEX, str(STARLING_GGML_AUDEX_MODEL))
-
-    def _release(self) -> None:
-        if self._model is not None:
-            self._model.close()
-            self._model = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        pcm = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._model.transcribe_pcm(
-            pcm.ctypes.data_as(_c_float_p), pcm.size, 16000).strip()
-
-
-def _starling_ggml_audex_keys() -> list[str]:
-    if StarlingGgmlAudex().available:
-        return ["starling-ggml-audex"]
-    return []
+        super().__init__("audex", "AUDEX", STARLING_GGML_AUDEX_MODEL)
 
 
 class GgmlMoss(Engine):
@@ -2120,17 +1863,27 @@ def _higgs_keys() -> list[str]:
     return ["starling-higgs", "stock-higgs"]
 
 
+_STARLING_GGML_ENGINES = {
+    "parakeet": StarlingGgmlParakeet,
+    "moss": StarlingGgmlMoss,
+    "ark": StarlingGgmlArk,
+    "higgs": StarlingGgmlHiggs,
+    "hojo": StarlingGgmlHojo,
+    "granite": StarlingGgmlGranite,
+    "qwen3": StarlingGgmlQwen3,
+    "s1": StarlingGgmlS1,
+    "audex": StarlingGgmlAudex,
+}
+
+
 def available_keys() -> list[str]:
     """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
     return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys() + _s1_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys()
             + _ggml_parakeet_keys() + _ggml_moss_keys()
-            + _starling_ggml_parakeet_keys() + _starling_ggml_moss_keys()
-            + _starling_ggml_ark_keys() + _starling_ggml_higgs_keys()
-            + _starling_ggml_hojo_keys() + _starling_ggml_granite_keys()
-            + _starling_ggml_qwen3_keys() + _starling_ggml_s1_keys()
-            + _starling_ggml_audex_keys())
+            + [f"starling-ggml-{model}" for model, cls in _STARLING_GGML_ENGINES.items()
+               if cls().available])
 
 
 def build_engines(
@@ -2170,26 +1923,7 @@ def build_engines(
             elif mdl == "moss":
                 chosen[mdl].append(GgmlMoss())
         elif key.startswith("starling-ggml-"):
-            # Starling's OWN in-tree ggml engine (libstarling_ggml). parakeet,
-            # MOSS, and ARK share the model-tagged C API.
-            if mdl == "parakeet":
-                chosen[mdl].append(StarlingGgmlParakeet())
-            elif mdl == "moss":
-                chosen[mdl].append(StarlingGgmlMoss())
-            elif mdl == "ark":
-                chosen[mdl].append(StarlingGgmlArk())
-            elif mdl == "higgs":
-                chosen[mdl].append(StarlingGgmlHiggs())
-            elif mdl == "hojo":
-                chosen[mdl].append(StarlingGgmlHojo())
-            elif mdl == "s1":
-                chosen[mdl].append(StarlingGgmlS1())
-            elif mdl == "audex":
-                chosen[mdl].append(StarlingGgmlAudex())
-            elif mdl == "granite":
-                chosen[mdl].append(StarlingGgmlGranite())
-            elif mdl == "qwen3":
-                chosen[mdl].append(StarlingGgmlQwen3())
+            chosen[mdl].append(_STARLING_GGML_ENGINES[mdl]())
         elif key.startswith("starling-batched-"):
             # fam == "starling-batched"; mdl is the model slug
             chosen[mdl].append({"granite": GraniteStarlingBatched,

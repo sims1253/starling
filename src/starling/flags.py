@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 
 
 @dataclass
@@ -100,9 +100,7 @@ class OptFlags:
     against the WER bench."""
 
     # ------------------------------------------------------------------
-    # Ablatable optimisations (wiki-driven).  Each defaults to off so the
-    # baseline remains byte-exact; the ablation harness flips them on/off to
-    # measure individual benefit.  See benchmarks/bench_ablate.py.
+    # Optimizations measured by benchmarks/bench_ablate.py.
     # ------------------------------------------------------------------
 
     rope_alloc_free: bool = True
@@ -133,56 +131,23 @@ class OptFlags:
     pre-concatenated qkv/gate-up weights).  See :mod:`starling.fp8_gemv`."""
 
     # ------------------------------------------------------------------
-    # EXPERIMENTAL / UNIMPLEMENTED
-    # These flags are research placeholders, not supported optimizations.
+    # Experimental optimizations, disabled by default.
     # ------------------------------------------------------------------
 
     gemm_epilogue_fusion: bool = False
-    """Fold RMSNorm + residual + SiLU-gate into the adjacent cuBLASLt GEMM
-    epilogues (CODA-style).  Removes ~4-5% of decode-step elementwise launches.
-    **Experimental** -- under construction; off by default."""
+    """Fold RMSNorm scaling into QKV and gate/up GEMVs.
+    Experimental: changes bf16 rounding and requires ``fused_qkv``."""
 
     nvfp4_weights: bool = False
-    """Load the LLM weights at NVFP4 (4-bit microscaling) with dequant fused
-    into the GEMV.  Halves the weight bandwidth that dominates decode (51% of
-    step time per the profile).  **Requires quantized weights + a QAD fine-tune
-    to preserve WER** -- not yet implemented; the loader gates on this flag.
-    **Breaks byte-exactness**; requires ``tolerance_mode=True``."""
+    """Quantize decoder projections to NVFP4 with fused dequant-GEMV.
+    Experimental: quality must be evaluated on representative audio.
+    Breaks byte-exactness; requires ``tolerance_mode=True``."""
 
     nvfp4_lm_head_only: bool = False
     """Quantize only the final LM-head projection to NVFP4, keeping decoder
     layers in bf16. Experimental WER-gated variant of ``nvfp4_weights`` for
     testing selective BF16 retention. **Breaks byte-exactness**; requires
     ``tolerance_mode=True``."""
-
-    kv_cache_compression: bool = False
-    """Compress the encoder KV cache via spectral calibration (only the 3-4%
-    of head dims carrying signal are kept; see kv-cache-spectral-compression).
-    Targets the encoder, not the LLM.  **Experimental** -- requires a
-    calibration pass to confirm ASR encoder KV is as low-rank as LLM KV."""
-
-    slim_draft_head: bool = False
-    """Speculative decoding: replace the draft LM-head with a low-rank
-    factorisation (SlimSpec, arXiv:2605.10453).  4-5x faster draft head, no
-    acceptance ceiling.  Composes with the existing CTC-BPE draft path."""
-
-    # ------------------------------------------------------------------
-    # Cross-platform kernel backend (Windows support).
-    # ------------------------------------------------------------------
-    kernel_backend: str = "auto"
-    """Which fused-kernel backend to use for the decode elementwise ops and the
-    FP8 dequant-GEMV.  See :mod:`starling._kernels`.
-
-    * ``"auto"`` (default) -- triton if importable (Linux), else torch.
-    * ``"triton"`` -- the hand-tuned Triton kernels (max perf; needs the triton
-      package, which has no official Windows wheel).
-    * ``"torch"`` -- stock-PyTorch fused ops (cross-platform; the Windows
-      default).  Correct, not optimised.
-    * ``"cuda"`` -- ``load_inline`` CUDA C++ kernels (cross-platform, perf
-      parity with triton; added later where the benchmark harness flags a loss).
-
-    Set via the ``STARLING_KERNEL_BACKEND`` env var or
-    :func:`starling._kernels.set_backend`."""
 
     def __post_init__(self) -> None:
         """Validate flag combinations at construction time."""
@@ -276,22 +241,11 @@ def flags(**overrides):
         # back to byte-exact default here
     """
     global _DEFAULT_FLAGS
-    # Hold the lock across snapshot, the entire yielded body, AND restore, so
-    # overlapping scopes cannot interleave and clobber each other's snapshots.
-    # RLock (not Lock) so a nested flags() on the same thread doesn't deadlock.
-    _FLAGS_LOCK.acquire()
-    try:
+    with _FLAGS_LOCK:
         saved = _DEFAULT_FLAGS
-        # Only apply overrides for fields that actually exist on OptFlags,
-        # so callers passing a stale/unknown key don't crash (matches prior
-        # lenient behavior).
-        valid_fields = {f.name for f in fields(saved)}
-        filtered = {k: v for k, v in overrides.items() if k in valid_fields}
-        new = replace(saved, **filtered)
+        new = replace(saved, **overrides)
         _DEFAULT_FLAGS = new
         try:
             yield new
         finally:
             _DEFAULT_FLAGS = saved
-    finally:
-        _FLAGS_LOCK.release()
