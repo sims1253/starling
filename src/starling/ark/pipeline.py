@@ -53,10 +53,6 @@ class MegaPipeline:
         its decoder trunk).
     processor : ARK-ASR processor
         Provides ``feature_extractor`` (mel) and ``tokenizer`` (text).
-    encoder_mode : {"cudagraph"}
-        Selects the CUDA-graphed encoder (``"cudagraph"``, the byte-exact,
-        zero-launch-overhead default). Kept as an API hook for a future eager
-        A/B path; currently only ``"cudagraph"`` is implemented.
     steps_per_replay : int | None
         K -- number of decode steps captured per CUDA-graph replay. ``None``
         selects K from the prompt length (K=2 short, K=4 medium, K=16 long).
@@ -88,7 +84,6 @@ class MegaPipeline:
         model: Any,
         processor: Any,
         *,
-        encoder_mode: str = "cudagraph",
         steps_per_replay: Optional[int] = None,
         max_cache_len: int = 4096,
         shape_bucketing: bool = True,
@@ -98,7 +93,6 @@ class MegaPipeline:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
-        self.encoder_mode = encoder_mode
         self.steps_per_replay = steps_per_replay
         self.max_cache_len = int(max_cache_len)
         # Prefill eager by default: the per-prompt-length prefill graphs are the
@@ -203,7 +197,6 @@ class MegaPipeline:
     def from_pretrained(
         cls,
         *,
-        encoder_mode: str = "cudagraph",
         steps_per_replay: Optional[int] = None,
         max_cache_len: int = 4096,
         attn_impl: str = "eager",
@@ -222,7 +215,6 @@ class MegaPipeline:
         return cls(
             model,
             processor,
-            encoder_mode=encoder_mode,
             steps_per_replay=steps_per_replay,
             max_cache_len=max_cache_len,
             shape_bucketing=shape_bucketing,

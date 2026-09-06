@@ -23,10 +23,8 @@ Usage (unchanged)::
 
 from __future__ import annotations
 
-import os
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 
 # Same exception class as the real lock (isinstance-equivalent across modules).
 # GpuLockBusy is re-exported so `from starling.parakeet.gpu_lock import GpuLockBusy`
@@ -34,7 +32,6 @@ from pathlib import Path
 from starling.gpu.session import GpuLockBusy, GpuSession
 
 __all__ = [
-    "LOCK_PATH",
     "GpuLockBusy",
     "GpuSession",
     "acquire_gpu_lock",
@@ -43,19 +40,6 @@ __all__ = [
     "with_gpu_lock",
 ]
 
-# --- compat attributes (kept so external readers / old tests still resolve) --
-# Computed CHEAPLY (no nvidia-smi) from the CVD string; the REAL lock key (the
-# GPU-UUID set) is resolved lazily inside GpuSession.acquire. Kept so any code
-# that displays or reads ``gpu_lock.LOCK_PATH`` still resolves a sane path.
-_cvdfallback = (
-    os.environ.get("CUDA_VISIBLE_DEVICES", "default") or "default"
-).replace("/", "_").replace(",", "-")
-LOCK_PATH = Path(
-    os.environ.get(
-        "STARLING_GPU_LOCK",
-        str(Path("/tmp") / f"starling-gpu-{_cvdfallback}.flock"),
-    )
-)
 _LOCAL = threading.local()
 
 

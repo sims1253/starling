@@ -60,7 +60,7 @@ import numpy as np
 import torch
 
 from .decode_mega import GraphedDecoder
-from .gpu_lock import LOCK_PATH, with_gpu_lock
+from .gpu_lock import with_gpu_lock
 
 # K values swept for the GraphedDecoder. The 5090 sweet spot (16) is in the set.
 DEFAULT_K_VALUES: tuple[int, ...] = (1, 4, 8, 16, 32, 64)
@@ -420,20 +420,6 @@ def _run_sweep(
         return times
 
 
-def _autotune_holds_lock() -> bool:
-    """True if the shared GPU lock is currently held by the autotune sweep.
-
-    Prevents self-deadlock when a caller that already holds the lock invokes the
-    sweep (benchmarks do this with ``acquire_lock=False``, but this is a safety
-    net).
-    """
-    try:
-        data = json.loads(LOCK_PATH.read_text())
-        return data.get("session") == _AUTOTUNE_SESSION
-    except Exception:
-        return False
-
-
 def autotune(
     model,
     processor,
@@ -463,8 +449,8 @@ def autotune(
         k_values: K values to sweep (default the full set; pass a small tuple
             like ``(1, 4)`` for a fast test sweep).
         acquire_lock: if True (default) acquire the shared GPU lock before the
-            timed sweep (unless this session already holds it). Set False when
-            the caller already holds the lock (e.g. a benchmark).
+            timed sweep. Set False when the caller already holds the lock
+            (e.g. a benchmark).
         cache_dir: override the cache directory (default ``~/.cache/starling``);
             tests pass a tmp dir for hermetic isolation.
         warmup / repeats: warmup iterations and timed samples per K for the
@@ -502,8 +488,7 @@ def autotune(
         save_cache(cfg, cache_dir=cache_dir)
         return cfg
 
-    need_lock = acquire_lock and not _autotune_holds_lock()
-    if need_lock:
+    if acquire_lock:
         with with_gpu_lock(
             session=_AUTOTUNE_SESSION, model="parakeet-tdt-0.6b-v3",
             eta_min=8, note="autotune sweep",
