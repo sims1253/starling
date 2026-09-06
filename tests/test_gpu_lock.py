@@ -167,7 +167,7 @@ def test_spawn_explicit_key_must_match_local_session(tmp_path, monkeypatch):
     monkeypatch.setattr("starling.gpu.session._query_gpu_uuids", lambda: [])
     owner = gpu_lock.acquire_gpu_lock(session="parent", model="test", uuid="device-a")
     try:
-        with pytest.raises(ValueError, match="does not match"):
+        with pytest.raises(ValueError, match="device-b.*does not match.*device-a"):
             gpu_lock.spawn_gpu_subprocess(
                 [sys.executable, "-c", "raise AssertionError('must not spawn')"],
                 owner_id=owner, uuid="device-b",

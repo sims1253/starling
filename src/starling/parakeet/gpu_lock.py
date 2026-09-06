@@ -105,7 +105,9 @@ def spawn_gpu_subprocess(
     gs = sess.get(key) if key else None
     if gs is not None:
         if not gs._disabled and uuid is not None and uuid != gs._key:
-            raise ValueError("Explicit GPU key does not match the held session")
+            raise ValueError(
+                f"Explicit GPU key {uuid!r} does not match the held session key {gs._key!r}"
+            )
         return gs.spawn(args, **popen_kwargs)
 
     # Standalone engine/test use: acquire solely for the child, pass the fd,
