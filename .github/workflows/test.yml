@@ -63,7 +63,7 @@ jobs:
           tests/test_multistep_controller.py
           tests/test_kernel_selection.py tests/test_gpu_runner.py
           tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
-          tests/test_ggml_patches.py
+          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
 
       - name: POSIX GPU lock lifecycle tests
         if: runner.os == 'Linux'

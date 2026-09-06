@@ -35,14 +35,30 @@ permissions:
   contents: read
 
 env:
+  # Windows pins this patch; Linux installs its major/minor metapackage.
+  # Runtime documentation is checked by scripts/release-runtime/check-contract.py.
+  CUDA_VERSION: '13.3.0'
   CMAKE_BUILD_PARALLEL_LEVEL: 4
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  runtime-contract:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - name: Check runtime version guidance
+        run: >-
+          python3 scripts/release-runtime/check-contract.py
+          --executing-cuda-version "$CUDA_VERSION"
+
   # ---------------------------------------------------------------------------
   # Linux Vulkan (cross-vendor GPU path; x86_64 executable)
   # ---------------------------------------------------------------------------
   linux-vulkan:
+    needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -100,6 +116,7 @@ jobs:
   # Linux CUDA (NVIDIA path)
   # ---------------------------------------------------------------------------
   linux-cuda:
+    needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -115,7 +132,8 @@ jobs:
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y cuda-toolkit-13-3
+          cuda_series="${CUDA_VERSION%.*}"
+          sudo apt-get install -y "cuda-toolkit-${cuda_series//./-}"
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
 
       - name: Build starling-serve (CUDA)
@@ -153,6 +171,7 @@ jobs:
   # Linux ROCm / HIP (AMD Radeon & Instinct path)
   # ---------------------------------------------------------------------------
   linux-rocm:
+    needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -209,6 +228,7 @@ jobs:
   # Windows Vulkan (MSVC + Vulkan, static CRT)
   # ---------------------------------------------------------------------------
   windows-vulkan:
+    needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -268,6 +288,7 @@ jobs:
   # Windows CUDA (MSVC + CUDA, static CRT)
   # ---------------------------------------------------------------------------
   windows-cuda:
+    needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -284,7 +305,7 @@ jobs:
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
         with:
-          cuda: '13.3.0'
+          cuda: ${{ env.CUDA_VERSION }}
           method: 'network'
 
       - name: Build starling-serve (CUDA, static CRT)
@@ -328,6 +349,7 @@ jobs:
   # macOS Metal (Apple Silicon)
   # ---------------------------------------------------------------------------
   macos-metal:
+    needs: runtime-contract
     # The standard macos-14 label is an Apple Silicon runner.
     runs-on: macos-14
     steps:
@@ -413,8 +435,8 @@ jobs:
             | `starling-serve-linux-cuda.tar.gz` | Linux x86_64 | CUDA | NVIDIA |
             | `starling-serve-linux-rocm.tar.gz` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
             | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
-            | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
-            | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
+            | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (static application CRT) |
+            | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (static application CRT) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
 
             ### Runtime requirements

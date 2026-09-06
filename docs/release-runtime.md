@@ -5,6 +5,14 @@ Release archives contain the executable, its SHA-256 checksum, and this file
 models. `BUILD_SHARED_LIBS=OFF` links the project libraries into the executable;
 it does not make CUDA or ROCm libraries static.
 
+The release workflow's `CUDA_VERSION` sets the Windows toolkit patch and the
+Linux toolkit series. Linux installs that series' metapackage, which can select a
+later patch. Runtime guidance names the shared major/minor series. When changing
+it, update the CUDA requirements here, in the native serving guide, and in the
+release body; `scripts/release-runtime/check-contract.py` checks their agreement.
+Release preflight also compares the executing workflow's CUDA version with the
+checked-out tag. For a manual release, select a workflow ref with the same version.
+
 ## Prerequisites
 
 | Artifact | Runtime prerequisites | Verification before upload |
