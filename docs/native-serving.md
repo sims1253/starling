@@ -280,8 +280,8 @@ Choose the executable for your operating system, CPU architecture, and GPU:
 | `starling-serve-linux-cuda` | Linux x86_64 | CUDA | NVIDIA |
 | `starling-serve-linux-rocm` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
 | `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
-| `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
-| `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
+| `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (static application CRT) |
+| `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (static application CRT) |
 | `starling-serve-macos-metal` | macOS arm64 | Metal | Apple Silicon |
 
 ### GPU selection
