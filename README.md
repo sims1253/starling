@@ -18,7 +18,7 @@ Run these commands from the repository:
 
 ```bash
 uv sync --extra server
-uv run python -m starling.server --model parakeet --port 8181
+uv run --extra server starling-python-serve --model parakeet --port 8181
 ```
 
 In another terminal, send a WAV file:
