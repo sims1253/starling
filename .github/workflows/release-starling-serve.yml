@@ -71,10 +71,11 @@ jobs:
       - name: Strip and package
         run: |
           strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
           cp build/starling-serve starling-serve-linux-vulkan
           sha256sum starling-serve-linux-vulkan > starling-serve-linux-vulkan.sha256
           tar czf starling-serve-linux-vulkan.tar.gz \
-            starling-serve-linux-vulkan starling-serve-linux-vulkan.sha256
+            starling-serve-linux-vulkan starling-serve-linux-vulkan.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         run: |
@@ -82,6 +83,13 @@ jobs:
           printf '%s\n' "$version"
           grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
           ./starling-serve-linux-vulkan --abi-version
+
+      - name: Verify extracted archive without the SDK
+        run: |
+          abi=$(awk '/^#define STARLING_GGML_ABI_VERSION / { print $3 }' cpp/include/starling_ggml.h)
+          test -n "$abi"
+          scripts/release-runtime/check-linux-vulkan.sh \
+            starling-serve-linux-vulkan.tar.gz "${RELEASE_TAG#v}" "$abi"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -123,10 +131,11 @@ jobs:
       - name: Strip and package
         run: |
           strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
           cp build/starling-serve starling-serve-linux-cuda
           sha256sum starling-serve-linux-cuda > starling-serve-linux-cuda.sha256
           tar czf starling-serve-linux-cuda.tar.gz \
-            starling-serve-linux-cuda starling-serve-linux-cuda.sha256
+            starling-serve-linux-cuda starling-serve-linux-cuda.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         run: |
@@ -178,10 +187,11 @@ jobs:
       - name: Strip and package
         run: |
           strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
           cp build/starling-serve starling-serve-linux-rocm
           sha256sum starling-serve-linux-rocm > starling-serve-linux-rocm.sha256
           tar czf starling-serve-linux-rocm.tar.gz \
-            starling-serve-linux-rocm starling-serve-linux-rocm.sha256
+            starling-serve-linux-rocm starling-serve-linux-rocm.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         run: |
@@ -234,10 +244,11 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          Copy-Item docs/release-runtime.md RUNTIME.md
           Copy-Item build\Release\starling-serve.exe starling-serve-windows-vulkan.exe
           $hash = (Get-FileHash starling-serve-windows-vulkan.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  starling-serve-windows-vulkan.exe" | Set-Content -Encoding ascii starling-serve-windows-vulkan.sha256
-          7z a starling-serve-windows-vulkan.zip starling-serve-windows-vulkan.exe starling-serve-windows-vulkan.sha256
+          7z a starling-serve-windows-vulkan.zip starling-serve-windows-vulkan.exe starling-serve-windows-vulkan.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         shell: pwsh
@@ -293,10 +304,11 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
+          Copy-Item docs/release-runtime.md RUNTIME.md
           Copy-Item build\Release\starling-serve.exe starling-serve-windows-cuda.exe
           $hash = (Get-FileHash starling-serve-windows-cuda.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  starling-serve-windows-cuda.exe" | Set-Content -Encoding ascii starling-serve-windows-cuda.sha256
-          7z a starling-serve-windows-cuda.zip starling-serve-windows-cuda.exe starling-serve-windows-cuda.sha256
+          7z a starling-serve-windows-cuda.zip starling-serve-windows-cuda.exe starling-serve-windows-cuda.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         shell: pwsh
@@ -338,10 +350,11 @@ jobs:
       - name: Strip and package
         run: |
           strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
           cp build/starling-serve starling-serve-macos-metal
           shasum -a 256 starling-serve-macos-metal > starling-serve-macos-metal.sha256
           tar czf starling-serve-macos-metal.tar.gz \
-            starling-serve-macos-metal starling-serve-macos-metal.sha256
+            starling-serve-macos-metal starling-serve-macos-metal.sha256 RUNTIME.md
 
       - name: Verify binary metadata
         run: |
@@ -403,6 +416,13 @@ jobs:
             | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (no VC++ runtime dep) |
             | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (no VC++ runtime dep) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
+
+            ### Runtime requirements
+            Read `RUNTIME.md` inside the archive before running it. GPU drivers and
+            accelerator runtime libraries are not bundled. CUDA requires the 13.3
+            runtime and cuBLAS; ROCm requires the build's matching HIP/BLAS runtime.
+            Only Linux Vulkan is smoke-tested outside its SDK build environment.
+            These startup checks do not verify GPU inference.
 
             ### Usage
             ```bash

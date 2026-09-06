@@ -1,0 +1,5 @@
+# Keep this list in sync with docs/release-runtime.md.
+FROM ubuntu:22.04
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libstdc++6 libgomp1 libvulkan1 \
+    && rm -rf /var/lib/apt/lists/*
