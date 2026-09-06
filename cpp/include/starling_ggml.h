@@ -63,6 +63,9 @@ typedef enum {
 
 // Lifecycle ------------------------------------------------------------------
 
+// Calls that load, free or run models are serialized inside the library.
+// The caller must keep each context alive until its pending calls finish.
+//
 // Load a model from a GGUF file. Returns a new context, or NULL on error
 // (call starling_ggml_last_error(NULL_or_ctx) for the message). `model` selects
 // the implementation; the GGUF must match. The caller owns the context and must
@@ -70,7 +73,7 @@ typedef enum {
 starling_ggml_ctx * starling_ggml_load(starling_ggml_model model,
                                        const char * gguf_path);
 
-// Free a context (idempotent; safe on NULL). Releases the model + its device
+// Free a context (safe on NULL; a non-NULL pointer must be freed once). Releases the model + its device
 // buffers. The global ggml backend itself is freed by starling_ggml_shutdown.
 void starling_ggml_free(starling_ggml_ctx * ctx);
 
@@ -82,7 +85,8 @@ void starling_ggml_free(starling_ggml_ctx * ctx);
 // OPTIONAL: starling_ggml also registers an internal std::atexit handler on
 // first backend creation that performs the same teardown automatically at
 // process exit, so a caller that never calls this still exits cleanly. Safe to
-// call multiple times, and safe alongside the atexit handler.
+// call multiple times, and safe alongside the atexit handler. Shutdown is
+// terminal: subsequent model loads and inference return an error.
 void starling_ggml_shutdown(void);
 
 // Flush the STARLING_IMATRIX activation-importance collector to its output
@@ -91,8 +95,8 @@ void starling_ggml_shutdown(void);
 // matter how the process ends.
 void starling_ggml_imatrix_flush_pub(void);
 
-// Retrieve the last error message for a context (or the global last-error if
-// ctx is NULL). Returns "" if no error. The pointer is owned by the library
+// Retrieve the last error message for a context (or this thread's last error
+// if ctx is NULL). Returns "" if no error. The pointer is owned by the library
 // and valid until the next call into the library on the same context.
 const char * starling_ggml_last_error(starling_ggml_ctx * ctx);
 

@@ -82,7 +82,6 @@ private:
 
     // GPU-only: replayable per-step LSTM graph, lazily built on first step().
     struct StepReplay;
-    mutable std::unique_ptr<StepReplay> replay_;
 
     // Host-side copy of the embedding table, lazily fetched on the first step()
     // via the loader tensor's ->data (the loader backs the tensor with the GGUF

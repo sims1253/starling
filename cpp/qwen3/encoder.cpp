@@ -349,12 +349,12 @@ struct EncoderReplayEntry {
 // const-initialized at load, before any atexit call, so a destructor would
 // run after the shutdown handler anyway; the leak keeps a single teardown
 // route instead of racing one.
-LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>* g_encoder_cache = nullptr;
-std::once_flag g_encoder_once;
+using EncoderCache = LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>;
 } // namespace
 
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;}
+size_t encoder_replay_cache_size(const Qwen3Model& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;}
 
 bool encode_audio_and_project(const Qwen3Model& model, const MelFeatures& mel,
                               AudioEmbeds& out, std::string& err) {
@@ -418,15 +418,11 @@ bool encode_audio_and_project(const Qwen3Model& model, const MelFeatures& mel,
     }
 
     // GPU: captured per-shape graph; the mel is the only varying input.
-    std::call_once(g_encoder_once, [] {
-        register_decode_cache_clearer([] { delete g_encoder_cache; g_encoder_cache = nullptr; });
-    });
-    if (!g_encoder_cache)
-        g_encoder_cache = new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(
-            replay_cache_size());
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
     ShapeKey key{mel.n_frames, s.L};
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.T_pad = mel.n_frames;
             entry.L = s.L;

@@ -1,8 +1,8 @@
 # Native Serving Layer: starling-serve
 
-A self-contained native binary that wraps `libstarling_ggml` behind the same
-endpoint surface as the Python `starling.server` (same routes and message
-shapes; client-visible differences are listed under "API contract"):
+A self-contained native binary that wraps `libstarling_ggml` behind the audio
+endpoints used by the Python `starling.server`. Client-visible differences
+are listed under "API contract":
 
 ```typescript
 // Before (Python subprocess):
@@ -77,11 +77,17 @@ starling-serve --model parakeet --gguf model.gguf --port 8181 [--warmup]
 
 ## API contract
 
-Mirrors the Python server's endpoint set, but the two are not drop-in
-identical. A client written against one needs four adjustments on the other:
+The servers share audio routes and streaming messages. Clients must account
+for these differences:
 
 - **Inputs**: this server requires 16 kHz audio (below); the Python server
-  resamples non-16 kHz WAVs via scipy instead of rejecting them.
+  resamples non-16 kHz WAVs via scipy instead of rejecting them. Native HTTP
+  uploads also accept raw mono PCM16; Python HTTP uploads require WAV. Both
+  WebSocket endpoints accept PCM16 and WAV.
+- **Models**: both serve `parakeet`, `moss`, `ark`, `higgs`, `granite`, `qwen3`,
+  and `audex`. Native serving also supports `hojo` and `s1`; Python serving
+  also supports `parakeet_unified` and `cohere`. Native `s1` exposes the
+  additional `POST /normalize` text endpoint.
 - **Request ids**: `X-Request-Id` values starting with `#` are rejected
   with `400` — the prefix is reserved for the server's internal queue
   tickets. The Python server accepts them.

@@ -49,7 +49,7 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            audex_loader_guard_test
+            audex_loader_guard_test model_lifetime_test
 
       - name: C++ unit tests (serve logic, no GPU/model)
         run: |
@@ -64,6 +64,22 @@ jobs:
           ./build/loader_guard_test
           ./build/higgs_dtype_guard_test
           ./build/audex_loader_guard_test
+          ./build/model_lifetime_test
+
+      - name: Model lifetime sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+          STARLING_GGML_DEVICE: cpu
+        run: |
+          cmake -S . -B build-sanitized -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF -DGGML_OPENMP=OFF \
+            -DCMAKE_BUILD_TYPE=Debug \
+            '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
+            '-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer' \
+            '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined'
+          cmake --build build-sanitized -j2 --target model_lifetime_test
+          ./build-sanitized/model_lifetime_test
 
       - name: Smoke test --version
         run: |

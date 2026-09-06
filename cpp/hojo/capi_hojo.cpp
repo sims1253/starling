@@ -2,6 +2,7 @@
 // C API flow: load -> mel -> audio_tower -> bottleneck -> ln_speech
 // (in prompt) -> prompt -> beam-4 decode -> detokenize.
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "audio_tower.hpp"
 #include "conformer.hpp"
@@ -9,6 +10,7 @@
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -22,54 +24,15 @@
 
 namespace {
 
-thread_local std::string g_load_error;
-
-struct HojoCtx {
-    std::unique_ptr<starling::ggml::hojo::HojoModel> model;
-    starling::ggml::hojo::Tokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char** out, const std::string& message) {
-    if (out) *out = message.c_str();
-}
-
-void report_load_error(const char** out, const std::string& message) {
-    g_load_error = message;
-    if (out) *out = g_load_error.c_str();
-}
+using HojoCtx = starling::ggml::lib::EngineContext<starling::ggml::hojo::HojoModel, starling::ggml::hojo::Tokenizer>;
+using starling::ggml::lib::report;
 
 } // namespace
 
 extern "C" {
 
 void* starling_ggml_hojo_load(const char* gguf_path, const char** err_out) {
-    try {
-        if (!gguf_path || !*gguf_path) {
-            if (err_out) *err_out = "null or empty Hojo GGUF path";
-            return nullptr;
-        }
-        auto ctx = std::make_unique<HojoCtx>();
-        ctx->model = std::make_unique<starling::ggml::hojo::HojoModel>();
-        if (!ctx->model->load(gguf_path, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        if (!ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        // Persist weights + force backend creation across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        starling::ggml::register_decode_cache_clearer([]() {});
-        if (err_out) *err_out = nullptr;
-        return ctx.release();
-    } catch (const std::exception& e) {
-        report_load_error(err_out, e.what());
-    } catch (...) {
-        report_load_error(err_out, "unknown exception loading Hojo model");
-    }
-    return nullptr;
+    return starling::ggml::lib::load_engine<HojoCtx>(gguf_path, "Hojo", err_out);
 }
 
 void starling_ggml_hojo_free(void* handle) {

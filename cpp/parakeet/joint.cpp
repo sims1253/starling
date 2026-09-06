@@ -162,9 +162,10 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
     // mirrors prediction.cpp's per-step LSTM graph fused with the joint + argmax.
     // The prediction output (top layer's h') feeds the joint's pred projection
     // DIRECTLY on the device (never read back).
+    auto& fused_replay_ = ml_.cache<FusedReplay>();
     if (!fused_replay_) {
-        fused_replay_ = std::unique_ptr<FusedReplay>(new FusedReplay());
-        FusedReplay* r = fused_replay_.get();
+        auto pending = std::unique_ptr<FusedReplay>(new FusedReplay());
+        FusedReplay* r = pending.get();
         r->H_pred = Hp; r->L_pred = L; r->H_joint = Hj;
         r->cap_h.assign(L, std::vector<float>((size_t)Hp));
         r->cap_c.assign(L, std::vector<float>((size_t)Hp));
@@ -243,6 +244,7 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
                 return tok_amax;
             }));
         assert(r->rg->n_inputs() == 1 && "fused step graph must have 1 coalesced input");
+        fused_replay_ = std::move(pending);
     }
 
     // Host-pack the coalesced input (no syncs): enc_proj_t, then the looked-up

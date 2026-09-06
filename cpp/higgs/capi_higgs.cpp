@@ -2,12 +2,14 @@
 // C API flow: load -> mel -> encode+project -> prompt/embeds -> greedy
 // decode -> detokenize, with a STARLING_HIGGS_TIMING phase-timing gate.
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "audio_encoder.hpp"
 #include "prompt.hpp"
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -22,71 +24,15 @@
 
 namespace {
 
-thread_local std::string g_load_error;
-
-// The higgs engine keeps process-global, deliberately unlocked state: the
-// encoder / prefill / kstep replay-graph caches and the DeviceCache (KV + RoPE
-// tables), plus per-graph host buffers (kstep pos/mask) that every replay
-// overwrites (runtime/lru_cache.hpp: synchronization is the caller's job).
-// Warmup transcriptions (serve layer) and raw ctypes callers (the Python
-// binding releases the GIL around transcribe_pcm) would race a real request
-// through that state. Serialize every transcription in the engine itself with
-// one mutex held across the whole decode; the guarantee is decode-vs-decode
-// exclusivity. Locks nested inside the decode (g_backend_mutex via
-// ensure_weights_realized, pocketfft's internal mutexes on the mel path) are
-// safe because acquisition is strictly one-directional — serve serial queue
-// -> decode -> backend/FFT — and nothing holding an inner lock calls back
-// into the higgs decode. starling_ggml_higgs_free against an in-flight decode
-// remains unguarded, matching existing serve-layer model lifetimes.
-std::mutex g_decode_mutex;
-
-struct HiggsCtx {
-    std::unique_ptr<starling::ggml::higgs::HiggsModel> model;
-    starling::ggml::higgs::Tokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char** out, const std::string& message) {
-    if (out) *out = message.c_str();
-}
-
-void report_load_error(const char** out, const std::string& message) {
-    g_load_error = message;
-    if (out) *out = g_load_error.c_str();
-}
+using HiggsCtx = starling::ggml::lib::EngineContext<starling::ggml::higgs::HiggsModel, starling::ggml::higgs::Tokenizer>;
+using starling::ggml::lib::report;
 
 } // namespace
 
 extern "C" {
 
 void* starling_ggml_higgs_load(const char* gguf_path, const char** err_out) {
-    try {
-        if (!gguf_path || !*gguf_path) {
-            if (err_out) *err_out = "null or empty Higgs GGUF path";
-            return nullptr;
-        }
-        auto ctx = std::make_unique<HiggsCtx>();
-        ctx->model = std::make_unique<starling::ggml::higgs::HiggsModel>();
-        if (!ctx->model->load(gguf_path, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        if (!ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        // Persist weights + force backend creation (and its orderly atexit
-        // shutdown registration) across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        starling::ggml::register_decode_cache_clearer([]() {});
-        if (err_out) *err_out = nullptr;
-        return ctx.release();
-    } catch (const std::exception& e) {
-        report_load_error(err_out, e.what());
-    } catch (...) {
-        report_load_error(err_out, "unknown exception loading Higgs model");
-    }
-    return nullptr;
+    return starling::ggml::lib::load_engine<HiggsCtx>(gguf_path, "Higgs", err_out);
 }
 
 void starling_ggml_higgs_free(void* handle) {
@@ -105,7 +51,6 @@ char* starling_ggml_higgs_decode(void* handle, const float* pcm, int64_t n,
         if (err_out) *err_out = "invalid Higgs PCM buffer";
         return nullptr;
     }
-    std::lock_guard<std::mutex> decode_lock(g_decode_mutex);
     try {
         using namespace starling::ggml::higgs;
         const bool timing = std::getenv("STARLING_HIGGS_TIMING") != nullptr;

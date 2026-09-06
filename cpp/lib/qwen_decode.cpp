@@ -486,53 +486,28 @@ struct KStepKey { int K;
     bool operator==(const KStepKey& o) const { return K == o.K; } };
 struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept { return (size_t)k.K; } };
 
-// Per-spec process-global decode caches, keyed by spec address (each model
-// bundle owns one static spec; first requester sizes the device cache).
-// Starling inference is process-serial (one Backend), so — like the rest of
-// the engine's caches — this is not internally locked.
+// Captured graphs borrow this model's weights and KV cache.
 struct SpecState {
     std::unique_ptr<DeviceCache> device_cache;
     std::unique_ptr<PrefillCache> prefill_cache;
     std::unordered_map<KStepKey, std::unique_ptr<KStepGraph>, KStepKeyHash> kstep;
-    std::once_flag device_once, prefill_once, kstep_once;
 };
 
-std::unordered_map<const QwenDecodeSpec*, SpecState>& spec_states() {
-    // Deliberately leaked: entries are torn down by the registered
-    // decode-cache clearers during shutdown_backend(), which runs from an
-    // atexit handler — that handler is registered BEFORE this static is
-    // constructed, so LIFO destroys the map FIRST and the clearers would
-    // read freed SpecStates (the exit-time "double free or corruption";
-    // ASan: heap-use-after-free in the DeviceCache clearer).
-    static auto* m = new std::unordered_map<const QwenDecodeSpec*, SpecState>();
-    return *m;
-}
-SpecState& state_for(const QwenDecodeSpec& spec) {
-    return spec_states()[&spec];
+SpecState& state_for(const ModelLoader& loader) {
+    auto& state = loader.cache<SpecState>();
+    if (!state) state = std::make_unique<SpecState>();
+    return *state;
 }
 
-// Process-global device-resident KV cache + precomputed RoPE tables, one per
-// spec; zeroed at the start of each utterance. The KV tensors live in a
-// persistent ggml_context allocated on the backend buffer; graphs reference
-// them (and the RoPE tables) as fixed leaves. Freed by the registered
-// decode-cache-clearer BEFORE backend teardown.
 DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
-    SpecState& st = state_for(m.spec);
-    // Capture the map-slot POINTER, not the local reference: the shutdown
-    // clearer runs long after this frame is gone, and a by-reference capture
-    // of `st` dereferences a dead stack slot (the historical exit-time
-    // "double free or corruption" in the decode-cache clearers).
-    SpecState* stp = &st;
-    std::call_once(st.device_once, [stp] {
-        register_decode_cache_clearer([stp] { stp->device_cache.reset(); });
-    });
+    SpecState& st = state_for(m.loader);
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
-    st.device_cache = std::unique_ptr<DeviceCache>(new DeviceCache());
-    if (!st.device_cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e)) {
-        st.device_cache.reset();
+    auto cache = std::make_unique<DeviceCache>();
+    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e)) {
         return nullptr;
     }
+    st.device_cache = std::move(cache);
     return st.device_cache.get();
 }
 
@@ -692,14 +667,10 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
 // one-shot build. Cached in a bounded LRU (runtime/lru_cache.hpp) of size
 // STARLING_REPLAY_CACHE_SIZE (default 16) — without the bound, each distinct
 // prompt length would pin its own captured graph + private gallocr until
-// exit (the unbounded-cache OOM bug). Cleared via register_decode_cache_clearer.
+// exit (the unbounded-cache OOM bug). Freed with the owning model.
 PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                                          std::string& e) {
-    SpecState& st = state_for(m.spec);
-    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
-    std::call_once(st.prefill_once, [stp] {
-        register_decode_cache_clearer([stp] { stp->prefill_cache.reset(); });
-    });
+    SpecState& st = state_for(m.loader);
     if (!st.prefill_cache)
         st.prefill_cache = std::make_unique<PrefillCache>(replay_cache_size());
     const auto& lc = m.dims;
@@ -914,11 +885,7 @@ int kstep_K(const QwenDecodeSpec& spec) {
 // Build (or fetch) the single full-capacity K-step graph for K. start_past is
 // a runtime input, so this graph is reused for every decode-step batch.
 KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
-    SpecState& st = state_for(m.spec);
-    SpecState* stp = &st;  // see get_device_cache: no dangling by-ref captures
-    std::call_once(st.kstep_once, [stp] {
-        register_decode_cache_clearer([stp] { stp->kstep.clear(); });
-    });
+    SpecState& st = state_for(m.loader);
     KStepKey key{K};
     auto it = st.kstep.find(key);
     if (it != st.kstep.end()) return it->second.get();
@@ -1131,9 +1098,9 @@ bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
 
 } // namespace
 
-size_t prefill_replay_cache_size(const QwenDecodeSpec& spec) {
-    SpecState& st = state_for(spec);
-    return st.prefill_cache ? st.prefill_cache->by_S.size() : 0;
+size_t prefill_replay_cache_size(const ModelLoader& loader) {
+    const auto* st = loader.find_cache<SpecState>();
+    return st && st->prefill_cache ? st->prefill_cache->by_S.size() : 0;
 }
 
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,

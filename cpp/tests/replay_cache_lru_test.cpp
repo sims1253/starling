@@ -109,7 +109,7 @@ int run_encoder_phase(moss::MossModel& m, int cap, int n,
             return 1;
         }
         if (i == 0 && first_out) *first_out = out.data;
-        sizes[(size_t)i] = moss::encoder_replay_cache_size();
+        sizes[(size_t)i] = moss::encoder_replay_cache_size(m);
         vrams[(size_t)i] = gpu_used_bytes();
         std::printf("[enc] i=%2d T=%lld cache_size=%zu vram_used=%.1fMiB\n",
                     i, (long long)T, sizes[(size_t)i], mib(vrams[(size_t)i]));
@@ -136,7 +136,7 @@ int run_prefill_phase(moss::MossModel& m, int cap, int n,
                 " (S=" + std::to_string(S) + "): " + e;
             return 1;
         }
-        sizes[(size_t)i] = moss::prefill_replay_cache_size();
+        sizes[(size_t)i] = moss::prefill_replay_cache_size(m);
         std::printf("[pfx] i=%2d S=%lld cache_size=%zu\n",
                     i, (long long)S, sizes[(size_t)i]);
     }

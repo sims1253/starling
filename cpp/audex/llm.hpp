@@ -26,6 +26,6 @@ bool llm_prefill(const AudexModel& m, const InputsEmbeds& i, int32_t max_cache_l
                  PrefillResult& o, std::string& e);
 bool greedy_generate(const AudexModel& m, const InputsEmbeds& i,
                      const GenerateOptions& op, GenerateResult& o, std::string& e);
-size_t prefill_replay_cache_size();
+size_t prefill_replay_cache_size(const AudexModel& model);
 
 } // namespace starling::ggml::audex

@@ -257,12 +257,12 @@ struct EncoderReplayEntry {
 // qwen_decode's spec_states()): the ONLY teardown path is the decode-cache
 // clearer registered at first use — a namespace-scope destructor would race
 // the shutdown handler instead.
-LruCache<int64_t, EncoderReplayEntry>* g_encoder_cache = nullptr;
-std::once_flag g_encoder_once;
+using EncoderCache = LruCache<int64_t, EncoderReplayEntry>;
 } // namespace
 
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;}
+size_t encoder_replay_cache_size(const AudexModel& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;}
 
 bool encode_audio_and_project(const AudexModel& model, const MelFeatures& mel,
                               AudioEmbeds& out, std::string& err) {
@@ -323,14 +323,10 @@ bool encode_audio_and_project(const AudexModel& model, const MelFeatures& mel,
 
     // GPU: captured graph (single shape in practice); the mel is the only
     // varying input.
-    std::call_once(g_encoder_once, [] {
-        register_decode_cache_clearer([] { delete g_encoder_cache; g_encoder_cache = nullptr; });
-    });
-    if (!g_encoder_cache)
-        g_encoder_cache = new LruCache<int64_t, EncoderReplayEntry>(
-            replay_cache_size());
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(mel.n_frames,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(mel.n_frames,
         [&](EncoderReplayEntry& entry) {
             entry.T_pad = mel.n_frames;
             entry.mel_buf = reinterpret_cast<ggml_bf16_t*>(entry.pool.alloc_bytes(

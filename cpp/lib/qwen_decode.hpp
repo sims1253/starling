@@ -5,9 +5,8 @@
 // A model binds the stack through a QwenDecodeCtx: a QwenDecodeSpec (the only
 // places the two trunks differ — projection family, env-var prefix, message
 // label, probe filename prefix), the ModelLoader holding the realized weights,
-// and the config dims the graphs are shaped by. The process-global caches
-// (device KV, per-S prefill graphs, per-K K-step graphs) are singletons keyed
-// by spec: one set per model, first requester sizes them.
+// and the config dims the graphs are shaped by. The device KV, per-S prefill graphs and per-K K-step graphs are owned by
+// the loaded model, so models with the same spec cannot share weights.
 #pragma once
 
 #include "runtime/model_loader.hpp"
@@ -106,8 +105,8 @@ bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t max_cach
                  PrefillResult& o, std::string& e);
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i, const GenerateParams& op,
                      GenerateResult& o, std::string& e);
-// Number of captured per-S prefill graphs for this spec (diagnostic + the
+// Number of captured per-S prefill graphs for this model (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
-size_t prefill_replay_cache_size(const QwenDecodeSpec& spec);
+size_t prefill_replay_cache_size(const ModelLoader& loader);
 
 } // namespace starling::ggml::lib

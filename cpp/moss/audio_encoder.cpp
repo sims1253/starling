@@ -319,7 +319,7 @@ bool encode_audio(const MossModel& model, const MelFeatures& mel,
 // gallocr + captured CUDA graph per distinct shape until exit (the Wave H OOM
 // bug); LRU evicts the least-recently-used shape (freeing its device buffer) at
 // capacity. The parakeet encoder ReplayCache (cpp/parakeet/encoder.{hpp,cpp})
-// uses the same bounded helper. Cleared via register_decode_cache_clearer.
+// uses the same bounded helper. Freed with the owning model.
 // Capture is GPU-only; CPU and the STARLING_MOSS_DEBUG diagnostic path keep the
 // one-shot encode_audio + apply_adapter pair.
 // ---------------------------------------------------------------------------
@@ -342,19 +342,13 @@ struct ShapeKeyHash { size_t operator()(const ShapeKey& k) const noexcept {
 // STARLING_REPLAY_CACHE_SIZE env var is read at first encode, not at process
 // start. reset() (the decode-cache clearer) frees every cached ReplayGraph
 // while the backend is still alive.
-std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>> g_encoder_cache;
-std::once_flag g_encoder_cache_once;
-
-void register_encoder_cache_clearer_once() {
-    std::call_once(g_encoder_cache_once, [] {
-        register_decode_cache_clearer([] { g_encoder_cache.reset(); });
-    });
-}
+using EncoderCache = LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>;
 } // namespace
 
 // Current number of cached encoder graphs (diagnostic / regression-test hook).
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;
+size_t encoder_replay_cache_size(const MossModel& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;
 }
 
 bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
@@ -372,10 +366,8 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
         err = "invalid MOSS mel shape/data"; return false;
     }
 
-    register_encoder_cache_clearer_once();
-    if (!g_encoder_cache)
-        g_encoder_cache = std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>>(
-            new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(replay_cache_size()));
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
     const MelShape s = mel_shape(mel.n_frames);
     ShapeKey key{s.C, s.tail};
@@ -383,7 +375,7 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
     // it: the ReplayGraph build lambda captures the stable pool pointers. On a
     // miss at capacity the LRU shape is evicted (its ReplayGraph freed) before
     // this entry is inserted.
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.shape = s;
             entry.chunks_buf = reinterpret_cast<ggml_bf16_t*>(

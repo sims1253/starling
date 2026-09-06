@@ -29,5 +29,5 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
 
 // Current number of cached fused encoder+adapter graphs (diagnostic + the Wave H
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU encode.
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const MossModel& model);
 } // namespace starling::ggml::moss

@@ -339,7 +339,13 @@ contains the configuration error. `STARLING_GPU_LOCK_DISABLE=1` bypasses this
 lock when GPU access is serialized externally; it is also needed on Windows,
 where POSIX flock is unavailable.
 
-Endpoints (FastAPI when available, stdlib fallback):
+The Python server uses FastAPI and Uvicorn. Install its optional dependencies
+from the repository with `uv sync --extra server` (or `pip install '.[server]'`).
+Development installs use `uv sync --extra dev`, which includes serving dependencies. The former `--stdlib` fallback has been removed; omit that
+flag and install the server extra. The native binary remains independently
+usable without Python.
+
+Endpoints:
 
 | Method + path             | Purpose |
 | ------------------------- | ------- |

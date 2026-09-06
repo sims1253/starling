@@ -63,8 +63,8 @@ bool greedy_generate(const AudexModel& m, const InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const AudexModel& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::audex

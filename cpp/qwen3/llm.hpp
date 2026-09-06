@@ -19,5 +19,5 @@ bool greedy_generate(const Qwen3Model&, const InputsEmbeds&, const GenerateOptio
                      GenerateResult&, std::string&);
 // Current number of cached per-S prefill graphs (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
-size_t prefill_replay_cache_size();
+size_t prefill_replay_cache_size(const Qwen3Model& model);
 } // namespace starling::ggml::qwen3

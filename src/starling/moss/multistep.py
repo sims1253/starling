@@ -1,35 +1,15 @@
-"""Multi-step CUDA-graph capture for the MOSS-Transcribe Qwen3 LLM decoder.
-
-Captures **K** consecutive decode steps into one ``torch.cuda.CUDAGraph`` so the
-host syncs once per K tokens instead of once per token.  Greedy argmax happens
-INSIDE the captured graph and feeds back as the next step's input token
-(device-side, no sync).  Mirrors ``starling.granite.multistep`` (Approach B:
-greedy-in-graph, post-hoc EOS trim).
-
-The emitted token sequence is **byte-exact** with the single-step greedy
-decoder (greedy is deterministic; only the timing of the argmax + sync changes).
-"""
+"""Moss decoder with shared K-step graph generation."""
 
 from __future__ import annotations
-
-import time
-from typing import Any, Optional
-
+from typing import Any
 import torch
-
 from .config import LLM_EOS_TOKEN_ID
 from .fused_decode import FusedMossLLMMega
 from .llm_mega import BenchReport, GenerateResult, MossLLMMega
+from ..multistep import MultiStepDecoder
 
 
-class MossMultiStepMega(MossLLMMega):
-    """K-step CUDA-graph-captured greedy decoder for the MOSS Qwen3 LLM.
-
-    Subclasses the single-step decoder (:class:`MossLLMMega`, the model's own
-    layers).  For the ~2x faster fused-Triton path use
-    :class:`FusedMossMultiStepMega`.
-    """
-
+class MossMultiStepMega(MultiStepDecoder, MossLLMMega):
     def __init__(
         self,
         language_model: Any,
@@ -50,18 +30,8 @@ class MossMultiStepMega(MossLLMMega):
             dtype=dtype,
             compile_decode=compile_decode,
         )
-        self.steps_per_replay = max(1, int(steps_per_replay))
-        self.K = self.steps_per_replay
+        self._init_multistep(steps_per_replay, device)
 
-        # ---- multi-step static buffers (fixed addresses for the graph) -----
-        self.output_ids = torch.zeros(self.K, dtype=torch.int64, device=device)
-        self.valid_len_buf = torch.zeros((), dtype=torch.int64, device=device)
-        self._attn_mask_flat = self.static_attn_mask.view(-1)  # (M,)
-
-        self._ms_graph: Optional[torch.cuda.CUDAGraph] = None
-        self._ms_captured = False
-
-    # ------------------------------------------------------------------ #
     def _reset_to_chunk_start(self, base: int, first_token: torch.Tensor) -> None:
         """Reset all multi-step state to the start of a chunk at position ``base``."""
         self._reset_cache_pos(base)
@@ -73,14 +43,11 @@ class MossMultiStepMega(MossLLMMega):
         if base > 0:
             self.static_attn_mask.view(-1)[:base] = 0.0
 
-    # ------------------------------------------------------------------ #
     def _captured_step(self, j: int) -> None:
         """One decode step inside the K-step captured graph (step index ``j``)."""
         # (a) unmask the single new position being written this step (slot
         #     base+j = valid_len_buf-1).  Single-element index_fill_.
-        self._attn_mask_flat.index_fill_(
-            0, (self.valid_len_buf - 1).view(1).long(), 0.0
-        )
+        self._attn_mask_flat.index_fill_(0, (self.valid_len_buf - 1).view(1).long(), 0.0)
 
         # (b) decode forward (writes static_logits, advances cache by 1).
         self._decode_step_eager()
@@ -95,39 +62,6 @@ class MossMultiStepMega(MossLLMMega):
         self.static_cache_pos += 1
         self.valid_len_buf += 1
 
-    def _run_k_steps(self) -> None:
-        for j in range(self.K):
-            self._captured_step(j)
-
-    # ------------------------------------------------------------------ #
-    @torch.inference_mode()
-    def capture(self, first_token: torch.Tensor, prefill_len: int) -> None:
-        """Capture K decode steps into a single CUDA graph."""
-        T = int(prefill_len)
-        if T + self.K > self.max_cache_len:
-            raise ValueError(
-                f"K={self.K} captured steps would overflow the static KV cache "
-                f"(prompt T={T}, max_cache_len={self.max_cache_len}; need "
-                f"T + K <= max_cache_len). Reduce K or max_cache_len."
-            )
-
-        # (0) capture the single-step graph too (used as a fallback / verify path).
-        super().capture(first_token, T)
-
-        self._reset_to_chunk_start(T, first_token)
-        for _ in range(self.warmup_iters):
-            self._run_k_steps()
-        torch.cuda.synchronize()
-        self._reset_to_chunk_start(T, first_token)
-
-        self._ms_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._ms_graph):
-            self._run_k_steps()
-
-        self._reset_to_chunk_start(T, first_token)
-        self._ms_captured = True
-
-    # ------------------------------------------------------------------ #
     @torch.inference_mode()
     def generate(
         self,
@@ -136,63 +70,18 @@ class MossMultiStepMega(MossLLMMega):
         eos_token_id: int = LLM_EOS_TOKEN_ID,
         capture: bool = True,
     ) -> GenerateResult:
-        """Greedy-generate ``max_new_tokens`` using K-step graph replays."""
-        T = inputs_embeds.shape[1]
-        max_safe = self.max_cache_len - T + 1
-        if max_new_tokens > max_safe:
-            raise ValueError(
-                f"max_new_tokens={max_new_tokens} would overflow the static KV "
-                f"cache (prompt T={T}, max_cache_len={self.max_cache_len})."
-            )
-        if inputs_embeds.shape[0] != 1:
-            raise ValueError(f"batch=1 only, got {inputs_embeds.shape[0]}.")
         if max_new_tokens <= 0:
             return self._finalize([], 0.0)
+        if inputs_embeds.shape[0] != 1:
+            raise ValueError("Multi-step decoding only supports batch=1.")
+        prompt_len = inputs_embeds.shape[1]
+        self._validate_token_budget(prompt_len, max_new_tokens)
+        first_token = self.prefill(inputs_embeds)
+        ids, elapsed = self._generate_multistep(
+            first_token, prompt_len, max_new_tokens, (eos_token_id,), capture
+        )
+        return self._finalize(ids, elapsed)
 
-        K = self.K
-        n_decode = max_new_tokens - 1
-
-        next_token = self.prefill(inputs_embeds)
-        gen_ids = [int(next_token.item())]
-
-        if max_new_tokens <= 1 or n_decode <= 0:
-            return self._finalize(gen_ids, 0.0)
-
-        n_chunks = (n_decode + K - 1) // K
-        total_steps = n_chunks * K
-        if T - 1 + total_steps >= self.max_cache_len:
-            raise ValueError(
-                f"multi-step rounded-up decode ({total_steps} steps across "
-                f"{n_chunks} chunks of K={K}) would overflow the static KV cache "
-                f"(prompt T={T}, max_cache_len={self.max_cache_len})."
-            )
-
-        if capture and not self._ms_captured:
-            self.capture(next_token, T)
-
-        self._reset_to_chunk_start(T, next_token)
-
-        t0 = time.perf_counter()
-        done = False
-        for _chunk in range(n_chunks):
-            self._ms_graph.replay()
-            out = self.output_ids.tolist()
-            for tok in out:
-                if len(gen_ids) >= max_new_tokens:
-                    done = True
-                    break
-                gen_ids.append(tok)
-                if tok == eos_token_id:
-                    done = True
-                    break
-            if done:
-                break
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-
-        return self._finalize(gen_ids, (t1 - t0) * 1000.0)
-
-    # ------------------------------------------------------------------ #
     @torch.inference_mode()
     def bench(
         self,

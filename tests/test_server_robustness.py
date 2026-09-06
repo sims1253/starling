@@ -7,7 +7,6 @@ the specific fixes called out in the review:
 
 * A. malformed audio -> HTTP 400 (not a 500 / dead socket)
 * B. multipart parsing selects the audio field by name / filename / content-type
-* C. WebSocket frame cap + client-mask enforcement
 * D. streaming buffer is bounded (committed prefix trimmed)
 * E. ``ChunkStreamer.flush`` retries the tail on a busy transcriber (bounded)
 * F. ``flags()`` applies overrides, restores defaults, preserves all fields
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import io
 import os
-import struct
 import sys
 import threading
 import time
@@ -33,7 +31,6 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from starling.server import (  # noqa: E402
-    MAX_WS_FRAME_BYTES,
     SAMPLE_RATE,
     STREAM_TRIM_MIN_SAMPLES,
     ServerConfig,
@@ -43,7 +40,6 @@ from starling.server import (  # noqa: E402
     _extract_multipart_payload,
     _transcribe_payload_sync,
     _wav_bytes_to_float32,
-    _ws_read_frame,
 )
 from starling.stream_chunk import (  # noqa: E402
     ChunkStreamer,
@@ -350,238 +346,6 @@ def test_multipart_zero_score_fallback_ignores_trailing_empty_part() -> None:
     out = _extract_multipart_payload(body, ctype)
 
     assert out == b"the real payload"  # last non-empty, not the empty trailer
-
-
-# ---------------------------------------------------------------------------
-# C. WS frame cap + mask validation
-# ---------------------------------------------------------------------------
-def _ws_frame(*, payload: bytes, opcode: int = 0x1, mask: bool = True,
-              mask_key: bytes = b"\x01\x02\x03\x04") -> bytes:
-    """Build one RFC 6455 client->server frame's wire bytes.
-
-    All client frames are masked per RFC 6455 §5.1 unless ``mask=False``.
-    """
-    b0 = 0x80 | (opcode & 0x0F)  # FIN set
-    n = len(payload)
-    out = bytearray()
-    if n < 126:
-        b1 = (0x80 if mask else 0x00) | n
-        out += struct.pack(">BB", b0, b1)
-    elif n < 65536:
-        b1 = (0x80 if mask else 0x00) | 126
-        out += struct.pack(">BBH", b0, b1, n)
-    else:
-        b1 = (0x80 if mask else 0x00) | 127
-        out += struct.pack(">BBQ", b0, b1, n)
-    if mask:
-        assert len(mask_key) == 4
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    else:
-        out += payload
-    return bytes(out)
-
-
-def _rfile(data: bytes) -> io.BufferedReader:
-    """A file-like rfile backed by BytesIO (has ``.read(n)``)."""
-    return io.BufferedReader(io.BytesIO(data))
-
-
-def test_ws_read_frame_valid_masked_text_frame() -> None:
-    payload = b"hello stream"
-    frame = _ws_frame(payload=payload, opcode=0x1)
-
-    opcode, out = _ws_read_frame(_rfile(frame))
-
-    assert opcode == 0x1
-    assert out == payload
-
-
-def test_ws_read_frame_rejects_unmasked_client_frame() -> None:
-    """An unmasked client->server frame is a protocol violation -> ConnectionError."""
-    frame = _ws_frame(payload=b"sneaky", opcode=0x1, mask=False)
-
-    with pytest.raises(ConnectionError, match="unmasked"):
-        _ws_read_frame(_rfile(frame))
-
-
-def test_ws_read_frame_rejects_oversized_frame_header() -> None:
-    """A frame claiming a payload > MAX_WS_FRAME_BYTES raises before reading body."""
-    huge = MAX_WS_FRAME_BYTES + 1
-    # 127-length extended header with a gigantic declared length, masked.
-    b0 = 0x80 | 0x1  # FIN + text
-    b1 = 0x80 | 127   # masked + 64-bit length
-    header = struct.pack(">BBQ", b0, b1, huge) + b"\x01\x02\x03\x04"
-
-    with pytest.raises(ValueError, match="too large"):
-        _ws_read_frame(_rfile(header))
-
-
-def test_ws_read_frame_allows_max_size_header() -> None:
-    """A frame declaring exactly MAX_WS_FRAME_BYTES passes the size check.
-
-    We only feed the header (no real payload) so the reader will then hit EOF
-    reading the body; the point is the size ValueError must NOT fire.
-    """
-    b0 = 0x80 | 0x1
-    b1 = 0x80 | 127
-    header = struct.pack(">BBQ", b0, b1, MAX_WS_FRAME_BYTES) + b"\x01\x02\x03\x04"
-
-    with pytest.raises(ConnectionError, match="closed mid-frame"):
-        _ws_read_frame(_rfile(header))
-    # If the size check had fired we'd have seen ValueError instead; reaching
-    # the EOF "closed mid-frame" ConnectionError proves the cap allowed it.
-
-
-def test_ws_read_frame_rejects_oversized_fragmented_message() -> None:
-    """The size cap applies across the WHOLE fragmented message, not per frame.
-
-    An unfinished text frame followed by a continuation whose combined payload
-    exceeds MAX_WS_FRAME_BYTES must raise, not return the joined payload.
-    """
-    mask_key = b"\x01\x02\x03\x04"
-
-    def _masked_frame(payload: bytes, opcode: int, *, fin: bool) -> bytes:
-        b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
-        n = len(payload)
-        b1 = 0x80 | (126 if n < 65536 else 127)
-        out = bytearray()
-        if n < 65536:
-            out += struct.pack(">BBH", b0, b1, n)
-        else:
-            out += struct.pack(">BBQ", b0, b1, n)
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        return bytes(out)
-
-    half = MAX_WS_FRAME_BYTES // 2 + 1  # two halves each under the per-frame cap...
-    first = _masked_frame(b"\x00" * half, opcode=0x1, fin=False)  # unfinished text
-    cont = _masked_frame(b"\x00" * half, opcode=0x0, fin=True)    # ...but combined > cap
-
-    with pytest.raises(ValueError, match="too large"):
-        _ws_read_frame(_rfile(first + cont))
-
-
-def _ws_raw_frame(payload: bytes, opcode: int, *, fin: bool, mask: bool = True,
-                  mask_key: bytes = b"\x01\x02\x03\x04") -> bytes:
-    """Build one masked client->server frame with a controlled FIN bit."""
-    b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
-    n = len(payload)
-    out = bytearray()
-    if n < 126:
-        out += struct.pack(">BB", b0, (0x80 if mask else 0x00) | n)
-    elif n < 65536:
-        out += struct.pack(">BBH", b0, (0x80 if mask else 0x00) | 126, n)
-    else:
-        out += struct.pack(">BBQ", b0, (0x80 if mask else 0x00) | 127, n)
-    if mask:
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    else:
-        out += payload
-    return bytes(out)
-
-
-def test_ws_read_frame_text_fragment_with_interleaved_ping_assembles_message() -> None:
-    """A ping interleaved mid-fragmented TEXT message must not discard the
-    accumulated fragments; the assembled text is returned once FIN arrives."""
-    first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)   # unfinished text
-    ping = _ws_raw_frame(b"ping-body", opcode=0x9, fin=True)  # interleaved ping
-    cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)      # finishing continuation
-
-    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
-
-    assert opcode == 0x1
-    assert out == b"hello"  # fragments preserved across the ping
-
-
-def test_ws_read_frame_binary_fragment_with_interleaved_ping_assembles_message() -> None:
-    """A ping interleaved mid-fragmented BINARY message preserves the fragments."""
-    first = _ws_raw_frame(b"\x01\x02", opcode=0x2, fin=False)  # unfinished binary
-    ping = _ws_raw_frame(b"x", opcode=0x9, fin=True)           # interleaved ping
-    cont = _ws_raw_frame(b"\x03\x04", opcode=0x0, fin=True)    # finishing continuation
-
-    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
-
-    assert opcode == 0x2
-    assert out == b"\x01\x02\x03\x04"
-
-
-def test_ws_read_frame_standalone_ping_when_no_pending_message() -> None:
-    """A ping with no pending fragmented message is surfaced to the caller (so it
-    can pong) -- the common case is unchanged."""
-    ping = _ws_raw_frame(b"keepalive", opcode=0x9, fin=True)
-
-    opcode, out = _ws_read_frame(_rfile(ping))
-
-    assert opcode == 0x9
-    assert out == b"keepalive"
-
-
-def test_ws_read_frame_rejects_non_final_ping() -> None:
-    """RFC 6455 §5.5: a control frame (ping) MUST have FIN set -- it cannot be
-    fragmented. A non-final ping is rejected before any payload handling."""
-    # FIN clear (fin=False) on a ping (0x9).
-    frame = _ws_raw_frame(b"x", opcode=0x9, fin=False)
-
-    with pytest.raises(ValueError, match="control frame .* must have FIN set"):
-        _ws_read_frame(_rfile(frame))
-
-
-def test_ws_read_frame_rejects_ping_payload_over_125_bytes() -> None:
-    """RFC 6455 §5.5: a control frame payload MUST NOT exceed 125 bytes. A
-    126-byte ping is rejected before on_ping could answer it."""
-    # A 126-byte payload uses the 16-bit extended-length encoding; _ws_raw_frame
-    # emits it correctly, but the reader must reject it as an invalid ping.
-    frame = _ws_raw_frame(b"\x00" * 126, opcode=0x9, fin=True)
-
-    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
-        _ws_read_frame(_rfile(frame))
-
-    # And it must also be rejected before invoking on_ping (no pong emitted).
-    pongs: list[bytes] = []
-    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
-        _ws_read_frame(_rfile(frame), on_ping=pongs.append)
-    assert pongs == []  # on_ping never called for the invalid frame
-
-
-def test_ws_read_frame_mid_fragment_ping_answers_via_callback_before_continuation() -> None:
-    """A ping interleaved mid-fragmented message is answered *immediately* via
-    on_ping, before the continuation frame is read -- not silently held until
-    the message completes. Regression: the original mid-fragment path swallowed
-    the ping, so no pong was ever sent for it."""
-    events: list[str] = []
-    pongs: list[bytes] = []
-
-    def on_ping(payload: bytes) -> None:
-        events.append(f"pong:{payload!r}")
-        pongs.append(payload)
-
-    # Wrap the rfile so reading the continuation records an event after the
-    # ping callback -- proving the callback ran *before* the continuation read.
-    raw_first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)
-    ping = _ws_raw_frame(b"ping", opcode=0x9, fin=True)
-    raw_cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)
-    rfile = _rfile(raw_first + ping + raw_cont)
-    real_read = rfile.read
-
-    def tracking_read(n: int = -1) -> bytes:
-        data = real_read(n)
-        # Only tag continuation reads (after the ping byte boundary); the
-        # simplest reliable marker is that pong has already been recorded.
-        if pongs and "cont-read" not in events:
-            events.append("cont-read")
-        return data
-
-    rfile.read = tracking_read  # type: ignore[method-assign]
-
-    opcode, out = _ws_read_frame(rfile, on_ping=on_ping)
-
-    assert opcode == 0x1
-    assert out == b"hello"  # message still assembled correctly
-    assert pongs == [b"ping"]  # pong payload captured
-    # The pong callback fired before the continuation frame was read.
-    assert events.index("pong:b'ping'") < events.index("cont-read")
 
 
 # ---------------------------------------------------------------------------
@@ -990,12 +754,10 @@ def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
     server.warmup()  # must short-circuit before touching the GPU lock
 
 
-@pytest.mark.parametrize("transport", ["stdlib", "fastapi"])
 @pytest.mark.parametrize("path", ["/inference", "/transcribe"])
 @pytest.mark.parametrize("multipart", [False, True])
-def test_http_aliases_accept_wav_uploads(transport, path, multipart, monkeypatch):
+def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
     import asyncio
-    from email.message import Message
     import json
     from starling import server as module
 
@@ -1018,41 +780,27 @@ def test_http_aliases_accept_wav_uploads(transport, path, multipart, monkeypatch
     monkeypatch.setattr(server, "_run_queued_sync", transcribe)
     headers = {"content-length": str(len(body)), "content-type": content_type,
                "x-request-id": "upload-id"}
-    if transport == "stdlib":
-        handler = object.__new__(module._build_stdlib_handler(server))
-        handler.path = path
-        handler.headers = Message()
-        for key, value in headers.items():
-            handler.headers[key] = value
-        handler.rfile = io.BytesIO(body)
-        sent = []
-        handler._send_json = lambda status, response: sent.append((status, response))
-        handler.do_POST()
-        status, response = sent[0]
-    else:
-        fastapi = pytest.importorskip("fastapi")
-        app = module.create_app(server=server, load_on_startup=False)
+    fastapi = pytest.importorskip("fastapi")
+    app = module.create_app(server=server, load_on_startup=False)
 
-        async def receive():
-            return {"type": "http.request", "body": body, "more_body": False}
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
 
-        request = fastapi.Request({"type": "http", "method": "POST", "path": path,
-                                   "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
-                                  receive)
-        route = next(r for r in app.routes if getattr(r, "path", None) == path)
-        result = asyncio.run(route.endpoint(request))
-        status, response = result.status_code, json.loads(result.body)
+    request = fastapi.Request({"type": "http", "method": "POST", "path": path,
+                               "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                              receive)
+    route = next(r for r in app.routes if getattr(r, "path", None) == path)
+    result = asyncio.run(route.endpoint(request))
+    status, response = result.status_code, json.loads(result.body)
     assert status == 200
     assert response["text"] == "accepted"
     assert response["request_id"] == "upload-id"
 
 
-@pytest.mark.parametrize("transport", ["stdlib", "fastapi"])
 @pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
-def test_http_engine_errors_are_json(transport, stage, error_type, monkeypatch, caplog):
+def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
     import asyncio
-    import http.client
     import json
     from starling import server as module
 
@@ -1066,39 +814,24 @@ def test_http_engine_errors_are_json(transport, stage, error_type, monkeypatch, 
     body = _wav_bytes(np.zeros(160, dtype=np.float32))
     headers = {"content-type": "audio/wav", "content-length": str(len(body)),
                "x-request-id": "failed-request"}
-    if transport == "stdlib":
-        httpd = module.ThreadingHTTPServer(("127.0.0.1", 0), module._build_stdlib_handler(server))
-        thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": .01})
-        thread.start()
-        connection = http.client.HTTPConnection(*httpd.server_address, timeout=5)
-        try:
-            connection.request("POST", "/inference", body, headers)
-            response = connection.getresponse()
-            status, content_type, payload = response.status, response.getheader("Content-Type"), response.read()
-        finally:
-            connection.close()
-            httpd.shutdown()
-            httpd.server_close()
-            thread.join(timeout=5)
-    else:
-        pytest.importorskip("fastapi")
-        app = module.create_app(server=server, load_on_startup=False)
-        messages = []
+    pytest.importorskip("fastapi")
+    app = module.create_app(server=server, load_on_startup=False)
+    messages = []
 
-        async def receive():
-            return {"type": "http.request", "body": body, "more_body": False}
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
 
-        async def send(message):
-            messages.append(message)
+    async def send(message):
+        messages.append(message)
 
-        asyncio.run(app({"type": "http", "asgi": {"version": "3.0"},
-                         "http_version": "1.1", "method": "POST", "scheme": "http",
-                         "path": "/inference", "query_string": b"", "root_path": "",
-                         "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
-                        receive, send))
-        status = messages[0]["status"]
-        content_type = dict(messages[0]["headers"])[b"content-type"].decode()
-        payload = b"".join(message.get("body", b"") for message in messages[1:])
+    asyncio.run(app({"type": "http", "asgi": {"version": "3.0"},
+                     "http_version": "1.1", "method": "POST", "scheme": "http",
+                     "path": "/inference", "query_string": b"", "root_path": "",
+                     "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                    receive, send))
+    status = messages[0]["status"]
+    content_type = dict(messages[0]["headers"])[b"content-type"].decode()
+    payload = b"".join(message.get("body", b"") for message in messages[1:])
     assert status == 500
     assert content_type == "application/json"
     assert json.loads(payload) == {"error": "transcription failed", "text": "",

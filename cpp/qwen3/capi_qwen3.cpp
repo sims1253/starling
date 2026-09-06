@@ -20,12 +20,14 @@
 // original Qwen3-ASR library, then everything after the first "<asr_text>"
 // marker (or the whole text) stripped.
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
 #include "prompt.hpp"
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,22 +42,8 @@
 
 namespace {
 
-thread_local std::string g_load_error;
-
-struct Qwen3Ctx {
-    std::unique_ptr<starling::ggml::qwen3::Qwen3Model> model;
-    starling::ggml::qwen3::Tokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char** out, const std::string& message) {
-    if (out) *out = message.c_str();
-}
-
-void report_load_error(const char** out, const std::string& message) {
-    g_load_error = message;
-    if (out) *out = g_load_error.c_str();
-}
+using Qwen3Ctx = starling::ggml::lib::EngineContext<starling::ggml::qwen3::Qwen3Model, starling::ggml::qwen3::Tokenizer>;
+using starling::ggml::lib::report;
 
 constexpr double kSampleRate = 16000.0;
 
@@ -223,33 +211,7 @@ std::string join_texts(const std::vector<std::string>& texts) {
 extern "C" {
 
 void* starling_ggml_qwen3_load(const char* gguf_path, const char** err_out) {
-    try {
-        if (!gguf_path || !*gguf_path) {
-            if (err_out) *err_out = "null or empty QWEN3 GGUF path";
-            return nullptr;
-        }
-        auto ctx = std::make_unique<Qwen3Ctx>();
-        ctx->model = std::make_unique<starling::ggml::qwen3::Qwen3Model>();
-        if (!ctx->model->load(gguf_path, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        if (!ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        // Persist weights + force backend creation (and its orderly atexit
-        // shutdown registration) across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        starling::ggml::register_decode_cache_clearer([]() {});
-        if (err_out) *err_out = nullptr;
-        return ctx.release();
-    } catch (const std::exception& e) {
-        report_load_error(err_out, e.what());
-    } catch (...) {
-        report_load_error(err_out, "unknown exception loading QWEN3 model");
-    }
-    return nullptr;
+    return starling::ggml::lib::load_engine<Qwen3Ctx>(gguf_path, "QWEN3", err_out);
 }
 
 void starling_ggml_qwen3_free(void* handle) {

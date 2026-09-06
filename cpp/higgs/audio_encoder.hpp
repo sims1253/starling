@@ -28,5 +28,5 @@ std::vector<float> read_tensor_to_f32(const ModelLoader& ml, const char* name,
 
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const HiggsModel& model);
 } // namespace starling::ggml::higgs

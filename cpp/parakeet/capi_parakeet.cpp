@@ -15,6 +15,7 @@
 #include "config.hpp"
 
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 #include "runtime/audio_io.hpp"
 
 #include "starling_ggml.h"
@@ -37,7 +38,6 @@ struct ParakeetCtx {
     std::unique_ptr<starling::ggml::parakeet::ParakeetModel> model;
     starling::ggml::parakeet::MelConstants mel_const;
     // Persistent GPU mel (kept warm across utterances); null on CPU.
-    std::unique_ptr<starling::ggml::parakeet::GpuMel> gmel;
     // Model-bound compute objects persist across transcription calls so their
     // lazy host weights and per-shape replay graphs reach steady state.
     std::unique_ptr<starling::ggml::parakeet::Encoder> encoder;
@@ -80,14 +80,14 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
         // Realize weights to the process-global backend (zero-copy on CPU /
         // upload on GPU). Also forces global_backend() creation so the
         // atexit handler is registered before any compute.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
+        starling::ggml::ensure_weights_realized(ctx->model->loader);
         if (std::getenv("STARLING_MEL_DEBUG"))
             std::fprintf(stderr, "[MEL_DEBUG] load: STARLING_GGML_DEVICE=%s dev=%s is_gpu=%d\n",
                 std::getenv("STARLING_GGML_DEVICE") ? std::getenv("STARLING_GGML_DEVICE") : "(auto)",
                 starling::ggml::global_backend().device_name(),
                 starling::ggml::global_backend().is_gpu() ? 1 : 0);
         if (starling::ggml::global_backend().is_gpu()) {
-            ctx->gmel = std::make_unique<starling::ggml::parakeet::GpuMel>(
+            ctx->model->loader.cache<starling::ggml::parakeet::GpuMel>() = std::make_unique<starling::ggml::parakeet::GpuMel>(
                 starling::ggml::global_backend(), ctx->mel_const);
         }
         ctx->encoder = std::make_unique<starling::ggml::parakeet::Encoder>(*ctx->model);
@@ -125,7 +125,7 @@ float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
     std::vector<float> feats;
     int T = 0;
     try {
-        if (c->gmel) c->gmel->compute(pcm, (size_t)n, feats, T);
+        if (auto& gmel = c->model->loader.cache<starling::ggml::parakeet::GpuMel>()) gmel->compute(pcm, (size_t)n, feats, T);
         else {
             starling::ggml::parakeet::MelFrontend cpu(c->mel_const);
             cpu.compute(pcm, (size_t)n, feats, T);
@@ -158,7 +158,7 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
     std::vector<float> feats;
     int T_mel = 0;
     try {
-        if (c->gmel) c->gmel->compute(pcm, (size_t)n, feats, T_mel);
+        if (auto& gmel = c->model->loader.cache<starling::ggml::parakeet::GpuMel>()) gmel->compute(pcm, (size_t)n, feats, T_mel);
         else {
             starling::ggml::parakeet::MelFrontend cpu(c->mel_const);
             cpu.compute(pcm, (size_t)n, feats, T_mel);
@@ -207,7 +207,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
     std::vector<float> feats;
     int T_mel = 0;
     try {
-        if (c->gmel) c->gmel->compute(pcm, (size_t)n, feats, T_mel);
+        if (auto& gmel = c->model->loader.cache<starling::ggml::parakeet::GpuMel>()) gmel->compute(pcm, (size_t)n, feats, T_mel);
         else {
             starling::ggml::parakeet::MelFrontend cpu(c->mel_const);
             cpu.compute(pcm, (size_t)n, feats, T_mel);
