@@ -70,19 +70,23 @@ granite|parakeet|parakeet_unified|moss|qwen3|ark|cohere|higgs|audex`, default
 isolated `.venv-higgs` environment documented in [Higgs environment notes](../src/starling/higgs/UV_NOTES.md).
 
 ```bash
-uv run python -m starling.server --model granite --port 8181 --max-chunk-seconds 30
-uv run python -m starling.server --model parakeet --profile realtime --warmup
-uv run python -m starling.server --model moss --profile batch  # SDPA + fused fp8
+uv run --extra server starling-python-serve --model granite --port 8181 --max-chunk-seconds 30
+uv run --extra server starling-python-serve --model parakeet --profile realtime --warmup
+uv run --extra server starling-python-serve --model moss --profile batch  # SDPA + fused fp8
 ```
 
 On multi-GPU hosts, set `CUDA_VISIBLE_DEVICES` to a full GPU UUID from
-`nvidia-smi -L`, for example `CUDA_VISIBLE_DEVICES=GPU-... python -m starling.server`.
+`nvidia-smi -L`, for example `CUDA_VISIBLE_DEVICES=GPU-... uv run --extra server starling-python-serve`.
 The process lock rejects numeric masks on these hosts because CUDA ordinals
 can differ from `nvidia-smi` order. Automatic locking also requires working
 NVIDIA discovery. If it fails, inference returns JSON 500 and the server log
 contains the configuration error. `STARLING_GPU_LOCK_DISABLE=1` bypasses this
 lock when GPU access is serialized externally; it is also needed on Windows,
 where POSIX flock is unavailable.
+
+`starling-python-serve` starts the Python server; the native executable is
+`starling-serve`. `python -m starling.server` remains available with the same
+arguments.
 
 The server uses FastAPI and Uvicorn. `uv sync --extra dev` includes the
 server dependencies and development tools.

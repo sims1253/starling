@@ -41,6 +41,7 @@ bench = [
 ]
 
 [project.scripts]
+starling-python-serve = "starling.server:run"
 starling-gpu-run = "starling.gpu.run:main"
 
 [build-system]

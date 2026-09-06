@@ -1589,10 +1589,10 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
 # ===========================================================================
 # CLI
 # ===========================================================================
-def _build_arg_parser() -> argparse.ArgumentParser:
+def _build_arg_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m starling.server",
-        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/cohere/higgs/audex).",
+        prog=prog,
+        description="Run a local Python speech recognition server.",
     )
     p.add_argument(
         "--model",
@@ -1712,9 +1712,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def run(argv: Optional[list[str]] = None) -> int:
+def run(argv: Optional[list[str]] = None, *, prog: str | None = None) -> int:
     """CLI entry point. Loads the model, builds the app, and serves forever."""
-    args = _build_arg_parser().parse_args(argv)
+    args = _build_arg_parser(prog=prog).parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -1811,4 +1811,4 @@ def run(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(run(prog="python -m starling.server"))
