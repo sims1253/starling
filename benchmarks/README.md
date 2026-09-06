@@ -9,7 +9,8 @@ uv run --extra bench python benchmarks/bench_all.py --help
 
 Use `--extra dev --extra bench` when running tests that also download corpora or
 score transcripts. The `dev` extra alone covers the CPU CI suite. Model execution
-still requires the hardware and model files described in the main README.
+still requires the [model files](../docs/models.md) and
+[Python setup](../docs/python-serving.md).
 `librosa` remains a runtime dependency because the Higgs model imports it.
 
 Maintained entry points:

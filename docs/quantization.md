@@ -71,7 +71,7 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
    CPU backend, so it is an offline pass, not a serving mode:
 
    ```bash
-   uv run python benchmarks/imatrix_collect.py \
+   uv run --extra bench python benchmarks/imatrix_collect.py \
        --model models/parakeet-tdt-0.6b-v3-f32.gguf \
        --output models/parakeet-tdt-0.6b-v3.imx.bin \
        --tiers short,medium,long --repeats 2 --wavs path/to/calibration_wavs/
@@ -95,10 +95,11 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
 4. **Verify** by WER against the f32 baseline on the fixtures (and, for
    release gates, the full Open-ASR-Leaderboard sets via
    `benchmarks/wer_leaderboard.py` with `STARLING_GGML_PARAKEET_MODEL`
-   pointing at the quantized file):
+   pointing at the quantized file). Install the scoring dependencies with
+   `uv sync --locked --extra bench`:
 
    ```bash
-   uv run python benchmarks/wer_quant.py --tiers short,medium,long \
+   uv run --extra bench python benchmarks/wer_quant.py --tiers short,medium,long \
        --models f32=models/parakeet-tdt-0.6b-v3-f32.gguf \
                 q8_0=models/parakeet-tdt-0.6b-v3-q8_0.gguf \
                 q4_k_m+imx=models/parakeet-tdt-0.6b-v3-q4_k_m.gguf
@@ -526,8 +527,10 @@ the community repos don't ship: q3_k_m/q2_k/iq2_xxs (634/574/325 MB) exist
 only calibrated (uniform q2_k collapses to 30%/17% where the calibrated
 build matches f32), plus the published imatrix for custom recipes.
 
-Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
-HTTP range reads on the parquet shards (~100 MB per config instead of the
+Tooling note: install the corpus dependencies with
+`uv sync --locked --extra bench` before using `benchmarks/fleurs_download.py`.
+Use `uv run --extra bench python benchmarks/fleurs_download.py --help` for options.
+It fetches FLEURS corpora over HTTP range reads on the parquet shards (~100 MB per config instead of the
 2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
 clips to collection/eval — the datasets-library streaming path accumulates
 multi-GB per config and stalled repeatedly next to a loaded model.
