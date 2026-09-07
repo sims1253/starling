@@ -141,10 +141,21 @@ bool Encoder::encode(const std::vector<float>& mel, int n_mels, int T,
                                        entry.Tp, entry.valid_len,
                                        ph_ok ? entry.ph_scratch.data() : nullptr);
                 });
+            // Static persistent inputs (their own host data: e.g. the
+            // transposed depthwise-conv kernels) upload immediately; the ph
+            // inputs share one scratch and need the layer-by-layer dance.
+            for (size_t i = 0; i < entry.graph->n_inputs(); ++i) {
+                if (!entry.graph->input_persistent(i)) continue;
+                if (entry.graph->input_host(i) == entry.ph_scratch.data()) continue;
+                entry.graph->set_input(i, entry.graph->input_host(i),
+                                       entry.graph->input_nbytes(i));
+            }
             if (!ph_ok) return;
             std::vector<size_t> ph_idx;
             for (size_t i = 0; i < entry.graph->n_inputs(); ++i)
-                if (entry.graph->input_persistent(i)) ph_idx.push_back(i);
+                if (entry.graph->input_persistent(i) &&
+                    entry.graph->input_host(i) == entry.ph_scratch.data())
+                    ph_idx.push_back(i);
             for (size_t k = 0; k < ph_idx.size(); ++k) {
                 if (k > 0 && !compute_pos_layer(Tp0, (int)k, entry.ph_scratch))
                     return;  // scratch holds layer k-1: benign staleness, kept

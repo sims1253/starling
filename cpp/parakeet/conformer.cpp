@@ -57,11 +57,12 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     ggml_tensor* y = ggml_mul_mat(ctx, pw1w, c);  // [2d, T]
     if (pw1b) y = ggml_add(ctx, y, pw1b);
 
-    // -- GLU over channel dim (NeMo F.glu(x, dim=1)).
+    // -- GLU over channel dim (NeMo F.glu(x, dim=1)). The two views share y's
+    // row stride; SIGMOID/MUL consume strided rows directly, so no cont()
+    // materialization is needed (2 fewer dispatches per layer).
     ggml_tensor* a = ggml_view_2d(ctx, y, D, T, y->nb[1], 0);
     ggml_tensor* b = ggml_view_2d(ctx, y, D, T, y->nb[1], (size_t)D * y->nb[0]);
-    ggml_tensor* glu = ggml_mul(ctx, ggml_cont(ctx, a),
-                                ggml_sigmoid(ctx, ggml_cont(ctx, b)));  // [d, T]
+    ggml_tensor* glu = ggml_mul(ctx, a, ggml_sigmoid(ctx, b));  // [d, T]
 
     // -- pad_mask: zero padded time positions before depthwise conv.
     if (valid_len < T) {
@@ -73,25 +74,62 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         glu = ggml_mul(ctx, glu, tmask);
     }
 
-    // -- depthwise_conv (Conv1d d->d, k=K, groups=d).
-    ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
-    ggml_tensor* dww = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
-    // Reshape to [K,1,1,C] (the layout ggml_conv_2d_dw_direct asserts).
-    dww = ggml_reshape_4d(ctx, dww, K, 1, 1, D);  // [K,1,1,C]
-    ggml_tensor* dw;
+    // -- depthwise_conv (Conv1d d->d, k=K, groups=d), channels-first path.
+    // ggml_conv_2d_dw_direct natively consumes a cwhn input ([W=T,H=1,C,1]
+    // with C contiguous, built by free reshape+permute views of glu [C,T])
+    // and produces a cwhn result viewable as [C,T] directly — no transpose,
+    // no cont, on either the input or the output side. The kernel must be
+    // c-fastest ([C per tap]); built once per layer and cached.
+    ggml_tensor* dww_t = nullptr;
     {
-        // Map the 1D conv onto 2D: W=T, H=1 (KH=1 contributes a single tap).
-        ggml_tensor* nb = ggml_reshape_4d(ctx, glu_tc,
-                              glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]
-        // Symmetric pad (offline model): native p0=pad.
-        ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, dww, nb,
-                                                /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
-                                                /*d0*/1, /*d1*/1);
-        // r is [OW=T, OH=1, C, 1]; collapse the unit axes -> [T, C].
-        dw = ggml_reshape_2d(ctx, r, T, D);
+        auto& cache = ml.cache<DwwTransposedCache>();
+        if (!cache) cache = std::make_unique<DwwTransposedCache>();
+        // layer index from the caller's pre string "encoder.layers.N."
+        const char* ls = pre.c_str() + sizeof("encoder.layers.") - 1;
+        int li = 0;
+        while (*ls >= '0' && *ls <= '9') li = li * 10 + (*ls++ - '0');
+        if (cache->by_layer.size() <= (size_t)li)
+            cache->by_layer.resize(li + 1);
+        auto& slot = cache->by_layer[li];
+        if (slot.empty()) {
+            ggml_tensor* src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+            if (!src_w) { /* unreachable: clone_weight below asserts */ }
+            if (!src_w->buffer) ensure_weights_realized(ml);
+            src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+            const size_t n = (size_t)ggml_nelements(src_w);
+            GGML_ASSERT(src_w->type == GGML_TYPE_F16);
+            std::vector<ggml_fp16_t> raw(n);
+            ggml_backend_tensor_get(src_w, raw.data(), 0, n * sizeof(ggml_fp16_t));
+            slot.assign((size_t)K * D, 0);
+            // (k, c): src at c*K + k  ->  dst at k*D + c
+            for (int c = 0; c < D; ++c)
+                for (int k = 0; k < K; ++k)
+                    slot[(size_t)k * D + c] = raw[(size_t)c * K + k];
+        }
+        int64_t dwt_ne[2] = {D, K};  // memory: (c, k) at c + k*D
+        dww_t = graph_input_tensor(ctx, GGML_TYPE_F16, 2, dwt_ne,
+                                   slot.data(), slot.size() * sizeof(ggml_fp16_t));
+        mark_graph_input_persistent(dww_t);
     }
+    // ggml_permute(ctx, a, ax0..ax3): ne[ax_i] = a->ne[i] (ax_i = where
+    // source dim i LANDS). Kernel [D,K,1,1] -> [K,1,1,D]: D->3, K->0.
+    ggml_tensor* knl = ggml_permute(ctx, ggml_reshape_4d(ctx, dww_t, D, K, 1, 1),
+                                    3, 0, 1, 2);  // ne [K,1,1,D]; c stride = 1 elem
+    // Input [D,1,T,1] -> [T,1,D,1]: D->2, T->0; the H=1 dim lands on axis3 so
+    // nb1 picks up the big N stride (is_contiguous_channels wants nb1 > nb0).
+    ggml_tensor* nb_in = ggml_permute(
+        ctx, ggml_reshape_4d(ctx, glu, D, 1, T, 1), 2, 3, 0, 1);  // [T,1,D,1] cwhn
+    std::fprintf(stderr, "[cwhn] knl ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] nb_in ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] K=%d D=%d\n",
+        (long long)knl->ne[0], (long long)knl->ne[1], (long long)knl->ne[2], (long long)knl->ne[3],
+        knl->nb[0], knl->nb[1], knl->nb[2], knl->nb[3],
+        (long long)nb_in->ne[0], (long long)nb_in->ne[1], (long long)nb_in->ne[2], (long long)nb_in->ne[3],
+        nb_in->nb[0], nb_in->nb[1], nb_in->nb[2], nb_in->nb[3], K, D);
+    ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, knl, nb_in,
+                                            /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
+                                            /*d0*/1, /*d1*/1);
+    // r is [OW=T, OH=1, C, 1] with cwhn strides: element (c, t) at t*D + c.
+    ggml_tensor* dwt = ggml_view_2d(ctx, r, D, T, (size_t)D * sizeof(float), 0);
     ggml_tensor* dwb = clone_weight_opt_s(ctx, ml, pre + "conv.depthwise_conv.bias");
-    ggml_tensor* dwt = ggml_cont(ctx, ggml_transpose(ctx, dw));  // [C, T]
     if (dwb) dwt = ggml_add(ctx, dwt, dwb);                      // broadcast [C] over T
 
     // -- norm (between depthwise conv and SiLU).

@@ -31,6 +31,18 @@
 #include "runtime/model_loader.hpp"
 
 #include <string>
+#include <vector>
+
+#include "ggml.h"
+
+namespace starling::ggml::parakeet {
+// Cached c-fastest (transposed) depthwise-conv kernels [C fastest per tap],
+// built once per layer from the GGUF's k-fastest [K,1,C] weight. Feeds the
+// channels-first (cwhn) conv path that avoids the in/out transposes.
+struct DwwTransposedCache {
+    std::vector<std::vector<ggml_fp16_t>> by_layer;
+};
+} // namespace starling::ggml::parakeet
 
 struct ggml_context;
 struct ggml_tensor;
