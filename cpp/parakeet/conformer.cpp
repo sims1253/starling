@@ -19,6 +19,7 @@
 #include "ggml.h"
 
 #include "ggml-backend.h"  // ggml_backend_tensor_get (D2H, works for host + device tensors)
+#include "runtime/graph.hpp"    // global_backend
 
 #include <cmath>
 #include <cstring>
@@ -76,7 +77,57 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         glu = ggml_mul(ctx, glu, tmask);
     }
 
-    // -- depthwise_conv (Conv1d d->d, k=K, groups=d), channels-first path.
+    // -- depthwise_conv (Conv1d d->d, k=K, groups=d).
+    // CPU keeps the reference whcn path: the CPU cwhn kernel asserts a kernel
+    // stride layout our permuted view does not satisfy, and CPU has no
+    // dispatch tax to save. GPU takes the channels-first path below.
+    if (!global_backend().is_gpu()) {
+        ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
+        ggml_tensor* dww_c = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
+        dww_c = ggml_reshape_4d(ctx, dww_c, K, 1, 1, D);  // [K,1,1,C]
+        ggml_tensor* nb_c = ggml_reshape_4d(ctx, glu_tc,
+                               glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]
+        ggml_tensor* rc = ggml_conv_2d_dw_direct(ctx, dww_c, nb_c,
+                                                 1, 1, pad, 0, 1, 1);
+        rc = ggml_reshape_2d(ctx, rc, T, D);
+        ggml_tensor* dwt_c = ggml_cont(ctx, ggml_transpose(ctx, rc));  // [C, T]
+        ggml_tensor* dwb_c = clone_weight_opt_s(ctx, ml, pre + "conv.depthwise_conv.bias");
+        if (dwb_c) dwt_c = ggml_add(ctx, dwt_c, dwb_c);
+        // batch_norm fold (same host math as the GPU path below).
+        float* sc_c = pool.alloc_f32(D);
+        float* sh_c = pool.alloc_f32(D);
+        {
+            auto read_f32 = [&](const std::string& nm, std::vector<float>& dstv) {
+                ggml_tensor* t = ml.tensor(nm.c_str());
+                if (!t) { dstv.clear(); return; }
+                size_t n = (size_t)ggml_nelements(t);
+                dstv.resize(n);
+                ggml_backend_tensor_get(t, dstv.data(), 0, n * sizeof(float));
+            };
+            std::vector<float> g, bb, m, var;
+            read_f32(pre + "conv.batch_norm.weight", g);
+            read_f32(pre + "conv.batch_norm.bias", bb);
+            read_f32(pre + "conv.batch_norm.running_mean", m);
+            read_f32(pre + "conv.batch_norm.running_var", var);
+            for (int cc = 0; cc < D; ++cc) {
+                sc_c[cc] = g[cc] / std::sqrt(var[cc] + bn_eps);
+                sh_c[cc] = bb[cc] - m[cc] * sc_c[cc];
+            }
+        }
+        int64_t dn[1] = {D};
+        ggml_tensor* sc_t = graph_input_tensor(ctx, GGML_TYPE_F32, 1, dn, sc_c, (size_t)D * sizeof(float));
+        ggml_tensor* sh_t = graph_input_tensor(ctx, GGML_TYPE_F32, 1, dn, sh_c, (size_t)D * sizeof(float));
+        ggml_tensor* normed_c = ggml_add(ctx, ggml_mul(ctx, dwt_c, sc_t), sh_t);
+        normed_c = ggml_silu(ctx, normed_c);
+        ggml_tensor* pw2_c = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
+        if (pw2_c->type != GGML_TYPE_F16) pw2_c = ggml_cast(ctx, pw2_c, GGML_TYPE_F16);
+        pw2_c = ggml_reshape_2d(ctx, pw2_c, D, D);
+        ggml_tensor* cout_c = ggml_mul_mat(ctx, pw2_c, normed_c);
+        ggml_tensor* pw2b_c = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
+        if (pw2b_c) cout_c = ggml_add(ctx, cout_c, pw2b_c);
+        return cout_c;  // [D, T]
+    }
+    // (GPU) channels-first (cwhn) path.
     // ggml_conv_2d_dw_direct natively consumes a cwhn input ([W=T,H=1,C,1]
     // with C contiguous, built by free reshape+permute views of glu [C,T])
     // and produces a cwhn result viewable as [C,T] directly — no transpose,
