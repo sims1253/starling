@@ -642,6 +642,19 @@ bool ReplayGraph::compute(std::vector<float>& out) {
         std::fprintf(stderr, "[node-hist] uid=%u n=%d %s\n",
                      (unsigned)gf_->uid, gf_->n_nodes, line.c_str());
     }
+    if (std::getenv("STARLING_NODE_SHAPES") && gf_) {
+        static std::mutex shp_mu;
+        std::lock_guard<std::mutex> lk(shp_mu);
+        for (int i = 0; i < gf_->n_nodes; ++i) {
+            ggml_tensor* n = gf_->nodes[i];
+            if (!n || n->op != GGML_OP_MUL_MAT) continue;
+            ggml_tensor* a = n->src[0];
+            ggml_tensor* b = n->src[1];
+            std::fprintf(stderr, "[mm-shape] m=%lld n=%lld k=%lld wtype=%s\n",
+                (long long)a->ne[1], (long long)b->ne[1], (long long)a->ne[0],
+                ggml_type_name(a->type));
+        }
+    }
     const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
     out.resize((size_t)ggml_nelements(out_));
     readback_async_then_sync(impl, out_, out);
