@@ -79,12 +79,13 @@ experiment command, not in measure.sh.
 - CPU (q8_0, medium): 1684ms. CPU build uses LLAMAFILE ON, NATIVE ON.
 
 ## What's Been Tried
-- **#2 KEEP** Vulkan fused LayerNorm+affine (norm_affine.comp, NORM_MUL_ADD, 120 norms): -26ms, byte-identical. (patch 0012)
-- **#3 KEEP** per-T' pos-bias cache (persistent ReplayGraph inputs): med -30ms, long -112ms, RSS -4MB. One-time 24 small computes per T (~65ms for new T).
-- **#4 KEEP** cwhn depthwise conv (GPU) + GLU cont removal: -192 nodes, -3ms. CPU keeps whcn path (CPU cwhn kernel asserts different strides).
-- **#5 KEEP** decode gate CONT removal + argmax BLOCK=512: -6ms formal.
-- **#7 KEEP** patch-series hygiene: ggml edits -> 0012 patch.
-- **#8 KEEP** F16->F16 cast gating on conv pw weights: med -78ms (150MB/pass of CPY copies!), short -29%. THE big single win.
-- **DEAD**: GGML_VK_FLOPS_PER_SUBMIT (worse), NO_BARRIERS/EXEC_ONLY (races), coherent-loads+fast-sync (slower: L1-bypass), warptile sweep (base optimal), FORCE_PIPE variants, q4_0 joint/LSTM quant (GEMV latency-bound not bandwidth — weight bytes don't matter), m_align 64->32 (no effect).
-- **Post-#8 encoder profile (medium, 521ms GPU-busy)**: FFN GEMMs 249ms (48%), attn qkvo 64ms, conv f16 52ms, FA 19ms, SILU 15ms, decode ~95ms, elementwise ~25ms, mel ~10ms. GPU ~fully busy (dispatch gaps hidden).
-- CPU (secondary): 1706ms after rebuild (cast gating + GLU cont help slightly); pos-cache/cwhn/argmax are GPU-only.
+- **#2 KEEP** Vulkan fused LayerNorm+affine (norm_affine.comp, NORM_MUL_ADD): -26ms, byte-identical. (patch 0012)
+- **#3 KEEP** per-T' pos-bias cache (persistent ReplayGraph inputs): med -30ms, long -112ms, RSS -4MB.
+- **#4 KEEP** cwhn depthwise conv (GPU; CPU keeps whcn — CPU cwhn kernel asserts different strides) + GLU cont removal.
+- **#5 KEEP** decode gate CONT removal + argmax BLOCK=512.
+- **#8 KEEP** F16->F16 cast gating on conv pw weights: med -78ms (was copying 150MB/pass), short -29%. THE big win.
+- **#12 KEEP** STARLING_GGML_THREADS env (CPU leg pins 6 physical): cpu_med 1877->1582ms. SMT hurts ~25%.
+- **DEAD ENDS**: FLOPS_PER_SUBMIT, NO_BARRIERS/EXEC_ONLY (nondeterministic races), coherent-loads+fast-sync (L1-bypass cost > flush saving; but PROVEN byte-exact-stable — the technique works, just not profitable here), warptile sweep (base optimal), FORCE_PIPE all variants, m_align 32 (no effect), q4_0 joint/LSTM quant (decode GEMV latency-bound: weight bytes don't matter), q8_0 conv pw quant (Vulkan flat, CPU +5%), exact ×0.5 fold (bit-exact! but flat speed + 408MB RSS from weight copies).
+- **MEASUREMENT CAVEAT**: GGML_VK_PERF_LOGGER per-node times are inflated by its own timestamp+barrier — don't trust elementwise numbers from it; only trust the big GEMM lines.
+- **Final state**: Vulkan med 770.7->624ms (rtf 0.0346->0.0280, -19%), CPU 1754->1582 (-10%), RSS 978->971, byte-identical transcripts, WER 3.94.
+- Remaining big lever: custom FFN GEMM shader (~250ms at ~61% of fp32 peak; needs int24 dot or better dequant pipelining — days of work, see ideas.md).
