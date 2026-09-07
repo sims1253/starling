@@ -89,3 +89,12 @@ experiment command, not in measure.sh.
 - **MEASUREMENT CAVEAT**: GGML_VK_PERF_LOGGER per-node times are inflated by its own timestamp+barrier — don't trust elementwise numbers from it; only trust the big GEMM lines.
 - **Final state**: Vulkan med 770.7->624ms (rtf 0.0346->0.0280, -19%), CPU 1754->1582 (-10%), RSS 978->971, byte-identical transcripts, WER 3.94.
 - Remaining big lever: custom FFN GEMM shader (~250ms at ~61% of fp32 peak; needs int24 dot or better dequant pipelining — days of work, see ideas.md).
+
+
+## Final state (end of session)
+- **Vulkan (primary)**: 770.7 → 618-636ms formal band (rtf 0.0346 → 0.0278-0.0285, **−19.7%**)
+- **CPU (secondary)**: 1753.8 → 1576-1615ms (**−10%**; pin STARLING_GGML_THREADS=6)
+- **Memory**: peak RSS 978 → 973MB; pos-cache adds device-resident ph per cached T (bounded by LRU)
+- **Quality**: byte-identical transcripts on every keep (sha1_12=2746b80b32fe throughout); WER 3.94 == baseline
+- Shipped: ggml patch 0012 (LN-affine fusion, argmax 512, debug envs) + engine commits through dac718b
+- To resume: rebuild build-ar-vk/build-ar-cpu (config in "How to Run"), ./.auto/measure.sh
