@@ -172,11 +172,6 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // nb1 picks up the big N stride (is_contiguous_channels wants nb1 > nb0).
     ggml_tensor* nb_in = ggml_permute(
         ctx, ggml_reshape_4d(ctx, glu, D, 1, T, 1), 2, 3, 0, 1);  // [T,1,D,1] cwhn
-    std::fprintf(stderr, "[cwhn] knl ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] nb_in ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] K=%d D=%d\n",
-        (long long)knl->ne[0], (long long)knl->ne[1], (long long)knl->ne[2], (long long)knl->ne[3],
-        knl->nb[0], knl->nb[1], knl->nb[2], knl->nb[3],
-        (long long)nb_in->ne[0], (long long)nb_in->ne[1], (long long)nb_in->ne[2], (long long)nb_in->ne[3],
-        nb_in->nb[0], nb_in->nb[1], nb_in->nb[2], nb_in->nb[3], K, D);
     ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, knl, nb_in,
                                             /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
                                             /*d0*/1, /*d1*/1);
