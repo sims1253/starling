@@ -627,6 +627,21 @@ bool ReplayGraph::compute(std::vector<float>& out) {
         ok = (ggml_backend_sched_graph_compute(impl->sched, gf_) == GGML_STATUS_SUCCESS);
     }
     if (!ok) return false;
+    if (std::getenv("STARLING_NODE_HIST") && gf_) {
+        // One-shot per-replay node-type histogram (debug aid; off by default).
+        static std::mutex hist_mu;
+        std::lock_guard<std::mutex> lk(hist_mu);
+        std::map<std::string, int> hist;
+        for (int i = 0; i < gf_->n_nodes; ++i) {
+            ggml_tensor* n = gf_->nodes[i];
+            if (!n) continue;
+            hist[ggml_op_name(n->op)]++;
+        }
+        std::string line;
+        for (auto& [k, v] : hist) line += k + "=" + std::to_string(v) + " ";
+        std::fprintf(stderr, "[node-hist] uid=%u n=%d %s\n",
+                     (unsigned)gf_->uid, gf_->n_nodes, line.c_str());
+    }
     const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
     out.resize((size_t)ggml_nelements(out_));
     readback_async_then_sync(impl, out_, out);
