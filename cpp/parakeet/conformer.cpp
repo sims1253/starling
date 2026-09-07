@@ -239,6 +239,11 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
                                  sc, (size_t)D * sizeof(float));
         ggml_tensor* shift = graph_input_tensor(ctx, GGML_TYPE_F32, 1, d_ne,
                                  sh, (size_t)D * sizeof(float));
+        // Constants of the cached graph (weights folded host-side): upload
+        // once per T entry instead of every replay (48 of the ~50 per-pass
+        // input uploads were these).
+        mark_graph_input_persistent(scale);
+        mark_graph_input_persistent(shift);
         normed = ggml_add(ctx, ggml_mul(ctx, dwt, scale), shift);  // [C, T]
     }
 
