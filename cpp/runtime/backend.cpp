@@ -652,6 +652,8 @@ bool ReplayGraph::compute(std::vector<float>& out) {
             ggml_tensor* n = gf_->nodes[i];
             if (!n) continue;
             hist[ggml_op_name(n->op)]++;
+            if (n->op == GGML_OP_CPY && std::getenv("STARLING_CPY_DEBUG"))
+                std::fprintf(stderr, "[cpy] %s <- %s (op %s)\n", n->name, n->src[0] ? n->src[0]->name : "?", n->src[0] ? ggml_op_name(n->src[0]->op) : "?");
         }
         std::string line;
         for (auto& [k, v] : hist) line += k + "=" + std::to_string(v) + " ";

@@ -51,7 +51,9 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
 
     // -- pointwise_conv1 (Conv1d d->2d, k=1): 1x1 conv == linear over channels.
     ggml_tensor* pw1w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv1.weight");
-    pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
+    // The GGUF stores conv weights F16 already; a same-dtype cast would emit a
+    // full-tensor CPY node per pass. Cast only when actually needed.
+    if (pw1w->type != GGML_TYPE_F16) pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
     pw1w = ggml_reshape_2d(ctx, pw1w, D, 2 * D);  // [in=d, out=2d]
     ggml_tensor* pw1b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv1.bias");
     ggml_tensor* y = ggml_mul_mat(ctx, pw1w, c);  // [2d, T]
@@ -197,7 +199,7 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // -- SiLU (Swish), then pointwise_conv2 (Conv1d d->d, k=1).
     normed = ggml_silu(ctx, normed);
     ggml_tensor* pw2w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
-    pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
+    if (pw2w->type != GGML_TYPE_F16) pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
     pw2w = ggml_reshape_2d(ctx, pw2w, D, D);  // [in=d, out=d]
     ggml_tensor* pw2b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
     ggml_tensor* cout = ggml_mul_mat(ctx, pw2w, normed);  // [d, T]
