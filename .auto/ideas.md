@@ -18,3 +18,5 @@
 - **Perf-logger inflation**: GGML_VK_PERF_LOGGER adds timestamp+barrier per node — elementwise numbers from it are 2-10x inflated. Trust only the big GEMM lines.
 - **CPU pos-cache**: NET NEGATIVE for short workloads (one-time pos compute on CPU ~1s vs 40ms/pass saved; GPU amortizes differently).
 - **int dot: 0 confirmed** at runtime despite RADV exposing the extension (device->integer_dot_product false; disabling it changes nothing).
+
+- **Fuse GpuMel into the encoder replay graph** (~1.5-2ms est): one graph/one sync instead of mel-graph sync + host mel round trip + transpose + re-upload; PCM becomes the input. Moderate plumbing (GpuMel shared with decode paths); numerics unchanged (same kernels in one graph).

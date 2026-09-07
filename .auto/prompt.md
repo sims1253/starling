@@ -85,8 +85,10 @@ experiment command, not in measure.sh.
 - **#5 KEEP** decode gate CONT removal + argmax BLOCK=512.
 - **#8 KEEP** F16->F16 cast gating on conv pw weights: med -78ms (was copying 150MB/pass), short -29%. THE big win.
 - **#12 KEEP** STARLING_GGML_THREADS env (CPU leg pins 6 physical): cpu_med 1877->1582ms. SMT hurts ~25%.
+- **#19 KEEP** DFT-mel (GpuMel) on the CPU backend: mel 80->10.8ms, CPU med -70ms (interleaved cold A/B 1536/1540 vs 1611/1604), byte-identical both paths (sha equal in 6 runs). Kill switch STARLING_MEL_CPU_FFT=1.
 - **#18 KEEP** persistent BN scale/shift inputs: encoder h2d 2595->285us/pass (only mel is volatile now). Byte-identical.
 - **DEAD (iter 2)**: forced split-K (parity at 2, worse at 4 — m-tiles saturate; reduce overhead eats gains); KSTEP sweep (K=16 optimal for T<=512 — bigger K wastes unconditional LSTM recompute vs saved syncs; all byte-exact).
+- **bd matmul identified**: the 24x[557x279x128,b8] f32 = per-head pos-scores (k=dk=128 short-k staging inefficiency, 15.2ms at 500 GFLOPS); merging heads into one GEMM is mathematically invalid (per-head operands differ); fix = custom kernel or FA fusion.
 - **Remaining profile anomalies** (need numerics drift or new ops, parked): mel DFT matmul writes 73MB/pass (6.4ms; f16 would halve but breaks byte-exactness); subsampling f32 im2col-matmuls 15.2ms (q8_0 = drift); FA at 366 GFLOPS (21.6ms, near shader ceiling); bd rel-shift chain ~7.5MB copies x24 (fused rel_shift needs a custom op).
 - **DEAD ENDS**: FLOPS_PER_SUBMIT, NO_BARRIERS/EXEC_ONLY (nondeterministic races), coherent-loads+fast-sync (L1-bypass cost > flush saving; but PROVEN byte-exact-stable — the technique works, just not profitable here), warptile sweep (base optimal), FORCE_PIPE all variants, m_align 32 (no effect), q4_0 joint/LSTM quant (decode GEMV latency-bound: weight bytes don't matter), q8_0 conv pw quant (Vulkan flat, CPU +5%), exact ×0.5 fold (bit-exact! but flat speed + 408MB RSS from weight copies).
 - **MEASUREMENT CAVEAT**: GGML_VK_PERF_LOGGER per-node times are inflated by its own timestamp+barrier — don't trust elementwise numbers from it; only trust the big GEMM lines.
