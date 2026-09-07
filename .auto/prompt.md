@@ -79,10 +79,12 @@ experiment command, not in measure.sh.
 - CPU (q8_0, medium): 1684ms. CPU build uses LLAMAFILE ON, NATIVE ON.
 
 ## What's Been Tried
-- **#2 KEEP** Vulkan fused LayerNorm+affine (norm_affine.comp, NORM_MUL_ADD fusion, 120 norms): med -26ms, byte-identical.
-- **#3 KEEP** per-T' pos-bias cache (persistent ReplayGraph inputs): med -30ms, long -112ms, RSS -4MB, byte-identical. One-time 24 small computes per T.
-- **DEAD**: GGML_VK_FLOPS_PER_SUBMIT=999999 (single submit) → +20ms WORSE. GGML_VK_NO_BARRIERS / EXEC_ONLY_BARRIERS → 17%/13% faster but NONDETERMINISTIC RACES (hash varies run to run) — sized the barrier cost at ~100-134ms; do NOT use.
-- Quant landscape: q8_0 fastest on Vulkan (bf16 1612ms, q8 769, q5 826, q4 786; WER all ~3.5-3.9 within noise).
-- ggml-vulkan debug envs added: GGML_VK_FORCE_PIPE={l,m,s} (l crashes: l-pipeline not created w/o coopmat on AMD).
-- Encoder breakdown (q8_0, medium, post-#3): GEMM ~345ms, non-GEMM ~65ms, dispatch-gap ~200ms. Decode ~106ms (GEMV bandwidth-bound: joint m=8198 at 39GB/s ≈ RAM limit).
-
+- **#2 KEEP** Vulkan fused LayerNorm+affine (norm_affine.comp, NORM_MUL_ADD, 120 norms): -26ms, byte-identical. (patch 0012)
+- **#3 KEEP** per-T' pos-bias cache (persistent ReplayGraph inputs): med -30ms, long -112ms, RSS -4MB. One-time 24 small computes per T (~65ms for new T).
+- **#4 KEEP** cwhn depthwise conv (GPU) + GLU cont removal: -192 nodes, -3ms. CPU keeps whcn path (CPU cwhn kernel asserts different strides).
+- **#5 KEEP** decode gate CONT removal + argmax BLOCK=512: -6ms formal.
+- **#7 KEEP** patch-series hygiene: ggml edits -> 0012 patch.
+- **#8 KEEP** F16->F16 cast gating on conv pw weights: med -78ms (150MB/pass of CPY copies!), short -29%. THE big single win.
+- **DEAD**: GGML_VK_FLOPS_PER_SUBMIT (worse), NO_BARRIERS/EXEC_ONLY (races), coherent-loads+fast-sync (slower: L1-bypass), warptile sweep (base optimal), FORCE_PIPE variants, q4_0 joint/LSTM quant (GEMV latency-bound not bandwidth — weight bytes don't matter), m_align 64->32 (no effect).
+- **Post-#8 encoder profile (medium, 521ms GPU-busy)**: FFN GEMMs 249ms (48%), attn qkvo 64ms, conv f16 52ms, FA 19ms, SILU 15ms, decode ~95ms, elementwise ~25ms, mel ~10ms. GPU ~fully busy (dispatch gaps hidden).
+- CPU (secondary): 1706ms after rebuild (cast gating + GLU cont help slightly); pos-cache/cwhn/argmax are GPU-only.

@@ -46,7 +46,11 @@ Backend& global_backend() {
     std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
     if (g_shutting_down.load()) throw std::runtime_error("Starling backend has been shut down");
     if (g_backend) return *g_backend;
-    int n = g_threads_set.load() ? g_num_threads.load() : kDefaultThreads;
+    // [starling] env override for CPU thread count (default 8; SMT knobs).
+    int n_env = 0;
+    if (const char* e = std::getenv("STARLING_GGML_THREADS")) n_env = atoi(e);
+    int n = g_threads_set.load() ? g_num_threads.load()
+          : (n_env > 0 ? n_env : kDefaultThreads);
     g_backend = std::make_unique<Backend>(n);
     // Register the atexit handler exactly once. The CUDA driver registers ITS
     // atexit handler lazily on the first CUDA call, which happens inside the

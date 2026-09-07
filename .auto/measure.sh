@@ -14,6 +14,8 @@ STARLING_GGML_LIB="$PK_VK_LIB" STARLING_GGML_DEVICE=Vulkan0 \
 
 if [[ -f "$PK_CPU_LIB" ]]; then
   echo "== CPU (secondary) =="
+  # 6 = physical cores on this Zen3 (SMT hurts the ggml kernels ~25%).
+  STARLING_GGML_THREADS="${PK_CPU_THREADS:-6}" \
   STARLING_GGML_LIB="$PK_CPU_LIB" STARLING_GGML_DEVICE=cpu \
     PK_REPS="${PK_REPS:-3}" \
     uv run python .auto/bench_speed.py 2>/dev/null \
