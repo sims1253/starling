@@ -296,3 +296,25 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8898,13 +8898,15 @@
+ 
+ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
+-    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic.
++    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic;
++    // an 'x' suffix forces the UNALIGNED variant (no n-padding).
+     {
+         static const char* env_pipe = getenv("GGML_VK_FORCE_PIPE");
+         if (env_pipe && env_pipe[0]) {
+-            if (env_pipe[0] == 'l') return aligned ? mmp->a_l : mmp->l;
+-            if (env_pipe[0] == 'm') return aligned ? mmp->a_m : mmp->m;
+-            if (env_pipe[0] == 's') return aligned ? mmp->a_s : mmp->s;
++            const bool unaligned = env_pipe[1] == 'x';
++            if (env_pipe[0] == 'l') return (aligned && !unaligned) ? mmp->a_l : mmp->l;
++            if (env_pipe[0] == 'm') return (aligned && !unaligned) ? mmp->a_m : mmp->m;
++            if (env_pipe[0] == 's') return (aligned && !unaligned) ? mmp->a_s : mmp->s;
+         }
+     }
+ 
