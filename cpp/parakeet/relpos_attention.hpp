@@ -49,9 +49,14 @@ public:
     // [D, 2T-1]. Returns the attention output [D, T]. Host masks (omitted when
     // trivial) are fed via graph_input_tensor and registered into `pool` (must
     // outlive the compute). CPU path is the byte-identical reference.
+    // ph (optional): a PRECOMPUTED per-layer positional projection
+    // [dk, pos_len, H] (contiguous). When non-null, the linear_pos matmul +
+    // head split are skipped (GPU cached path: ph is constant per T'). When
+    // null, ph is computed inline from `pe` (CPU reference path).
     ggml_tensor* build_graph(ggml_context* ctx, ggml_tensor* xt, int T,
                              ggml_tensor* pe, int pos_len, int valid_len,
-                             GraphInputPool& pool) const;
+                             GraphInputPool& pool,
+                             ggml_tensor* ph = nullptr) const;
 
 private:
     const ModelLoader& ml_;

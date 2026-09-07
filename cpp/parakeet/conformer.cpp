@@ -172,7 +172,8 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
 ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
                                          int T, ggml_tensor* pe, int pos_len,
                                          int valid_len,
-                                         GraphInputPool& pool) const {
+                                         GraphInputPool& pool,
+                                         ggml_tensor* ph) const {
     const int D = d_model_;
     const int K = conv_kernel_;
     const float ln_eps = 1e-5f;  // LayerNorm eps (NeMo nn.LayerNorm default)
@@ -217,7 +218,7 @@ ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
     // === Stage B: r = r + self_attn(norm_self_att(r)). ===
     ggml_tensor* attn_in = layer_norm(r, "norm_self_att");
     ggml_tensor* attn_out = attn_.build_graph(ctx, attn_in, T, pe, pos_len,
-                                              valid_len, pool);  // [D, T]
+                                              valid_len, pool, ph);  // [D, T]
     r = ggml_add(ctx, r, attn_out);
 
     // === Stage C: r = r + conv(norm_conv(r)). ===

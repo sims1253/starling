@@ -80,6 +80,8 @@ thread_local std::vector<PendingCapture>* t_pending_captures = nullptr;
 // Side-effect expansion roots registered during the current build (Wave D
 // decode-state write-back cpys): nodes that must execute but are not read back.
 thread_local std::vector<ggml_tensor*>*    t_pending_roots = nullptr;
+// [starling pos-cache] tensors marked persistent during the current build.
+thread_local std::vector<ggml_tensor*>*   t_pending_persistent = nullptr;
 
 // Restore registration state on normal return, exceptions and nested builds.
 struct BuildScope {
@@ -87,18 +89,22 @@ struct BuildScope {
     std::vector<PendingInput>* previous_inputs = t_pending_inputs;
     std::vector<PendingCapture>* previous_captures = t_pending_captures;
     std::vector<ggml_tensor*>* previous_roots = t_pending_roots;
+    std::vector<ggml_tensor*>* previous_persistent = t_pending_persistent;
     BuildScope(Backend& backend, std::vector<PendingInput>& inputs,
-               std::vector<PendingCapture>& captures, std::vector<ggml_tensor*>& roots) {
+               std::vector<PendingCapture>& captures, std::vector<ggml_tensor*>& roots,
+               std::vector<ggml_tensor*>* persistent_marks = nullptr) {
         t_active_backend = &backend;
         t_pending_inputs = &inputs;
         t_pending_captures = &captures;
         t_pending_roots = &roots;
+        t_pending_persistent = persistent_marks;
     }
     ~BuildScope() {
         t_active_backend = previous_backend;
         t_pending_inputs = previous_inputs;
         t_pending_captures = previous_captures;
         t_pending_roots = previous_roots;
+        t_pending_persistent = previous_persistent;
     }
 };
 
@@ -405,6 +411,10 @@ void capture_graph_output(ggml_tensor* t, std::vector<float>* dst) {
     if (t_active_backend) t_active_backend->register_capture(t, dst);
 }
 
+void mark_graph_input_persistent(ggml_tensor* t) {
+    if (t_pending_persistent) t_pending_persistent->push_back(t);
+}
+
 void add_graph_root(ggml_tensor* t) {
     // The node is NOT marked output (no readback); the caller just needs it
     // expanded into the cgraph so it executes as a side effect.
@@ -468,8 +478,9 @@ ReplayGraph::ReplayGraph(Backend& backend,
         std::vector<PendingInput> pin;
         std::vector<PendingCapture> pcap;
         std::vector<ggml_tensor*> roots;
+        std::vector<ggml_tensor*> persistent_marks;
         {
-            BuildScope scope(backend_, pin, pcap, roots);
+            BuildScope scope(backend_, pin, pcap, roots, &persistent_marks);
             out_ = build(ctx_);
         }
 
@@ -488,6 +499,10 @@ ReplayGraph::ReplayGraph(Backend& backend,
             for (const auto& in : pin) {
                 inputs_.push_back(in.t);
                 input_hosts_.push_back(in.host);
+            }
+            for (ggml_tensor* t : persistent_marks) {
+                for (size_t i = 0; i < inputs_.size(); ++i)
+                    if (inputs_[i] == t) { persistent_.resize(inputs_.size(), false); persistent_[i] = true; break; }
             }
             for (const auto& c : pcap) {
                 captures_.emplace_back(c.t, c.dst);
@@ -559,6 +574,7 @@ ReplayGraph::~ReplayGraph() {
 
 void ReplayGraph::set_input(size_t i, const void* host, size_t nbytes) {
     if (i >= inputs_.size()) return;
+    if (inputs_[i]->data == nullptr) return;  // unallocated (dead) input
     // Async H2D on the backend's compute stream; stream ordering guarantees it
     // completes before the next graph_compute reads it. No sync here.
     ggml_backend_tensor_set_async(backend_.handle(), inputs_[i], host, 0, nbytes);
