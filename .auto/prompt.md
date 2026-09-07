@@ -85,6 +85,9 @@ experiment command, not in measure.sh.
 - **#5 KEEP** decode gate CONT removal + argmax BLOCK=512.
 - **#8 KEEP** F16->F16 cast gating on conv pw weights: med -78ms (was copying 150MB/pass), short -29%. THE big win.
 - **#12 KEEP** STARLING_GGML_THREADS env (CPU leg pins 6 physical): cpu_med 1877->1582ms. SMT hurts ~25%.
+- **#18 KEEP** persistent BN scale/shift inputs: encoder h2d 2595->285us/pass (only mel is volatile now). Byte-identical.
+- **DEAD (iter 2)**: forced split-K (parity at 2, worse at 4 — m-tiles saturate; reduce overhead eats gains); KSTEP sweep (K=16 optimal for T<=512 — bigger K wastes unconditional LSTM recompute vs saved syncs; all byte-exact).
+- **Remaining profile anomalies** (need numerics drift or new ops, parked): mel DFT matmul writes 73MB/pass (6.4ms; f16 would halve but breaks byte-exactness); subsampling f32 im2col-matmuls 15.2ms (q8_0 = drift); FA at 366 GFLOPS (21.6ms, near shader ceiling); bd rel-shift chain ~7.5MB copies x24 (fused rel_shift needs a custom op).
 - **DEAD ENDS**: FLOPS_PER_SUBMIT, NO_BARRIERS/EXEC_ONLY (nondeterministic races), coherent-loads+fast-sync (L1-bypass cost > flush saving; but PROVEN byte-exact-stable — the technique works, just not profitable here), warptile sweep (base optimal), FORCE_PIPE all variants, m_align 32 (no effect), q4_0 joint/LSTM quant (decode GEMV latency-bound: weight bytes don't matter), q8_0 conv pw quant (Vulkan flat, CPU +5%), exact ×0.5 fold (bit-exact! but flat speed + 408MB RSS from weight copies).
 - **MEASUREMENT CAVEAT**: GGML_VK_PERF_LOGGER per-node times are inflated by its own timestamp+barrier — don't trust elementwise numbers from it; only trust the big GEMM lines.
 - **Final state**: Vulkan med 770.7->624ms (rtf 0.0346->0.0280, -19%), CPU 1754->1582 (-10%), RSS 978->971, byte-identical transcripts, WER 3.94.
