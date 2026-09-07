@@ -11,3 +11,10 @@
 - **starling-serve streaming**: chunked decode reuses replay graphs — the pos-cache LRU (16 T values) could hold ph for the common chunk lengths.
 - **Quant recipes**: q8_0 wins on Vulkan because dequant cost dominates; a CUSTOM q8 format with smaller blocks (16 instead of 32) or per-tensor scales could trade a bit of density for faster dequant in shaders. Requires converter + shader variant + loader — medium effort.
 - **Peak-memory**: ph cache adds device-resident [dk,P,H] per cached T (up to 16×183MB worst case for very long audio); consider capping ph-bearing entries in the LRU or storing ph as f16 (halves bytes, small numerics risk).
+
+## Post-session additions (2026-09-21)
+- **FFN GEMM custom shader** (the ~250ms block): float-dequant mm path runs at ~61% of fp32 peak; emulated int-dot NO better (Mesa lowers to same unpack+mul); a real win needs hand-written GCN asm or SPIR-V with v_mad_i32_i24 — days of work, unproven.
+- **FA F32 mask**: fattn.comp hardcodes f16 data_m + ggml.c asserts F16 masks — patching means touching the cross-backend op contract for ~4ms. Parked.
+- **Perf-logger inflation**: GGML_VK_PERF_LOGGER adds timestamp+barrier per node — elementwise numbers from it are 2-10x inflated. Trust only the big GEMM lines.
+- **CPU pos-cache**: NET NEGATIVE for short workloads (one-time pos compute on CPU ~1s vs 40ms/pass saved; GPU amortizes differently).
+- **int dot: 0 confirmed** at runtime despite RADV exposing the extension (device->integer_dot_product false; disabling it changes nothing).
