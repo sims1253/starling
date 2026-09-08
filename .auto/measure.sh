@@ -3,7 +3,7 @@ set -euo pipefail
 cd /home/m0hawk/Documents/starling
 export PK_MODEL="${PK_MODEL:-models/parakeet-tdt-0.6b-v3-q4-fullimx.gguf}"
 PK_MODEL_VK="${PK_MODEL_VK:-models/parakeet-tdt-0.6b-v3-q4-fullimx.gguf}"
-PK_MODEL_CPU="${PK_MODEL_CPU:-models/parakeet-tdt-0.6b-v3-q8_0.gguf}"
+PK_MODEL_CPU="${PK_MODEL_CPU:-$PK_MODEL}"
 PK_VK_LIB="${PK_VK_LIB:-build-ar-vk/libstarling_ggml.so}"
 PK_CPU_LIB="${PK_CPU_LIB:-build-ar-cpu/libstarling_ggml.so}"
 
