@@ -107,6 +107,7 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
         int64_t mk_ne[2] = {1, Tp};
         ggml_tensor* mask = graph_input_tensor(ctx, GGML_TYPE_F32, 2, mk_ne,
                                 outmask, (size_t)Tp * sizeof(float));
+        mark_graph_input_persistent(mask);
         flat = ggml_mul(ctx, flat, mask);
     }
 
