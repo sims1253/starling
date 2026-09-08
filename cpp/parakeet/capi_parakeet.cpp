@@ -86,7 +86,14 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
                 std::getenv("STARLING_GGML_DEVICE") ? std::getenv("STARLING_GGML_DEVICE") : "(auto)",
                 starling::ggml::global_backend().device_name(),
                 starling::ggml::global_backend().is_gpu() ? 1 : 0);
-        if (starling::ggml::global_backend().is_gpu()) {
+        // [starling] the DFT-matmul mel ("GpuMel") runs on ANY backend; on CPU
+        // it replaces the double-precision FFT (80ms -> ~25ms on the 5650U)
+        // with bit-identical output (validated by fixture sha across devices).
+        // Kill switch: STARLING_MEL_CPU_FFT=1 restores the FFT reference.
+        if (!starling::ggml::global_backend().is_gpu() &&
+            std::getenv("STARLING_MEL_CPU_FFT")) {
+            // CPU + explicit FFT request: keep the reference path.
+        } else {
             ctx->model->loader.cache<starling::ggml::parakeet::GpuMel>() = std::make_unique<starling::ggml::parakeet::GpuMel>(
                 starling::ggml::global_backend(), ctx->mel_const);
         }

@@ -209,10 +209,10 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
                     ggml_tensor* z = ggml_add(ctx,
                         ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                         ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_in),     bhh));
-                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, 0)));
-                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp * sizeof(float))));
-                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)2 * Hp * sizeof(float))));
-                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3 * Hp * sizeof(float))));
+                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, 0));
+                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp * sizeof(float)));
+                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_view_1d(ctx, z, Hp, (size_t)2 * Hp * sizeof(float)));
+                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3 * Hp * sizeof(float)));
                     ggml_tensor* c_out = ggml_add(ctx, ggml_mul(ctx, f, c_in), ggml_mul(ctx, i, gg));
                     ggml_tensor* h_out = ggml_mul(ctx, o, ggml_tanh(ctx, c_out));
                     capture_graph_output(c_out, &r->cap_c[l]);
