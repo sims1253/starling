@@ -7,17 +7,24 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
    shader + NORM_MUL_ADD fusion case. The conformer emits one LN-affine chain
    per norm (~120/pass); fusing removes 2 dispatches + 2 full-tensor round
    trips per chain. Numerics identical to norm.comp + mul + add (same
-   reduction and op order).
+   reduction and op order). The fused shader indexes operands from raw base
+   offsets (no get_aoffset()/get_doffset() misalign adjustment), so the
+   fusion constraints require storage-aligned subbuffer bindings for
+   x/g/b/dst and fall back to the unfused upstream shaders otherwise.
 2. argmax_f32 BLOCK_SIZE spec constant: subgroup_size -> 512. The row argmax
    is load-latency bound; 8 waves per workgroup hide it (TDT joint step).
 3. Debug/tuning envs (no default behavior change): GGML_VK_FORCE_PIPE={l,m,s}
    forces the matmul pipeline class; GGML_VK_FLOPS_PER_SUBMIT overrides the
-   submit batching threshold.
+   submit batching threshold. GGML_VK_NO_BARRIERS / GGML_VK_EXEC_ONLY_BARRIERS
+   are value-parsed (=1 to enable) so an explicit =0 cannot arm the
+   spec-UB barrier-skip paths.
 
 ---
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index e5677e9d..82418cff 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -999,6 +999,7 @@
+@@ -999,6 +999,7 @@ struct vk_device_struct {
      vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
      vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
      vk_pipeline pipeline_norm_f32;
@@ -25,18 +32,33 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      vk_pipeline pipeline_group_norm_f32;
      vk_pipeline pipeline_rms_norm_f32;
      vk_pipeline pipeline_rms_norm_mul_f32;
-@@ -3714,6 +3715,21 @@
+@@ -3705,6 +3706,13 @@ static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const
+     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
+ }
+ 
++// [starling] value-parsed env gate: only an explicit "1" (or value starting
++// with '1') enables the knob, so VAR=0 keeps the default path.
++static bool env_enabled(const char* name) {
++    const char* e = getenv(name);
++    return e && e[0] == '1';
++}
++
+ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
+     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+ 
+@@ -3714,6 +3722,22 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
          ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
      }
  
 +    // [starling] experiment gate: skip intra-queue global barriers entirely.
 +    // UB by the spec (no implicit ordering between dispatches) but on UMA GCN
 +    // with L2 as the coherence point this sizes the barrier overhead.
-+    if (getenv("GGML_VK_NO_BARRIERS")) return;
++    // Value-parsed (=1) so an explicit =0 cannot enable the UB path.
++    if (env_enabled("GGML_VK_NO_BARRIERS")) return;
 +
 +    // [starling] experiment gate: execution-only dependency (no memory flush).
 +    // Dispatch N+1 waits for N to complete but skips the L2 invalidation.
-+    if (getenv("GGML_VK_EXEC_ONLY_BARRIERS")) {
++    if (env_enabled("GGML_VK_EXEC_ONLY_BARRIERS")) {
 +        subctx->s->buffer->buf.pipelineBarrier(
 +            subctx->p->q->stage_flags,
 +            subctx->p->q->stage_flags,
@@ -47,7 +69,7 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      subctx->s->buffer->buf.pipelineBarrier(
          subctx->p->q->stage_flags,
          subctx->p->q->stage_flags,
-@@ -5589,6 +5605,8 @@
+@@ -5589,6 +5613,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
      ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -56,7 +78,7 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
-@@ -5858,7 +5876,7 @@
+@@ -5858,7 +5884,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
          ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
      }
  
@@ -65,23 +87,25 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
  
      ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
      ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
-@@ -8880,6 +8898,15 @@
+@@ -8880,6 +8906,17 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
  
  static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
      VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
-+    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic.
++    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic;
++    // an 'x' suffix forces the UNALIGNED variant (no n-padding).
 +    {
 +        static const char* env_pipe = getenv("GGML_VK_FORCE_PIPE");
 +        if (env_pipe && env_pipe[0]) {
-+            if (env_pipe[0] == 'l') return aligned ? mmp->a_l : mmp->l;
-+            if (env_pipe[0] == 'm') return aligned ? mmp->a_m : mmp->m;
-+            if (env_pipe[0] == 's') return aligned ? mmp->a_s : mmp->s;
++            const bool unaligned = env_pipe[1] == 'x';
++            if (env_pipe[0] == 'l') return (aligned && !unaligned) ? mmp->a_l : mmp->l;
++            if (env_pipe[0] == 'm') return (aligned && !unaligned) ? mmp->a_m : mmp->m;
++            if (env_pipe[0] == 's') return (aligned && !unaligned) ? mmp->a_s : mmp->s;
 +        }
 +    }
  
      // The q8_1 (integer dot) mmq path uses a different shader with its own
      // shared-memory layout, so use the int-specific availability flags.
-@@ -13457,6 +13484,51 @@
+@@ -13457,6 +13494,51 @@ static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, cons
      ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
  }
  
@@ -133,7 +157,7 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
  static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
      const int * int_op_params = (const int *)dst->op_params;
      const float * float_op_params = (const float *)dst->op_params;
-@@ -15990,7 +16062,11 @@
+@@ -15990,7 +16072,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
  
          break;
      case GGML_OP_NORM:
@@ -146,7 +170,7 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
  
          break;
      case GGML_OP_GROUP_NORM:
-@@ -16967,6 +17043,33 @@
+@@ -16967,6 +17053,45 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
          return false;
      }
  
@@ -175,12 +199,24 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
 +        if (!ggml_is_contiguous_rows(norm->src[0]) || !ggml_is_contiguous_rows(add)) {
 +            return false;
 +        }
++        // The fused shader indexes x/g/b/dst from raw base offsets — unlike
++        // norm.comp it applies no get_aoffset()/get_doffset() misalign
++        // adjustment, and the dispatch binds with allow_misalign=true. Only
++        // fuse when every operand's subbuffer binding is storage-aligned;
++        // otherwise fall back to the upstream NORM/MUL/ADD shaders, which
++        // handle misaligned bindings.
++        if (get_misalign_bytes(ctx, norm->src[0]) != 0 ||
++            get_misalign_bytes(ctx, g) != 0 ||
++            get_misalign_bytes(ctx, b) != 0 ||
++            get_misalign_bytes(ctx, add) != 0) {
++            return false;
++        }
 +    }
 +
      if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
          // additional constraints specific to this fusion
          const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
-@@ -17686,6 +17789,14 @@
+@@ -17686,6 +17811,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
      }
      uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
  
@@ -195,7 +231,7 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      auto const submit_after = [&](int start, int end) {
          if (ctx->device->serialize_submissions) {
              try {
-@@ -17750,8 +17861,15 @@
+@@ -17750,8 +17883,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
          ctx->fused_topk_qsa = false;
          const char *fusion_string {};
          if (!ctx->device->disable_fusion) {
@@ -213,7 +249,9 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
                  ctx->num_additional_fused_ops = num_adds - 1;
                  fusion_string = "MULTI_ADD";
                  std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-
+diff --git a/src/ggml-vulkan/vulkan-shaders/norm_affine.comp b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
+new file mode 100644
+index 00000000..62982b09
 --- /dev/null
 +++ b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
 @@ -0,0 +1,67 @@
@@ -284,10 +322,11 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
 +        data_d[d_base + i0*p.nb20] = D_TYPE(xn * float(data_b[i0]) + float(data_c[i0]));
 +    }
 +}
-
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 27ff68c1..360128f2 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -803,6 +803,8 @@
+@@ -803,6 +803,8 @@ void process_shaders() {
  
      // Norms
      string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -296,25 +335,3 @@ Engine-side performance patches for the parakeet conformer on GCN iGPUs:
      string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
---- a/src/ggml-vulkan/ggml-vulkan.cpp
-+++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -8898,13 +8898,15 @@
- 
- static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
-     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
--    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic.
-+    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic;
-+    // an 'x' suffix forces the UNALIGNED variant (no n-padding).
-     {
-         static const char* env_pipe = getenv("GGML_VK_FORCE_PIPE");
-         if (env_pipe && env_pipe[0]) {
--            if (env_pipe[0] == 'l') return aligned ? mmp->a_l : mmp->l;
--            if (env_pipe[0] == 'm') return aligned ? mmp->a_m : mmp->m;
--            if (env_pipe[0] == 's') return aligned ? mmp->a_s : mmp->s;
-+            const bool unaligned = env_pipe[1] == 'x';
-+            if (env_pipe[0] == 'l') return (aligned && !unaligned) ? mmp->a_l : mmp->l;
-+            if (env_pipe[0] == 'm') return (aligned && !unaligned) ? mmp->a_m : mmp->m;
-+            if (env_pipe[0] == 's') return (aligned && !unaligned) ? mmp->a_s : mmp->s;
-         }
-     }
- 

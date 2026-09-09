@@ -146,7 +146,7 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         auto& slot = cache->by_layer[li];
         if (slot.empty()) {
             ggml_tensor* src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
-            if (!src_w) { /* unreachable: clone_weight below asserts */ }
+            GGML_ASSERT(src_w && src_w->type == GGML_TYPE_F16);
             if (!src_w->buffer) ensure_weights_realized(ml);
             src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
             const size_t n = (size_t)ggml_nelements(src_w);

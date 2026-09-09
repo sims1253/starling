@@ -173,13 +173,6 @@ public:
     size_t n_inputs() const { return inputs_.size(); }
     size_t input_nbytes(size_t i) const;
     const void* input_host(size_t i) const;
-    // [starling] persistent inputs keep their device buffer contents across
-    // replays (uploaded once by the first set_input, then never re-uploaded).
-    void mark_input_persistent(size_t i) {
-        if (i >= inputs_.size()) return;
-        if (persistent_.size() < inputs_.size()) persistent_.resize(inputs_.size(), false);
-        persistent_[i] = true;
-    }
     bool input_persistent(size_t i) const {
         return i < persistent_.size() && persistent_[i];
     }
@@ -190,7 +183,7 @@ private:
     ggml_cgraph*  gf_  = nullptr;
     ggml_tensor*  out_ = nullptr;
     std::vector<ggml_tensor*> inputs_;
-    std::vector<bool> persistent_;  // [starling] see mark_input_persistent
+    std::vector<bool> persistent_;  // [starling] see mark_graph_input_persistent
     std::vector<const void*> input_hosts_;
     std::vector<std::pair<ggml_tensor*, std::vector<float>*>> captures_;
     bool need_sched_ = false;

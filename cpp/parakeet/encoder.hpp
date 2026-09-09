@@ -42,7 +42,6 @@ private:
         // compute), uploaded into its PERSISTENT replay input, then the
         // scratch is reused -> transient host footprint is one ph layer.
         std::vector<float> ph_scratch;   // stable-address scratch (entry-owned)
-        size_t ph_count = 0;             // number of ph inputs registered
     };
     struct ReplayCache {
         LruCache<int, ReplayEntry> by_T;

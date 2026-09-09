@@ -75,7 +75,6 @@ ggml_tensor* Encoder::build_graph(ggml_context* ctx,
 // host footprint is ONE layer's ph, not all 24).
 bool Encoder::compute_pos_layer(int Tp, int layer,
                                 std::vector<float>& ph_out) const {
-    (void)0;
     const ModelLoader& ml = model_.loader;
     const int D = (int)config_.d_model;
     const int H = (int)config_.n_heads;
@@ -157,14 +156,28 @@ bool Encoder::encode(const std::vector<float>& mel, int n_mels, int T,
                     entry.graph->input_host(i) == entry.ph_scratch.data())
                     ph_idx.push_back(i);
             for (size_t k = 0; k < ph_idx.size(); ++k) {
-                if (k > 0 && !compute_pos_layer(Tp0, (int)k, entry.ph_scratch))
-                    return;  // scratch holds layer k-1: benign staleness, kept
+                if (k > 0 && !compute_pos_layer(Tp0, (int)k, entry.ph_scratch)) {
+                    // Poison the entry: later ph persistent inputs were
+                    // registered but will never be uploaded — replaying this
+                    // graph would read never-written garbage. Failing loudly
+                    // (until the entry is evicted or the model unloads)
+                    // beats silently wrong transcripts.
+                    entry.graph.reset();
+                    return;
+                }
                 entry.graph->set_input(ph_idx[k], entry.ph_scratch.data(),
                                        entry.ph_scratch.size() * sizeof(float));
                 ggml_backend_synchronize(backend.handle());
             }
-            entry.ph_count = ph_idx.size();
         });
+    if (!e.graph) {
+        // Poisoned by the initializer (pos-projection compute failed after
+        // the replay graph was built): refuse to replay on never-uploaded
+        // persistent inputs instead of emitting garbage.
+        std::fprintf(stderr, "[encoder] T=%d replay entry poisoned: positional "
+                             "projection compute failed; transcription aborted\n", T);
+        return false;
+    }
 
     // F1 instrumentation: split the encoder phase into host-mel-transpose,
     // H2D enqueue (set_input is async), and graph_compute+readback (the latter

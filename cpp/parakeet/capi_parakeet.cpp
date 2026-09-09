@@ -90,8 +90,9 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
         // it replaces the double-precision FFT (80ms -> ~25ms on the 5650U)
         // with bit-identical output (validated by fixture sha across devices).
         // Kill switch: STARLING_MEL_CPU_FFT=1 restores the FFT reference.
+        const char* mel_fft = std::getenv("STARLING_MEL_CPU_FFT");
         if (!starling::ggml::global_backend().is_gpu() &&
-            std::getenv("STARLING_MEL_CPU_FFT")) {
+            mel_fft && mel_fft[0] == '1') {
             // CPU + explicit FFT request: keep the reference path.
         } else {
             ctx->model->loader.cache<starling::ggml::parakeet::GpuMel>() = std::make_unique<starling::ggml::parakeet::GpuMel>(
