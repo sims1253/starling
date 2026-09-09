@@ -33,7 +33,8 @@ ggml_tensor* clone_weight_s(ggml_context* ctx, const ModelLoader& ml,
 ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
                                           int T, ggml_tensor* pe, int pos_len,
                                           int valid_len,
-                                          GraphInputPool& pool) const {
+                                          GraphInputPool& pool,
+                                          ggml_tensor* ph_pre) const {
     const int D  = d_model_;
     const int H  = n_heads_;
     const int dk = d_head_;
@@ -59,7 +60,6 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     ggml_tensor* q = linear("linear_q.weight", "linear_q.bias", xt);  // [D, T]
     ggml_tensor* k = linear("linear_k.weight", "linear_k.bias", xt);  // [D, T]
     ggml_tensor* v = linear("linear_v.weight", "linear_v.bias", xt);  // [D, T]
-    ggml_tensor* p = linear("linear_pos.weight", nullptr, pe);        // [D, P]
 
     // ---- split into heads: [D, *] -> [dk, H, *] -> [dk, *, H] ----
     auto to_heads = [&](ggml_tensor* t, int n) {
@@ -70,7 +70,9 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     ggml_tensor* qh = to_heads(q, T);        // [dk, T, H]
     ggml_tensor* kh = to_heads(k, T);        // [dk, T, H]
     ggml_tensor* vh = to_heads(v, T);        // [dk, T, H]
-    ggml_tensor* ph = to_heads(p, pos_len);  // [dk, P, H]
+    // Precomputed per-T' cached projection (GPU): skip linear_pos + split.
+    ggml_tensor* ph = ph_pre ? ph_pre : to_heads(
+        linear("linear_pos.weight", nullptr, pe), pos_len);  // [dk, P, H]
 
     // ---- pos_bias_u/v: ne [dk, H] -> [dk, 1, H] to broadcast over T ----
     ggml_tensor* bu = clone_weight_s(ctx, ml, pre + "pos_bias_u");  // [dk, H]

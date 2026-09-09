@@ -1,0 +1,337 @@
+From: starling autoresearch
+Subject: [starling] vulkan: fused LayerNorm+affine, argmax block tuning, matmul debug envs
+
+Engine-side performance patches for the parakeet conformer on GCN iGPUs:
+
+1. Fused LayerNorm + affine (NORM -> MUL -> ADD) as a new norm_affine.comp
+   shader + NORM_MUL_ADD fusion case. The conformer emits one LN-affine chain
+   per norm (~120/pass); fusing removes 2 dispatches + 2 full-tensor round
+   trips per chain. Numerics identical to norm.comp + mul + add (same
+   reduction and op order). The fused shader indexes operands from raw base
+   offsets (no get_aoffset()/get_doffset() misalign adjustment), so the
+   fusion constraints require storage-aligned subbuffer bindings for
+   x/g/b/dst and fall back to the unfused upstream shaders otherwise.
+2. argmax_f32 BLOCK_SIZE spec constant: subgroup_size -> 512. The row argmax
+   is load-latency bound; 8 waves per workgroup hide it (TDT joint step).
+3. Debug/tuning envs (no default behavior change): GGML_VK_FORCE_PIPE={l,m,s}
+   forces the matmul pipeline class; GGML_VK_FLOPS_PER_SUBMIT overrides the
+   submit batching threshold. GGML_VK_NO_BARRIERS / GGML_VK_EXEC_ONLY_BARRIERS
+   are value-parsed (=1 to enable) so an explicit =0 cannot arm the
+   spec-UB barrier-skip paths.
+
+---
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index e5677e9d..82418cff 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -999,6 +999,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
+     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
+     vk_pipeline pipeline_norm_f32;
++    vk_pipeline pipeline_norm_mul_add_f32;   // [starling] fused LN + affine
+     vk_pipeline pipeline_group_norm_f32;
+     vk_pipeline pipeline_rms_norm_f32;
+     vk_pipeline pipeline_rms_norm_mul_f32;
+@@ -3705,6 +3706,13 @@ static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const
+     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
+ }
+ 
++// [starling] value-parsed env gate: only an explicit "1" (or value starting
++// with '1') enables the knob, so VAR=0 keeps the default path.
++static bool env_enabled(const char* name) {
++    const char* e = getenv(name);
++    return e && e[0] == '1';
++}
++
+ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
+     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+ 
+@@ -3714,6 +3722,22 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
+         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+     }
+ 
++    // [starling] experiment gate: skip intra-queue global barriers entirely.
++    // UB by the spec (no implicit ordering between dispatches) but on UMA GCN
++    // with L2 as the coherence point this sizes the barrier overhead.
++    // Value-parsed (=1) so an explicit =0 cannot enable the UB path.
++    if (env_enabled("GGML_VK_NO_BARRIERS")) return;
++
++    // [starling] experiment gate: execution-only dependency (no memory flush).
++    // Dispatch N+1 waits for N to complete but skips the L2 invalidation.
++    if (env_enabled("GGML_VK_EXEC_ONLY_BARRIERS")) {
++        subctx->s->buffer->buf.pipelineBarrier(
++            subctx->p->q->stage_flags,
++            subctx->p->q->stage_flags,
++            {}, {}, {}, {});
++        return;
++    }
++
+     subctx->s->buffer->buf.pipelineBarrier(
+         subctx->p->q->stage_flags,
+         subctx->p->q->stage_flags,
+@@ -5589,6 +5613,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
++        // [starling] fused LayerNorm + affine: A=x, B=g, C=bias, D=dst
++        ggml_vk_create_pipeline(device, device->pipeline_norm_mul_add_f32, "norm_mul_add_f32", norm_mul_add_f32_len, norm_mul_add_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+@@ -5858,7 +5884,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+     }
+ 
+-    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 512 }, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+@@ -8880,6 +8906,17 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
+ 
+ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
++    // [starling] tuning hook: GGML_VK_FORCE_PIPE={l,m,s} overrides the heuristic;
++    // an 'x' suffix forces the UNALIGNED variant (no n-padding).
++    {
++        static const char* env_pipe = getenv("GGML_VK_FORCE_PIPE");
++        if (env_pipe && env_pipe[0]) {
++            const bool unaligned = env_pipe[1] == 'x';
++            if (env_pipe[0] == 'l') return (aligned && !unaligned) ? mmp->a_l : mmp->l;
++            if (env_pipe[0] == 'm') return (aligned && !unaligned) ? mmp->a_m : mmp->m;
++            if (env_pipe[0] == 's') return (aligned && !unaligned) ? mmp->a_s : mmp->s;
++        }
++    }
+ 
+     // The q8_1 (integer dot) mmq path uses a different shader with its own
+     // shared-memory layout, so use the int-specific availability flags.
+@@ -13457,6 +13494,51 @@ static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_NORM, std::move(p));
+ }
+ 
++// [starling] Fused LayerNorm + affine dispatch: nodes[i] = NORM, nodes[i+1] = MUL
++// (x_norm * g), nodes[i+2] = ADD (+ b). dst is the ADD node.
++static void ggml_vk_norm_affine(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
++    ggml_tensor * norm = cgraph->nodes[node_idx + 0];
++    ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
++    ggml_tensor * add  = cgraph->nodes[node_idx + 2];
++    const ggml_tensor * src0 = norm->src[0];
++    const ggml_tensor * g = (mul->src[0] == norm) ? mul->src[1] : mul->src[0];
++    const ggml_tensor * b = (add->src[0] == mul)  ? add->src[1] : add->src[0];
++    ggml_tensor * dst = add;
++
++    const uint32_t src0_type_size = ggml_type_size(src0->type);
++    const uint32_t src1_type_size = ggml_type_size(g->type);
++    const uint32_t dst_type_size  = ggml_type_size(dst->type);
++
++    vk_op_binary_push_constants pc {
++        (uint32_t)ggml_nelements(src0),
++        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
++        (uint32_t)g->ne[0], (uint32_t)g->ne[1], (uint32_t)g->ne[2],(uint32_t)g->ne[3], (uint32_t)g->nb[0] / src1_type_size, (uint32_t)g->nb[1] / src1_type_size, (uint32_t)g->nb[2] / src1_type_size, (uint32_t)g->nb[3] / src1_type_size,
++        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
++        0,
++        ((const float *)norm->op_params)[0], 0.0f, 0,
++    };
++    init_pushconst_tensor_offsets(ctx, pc, src0, g, b, nullptr, dst);
++
++    const uint32_t nr = ggml_nrows(src0);
++    std::array<uint32_t, 3> elements;
++    if (nr > 262144) {
++        elements = { 512, 512, CEIL_DIV(nr, 262144) };
++    } else if (nr > 512) {
++        elements = { 512, CEIL_DIV(nr, 512), 1 };
++    } else {
++        elements = { nr, 1, 1 };
++    }
++
++    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_norm_mul_add_f32, 1);
++    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_norm_mul_add_f32,
++        {
++            ggml_vk_tensor_subbuffer(ctx, src0, true),
++            ggml_vk_tensor_subbuffer(ctx, g, true),
++            ggml_vk_tensor_subbuffer(ctx, b, true),
++            ggml_vk_tensor_subbuffer(ctx, dst, true),
++        }, pc, elements);
++}
++
+ static void ggml_vk_group_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     const int * int_op_params = (const int *)dst->op_params;
+     const float * float_op_params = (const float *)dst->op_params;
+@@ -15990,7 +16072,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_NORM:
+-        ggml_vk_norm(ctx, compute_ctx, src0, node);
++        if (ctx->num_additional_fused_ops == 2) {
++            ggml_vk_norm_affine(ctx, compute_ctx, cgraph, node_idx);
++        } else {
++            ggml_vk_norm(ctx, compute_ctx, src0, node);
++        }
+ 
+         break;
+     case GGML_OP_GROUP_NORM:
+@@ -16967,6 +17053,45 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+         return false;
+     }
+ 
++    // [starling] fused LayerNorm + affine constraints
++    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL && ops.begin()[2] == GGML_OP_ADD) {
++        const ggml_tensor *norm = cgraph->nodes[node_idx];
++        const ggml_tensor *mul  = cgraph->nodes[node_idx + 1];
++        const ggml_tensor *add  = cgraph->nodes[node_idx + 2];
++        const ggml_tensor *g = (mul->src[0] == norm) ? mul->src[1] : mul->src[0];
++        const ggml_tensor *b = (add->src[0] == mul)  ? add->src[1] : add->src[0];
++
++        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
++        GGML_ASSERT(norm->type == GGML_TYPE_F32);
++        if (mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (!g || !b || g->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
++            return false;
++        }
++        // g/b are 1-D [ne00] contiguous broadcast vectors
++        if (ggml_nelements(g) != norm->src[0]->ne[0] || ggml_nelements(b) != norm->src[0]->ne[0] ||
++            !ggml_is_contiguous(g) || !ggml_is_contiguous(b)) {
++            return false;
++        }
++        // shader assumes contiguous rows for x and dst
++        if (!ggml_is_contiguous_rows(norm->src[0]) || !ggml_is_contiguous_rows(add)) {
++            return false;
++        }
++        // The fused shader indexes x/g/b/dst from raw base offsets — unlike
++        // norm.comp it applies no get_aoffset()/get_doffset() misalign
++        // adjustment, and the dispatch binds with allow_misalign=true. Only
++        // fuse when every operand's subbuffer binding is storage-aligned;
++        // otherwise fall back to the upstream NORM/MUL/ADD shaders, which
++        // handle misaligned bindings.
++        if (get_misalign_bytes(ctx, norm->src[0]) != 0 ||
++            get_misalign_bytes(ctx, g) != 0 ||
++            get_misalign_bytes(ctx, b) != 0 ||
++            get_misalign_bytes(ctx, add) != 0) {
++            return false;
++        }
++    }
++
+     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+         // additional constraints specific to this fusion
+         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+@@ -17686,6 +17811,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     }
+     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+ 
++    // [starling] env override for the submit batching threshold: a large value
++    // (e.g. 999999) effectively disables mid-graph submits -> one command
++    // buffer per graph. 0 keeps the heuristic above.
++    if (const char* env_fs = getenv("GGML_VK_FLOPS_PER_SUBMIT")) {
++        const uint64_t v = std::strtoull(env_fs, nullptr, 10);
++        if (v != 0) flops_per_submit = v;
++    }
++
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+             try {
+@@ -17750,8 +17883,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_qsa = false;
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+-            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+-            if (num_adds) {
++            // [starling] fused LayerNorm + affine (NORM -> MUL -> ADD), the
++            // conformer's per-layer LayerNorm pattern.
++            if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
++                ctx->num_additional_fused_ops = 2;
++                fusion_string = "NORM_MUL_ADD";
++                op_srcs_fused_elementwise[0] = false;
++                op_srcs_fused_elementwise[1] = true;
++                op_srcs_fused_elementwise[2] = true;
++            } else if (uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i)) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+                 fusion_string = "MULTI_ADD";
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+diff --git a/src/ggml-vulkan/vulkan-shaders/norm_affine.comp b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
+new file mode 100644
+index 00000000..62982b09
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/norm_affine.comp
+@@ -0,0 +1,67 @@
++#version 450
++
++#include "types.glsl"
++#include "utils.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++#define BLOCK_SIZE 512
++
++// [starling] Fused LayerNorm + affine (MUL by ne00-vector g, ADD of ne00-vector b):
++//   dst = ((x - mean) * inv_std) * g[col] + b[col]
++// The engine's conformer emits NORM -> MUL -> ADD for every LayerNorm; fusing
++// removes two full-tensor round trips and two dispatch barriers per norm.
++// g (binding 1) and b (binding 2) are 1-D [ne00] contiguous F32 vectors,
++// indexed identically. Push constants reuse the binary layout: src0 slots = x,
++// src1 slots = g/b, src2 slots = dst, param1 = eps.
++layout (push_constant) uniform parameter
++{
++    uint ne;
++    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
++    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
++    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
++    uint misalign_offsets;
++    float param1; float param2; int param3;
++} p;
++
++layout (binding = 0) readonly coherent buffer A {A_TYPE data_a[];};
++layout (binding = 1) readonly coherent buffer B {B_TYPE data_b[];};
++layout (binding = 2) readonly coherent buffer C {B_TYPE data_c[];};
++layout (binding = 3) writeonly coherent buffer D {D_TYPE data_d[];};
++
++layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++shared vec2 sum[BLOCK_SIZE];
++
++void main() {
++    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
++    const uint tid = gl_LocalInvocationID.x;
++
++    const uint a_base = row * p.ne00;
++    const uint d_base = row * p.ne20;
++
++    sum[tid] = vec2(0.0f, 0.0f);
++
++    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
++        const float xi = float(data_a[a_base + i0*p.nb00]);
++        sum[tid].x += xi;
++        sum[tid].y += xi * xi;
++    }
++
++    // sum up partial sums and write back result
++    barrier();
++    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sum[tid] += sum[tid + s];
++        }
++        barrier();
++    }
++
++    const float mean = sum[0].x / p.ne00;
++    const float var = sum[0].y / p.ne00 - mean * mean;
++    const float inv_std = inversesqrt(var + p.param1);
++
++    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
++        const float xn = (float(data_a[a_base + i0*p.nb00]) - mean) * inv_std;
++        data_d[d_base + i0*p.nb20] = D_TYPE(xn * float(data_b[i0]) + float(data_c[i0]));
++    }
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 27ff68c1..360128f2 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -803,6 +803,8 @@ void process_shaders() {
+ 
+     // Norms
+     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
++    // [starling] fused LayerNorm + affine (NORM -> MUL -> ADD)
++    string_to_spv("norm_mul_add_f32", "norm_affine.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));

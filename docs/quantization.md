@@ -185,6 +185,18 @@ Two opt-in recipes retain the IQ2_XXS encoder and its importance matrix:
   This option remains **experimental**: it increased observed word errors
   in the controlled study below.
 
+A third opt-in recipe targets the speed/memory sweet spot rather than
+minimum size:
+
+- `benchmarks/recipes/parakeet-q4-fullimx.recipe` is uniform Q4_0 with the
+  full-corpus importance matrix (fixtures x2 + 32 real utterances, ~26k
+  observations). On the Vulkan iGPU this beat Q8_0 on every axis — medium
+  fixture 770.7 -> 603.5 ms, peak RSS 972 -> 710 MB — with real-corpus WER
+  3.55 vs the Q8_0 baseline's 3.94. The calibration mix matters: a
+  short-tier-only imatrix measured strictly worse than Q8_0, and uniform
+  Q4_0 beat attention-only and hybrid FFN variants. Requires `--imatrix`;
+  the collection command is in the recipe header.
+
 Named levels and their fallback rules stay unchanged. Other model
 architectures retain the embedding keep-list.
 

@@ -19,6 +19,7 @@
 #include "ggml.h"
 
 #include "ggml-backend.h"  // ggml_backend_tensor_get (D2H, works for host + device tensors)
+#include "runtime/graph.hpp"    // global_backend
 
 #include <cmath>
 #include <cstring>
@@ -51,17 +52,20 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
 
     // -- pointwise_conv1 (Conv1d d->2d, k=1): 1x1 conv == linear over channels.
     ggml_tensor* pw1w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv1.weight");
-    pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
+    // The GGUF stores conv weights F16 already; a same-dtype cast would emit a
+    // full-tensor CPY node per pass. Cast only when actually needed.
+    if (pw1w->type != GGML_TYPE_F16) pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
     pw1w = ggml_reshape_2d(ctx, pw1w, D, 2 * D);  // [in=d, out=2d]
     ggml_tensor* pw1b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv1.bias");
     ggml_tensor* y = ggml_mul_mat(ctx, pw1w, c);  // [2d, T]
     if (pw1b) y = ggml_add(ctx, y, pw1b);
 
-    // -- GLU over channel dim (NeMo F.glu(x, dim=1)).
+    // -- GLU over channel dim (NeMo F.glu(x, dim=1)). The two views share y's
+    // row stride; SIGMOID/MUL consume strided rows directly, so no cont()
+    // materialization is needed (2 fewer dispatches per layer).
     ggml_tensor* a = ggml_view_2d(ctx, y, D, T, y->nb[1], 0);
     ggml_tensor* b = ggml_view_2d(ctx, y, D, T, y->nb[1], (size_t)D * y->nb[0]);
-    ggml_tensor* glu = ggml_mul(ctx, ggml_cont(ctx, a),
-                                ggml_sigmoid(ctx, ggml_cont(ctx, b)));  // [d, T]
+    ggml_tensor* glu = ggml_mul(ctx, a, ggml_sigmoid(ctx, b));  // [d, T]
 
     // -- pad_mask: zero padded time positions before depthwise conv.
     if (valid_len < T) {
@@ -74,24 +78,106 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     }
 
     // -- depthwise_conv (Conv1d d->d, k=K, groups=d).
-    ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
-    ggml_tensor* dww = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
-    // Reshape to [K,1,1,C] (the layout ggml_conv_2d_dw_direct asserts).
-    dww = ggml_reshape_4d(ctx, dww, K, 1, 1, D);  // [K,1,1,C]
-    ggml_tensor* dw;
-    {
-        // Map the 1D conv onto 2D: W=T, H=1 (KH=1 contributes a single tap).
-        ggml_tensor* nb = ggml_reshape_4d(ctx, glu_tc,
-                              glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]
-        // Symmetric pad (offline model): native p0=pad.
-        ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, dww, nb,
-                                                /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
-                                                /*d0*/1, /*d1*/1);
-        // r is [OW=T, OH=1, C, 1]; collapse the unit axes -> [T, C].
-        dw = ggml_reshape_2d(ctx, r, T, D);
+    // CPU keeps the reference whcn path: the CPU cwhn kernel asserts a kernel
+    // stride layout our permuted view does not satisfy, and CPU has no
+    // dispatch tax to save. GPU takes the channels-first path below.
+    if (!global_backend().is_gpu()) {
+        ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
+        ggml_tensor* dww_c = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
+        dww_c = ggml_reshape_4d(ctx, dww_c, K, 1, 1, D);  // [K,1,1,C]
+        ggml_tensor* nb_c = ggml_reshape_4d(ctx, glu_tc,
+                               glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]
+        ggml_tensor* rc = ggml_conv_2d_dw_direct(ctx, dww_c, nb_c,
+                                                 1, 1, pad, 0, 1, 1);
+        rc = ggml_reshape_2d(ctx, rc, T, D);
+        ggml_tensor* dwt_c = ggml_cont(ctx, ggml_transpose(ctx, rc));  // [C, T]
+        ggml_tensor* dwb_c = clone_weight_opt_s(ctx, ml, pre + "conv.depthwise_conv.bias");
+        if (dwb_c) dwt_c = ggml_add(ctx, dwt_c, dwb_c);
+        // batch_norm fold (same host math as the GPU path below).
+        float* sc_c = pool.alloc_f32(D);
+        float* sh_c = pool.alloc_f32(D);
+        {
+            auto read_f32 = [&](const std::string& nm, std::vector<float>& dstv) {
+                ggml_tensor* t = ml.tensor(nm.c_str());
+                if (!t) { dstv.clear(); return; }
+                size_t n = (size_t)ggml_nelements(t);
+                dstv.resize(n);
+                ggml_backend_tensor_get(t, dstv.data(), 0, n * sizeof(float));
+            };
+            std::vector<float> g, bb, m, var;
+            read_f32(pre + "conv.batch_norm.weight", g);
+            read_f32(pre + "conv.batch_norm.bias", bb);
+            read_f32(pre + "conv.batch_norm.running_mean", m);
+            read_f32(pre + "conv.batch_norm.running_var", var);
+            for (int cc = 0; cc < D; ++cc) {
+                sc_c[cc] = g[cc] / std::sqrt(var[cc] + bn_eps);
+                sh_c[cc] = bb[cc] - m[cc] * sc_c[cc];
+            }
+        }
+        int64_t dn[1] = {D};
+        ggml_tensor* sc_t = graph_input_tensor(ctx, GGML_TYPE_F32, 1, dn, sc_c, (size_t)D * sizeof(float));
+        ggml_tensor* sh_t = graph_input_tensor(ctx, GGML_TYPE_F32, 1, dn, sh_c, (size_t)D * sizeof(float));
+        ggml_tensor* normed_c = ggml_add(ctx, ggml_mul(ctx, dwt_c, sc_t), sh_t);
+        normed_c = ggml_silu(ctx, normed_c);
+        ggml_tensor* pw2_c = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
+        if (pw2_c->type != GGML_TYPE_F16) pw2_c = ggml_cast(ctx, pw2_c, GGML_TYPE_F16);
+        pw2_c = ggml_reshape_2d(ctx, pw2_c, D, D);
+        ggml_tensor* cout_c = ggml_mul_mat(ctx, pw2_c, normed_c);
+        ggml_tensor* pw2b_c = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
+        if (pw2b_c) cout_c = ggml_add(ctx, cout_c, pw2b_c);
+        return cout_c;  // [D, T]
     }
+    // (GPU) channels-first (cwhn) path.
+    // ggml_conv_2d_dw_direct natively consumes a cwhn input ([W=T,H=1,C,1]
+    // with C contiguous, built by free reshape+permute views of glu [C,T])
+    // and produces a cwhn result viewable as [C,T] directly — no transpose,
+    // no cont, on either the input or the output side. The kernel must be
+    // c-fastest ([C per tap]); built once per layer and cached.
+    ggml_tensor* dww_t = nullptr;
+    {
+        auto& cache = ml.cache<DwwTransposedCache>();
+        if (!cache) cache = std::make_unique<DwwTransposedCache>();
+        // layer index from the caller's pre string "encoder.layers.N."
+        const char* ls = pre.c_str() + sizeof("encoder.layers.") - 1;
+        int li = 0;
+        while (*ls >= '0' && *ls <= '9') li = li * 10 + (*ls++ - '0');
+        if (cache->by_layer.size() <= (size_t)li)
+            cache->by_layer.resize(li + 1);
+        auto& slot = cache->by_layer[li];
+        if (slot.empty()) {
+            ggml_tensor* src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+            GGML_ASSERT(src_w && src_w->type == GGML_TYPE_F16);
+            if (!src_w->buffer) ensure_weights_realized(ml);
+            src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+            const size_t n = (size_t)ggml_nelements(src_w);
+            GGML_ASSERT(src_w->type == GGML_TYPE_F16);
+            std::vector<ggml_fp16_t> raw(n);
+            ggml_backend_tensor_get(src_w, raw.data(), 0, n * sizeof(ggml_fp16_t));
+            slot.assign((size_t)K * D, 0);
+            // (k, c): src at c*K + k  ->  dst at k*D + c
+            for (int c = 0; c < D; ++c)
+                for (int k = 0; k < K; ++k)
+                    slot[(size_t)k * D + c] = raw[(size_t)c * K + k];
+        }
+        int64_t dwt_ne[2] = {D, K};  // memory: (c, k) at c + k*D
+        dww_t = graph_input_tensor(ctx, GGML_TYPE_F16, 2, dwt_ne,
+                                   slot.data(), slot.size() * sizeof(ggml_fp16_t));
+        mark_graph_input_persistent(dww_t);
+    }
+    // ggml_permute(ctx, a, ax0..ax3): ne[ax_i] = a->ne[i] (ax_i = where
+    // source dim i LANDS). Kernel [D,K,1,1] -> [K,1,1,D]: D->3, K->0.
+    ggml_tensor* knl = ggml_permute(ctx, ggml_reshape_4d(ctx, dww_t, D, K, 1, 1),
+                                    3, 0, 1, 2);  // ne [K,1,1,D]; c stride = 1 elem
+    // Input [D,1,T,1] -> [T,1,D,1]: D->2, T->0; the H=1 dim lands on axis3 so
+    // nb1 picks up the big N stride (is_contiguous_channels wants nb1 > nb0).
+    ggml_tensor* nb_in = ggml_permute(
+        ctx, ggml_reshape_4d(ctx, glu, D, 1, T, 1), 2, 3, 0, 1);  // [T,1,D,1] cwhn
+    ggml_tensor* r = ggml_conv_2d_dw_direct(ctx, knl, nb_in,
+                                            /*s0*/1, /*s1*/1, /*p0*/pad, /*p1*/0,
+                                            /*d0*/1, /*d1*/1);
+    // r is [OW=T, OH=1, C, 1] with cwhn strides: element (c, t) at t*D + c.
+    ggml_tensor* dwt = ggml_view_2d(ctx, r, D, T, (size_t)D * sizeof(float), 0);
     ggml_tensor* dwb = clone_weight_opt_s(ctx, ml, pre + "conv.depthwise_conv.bias");
-    ggml_tensor* dwt = ggml_cont(ctx, ggml_transpose(ctx, dw));  // [C, T]
     if (dwb) dwt = ggml_add(ctx, dwt, dwb);                      // broadcast [C] over T
 
     // -- norm (between depthwise conv and SiLU).
@@ -153,13 +239,18 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
                                  sc, (size_t)D * sizeof(float));
         ggml_tensor* shift = graph_input_tensor(ctx, GGML_TYPE_F32, 1, d_ne,
                                  sh, (size_t)D * sizeof(float));
+        // Constants of the cached graph (weights folded host-side): upload
+        // once per T entry instead of every replay (48 of the ~50 per-pass
+        // input uploads were these).
+        mark_graph_input_persistent(scale);
+        mark_graph_input_persistent(shift);
         normed = ggml_add(ctx, ggml_mul(ctx, dwt, scale), shift);  // [C, T]
     }
 
     // -- SiLU (Swish), then pointwise_conv2 (Conv1d d->d, k=1).
     normed = ggml_silu(ctx, normed);
     ggml_tensor* pw2w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
-    pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
+    if (pw2w->type != GGML_TYPE_F16) pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
     pw2w = ggml_reshape_2d(ctx, pw2w, D, D);  // [in=d, out=d]
     ggml_tensor* pw2b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
     ggml_tensor* cout = ggml_mul_mat(ctx, pw2w, normed);  // [d, T]
@@ -172,7 +263,8 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
 ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
                                          int T, ggml_tensor* pe, int pos_len,
                                          int valid_len,
-                                         GraphInputPool& pool) const {
+                                         GraphInputPool& pool,
+                                         ggml_tensor* ph) const {
     const int D = d_model_;
     const int K = conv_kernel_;
     const float ln_eps = 1e-5f;  // LayerNorm eps (NeMo nn.LayerNorm default)
@@ -217,7 +309,7 @@ ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
     // === Stage B: r = r + self_attn(norm_self_att(r)). ===
     ggml_tensor* attn_in = layer_norm(r, "norm_self_att");
     ggml_tensor* attn_out = attn_.build_graph(ctx, attn_in, T, pe, pos_len,
-                                              valid_len, pool);  // [D, T]
+                                              valid_len, pool, ph);  // [D, T]
     r = ggml_add(ctx, r, attn_out);
 
     // === Stage C: r = r + conv(norm_conv(r)). ===

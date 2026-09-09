@@ -37,6 +37,11 @@ private:
         int valid_len = 0;
         GraphInputPool pool;
         std::unique_ptr<ReplayGraph> graph;
+        // [starling pos-cache] per-layer positional projections [dk, P, H],
+        // constant per T': each layer is computed once (small one-shot device
+        // compute), uploaded into its PERSISTENT replay input, then the
+        // scratch is reused -> transient host footprint is one ph layer.
+        std::vector<float> ph_scratch;   // stable-address scratch (entry-owned)
     };
     struct ReplayCache {
         LruCache<int, ReplayEntry> by_T;
@@ -46,7 +51,12 @@ private:
 
     ggml_tensor* build_graph(ggml_context* ctx, const std::vector<float>& mel,
                              int n_mels, int T, GraphInputPool& pool,
-                             int& Tp, int& valid_len) const;
+                             int& Tp, int& valid_len,
+                             const float* ph_scratch = nullptr) const;
+
+    // One-shot per-layer pos compute: layer L's [dk, P, H] projection of the
+    // sinusoidal table for this T' (device compute, host readback).
+    bool compute_pos_layer(int Tp, int layer, std::vector<float>& ph_out) const;
 
     const ParakeetModel& model_;
     Subsampling sub_;
