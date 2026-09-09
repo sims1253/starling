@@ -1,0 +1,23 @@
+# starling-quantize recipe: uniform Q4_0 with the full-corpus importance
+# matrix — the measured best speed/memory point for the Vulkan iGPU path
+# (medium fixture: 770.7 -> 603.5 ms, 972 -> 710 MB peak RSS, real-corpus
+# WER 3.55 vs the q8_0 baseline's 3.94; see docs/quantization.md).
+# No per-tensor rules: the win is the imatrix calibration, not sensitivity
+# tiering — attention-only or q6_k full-imatrix variants measured slower.
+#
+# The imatrix must cover the whole workload mix (fixtures x2 plus 32 real
+# utterances, ~26k observations), not just the short tier: a short-tier-only
+# imatrix measured strictly worse than q8_0.
+#
+#   uv run --extra bench python benchmarks/imatrix_collect.py \
+#       --model models/parakeet-tdt-0.6b-v3-f32.gguf \
+#       --output models/parakeet-full.imx \
+#       --tiers short,medium,long --repeats 2 \
+#       --wavs tests/fixtures/real_corpus
+#
+#   build-cpu/starling-quantize \
+#       --input models/parakeet-tdt-0.6b-v3-f32.gguf \
+#       --output models/parakeet-tdt-0.6b-v3-q4-fullimx.gguf \
+#       --recipe benchmarks/recipes/parakeet-q4-fullimx.recipe \
+#       --imatrix models/parakeet-full.imx
+default q4_0
