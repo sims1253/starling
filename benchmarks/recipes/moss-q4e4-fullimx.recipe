@@ -1,0 +1,13 @@
+# EXPERIMENTAL starling-quantize recipe: Q4_0 linears + Q4_0 tied embed/lm_head.
+# The 151936-wide lm_head GEMV is ~20% of decode traffic; Q4 halves it again
+# vs Q8 (saves another ~160 MB). The head is the most quality-sensitive tensor:
+# CER-gated per run, full leaderboard WER before any release claim. If WER
+# regresses, fall back to moss-q4e8-fullimx.recipe (embed Q8_0).
+#
+#   build-cpu/starling-quantize \
+#       --input models/moss-transcribe-preview-2b-bf16-exact.gguf \
+#       --output models/moss-transcribe-preview-2b-q4e4-fullimx.gguf \
+#       --recipe benchmarks/recipes/moss-q4e4-fullimx.recipe \
+#       --imatrix models/moss-full.imx --f32-1d
+default q4_0
+^llm\.embed\.weight$ q4_0

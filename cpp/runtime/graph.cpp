@@ -6,17 +6,64 @@
 #include "model_loader.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <stdexcept>
+#include <utility>
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 namespace starling::ggml {
 namespace {
 
 constexpr int kDefaultThreads = 8;
+
+// Default CPU thread count: physical cores (SMT siblings share execution
+// units and only add barrier/dequant contention for this workload; measured
+// 6 > 4 > 8 > 12 on a 6C/12T box, worse at every stage with SMT on). Linux:
+// unique (package, core) among the sched-affine CPUs (container-quota safe).
+// Elsewhere: 0 (unknown) -> the kDefaultThreads fallback below.
+int physical_core_default() {
+#ifdef __linux__
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    const int ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu < 1) return 0;
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0) return 0;
+    std::set<std::pair<std::string, std::string>> cores;
+    char path[128], buf[64];
+    for (int i = 0; i < ncpu; ++i) {
+        if (!CPU_ISSET(i, &mask)) continue;
+        std::snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+        FILE* f = std::fopen(path, "r");
+        if (!f) return 0;
+        const bool ok1 = std::fgets(buf, sizeof(buf), f) != nullptr;
+        std::fclose(f);
+        if (!ok1) return 0;
+        std::string core(buf);
+        std::snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
+        f = std::fopen(path, "r");
+        if (!f) return 0;
+        const bool ok2 = std::fgets(buf, sizeof(buf), f) != nullptr;
+        std::fclose(f);
+        if (!ok2) return 0;
+        cores.emplace(buf, core);
+    }
+    return cores.empty() ? 0 : (int)cores.size();
+#else
+    return 0;
+#endif
+}
 
 // Graph builders may re-enter global_backend() while the runtime lock is held.
 std::recursive_mutex g_backend_mutex;
@@ -46,11 +93,13 @@ Backend& global_backend() {
     std::lock_guard<std::recursive_mutex> lk(g_backend_mutex);
     if (g_shutting_down.load()) throw std::runtime_error("Starling backend has been shut down");
     if (g_backend) return *g_backend;
-    // [starling] env override for CPU thread count (default 8; SMT knobs).
+    // [starling] env override for CPU thread count (default: physical cores;
+    // SMT siblings measured slower at every stage). STARLING_GGML_THREADS wins.
     int n_env = 0;
     if (const char* e = std::getenv("STARLING_GGML_THREADS")) n_env = atoi(e);
+    const int n_phys = physical_core_default();
     int n = g_threads_set.load() ? g_num_threads.load()
-          : (n_env > 0 ? n_env : kDefaultThreads);
+          : (n_env > 0 ? n_env : (n_phys > 0 ? n_phys : kDefaultThreads));
     g_backend = std::make_unique<Backend>(n);
     // Register the atexit handler exactly once. The CUDA driver registers ITS
     // atexit handler lazily on the first CUDA call, which happens inside the

@@ -549,7 +549,21 @@ bool ReplayGraph::alloc_internal() {
     if (backend_.is_gpu() && !need_sched_) {
         for (int i = 0; i < ggml_graph_n_nodes(gf_); ++i) {
             if (!ggml_backend_supports_op(backend_.handle(), ggml_graph_node(gf_, i))) {
-                need_sched_ = true; break;
+                need_sched_ = true;
+                // STARLING_SCHED_DEBUG names the first unsupported node (the
+                // sched path breaks ReplayGraph input uploads, so any hit here
+                // is a hard error for captured graphs, not a fallback).
+                if (std::getenv("STARLING_SCHED_DEBUG")) {
+                    ggml_tensor* n = ggml_graph_node(gf_, i);
+                    std::fprintf(stderr, "[sched-dbg] unsupported node %d/%d: op=%s dst=%s",
+                        i, ggml_graph_n_nodes(gf_), ggml_op_name(n->op), ggml_type_name(n->type));
+                    for (int s = 0; s < 3 && n->src[s]; ++s)
+                        std::fprintf(stderr, " src%d=%s(%s%s)", s, ggml_type_name(n->src[s]->type),
+                            ggml_op_name(n->src[s]->op),
+                            ggml_is_contiguous(n->src[s]) ? ",cont" : ",STRIDED");
+                    std::fprintf(stderr, "\n");
+                }
+                break;
             }
         }
     }

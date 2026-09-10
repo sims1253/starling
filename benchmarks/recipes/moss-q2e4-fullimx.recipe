@@ -1,0 +1,19 @@
+# EXPERIMENTAL starling-quantize recipe: Q2_K linears + Q4_0 tied embed/lm_head.
+# Q2_K dequant is cheap on both backends (unlike Q3_K): -15% time AND -31%
+# memory vs the Q4 best, and -20% on CPU. Quality: short/med fixture WER 0.00,
+# loop CER 0.0, but the tail is noisier than Q4 (32-clip fidelity vs Q8-head:
+# 16/32 identical, mean CER 0.03, max 0.20 — single-word flips on hard audio)
+# and the 10x-repetition long tile early-stops after 1 rep (long WER 90 vs
+# 40 for all other models). The early stop is repetition-specific: a 31 s
+# diverse-concatenation clip is covered fully (346 vs 350 chars, CER 0.04).
+# q4e4-fullimx stays the safe fallback. Leaderboard WER before any release.
+# Possible follow-up: re-collect the imatrix ON Q2 (F32 acts via gemm_act)
+# to sharpen the Q2 blocks at identical speed.
+#
+#   build-cpu/starling-quantize \
+#       --input models/moss-transcribe-preview-2b-bf16-exact.gguf \
+#       --output models/moss-transcribe-preview-2b-q2e4-fullimx.gguf \
+#       --recipe benchmarks/recipes/moss-q2e4-fullimx.recipe \
+#       --imatrix models/moss-full.imx --f32-1d
+default q2_k
+^llm\.embed\.weight$ q4_0

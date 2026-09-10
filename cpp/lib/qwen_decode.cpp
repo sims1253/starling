@@ -150,6 +150,59 @@ void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
 }
 
 
+// F32-activation variants for the f32_acts discipline (GPU + quantized
+// linears only): identical math, no bf16 round-trips. With F32 norm weights
+// (--f32-1d models) the f32() wraps are identities, so the Vulkan backend
+// sees consecutive {RMS_NORM,MUL} patterns and fuses them; the hundreds of
+// tiny CAST dispatches per step vanish regardless.
+bool use_f32_acts(const QwenDecodeCtx& m) {
+    if (!m.spec.f32_acts || !global_backend().is_gpu()) return false;
+    ggml_tensor* w = m.loader.tensor("llm.blk.0.attn.q.weight");
+    return w && ggml_is_quantized(w->type);
+}
+
+ggml_tensor* linf(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
+                  const std::string& n) {
+    return ggml_mul_mat(c, clone_weight(c, ml, n.c_str()), f32(c, x));
+}
+
+ggml_tensor* linear_f32_bias(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
+                             const std::string& n) {
+    ggml_tensor* y = ggml_mul_mat(c, clone_weight(c, ml, (n + ".weight").c_str()),
+                                  f32(c, x));
+    return ggml_add(c, y, f32(c, clone_weight(c, ml, (n + ".bias").c_str())));
+}
+
+ggml_tensor* rmsf(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
+                  const std::string& n, float eps) {
+    return ggml_mul(c, ggml_rms_norm(c, f32(c, x), eps),
+                    f32(c, clone_weight(c, ml, n.c_str())));
+}
+
+ggml_tensor* residual_add_f(ggml_context* c, const QwenDecodeSpec& s,
+                            ggml_tensor* r, ggml_tensor* y) {
+    // Upcast both sides: r may be a BF16 graph input (first layer) or Q8
+    // embedding rows (K-step entry) while y is F32; mixed-dtype ADD is not
+    // supported on Vulkan. Later layers are already F32 (identities).
+    ggml_tensor* rf = f32(c, r);
+    ggml_tensor* yf = f32(c, y);
+    if (s.residual_multiplier == 1.0f) return ggml_add(c, rf, yf);
+    return ggml_add(c, rf, ggml_scale(c, yf, s.residual_multiplier));
+}
+
+ggml_tensor* spec_mlp_f(ggml_context* c, const QwenDecodeCtx& m,
+                        ggml_tensor* n, const std::string& p) {
+    if (m.spec.mlp_activation == QwenMlpAct::kRelu2Plain) {
+        ggml_tensor* u = linf(c, m.loader, n, p + "ffn.up.weight");
+        ggml_tensor* r = ggml_relu(c, u);
+        return linf(c, m.loader, ggml_mul(c, r, r), p + "ffn.down.weight");
+    }
+    ggml_tensor* g = linf(c, m.loader, n, p + "ffn.gate.weight");
+    ggml_tensor* u = linf(c, m.loader, n, p + "ffn.up.weight");
+    ggml_tensor* si = ggml_silu(c, g);
+    return linf(c, m.loader, ggml_mul(c, si, u), p + "ffn.down.weight");
+}
+
 // ---------------------------------------------------------------------------
 // Staged layer-0 parity probe.
 // <env>_L0_STAGE=<stage> makes layer 0 of a 107-token prefill return
@@ -467,6 +520,7 @@ struct PrefillCache {
 // device<->host sync per K tokens.
 struct KStepGraph {
     int K = 0;
+    int64_t W = 0;  // attention width bucket (keys [0, W) resident per step)
     int64_t start_past = 0;
     std::unique_ptr<ReplayGraph> rg;
     size_t in_prev_tok = 0;
@@ -482,9 +536,10 @@ struct KStepGraph {
 // ONE captured K-step graph per K (start_past is a runtime input, so a single
 // graph serves every decode step and every utterance -> perfect capture
 // amortization).
-struct KStepKey { int K;
-    bool operator==(const KStepKey& o) const { return K == o.K; } };
-struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept { return (size_t)k.K; } };
+struct KStepKey { int K; int64_t W;
+    bool operator==(const KStepKey& o) const { return K == o.K && W == o.W; } };
+struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept {
+    return (size_t)k.K * 1000003u + (size_t)k.W; } };
 
 // Captured graphs borrow this model's weights and KV cache.
 struct SpecState {
@@ -525,22 +580,41 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                               ggml_tensor* cache_k, ggml_tensor* cache_v,
                               ggml_tensor* cs, ggml_tensor* sn,
                               ggml_tensor* mask, int kv_mode,
-                              ggml_tensor* idx_past) {
+                              ggml_tensor* idx_past, ggml_tensor* rope_pos) {
     const auto& lc = m.dims;
     const int D = lc.head_dim, H = lc.n_heads, KV = lc.n_kv_heads;
-    const int64_t K = (kv_mode == 2) ? (int64_t)lc.max_cache : (past + S);
+    // Attention key width: the cache tensor's own width (a bucket prefix view
+    // [D, W, KV] in bucketed K-step; full cache otherwise), else past+S.
+    const int64_t K = (kv_mode == 2) ? cache_k->ne[1] : (past + S);
     const std::string p = "llm.blk." + std::to_string(li) + ".";
     ggml_tensor* r = x_in;
+    // F32-activation discipline (f32_acts spec + GPU + quantized linears):
+    // same math, no bf16 round-trips. Graph paths only (kv_mode 0/2): the
+    // legacy exact-width probe path (mode 1) keeps the exact discipline.
+    // In F mode cs/sn are unused (rope_ext reads positions); the F-helpers
+    // upcast internally, so no caller pre-wrapping is needed.
+    const bool F = use_f32_acts(m) && kv_mode != 1;
 
-    ggml_tensor* n = spec_rms(c, m.spec, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps);
+    ggml_tensor* n = F ? rmsf(c, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps)
+                       : spec_rms(c, m.spec, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps);
     // Projection family per spec (see QwenDecodeSpec): Qwen2.5 takes biased
     // q/k/v by BASE name and has no q_norm/k_norm; Qwen3 takes bias-free full
     // names plus per-head q_norm/k_norm after the reshape.
     ggml_tensor* q, *k, *v;
     if (m.spec.qkv_bias) {
-        q = linear_bf16(c, m.loader, n, p + "attn.q", true);
-        k = linear_bf16(c, m.loader, n, p + "attn.k", true);
-        v = linear_bf16(c, m.loader, n, p + "attn.v", true);
+        if (F) {
+            q = linear_f32_bias(c, m.loader, n, p + "attn.q");
+            k = linear_f32_bias(c, m.loader, n, p + "attn.k");
+            v = linear_f32_bias(c, m.loader, n, p + "attn.v");
+        } else {
+            q = linear_bf16(c, m.loader, n, p + "attn.q", true);
+            k = linear_bf16(c, m.loader, n, p + "attn.k", true);
+            v = linear_bf16(c, m.loader, n, p + "attn.v", true);
+        }
+    } else if (F) {
+        q = linf(c, m.loader, n, p + "attn.q.weight");
+        k = linf(c, m.loader, n, p + "attn.k.weight");
+        v = linf(c, m.loader, n, p + "attn.v.weight");
     } else {
         q = lin(c, m.loader, n, p + "attn.q.weight");
         k = lin(c, m.loader, n, p + "attn.k.weight");
@@ -550,15 +624,37 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     k = ggml_reshape_3d(c, k, D, KV, S);
     v = ggml_reshape_3d(c, v, D, KV, S);
     if (!m.spec.qkv_bias && m.spec.qk_norm) {
-        q = spec_rms(c, m.spec, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
-        k = spec_rms(c, m.spec, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+        if (F) {
+            q = rmsf(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
+            k = rmsf(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+        } else {
+            q = spec_rms(c, m.spec, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
+            k = spec_rms(c, m.spec, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+        }
+    }
+    // RoPE (rotate-half, f32 math). cs/sn are the SAME bf16 values as the
+    // legacy host table; only their source differs (device table vs host input).
+    // In F mode (K-step only) the fused ggml_rope_ext kernel (NEOX = pairs
+    // split across halves, exactly this formula with F32 trig) replaces the
+    // whole view/scale/concat/mul/add subgraph: 1 dispatch per rope instead
+    // of ~8. It reads [D,H,S] heads-major, so it runs before the permute;
+    // idx_past ([1] int32) is the position vector it needs. Its F32 output is
+    // rounded for the BF16 attention core (one tiny contiguous cast); k needs
+    // no round (it reaches attention only via the BF16 cache).
+    if (F) {
+        // F32 rope via the fused kernel. Position source: idx_past for the
+        // single-step decodes, rope_pos ([S] table positions) for prefill.
+        ggml_tensor* rp = idx_past ? idx_past : rope_pos;
+        q = ggml_rope_ext(c, q, rp, nullptr, D, GGML_ROPE_TYPE_NEOX, (int)lc.max_cache,
+                          lc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(c, k, rp, nullptr, D, GGML_ROPE_TYPE_NEOX, (int)lc.max_cache,
+                          lc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        q = bf(c, q);
     }
     q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));  // [D, S, H]
     k = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));  // [D, S, KV]
     v = ggml_cont(c, ggml_permute(c, v, 0, 2, 1, 3));  // [D, S, KV]
-
-    // RoPE (rotate-half, f32 math). cs/sn are the SAME bf16 values as the
-    // legacy host table; only their source differs (device table vs host input).
+    if (!F) {
     auto rope = [&](ggml_tensor* z, int heads) {
         ggml_tensor* lo = ggml_view_3d(c, z, D / 2, S, heads,
                                        z->nb[1], z->nb[2], 0);
@@ -572,6 +668,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     };
     q = rope(q, H);
     k = rope(k, KV);
+    }
 
     // KV cache: write this step's k/v into the device cache in-graph and
     // assemble kall/vall. Depending on the cpy/set_rows result (via attention)
@@ -583,8 +680,10 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                                           cache_k->nb[1], cache_k->nb[2], 0);
         ggml_tensor* vview = ggml_view_3d(c, cache_v, D, S, KV,
                                           cache_v->nb[1], cache_v->nb[2], 0);
-        kall = ggml_cpy(c, k, kview);  // [D, S, KV], slots [0,S)
-        vall = ggml_cpy(c, v, vview);
+        // F: round k/v for the BF16 cache (exact-width views: cheap); the
+        // attention core stays BF16, like the K-step path.
+        kall = ggml_cpy(c, F ? bf(c, k) : k, kview);  // [D, S, KV], slots [0,S)
+        vall = ggml_cpy(c, F ? bf(c, v) : v, vview);
     } else if (kv_mode == 2) {     // decode full-capacity (captured, dynamic slot)
         // set_rows writes ff(k) (f32) into the bf16 cache at slot `past`; the
         // values are bf16-representable so the f32->bf16 round is exact. The
@@ -622,6 +721,11 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     ggml_tensor* joined;
     if (!env(m.spec, "_PERHEAD")) {
         // scores = K^T Q / sqrt(D) over all heads (GQA broadcast KV->H).
+        // BF16 core, always: F32 attention was measured slower twice (full-
+        // width catastrophic via cache traffic; bucket-narrow -5% — the
+        // fp16-capable iGPU outruns the staging tax on these small GEMVs).
+        // In F mode q was rounded after rope (one tiny cast) and joined
+        // feeds linf, whose f32() is exact.
         ggml_tensor* sc = ggml_mul_mat(c, kall, q);                 // [K, S, H]
         sc = bf(c, ggml_scale(c, ff(c, sc), scale));
         ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
@@ -648,13 +752,16 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         }
     }
 
-    ggml_tensor* a = lin(c, m.loader, joined, p + "attn.o.weight");
-    ggml_tensor* x = residual_add(c, m.spec, r, a);
+    ggml_tensor* a = F ? linf(c, m.loader, joined, p + "attn.o.weight")
+                      : lin(c, m.loader, joined, p + "attn.o.weight");
+    ggml_tensor* x = F ? residual_add_f(c, m.spec, r, a)
+                       : residual_add(c, m.spec, r, a);
     r = x;
-    n = spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
-    ggml_tensor* dn = spec_mlp(c, m.spec, m.loader, n, p);
-    x = residual_add(c, m.spec, r, dn);
-    return x;  // [hidden, S] bf16
+    n = F ? rmsf(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps)
+          : spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
+    ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.spec, m.loader, n, p);
+    x = F ? residual_add_f(c, m.spec, r, dn) : residual_add(c, m.spec, r, dn);
+    return x;  // [hidden, S] bf16 (F32 in F mode)
 }
 
 // Build (or fetch) the captured prefill graph for prompt length S.
@@ -696,6 +803,9 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
 
             entry.graph = std::make_unique<ReplayGraph>(global_backend(),
                 [&](ggml_context* c) -> ggml_tensor* {
+                    // F32 prefill (GPU + quant): skip the rope tables (rope_ext
+                    // reads pos_t) and the per-op round-trips, like K-step.
+                    const bool PF = use_f32_acts(m);
                     int64_t xne[2] = {lc.hidden, S};
                     ggml_tensor* x = graph_input_tensor(c, GGML_TYPE_BF16, 2, xne,
                         entry.xb_buf, (size_t)S * lc.hidden * sizeof(ggml_bf16_t));
@@ -703,18 +813,19 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                     int64_t pne[1] = {S};
                     ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, pne,
                         pos_buf, (size_t)S * sizeof(int32_t));
-                    ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, S]
-                    ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos_t);
+                    ggml_tensor* cs = PF ? nullptr : ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, S]
+                    ggml_tensor* sn = PF ? nullptr : ggml_get_rows(c, dc->rope_sin, pos_t);
                     int64_t mne[2] = {S, S};
                     ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                         mask_buf, (size_t)S * S * sizeof(float));
                     for (int li = 0; li < (int)lc.n_layers; ++li)
                         x = append_layer_new(c, m, li, x, S, 0, dc->k[li], dc->v[li],
-                                             cs, sn, mt, /*kv_mode=*/0, nullptr);
+                                             cs, sn, mt, /*kv_mode=*/0, nullptr, pos_t);
                     // Final norm + lm_head on the LAST token only.
                     ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                                      (size_t)(S - 1) * x->nb[1]);
-                    ggml_tensor* n = spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
+                    ggml_tensor* n = PF ? rmsf(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps)
+                                        : spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
                     ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
                     return ff(c, apply_logits_scaling(c, m.spec, lg));
                 });
@@ -755,7 +866,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
                                                  mask.data(), mask.size() * sizeof(float));
             for (int li = 0; li < (int)lc.n_layers; ++li)
                 x = append_layer_new(c, m, li, x, S, 0, dc->k[li], dc->v[li],
-                                     cs, sn, mt, /*kv_mode=*/0, nullptr);
+                                     cs, sn, mt, /*kv_mode=*/0, nullptr, pos_t);
             ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                              (size_t)(S - 1) * x->nb[1]);
             ggml_tensor* n = spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
@@ -819,6 +930,7 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
         ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos_t);
+        const bool DF = use_f32_acts(m);
         int64_t mne[2] = {mask_w, 1};
         ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                                              mask.data(), mask.size() * sizeof(float));
@@ -827,8 +939,9 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             : nullptr;
         for (int li = 0; li < (int)lc.n_layers; ++li)
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
-                                 cs, sn, mt, kv_mode, idx_t);
-        ggml_tensor* n = spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+                                 cs, sn, mt, kv_mode, idx_t, nullptr);
+        ggml_tensor* n = DF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
+                            : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
@@ -860,13 +973,16 @@ int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
 // Captures K consecutive decode steps into ONE ReplayGraph with the per-step
 // state chained IN-GRAPH (output token -> get_rows(embed) -> next step's
 // input), so there is ONE device<->host sync per K steps instead of per step.
-// KV writes land at baked slots [start_past, start_past+K) (the graph is built
-// per start_past); attention is EXACT-WIDTH per step (no padding, no full-
-// capacity mask) so the softmax reduction order is byte-identical to the one-
-// step decode.
+// Attention is bucketed exact-width: the graph serves attention width W (a
+// prefix view [D, W, KV] of the device KV cache + [W, 1] runtime masks), with
+// W the smallest bucket in {128, 256, 512, 1024} covering the block's keys
+// (else full max_cache). Narrower W means proportionally less QK/softmax/ctx
+// traffic per step (short: 128-wide vs 2048 full-cap = 16x); the softmax math
+// is unchanged (masked slots contributed exactly 0 before), only the
+// reduction width differs, so CER-gated. <env>_NOBUCKET forces full-capacity.
 //
-// Graph cache keyed on K: start_past is a runtime input, so ONE graph per K
-// serves every decode step and every utterance; graphs are cached
+// Graph cache keyed on (K, W): positions stay runtime inputs, so a handful of
+// graphs serve every decode step and every utterance; graphs are cached
 // process-globally and reused across reps / same-prompt runs.
 // ===========================================================================
 
@@ -882,11 +998,21 @@ int kstep_K(const QwenDecodeSpec& spec) {
     return v;
 }
 
-// Build (or fetch) the single full-capacity K-step graph for K. start_past is
+// Attention-width bucket for a K-step block starting at `past`: smallest of
+// {128, 256, 512, 1024} covering the block's keys [0, past+K), else full
+// max_cache. Short (prompt ~107 + gen) lives in 128/256 the whole decode.
+int64_t kstep_bucket(const QwenDecodeCtx& m, int64_t past, int K) {
+    if (!m.spec.kstep_bucket || env(m.spec, "_NOBUCKET")) return (int64_t)m.dims.max_cache;
+    const int64_t need = past + K;
+    for (int64_t w : {128, 256, 512, 1024}) if (need <= w) return w;
+    return (int64_t)m.dims.max_cache;
+}
+
+// Build (or fetch) the bucketed K-step graph for (K, W). start_past is
 // a runtime input, so this graph is reused for every decode-step batch.
-KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
+KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::string& e) {
     SpecState& st = state_for(m.loader);
-    KStepKey key{K};
+    KStepKey key{K, W};
     auto it = st.kstep.find(key);
     if (it != st.kstep.end()) return it->second.get();
 
@@ -896,16 +1022,17 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
 
     auto kg = std::unique_ptr<KStepGraph>(new KStepGraph());
     kg->K = K;
+    kg->W = W;
     kg->start_past = 0;
     // Per-replay host backing for the runtime inputs (overwritten each replay).
     kg->host_pos.assign((size_t)K, 0);
-    kg->host_mask.assign((size_t)K, std::vector<float>((size_t)lc.max_cache, 0.0f));
+    kg->host_mask.assign((size_t)K, std::vector<float>((size_t)W, 0.0f));
     kg->in_pos.resize((size_t)K);
     kg->in_mask.resize((size_t)K);
     kg->cap_tokens.assign((size_t)K, 0.0f);
 
     KStepGraph* raw = kg.get();
-    const int64_t mc = lc.max_cache;
+    const int D = lc.head_dim, KV = lc.n_kv_heads;
     // bf16-tie mode: constant [vocab] descending column iota (vocab - col,
     // exactly representable: vocab < 2^24). The per-step pick multiplies the
     // equality-mask of the bf16-rounded logits' max by this iota, so the
@@ -946,9 +1073,9 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                                                        &raw->host_pos[(size_t)j], sizeof(int32_t));
                 raw->in_pos[(size_t)j] = idx++;
             }
-            // K+1..2K: runtime per-step full-capacity masks [max_cache, 1].
+            // K+1..2K: runtime per-step bucket-width masks [W, 1].
             for (int j = 0; j < K; ++j) {
-                int64_t mw[2] = {mc, 1};
+                int64_t mw[2] = {W, 1};
                 mask_t[(size_t)j] = graph_input_tensor(c, GGML_TYPE_F32, 2, mw,
                                                        raw->host_mask[(size_t)j].data(),
                                                        raw->host_mask[(size_t)j].size() * sizeof(float));
@@ -978,20 +1105,33 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
                 raw->in_one = idx++;
             }
             // Chain K steps in-graph: tok = prev-token; each step's argmax feeds
-            // the next step's embed (get_rows), all on device.
+            // the next step's embed (get_rows), all on device. Cache prefix
+            // views [D, W, KV] (static for the graph) are the set_rows targets
+            // so attention runs bucket-width; the write->read dependency still
+            // flows through set_rows.
+            std::vector<ggml_tensor*> ckw((size_t)lc.n_layers), cvw((size_t)lc.n_layers);
+            for (int li = 0; li < (int)lc.n_layers; ++li) {
+                ckw[(size_t)li] = ggml_view_3d(c, dc->k[li], D, W, KV,
+                    dc->k[li]->nb[1], dc->k[li]->nb[2], 0);
+                cvw[(size_t)li] = ggml_view_3d(c, dc->v[li], D, W, KV,
+                    dc->v[li]->nb[1], dc->v[li]->nb[2], 0);
+            }
             ggml_tensor* tok = prev_tok_t;
             std::vector<ggml_tensor*> tok_nodes;
             tok_nodes.reserve((size_t)K);
+            const bool KF = use_f32_acts(m);
             for (int j = 0; j < K; ++j) {
                 ggml_tensor* x = ggml_get_rows(c, embed_w, tok);                     // [hidden, 1]
                 x = apply_embed_mul(c, m.spec, x);
-                ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t[(size_t)j]);  // [D, 1]
-                ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos_t[(size_t)j]);
+                // F mode ropes via rope_ext on idx_past; the table lookups stay dead.
+                ggml_tensor* cs = KF ? nullptr : ggml_get_rows(c, dc->rope_cos, pos_t[(size_t)j]);  // [D, 1]
+                ggml_tensor* sn = KF ? nullptr : ggml_get_rows(c, dc->rope_sin, pos_t[(size_t)j]);
                 for (int li = 0; li < (int)lc.n_layers; ++li)
                     x = append_layer_new(c, m, li, x, /*S=*/1, /*past=*/0,
-                                         dc->k[li], dc->v[li], cs, sn, mask_t[(size_t)j],
-                                         /*kv_mode=*/2, pos_t[(size_t)j]);
-                ggml_tensor* n = spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+                                         ckw[(size_t)li], cvw[(size_t)li], cs, sn, mask_t[(size_t)j],
+                                         /*kv_mode=*/2, pos_t[(size_t)j], nullptr);
+                ggml_tensor* n = KF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
+                                     : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
                 ggml_tensor* logits = ggml_mul_mat(c, head_w, gemm_act(c, head_w, n));  // [vocab, 1]
@@ -1046,7 +1186,10 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, std::string& e) {
 bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
                int32_t eos, int32_t eos2, int max_new_tokens,
                std::vector<int32_t>& ids, bool& hit_eos, std::string& e) {
-    KStepGraph* kg = get_or_build_kstep(m, K, e);
+    // Bucketed width for this block: every step's keys [0, past+j] and write
+    // slot (past+j) must land inside [0, W) (asserted per step below).
+    const int64_t W = kstep_bucket(m, past, K);
+    KStepGraph* kg = get_or_build_kstep(m, K, W, e);
     if (!kg) return false;
     const int64_t mc = m.dims.max_cache;
     const float neg = -3.3895313892515355e38f;
@@ -1069,15 +1212,17 @@ bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
         // a detectable error instead of silent device-memory corruption. (The
         // OOB write lands in ggml's buffer padding and does NOT fault, so a
         // crash/CUDA-error gate alone cannot catch this class of bug.)
-        if (kg->host_pos[(size_t)j] < 0 || kg->host_pos[(size_t)j] >= (int32_t)mc) {
+        if (kg->host_pos[(size_t)j] < 0 || kg->host_pos[(size_t)j] >= (int32_t)mc ||
+            kg->host_pos[(size_t)j] >= (int32_t)W) {
             e = std::string(m.spec.label) + " K-step position out of bounds (pos=" +
                 std::to_string(kg->host_pos[(size_t)j]) +
-                ", max_cache=" + std::to_string(mc) + ")";
+                ", max_cache=" + std::to_string(mc) +
+                ", bucket=" + std::to_string(W) + ")";
             return false;
         }
         std::vector<float>& mk = kg->host_mask[(size_t)j];
-        for (int64_t s = 0; s < boundary + 1 && s < mc; ++s) mk[(size_t)s] = 0.0f;
-        for (int64_t s = boundary + 1; s < mc; ++s) mk[(size_t)s] = neg;
+        for (int64_t s = 0; s < boundary + 1; ++s) mk[(size_t)s] = 0.0f;
+        for (int64_t s = boundary + 1; s < W; ++s) mk[(size_t)s] = neg;
         kg->rg->set_input(kg->in_pos[(size_t)j], &kg->host_pos[(size_t)j], sizeof(int32_t));
         kg->rg->set_input(kg->in_mask[(size_t)j], mk.data(), mk.size() * sizeof(float));
     }
