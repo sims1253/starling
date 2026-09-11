@@ -930,7 +930,7 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
         ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos_t);
-        const bool DF = use_f32_acts(m);
+        const bool DF = use_f32_acts(m) && kv_mode != 1;
         int64_t mne[2] = {mask_w, 1};
         ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                                              mask.data(), mask.size() * sizeof(float));
@@ -1002,9 +1002,11 @@ int kstep_K(const QwenDecodeSpec& spec) {
 // {128, 256, 512, 1024} covering the block's keys [0, past+K), else full
 // max_cache. Short (prompt ~107 + gen) lives in 128/256 the whole decode.
 int64_t kstep_bucket(const QwenDecodeCtx& m, int64_t past, int K) {
-    if (!m.spec.kstep_bucket || env(m.spec, "_NOBUCKET")) return (int64_t)m.dims.max_cache;
+    if (!m.spec.kstep_bucket || !use_f32_acts(m) || env(m.spec, "_NOBUCKET"))
+        return (int64_t)m.dims.max_cache;
     const int64_t need = past + K;
-    for (int64_t w : {128, 256, 512, 1024}) if (need <= w) return w;
+    for (int64_t w : {128, 256, 512, 1024})
+        if (need <= w) return std::min(w, (int64_t)m.dims.max_cache);
     return (int64_t)m.dims.max_cache;
 }
 

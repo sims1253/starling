@@ -72,7 +72,8 @@ unsupported values:
 
 | Model | Accepted `starling.numeric_profile` values |
 | --- | --- |
-| MOSS, ARK, Higgs | `bf16_exact`, `f16` |
+| MOSS | `bf16_exact`, `f16`, `quantized` |
+| ARK, Higgs | `bf16_exact`, `f16` |
 | Hojo | `mixed_f32_bf16_exact`, `bf16_exact`, `f16` |
 | Granite, Qwen3, S1 | `bf16_exact` |
 | Audex | `bf16_exact`, `quantized` |

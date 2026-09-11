@@ -5,6 +5,7 @@
 #include "backend.hpp"
 #include "model_loader.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -29,13 +30,13 @@ constexpr int kDefaultThreads = 8;
 // Default CPU thread count: physical cores (SMT siblings share execution
 // units and only add barrier/dequant contention for this workload; measured
 // 6 > 4 > 8 > 12 on a 6C/12T box, worse at every stage with SMT on). Linux:
-// unique (package, core) among the sched-affine CPUs (container-quota safe).
+// unique (package, core) among the sched-affine CPUs (respects cpusets).
 // Elsewhere: 0 (unknown) -> the kDefaultThreads fallback below.
 int physical_core_default() {
 #ifdef __linux__
     cpu_set_t mask;
     CPU_ZERO(&mask);
-    const int ncpu = (int)sysconf(_SC_NPROCESSORS_CONF);
+    const long ncpu = std::min(sysconf(_SC_NPROCESSORS_CONF), (long)CPU_SETSIZE);
     if (ncpu < 1) return 0;
     if (sched_getaffinity(0, sizeof(mask), &mask) != 0) return 0;
     std::set<std::pair<std::string, std::string>> cores;

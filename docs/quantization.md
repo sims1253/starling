@@ -633,7 +633,10 @@ Imatrix collection rides the stock collector (`STARLING_IMATRIX` +
 observes F32 activations and the BF16 model's GEMMs take BF16, while Q8's
 `gemm_act` routes F32 everywhere. Activation statistics are
 weight-precision agnostic. One pass over fixtures + 32 real-corpus clips:
-394 tensors, ~196k observations (`.auto/collect_moss_imx.py`).
+394 tensors, ~196k observations. The one-off driver, `.auto/collect_moss_imx.py`,
+was a local session artifact and is not included in this repository. These
+collection counts record that experiment; the committed recipes require the
+resulting imatrix file or a new collection pass over the same Q8_0 model.
 
 Recipes (`benchmarks/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
 
@@ -648,8 +651,6 @@ Recipes (`benchmarks/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
 (IQ2_XXS: speed ties, CER 0.11 word errors) and sub-Q4 heads (Q3: tie with
 worse tail; Q2: faster but CER 0.06 with real errors) were tried and
 rejected — Q2_K is the linear floor, Q4 the head floor.)
-
-(Q8_0 uniform, no imatrix, was the stepping stone: 2883 MB.)
 
 Fixture WER vs ground truth (`benchmarks/wer.py` LibriSpeech refs), Vulkan:
 

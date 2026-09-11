@@ -553,7 +553,8 @@ bool ReplayGraph::alloc_internal() {
                 // STARLING_SCHED_DEBUG names the first unsupported node (the
                 // sched path breaks ReplayGraph input uploads, so any hit here
                 // is a hard error for captured graphs, not a fallback).
-                if (std::getenv("STARLING_SCHED_DEBUG")) {
+                if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
+                    debug && debug[0] == '1') {
                     ggml_tensor* n = ggml_graph_node(gf_, i);
                     std::fprintf(stderr, "[sched-dbg] unsupported node %d/%d: op=%s dst=%s",
                         i, ggml_graph_n_nodes(gf_), ggml_op_name(n->op), ggml_type_name(n->type));
