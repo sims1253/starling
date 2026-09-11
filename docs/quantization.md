@@ -607,6 +607,112 @@ Speed (single run, short/medium fixture): bf16 28.3/38.4 s, q8_0 27.1/33.9 s,
 q4_k_m 28.8/33.4 s — size plays, roughly speed-neutral, as with parakeet.
 GPU quantization parity and timings remain untested for this Audex study.
 
+### Moss-transcribe-2b port (2026-09-10) — quants + Vulkan/CPU engine work
+
+Executed against the bf16_exact base
+(`models/moss-transcribe-preview-2b-bf16-exact.gguf`, 4845 MB). All big
+linears have row widths divisible by 32 and 256, so no block-size fallbacks
+(unlike parakeet's 640-row linears). Three engine fixes were load-bearing:
+
+1. Loader allowlist: `cpp/moss/loader.cpp` gains `"quantized"` (audex
+   precedent).
+2. Adapter `mul_mat` passed BF16 activations straight into (now quantized)
+   weights, aborting in ggml-vulkan's `q_f16` path. Fix: route both adapter
+   linears (`cpp/moss/adapter.cpp`, fused `build_adapter`) through the
+   existing `gemm_act()` rule (F32 activations against quantized weights;
+   exact upcast, weight-only noise). Same latent pattern to audit in other
+   engines when they quantize.
+3. `starling-quantize` grew `--f32-1d` (kept 1-D norms/biases stored as F32:
+   bit-identical values, but no CAST graph nodes, so Vulkan's
+   `{NORM,MUL,ADD}` / `{RMS_NORM,MUL}` fusions see consecutive patterns)
+   and a moss-scoped explicit embed rule (`^llm.embed.weight$`, q8_0 or —
+   experimental — q4_0; every other family keeps the parakeet-only gate).
+
+Imatrix collection rides the stock collector (`STARLING_IMATRIX` +
+`STARLING_GGML_DEVICE=cpu`), but on the **Q8_0 model**: the collector only
+observes F32 activations and the BF16 model's GEMMs take BF16, while Q8's
+`gemm_act` routes F32 everywhere. Activation statistics are
+weight-precision agnostic. One pass over fixtures + 32 real-corpus clips:
+394 tensors, ~196k observations. The one-off driver, `.auto/collect_moss_imx.py`,
+was a local session artifact and is not included in this repository. These
+collection counts record that experiment; the committed recipes require the
+resulting imatrix file or a new collection pass over the same Q8_0 model.
+
+Recipes (`benchmarks/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
+
+| recipe | linears | embed (tied head) | size | note |
+|--------|---------|-------------------|------|------|
+| `moss-q4-fullimx` | q4_0 + imx | BF16 exact | 1838 MB | best single-model speed pre-head-quant |
+| `moss-q4e8-fullimx` | q4_0 + imx | q8_0 | 1546 MB | recommended if Q2 tail unacceptable |
+| `moss-q4e4-fullimx` | q4_0 + imx | q4_0 | 1391 MB | safe pick: WER-identical, 28/32 fidelity |
+| `moss-q2e4-fullimx` | q2_k + imx | q4_0 | 900 MB | fastest (-15% vs Q4): short/med WER 0.00, noisier tail |
+
+(Q8_0 uniform, no imatrix, was the stepping stone: 2883 MB. Sub-Q2 linears
+(IQ2_XXS: speed ties, CER 0.11 word errors) and sub-Q4 heads (Q3: tie with
+worse tail; Q2: faster but CER 0.06 with real errors) were tried and
+rejected — Q2_K is the linear floor, Q4 the head floor.)
+
+Fixture WER vs ground truth (`benchmarks/wer.py` LibriSpeech refs), Vulkan:
+
+| model | short | medium | long |
+|-------|-------|--------|------|
+| bf16_exact | 0.00% | 0.00% | 40.00% |
+| q8_0 | 0.00% | 0.00% | 40.00% |
+| q4_0 + imx | 0.00% | 0.00% | 40.00% |
+| q4_0 + q8 head | 0.00% | 0.00% | 40.00% |
+| q4_0 + q4 head | 0.00% | 0.00% | 40.00% |
+| q2_k + q4 head | 0.00% | 0.00% | 90.00%* |
+
+The long-tier 40% is a tiled-audio repetition artifact (the model loses the
+10x repetition count), identical across all five artifacts — no quant
+regression. (*) The Q2 model early-stops after 1 repetition on exact-repeat
+tiles (long WER 90): repetition-specific, verified deterministic and
+order-independent (a stale-script false alarm about nondeterminism was
+chased down to a `sed` chain drift). A 31 s diverse-concatenation clip is
+covered fully (346 vs 350 chars, CER 0.04), and short/med are exact — but
+the tail is noisier generally (see fidelity below), so Q2 needs leaderboard
+WER before any release claim. 32-clip real-corpus fidelity q4-head vs q8-head: 28/32
+byte-identical transcripts, mean normalized CER 0.0035 (the corpus's own
+`reference.json` is index-mismatched — even bf16_exact "hallucinates"
+against it — so fidelity, not accuracy, is the gate there; full Open-ASR
+WER before any release claim). Q2-head fidelity vs q8-head: 16/32 identical,
+mean CER 0.03, max 0.20 — single-word flips on hard audio; acceptable as an
+experimental trade for -15%/-31% but the reason Q4 stays the safe pick.
+
+Speed interleaves quant + engine work (this box: RADV RENOIR uma iGPU +
+6C/12T Zen3; short fixture, steady-state median, RTF in parens):
+
+| step | Vulkan ms | CPU ms |
+|------|-----------|--------|
+| bf16_exact | 5328 (1.40x) | 37857 (0.20x) |
+| + q8_0 | 3205 (2.32x) | 4285 (1.74x) |
+| + q4_0 + imx | 2817 (2.64x) | 3882 (1.92x) |
+| + embed q8_0 | 2614 (2.85x) | 3689 (2.02x) |
+| + F32 K-step decode + rope_ext | 2418 (3.08x) | — |
+| + bucketed K-step attention | 1985 (3.75x) | — |
+| + F32 prefill / encoder | 1874 (3.97x) | — |
+| + q4 head | 1793 (4.15x) | 3165 (2.35x) |
+| + physical-core thread default | — (neutral) | 3381→3150* |
+| + q2_k linears (Q4 head kept) | 1532 (4.85x) | 2507 (2.97x) |
+
+(*) thread default measured on the q4e8 model; q4-head CPU re-measured after.
+Peak RSS (Vulkan): 4765 -> 2932 -> 1930 -> 1657 -> 1644 MB (q4-head: 1504).
+Medium/long Vulkan: ~19 s -> 5.3 s / ~55 s -> 16.2 s (long varies run to
+run; short is the stable gate).
+
+Engine notes (all auto-gated: GPU + quantized linears, CPU/BF16 keep the
+exact discipline; CER-gated per run): `f32_acts` decode (skipped bf16
+round-trips unlock 452 Vulkan `RMS_NORM_MUL[_ROPE]` fusions per K-step
+replay; attention core stays BF16 to avoid full-cache F32 traffic),
+bucketed exact-width K-step attention (128/256/512/1024 prefix views +
+runtime masks; `STARLING_MOSS_NOBUCKET` forces full-cap), `rope_ext`
+(NEOX = half-rotation, matches the engine formula), F32 prefill/encoder,
+physical-core CPU thread default (`STARLING_GGML_THREADS` still wins).
+Dead ends kept for the record: KSTEP=8 (noise, then +7.6% slower),
+`GGML_VK_FLOPS_PER_SUBMIT` one-submit (neutral), `GGML_VK_NO_BARRIERS`
+(4x slower + garbage — never), IQ4_NL (ties Q4_0), F32-on-CPU and CPU
+K-step (correct, zero gain — CPU is GEMV-compute-bound at ~82 ms/tok).
+
 ## Ours vs the community quants (matched levels, 300-clip EN/DE with CIs)
 
 Head-to-head against handy-computer's transcribe.cpp-dialect ladder through

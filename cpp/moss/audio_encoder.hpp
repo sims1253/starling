@@ -17,6 +17,10 @@ struct AudioEncoding {
 // The processor/module deepstack length function from spec section 2.3.
 int64_t audio_token_length(int64_t mel_frames);
 
+// F32-activation discipline for the encoder+adapter (GPU + quantized linears
+// only; mirrors lib::use_f32_acts). CPU keeps the exact bf16-oracle discipline.
+bool encoder_f32(const MossModel& model);
+
 bool encode_audio(const MossModel& model, const MelFeatures& mel,
                   AudioEncoding& out, std::string& err);
 

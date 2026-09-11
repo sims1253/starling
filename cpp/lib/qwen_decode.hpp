@@ -61,6 +61,20 @@ struct QwenDecodeSpec {
     // discipline (round after the rsqrt, round again after the weight mul)
     // the stack was built on (moss/ark/granite/qwen3 byte-identity).
     bool rms_norm_single_round = false;
+    // F32-throughout activations for the decode stack (GPU + quantized
+    // linears only; auto-falls-back when the first linear is unquantized).
+    // Skips every intermediate bf16 round-trip, so the Vulkan backend's
+    // {RMS_NORM,MUL} fusion sees consecutive patterns and fires, and the
+    // hundreds of tiny CAST dispatches per step vanish. Numerics move by
+    // <=1 bf16 ulp per rounding skipped (strictly more precise); CER-gated.
+    // CPU keeps the exact discipline (portable fallback parity).
+    bool f32_acts = false;
+    // Bucketed exact-width K-step attention (128/256/512/1024 prefix views +
+    // runtime masks instead of full-capacity). Same softmax math over fewer
+    // keys (masked slots contributed exactly 0); only the reduction width
+    // differs, so near-tie argmax flips are possible — CER-gated per model.
+    // Default off keeps every other trunk byte-identical.
+    bool kstep_bucket = false;
 };
 
 // The config fields the decode graphs are shaped by.

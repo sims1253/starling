@@ -249,14 +249,14 @@ std::vector<float> to_f32(const ggml_tensor* t) {
 
 struct Args {
     std::string input, output, quant = "q5_k_m", imatrix, recipe;
-    bool shrink_f16 = false, list_only = false, quiet = false;
+    bool shrink_f16 = false, list_only = false, quiet = false, f32_1d = false;
 };
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
         "usage: %s --input in.gguf --output out.gguf --quant q5_k_m\n"
         "                 [--imatrix file] [--recipe file] [--shrink-f16]\n"
-        "                 [--list] [--quiet]\n",
+        "                 [--f32-1d] [--list] [--quiet]\n",
         argv0);
 }
 
@@ -279,6 +279,7 @@ int main(int argc, char** argv) {
         else if (a == "--imatrix") args.imatrix = next("--imatrix");
         else if (a == "--recipe") args.recipe = next("--recipe");
         else if (a == "--shrink-f16") args.shrink_f16 = true;
+        else if (a == "--f32-1d") args.f32_1d = true;
         else if (a == "--list") args.list_only = true;
         else if (a == "--quiet") args.quiet = true;
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
@@ -360,6 +361,9 @@ int main(int argc, char** argv) {
     const bool parakeet = arch_key >= 0 &&
         gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
         std::strcmp(gguf_get_val_str(in, arch_key), "parakeet_tdt") == 0;
+    const bool moss_embed_ok = arch_key >= 0 &&
+        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
+        std::strcmp(gguf_get_val_str(in, arch_key), "moss_transcribe") == 0;
 
     // Output meta context: no_alloc tensors whose ->data we point at owned
     // host buffers until gguf_write_to_file.
@@ -400,14 +404,24 @@ int main(int argc, char** argv) {
         ggml_type want = (ggml_type)t->type;
         // An explicit rule is required: a recipe's default must not newly
         // quantize embeddings, which are not observed by the imatrix collector.
-        // Limit this exception to the engine whose host lookup dequantizes.
-        if (use_recipe && parakeet && n_dims == 2 &&
-            name == "decoder.prediction.embed.weight") {
+        // Limit this exception to the engines whose host lookup dequantizes
+        // (parakeet prediction embed; moss tied embed/lm_head via get_rows).
+        if (use_recipe && n_dims == 2 &&
+            ((parakeet && name == "decoder.prediction.embed.weight") ||
+             (moss_embed_ok && name == "llm.embed.weight"))) {
             for (const auto& rule : recipe.rules) {
                 if (std::regex_search(name, rule.first)) {
-                    if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32) {
+                    // Parakeet prediction embed: q8_0/f32 only (low-precision
+                    // input embeddings break the TDT joint). Moss tied
+                    // embed/lm_head: q8_0 proven, q4_0 experimental (the head
+                    // is quality-sensitive; CER-gated per run, leaderboard WER
+                    // before any release claim).
+                    const bool moss_head = moss_embed_ok && name == "llm.embed.weight";
+                    if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32 &&
+                        !(moss_head && rule.second == GGML_TYPE_Q4_0)) {
                         std::fprintf(stderr,
-                                     "error: Parakeet embedding recipe supports only q8_0 or f32\n");
+                                     "error: embedding recipe supports only q8_0 or f32%s\n",
+                                     moss_head ? " (moss head: also q4_0)" : "");
                         return 1;
                     }
                     candidates++;
@@ -432,6 +446,14 @@ int main(int argc, char** argv) {
             }
         } else if (args.shrink_f16 && t->type == GGML_TYPE_F32 && shrink_eligible(name, n_dims)) {
             want = GGML_TYPE_F16;
+        } else if (args.f32_1d && n_dims == 1 && t->type != GGML_TYPE_F32) {
+            // Upcast kept 1-D tensors (norm weights, biases) to F32. The
+            // values are bit-identical through the BF16->F32 upcast, and
+            // every engine elementwise path consumes them in F32 anyway —
+            // but F32 leaves emit no CAST graph nodes, so the Vulkan
+            // backend's {NORM,MUL,ADD} / {RMS_NORM,MUL} / {MUL_MAT,ADD}
+            // fusions see consecutive patterns and fire. ~1 MB for moss.
+            want = GGML_TYPE_F32;
         }
 
         // Materialize the output tensor + data. gguf_add_tensor records the
@@ -448,6 +470,9 @@ int main(int argc, char** argv) {
             if (want == GGML_TYPE_F16) {
                 ggml_fp32_to_fp16_row(f32.data(), (ggml_fp16_t*)owned.back().get(),
                                       (int64_t)ggml_nelements(t));
+            } else if (want == GGML_TYPE_F32) {
+                std::memcpy(owned.back().get(), f32.data(),
+                            (size_t)ggml_nelements(t) * sizeof(float));
             } else {
                 // Quantized: weight the block search by the imatrix when the
                 // entry matches this tensor's row width.
