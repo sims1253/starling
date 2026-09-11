@@ -17,6 +17,11 @@ Maintained entry points:
 
 - `bench_all.py`: unified latency/RTFx regression grid and [benchmark table](../docs/benchmarks.md) source.
 - `bench_leaderboard.py`: real-corpus Open ASR Leaderboard WER/RTFx evaluation.
+- `sonar/run_sonar.py`: SONAR-OSS (`psdn-sonar`) evaluation of models x native
+  backends x GGUFs over SONAR's own datasets. Separate `uv` project (CPU torch,
+  no Starling deps); talks to `starling-serve` over HTTP. See
+  [sonar/README.md](sonar/README.md). This is the candidate replacement for
+  `bench_leaderboard.py`'s quality numbers.
 - `s1/bench_normalize.py`: s1-mini normalization suite: latency/throughput
   per engine, byte-exact parity vs stock, curated quality cases, and the
   16-cell control matrix (styling × structure × context). [Benchmark](../docs/benchmarks.md) `BENCH:S1`
