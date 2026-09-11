@@ -18,15 +18,15 @@ Typical use (from the repo root)::
 
     # run the parakeet quant ladder on the Vulkan backend
     uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-        --preset quants --language en --max-samples 100
+        --preset quants --language en --max-samples 100 --gpu-uuid vulkan:device-serial
 
     # compare CPU vs Vulkan at two quants
     uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-        --preset backends --language en --max-samples 100
+        --preset backends --language en --max-samples 100 --gpu-uuid vulkan:device-serial
 
-The adapter works against any server exposing ``POST /inference``, so a CUDA
-``starling-serve`` build or ``python -m starling.server`` can be added by
-pointing a backend at that binary in :mod:`variants`.
+Use a shared physical-device key in place of ``vulkan:device-serial``.
+The adapter supports any server exposing ``POST /inference``. This orchestrator
+requires native ``starling-serve`` startup logs to verify backend attribution.
 """
 
 from __future__ import annotations
@@ -34,12 +34,15 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import wave
+from contextlib import nullcontext
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -47,10 +50,13 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 REPO_ROOT = HERE.parents[1]
+# The shared lock is lightweight and does not import Starling's inference stack.
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import requests  # noqa: E402
 
 from starling_sonar_adapter import register_starling_model  # noqa: E402
+from starling.parakeet.gpu_lock import spawn_gpu_subprocess, with_gpu_lock  # noqa: E402
 from variants import (  # noqa: E402
     DEFAULT_BINARIES,
     DEFAULT_GGUF_DIR,
@@ -124,14 +130,16 @@ def _warmup(base_url: str, seconds: float = 3.0) -> None:
 
 
 def _disable_audio_quality() -> None:
-    """Replace SONAR's per-clip audio-quality pass with the empty record.
+    """Disable SONAR 0.1.2's per-clip quality pass and background model loads.
 
     SONAR recomputes SNR/UTMOS/SQUIM/DNSMOS for every model in a run, on CPU
     here; across a multi-variant sweep that is hours of work with no bearing on
     WER/RTFx. The per-utterance CSV schema is unchanged (the quality columns
-    stay empty). This is the one place the harness reaches into SONAR internals
-    and it is opt-in via --skip-audio-quality.
+    stay empty). The prewarm function is nested inside run_evaluation, so its
+    three lazy model loaders must also be replaced. These patches are opt-in
+    via --skip-audio-quality; the dependency is pinned to the reviewed version.
     """
+    from psdn_sonar import quality_models
     from psdn_sonar.evaluators import single_speaker
 
     def _empty(item: dict) -> tuple:
@@ -139,9 +147,16 @@ def _disable_audio_quality() -> None:
 
     single_speaker.SingleSpeakerEvaluator._compute_audio_quality = staticmethod(_empty)
 
+    def _no_model():
+        return None
+
+    quality_models._get_dnsmos = _no_model
+    quality_models._get_utmos = _no_model
+    quality_models._get_squim = _no_model
+
 
 def _start_server(
-    variant: StarlingVariant, *, log_path: Path, timeout_s: float
+    variant: StarlingVariant, *, log_path: Path, timeout_s: float, gpu_uuid: str | None = None
 ) -> tuple[subprocess.Popen, str]:
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -162,12 +177,38 @@ def _start_server(
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write("$ " + " ".join(cmd) + "\n")
         log_file.flush()
-        proc = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+        spawn = subprocess.Popen if variant.backend == "cpu" else spawn_gpu_subprocess
+        extra = {} if variant.backend == "cpu" else {"uuid": gpu_uuid}
+        child_env = dict(os.environ)
+        if variant.backend == "cpu":
+            child_env["STARLING_GGML_DEVICE"] = "cpu"
+        proc = spawn(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **extra,
         )
     try:
         _wait_healthy(base_url, proc, timeout_s, log_path)
-    except Exception:
+        # The native server prints this after eager model loading, so it names
+        # the selected runtime device, including any CPU fallback.
+        startup = re.search(
+            r"\[starling-serve\] starting on .*\(model=[^,]+, backend=([^,]+), abi=\d+\)",
+            log_path.read_text(encoding="utf-8", errors="replace"),
+        )
+        actual = startup.group(1).lower() if startup else "unknown"
+        expected = variant.backend.lower()
+        if not (
+            actual == expected
+            or (actual.startswith(expected) and actual[len(expected) :].isdigit())
+        ):
+            raise RuntimeError(
+                f"requested backend {variant.backend!r}, but server reported {actual!r}; "
+                f"check STARLING_GGML_DEVICE and {log_path}"
+            )
+    except BaseException:
         _stop_server(proc)
         raise
     return proc, base_url
@@ -209,6 +250,9 @@ def _ensure_dataset(
     tsv = data_root / language / dataset / "test.tsv"
     if tsv.is_file() and not force:
         print(f"[sonar] reusing dataset TSV {tsv}")
+        print(
+            "[sonar] cached split size is unchanged; use --force-prepare to change its sample cap"
+        )
         return tsv
     print(
         f"[sonar] preparing dataset {dataset}/{language} (max_samples={max_samples}) -> {data_root}"
@@ -343,6 +387,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--quants", nargs="+", help="override preset quant tags (e.g. bf16 q4_0)")
     parser.add_argument("--backends", nargs="+", help="override preset backends (e.g. vulkan cpu)")
+    parser.add_argument(
+        "--gpu-uuid", help="shared physical GPU lock key; required for Vulkan, HIP, and Metal"
+    )
     parser.add_argument("--gguf-dir", type=Path, default=DEFAULT_GGUF_DIR)
     parser.add_argument(
         "--binary",
@@ -388,12 +435,35 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--prepare-only", action="store_true", help="prepare the dataset, then exit"
     )
+    parser.add_argument(
+        "--force-prepare",
+        action="store_true",
+        help="regenerate cached dataset splits with the requested sample cap",
+    )
     parser.add_argument("--dry-run", action="store_true", help="list the variant grid, then exit")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.max_samples < 0:
+        raise SystemExit("--max-samples must be zero (all) or positive")
+
+    tsv = args.tsv
+    if not args.dry_run:
+        if tsv is None:
+            tsv = _ensure_dataset(
+                args.language,
+                args.dataset,
+                args.max_samples,
+                args.data_root,
+                force=args.force_prepare,
+            )
+        if not tsv.is_file():
+            raise SystemExit(f"TSV not found: {tsv}")
+        if args.prepare_only:
+            print(f"[sonar] dataset ready: {tsv}")
+            return 0
 
     binaries = dict(DEFAULT_BINARIES)
     for override in args.binary:
@@ -417,24 +487,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    tsv = args.tsv
-    if tsv is None:
-        tsv = _ensure_dataset(
-            args.language,
-            args.dataset,
-            args.max_samples,
-            args.data_root,
-            force=False,
-        )
-    if not tsv.is_file():
-        raise SystemExit(f"TSV not found: {tsv}")
-    if args.prepare_only:
-        print(f"[sonar] dataset ready: {tsv}")
-        return 0
+    if any(v.backend not in ("cpu", "cuda") for v in variants) and not args.gpu_uuid:
+        if os.environ.get("STARLING_GPU_LOCK_DISABLE") != "1":
+            raise SystemExit("--gpu-uuid must identify the physical GPU used by this sweep")
 
     tag = args.tag or time.strftime("run-%Y%m%d-%H%M%S")
     run_dir = args.results_root / tag
-    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise SystemExit(f"Results already exist: {run_dir}; choose a new --tag") from None
     print(f"[sonar] results -> {run_dir}")
 
     if args.skip_audio_quality:
@@ -448,29 +510,44 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = run_dir / variant.label
         proc: subprocess.Popen | None = None
         try:
-            proc, base_url = _start_server(
-                variant, log_path=log_path, timeout_s=args.server_timeout
+            lock = (
+                nullcontext()
+                if variant.backend == "cpu"
+                else with_gpu_lock(
+                    session="sonar",
+                    model=variant.model_slug,
+                    uuid=args.gpu_uuid,
+                    note=variant.describe,
+                )
             )
-            if not args.no_warmup:
+            with lock:
                 try:
-                    _warmup(base_url)
-                except Exception as exc:  # noqa: BLE001 - warmup is best-effort
-                    print(f"[sonar]   warmup failed (continuing): {exc}")
-            metrics = _evaluate_variant(
-                variant,
-                base_url=base_url,
-                tsv=tsv,
-                language=args.language,
-                max_samples=args.max_samples,
-                out_dir=out_dir,
-            )
+                    proc, base_url = _start_server(
+                        variant,
+                        log_path=log_path,
+                        timeout_s=args.server_timeout,
+                        gpu_uuid=args.gpu_uuid,
+                    )
+                    if not args.no_warmup:
+                        try:
+                            _warmup(base_url)
+                        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+                            print(f"[sonar]   warmup failed (continuing): {exc}")
+                    metrics = _evaluate_variant(
+                        variant,
+                        base_url=base_url,
+                        tsv=tsv,
+                        language=args.language,
+                        max_samples=args.max_samples,
+                        out_dir=out_dir,
+                    )
+                finally:
+                    _stop_server(proc)
             summary = metrics.get(variant.sonar_name, {}).get("summary", {})
             print(f"[sonar]   WER={summary.get('avg_wer')}")
         except Exception as exc:  # noqa: BLE001 - one variant must not kill the sweep
             print(f"[sonar]   FAILED: {exc}")
             failures.append((variant.sonar_name, str(exc)))
-        finally:
-            _stop_server(proc)
 
     rows = _render_leaderboard(run_dir, args.language)
     _write_manifest(run_dir, rows)
@@ -479,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[sonar] {len(failures)} variant(s) failed:")
         for name, reason in failures:
             print(f"  - {name}: {reason}")
-    return 1 if failures and not rows else 0
+    return 1 if failures or not rows else 0
 
 
 if __name__ == "__main__":

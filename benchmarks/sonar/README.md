@@ -15,8 +15,9 @@ SONAR pins Python 3.10–3.12 plus its own torch/transformers, and the native gg
 engines exist precisely to avoid the Python runtime. The harness therefore lives
 in its own `uv` project (`benchmarks/sonar/pyproject.toml`) and talks to Starling
 over HTTP (`POST /inference`), the same contract both `starling-serve` and
-`python -m starling.server` expose. No SONAR code is modified; the adapter
-registers itself into SONAR's model registry at run time.
+`python -m starling.server` expose. The adapter registers itself into SONAR's
+model registry at run time. The optional quality bypass patches the pinned
+SONAR version's quality pass and model loaders.
 
 ## Setup
 
@@ -24,11 +25,18 @@ registers itself into SONAR's model registry at run time.
 # 1. isolated SONAR venv (CPU torch — this box has no NVIDIA GPU)
 uv sync --project benchmarks/sonar
 
-# 2. native serve binaries the presets expect
-#    build-ar-vk  -> Vulkan   |   build-ar-cpu -> CPU
-#    (see docs/native-serving.md; --binary NAME=PATH overrides either)
-ls build-ar-vk/starling-serve build-ar-cpu/starling-serve
+# 2. native serve binaries the presets expect (run from the repository root)
+git submodule update --init --recursive
+cmake -B build-ar-vk -DSTARLING_SERVE=ON -DSTARLING_GGML_VULKAN=ON
+cmake --build build-ar-vk -j --target starling-serve
+cmake -B build-ar-cpu -DSTARLING_SERVE=ON
+cmake --build build-ar-cpu -j --target starling-serve
 ```
+
+See [native serving](../../docs/native-serving.md) for backend prerequisites.
+`--binary NAME=PATH` overrides either binary path. Dataset preparation does not
+require these binaries or GGUF files. Scoring requires the GGUFs listed in
+`variants.py` under `models/`, or in the directory passed to `--gguf-dir`.
 
 ## Prepare the dataset (once)
 
@@ -43,31 +51,49 @@ uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
 # -> benchmarks/sonar/data/en/fleurs/{train,validation,test}.tsv
 ```
 
+Prepared splits retain their original sample cap. To enlarge a cached split,
+add `--force-prepare --max-samples N`; use `N=0` for all samples. `--tsv` uses
+the supplied file without preparing data.
+
 ## Run a sweep
+
+GPU sweeps use Starling's shared lock and pass its descriptor to the server.
+For Vulkan, HIP, or Metal, pass `--gpu-uuid` with a stable physical-device key
+shared by every process using that GPU. Replace `vulkan:device-serial` below
+with that key. It identifies the lock; `STARLING_GGML_DEVICE` selects the
+runtime device. A backend mismatch or CPU fallback fails the variant before
+scoring. CPU variants explicitly select CPU. On Windows, serialize GPU work
+externally and set `STARLING_GPU_LOCK_DISABLE=1`.
 
 ```bash
 # quick plumbing check: parakeet bf16 + q4_0 on Vulkan
 uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-    --preset smoke --language en --max-samples 100
+    --preset smoke --language en --max-samples 100 --gpu-uuid vulkan:device-serial
 
 # the full parakeet quant ladder on Vulkan (accuracy vs. bits)
 uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-    --preset quants --language en --max-samples 100
+    --preset quants --language en --max-samples 100 --gpu-uuid vulkan:device-serial
 
 # same model+quant on CPU vs Vulkan (does the implementation change output?)
 uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-    --preset backends --language en --max-samples 100 --skip-audio-quality
+    --preset backends --language en --max-samples 100 --skip-audio-quality \
+    --gpu-uuid vulkan:device-serial
 
 # custom grid / an alternative build
 uv run --project benchmarks/sonar python benchmarks/sonar/run_sonar.py \
-    --models parakeet moss --quants bf16 q4_0 --backends vulkan \
+    --models parakeet moss --quants bf16 q8_0 --backends vulkan \
     --binary vulkan=build-ar-vk/starling-serve \
-    --tag my-run --skip-audio-quality
+    --tag my-run --skip-audio-quality --gpu-uuid vulkan:device-serial
 ```
 
 `--dry-run` prints the resolved grid without launching anything.
 `--skip-audio-quality` drops SONAR's per-clip SNR/MOS pass (recomputed for every
-variant, hours of CPU here) while keeping WER/CER/POSEIDON and latency intact.
+variant, hours of CPU here) and disables UTMOS/DNSMOS/SQUIM model loading,
+including background prewarming. WER/CER/POSEIDON and latency remain enabled.
+
+Each run needs a new `--tag`; existing result directories are rejected. The
+runner finishes the sweep and writes available results, then exits nonzero
+if any variant failed or no leaderboard rows were produced.
 
 ## Presets
 
@@ -80,7 +106,8 @@ variant, hours of CPU here) while keeping WER/CER/POSEIDON and latency intact.
 
 The ladder and binaries live in [`variants.py`](variants.py); add a model by
 adding a `QUANT_LADDERS` entry, or a backend by adding to `DEFAULT_BINARIES`
-(e.g. a CUDA `starling-serve`, or a `python -m starling.server` wrapper).
+(e.g. a CUDA `starling-serve`). The orchestrator verifies the native server's
+startup log; Python-server use requires a separate lifecycle integration.
 
 ## Output
 

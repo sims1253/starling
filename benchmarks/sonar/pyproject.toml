@@ -6,8 +6,12 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     # Pin the lower bound: 0.1.0 predates the Requires-Python bound and pip/uv
     # can silently fall back to it on an unsupported interpreter.
-    "psdn-sonar[ml]>=0.1.2",
+    "psdn-sonar[ml]==0.1.2",
     "requests>=2.31.0",
+    # Declare these directly so uv applies the CPU index to SONAR's ML stack.
+    "torch",
+    "torchaudio",
+    "torchvision",
 ]
 
 # This is a harness, not a package: uv builds a venv with the deps only and
