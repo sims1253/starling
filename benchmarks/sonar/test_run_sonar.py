@@ -213,11 +213,22 @@ class HarnessTests(unittest.TestCase):
         with ExitStack() as stack:
             # Restore SONAR internals after the opt-in patch is exercised.
             stack.enter_context(patch.object(evaluator, "_compute_audio_quality"))
-            loaders = [
-                stack.enter_context(patch.object(quality_models, name))
-                for name in ("_get_dnsmos", "_get_utmos", "_get_squim")
-            ]
+            names = ("_get_dnsmos", "_get_utmos", "_get_squim")
+            for name in names:
+                stack.enter_context(
+                    patch.object(
+                        quality_models,
+                        name,
+                        side_effect=AssertionError(f"{name} was not disabled"),
+                    )
+                )
             runner._disable_audio_quality()
+            loaders = [
+                stack.enter_context(
+                    patch.object(quality_models, name, wraps=getattr(quality_models, name))
+                )
+                for name in names
+            ]
             path, quality = evaluator._compute_audio_quality({"audio_path": "clip.wav"})
             self.assertEqual(path, "clip.wav")
             self.assertEqual(quality, single_speaker._EMPTY_AUDIO_QUALITY)
@@ -237,7 +248,7 @@ class HarnessTests(unittest.TestCase):
                     language="en",
                 )
             for loader in loaders:
-                loader.assert_not_called()
+                loader.assert_called_once_with()
 
 
 if __name__ == "__main__":
