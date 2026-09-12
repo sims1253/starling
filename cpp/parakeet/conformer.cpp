@@ -89,6 +89,39 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     if (!global_backend().is_gpu()) {
         ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
         ggml_tensor* dww_c = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
+        // ggml-cpu's dw-direct kernel only accepts F16/F32 kernels, and the
+        // [K,1,1,D] reshape below cannot span quant blocks (K is never
+        // block-aligned) — a quantized depthwise aborts in ggml_row_size at
+        // graph build, or reads quant blocks as raw floats under NDEBUG.
+        // Dequantize host-side once per layer into an F32 graph input (cache-
+        // owned, like the GPU branch's transposed-kernel slot).
+        if (ggml_is_quantized(dww_c->type)) {
+            auto& fcache = ml.cache<DwwTransposedCache>();
+            if (!fcache) fcache = std::make_unique<DwwTransposedCache>();
+            const char* ls = pre.c_str() + sizeof("encoder.layers.") - 1;
+            int li = 0;
+            while (*ls >= '0' && *ls <= '9') li = li * 10 + (*ls++ - '0');
+            if (fcache->f32_by_layer.size() <= (size_t)li)
+                fcache->f32_by_layer.resize(li + 1);
+            auto& slot = fcache->f32_by_layer[li];
+            if (slot.empty()) {
+                if (!dww_c->buffer) ensure_weights_realized(ml);
+                dww_c = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+                const ggml_type_traits* tr = ggml_get_type_traits(dww_c->type);
+                GGML_ASSERT(tr && tr->to_float);
+                const size_t n = (size_t)ggml_nelements(dww_c);
+                std::vector<uint8_t> bytes(ggml_nbytes(dww_c));
+                ggml_backend_tensor_get(dww_c, bytes.data(), 0, bytes.size());
+                slot.resize(n);
+                tr->to_float(bytes.data(), slot.data(), (int)n);
+            }
+            int64_t kne[4] = {K, 1, 1, D};
+            dww_c = graph_input_tensor(ctx, GGML_TYPE_F32, 4, kne,
+                                       slot.data(), slot.size() * sizeof(float));
+            mark_graph_input_persistent(dww_c);
+        } else {
+            GGML_ASSERT(dww_c->type == GGML_TYPE_F16 || dww_c->type == GGML_TYPE_F32);
+        }
         dww_c = ggml_reshape_4d(ctx, dww_c, K, 1, 1, D);  // [K,1,1,C]
         ggml_tensor* nb_c = ggml_reshape_4d(ctx, glu_tc,
                                glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]

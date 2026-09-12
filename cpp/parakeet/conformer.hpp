@@ -39,8 +39,11 @@ namespace starling::ggml::parakeet {
 // Cached c-fastest (transposed) depthwise-conv kernels [C fastest per tap],
 // built once per layer from the GGUF's k-fastest [K,1,C] weight. Feeds the
 // channels-first (cwhn) conv path that avoids the in/out transposes.
+// f32_by_layer holds the same weight dequantized to F32 (k-fastest layout)
+// for the CPU path when the GGUF stores it quantized.
 struct DwwTransposedCache {
     std::vector<std::vector<ggml_fp16_t>> by_layer;
+    std::vector<std::vector<float>> f32_by_layer;
 };
 } // namespace starling::ggml::parakeet
 
