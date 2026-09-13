@@ -21,7 +21,8 @@ struct DeviceCache {
     int n_layers = 0, D = 0, KV = 0;
 
     bool init(int n_layers_, int D_, int KV_, int max_cache_, float rope_theta,
-              ggml_backend_t backend, std::string& e);
+              ggml_backend_t backend, std::string& e,
+              ggml_type kv_type = GGML_TYPE_BF16);
     void zero();
     ~DeviceCache() {
         if (shutting_down()) return;  // driver gone -> leak (fine at exit)

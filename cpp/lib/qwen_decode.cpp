@@ -161,6 +161,22 @@ bool use_f32_acts(const QwenDecodeCtx& m) {
     return w && ggml_is_quantized(w->type);
 }
 
+// Fused flash attention for the captured GPU graph paths (kv_mode 0/2).
+// ggml_flash_attn_ext fuses QK^T + causal softmax + PV and streams K/V
+// straight out of the cache without materializing per-head score matrices —
+// on bandwidth-starved integrated GPUs this measured ~1.8x faster than the
+// batched manual chain (RADV RENOIR / Ryzen 5650U, qwen3-asr q5_k_m; the
+// competing handy engine ships flash and loses the same factor when its
+// flash path is disabled). The FA pipelines are f16-compute with f32
+// accumulation, so flash mode forces the F32-activation discipline (its
+// upcasts are exact) and an F16 KV cache; the manual formulations remain
+// the CPU oracle and the <env>_NO_FLASH exactness A/B. Numerics differ from
+// the bf16-oracle manual path by the f16 K/V/q storage rounding — the same
+// rounding every whisper-lineage engine ships.
+bool kv_cache_f16(const QwenDecodeCtx& m) {
+    return global_backend().is_gpu() && !env(m.spec, "_NO_FLASH");
+}
+
 ggml_tensor* linf(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
                   const std::string& n) {
     return ggml_mul_mat(c, clone_weight(c, ml, n.c_str()), f32(c, x));
@@ -559,7 +575,8 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
     auto cache = std::make_unique<DeviceCache>();
-    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e)) {
+    const ggml_type kv_t = kv_cache_f16(m) ? GGML_TYPE_F16 : GGML_TYPE_BF16;
+    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e, kv_t)) {
         return nullptr;
     }
     st.device_cache = std::move(cache);
@@ -592,8 +609,11 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     // same math, no bf16 round-trips. Graph paths only (kv_mode 0/2): the
     // legacy exact-width probe path (mode 1) keeps the exact discipline.
     // In F mode cs/sn are unused (rope_ext reads positions); the F-helpers
-    // upcast internally, so no caller pre-wrapping is needed.
-    const bool F = use_f32_acts(m) && kv_mode != 1;
+    // upcast internally, so no caller pre-wrapping is needed. Flash mode
+    // forces F on (any weight dtype): the FA core needs f32 clean inputs
+    // for its single f32->f16 cast.
+    const bool FLASH = kv_cache_f16(m) && kv_mode != 1;
+    const bool F = (use_f32_acts(m) || FLASH) && kv_mode != 1;
 
     ggml_tensor* n = F ? rmsf(c, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps)
                        : spec_rms(c, m.spec, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps);
@@ -649,7 +669,9 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                           lc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         k = ggml_rope_ext(c, k, rp, nullptr, D, GGML_ROPE_TYPE_NEOX, (int)lc.max_cache,
                           lc.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        q = bf(c, q);
+        // Flash mode keeps q F32 here; the attention core casts it to F16
+        // (its compute dtype) in one shot. The manual core rounds to BF16.
+        if (!FLASH) q = bf(c, q);
     }
     q = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));  // [D, S, H]
     k = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));  // [D, S, KV]
@@ -681,14 +703,19 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         ggml_tensor* vview = ggml_view_3d(c, cache_v, D, S, KV,
                                           cache_v->nb[1], cache_v->nb[2], 0);
         // F: round k/v for the BF16 cache (exact-width views: cheap); the
-        // attention core stays BF16, like the K-step path.
-        kall = ggml_cpy(c, F ? bf(c, k) : k, kview);  // [D, S, KV], slots [0,S)
-        vall = ggml_cpy(c, F ? bf(c, v) : v, vview);
+        // attention core stays BF16, like the K-step path. F16 cache (flash
+        // mode): cpy converts the F32 k/v straight to F16 storage.
+        ggml_tensor* ksrc = (cache_k->type == GGML_TYPE_F16) ? k : (F ? bf(c, k) : k);
+        ggml_tensor* vsrc = (cache_v->type == GGML_TYPE_F16) ? v : (F ? bf(c, v) : v);
+        kall = ggml_cpy(c, ksrc, kview);  // [D, S, KV], slots [0,S)
+        vall = ggml_cpy(c, vsrc, vview);
     } else if (kv_mode == 2) {     // decode full-capacity (captured, dynamic slot)
-        // set_rows writes ff(k) (f32) into the bf16 cache at slot `past`; the
-        // values are bf16-representable so the f32->bf16 round is exact. The
-        // result is a view of the WHOLE cache (slot `past` now updated), which
-        // we use directly as kall -> the set_rows executes before attention.
+        // set_rows writes ff(k) (f32) into the cache at slot `past`; with the
+        // BF16 cache the values are bf16-representable so the round is exact;
+        // the F16 cache (flash mode) rounds to f16 — one of the two numeric
+        // deltas of the flash formulation. The result is a view of the WHOLE
+        // cache (slot `past` now updated), which we use directly as kall ->
+        // the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
         vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
     } else {                       // decode exact-width
@@ -711,15 +738,31 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         vall = past ? bf(c, ggml_concat(c, ff(c, vprev), ff(c, vnew), 1)) : vnew;
     }
 
-    // Attention. Two formulations, switchable for an A/B exactness gate:
-    //   - batched (default): one batched mul_mat over all heads using ggml's
-    //     native GQA broadcast (ne12 % ne02 == 0, r2 = H/KV). Math per head is
-    //     unchanged; produces [hidden, S] via permute+reshape.
+    // Attention. Three formulations:
+    //   - flash (GPU default): one fused ggml_flash_attn_ext per layer; no
+    //     materialized scores, K/V streamed from the F16 cache, GQA broadcast
+    //     native, causal -inf mask via the additive mask. ~1.8x faster than
+    //     the manual chain on iGPUs (see kv_cache_f16).
+    //   - batched (CPU default): one batched mul_mat over all heads using
+    //     ggml's native GQA broadcast (ne12 % ne02 == 0, r2 = H/KV). Math per
+    //     head is unchanged; produces [hidden, S] via permute+reshape.
     //   - per-head (<env>_PERHEAD=1): the H-iteration loop, identical op
     //     sequence to layer_legacy.
     const float scale = attn_scale(m.spec, D);
     ggml_tensor* joined;
-    if (!env(m.spec, "_PERHEAD")) {
+    if (FLASH) {
+        // q arrives [D, S, H] F32 (rope_ext output; see the round skip above)
+        // and stays F32: ggml-vulkan's FA contract is F32 q + F16 K/V + F16
+        // mask (it converts internally, accumulating F32). K/V are the F16
+        // cache tensors already; the F32 mask (0 / -inf, exact in f16) takes
+        // one cast for that contract. ggml_flash_attn_ext returns
+        // [D, H, S, B] F32 already heads-major: a plain reshape yields
+        // [hidden = D*H, S] (linf's f32() below is a no-op).
+        ggml_tensor* mf = ggml_cast(c, mask, GGML_TYPE_F16);           // [K,S]
+        ggml_tensor* o = ggml_flash_attn_ext(c, q, kall, vall, mf,
+                                             scale, 0.0f, 0.0f);       // [D,H,S,1]
+        joined = ggml_reshape_2d(c, o, (int64_t)D * H, S);             // [hidden, S]
+    } else if (!env(m.spec, "_PERHEAD")) {
         // scores = K^T Q / sqrt(D) over all heads (GQA broadcast KV->H).
         // BF16 core, always: F32 attention was measured slower twice (full-
         // width catastrophic via cache traffic; bucket-narrow -5% — the

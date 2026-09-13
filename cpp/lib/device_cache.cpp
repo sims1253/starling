@@ -7,7 +7,8 @@
 namespace starling::ggml::lib {
 
 bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
-                       float rope_theta, ggml_backend_t backend, std::string& e) {
+                       float rope_theta, ggml_backend_t backend, std::string& e,
+                       ggml_type kv_type) {
     n_layers = n_layers_;
     D = D_;
     KV = KV_;
@@ -27,8 +28,8 @@ bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
     k.resize(n_layers);
     v.resize(n_layers);
     for (int i = 0; i < n_layers; ++i) {
-        k[i] = ggml_new_tensor(ctx, GGML_TYPE_BF16, 3, kv_ne);
-        v[i] = ggml_new_tensor(ctx, GGML_TYPE_BF16, 3, kv_ne);
+        k[i] = ggml_new_tensor(ctx, kv_type, 3, kv_ne);
+        v[i] = ggml_new_tensor(ctx, kv_type, 3, kv_ne);
     }
     int64_t rope_ne[2] = {D, max_pos};
     rope_cos = ggml_new_tensor(ctx, GGML_TYPE_BF16, 2, rope_ne);

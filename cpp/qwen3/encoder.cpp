@@ -176,6 +176,31 @@ ggml_tensor* windowed_layer(ggml_context* c, const Qwen3Model& m, int li,
             ggml_reshape_4d(c, z, D, H, s.W, s.nW), 0, 2, 1, 3));
     };
     ggml_tensor* q4 = to_heads(q), * k4 = to_heads(k), * v4 = to_heads(v);
+    // Attention. Two formulations:
+    //   - flash (GPU default, STARLING_QWEN3_ENC_NO_FLASH to disable): one
+    //     fused ggml_flash_attn_ext per layer over (heads = ne2, windows =
+    //     ne3), with the per-window mask [W, W, 1, nW] broadcast across
+    //     heads. F32 q (the vulkan FA contract; the cast from the bf16 core
+    //     is exact), K/V stay bf16 (FA's kv contract accepts bf16 when both
+    //     match). No materialized [W, W, H, nW] score matrix. Output arrives
+    //     [D, H, W, nW] heads-major — reshape straight to [hidden, P].
+    //   - manual (CPU / exactness oracle): the batched score/softmax/PV chain.
+    const bool use_fa = global_backend().is_gpu() &&
+                        !std::getenv("STARLING_QWEN3_ENC_NO_FLASH");
+    ggml_tensor* co;
+    if (use_fa) {
+        ggml_tensor* mf = nullptr;
+        if (!s.wmask.empty()) {
+            int64_t mne[4] = {s.W, s.W, 1, s.nW};
+            ggml_tensor* mask = graph_input_tensor(c, GGML_TYPE_F32, 4, mne,
+                                                   s.wmask.data(),
+                                                   s.wmask.size() * sizeof(float));
+            mf = ggml_cast(c, mask, GGML_TYPE_F16);
+        }
+        ggml_tensor* o = ggml_flash_attn_ext(c, f32(c, q4), k4, v4, mf,
+                                             scale, 0.0f, 0.0f);   // [D,H,W,nW]
+        co = ggml_reshape_2d(c, o, hidden, P);                      // [hidden, P]
+    } else {
     // Scores with KEYS innermost (softmax runs over ne0): [W(k), W(q), H, nW].
     ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k4, q4));
     sc = bf16(c, ggml_scale(c, f32(c, sc), scale));
@@ -193,9 +218,10 @@ ggml_tensor* windowed_layer(ggml_context* c, const Qwen3Model& m, int li,
     // ggml_permute is scatter-style (old dim j lands at position axis_j):
     // a 0<->1 axis swap gives [W, D, H, nW] from [D, W, H, nW].
     ggml_tensor* vt = ggml_cont(c, ggml_permute(c, v4, 1, 0, 2, 3)); // [W, D, H, nW]
-    ggml_tensor* co = bf16(c, ggml_mul_mat(c, vt, pr));              // [D, W, H, nW]
+    co = bf16(c, ggml_mul_mat(c, vt, pr));              // [D, W, H, nW]
     co = ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3));              // [D, H, W, nW]
     co = ggml_reshape_2d(c, co, hidden, P);
+    }
     ggml_tensor* a = lib::linear_bf16(c, ml, co, p + "attn_o", true);
     if (stage_wants(stop->name, "attnm")) { stop->hit = true; return a; }
     x = lib::addb(c, x, a);
