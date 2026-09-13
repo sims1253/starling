@@ -108,7 +108,7 @@ bool GraniteModel::load(const char* path, std::string& err) {
         for (auto v : a) c.prompt_suffix.push_back((int32_t) v);
 
     // --- Validate untrusted GGUF metadata (mirror ark/loader.cpp). ---
-    if (!lib::check_gguf_header(m, "granite", "GRANITE", {"bf16_exact"}, err))
+    if (!lib::check_gguf_header(m, "granite", "GRANITE", {"bf16_exact", "quantized"}, err))
         return false;
 #define POS(v, name) do { if (!(v)) { err = "GRANITE GGUF " name " must be positive"; return false; } } while (0)
     POS(c.encoder.n_layers, "enc.layers");
