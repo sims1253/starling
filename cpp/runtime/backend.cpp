@@ -13,6 +13,7 @@
 
 #include "graph.hpp"
 #include "imatrix.hpp"
+#include "lru_cache.hpp"
 #include "model_loader.hpp"
 
 #include "ggml.h"
@@ -111,6 +112,17 @@ struct BuildScope {
 constexpr size_t kGraphSize = 32768;  // max nodes in one ggml_cgraph (bumped for
                                           // the moss K-step multistep decode graph)
 
+// Device-class fallback for the per-shape replay-graph LRU caches (see
+// runtime/lru_cache.hpp). kDefaultReplayCacheSize assumes discrete-GPU VRAM:
+// on integrated GPUs — and any card whose reported memory is small — the
+// weights and every cached per-shape encoder graph share one window, and a
+// 4 GB-class model plus 16 cached graphs exhausts an 8 GB GTT mid-stream
+// (observed as radv "not enough memory for command submission" -> device
+// lost). Written once per Backend construction from the chosen device's
+// properties; reads are lock-free.
+std::atomic<size_t> g_device_replay_cache_default{kDefaultReplayCacheSize};
+constexpr size_t kSharedWindowTotalBytes = size_t(12) << 30;  // 12 GiB
+
 // The ggml_backend_sched_eval_callback trampoline feeding the ImatrixCollector
 // (see imatrix.hpp). NOTE: returning true does NOT force the node onto the
 // CPU backend — the sched consults the callback only for batching/
@@ -205,6 +217,16 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
         impl_->backend = ggml_backend_dev_init(chosen, nullptr);
+        // Record the replay-cache default for this device class before any
+        // model can construct its per-shape caches.
+        struct ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(chosen, &props);
+        const bool shared_window =
+            props.type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+            (props.memory_total > 0 && props.memory_total < kSharedWindowTotalBytes);
+        g_device_replay_cache_default.store(
+            shared_window ? kSharedMemoryReplayCacheSize : kDefaultReplayCacheSize,
+            std::memory_order_relaxed);
     }
     if (!impl_->backend) {
         // CPU fallback (always available).
@@ -427,6 +449,9 @@ void add_graph_root(ggml_tensor* t) {
 void ensure_weights_realized(const ModelLoader& ml) {
     if (!const_cast<ModelLoader&>(ml).realize_weights(global_backend()))
         throw std::runtime_error(ml.last_error());
+}
+size_t device_replay_cache_default() {
+    return g_device_replay_cache_default.load(std::memory_order_relaxed);
 }
 ggml_tensor* clone_weight_opt(ggml_context* /*ctx*/, const ModelLoader& ml, const char* name) {
     ggml_tensor* t = ml.tensor(name);

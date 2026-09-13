@@ -53,8 +53,13 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // -- pointwise_conv1 (Conv1d d->2d, k=1): 1x1 conv == linear over channels.
     ggml_tensor* pw1w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv1.weight");
     // The GGUF stores conv weights F16 already; a same-dtype cast would emit a
-    // full-tensor CPY node per pass. Cast only when actually needed.
-    if (pw1w->type != GGML_TYPE_F16) pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
+    // full-tensor CPY node per pass. Cast only when actually needed. Quantized
+    // conv weights (q8pw-style recipes) must skip the cast: ggml-cpu's DUP has
+    // no quantized->F16 path (fatal error in ops.cpp), and mul_mat dequantizes
+    // natively. Quantized conv weights arrive pre-flattened [in, out], so the
+    // reshape below is an identity view for them.
+    if (pw1w->type != GGML_TYPE_F16 && !ggml_is_quantized(pw1w->type))
+        pw1w = ggml_cast(ctx, pw1w, GGML_TYPE_F16);
     pw1w = ggml_reshape_2d(ctx, pw1w, D, 2 * D);  // [in=d, out=2d]
     ggml_tensor* pw1b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv1.bias");
     ggml_tensor* y = ggml_mul_mat(ctx, pw1w, c);  // [2d, T]
@@ -84,6 +89,39 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     if (!global_backend().is_gpu()) {
         ggml_tensor* glu_tc = ggml_cont(ctx, ggml_transpose(ctx, glu));  // [T, C]
         ggml_tensor* dww_c = clone_weight_s(ctx, ml, pre + "conv.depthwise_conv.weight");
+        // ggml-cpu's dw-direct kernel only accepts F16/F32 kernels, and the
+        // [K,1,1,D] reshape below cannot span quant blocks (K is never
+        // block-aligned) — a quantized depthwise aborts in ggml_row_size at
+        // graph build, or reads quant blocks as raw floats under NDEBUG.
+        // Dequantize host-side once per layer into an F32 graph input (cache-
+        // owned, like the GPU branch's transposed-kernel slot).
+        if (ggml_is_quantized(dww_c->type)) {
+            auto& fcache = ml.cache<DwwTransposedCache>();
+            if (!fcache) fcache = std::make_unique<DwwTransposedCache>();
+            const char* ls = pre.c_str() + sizeof("encoder.layers.") - 1;
+            int li = 0;
+            while (*ls >= '0' && *ls <= '9') li = li * 10 + (*ls++ - '0');
+            if (fcache->f32_by_layer.size() <= (size_t)li)
+                fcache->f32_by_layer.resize(li + 1);
+            auto& slot = fcache->f32_by_layer[li];
+            if (slot.empty()) {
+                if (!dww_c->buffer) ensure_weights_realized(ml);
+                dww_c = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
+                const ggml_type_traits* tr = ggml_get_type_traits(dww_c->type);
+                GGML_ASSERT(tr && tr->to_float);
+                const size_t n = (size_t)ggml_nelements(dww_c);
+                std::vector<uint8_t> bytes(ggml_nbytes(dww_c));
+                ggml_backend_tensor_get(dww_c, bytes.data(), 0, bytes.size());
+                slot.resize(n);
+                tr->to_float(bytes.data(), slot.data(), (int)n);
+            }
+            int64_t kne[4] = {K, 1, 1, D};
+            dww_c = graph_input_tensor(ctx, GGML_TYPE_F32, 4, kne,
+                                       slot.data(), slot.size() * sizeof(float));
+            mark_graph_input_persistent(dww_c);
+        } else {
+            GGML_ASSERT(dww_c->type == GGML_TYPE_F16 || dww_c->type == GGML_TYPE_F32);
+        }
         dww_c = ggml_reshape_4d(ctx, dww_c, K, 1, 1, D);  // [K,1,1,C]
         ggml_tensor* nb_c = ggml_reshape_4d(ctx, glu_tc,
                                glu_tc->ne[0], 1, glu_tc->ne[1], 1);  // [T,1,C,1]
@@ -120,7 +158,9 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         ggml_tensor* normed_c = ggml_add(ctx, ggml_mul(ctx, dwt_c, sc_t), sh_t);
         normed_c = ggml_silu(ctx, normed_c);
         ggml_tensor* pw2_c = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
-        if (pw2_c->type != GGML_TYPE_F16) pw2_c = ggml_cast(ctx, pw2_c, GGML_TYPE_F16);
+        // See pointwise_conv1 above: never F16-cast quantized conv weights.
+        if (pw2_c->type != GGML_TYPE_F16 && !ggml_is_quantized(pw2_c->type))
+            pw2_c = ggml_cast(ctx, pw2_c, GGML_TYPE_F16);
         pw2_c = ggml_reshape_2d(ctx, pw2_c, D, D);
         ggml_tensor* cout_c = ggml_mul_mat(ctx, pw2_c, normed_c);
         ggml_tensor* pw2b_c = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
@@ -146,13 +186,34 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
         auto& slot = cache->by_layer[li];
         if (slot.empty()) {
             ggml_tensor* src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
-            GGML_ASSERT(src_w && src_w->type == GGML_TYPE_F16);
+            GGML_ASSERT(src_w);
             if (!src_w->buffer) ensure_weights_realized(ml);
             src_w = ml.tensor((pre + "conv.depthwise_conv.weight").c_str());
             const size_t n = (size_t)ggml_nelements(src_w);
-            GGML_ASSERT(src_w->type == GGML_TYPE_F16);
+            // Dtype-agnostic fetch. Native GGUFs store this tensor F16, but
+            // community dialects store it F32 (transcribe.cpp "F16" files) or
+            // quantized (Q8_0/Q4_K_M) — dequantize anything not already F16
+            // through the type traits instead of reading raw bytes.
             std::vector<ggml_fp16_t> raw(n);
-            ggml_backend_tensor_get(src_w, raw.data(), 0, n * sizeof(ggml_fp16_t));
+            if (src_w->type == GGML_TYPE_F16) {
+                ggml_backend_tensor_get(src_w, raw.data(), 0, n * sizeof(ggml_fp16_t));
+            } else {
+                std::vector<float> f32_row(n);
+                if (src_w->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(src_w, f32_row.data(), 0,
+                                            n * sizeof(float));
+                } else {
+                    // Quantized and other exotic dtypes dequantize through
+                    // the type traits (to_float is only set for those).
+                    const ggml_type_traits* tr = ggml_get_type_traits(src_w->type);
+                    GGML_ASSERT(tr && tr->to_float);
+                    std::vector<uint8_t> bytes(ggml_nbytes(src_w));
+                    ggml_backend_tensor_get(src_w, bytes.data(), 0, bytes.size());
+                    tr->to_float(bytes.data(), f32_row.data(), (int)n);
+                }
+                for (size_t i = 0; i < n; i++)
+                    raw[i] = ggml_fp32_to_fp16(f32_row[i]);
+            }
             slot.assign((size_t)K * D, 0);
             // (k, c): src at c*K + k  ->  dst at k*D + c
             for (int c = 0; c < D; ++c)
@@ -250,7 +311,9 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // -- SiLU (Swish), then pointwise_conv2 (Conv1d d->d, k=1).
     normed = ggml_silu(ctx, normed);
     ggml_tensor* pw2w = clone_weight_s(ctx, ml, pre + "conv.pointwise_conv2.weight");
-    if (pw2w->type != GGML_TYPE_F16) pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
+    // See pointwise_conv1 above: never F16-cast quantized conv weights.
+    if (pw2w->type != GGML_TYPE_F16 && !ggml_is_quantized(pw2w->type))
+        pw2w = ggml_cast(ctx, pw2w, GGML_TYPE_F16);
     pw2w = ggml_reshape_2d(ctx, pw2w, D, D);  // [in=d, out=d]
     ggml_tensor* pw2b = clone_weight_opt_s(ctx, ml, pre + "conv.pointwise_conv2.bias");
     ggml_tensor* cout = ggml_mul_mat(ctx, pw2w, normed);  // [d, T]

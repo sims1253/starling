@@ -15,6 +15,14 @@ namespace starling::ggml {
 // Maximum retained shapes per model cache; configurable below.
 constexpr size_t kDefaultReplayCacheSize = 16;
 
+// Reduced cap for devices whose single memory window has to hold the weights
+// AND every cached per-shape replay graph (integrated GPUs, small-VRAM cards).
+constexpr size_t kSharedMemoryReplayCacheSize = 2;
+
+// Device-aware fallback for replay_cache_size() when STARLING_REPLAY_CACHE_SIZE
+// is unset; defined in backend.cpp from the active device's properties.
+size_t device_replay_cache_default();
+
 // Process-global cache capacity, read from STARLING_REPLAY_CACHE_SIZE (>=1) on
 // each cache's first construction. Reading at first use (rather than once at
 // process start) lets a test or harness set the env before loading a model.
@@ -23,7 +31,7 @@ inline size_t replay_cache_size() {
         long v = std::atol(env);
         if (v >= 1) return (size_t)v;
     }
-    return kDefaultReplayCacheSize;
+    return device_replay_cache_default();
 }
 
 // A bounded LRU map. `Value` is typically an entry struct holding a
