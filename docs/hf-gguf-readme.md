@@ -75,7 +75,8 @@ unsupported values:
 | MOSS | `bf16_exact`, `f16`, `quantized` |
 | ARK, Higgs | `bf16_exact`, `f16` |
 | Hojo | `mixed_f32_bf16_exact`, `bf16_exact`, `f16` |
-| Granite, Qwen3, S1 | `bf16_exact` |
+| Granite, Qwen3 | `bf16_exact`, `quantized` |
+| S1 | `bf16_exact` |
 | Audex | `bf16_exact`, `quantized` |
 
 For these loaders, `starling.format_version` must be `1` when present.
