@@ -343,17 +343,14 @@ struct ShapeKey {
 struct ShapeKeyHash {
     size_t operator()(const ShapeKey& k) const noexcept { return (size_t) k.T_enc; }
 };
-std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>> g_encoder_cache;
-std::once_flag g_encoder_cache_once;
-void register_encoder_cache_clearer_once() {
-    std::call_once(g_encoder_cache_once, [] {
-        register_decode_cache_clearer([] { g_encoder_cache.reset(); });
-    });
-}
+// Bounded LRU (runtime/lru_cache.hpp), held per loader so the cached
+// ReplayGraphs are freed with the model while the backend is alive.
+using EncoderCache = LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>;
 } // namespace
 
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;
+size_t encoder_replay_cache_size(const VoxtralModel& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;
 }
 
 bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
@@ -497,13 +494,12 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
     // conv1 runs -- so each replay is two steps: (1) run the small captured
     // conv1 graph, (2) stage conv2's padded input on the host, (3) replay the
     // captured layers+projector graph. The cached entry owns both graphs.
-    register_encoder_cache_clearer_once();
-    if (!g_encoder_cache)
-        g_encoder_cache = std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>>(
-            new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(replay_cache_size()));
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache)
+        encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
     ShapeKey key{T_enc};
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.T_enc = T_enc;
             entry.mel_pad_buf = reinterpret_cast<float*>(entry.pool.alloc_bytes(

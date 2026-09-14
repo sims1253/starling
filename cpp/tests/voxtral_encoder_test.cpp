@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
         check(c.size_match && c.finite && c.max_abs <= kTol,
               "replay vs host projected rows", detail);
         std::printf("    max_abs=%.6g (tol %.3g)\n", c.max_abs, kTol);
-        check(encoder_replay_cache_size() == 1, "one ReplayGraph cached per T_enc");
+        check(encoder_replay_cache_size(model) == 1, "one ReplayGraph cached per T_enc");
     }
     ::unsetenv("STARLING_VOXTRAL_FORCE_REPLAY");
 

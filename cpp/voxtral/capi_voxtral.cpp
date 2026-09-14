@@ -66,7 +66,6 @@ void* starling_ggml_voxtral_load(const char* gguf_path, const char** err_out) {
             report_load_error(err_out, ctx->model->loader.last_error());
             return nullptr;
         }
-        starling::ggml::register_decode_cache_clearer([]() {});
         if (err_out) *err_out = nullptr;
         return ctx.release();
     } catch (const std::exception& e) {

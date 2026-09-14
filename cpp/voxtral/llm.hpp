@@ -51,6 +51,6 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
 
 // Current number of cached per-S prefill graphs (diagnostic). Zero on CPU /
 // before first GPU prefill.
-size_t prefill_replay_cache_size();
+size_t prefill_replay_cache_size(const VoxtralModel& model);
 
 } // namespace starling::ggml::voxtral

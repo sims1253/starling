@@ -74,6 +74,6 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
 
 // Current number of cached encoder ReplayGraphs (diagnostic). Zero on CPU /
 // before first replay-path encode.
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const VoxtralModel& model);
 
 } // namespace starling::ggml::voxtral

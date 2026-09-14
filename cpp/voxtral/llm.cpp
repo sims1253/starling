@@ -39,6 +39,8 @@ const lib::QwenDecodeSpec kSpec = {
     /*argmax_low_ties=*/true,
     /*mlp_activation=*/lib::QwenMlpAct::kSiluGated,
     /*rms_norm_single_round=*/false,
+    /*f32_acts=*/false,
+    /*kstep_bucket=*/false,
     /*banned_ids=*/nullptr,
     /*n_banned=*/0,
     /*ada_rms_norm=*/true,
@@ -145,8 +147,8 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
     return true;
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const VoxtralModel& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::voxtral
