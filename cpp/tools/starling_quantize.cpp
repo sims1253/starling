@@ -426,7 +426,9 @@ int main(int argc, char** argv) {
                     // before any release claim).
                     const bool tied_head = (moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight";
                     if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32 &&
-                        !(tied_head && rule.second == GGML_TYPE_Q4_0)) {
+                        !(tied_head && (rule.second == GGML_TYPE_Q4_0 ||
+                                        rule.second == GGML_TYPE_Q5_K ||
+                                        rule.second == GGML_TYPE_Q6_K))) {
                         std::fprintf(stderr,
                                      "error: embedding recipe supports only q8_0 or f32%s\n",
                                      tied_head ? " (tied head: also q4_0)" : "");
