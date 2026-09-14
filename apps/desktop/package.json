@@ -1,0 +1,71 @@
+{
+  "name": "@starling/desktop",
+  "version": "0.1.0",
+  "description": "Faithful local-first voice transcription for desktop",
+  "author": "Starling contributors",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.mjs",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc -b && tsc -p tsconfig.electron.json",
+    "build": "npm run typecheck && vite build && node --experimental-strip-types electron/build.ts",
+    "preview": "vite preview",
+    "native": "npm run build && electron dist-electron/main.mjs",
+    "native:dev": "npm run build:electron && node --experimental-strip-types electron/dev.ts",
+    "desktop": "npm run native:dev",
+    "package": "npm run build && electron-builder",
+    "build:electron": "tsc -p tsconfig.electron.json && node --experimental-strip-types electron/build.ts"
+  },
+  "devDependencies": {
+    "@starling/dictation": "*",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.3.0",
+    "electron-builder": "^26.0.12",
+    "lucide-react": "^0.544.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.0",
+    "effect": "4.0.0-rc.115",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.13",
+    "@types/node": "22.20.2"
+  },
+  "build": {
+    "appId": "dev.starling.dictation",
+    "productName": "Starling",
+    "executableName": "starling",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json",
+      "assets/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Starling records audio when you press Record so your selected transcription server can turn it into text."
+      }
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "assets/icon.png"
+    }
+  }
+}

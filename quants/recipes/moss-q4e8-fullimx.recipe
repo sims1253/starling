@@ -1,0 +1,13 @@
+# starling-quantize recipe: Q4_0 linears + Q8_0 tied embed/lm_head, full imatrix.
+# The 622 MB BF16 embed table is ALSO the lm_head: every decode step runs a
+# 151936x2048 GEMV over it (~half the step's traffic on UMA iGPUs), so Q8
+# halves that traffic and saves ~290 MB. Q8 heads are standard practice;
+# CER-gated per run, leaderboard WER before release.
+#
+#   build-cpu/starling-quantize \
+#       --input models/moss-transcribe-preview-2b-bf16-exact.gguf \
+#       --output models/moss-transcribe-preview-2b-q4e8-fullimx.gguf \
+#       --recipe quants/recipes/moss-q4e8-fullimx.recipe \
+#       --imatrix models/moss-full.imx --f32-1d
+default q4_0
+^llm\.embed\.weight$ q8_0

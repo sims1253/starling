@@ -1,4 +1,7 @@
-# Python serving
+# Python serving (deprecated)
+
+**Deprecated:** new serving and app development uses the [native backend](native-serving.md).
+This path remains for research and existing integrations.
 
 Run one speech recognition model as a local HTTP and WebSocket service.
 For CPU, AMD GPUs, or Apple Silicon, use [native serving](native-serving.md).

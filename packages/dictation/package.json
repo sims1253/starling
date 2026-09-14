@@ -1,0 +1,26 @@
+{
+  "name": "@starling/dictation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./audio": "./src/audio.ts",
+    "./client": "./src/client.ts",
+    "./fidelity": "./src/fidelity.ts",
+    "./storage": "./src/storage.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.2",
+    "fake-indexeddb": "^6.2.2",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "effect": "4.0.0-rc.115"
+  }
+}

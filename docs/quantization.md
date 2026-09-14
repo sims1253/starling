@@ -178,9 +178,9 @@ kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 
 Two opt-in recipes retain the IQ2_XXS encoder and its importance matrix:
 
-- `benchmarks/recipes/parakeet-iq2-embedding-q8.recipe` stores the prediction
+- `quants/recipes/parakeet-iq2-embedding-q8.recipe` stores the prediction
   embedding as Q8_0 and preserves every other tensor's existing policy.
-- `benchmarks/recipes/parakeet-iq2-compact.recipe` also stores six 640-wide
+- `quants/recipes/parakeet-iq2-compact.recipe` also stores six 640-wide
   joint/LSTM matrices as IQ4_NL (32-element blocks, 4.5 bits per weight).
   This option remains **experimental**: it increased observed word errors
   in the controlled study below.
@@ -188,7 +188,7 @@ Two opt-in recipes retain the IQ2_XXS encoder and its importance matrix:
 A third opt-in recipe targets the speed/memory sweet spot rather than
 minimum size:
 
-- `benchmarks/recipes/parakeet-q4-fullimx.recipe` is uniform Q4_0 with the
+- `quants/recipes/parakeet-q4-fullimx.recipe` is uniform Q4_0 with the
   full-corpus importance matrix (fixtures x2 + 32 real utterances, ~26k
   observations). On the Vulkan iGPU this beat Q8_0 on every axis — medium
   fixture 770.7 -> 603.5 ms, peak RSS 972 -> 710 MB — with real-corpus WER
@@ -206,7 +206,7 @@ cmake --build build-cpu --target starling-quantize starling_ggml -j
 build-cpu/starling-quantize \
   --input models/parakeet-tdt-0.6b-v3-f32.gguf \
   --output models/parakeet-iq2-compact.gguf \
-  --recipe benchmarks/recipes/parakeet-iq2-compact.recipe \
+  --recipe quants/recipes/parakeet-iq2-compact.recipe \
   --imatrix models/parakeet-imx-prod-25x48.bin --shrink-f16
 ```
 
@@ -638,7 +638,7 @@ was a local session artifact and is not included in this repository. These
 collection counts record that experiment; the committed recipes require the
 resulting imatrix file or a new collection pass over the same Q8_0 model.
 
-Recipes (`benchmarks/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
+Recipes (`quants/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
 
 | recipe | linears | embed (tied head) | size | note |
 |--------|---------|-------------------|------|------|
