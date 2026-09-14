@@ -41,7 +41,7 @@ the root `vite.config.ts`.
 application and shared TypeScript source.
 
 Keep `@oxlint/plugins` at the Oxlint version that Vite+ bundles (`vp --version`
-lists it; currently 1.81.0). The complete generic
+lists it; currently 1.82.0). The complete generic
 and Effect [anti-slop rules](https://github.com/dmmulroy/anti-slop) are vendored in
 `tools/oxlint/anti-slop`. That directory includes the upstream revision and
 licenses. Oxlint executes the rules; ESLint is not the lint runner. Review the
