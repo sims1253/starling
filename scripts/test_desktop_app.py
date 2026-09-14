@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real desktop web UI and HTTP adapter with a test engine.
 
-Run from the checkout after npm ci and building starling-serve-contract-fixture:
+Run from the checkout after pnpm install and building starling-serve-contract-fixture:
   uv run --no-project --with playwright python scripts/test_desktop_app.py
 Install Chromium with the same uv environment's `python -m playwright install chromium`.
 """
@@ -75,9 +75,9 @@ def main():
     binary = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
     if not binary.is_file():
         raise RuntimeError("Build starling-serve-contract-fixture before running the app tests")
-    npm = shutil.which("npm")
-    if npm is None:
-        raise RuntimeError("npm is required")
+    pnpm = shutil.which("pnpm")
+    if pnpm is None:
+        raise RuntimeError("pnpm is required")
     backend_port, frontend_port = free_port(), free_port()
     with ExitStack() as stack:
         log_directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="starling-app-test-"))
@@ -87,7 +87,7 @@ def main():
         stack.callback(stop, server)
         wait_ready(f"http://127.0.0.1:{backend_port}/health", server)
         environment = {**os.environ, "STARLING_API_TARGET": f"http://127.0.0.1:{backend_port}"}
-        frontend = subprocess.Popen([npm, "run", "dev", "--workspace", "@starling/desktop", "--", "--host", "127.0.0.1", "--port", str(frontend_port)], cwd=ROOT, start_new_session=os.name != "nt", env=environment, stdout=frontend_log, stderr=subprocess.STDOUT)
+        frontend = subprocess.Popen([pnpm, "--filter", "@starling/desktop", "dev", "--host", "127.0.0.1", "--port", str(frontend_port)], cwd=ROOT, start_new_session=os.name != "nt", env=environment, stdout=frontend_log, stderr=subprocess.STDOUT)
         stack.callback(stop, frontend)
         try:
             wait_ready(f"http://127.0.0.1:{frontend_port}", frontend)

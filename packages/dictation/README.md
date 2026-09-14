@@ -33,8 +33,7 @@ const session = await sessions.create({ wav: wav.blob, durationMs: wav.durationM
 
 await sessions.markAttempt(session.id);
 try {
-  const result = await new StarlingClient({ baseUrl: "http://127.0.0.1:8181" })
-    .transcribe(wav);
+  const result = await new StarlingClient({ baseUrl: "http://127.0.0.1:8181" }).transcribe(wav);
   await sessions.saveTranscript(session.id, result);
   const review = analyzeTranscript(result.text, { expectedTerms: ["auth"] });
   console.log(review.rawText, review.warnings);

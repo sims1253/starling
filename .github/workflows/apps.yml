@@ -25,14 +25,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run check
+          node-version: 24
+          cache: true
+          run-install: true
+      - run: vp run check
       - name: Package Electron desktop app
-        run: npm run package --workspace @starling/desktop -- --dir
+        run: vp run --filter @starling/desktop package --dir
 
   browser-and-api:
     runs-on: ubuntu-24.04
@@ -41,12 +41,12 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
         with:
-          node-version: 22
-          cache: npm
+          node-version: 24
+          cache: true
+          run-install: true
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
-      - run: npm ci
       - name: Build real HTTP handlers with a deterministic test engine
         run: |
           cmake --preset native-cpu
@@ -59,15 +59,15 @@ jobs:
       - name: Install browser
         run: uv run --no-project --with playwright python -m playwright install --with-deps chromium
       - name: Recording, recovery, and transcript UI
-        run: npm run test:apps
+        run: vp run test:apps
       - name: Electron preload and OpenAI upload
         env:
           # Hosted Linux restricts Chromium user namespaces. This flag belongs
           # to the test launcher; application defaults retain sandboxing.
           STARLING_TEST_NO_SANDBOX: "1"
         run: |
-          npm run build
-          xvfb-run -a npm run test:electron
+          vp run build
+          xvfb-run -a vp run test:electron
 
   android:
     runs-on: ubuntu-24.04

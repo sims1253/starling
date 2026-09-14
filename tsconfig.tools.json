@@ -11,6 +11,6 @@
     ]
   },
   "include": [
-    "oxlint.config.ts"
+    "vite.config.ts"
   ]
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Launch the built Electron renderer, exercise its IPC, and measure the shell.
 
-Linux without a display: xvfb-run -a npm run test:electron
-Requires npm ci, npm run build, the native contract fixture, and Playwright.
+Linux without a display: xvfb-run -a pnpm run test:electron
+Requires pnpm install, pnpm run build, the native contract fixture, and Playwright.
 Set STARLING_ELECTRON_EXECUTABLE to smoke-test an unpacked application binary.
 """
 from contextlib import ExitStack
@@ -83,7 +83,7 @@ def main():
     if packaged:
         executable = Path(packaged).resolve()
     else:
-        # Resolve from the workspace that declares Electron; npm may hoist it
+        # Resolve from the workspace that declares Electron; the package manager may hoist it
         # or install it under apps/desktop/node_modules.
         executable = Path(subprocess.check_output(
             ["node", "-e", "console.log = console.error; process.stdout.write(require('electron'))"],

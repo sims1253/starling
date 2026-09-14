@@ -7,8 +7,8 @@ The desktop client records mono microphone audio, converts it to PCM16 16 kHz WA
 Start `starling-serve` on `127.0.0.1:8181`, then from the repository root run:
 
 ```bash
-npm ci
-npm run dev --workspace @starling/desktop
+pnpm install
+pnpm run dev
 ```
 
 Vite proxies `/api` to `http://127.0.0.1:8181`. Set `STARLING_API_TARGET` before the dev command to change the proxy destination.
@@ -18,7 +18,7 @@ Vite proxies `/api` to `http://127.0.0.1:8181`. Set `STARLING_API_TARGET` before
 Install the workspace dependencies, then run the Electron shell with live renderer reload:
 
 ```bash
-npm run desktop --workspace @starling/desktop
+pnpm run desktop
 ```
 
 - macOS asks for microphone access using the packaged `NSMicrophoneUsageDescription`.
@@ -27,7 +27,7 @@ npm run desktop --workspace @starling/desktop
 
 The native app sends requests through its sandboxed Electron preload bridge, so a local server does not need browser CORS headers. `Cmd+Shift+Space` on macOS or `Ctrl+Shift+Space` on Windows/Linux focuses Starling and toggles recording. It does not inject text into another app; copying and export are explicit actions.
 
-Create an unpacked application directory with `npm run package --workspace @starling/desktop -- --dir`, or build the platform installer with `npm run package --workspace @starling/desktop`. Packaging targets macOS, Windows, AppImage, and Debian packages. Each installer is built on its native host.
+Create an unpacked application directory with `pnpm --filter @starling/desktop package --dir`, or build the platform installer with `pnpm --filter @starling/desktop package`. Packaging targets macOS, Windows, AppImage, and Debian packages. Each installer is built on its native host.
 
 Audio is held in memory while the microphone is live and becomes durable when recording stops, before the upload starts. A process or device crash during an active recording cannot be recovered in this foundation.
 

@@ -3,13 +3,16 @@ import { createRequire } from "node:module";
 
 const url = "http://127.0.0.1:1420";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-
 const executable: string = createRequire(import.meta.url)("electron");
 
 const detached = process.platform !== "win32";
 
-const vite = spawn(npm, ["run", "dev"], { stdio: "inherit", detached });
+// pnpm puts node_modules/.bin on PATH; Windows needs a shell to launch the .cmd shim.
+const vite = spawn("vp", ["dev"], {
+  stdio: "inherit",
+  detached,
+  shell: process.platform === "win32",
+});
 
 let electron: ChildProcess | undefined;
 
@@ -36,6 +39,13 @@ process.on("uncaughtException", (error) => {
 
 process.on("unhandledRejection", (error) => {
   throw error;
+});
+
+vite.on("exit", (code) => {
+  if (electron) return;
+
+  console.error(`Vite exited with code ${code ?? 1} before the renderer was ready.`);
+  process.exit(code || 1);
 });
 
 for (let attempt = 0; attempt < 100; attempt += 1) {
