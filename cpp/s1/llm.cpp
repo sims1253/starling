@@ -56,8 +56,8 @@ bool greedy_generate(const S1Model& m, const lib::InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const S1Model& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::s1

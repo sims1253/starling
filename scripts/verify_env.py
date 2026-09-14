@@ -1,7 +1,7 @@
 """Environment verification for the starling bootstrap.
 
 Checks: python version, torch + cuda + arch + device, FP8 capabilities, and that
-transformers (from git source) can load the nvidia/parakeet-tdt-0.6b-v3 config
+transformers can load the nvidia/parakeet-tdt-0.6b-v3 config
 (i.e. the `parakeet_tdt` model type is registered). Prints every dim that drives
 kernel sizing in later phases.
 
@@ -37,18 +37,12 @@ def check_torch() -> None:
         raise RuntimeError("torch.cuda.is_available() is False -- no CUDA device visible")
     dev_name = torch.cuda.get_device_name(0)
     print(f"device name     : {dev_name}")
-    if "5090" not in dev_name:
-        print(f"WARNING: expected RTX 5090, got {dev_name!r}")
-    else:
-        print("OK: RTX 5090 detected")
 
     _section("FP8 CAPABILITIES")
     has_scaled_mm = hasattr(torch, "_scaled_mm")
     has_fp8_dtype = hasattr(torch, "float8_e4m3fn")
     print(f"has torch._scaled_mm       : {has_scaled_mm}")
     print(f"has torch.float8_e4m3fn    : {has_fp8_dtype}")
-    if not (has_scaled_mm and has_fp8_dtype):
-        raise RuntimeError("FP8 capabilities missing -- later-phase FP8 work will break")
 
 
 def check_transformers() -> None:
@@ -61,7 +55,7 @@ def check_transformers() -> None:
 
     model_id = "nvidia/parakeet-tdt-0.6b-v3"
     print(f"loading config for: {model_id}")
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id)
     print(f"config class      : {type(config).__name__}")
     print(f"model_type        : {getattr(config, 'model_type', '<missing>')}")
 

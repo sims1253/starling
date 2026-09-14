@@ -24,8 +24,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .audio import extract_mel, read_wav, spectrogram_lengths
-from .config import AUTOMIX_DTYPE, MAX_NEW_TOKENS
+from .audio import extract_mel, spectrogram_lengths
+from .config import AUTOMIX_DTYPE
 from .encoder_mega import FusedEncoder
 from .llm_mega import BeamDecodeConfig, GenerateResult, LLMMega
 

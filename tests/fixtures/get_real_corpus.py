@@ -82,6 +82,41 @@ def _cache_paths() -> List[Path]:
     return sorted(CACHE_DIR.glob("utterance_*.wav"))
 
 
+def _wav_index(path: Path) -> int:
+    return int(path.stem.split("_")[-1])
+
+
+def _load_reference_map() -> dict:
+    """Read ``reference.json`` as ``{index: text}``; ``{}`` when absent/invalid."""
+    import json
+
+    if not REF_TEXT_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(REF_TEXT_PATH.read_text())
+        return {int(k): str(v) for k, v in raw.items()}
+    except (json.JSONDecodeError, OSError, AttributeError, TypeError, ValueError):
+        return {}
+
+
+def _cache_is_consistent(cached: List[Path], ref: dict, n: int) -> bool:
+    """True when the cached wavs and ``reference.json`` describe the same clips.
+
+    Every served clip needs a non-empty reference AND the wav indices must match
+    the reference keys *exactly* -- not merely "at least n of each". A cache left
+    by a larger earlier call (utterance_000..031) beside a smaller
+    reference.json (0..7) lines up numerically but not semantically, because
+    ``_pick_varied`` selected different dataset items for the two sizes; serving
+    it pairs real audio with the wrong transcript and silently poisons WER.
+    """
+    if n <= 0 or len(cached) < n or len(ref) < n:
+        return False
+    cached_idx = {_wav_index(p) for p in cached}
+    if cached_idx != set(ref):
+        return False
+    return all(str(ref[i]).strip() for i in cached_idx)
+
+
 def load_real_corpus(n: int = 8) -> List[Tuple[np.ndarray, int, str]]:
     """Return ``n`` real varied LibriSpeech utterances as ``(audio, sr, text)``.
 
@@ -98,36 +133,30 @@ def load_real_corpus(n: int = 8) -> List[Tuple[np.ndarray, int, str]]:
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cached = _cache_paths()
-    ref = {}
-    if REF_TEXT_PATH.exists():
-        import json
-        try:
-            ref = {int(k): v for k, v in json.loads(REF_TEXT_PATH.read_text()).items()}
-        except (json.JSONDecodeError, OSError):
-            ref = {}
+    ref = _load_reference_map()
 
-    if len(cached) >= n and len(ref) >= n:
+    if _cache_is_consistent(cached, ref, n):
         # serve from cache
         out = []
         for p in cached[:n]:
-            idx = int(p.stem.split("_")[-1])
+            idx = _wav_index(p)
             a, sr = sf.read(str(p))
             if a.ndim != 1:
                 a = a[:, 0]
             a = np.ascontiguousarray(a, dtype=np.float32)
-            out.append((a, int(sr), ref.get(idx, "")))
+            out.append((a, int(sr), ref[idx]))
         # sort by duration for stable, readable reporting
         out.sort(key=lambda t: len(t[0]) / float(t[1]))
         return out
 
     # ---- download ----
+    import json
     from datasets import load_dataset
 
     ds = load_dataset(DATASET_ID, DATASET_CONFIG, split=DATASET_SPLIT)
     items = list(ds)
     picks = _pick_varied(items, n)
 
-    import json
     ref_out = {}
     out: List[Tuple[np.ndarray, int, str]] = []
     for new_idx, ds_idx in enumerate(picks):
@@ -142,6 +171,11 @@ def load_real_corpus(n: int = 8) -> List[Tuple[np.ndarray, int, str]]:
         ref_out[new_idx] = text
         out.append((arr, sr, text))
 
+    # Drop wavs from an earlier, differently-sized cache so the wav set and
+    # reference.json can never disagree (the mismatch the guard above rejects).
+    for stale in _cache_paths():
+        if _wav_index(stale) not in ref_out:
+            stale.unlink()
     REF_TEXT_PATH.write_text(json.dumps(ref_out, indent=2))
     out.sort(key=lambda t: len(t[0]) / float(t[1]))
     return out

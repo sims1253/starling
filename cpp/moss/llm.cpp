@@ -26,6 +26,17 @@ const lib::QwenDecodeSpec kSpec = {
     /*env=*/"STARLING_MOSS",
     /*label=*/"MOSS",
     /*stage_prefix=*/"moss_stage_",
+    /*qk_norm=*/true,
+    /*tied_lm_head=*/true,
+    /*attention_scale=*/0.0f,
+    /*embedding_multiplier=*/1.0f,
+    /*residual_multiplier=*/1.0f,
+    /*logits_scaling=*/1.0f,
+    /*argmax_low_ties=*/false,
+    /*mlp_activation=*/lib::QwenMlpAct::kSiluGated,
+    /*rms_norm_single_round=*/false,
+    /*f32_acts=*/true,
+    /*kstep_bucket=*/true,
 };
 
 lib::QwenDecodeCtx decode_ctx(const MossModel& m) {
@@ -49,8 +60,8 @@ bool greedy_generate(const MossModel& m, const InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const MossModel& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::moss

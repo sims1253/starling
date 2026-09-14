@@ -21,12 +21,14 @@
 // input audio is '<transcript>'." and re.search(r"'(.+)'", DOTALL) is greedy
 // to the last quote); without quotes the stripped raw text is the result.
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
 #include "prompt.hpp"
 #include "llm.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -41,22 +43,8 @@
 
 namespace {
 
-thread_local std::string g_load_error;
-
-struct AudexCtx {
-    std::unique_ptr<starling::ggml::audex::AudexModel> model;
-    starling::ggml::audex::Tokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char** out, const std::string& message) {
-    if (out) *out = message.c_str();
-}
-
-void report_load_error(const char** out, const std::string& message) {
-    g_load_error = message;
-    if (out) *out = g_load_error.c_str();
-}
+using AudexCtx = starling::ggml::lib::EngineContext<starling::ggml::audex::AudexModel, starling::ggml::audex::Tokenizer>;
+using starling::ggml::lib::report;
 
 constexpr double kSampleRate = 16000.0;
 
@@ -162,33 +150,7 @@ std::string join_texts(const std::vector<std::string>& texts) {
 extern "C" {
 
 void* starling_ggml_audex_load(const char* gguf_path, const char** err_out) {
-    try {
-        if (!gguf_path || !*gguf_path) {
-            if (err_out) *err_out = "null or empty AUDEX GGUF path";
-            return nullptr;
-        }
-        auto ctx = std::make_unique<AudexCtx>();
-        ctx->model = std::make_unique<starling::ggml::audex::AudexModel>();
-        if (!ctx->model->load(gguf_path, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        if (!ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err)) {
-            report_load_error(err_out, ctx->err);
-            return nullptr;
-        }
-        // Persist weights + force backend creation (and its orderly atexit
-        // shutdown registration) across all transcription calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        starling::ggml::register_decode_cache_clearer([]() {});
-        if (err_out) *err_out = nullptr;
-        return ctx.release();
-    } catch (const std::exception& e) {
-        report_load_error(err_out, e.what());
-    } catch (...) {
-        report_load_error(err_out, "unknown exception loading AUDEX model");
-    }
-    return nullptr;
+    return starling::ggml::lib::load_engine<AudexCtx>(gguf_path, "AUDEX", err_out);
 }
 
 void starling_ggml_audex_free(void* handle) {

@@ -78,3 +78,26 @@ artifacts/
 
 dbg/
 .hf-cache
+
+# Application workspaces
+node_modules/
+dist/
+target/
+.gradle/
+local.properties
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Apple build products and user state
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+apps/ios/*.xcodeproj/
+
+# Packaged desktop artifacts
+/apps/desktop/release/
+
+# Compiled TypeScript Electron shell
+dist-electron/

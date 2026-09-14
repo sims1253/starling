@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="starling_ink">#24251E</color>
+    <color name="starling_muted">#646657</color>
+    <color name="starling_accent">#526526</color>
+    <color name="starling_surface">#E8E4D9</color>
+    <color name="starling_card">#F5F1E7</color>
+    <color name="starling_line">#D2CEC1</color>
+</resources>

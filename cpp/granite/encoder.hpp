@@ -26,6 +26,6 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const GraniteModel& model);
 
 } // namespace starling::ggml::granite

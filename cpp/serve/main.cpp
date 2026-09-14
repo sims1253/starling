@@ -53,13 +53,13 @@ static void usage(const char* prog) {
         "Usage: %s --model <slug> --gguf <path> [options]\n"
         "\n"
         "Required:\n"
-        "  --model <slug>     Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, audex, voxtral\n"
+        "  --model <slug>     Model slug: %s\n"
         "  --gguf <path>      Path to the GGUF model file\n"
         "\n"
         "Serving:\n"
         "  --host <addr>      Bind address (default 127.0.0.1)\n"
         "  --port <n>         Bind port (default 8181)\n"
-        "  --warmup           Warm up CUDA graphs on startup\n"
+        "  --warmup           Warm up the model on startup\n"
         "  --no-eager-load    Defer model load to first request\n"
         "  --idle-timeout <s> Shut down after N seconds idle (0 = never, default 0)\n"
         "  --request-timeout-seconds <s> Fail queued requests after N s waiting for\n"
@@ -80,7 +80,7 @@ static void usage(const char* prog) {
         "  --version          Print version + ABI version + backend, then exit\n"
         "  --abi-version      Print just the ABI version integer, then exit\n"
         "  --help             Show this help\n",
-        prog);
+        prog, serve::supported_models_str().c_str());
 }
 
 // ---- simple arg parser ----------------------------------------------------
@@ -630,6 +630,92 @@ int main(int argc, char** argv) {
     svr.Post("/transcribe", handle_transcribe);
     svr.Post("/inference", handle_transcribe);
 
+    // OpenAI-compatible batch transcription subset. Keep validation separate
+    // from legacy routes: unsupported options must never look as if they worked.
+    svr.Get("/v1/models", [&server](const httplib::Request&, httplib::Response& res) {
+        g_last_activity.store(std::time(nullptr));
+        send_json(res, "{\"object\":\"list\",\"data\":[{\"id\":\""
+            + json_escape(server->model_slug())
+            + "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"starling\"}]}");
+    });
+    svr.Get("/v1/starling/capabilities", [&server](const httplib::Request&, httplib::Response& res) {
+        g_last_activity.store(std::time(nullptr));
+        send_json(res, "{\"schema_version\":1,\"model\":\"" + json_escape(server->model_slug())
+            + "\",\"audio_transcription\":" + (server->is_text_model() ? "false" : "true")
+            + ",\"audio_formats\":[\"wav\"],\"sample_rate_hz\":16000,"
+              "\"response_formats\":[\"json\",\"text\"],\"prompt\":false,"
+              "\"language_selection\":false,\"word_timestamps\":false,"
+              "\"streaming_transcriptions\":false,\"legacy_websocket_path\":\"/stream\"}");
+    });
+    svr.Post("/v1/audio/transcriptions", [&server, &handle_transcribe](
+            const httplib::Request& req, httplib::Response& res) {
+        g_last_activity.store(std::time(nullptr));
+        auto fail = [&res](const std::string& message, const std::string& param, int status = 400) {
+            send_json(res, "{\"error\":{\"message\":\"" + json_escape(message)
+                + "\",\"type\":\"" + (status >= 500 ? "server_error" : "invalid_request_error")
+                + "\",\"param\":" + (param.empty() ? "null" : "\"" + json_escape(param) + "\"")
+                + ",\"code\":null}}", status);
+        };
+        if (!req.is_multipart_form_data()) {
+            fail("Expected multipart/form-data with file and model", "file");
+            return;
+        }
+        if (req.form.get_field_count("model") != 1 || req.form.get_field("model").empty()) {
+            fail("Exactly one model field is required; use GET /v1/models", "model");
+            return;
+        }
+        if (req.form.get_field("model") != server->model_slug()) {
+            fail("Requested model is not served by this process; use GET /v1/models", "model", 404);
+            return;
+        }
+        if (server->is_text_model()) {
+            fail("This model accepts text, not audio", "model");
+            return;
+        }
+        for (const auto& [name, field] : req.form.fields) {
+            const auto& value = field.content;
+            if (req.form.get_field_count(name) != 1) {
+                fail("Duplicate field", name);
+                return;
+            }
+            if (name == "model" || name == "response_format") continue;
+            if (name == "stream" && value == "false") continue;
+            if (name == "temperature" && (value == "0" || value == "0.0")) continue;
+            fail("Unsupported transcription option; see /v1/starling/capabilities", name);
+            return;
+        }
+        const std::string format = req.form.get_field("response_format");
+        if (!format.empty() && format != "json" && format != "text") {
+            fail("Supported response formats are json and text", "response_format");
+            return;
+        }
+        if (req.form.files.size() != 1 || !req.form.has_file("file")) {
+            fail("Exactly one audio file named file is required", "file");
+            return;
+        }
+        const auto& payload = req.form.get_file("file").content;
+        if (payload.size() < 12 || payload.compare(8, 4, "WAVE") != 0
+            || (payload.compare(0, 4, "RIFF") != 0 && payload.compare(0, 4, "RF64") != 0)) {
+            fail("This backend accepts 16 kHz WAV files; convert compressed audio before upload", "file");
+            return;
+        }
+        handle_transcribe(req, res);
+        if (res.status != 200) {
+            std::string message;
+            if (!json_get_string(res.body, "error", message)) message = "Transcription failed";
+            fail(message, "", res.status);
+            return;
+        }
+        std::string text, request_id;
+        if (!json_get_string(res.body, "text", text)) {
+            fail("Invalid internal transcription response", "", 500);
+            return;
+        }
+        if (json_get_string(res.body, "request_id", request_id)) res.set_header("X-Request-Id", request_id);
+        if (format == "text") res.set_content(text, "text/plain; charset=utf-8");
+        else send_json(res, "{\"text\":\"" + json_escape(text) + "\"}");
+    });
+
     // ---- POST /normalize (text models: s1) ----
     // Body: JSON {"transcript": "...", "styling": "...?, "structure": "...?,
     //             "context": "...?"} — control fields optional (trained
@@ -790,7 +876,12 @@ int main(int argc, char** argv) {
                         double dur = session.buffered_seconds();
                         std::string text;
                         if (dur > 0.0) {
-                            text = session.stream_flush();
+                            auto final = session.stream_flush();
+                            if (!final.has_value()) {
+                                ws.send("{\"type\":\"error\",\"message\":\"server busy\"}");
+                                continue;
+                            }
+                            text = *final;
                         }
                         std::string safe_text = json_escape(text);
                         std::ostringstream ss;

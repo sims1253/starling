@@ -67,8 +67,8 @@ bool greedy_generate(const HiggsModel& m, const InputsEmbeds& inputs,
     return true;
 }
 
-size_t prefill_replay_cache_size() {
-    return lib::prefill_replay_cache_size(kSpec);
+size_t prefill_replay_cache_size(const HiggsModel& model) {
+    return lib::prefill_replay_cache_size(model.loader);
 }
 
 } // namespace starling::ggml::higgs

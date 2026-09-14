@@ -11,10 +11,8 @@ over the WebSocket while printing partial and final results. Exits 0 only if
 every requested check passed; any failed check exits 1, so the script works
 as a smoke gate as well as an interactive client.
 
-Zero third-party deps: HTTP uses :mod:`http.client`, and the WebSocket client
-is a tiny RFC 6455 implementation on a raw socket. This matches the server's
-own zero-dependency stdlib backend, so the client runs in the project venv
-(which has torch/CUDA but no ``requests``/``websockets``).
+The client uses NumPy for audio, :mod:`http.client` for HTTP, and a raw socket
+for WebSocket messages. It works with both the Python and native servers.
 
 Usage::
 
@@ -236,7 +234,7 @@ def _ws_send(sock: socket.socket, opcode: int, payload: bytes) -> None:
     sock.sendall(header + mask + masked)
 
 
-def _ws_recv(sock: socket.socket) -> tuple[int, bytes]:
+def _ws_recv(sock: socket.socket, *, deadline: float | None = None) -> tuple[int, bytes]:
     """Read one (unmasked) server->client frame -> ``(opcode, payload)``.
 
     Handles fragmentation and control frames (ping/pong) inline.
@@ -244,6 +242,11 @@ def _ws_recv(sock: socket.socket) -> tuple[int, bytes]:
     def _read_exact(n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("websocket deadline exceeded")
+                sock.settimeout(remaining)
             chunk = sock.recv(n - len(buf))
             if not chunk:
                 raise ConnectionError("websocket closed")
@@ -319,15 +322,16 @@ def test_stream(host: str, port: int, samples: np.ndarray, sr: int, chunk_ms: in
             # Pace the send to simulate real-time mic input.
             time.sleep(chunk_ms / 1000.0)
 
-        # Signal end-of-stream.
+        # Keep retries and all response frames within one commit deadline.
+        deadline = time.monotonic() + 60.0
+        sock.settimeout(60.0)
         _ws_send(sock, 0x1, json.dumps({"type": "commit"}).encode())
         print("[ws]   sent commit")
 
-        # Drain remaining messages until we see final.
-        sock.settimeout(60.0)
+        # A busy commit retains buffered audio and requires another commit.
         try:
             while True:
-                opcode, payload = _ws_recv(sock)
+                opcode, payload = _ws_recv(sock, deadline=deadline)
                 if opcode != 0x1:
                     continue
                 try:
@@ -336,6 +340,18 @@ def test_stream(host: str, port: int, samples: np.ndarray, sr: int, chunk_ms: in
                     continue
                 if _print_ws_msg(msg, t0):
                     return True
+                if msg.get("type") == "error":
+                    if msg.get("message") != "server busy":
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("commit deadline exceeded")
+                    time.sleep(min(0.25, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("commit deadline exceeded")
+                    sock.settimeout(remaining)
+                    _ws_send(sock, 0x1, json.dumps({"type": "commit"}).encode())
         except (socket.timeout, ConnectionError):
             print("[ws]   timed out / closed waiting for final")
             return False

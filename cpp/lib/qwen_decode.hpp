@@ -5,9 +5,8 @@
 // A model binds the stack through a QwenDecodeCtx: a QwenDecodeSpec (the only
 // places the two trunks differ — projection family, env-var prefix, message
 // label, probe filename prefix), the ModelLoader holding the realized weights,
-// and the config dims the graphs are shaped by. The process-global caches
-// (device KV, per-S prefill graphs, per-K K-step graphs) are singletons keyed
-// by spec: one set per model, first requester sizes them.
+// and the config dims the graphs are shaped by. The device KV, per-S prefill graphs and per-K K-step graphs are owned by
+// the loaded model, so models with the same spec cannot share weights.
 #pragma once
 
 #include "runtime/model_loader.hpp"
@@ -62,6 +61,20 @@ struct QwenDecodeSpec {
     // discipline (round after the rsqrt, round again after the weight mul)
     // the stack was built on (moss/ark/granite/qwen3 byte-identity).
     bool rms_norm_single_round = false;
+    // F32-throughout activations for the decode stack (GPU + quantized
+    // linears only; auto-falls-back when the first linear is unquantized).
+    // Skips every intermediate bf16 round-trip, so the Vulkan backend's
+    // {RMS_NORM,MUL} fusion sees consecutive patterns and fires, and the
+    // hundreds of tiny CAST dispatches per step vanish. Numerics move by
+    // <=1 bf16 ulp per rounding skipped (strictly more precise); CER-gated.
+    // CPU keeps the exact discipline (portable fallback parity).
+    bool f32_acts = false;
+    // Bucketed exact-width K-step attention (128/256/512/1024 prefix views +
+    // runtime masks instead of full-capacity). Same softmax math over fewer
+    // keys (masked slots contributed exactly 0); only the reduction width
+    // differs, so near-tie argmax flips are possible — CER-gated per model.
+    // Default off keeps every other trunk byte-identical.
+    bool kstep_bucket = false;
     // Generation suppression: sorted token ids banned from greedy picks (the
     // model card's bad_words_ids constraint: special and codec ids the
     // reference never emits). Appended last so existing positional field
@@ -143,8 +156,8 @@ bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
 int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x);
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i, const GenerateParams& op,
                      GenerateResult& o, std::string& e);
-// Number of captured per-S prefill graphs for this spec (diagnostic + the
+// Number of captured per-S prefill graphs for this model (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
-size_t prefill_replay_cache_size(const QwenDecodeSpec& spec);
+size_t prefill_replay_cache_size(const ModelLoader& loader);
 
 } // namespace starling::ggml::lib

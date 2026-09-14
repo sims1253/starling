@@ -55,7 +55,7 @@ def main() -> int:
         print("[qwen3-components] loading model (eager, bf16) ...")
         model, processor = load_model_and_processor(attn_impl="eager")
         comps = get_components(model)
-        encoder, projector = comps["encoder"], comps["projector"]
+        encoder = comps["encoder"]
         embed = comps["language_model"].get_input_embeddings()
         audio_token_id = int(model.config.audio_token_id)
 

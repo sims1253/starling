@@ -99,7 +99,6 @@ private:
     // sync per step). Lazily built on the first step_fused_argmax. Incomplete in
     // the header (ReplayGraph stays in the .cpp).
     struct FusedReplay;
-    mutable std::unique_ptr<FusedReplay> fused_replay_;
 };
 
 } // namespace starling::ggml::parakeet

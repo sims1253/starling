@@ -9,6 +9,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <typeindex>
+#include <utility>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +19,7 @@
 struct ggml_context;
 struct ggml_tensor;
 struct gguf_context;
+struct ggml_backend_buffer;
 
 namespace starling::ggml {
 
@@ -70,7 +74,7 @@ public:
     std::vector<std::string> tensor_names() const;
 
     // The ggml context that owns the weight tensors (memory-backed by the GGUF
-    // mmap on CPU; realized to the device by realize_weights on GPU).
+    // allocation on CPU; realized to the device by realize_weights on GPU).
     ggml_context* ctx() const { return ctx_; }
 
     // Give every weight a backend buffer on `backend` (zero-copy on CPU, a
@@ -78,6 +82,29 @@ public:
     // (via ensure_weights_realized) the first time a graph references a weight;
     // models also call it up-front at load to surface missing tensors early.
     bool realize_weights(Backend& backend);
+
+    // Private graph/cache types stay in their implementation files. Slots belong
+    // to this loaded model and are destroyed in reverse creation order, before
+    // its weight buffers. Callers serialize access with the runtime lock.
+    template<class T> std::unique_ptr<T>& cache() const {
+        const std::type_index key(typeid(T));
+        for (auto& slot : caches_)
+            if (slot.first == key) return static_cast<Cache<T>&>(*slot.second).value;
+        auto slot = std::make_unique<Cache<T>>();
+        auto& value = slot->value;
+        caches_.emplace_back(key, std::move(slot));
+        return value;
+    }
+    template<class T> const T* find_cache() const {
+        const std::type_index key(typeid(T));
+        for (auto& slot : caches_)
+            if (slot.first == key) return static_cast<Cache<T>&>(*slot.second).value.get();
+        return nullptr;
+    }
+
+    // Release caches and weights while the backend is alive. Shutdown visits
+    // every live loader, including models whose caller has not freed them.
+    static void release_all_runtime_resources();
 
     // ---- community-dialect compat (see cpp/parakeet/compat.cpp) ----------
     // Register an additional lookup name for an already-present tensor
@@ -98,10 +125,17 @@ public:
     void add_kv_arr_str(const std::string& key, const std::vector<std::string>& v);
 
 private:
+    struct CacheBase { virtual ~CacheBase() = default; };
+    template<class T> struct Cache : CacheBase { std::unique_ptr<T> value; };
+    mutable std::vector<std::pair<std::type_index, std::unique_ptr<CacheBase>>> caches_;
+    void release_runtime_resources();
+    ggml_context* device_ctx_ = nullptr;
+    ggml_backend_buffer* weight_buffer_ = nullptr;
     ggml_context* ctx_ = nullptr;          // owns the weight tensors
     ggml_context* compat_ctx_ = nullptr;   // compat-fabricated tensors (see compat.cpp)
     gguf_context* gguf_ctx_ = nullptr;      // the gguf_init_from_file handle
     std::unordered_map<std::string, ggml_tensor*> tensors_;
+    std::unordered_map<std::string, ggml_tensor*> host_tensors_;
     std::unordered_map<std::string, GgufValue> kv_;
     std::string error_;
     bool realized_ = false;

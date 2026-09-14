@@ -1,16 +1,7 @@
 // stream_session.hpp — real-time streaming dictation session.
 //
-// A faithful C++ port of the Python streaming logic in src/starling/server.py
-// (StreamSession) and src/starling/stream_chunk.py (ChunkStreamer).
-//
-// The rolling audio buffer is finalized in fixed-length overlapping windows:
-//   - Each window is a constant mel length → cudagraph encoder reuse.
-//   - Work is O(N): each second of audio is transcribed a bounded number of
-//     times.
-//   - The prompt per transcribe is bounded by the window, so the KV cache is
-//     never exceeded regardless of total session length.
-//   - Consecutive windows overlap, so boundary words are deduped via
-//     stitch_words (longest-common-subsequence match on the overlap region).
+// Fixed-length overlapping windows bound each transcription call. Word matching
+// reduces overlap duplication but cannot guarantee agreement across windows.
 #pragma once
 
 #include "server.hpp"
@@ -66,8 +57,8 @@ public:
                                      double now, const TranscribeFn& tx);
 
     // Finalize all remaining audio (on commit) and return the full text.
-    // Retries the tail window a few times if the transcriber is busy.
-    std::string flush(const std::vector<float>& samples, const TranscribeFn& tx);
+    // After bounded busy retries, returns nullopt; retain audio and retry commit.
+    std::optional<std::string> flush(const std::vector<float>& samples, const TranscribeFn& tx);
 
     void reset();
 
@@ -120,8 +111,8 @@ public:
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.
     std::optional<std::string> stream_step(double now);
 
-    // Finalize all buffered audio on commit; returns the full text.
-    std::string stream_flush();
+    // Finalize all buffered audio, or nullopt if busy; retain audio for retry.
+    std::optional<std::string> stream_flush();
 
     void reset();
 

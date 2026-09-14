@@ -23,10 +23,8 @@ Usage (unchanged)::
 
 from __future__ import annotations
 
-import os
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 
 # Same exception class as the real lock (isinstance-equivalent across modules).
 # GpuLockBusy is re-exported so `from starling.parakeet.gpu_lock import GpuLockBusy`
@@ -34,8 +32,6 @@ from pathlib import Path
 from starling.gpu.session import GpuLockBusy, GpuSession
 
 __all__ = [
-    "LOCK_PATH",
-    "STALE_SEC",
     "GpuLockBusy",
     "GpuSession",
     "acquire_gpu_lock",
@@ -43,23 +39,6 @@ __all__ = [
     "spawn_gpu_subprocess",
     "with_gpu_lock",
 ]
-
-# --- compat attributes (kept so external readers / old tests still resolve) --
-# Computed CHEAPLY (no nvidia-smi) from the CVD string; the REAL lock key (the
-# GPU-UUID set) is resolved lazily inside GpuSession.acquire. Kept so any code
-# that displays or reads ``gpu_lock.LOCK_PATH`` still resolves a sane path.
-_cvdfallback = (
-    os.environ.get("CUDA_VISIBLE_DEVICES", "default") or "default"
-).replace("/", "_").replace(",", "-")
-LOCK_PATH = Path(
-    os.environ.get(
-        "STARLING_GPU_LOCK",
-        str(Path("/tmp") / f"starling-gpu-{_cvdfallback}.flock"),
-    )
-)
-# Kept as a constant for any code that reads it; the flock releases on death so
-# age-based staleness no longer applies (heartbeat staleness lives in GpuSession).
-STALE_SEC = 10 * 60
 
 _LOCAL = threading.local()
 
@@ -81,17 +60,24 @@ def acquire_gpu_lock(
     wait: bool = True,
     poll_sec: float = 0.2,
     max_wait_sec: float = 600.0,
+    uuid: str | None = None,
 ) -> str:
     """Acquire the GPU lock; return an opaque ``owner_id`` token.
 
     Delegates to :class:`GpuSession`. Raises :class:`GpuLockBusy` if a fresh
     lock is held and ``wait=False``. The returned token must be passed to
     :func:`release_gpu_lock`.
+
+    ``uuid`` is the physical device key, as in ``GpuSession(uuid=...)`` and
+    ``starling-gpu-run --uuid``. For devices without NVIDIA discovery, pass the
+    same stable key at every acquisition, including nested calls. The key does
+    not select a device: callers must select the matching device in their
+    backend and change the key if they change that selection. Omitting it uses
+    NVIDIA discovery, even when a parent supplied an inherited lock.
     """
     gs = GpuSession(
         session=session, model=model, eta_min=eta_min, note=note,
-        wait=wait, poll_sec=poll_sec, max_wait_sec=max_wait_sec,
-        install_signal_handlers=False,
+        wait=wait, poll_sec=poll_sec, max_wait_sec=max_wait_sec, uuid=uuid,
     )
     gs.acquire()  # raises GpuLockBusy / GpuLockTimeout on contention
     owner_id = gs.owner_id or ""
@@ -100,23 +86,34 @@ def acquire_gpu_lock(
     return owner_id
 
 
-def spawn_gpu_subprocess(args, *, owner_id: str | None = None, **popen_kwargs):
+def spawn_gpu_subprocess(
+    args, *, owner_id: str | None = None, uuid: str | None = None, **popen_kwargs,
+):
     """Spawn a GPU subprocess that inherits the currently-held lock.
 
     Persistent native benchmark servers must use this instead of bare
     ``subprocess.Popen`` so they keep exclusivity if the Python parent exits.
+
+    Without a local session, ``uuid`` follows :func:`acquire_gpu_lock`: supply
+    the same physical device key as the runner; omission uses NVIDIA discovery.
+    With a local session, an explicit key must match that session. To spawn on
+    another device, acquire its lock first and pass its ``owner_id``. The key
+    identifies the lock only; callers must select the matching backend device.
     """
     sess = _sessions()
     key = owner_id or getattr(_LOCAL, "last_owner", None)
     gs = sess.get(key) if key else None
     if gs is not None:
+        if not gs._disabled and uuid is not None and uuid != gs._key:
+            raise ValueError(
+                f"Explicit GPU key {uuid!r} does not match the held session key {gs._key!r}"
+            )
         return gs.spawn(args, **popen_kwargs)
 
     # Standalone engine/test use: acquire solely for the child, pass the fd,
     # then close the parent's reference. The child remains the kernel owner.
     gs = GpuSession(
-        session="native-subprocess", model="external", note="auto child lock",
-        install_signal_handlers=False,
+        session="native-subprocess", model="external", note="auto child lock", uuid=uuid,
     )
     gs.acquire()
     try:
@@ -145,10 +142,13 @@ def release_gpu_lock(owner_id: str | None = None) -> bool:
 
 
 @contextmanager
-def with_gpu_lock(*, session: str, model: str, eta_min: int = 5, note: str = ""):
+def with_gpu_lock(
+    *, session: str, model: str, eta_min: int = 5, note: str = "",
+    uuid: str | None = None,
+):
     """Context-manager wrapper around :func:`acquire_gpu_lock`/`release_gpu_lock`."""
     owner_id = acquire_gpu_lock(
-        session=session, model=model, eta_min=eta_min, note=note)
+        session=session, model=model, eta_min=eta_min, note=note, uuid=uuid)
     try:
         yield
     finally:

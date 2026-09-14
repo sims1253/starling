@@ -1,0 +1,272 @@
+{
+  "date": "2026-09-06",
+  "status": "Opt-in recipes; combined storage shows increased sample errors and noninferiority is not established.",
+  "engine": {
+    "commit": "dc09fcd1f16fa321fb1ac20bc5e1dd5031dac22f",
+    "device": "cpu",
+    "processor": "AMD Ryzen 5 PRO 5650U",
+    "ggml_commit": "e91ded11bdcd78c42f9c8d3978ff6686eb4c1226",
+    "ggml_patches": "In-tree patch series at engine commit",
+    "process_isolation": "One fresh process per evaluated model"
+  },
+  "metric": {
+    "name": "mean_per_clip_wer_percent",
+    "normalization": "benchmarks/wer.py normalize (lowercase, remove punctuation, collapse whitespace, strip)",
+    "marginal_ci": {
+      "method": "percentile bootstrap of per-clip WER means",
+      "resamples": 1000,
+      "seed": "crc32(corpus group name) % 2**31"
+    },
+    "paired_ci": {
+      "method": "percentile bootstrap of per-clip candidate minus baseline WER differences",
+      "resamples": 10000,
+      "seed": 0,
+      "generator": "numpy.random.default_rng",
+      "percentiles": [
+        2.5,
+        97.5
+      ],
+      "pairing_keys": [
+        "id",
+        "audio_sha256",
+        "reference"
+      ],
+      "sampling": "300 differences with replacement per replicate; separate language analyses; no noninferiority margin specified"
+    }
+  },
+  "source_gguf": {
+    "name": "parakeet-tdt-0.6b-v3-f32.gguf",
+    "bytes": 2508529408,
+    "sha256": "98b0f2f13f7ec9fc5a802c2636986ff3d22a37840fcf8a0594b28540b49fe6bb"
+  },
+  "imatrix": {
+    "name": "parakeet-imx-prod-25x48.bin",
+    "sha256": "0e9bbf564abf11404f5ed1003a738aaf0807be5bf14d5dc70aa0d6a644b7a683",
+    "entries": 275
+  },
+  "corpus": {
+    "dataset": "google/fleurs",
+    "split": "test",
+    "dataset_revision": null,
+    "selection": "First 300 valid clips per configuration via benchmarks/fleurs_download.py; historical download did not record a dataset revision. Exact cached WAV/TXT files are identified by the manifest hash.",
+    "clips": {
+      "en_us_test": 300,
+      "de_de_test": 300
+    },
+    "audio_seconds": {
+      "en_us_test": 2891.72,
+      "de_de_test": 4066.26
+    },
+    "name": "fleurs_test_big_ende",
+    "files": 1200,
+    "manifest_sha256": "18fc0fd5cb926a3503e512783fc958b83e0ff6eb46db59fc0a32081081e0ee46",
+    "manifest_format": "Sorted relative filenames; each UTF-8 line is filename + NUL + lowercase SHA256(file bytes) + newline."
+  },
+  "models": {
+    "baseline": {
+      "description": "Released IQ2_XXS with conv shrink",
+      "evaluated_filename": "parakeet-tdt-0.6b-v3-iq2_xxs-imx-shrink16.gguf",
+      "recipe": "--quant iq2_xxs --shrink-f16",
+      "bytes": 325121440,
+      "sha256": "81b285cc75f233bdc472609db2bc9cd2c29abcc02c1116f01066add4e044596f",
+      "changed_tensor_names": []
+    },
+    "embedding": {
+      "description": "Q8_0 prediction embedding",
+      "evaluated_filename": "embedding.gguf",
+      "recipe": "benchmarks/recipes/parakeet-iq2-embedding-q8.recipe",
+      "bytes": 309718656,
+      "sha256": "69b825e30c65c1ad9cc24731ac83e8a9e8b318dfefd693917d357b2284f4f185",
+      "changed_tensor_names": [
+        "decoder.prediction.embed.weight"
+      ]
+    },
+    "combined": {
+      "description": "Q8_0 prediction embedding and six IQ4_NL joint/LSTM linears",
+      "evaluated_filename": "combined.gguf",
+      "recipe": "benchmarks/recipes/parakeet-iq2-compact.recipe",
+      "bytes": 303613696,
+      "sha256": "df02b4e9b76019cc161050661a060b11fde4d4debd280b69302cc63d75017037",
+      "changed_tensor_names": [
+        "joint.pred.weight",
+        "decoder.prediction.embed.weight",
+        "decoder.prediction.dec_rnn.lstm.weight_hh_l0",
+        "decoder.prediction.dec_rnn.lstm.weight_hh_l1",
+        "decoder.prediction.dec_rnn.lstm.weight_ih_l0",
+        "decoder.prediction.dec_rnn.lstm.weight_ih_l1",
+        "joint.joint_net.2.weight"
+      ]
+    }
+  },
+  "elapsed_seconds": {
+    "embedding_quantization": 161.541,
+    "combined_quantization": 165.97111513698474,
+    "baseline": 520.2360951649607,
+    "embedding": 552.4432114210213,
+    "combined": 492.5863776379847
+  },
+  "results": {
+    "en_us_test": {
+      "baseline": {
+        "clips": 300,
+        "zero_wer_clips": 91,
+        "changed_clip_wer": 0,
+        "mean_wer": 8.539683345395716,
+        "wer_ci": [
+          7.59,
+          9.54
+        ],
+        "paired_delta": 0.0,
+        "paired_95_ci": [
+          0.0,
+          0.0
+        ],
+        "changed_hypotheses": 0,
+        "counts": {
+          "hits": 5935,
+          "substitutions": 367,
+          "deletions": 87,
+          "insertions": 67,
+          "reference_words": 6389,
+          "errors": 521
+        }
+      },
+      "embedding": {
+        "clips": 300,
+        "zero_wer_clips": 91,
+        "changed_clip_wer": 1,
+        "mean_wer": 8.526350012062382,
+        "wer_ci": [
+          7.56,
+          9.51
+        ],
+        "paired_delta": -0.013333333333333334,
+        "paired_95_ci": [
+          -0.04,
+          0.0
+        ],
+        "changed_hypotheses": 1,
+        "counts": {
+          "hits": 5936,
+          "substitutions": 366,
+          "deletions": 87,
+          "insertions": 67,
+          "reference_words": 6389,
+          "errors": 520
+        }
+      },
+      "combined": {
+        "clips": 300,
+        "zero_wer_clips": 90,
+        "changed_clip_wer": 68,
+        "mean_wer": 8.736521405104527,
+        "wer_ci": [
+          7.67,
+          9.84
+        ],
+        "paired_delta": 0.19683805970881213,
+        "paired_95_ci": [
+          -0.22024696999330579,
+          0.6384509511470766
+        ],
+        "changed_hypotheses": 132,
+        "counts": {
+          "hits": 5911,
+          "substitutions": 366,
+          "deletions": 112,
+          "insertions": 61,
+          "reference_words": 6389,
+          "errors": 539
+        }
+      },
+      "combined_minus_embedding": {
+        "paired_delta": 0.21017139304214547,
+        "paired_95_ci": [
+          -0.20738815822786413,
+          0.6563577664937124
+        ]
+      }
+    },
+    "de_de_test": {
+      "baseline": {
+        "clips": 300,
+        "zero_wer_clips": 81,
+        "changed_clip_wer": 0,
+        "mean_wer": 9.354242438282183,
+        "wer_ci": [
+          8.22,
+          10.51
+        ],
+        "paired_delta": 0.0,
+        "paired_95_ci": [
+          0.0,
+          0.0
+        ],
+        "changed_hypotheses": 0,
+        "counts": {
+          "hits": 5992,
+          "substitutions": 447,
+          "deletions": 72,
+          "insertions": 62,
+          "reference_words": 6511,
+          "errors": 581
+        }
+      },
+      "embedding": {
+        "clips": 300,
+        "zero_wer_clips": 81,
+        "changed_clip_wer": 0,
+        "mean_wer": 9.354242438282183,
+        "wer_ci": [
+          8.22,
+          10.51
+        ],
+        "paired_delta": 0.0,
+        "paired_95_ci": [
+          0.0,
+          0.0
+        ],
+        "changed_hypotheses": 0,
+        "counts": {
+          "hits": 5992,
+          "substitutions": 447,
+          "deletions": 72,
+          "insertions": 62,
+          "reference_words": 6511,
+          "errors": 581
+        }
+      },
+      "combined": {
+        "clips": 300,
+        "zero_wer_clips": 81,
+        "changed_clip_wer": 83,
+        "mean_wer": 9.748200300642099,
+        "wer_ci": [
+          8.54,
+          10.93
+        ],
+        "paired_delta": 0.3939578623599178,
+        "paired_95_ci": [
+          -0.019685907966166826,
+          0.8232495041332143
+        ],
+        "changed_hypotheses": 153,
+        "counts": {
+          "hits": 5966,
+          "substitutions": 453,
+          "deletions": 92,
+          "insertions": 60,
+          "reference_words": 6511,
+          "errors": 605
+        }
+      },
+      "combined_minus_embedding": {
+        "paired_delta": 0.3939578623599178,
+        "paired_95_ci": [
+          -0.019685907966166826,
+          0.8232495041332143
+        ]
+      }
+    }
+  }
+}

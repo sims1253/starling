@@ -83,7 +83,7 @@ index c1d86aaa..860f6919 100644
      } else {
          d_Y = d_Qy;
 @@ -9679,6 +9687,18 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
-             ctx->prealloc_y_last_decode_vector_staging = false;
+             ctx->prealloc_y_last_k_padded = false;
          }
      }
 +    if (y_bf16_f32) {
@@ -96,7 +96,7 @@ index c1d86aaa..860f6919 100644
 +        ggml_vk_cpy_to_contiguous(ctx, subctx, ctx->device->pipeline_contig_cpy_bf16_f32, src1, d_Qy, d_Y);
 +        ctx->prealloc_y_last_pipeline_used = ctx->device->pipeline_contig_cpy_bf16_f32.get();
 +        ctx->prealloc_y_last_tensor_used = src1;
-+        ctx->prealloc_y_last_decode_vector_staging = false;
++        ctx->prealloc_y_last_k_padded = false;
 +    }
  
      // For batch_n, the A matrix is the same for each batch, and B/D use the row stride as the batch stride

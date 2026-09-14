@@ -260,6 +260,7 @@ class LLMMega:
         self.static_position_ids.copy_(torch.tensor([[prefill_len]], device=self.device))
         self._set_mask(prefill_len + 1)
         for _ in range(self.warmup_iters):
+            self._reset_cache_pos(prefill_len)
             self._decode_step_eager()
         torch.cuda.synchronize()
         self._reset_cache_pos(prefill_len)

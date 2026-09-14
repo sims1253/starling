@@ -1,137 +1,87 @@
 #!/usr/bin/env bash
-#
-# apply_ggml_patches.sh
-#
-# Apply the in-tree ggml patches to third_party/ggml. Idempotent: re-running
-# is a no-op once everything is applied.
-#
-# Patches live in third_party/ggml-patches/ and are applied in filename order
-# (the numeric prefix from `git format-patch` gives us the right ordering).
-#
-# Usage:
-#   bash scripts/apply_ggml_patches.sh
-#
-# Exits 0 on success, non-zero on any failure. Designed to be called by CMake
-# during configure but also runnable standalone for debugging.
-
+# Apply the ordered ggml patch series without changing the caller's Git index.
+# Usage: bash scripts/apply_ggml_patches.sh
 set -euo pipefail
+export LC_ALL=C
 
-# Resolve the project root from the script's own location so this works from
-# any CWD (including CMake's build dir).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 GGML_DIR="${PROJECT_ROOT}/third_party/ggml"
 PATCH_DIR="${PROJECT_ROOT}/third_party/ggml-patches"
 
-if [[ ! -d "${GGML_DIR}" ]]; then
-    echo "error: ggml submodule not found at ${GGML_DIR}" >&2
-    echo "       did you forget 'git submodule update --init --recursive'?" >&2
-    exit 1
-fi
-
 if [[ ! -d "${GGML_DIR}/.git" && ! -f "${GGML_DIR}/.git" ]]; then
-    echo "error: ${GGML_DIR} is not a git repository" >&2
+    echo "error: ggml submodule not initialized at ${GGML_DIR}" >&2
+    echo "       run git submodule update --init --recursive" >&2
     exit 1
 fi
-
 if [[ ! -d "${PATCH_DIR}" ]]; then
     echo "error: patch directory not found at ${PATCH_DIR}" >&2
     exit 1
 fi
 
+# Bash glob order under the C locale follows the numeric filename prefixes.
 shopt -s nullglob
 PATCHES=("${PATCH_DIR}"/*.patch)
-shopt -u nullglob
-
 if [[ ${#PATCHES[@]} -eq 0 ]]; then
-    echo "ggml patches: no patches found in ${PATCH_DIR} (nothing to do)"
+    echo "ggml patches: no patches found (nothing to do)"
     exit 0
 fi
-
-# Sort by filename so the numeric prefix (0001-, 0002-, ...) determines order.
-IFS=$'\n' PATCHES=($(printf '%s\n' "${PATCHES[@]}" | sort))
-unset IFS
-
-applied=0
-skipped=0
-
 cd "${GGML_DIR}"
 
-# Serialise concurrent invocations against the shared submodule tree.  Several
-# downstream consumers (e.g. LocalAI's per-CPU-variant build matrix) invoke
-# CMake configure in parallel against the same sources clone, which makes the
-# patch loop below race.  A best-effort flock on a sentinel file alongside the
-# submodule serialises that window; we re-exec the script under flock so the
-# rest of the body runs serially.
-if [[ -z "${PARAKEET_PATCH_FLOCK_HELD:-}" ]] && command -v flock >/dev/null 2>&1; then
-    LOCK_FILE="${PROJECT_ROOT}/third_party/.ggml-patch.lock"
-    : > "${LOCK_FILE}" 2>/dev/null || true
-    if [[ -e "${LOCK_FILE}" ]]; then
-        export PARAKEET_PATCH_FLOCK_HELD=1
-        SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
-        exec flock "${LOCK_FILE}" bash "${SCRIPT_PATH}" "$@"
+# mkdir is atomic on Linux, macOS and Git Bash; flock is not always available.
+LOCK_DIR="$(git rev-parse --absolute-git-dir)/starling-patches.lock"
+for ((attempt = 0; ; attempt++)); do
+    if mkdir "${LOCK_DIR}" 2>/dev/null; then
+        break
     fi
-fi
+    if [[ ! -d "${LOCK_DIR}" || ${attempt} -ge 60 ]]; then
+        echo "error: cannot acquire ggml patch lock: ${LOCK_DIR}" >&2
+        echo "       if no patch process is running, remove that directory and retry" >&2
+        exit 1
+    fi
+    sleep 1
+done
+TEMP_DIR=""
+cleanup() {
+    [[ -z "${TEMP_DIR}" ]] || rm -rf "${TEMP_DIR}"
+    rmdir "${LOCK_DIR}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/starling-ggml-patches.XXXXXX")"
+export GIT_INDEX_FILE="${TEMP_DIR}/index"
 
-# Fast path: if the LAST patch in the ordered series reverse-checks, the
-# whole series is in place (patches are a strict sequence; the tail cannot be
-# present without its predecessors). This is also the only reliable per-patch
-# idempotency signal for overlapping series: a later patch can touch context
-# lines of an earlier patch's hunks, which makes the earlier patch's
-# standalone reverse-check fail even though it is applied.
-last_patch="${PATCHES[${#PATCHES[@]}-1]}"
-if git apply --check --reverse "${last_patch}" >/dev/null 2>&1; then
-    echo "ggml patches: series already applied (tail $(basename "${last_patch}") present; nothing to do)"
+# Snapshot the worktree, including local edits and untracked files, in a private
+# index. Reverse the series backwards so later overlapping hunks are removed
+# before checking their predecessors. Nothing touches the worktree yet.
+git read-tree HEAD
+git add --all -- .
+BEFORE="$(git write-tree)"
+for ((i = ${#PATCHES[@]} - 1; i >= 0; i--)); do
+    if git apply --cached --check --reverse "${PATCHES[i]}" 2>/dev/null; then
+        git apply --cached --reverse "${PATCHES[i]}"
+    fi
+done
+
+# Every patch must now apply, including predecessors independent of the tail.
+# A partial hunk or conflicting edit fails before any real file is changed.
+for patch in "${PATCHES[@]}"; do
+    if ! git apply --cached "${patch}"; then
+        echo "error: cannot validate complete ggml patch series at $(basename "${patch}")" >&2
+        echo "       worktree and Git index unchanged; inspect git -C '${GGML_DIR}' status" >&2
+        exit 1
+    fi
+done
+AFTER="$(git write-tree)"
+if [[ "${BEFORE}" == "${AFTER}" ]]; then
+    echo "ggml patches: complete series already applied (nothing to do)"
     exit 0
 fi
 
-for patch in "${PATCHES[@]}"; do
-    name="$(basename "${patch}")"
-
-    # Already applied? `git apply --check --reverse` succeeds iff every hunk
-    # is currently present in the tree (i.e. we *could* roll it back).
-    if git apply --check --reverse "${patch}" >/dev/null 2>&1; then
-        echo "ggml patches: skipping ${name} (already applied)"
-        skipped=$((skipped + 1))
-        continue
-    fi
-
-    # Otherwise it must apply cleanly forward.
-    if git apply --check "${patch}" >/dev/null 2>&1; then
-        if ! git apply "${patch}"; then
-            echo "error: failed to apply ${name} after --check succeeded" >&2
-            echo "       this should not happen; the submodule tree may be dirty" >&2
-            exit 1
-        fi
-        echo "ggml patches: applied ${name}"
-        applied=$((applied + 1))
-        continue
-    fi
-
-    # Buried patch? A later series patch already present can invalidate this
-    # patch's forward and reverse context. If any later patch reverse-checks,
-    # treat this one as applied underneath it.
-    buried=0
-    for later in "${PATCHES[@]}"; do
-        [[ "${later}" > "${patch}" ]] || continue
-        if git apply --check --reverse "${later}" >/dev/null 2>&1; then
-            echo "ggml patches: skipping ${name} (buried under $(basename "${later}"))"
-            skipped=$((skipped + 1))
-            buried=1
-            break
-        fi
-    done
-    [[ ${buried} -eq 1 ]] && continue
-
-    # Neither forward-applicable nor already-applied: bail with diagnostics.
-    echo "error: cannot apply ${name}" >&2
-    echo "       'git apply --check' output (forward):" >&2
-    git apply --check "${patch}" 2>&1 | sed 's/^/         /' >&2 || true
-    echo "       'git apply --check --reverse' output:" >&2
-    git apply --check --reverse "${patch}" 2>&1 | sed 's/^/         /' >&2 || true
-    echo "       submodule HEAD: $(git rev-parse HEAD)" >&2
-    echo "       try: cd ${GGML_DIR} && git status" >&2
-    exit 1
-done
-
-echo "ggml patches: applied ${applied}, skipped ${skipped}"
+# Apply only the missing changes. git apply checks the entire diff before
+# writing, and preserves unrelated local edits and the original staging index.
+git diff --binary --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ "${BEFORE}" "${AFTER}" > "${TEMP_DIR}/remaining.patch"
+git apply --check "${TEMP_DIR}/remaining.patch"
+git apply "${TEMP_DIR}/remaining.patch"
+echo "ggml patches: complete series applied"

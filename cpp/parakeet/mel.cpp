@@ -241,28 +241,30 @@ void GpuMel::build_basis() {
 
 void GpuMel::build_or_reuse_replay(int T) {
     if (replay_ && replay_->T == T) return;
-    replay_ = std::make_unique<MelReplay>();
-    replay_->T = T;
-    replay_->pool.alloc_f32(1);  // touch the pool
+    replay_.reset();
+    auto pending = std::make_unique<MelReplay>();
+    auto* replay = pending.get();
+    replay->T = T;
+    replay->pool.alloc_f32(1);  // touch the pool
     // Host backing for the windowed frames: [n_fft * T], built per compute().
-    replay_->xw_host = replay_->pool.alloc_f32((size_t)c_.n_fft * T);
-    replay_->xw_nbytes = (size_t)c_.n_fft * T * sizeof(float);
+    replay->xw_host = replay->pool.alloc_f32((size_t)c_.n_fft * T);
+    replay->xw_nbytes = (size_t)c_.n_fft * T * sizeof(float);
 
     const int64_t N = c_.n_fft, B = c_.n_bins, M = c_.n_mels, Tt = T;
     // Build the ggml graph once: xw[N,T] -> re=B@xw, im=B@xw -> power -> mel -> log.
-    replay_->rg = std::make_unique<ReplayGraph>(backend_,
-        [this, N, B, M, Tt](ggml_context* ctx) -> ggml_tensor* {
+    replay->rg = std::make_unique<ReplayGraph>(backend_,
+        [this, replay, N, B, M, Tt](ggml_context* ctx) -> ggml_tensor* {
             // Inputs (registered in order; set_input feeds them per call).
             int64_t ne_xw[2]  = {N, Tt};
             ggml_tensor* xw = graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne_xw,
-                replay_->xw_host, replay_->xw_nbytes);
+                replay->xw_host, replay->xw_nbytes);
             // Constant DFT bases + filterbank + log-guard scalar (GraphInputPool).
             int64_t ne_basis[2] = {N, B};
-            float* cosb_h = replay_->pool.alloc_f32((size_t)N * B);
+            float* cosb_h = replay->pool.alloc_f32((size_t)N * B);
             std::memcpy(cosb_h, dft_cos_.data(), (size_t)N * B * sizeof(float));
             ggml_tensor* cosb = graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne_basis,
                 cosb_h, (size_t)N * B * sizeof(float));
-            float* sinb_h = replay_->pool.alloc_f32((size_t)N * B);
+            float* sinb_h = replay->pool.alloc_f32((size_t)N * B);
             std::memcpy(sinb_h, dft_sin_.data(), (size_t)N * B * sizeof(float));
             ggml_tensor* sinb = graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne_basis,
                 sinb_h, (size_t)N * B * sizeof(float));
@@ -284,19 +286,20 @@ void GpuMel::build_or_reuse_replay(int T) {
             // yield ne0=M, ne1=T = frame-major, which is the bug this fixes: the
             // downstream CMVN / output assume feats[m*T + t] feat-major.)
             int64_t ne_fb[2] = {B, M};
-            float* fb_h = replay_->pool.alloc_f32((size_t)B * M);
+            float* fb_h = replay->pool.alloc_f32((size_t)B * M);
             std::memcpy(fb_h, c_.filterbank.data(), (size_t)B * M * sizeof(float));
             ggml_tensor* fb = graph_input_tensor(ctx, GGML_TYPE_F32, 2, ne_fb,
                 fb_h, (size_t)B * M * sizeof(float));
             ggml_tensor* mel = ggml_mul_mat(ctx, power, fb);
             // log(mel + log_guard).
-            float* g_h = replay_->pool.alloc_f32(1); g_h[0] = c_.log_zero_guard;
+            float* g_h = replay->pool.alloc_f32(1); g_h[0] = c_.log_zero_guard;
             int64_t ne_g[1] = {1};
             ggml_tensor* g = graph_input_tensor(ctx, GGML_TYPE_F32, 1, ne_g,
                 g_h, sizeof(float));
             ggml_tensor* lm = ggml_log(ctx, ggml_add(ctx, mel, g));
             return lm;  // [n_mels, T] feat-major
         });
+    replay_ = std::move(pending);
 }
 
 void GpuMel::compute(const float* pcm, size_t S, std::vector<float>& feats,

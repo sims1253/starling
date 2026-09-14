@@ -89,39 +89,33 @@ ggml_tensor* rms(ggml_context* c, const HojoModel& m, ggml_tensor* x, const std:
 // so the caches are NOT zeroed between utterances. DeviceCache's bf16 RoPE
 // tables are unused: hojo feeds f32 host RoPE rows as graph inputs.
 // ---------------------------------------------------------------------------
-std::vector<std::unique_ptr<DeviceCache>> g_beam_caches;
-std::once_flag g_beam_caches_once;
-void register_beam_cache_clearer_once() {
-    std::call_once(g_beam_caches_once, [] {
-        register_decode_cache_clearer([] { g_beam_caches.clear(); });
-    });
-}
-// Lazily allocate (or return) the first `count` per-beam caches. Single-config
-// per process (the shared global-backend assumption); a mismatched config is
-// an error, never a silent reuse.
+using BeamCaches = std::vector<std::unique_ptr<DeviceCache>>;
+// Lazily allocate the first `count` beam caches for this loaded model.
 std::vector<DeviceCache*> get_beam_caches(const HojoModel& m, int count, std::string& e) {
-    register_beam_cache_clearer_once();
+    auto& slot = m.loader.cache<BeamCaches>();
+    if (!slot) slot = std::make_unique<BeamCaches>();
+    auto& beam_caches = *slot;
     const auto& lc = m.config.llm;
-    if (!g_beam_caches.empty()) {
-        const DeviceCache& c = *g_beam_caches[0];
+    if (!beam_caches.empty()) {
+        const DeviceCache& c = *beam_caches[0];
         if (c.n_layers != (int) lc.n_layers || c.D != (int) lc.head_dim ||
             c.KV != (int) lc.n_kv_heads || c.max_cache != (int) lc.max_cache) {
-            e = "Hojo KV cache dims changed within process";
+            e = "Hojo KV cache dims changed within model";
             return {};
         }
     }
-    while ((int) g_beam_caches.size() < count) {
+    while ((int) beam_caches.size() < count) {
         auto dc = std::unique_ptr<DeviceCache>(new DeviceCache());
         if (!dc->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads,
                       (int) lc.max_cache, (float) lc.rope_theta,
                       global_backend().handle(), e)) {
-            g_beam_caches.clear();
+            beam_caches.clear();
             return {};
         }
-        g_beam_caches.push_back(std::move(dc));
+        beam_caches.push_back(std::move(dc));
     }
     std::vector<DeviceCache*> out;
-    for (int b = 0; b < count; ++b) out.push_back(g_beam_caches[(size_t) b].get());
+    for (int b = 0; b < count; ++b) out.push_back(beam_caches[(size_t) b].get());
     return out;
 }
 
@@ -240,7 +234,7 @@ ggml_tensor* build_prefill_graph(ggml_context* c, const HojoModel& m, DeviceCach
 // fully determines every shape). Only inputs_embeds varies per utterance; the
 // f32 RoPE rows [0,S) and the causal mask are constant for S. Bounded LRU so
 // each distinct prompt length does not pin its own captured graph + private
-// gallocr until exit. Cleared via register_decode_cache_clearer.
+// gallocr until exit. Freed with the owning model.
 struct PrefillReplayEntry {
     int64_t S = 0;
     GraphInputPool pool;
@@ -254,24 +248,16 @@ struct PrefillCache {
     LruCache<int64_t, PrefillReplayEntry> by_S;
     explicit PrefillCache(size_t cap) : by_S(cap) {}
 };
-std::unique_ptr<PrefillCache> g_prefill_cache;
-std::once_flag g_prefill_once;
-void register_prefill_clearer_once() {
-    std::call_once(g_prefill_once, [] {
-        register_decode_cache_clearer([] { g_prefill_cache.reset(); });
-    });
-}
 } // namespace
 
 PrefillReplayEntry* get_or_build_prefill(const HojoModel& m, DeviceCache* dc, int64_t S,
                                          const RopeTables& rope, std::string& e) {
-    register_prefill_clearer_once();
-    if (!g_prefill_cache)
-        g_prefill_cache = std::make_unique<PrefillCache>(replay_cache_size());
+    auto& prefill_cache = m.loader.cache<PrefillCache>();
+    if (!prefill_cache) prefill_cache = std::make_unique<PrefillCache>(replay_cache_size());
     const auto& lc = m.config.llm;
     // get_or_init places the entry (stable address) first, then builds: the
     // ReplayGraph build lambda captures the stable pool pointers.
-    return g_prefill_cache->by_S.get_or_init(S,
+    return prefill_cache->by_S.get_or_init(S,
         [&](PrefillReplayEntry& entry) -> PrefillReplayEntry& {
             entry.S = S;
             entry.xb_buf = reinterpret_cast<ggml_bf16_t*>(

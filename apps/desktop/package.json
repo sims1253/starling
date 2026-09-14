@@ -1,0 +1,71 @@
+{
+  "name": "@starling/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Faithful local-first voice transcription for desktop",
+  "author": "Starling contributors",
+  "type": "module",
+  "main": "dist-electron/main.mjs",
+  "scripts": {
+    "dev": "vp dev",
+    "typecheck": "tsc -b && tsc -p tsconfig.electron.json",
+    "build": "pnpm run typecheck && vp build && node electron/build.ts",
+    "preview": "vp preview",
+    "native": "pnpm run build && electron dist-electron/main.mjs",
+    "native:dev": "pnpm run build:electron && node electron/dev.ts",
+    "desktop": "pnpm run native:dev",
+    "package": "pnpm run build && electron-builder",
+    "build:electron": "tsc -p tsconfig.electron.json && node electron/build.ts"
+  },
+  "devDependencies": {
+    "@starling/dictation": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "effect": "catalog:",
+    "electron": "44.3.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "0.28.2",
+    "lucide-react": "^1.46.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "build": {
+    "appId": "dev.starling.dictation",
+    "productName": "Starling",
+    "executableName": "starling",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json",
+      "assets/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Starling records audio when you press Record so your selected transcription server can turn it into text."
+      }
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
+      "icon": "assets/icon.png"
+    }
+  }
+}

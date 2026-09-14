@@ -56,20 +56,20 @@ def fleurs_clips(budget: dict[str, int], split: str = "train"):
     from datasets import load_dataset
 
     for cfg, n in budget.items():
-        try:
-            ds = load_dataset("google/fleurs", cfg, split=split, streaming=True)
-            got = 0
-            for i, ex in enumerate(ds):
-                if got >= n:
-                    break
-                array, sr = _decode(ex)
-                if array.size < 1600:  # <0.1 s: skip degenerate clips
-                    continue
-                text = ex.get("transcription") or ex.get("transcript") or ""
-                if not text.strip():
-                    continue
-                yield f"fleurs:{cfg}:{i}", _to_16k(array, sr), text.strip()
-                got += 1
-        except Exception as e:  # a bad config must not sink the batch
-            print(f"[fleurs] WARNING: {cfg} unavailable ({type(e).__name__}: "
-                  f"{str(e)[:120]}) — skipping")
+        if n <= 0:
+            raise ValueError(f"{cfg}: clip count must be positive")
+        ds = load_dataset("google/fleurs", cfg, split=split, streaming=True)
+        got = 0
+        for i, ex in enumerate(ds):
+            array, sr = _decode(ex)
+            if array.size < 1600:  # <0.1 s: skip degenerate clips
+                continue
+            text = ex.get("transcription") or ex.get("transcript") or ""
+            if not text.strip():
+                continue
+            yield f"fleurs:{cfg}:{i}", _to_16k(array, sr), text.strip()
+            got += 1
+            if got == n:
+                break
+        if got != n:
+            raise RuntimeError(f"{cfg} {split}: requested {n} clips, found {got}")

@@ -129,7 +129,10 @@ def available() -> bool:
 
 
 def backend_name() -> str:
-    """The active ggml backend ('cuda'/'metal'/'vulkan'/'cpu').
+    """The active ggml device name ('CPU'/'Vulkan0'/'CUDA0', as selected
+    by STARLING_GGML_DEVICE or auto-pick) once a model load has created the
+    global backend; before the first load, the compile-time backend family
+    ('cuda'/'metal'/'vulkan'/'cpu').
 
     Returns 'unavailable' if the library isn't loaded (for diagnostics).
     """

@@ -11,7 +11,6 @@ from typing import Any
 
 import torch
 
-from . import _tf_bootstrap  # noqa: F401 -- restores qwen3_asr in shared venv
 from .config import MODEL_ID
 
 

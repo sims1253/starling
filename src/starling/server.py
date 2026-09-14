@@ -18,7 +18,7 @@ The model pipelines have incompatible ``transcribe`` signatures, so the
 per-model differences (input building, long-audio chunking, the granite-only
 speculative path) are isolated behind a :class:`ModelBackend` with one subclass
 per model. Everything else -- request queue, cancellation, lifecycle phase,
-streaming session, the dual FastAPI/stdlib transport, WAV/PCM decoding -- is
+streaming session, the FastAPI transport, WAV/PCM decoding -- is
 model-agnostic and shared.
 
 Run with::
@@ -31,17 +31,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
-from collections.abc import Callable
 import email.policy
-import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
 import io
 import json
 import logging
 import math
-import socket
-import struct
 import threading
 import time
 import uuid
@@ -49,7 +44,6 @@ import wave
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.parser import BytesParser
 from typing import Any, Optional
 
@@ -58,7 +52,7 @@ import numpy as np
 log = logging.getLogger("starling.server")
 
 # Single source of truth for every Python-reported version string (the FastAPI
-# app version and the stdlib Server: header): the pyproject.toml project
+# app version): the pyproject.toml project
 # version, so the two can never drift apart again. The native starling-serve
 # binary is versioned separately via its STARLING_SERVE_VERSION cmake variable
 # (overridden with the release tag by the release workflow).
@@ -123,24 +117,6 @@ DEFAULT_MAX_UPLOAD_BYTES: int = 256 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS: float = 10 * 60.0
 """Wall-clock deadline covering both queueing and model execution."""
 
-WS_GUID: bytes = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-MAX_WS_FRAME_BYTES: int = 16 * 1024 * 1024
-"""Maximum accepted single WebSocket frame payload (16 MiB cap).
-
-A client that claims a gigantic 64-bit payload length would otherwise block the
-receiver (``_read_exact``) indefinitely. Frames larger than this raise and tear
-the connection down instead.
-"""
-
-WS_SOCKET_TIMEOUT_SECONDS: float = 120.0
-"""Idle timeout (seconds) on a stdlib WebSocket session.
-
-A long dictation can stay silent for many seconds between utterances, so this is
-generous; a totally dead/silent connection still times out rather than hanging a
-handler thread forever.
-"""
-
 STREAM_TRIM_MIN_SAMPLES: int = SAMPLE_RATE
 """Minimum committed-prefix length (in samples) to drop from a stream buffer.
 
@@ -175,7 +151,7 @@ def _gpu_lock_model(slug: str) -> str:
 class ModelBackend:
     """Loads one model pipeline and transcribes 1-D float32 mono audio.
 
-    Subclasses override :meth:`load`, :meth:`transcribe`, and :meth:`prewarm`.
+    Subclasses override :meth:`load` and :meth:`transcribe`.
     Audio arrives as a contiguous float32 numpy array at ``SAMPLE_RATE`` Hz;
     the return is a :class:`TranscribeResult` (text + chunk-level segments).
     Heavy ``torch`` / model imports happen inside :meth:`load` so ``--help``
@@ -201,10 +177,6 @@ class ModelBackend:
 
     def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
         raise NotImplementedError
-
-    def prewarm(self, samples: np.ndarray) -> None:
-        """Default warmup: one transcribe on a short silent clip."""
-        self.transcribe(samples)
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
         """Pick graphed vs eager for the coming transcribe. No-op by default;
@@ -393,9 +365,7 @@ class ParakeetBackend(ModelBackend):
             self._check_stopped()
             texts = self.pipe.transcribe([audio])
             text = texts[0] if texts else ""
-        # Parakeet's TDT decoder has no chunk-window segment contract exposed
-        # here, so we return a single whole-utterance segment (the server's
-        # streaming partials still carve the timeline via the rolling buffer).
+        # Both Parakeet pipelines expose text without chunk timestamps.
         return TranscribeResult(
             text=text,
             segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
@@ -403,7 +373,7 @@ class ParakeetBackend(ModelBackend):
         )
 
 
-class ParakeetUnifiedBackend(ModelBackend):
+class ParakeetUnifiedBackend(ParakeetBackend):
     """parakeet-unified-en-0.6b: NeMo-free megakernel (FastConformer-RNN-T)."""
 
     slug = "parakeet_unified"
@@ -431,27 +401,6 @@ class ParakeetUnifiedBackend(ModelBackend):
                 overlap_seconds=overlap_seconds,
             )
         return self.chunker
-
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
-        assert self.pipe is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        audio = np.ascontiguousarray(samples, dtype=np.float32)
-        audio_seconds = len(audio) / SAMPLE_RATE
-        max_chunk_seconds = self._configured_chunk_seconds()
-        if audio_seconds > max_chunk_seconds:
-            text = self._get_chunker().transcribe(
-                audio, sr=SAMPLE_RATE, should_stop=self._check_stopped
-            )
-        else:
-            self._check_stopped()
-            texts = self.pipe.transcribe([audio])
-            text = texts[0] if texts else ""
-        return TranscribeResult(
-            text=text,
-            segments=[{"text": text, "start_s": 0.0, "end_s": audio_seconds}],
-            duration_s=audio_seconds,
-        )
 
 
 class MossBackend(ModelBackend):
@@ -877,7 +826,6 @@ class StarlingServer:
     _load_lock: threading.Lock = field(default_factory=threading.Lock)
 
     # --- request queueing -------------------------------------------------
-    _n_waiters: int = 0
     _requests: dict[str, "RequestContext"] = field(default_factory=dict)
     _request_order: list[str] = field(default_factory=list)
     _queue_changed: threading.Condition = field(init=False, repr=False)
@@ -1030,11 +978,10 @@ class StarlingServer:
         deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         ctx = RequestContext(rid, deadline=deadline)
         with self._queue_changed:
-            if self._n_waiters >= MAX_WAITERS:
+            if len(self._requests) >= MAX_WAITERS:
                 raise _Busy()
             if ctx.id in self._requests:
                 raise _DuplicateRequest(ctx.id)
-            self._n_waiters += 1
             self._requests[ctx.id] = ctx
             self._request_order.append(ctx.id)
             self._queue_changed.notify_all()
@@ -1042,7 +989,6 @@ class StarlingServer:
             return self._serial_run(ctx, samples, streaming=streaming)
         finally:
             with self._queue_changed:
-                self._n_waiters = max(0, self._n_waiters - 1)
                 self._requests.pop(ctx.id, None)
                 if ctx.id in self._request_order:
                     self._request_order.remove(ctx.id)
@@ -1113,7 +1059,7 @@ class StarlingServer:
 
     def is_busy(self) -> bool:
         with self._lock:
-            return self._n_waiters > 0
+            return bool(self._requests)
 
     def phase(self) -> str:
         with self._lock:
@@ -1140,8 +1086,8 @@ def _transcribe_payload_sync(
     # Lazily load the backend before queueing inference. Done here, outside the
     # malformed-audio handler, so a valid request to an unloaded server triggers
     # load() rather than crashing inside _run_queued_sync -> _serial_run.
-    server._ensure_loaded()
     try:
+        server._ensure_loaded()
         result = server._run_queued_sync(samples, request_id)
     except _Busy:
         return 503, {
@@ -1155,6 +1101,9 @@ def _transcribe_payload_sync(
         return 504, {"error": "request timed out", "text": ""}
     except _DuplicateRequest:
         return 409, {"error": "request id already active", "text": ""}
+    except Exception:
+        log.exception("transcription failed (request_id=%s)", request_id)
+        return 500, {"error": "transcription failed", "text": "", "request_id": request_id}
     response = result.to_dict()
     response["request_id"] = request_id
     return 200, response
@@ -1263,7 +1212,10 @@ class StreamSession:
 
     def stream_flush(self) -> str:
         """Finalize all buffered audio (on commit) and return the full text."""
-        return self.chunker.flush(self.samples, self._tx)
+        text = self.chunker.flush(self.samples, self._tx)
+        if text is None:
+            raise _Busy("stream commit incomplete; retry with buffered audio retained")
+        return text
 
     def _maybe_trim_samples(self) -> None:
         """Drop the chunker's committed prefix from the rolling buffer.
@@ -1356,7 +1308,7 @@ class StreamSession:
 
 
 # ===========================================================================
-# BACKEND A: FastAPI + uvicorn (preferred, optional deps)
+# FastAPI application
 # ===========================================================================
 def create_app(
     config: Optional[ServerConfig] = None,
@@ -1458,17 +1410,10 @@ def create_app(
     async def _inference(request):  # noqa: ANN001
         payload = await _decode_inference_body(request)
         if not payload:
-            raise HTTPException(status_code=400, detail="empty upload")
-        rid = _request_id(request)
-        status, response = await asyncio.to_thread(
-            _transcribe_payload_sync, server, payload, rid
-        )
-        return JSONResponse(response, status_code=status)
-
-    async def _transcribe(request):  # noqa: ANN001
-        payload = await _decode_inference_body(request)
-        if not payload:
-            raise HTTPException(status_code=400, detail="empty request body")
+            raise HTTPException(
+                status_code=400,
+                detail="empty upload" if request.url.path == "/inference" else "empty request body",
+            )
         rid = _request_id(request)
         status, response = await asyncio.to_thread(
             _transcribe_payload_sync, server, payload, rid
@@ -1486,10 +1431,9 @@ def create_app(
         )
 
     _inference.__annotations__["request"] = Request
-    _transcribe.__annotations__["request"] = Request
     _abort.__annotations__["request"] = Request
     app.add_api_route("/inference", _inference, methods=["POST"])
-    app.add_api_route("/transcribe", _transcribe, methods=["POST"])
+    app.add_api_route("/transcribe", _inference, methods=["POST"])
     app.add_api_route("/inference/{id}", _abort, methods=["DELETE"])
 
     async def _stream(ws):  # noqa: ANN001
@@ -1499,6 +1443,8 @@ def create_app(
         try:
             while True:
                 msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
                 text_msg = msg.get("text")
                 if text_msg is not None:
                     try:
@@ -1506,9 +1452,13 @@ def create_app(
                     except json.JSONDecodeError:
                         await ws.send_json({"type": "error", "message": "bad json"})
                         continue
+                    if not isinstance(cmd, dict):
+                        await ws.send_json({"type": "error", "message": "expected JSON object"})
+                        continue
                     mtype = cmd.get("type")
                     if mtype == "commit":
                         if sess.buffered_seconds > 0.0:
+                            await asyncio.to_thread(server._ensure_loaded)
                             try:
                                 if sess.chunker is not None:
                                     text = await asyncio.to_thread(sess.stream_flush)
@@ -1555,6 +1505,7 @@ def create_app(
                 # append_wav itself sniffs RIFF/WAVE vs raw PCM16.
                 sess.append_wav(bdata)
 
+                await asyncio.to_thread(server._ensure_loaded)
                 now = time.monotonic()
                 if sess.chunker is not None:
                     # Chunked path: finalize full windows + emit committed+tail.
@@ -1610,7 +1561,7 @@ def create_app(
 
 
 # ===========================================================================
-# BACKEND B: stdlib-only (http.server + minimal RFC 6455 WebSocket)
+# Multipart uploads
 # ===========================================================================
 def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
     """Pull the audio bytes out of a ``multipart/form-data`` upload.
@@ -1689,394 +1640,13 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
 
 
 
-def _ws_accept_key(client_key: str) -> str:
-    h = hashlib.sha1(client_key.encode() + WS_GUID).digest()
-    return base64.b64encode(h).decode()
-
-
-def _ws_read_frame(
-    rfile, on_ping: Optional[Callable[[bytes], None]] = None
-) -> tuple[int, bytes]:
-    def _read_exact(n: int) -> bytes:
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = rfile.read(n - len(buf))
-            if not chunk:
-                raise ConnectionError("websocket closed mid-frame")
-            buf.extend(chunk)
-        return bytes(buf)
-
-    pieces: list[bytes] = []
-    total = 0
-    final_opcode = 0x1
-    while True:
-        hdr = _read_exact(2)
-        b0, b1 = hdr[0], hdr[1]
-        fin = bool(b0 & 0x80)
-        opcode = b0 & 0x0F
-        masked = bool(b1 & 0x80)
-        # RFC 6455 §5.1: client->server frames MUST be masked. A missing mask is
-        # a protocol error; the spec wants a close with code 1002, but tearing
-        # the connection down here is the practical security-equivalent measure.
-        if not masked:
-            raise ConnectionError("unmasked client frame (RFC 6455 violation)")
-        length = b1 & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", _read_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", _read_exact(8))[0]
-        # RFC 6455 §5.5: control frames (close 0x8, ping 0x9, pong 0xA) MUST be
-        # FIN (cannot be fragmented) and MUST NOT exceed 125 bytes payload.
-        # Validate BEFORE reading/unmasking the payload so a malformed oversized
-        # ping is rejected before on_ping could answer it.
-        if opcode in (0x8, 0x9, 0xA):
-            if not fin:
-                raise ValueError(f"control frame {opcode:#x} must have FIN set")
-            if length > 125:
-                raise ValueError(
-                    f"control frame {opcode:#x} payload exceeds 125 bytes ({length})"
-                )
-        # Cap the claimed length so a bogus 2^63 can't wedge _read_exact forever.
-        if length > MAX_WS_FRAME_BYTES:
-            raise ValueError(f"websocket frame too large: {length} bytes")
-        mask = _read_exact(4) if masked else b""
-        payload = _read_exact(length)
-        if masked:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-
-        # Enforce the cap across the *whole* fragmented message, not just per
-        # frame: an unbounded run of <=16 MiB continuation frames could otherwise
-        # assemble an arbitrarily large message (memory exhaustion).
-        if opcode in (0x1, 0x2, 0x0):
-            total += len(payload)
-            if total > MAX_WS_FRAME_BYTES:
-                raise ValueError(
-                    f"websocket message too large: {total} bytes"
-                )
-
-        if opcode == 0x8:
-            raise ConnectionError("client closed")
-        if opcode in (0x9, 0xA):
-            # Ping (0x9) / pong (0xA): control frames may arrive interleaved
-            # with a fragmented data message. Do NOT abandon the accumulated
-            # pieces/total -- handle the control frame inline and keep reading
-            # continuation frames until the data message is complete. (Pong is
-            # a no-op reply.) When an ``on_ping`` callback is supplied (the
-            # stdlib backend passes one that writes the pong frame), answer the
-            # ping *immediately* -- even mid-fragment -- so the peer gets its
-            # pong without waiting for the data message to finish assembling.
-            # Without a callback, a standalone ping (no pending message) is
-            # surfaced to the caller as (0x9, payload) so it can pong; a
-            # mid-fragment ping with no callback cannot be answered here (the
-            # reader only has the rfile) and is held until the message
-            # completes. The FastAPI backend handles its own pings via
-            # Starlette.
-            if opcode == 0x9 and on_ping is not None:
-                on_ping(payload)
-                continue
-            if opcode == 0x9:
-                # No callback: surface a standalone ping so the caller can pong.
-                # A mid-fragment ping is held (preserve state, keep reading).
-                if not pieces:
-                    return 0x9, payload
-                continue
-            continue
-
-        if opcode in (0x1, 0x2):
-            final_opcode = opcode
-            pieces.append(payload)
-        elif opcode == 0x0:
-            pieces.append(payload)
-        else:
-            raise ConnectionError(f"unknown ws opcode {opcode}")
-
-        if fin:
-            return final_opcode, b"".join(pieces)
-
-
-def _ws_write_frame(wfile, opcode: int, payload: bytes) -> None:
-    b0 = 0x80 | (opcode & 0x0F)
-    n = len(payload)
-    if n < 126:
-        header = struct.pack(">BB", b0, n)
-    elif n < 65536:
-        header = struct.pack(">BBH", b0, 126, n)
-    else:
-        header = struct.pack(">BBQ", b0, 127, n)
-    wfile.write(header + payload)
-    wfile.flush()
-
-
-def _ws_send_json(wfile, obj: dict) -> None:
-    _ws_write_frame(wfile, 0x1, json.dumps(obj).encode())
-
-
-def _ws_send_pong(wfile, payload: bytes) -> None:
-    _ws_write_frame(wfile, 0xA, payload)
-
-
-def _serve_stream_session(
-    rfile, wfile, server: StarlingServer, client_addr: tuple
-) -> None:
-    sess = StreamSession(server=server)
-    log.info("WS /stream client connected from %s", client_addr)
-    try:
-        while True:
-            try:
-                opcode, payload = _ws_read_frame(
-                    rfile, on_ping=lambda p: _ws_send_pong(wfile, p)
-                )
-            except ConnectionError:
-                break
-            except socket.timeout:
-                # Idle beyond WS_SOCKET_TIMEOUT_SECONDS -- close cleanly.
-                log.info("WS /stream client %s timed out (idle)", client_addr)
-                break
-
-            if opcode == 0x9:
-                _ws_send_pong(wfile, payload)
-                continue
-            if opcode == 0x1:
-                try:
-                    cmd = json.loads(payload.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    _ws_send_json(wfile, {"type": "error", "message": "bad json"})
-                    continue
-                mtype = cmd.get("type")
-                if mtype == "commit":
-                    if sess.buffered_seconds > 0.0:
-                        try:
-                            if sess.chunker is not None:
-                                _t = sess.stream_flush()
-                                result = TranscribeResult(
-                                    text=_t,
-                                    segments=[{"text": _t, "start_s": 0.0,
-                                               "end_s": sess.buffered_seconds}],
-                                    duration_s=sess.buffered_seconds,
-                                )
-                            else:
-                                result = sess.transcribe_current_sync()
-                        except _Busy:
-                            _ws_send_json(wfile, {"type": "error", "message": "server busy"})
-                            continue
-                        except _Cancelled:
-                            _ws_send_json(wfile, {"type": "error", "message": "cancelled"})
-                            continue
-                    else:
-                        result = TranscribeResult(text="")
-                    _ws_send_json(
-                        wfile,
-                        {
-                            "type": "final",
-                            "text": result.text,
-                            "segments": result.segments,
-                            "duration_s": round(sess.buffered_seconds, 3),
-                        },
-                    )
-                    sess.reset()
-                    continue
-                elif mtype == "ping":
-                    _ws_send_json(wfile, {"type": "pong"})
-                    continue
-                elif mtype == "reset":
-                    sess.reset()
-                    _ws_send_json(wfile, {"type": "reset_ack"})
-                    continue
-                else:
-                    _ws_send_json(wfile, {"type": "error", "message": f"unknown type {mtype!r}"})
-                    continue
-            # append_wav itself sniffs RIFF/WAVE vs raw PCM16.
-            sess.append_wav(payload)
-
-            now = time.monotonic()
-            if sess.chunker is not None:
-                text = sess.stream_step(now)
-                if text is not None:
-                    sess.last_partial_ts = now
-                    _ws_send_json(
-                        wfile,
-                        {
-                            "type": "partial",
-                            "text": text,
-                            "segments": [{"text": text, "start_s": 0.0,
-                                          "end_s": sess.buffered_seconds}],
-                            "start_s": 0.0,
-                            "end_s": sess.buffered_seconds,
-                        },
-                    )
-            elif sess.should_emit_partial(now):
-                try:
-                    result = sess.transcribe_current_sync()
-                except _Busy:
-                    continue
-                except _Cancelled:
-                    continue
-                sess.last_partial_ts = now
-                _ws_send_json(
-                    wfile,
-                    {
-                        "type": "partial",
-                        "text": result.text,
-                        "segments": result.segments,
-                        "start_s": 0.0,
-                        "end_s": sess.buffered_seconds,
-                    },
-                )
-    except Exception as exc:  # pragma: no cover - defensive
-        log.exception("WS /stream error: %s", exc)
-        try:
-            _ws_send_json(wfile, {"type": "error", "message": str(exc)})
-        except Exception:
-            pass
-    finally:
-        log.info("WS /stream client %s disconnected", client_addr)
-
-
-def _build_stdlib_handler(server: StarlingServer):
-    class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
-            log.debug("http %s - %s", self.address_string(), fmt % args)
-
-        server_version = f"starling-server/{SERVER_VERSION}"
-        protocol_version = "HTTP/1.1"
-
-        def _send_json(self, status: int, obj: dict) -> None:
-            body = json.dumps(obj).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self) -> None:  # noqa: N802
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._send_json(400, {"error": "invalid Content-Length", "text": ""})
-                return
-
-            if length > server.config.max_upload_bytes:
-                self.close_connection = True
-                self._send_json(413, {"error": "request body too large", "text": ""})
-                return
-
-            if self.path == "/warmup":
-                # Mirror the FastAPI route: reject instead of a 202 that would
-                # silently no-op on an unloaded model.
-                if not server.loaded:
-                    self._send_json(
-                        409, {"error": "model not loaded", "phase": server.phase()}
-                    )
-                    return
-                threading.Thread(target=server.warmup, daemon=True).start()
-                self._send_json(202, {"status": "warmup started", "phase": server.phase()})
-                return
-
-            body = self.rfile.read(length) if length > 0 else b""
-
-            rid = (
-                self.headers.get("X-Request-Id")
-                or self.headers.get("X-Correlation-Id")
-                or uuid.uuid4().hex
-            )
-
-            if self.path == "/inference":
-                ctype = self.headers.get("Content-Type", "")
-                if "multipart/form-data" in ctype:
-                    payload = _extract_multipart_payload(body, ctype)
-                else:
-                    payload = body
-                if not payload:
-                    self._send_json(400, {"error": "empty upload", "text": ""})
-                    return
-                status, response = _transcribe_payload_sync(server, payload, rid)
-                self._send_json(status, response)
-                return
-
-            if self.path == "/transcribe":
-                if not body:
-                    self._send_json(400, {"error": "empty body", "text": ""})
-                    return
-                status, response = _transcribe_payload_sync(server, body, rid)
-                self._send_json(status, response)
-                return
-
-            self._send_json(404, {"error": "not found"})
-
-        def do_DELETE(self) -> None:  # noqa: N802
-            if self.path.startswith("/inference/"):
-                rid = self.path[len("/inference/"):]
-                cancelled = server.cancel_request(rid) if rid else False
-                self._send_json(
-                    200 if cancelled else 404,
-                    {"status": "cancelled" if cancelled else "not_found", "request_id": rid},
-                )
-                return
-            self._send_json(404, {"error": "not found"})
-
-        def do_GET_ws(self) -> bool:
-            upgrade = self.headers.get("Upgrade", "").lower()
-            if upgrade != "websocket" or self.path != "/stream":
-                return False
-            key = self.headers.get("Sec-WebSocket-Key")
-            if not key:
-                self.send_response(400)
-                self.end_headers()
-                return True
-            accept = _ws_accept_key(key)
-            self.send_response(101)
-            self.send_header("Upgrade", "websocket")
-            self.send_header("Connection", "Upgrade")
-            self.send_header("Sec-WebSocket-Accept", accept)
-            self.end_headers()
-            # Bound the session so a dead/silent client can't pin a handler
-            # thread forever. Setting the socket timeout propagates to the
-            # rfile/wfile buffered file objects used by the frame reader.
-            self.request.settimeout(WS_SOCKET_TIMEOUT_SECONDS)
-            _serve_stream_session(self.rfile, self.wfile, server, self.client_address)
-            return True
-
-        def do_GET(self) -> None:  # noqa: N802
-            if self.do_GET_ws():
-                return
-            if self.path in ("/", "/health"):
-                self._send_json(
-                    200,
-                    {
-                        "status": "ok",
-                        "model": server.model_slug,
-                        "loaded": server.loaded,
-                        "busy": server.is_busy(),
-                        "phase": server.phase(),
-                        "queue_depth": server.queue_depth(),
-                    },
-                )
-                return
-            self._send_json(404, {"error": "not found"})
-
-    return _Handler
-
-
-def _run_stdlib_server(server: StarlingServer, host: str, port: int) -> None:
-    handler_cls = _build_stdlib_handler(server)
-    httpd = ThreadingHTTPServer((host, port), handler_cls)
-    httpd.daemon_threads = True
-    log.info("stdlib server listening on %s:%d", host, port)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        httpd.server_close()
-
-
 # ===========================================================================
 # CLI
 # ===========================================================================
-def _build_arg_parser() -> argparse.ArgumentParser:
+def _build_arg_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m starling.server",
-        description="Unified starling ASR server (granite/parakeet/moss/qwen3/ark/ark06/cohere/higgs/audex/voxtral).",
+        prog=prog,
+        description="Run a local Python speech recognition server.",
     )
     p.add_argument(
         "--model",
@@ -2090,7 +1660,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--profile",
         choices=["file", "realtime", "batch", "accuracy"],
         default="file",
-        help="named serving profile (default file)",
+        help="named serving profile; realtime and batch allow numerical tolerance (default file)",
     )
     p.add_argument(
         "--max-chunk-seconds",
@@ -2158,7 +1728,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--sdpa-attention", action="store_true",
-        help="enable the nearly byte-exact shared SDPA attention path",
+        help="enable shared SDPA attention (requires --tolerance-mode)",
     )
     p.add_argument(
         "--fp8-weights", action="store_true",
@@ -2166,7 +1736,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--tolerance-mode", action="store_true",
-        help="allow validated non-byte-exact optimizations",
+        help="allow optimizations that change floating-point rounding",
     )
     p.add_argument(
         "--max-upload-mb", type=float, default=DEFAULT_MAX_UPLOAD_BYTES / (1024 * 1024),
@@ -2188,11 +1758,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="do not load the model at startup; load lazily on first request instead",
     )
     p.add_argument(
-        "--stdlib",
-        action="store_true",
-        help="force the stdlib-only backend even if FastAPI/uvicorn are available",
-    )
-    p.add_argument(
         "--log-level",
         default="info",
         choices=["debug", "info", "warning", "error"],
@@ -2201,18 +1766,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _have_fastapi() -> bool:
-    try:
-        import fastapi  # noqa: F401
-        import uvicorn  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
-def run(argv: Optional[list[str]] = None) -> int:
+def run(argv: Optional[list[str]] = None, *, prog: str | None = None) -> int:
     """CLI entry point. Loads the model, builds the app, and serves forever."""
-    args = _build_arg_parser().parse_args(argv)
+    args = _build_arg_parser(prog=prog).parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -2232,7 +1788,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         )
         profile_graph_mode = "graphed"
     elif args.profile == "realtime":
-        opt_flags = OptFlags(sdpa_attention=True)
+        opt_flags = OptFlags(tolerance_mode=True, sdpa_attention=True)
         profile_graph_mode = "graphed"
     else:
         opt_flags = OptFlags()
@@ -2242,6 +1798,8 @@ def run(argv: Optional[list[str]] = None) -> int:
         raise SystemExit("--fp8-weights requires --tolerance-mode (or --profile batch)")
     if args.fp8_weights and args.model not in fp8_models:
         raise SystemExit("--fp8-weights is currently implemented only for granite and moss")
+    if args.sdpa_attention and not (args.tolerance_mode or opt_flags.tolerance_mode):
+        raise SystemExit("--sdpa-attention requires --tolerance-mode (or a performance profile)")
     if args.sdpa_attention:
         opt_flags.sdpa_attention = True
     if args.tolerance_mode:
@@ -2269,7 +1827,15 @@ def run(argv: Optional[list[str]] = None) -> int:
         opt_flags=opt_flags,
     )
 
-    use_fastapi = (not args.stdlib) and _have_fastapi()
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn
+        import websockets  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            'Python serving requires the server extra: uv sync --extra server '
+            '(or pip install ".[server]" from the repository)'
+        ) from exc
 
     server = StarlingServer(config=config)
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -2277,8 +1843,6 @@ def run(argv: Optional[list[str]] = None) -> int:
             "binding unauthenticated ASR endpoints to public/non-loopback host %s",
             args.host,
         )
-    if not args.no_eager_load:
-        server.load()
 
     if args.warmup and args.no_eager_load:
         log.warning(
@@ -2291,19 +1855,14 @@ def run(argv: Optional[list[str]] = None) -> int:
         args.host,
         args.port,
         args.model,
-        "fastapi" if use_fastapi else "stdlib",
+        "fastapi",
         config.warmup,
     )
 
-    if use_fastapi:
-        import uvicorn
-
-        app = create_app(server=server, load_on_startup=not args.no_eager_load)
-        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
-    else:
-        _run_stdlib_server(server, args.host, args.port)
+    app = create_app(server=server, load_on_startup=not args.no_eager_load)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(run(prog="python -m starling.server"))

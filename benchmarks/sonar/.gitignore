@@ -1,0 +1,6 @@
+# Isolated SONAR venv, prepared datasets, and run artifacts.
+.venv/
+data/
+results/
+__pycache__/
+*.pyc

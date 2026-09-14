@@ -13,9 +13,3 @@ decode + fused Triton elementwise kernels follow the granite design.
 Shared architecture constants live in :mod:`starling.qwen3.config`.
 """
 
-# Ensure the shared transformers install exposes qwen3_asr BEFORE any caller
-# does `from transformers import Qwen3ASRForConditionalGeneration`. Importing
-# this package triggers the restore; run it eagerly here so a bare
-# `import starling.qwen3` is enough. (See _tf_bootstrap for why this is needed.)
-from . import _tf_bootstrap as _tf_bootstrap  # noqa: F401
-

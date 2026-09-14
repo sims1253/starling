@@ -19,8 +19,8 @@ Usage::
     uv run python benchmarks/fleurs_download.py --out models/fleurs_test \\
         --split test --fleurs de_de:50 --fleurs en_us:50
 
-Idempotent: a ``<config>_<split>.done`` marker per config makes re-runs
-resume where they failed.
+A configuration is complete only when every requested WAV and transcript
+exists. Increasing the clip budget fetches the larger corpus.
 """
 
 from __future__ import annotations
@@ -90,12 +90,15 @@ def main() -> int:
         for cfg in PARAKEET_V3_LANGS:
             budget[cfg] = max(budget.get(cfg, 0), args.fleurs_25)
 
+    if not budget or any(n <= 0 for n in budget.values()):
+        ap.error("request at least one configuration with a positive clip count")
+
     args.out.mkdir(parents=True, exist_ok=True)
     import subprocess
     failed = []
     for cfg, n in budget.items():
-        marker = args.out / f"{cfg}_{args.split}.done"
-        if marker.exists():
+        if all((args.out / f"{cfg}_{args.split}_{i}{suffix}").is_file()
+               for i in range(n) for suffix in (".wav", ".txt")):
             print(f"[skip] {cfg} ({args.split}): done", flush=True)
             continue
         print(f"[fetch] {cfg} ({args.split}) x{n} ...", flush=True)
@@ -106,9 +109,7 @@ def main() -> int:
             ok = r.returncode == 0
         except subprocess.TimeoutExpired:
             ok = False
-        if ok:
-            marker.touch()
-        else:
+        if not ok:
             failed.append(cfg)
             print(f"[fail] {cfg} (timeout or rc!=0)", flush=True)
     if failed:

@@ -284,3 +284,66 @@ def test_pipeline_respects_custom_config():
         f"custom K=8 not plumbed into GraphedDecoder; got "
         f"{dec.steps_per_replay}"
     )
+
+
+@pytest.fixture
+def autotune_lock_env(monkeypatch, tmp_path):
+    import functools
+    from starling.gpu import session
+
+    if session.fcntl is None:
+        pytest.skip("flock requires POSIX")
+    monkeypatch.delenv("STARLING_GPU_LOCK_DISABLE", raising=False)
+    monkeypatch.delenv("STARLING_GPU_LOCK_FD", raising=False)
+    lock = functools.partial(
+        session.GpuSession, uuid="autotune-test", lock_dir=str(tmp_path),
+        wait=False, heartbeat=False,
+    )
+    monkeypatch.setattr(at, "with_gpu_lock", lock)
+    monkeypatch.setattr(at, "detect_gpu", lambda: KernelConfig(
+        gpu_name="test", gpu_vram_gb=8, compute_capability=(8, 0),
+        steps_per_replay=1, chunk_batch_size=1, autotuned=False,
+    ))
+    monkeypatch.setattr(at, "chunk_batch_size_from_vram", lambda: 1)
+    monkeypatch.setattr(at, "_run_sweep", lambda *args, **kwargs: {1: 1.0})
+    return lock
+
+
+def test_autotune_stale_token_does_not_skip_lock(autotune_lock_env, monkeypatch, tmp_path):
+    from starling.gpu.session import GpuLockBusy
+
+    lock = autotune_lock_env
+    with lock(session=at._AUTOTUNE_SESSION) as holder:
+        token_path = holder.lock_path
+    # Old code consulted this compatibility attribute and trusted session text.
+    monkeypatch.setattr(at, "LOCK_PATH", token_path, raising=False)
+
+    def sweep(*args, **kwargs):
+        with pytest.raises(GpuLockBusy):
+            lock(session="contender").acquire()
+        return {1: 1.0}
+
+    monkeypatch.setattr(at, "_run_sweep", sweep)
+    assert at.autotune(None, None, cache_dir=tmp_path).autotuned
+    with lock(session="after-sweep"):
+        pass
+
+
+def test_autotune_matching_owner_token_does_not_bypass_contention(
+    autotune_lock_env, monkeypatch, tmp_path,
+):
+    from starling.gpu.session import GpuLockBusy
+
+    with autotune_lock_env(session=at._AUTOTUNE_SESSION) as holder:
+        monkeypatch.setattr(at, "LOCK_PATH", holder.lock_path, raising=False)
+        with pytest.raises(GpuLockBusy):
+            at.autotune(None, None, cache_dir=tmp_path)
+
+
+def test_autotune_explicit_nested_lock_keeps_outer_owner(autotune_lock_env, tmp_path):
+    from starling.gpu.session import GpuLockBusy
+
+    with autotune_lock_env(session="benchmark"):
+        assert at.autotune(None, None, acquire_lock=False, cache_dir=tmp_path).autotuned
+        with pytest.raises(GpuLockBusy):
+            autotune_lock_env(session="contender").acquire()

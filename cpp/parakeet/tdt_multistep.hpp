@@ -51,12 +51,4 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     const std::vector<int32_t>& durations,
     int blank_id, int max_symbols);
 
-// Drop every cached K-step decode graph (each holds a ReplayGraph that owns a
-// device buffer + a captured CUDA graph). Registered with
-// register_decode_cache_clearer() so shutdown_backend() frees these WHILE the
-// CUDA driver is still alive (rather than by static destruction at process
-// exit, which runs after the driver's own atexit handler and aborts). Safe to
-// call when no graph was ever built (no-op) and idempotent.
-void clear_kstep_cache();
-
 } // namespace starling::ggml::parakeet

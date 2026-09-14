@@ -1,8 +1,5 @@
-// device_cache.hpp — device-resident KV cache + RoPE tables. One cache per
-// process; graphs reference the k/v tensors and RoPE tables as fixed leaves;
-// zeroed at the start of each utterance and freed by the decode-cache
-// clearer before backend teardown. Per-model get_device_cache() wrappers
-// bind this to their LlmConfig.
+// Device-resident KV and RoPE tensors. Owned by one loaded model; captured
+// graphs are destroyed before this cache, and the backend outlives both.
 #pragma once
 
 #include "runtime/backend.hpp"

@@ -18,10 +18,12 @@
 // The greedy budget mirrors the model card + the Python pipeline:
 // min(1.3 * prompt_len + 32, max_cache_len - prompt_len - 1).
 #include "loader.hpp"
+#include "lib/capi_helpers.hpp"
 #include "llm.hpp"
 #include "lib/bpe_tokenizer.hpp"
 #include "lib/embed_scatter.hpp"
 #include "runtime/graph.hpp"
+#include "runtime/backend.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -38,15 +40,8 @@ namespace {
 
 thread_local std::string g_load_error;
 
-struct S1Ctx {
-    std::unique_ptr<starling::ggml::s1::S1Model> model;
-    starling::ggml::lib::BpeTokenizer tokenizer;
-    std::string err;
-};
-
-void report(const char** out, const std::string& message) {
-    if (out) *out = message.c_str();
-}
+using S1Ctx = starling::ggml::lib::EngineContext<starling::ggml::s1::S1Model, starling::ggml::lib::BpeTokenizer>;
+using starling::ggml::lib::report;
 
 void report_load_error(const char** out, const std::string& message) {
     g_load_error = message;
@@ -95,8 +90,7 @@ void* starling_ggml_s1_load(const char* gguf_path, const char** err_out) {
         }
         // Persist weights + force backend creation (and its orderly atexit
         // shutdown registration) across all normalization calls.
-        ctx->model->loader.realize_weights(starling::ggml::global_backend());
-        starling::ggml::register_decode_cache_clearer([]() {});
+        starling::ggml::ensure_weights_realized(ctx->model->loader);
         if (err_out) *err_out = nullptr;
         return ctx.release();
     } catch (const std::exception& e) {

@@ -162,9 +162,10 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
     // mirrors prediction.cpp's per-step LSTM graph fused with the joint + argmax.
     // The prediction output (top layer's h') feeds the joint's pred projection
     // DIRECTLY on the device (never read back).
+    auto& fused_replay_ = ml_.cache<FusedReplay>();
     if (!fused_replay_) {
-        fused_replay_ = std::unique_ptr<FusedReplay>(new FusedReplay());
-        FusedReplay* r = fused_replay_.get();
+        auto pending = std::unique_ptr<FusedReplay>(new FusedReplay());
+        FusedReplay* r = pending.get();
         r->H_pred = Hp; r->L_pred = L; r->H_joint = Hj;
         r->cap_h.assign(L, std::vector<float>((size_t)Hp));
         r->cap_c.assign(L, std::vector<float>((size_t)Hp));
@@ -208,10 +209,10 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
                     ggml_tensor* z = ggml_add(ctx,
                         ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                         ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_in),     bhh));
-                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, 0)));
-                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp * sizeof(float))));
-                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)2 * Hp * sizeof(float))));
-                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3 * Hp * sizeof(float))));
+                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, 0));
+                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp * sizeof(float)));
+                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_view_1d(ctx, z, Hp, (size_t)2 * Hp * sizeof(float)));
+                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3 * Hp * sizeof(float)));
                     ggml_tensor* c_out = ggml_add(ctx, ggml_mul(ctx, f, c_in), ggml_mul(ctx, i, gg));
                     ggml_tensor* h_out = ggml_mul(ctx, o, ggml_tanh(ctx, c_out));
                     capture_graph_output(c_out, &r->cap_c[l]);
@@ -243,6 +244,7 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
                 return tok_amax;
             }));
         assert(r->rg->n_inputs() == 1 && "fused step graph must have 1 coalesced input");
+        fused_replay_ = std::move(pending);
     }
 
     // Host-pack the coalesced input (no syncs): enc_proj_t, then the looked-up

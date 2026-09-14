@@ -32,7 +32,6 @@ from transformers import StoppingCriteria
 from .config import (
     AUTOMIX_DTYPE,
     DO_SAMPLE,
-    EOS_TOKEN_ID,
     LENGTH_PENALTY,
     MAX_NEW_TOKENS,
     MIN_LENGTH,

@@ -25,35 +25,65 @@ namespace {
 using lib::weight;
 using lib::bf16;
 using lib::f32;
+using lib::gemm_act;
+
+} // namespace
+
+// F32-activation discipline for the encoder+adapter (GPU + quantized linears
+// only): same math, no bf16 round-trips. CPU keeps the exact bf16-oracle
+// discipline. Auto-falls-back for unquantized models, mirroring
+// lib::use_f32_acts.
+bool encoder_f32(const MossModel& model) {
+    if (!global_backend().is_gpu()) return false;
+    ggml_tensor* w = model.loader.tensor("enc.blk.0.attn.q.weight");
+    return w && ggml_is_quantized(w->type);
+}
+
+namespace {
 // nn.Linear in the BF16 oracle: the GEMM and bias constitute one operation and
 // expose a BF16 tensor. ggml GEMM exposes F32, so round at that boundary.
+// In F mode the F32 result flows through (gemm_act already routes F32 for
+// quantized weights, so this is also robust for unquantized ones).
 ggml_tensor* linear(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
-                    const std::string& n, bool bias) {
-    return lib::linear_bf16(c, ml, x, n, bias);
+                    const std::string& n, bool bias, bool F) {
+    if (!F) return lib::linear_bf16(c, ml, x, n, bias);
+    ggml_tensor* w = weight(c, ml, n + ".weight");
+    ggml_tensor* y = ggml_mul_mat(c, w, gemm_act(c, w, x));
+    if (bias) y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
+    return y;
 }
-ggml_tensor* conv2d_bf16(ggml_context* c, ggml_tensor* kernel, ggml_tensor* input) {
+ggml_tensor* conv2d_bf16(ggml_context* c, ggml_tensor* kernel, ggml_tensor* input, bool F) {
     // Use ggml's canonical Conv2d builder. Its im2col kernels do not accept a
     // BF16 destination on CUDA, so present the BF16 values as F32 and round the
     // convolution output immediately back to the oracle's BF16 boundary.
-    return bf16(c, ggml_conv_2d(c, f32(c, kernel), f32(c, input),
-                                2, 2, 1, 1, 1, 1));
+    ggml_tensor* y = ggml_conv_2d(c, f32(c, kernel), f32(c, input),
+                                  2, 2, 1, 1, 1, 1);
+    return F ? y : bf16(c, y);
 }
 
-ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
+ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x, bool F) {
     // ggml_gelu is the tanh approximation. GELU_ERF is the required
     // approximate="none" path. Generic elementwise kernels are F32, then we
     // immediately restore the ATen BF16 output boundary.
-    return lib::gelu_erf_bf16(c, x);
+    if (F) return ggml_gelu_erf(c, f32(c, x));
+    return lib::gelu_erf_bf16(c, bf16(c, x));
 }
-ggml_tensor* add_bf16(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
+ggml_tensor* add_bf16(ggml_context* c, ggml_tensor* a, ggml_tensor* b, bool F) {
+    // F: plain F32 add (upcasts are identities past the first layer, and the
+    // pe-entry rounding is preserved by the caller's bf16(pe) argument).
+    if (F) return ggml_add(c, f32(c, a), f32(c, b));
     return lib::addb(c, a, b);
 }
 ggml_tensor* layer_norm(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
-                        const std::string& n, float eps) {
+                        const std::string& n, float eps, bool F) {
     // PyTorch ordinary LayerNorm: F32 reduction and affine, one final BF16
     // store. Do not use the fused NORM+MUL+ADD patch: retaining its F32 result
     // through the following GEMM violates the explicit cast policy.
-    return lib::layer_norm_bf16(c, ml, x, n, eps);
+    if (!F) return lib::layer_norm_bf16(c, ml, x, n, eps);
+    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
+    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
+    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
+    return y;
 }
 
 bool debug_enabled() {
@@ -108,9 +138,11 @@ void pack_mel_into(const MelFeatures& mel, const MelShape& s,
 // the concat boundaries are no-ops on the bf16-representable values. This cuts
 // the node count from 32 layers x n_windows sub-graphs to 32 x 2.
 // `q/k/v` are [d_model, A] bf16. Returns [d_model, A] bf16.
+// In F mode all boundaries stay F32 (same math, no round-trips).
 ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
                                 const EncoderConfig& ec,
-                                ggml_tensor* q, ggml_tensor* k, ggml_tensor* v) {
+                                ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
+                                bool F) {
     const int A = s.A, M = s.M;
     const int H = (int)ec.n_heads, D = (int)ec.head_dim;
     const int W = M * ((int)ec.n_window_infer / 100);
@@ -131,12 +163,16 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
         ggml_tensor* qw = batch(q), * kw = batch(k), * vw = batch(v);
         // BF16 QK GEMM result and BF16 scalar multiply boundaries, followed by
         // F32 softmax and BF16 probabilities (same boundaries as the per-window path).
-        ggml_tensor* scores = bf16(ctx, ggml_mul_mat(ctx, kw, qw));        // [W,W,H,n_full]
-        scores = bf16(ctx, ggml_scale(ctx, f32(ctx, scores), scale));
-        ggml_tensor* prob = ggml_soft_max_ext(ctx, f32(ctx, scores), nullptr, 1.0f, 0.0f);
-        prob = bf16(ctx, prob);
+        // In F mode the boundaries stay F32 (identical math otherwise).
+        ggml_tensor* scores = ggml_mul_mat(ctx, kw, qw);        // [W,W,H,n_full]
+        if (!F) scores = bf16(ctx, scores);
+        scores = ggml_scale(ctx, F ? scores : f32(ctx, scores), scale);
+        if (!F) scores = bf16(ctx, scores);
+        ggml_tensor* prob = ggml_soft_max_ext(ctx, F ? scores : f32(ctx, scores), nullptr, 1.0f, 0.0f);
+        if (!F) prob = bf16(ctx, prob);
         ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, vw, 1, 0, 2, 3));  // [W,D,H,n_full]
-        ggml_tensor* co = bf16(ctx, ggml_mul_mat(ctx, vt, prob));            // [D,W,H,n_full]
+        ggml_tensor* co = ggml_mul_mat(ctx, vt, prob);            // [D,W,H,n_full]
+        if (!F) co = bf16(ctx, co);
         co = ggml_cont(ctx, ggml_permute(ctx, co, 0, 2, 1, 3));              // [D,H,W,n_full]
         // [D,H,W,n_full] contiguous -> [d_model=D*H, W*n_full], token order
         // (window j, pos w) -> column w + j*W == concat(window_0..window_{n_full-1}).
@@ -154,18 +190,22 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
             return ggml_cont(ctx, ggml_permute(ctx, vw, 0, 2, 1, 3));   // [D,tail_S,H]
         };
         ggml_tensor* qw = window(q), * kw = window(k), * vw = window(v);
-        ggml_tensor* scores = bf16(ctx, ggml_mul_mat(ctx, kw, qw));
-        scores = bf16(ctx, ggml_scale(ctx, f32(ctx, scores), scale));
-        ggml_tensor* prob = ggml_soft_max_ext(ctx, f32(ctx, scores), nullptr, 1.0f, 0.0f);
-        prob = bf16(ctx, prob);
+        ggml_tensor* scores = ggml_mul_mat(ctx, kw, qw);
+        if (!F) scores = bf16(ctx, scores);
+        scores = ggml_scale(ctx, F ? scores : f32(ctx, scores), scale);
+        if (!F) scores = bf16(ctx, scores);
+        ggml_tensor* prob = ggml_soft_max_ext(ctx, F ? scores : f32(ctx, scores), nullptr, 1.0f, 0.0f);
+        if (!F) prob = bf16(ctx, prob);
         ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, vw, 1, 0, 2, 3));  // [tail_S,D,H]
-        ggml_tensor* co = bf16(ctx, ggml_mul_mat(ctx, vt, prob));            // [D,tail_S,H]
+        ggml_tensor* co = ggml_mul_mat(ctx, vt, prob);            // [D,tail_S,H]
+        if (!F) co = bf16(ctx, co);
         co = ggml_cont(ctx, ggml_permute(ctx, co, 0, 2, 1, 3));
         joined_tail = ggml_reshape_2d(ctx, co, ec.d_model, tail_S);
     }
 
     if (joined_full && joined_tail)
-        return bf16(ctx, ggml_concat(ctx, f32(ctx, joined_full), f32(ctx, joined_tail), 1));
+        return F ? ggml_concat(ctx, joined_full, joined_tail, 1)
+                 : bf16(ctx, ggml_concat(ctx, f32(ctx, joined_full), f32(ctx, joined_tail), 1));
     return joined_full ? joined_full : joined_tail;
 }
 
@@ -185,6 +225,9 @@ ggml_tensor* build_encoder_body(ggml_context* ctx, const MossModel& model,
     const auto& ec = model.config.encoder;
     const ModelLoader& ml = model.loader;
     const int C = s.C, P = s.P, M = s.M, A = s.A;
+    // F32-activation discipline (GPU + quantized linears): same math, no
+    // bf16 round-trips. Computed once per build; CPU keeps the exact oracle.
+    const bool F = encoder_f32(model);
 
     int64_t ine[4] = {P, 128, 1, C};
     ggml_tensor* x = graph_input_tensor(ctx, GGML_TYPE_BF16, 4, ine,
@@ -193,68 +236,79 @@ ggml_tensor* build_encoder_body(ggml_context* ctx, const MossModel& model,
     for (int i = 0; i < 3; ++i) {
         const std::string n = "enc.conv" + std::to_string(i + 1);
         ggml_tensor* cw = weight(ctx, ml, n + ".weight");
-        x = conv2d_bf16(ctx, cw, x);
+        x = conv2d_bf16(ctx, cw, x, F);
         x = ggml_add(ctx, f32(ctx, x),
                      ggml_reshape_4d(ctx, f32(ctx, weight(ctx, ml, n + ".bias")),
                                      1, 1, channels[i], 1));
-        x = exact_gelu(ctx, bf16(ctx, x));   // conv boundary, then exact GELU boundary
+        x = exact_gelu(ctx, x, F);   // conv boundary, then exact GELU boundary
     }
     // [M,16,480,C] -> contiguous [16,480,M,C], flatten each time row.
     x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));
     x = ggml_reshape_2d(ctx, x, 16 * 480, (int64_t)M * C);
-    x = linear(ctx, ml, x, "enc.conv_out", false);
+    x = linear(ctx, ml, x, "enc.conv_out", false, F);
 
     ggml_tensor* pet = weight(ctx, ml, "enc.positional_embedding");
     ggml_tensor* pe = ggml_view_2d(ctx, pet, ec.d_model, M, pet->nb[1], 0);
-    x = add_bf16(ctx, x, bf16(ctx, pe));
+    x = add_bf16(ctx, x, bf16(ctx, pe), F);
     int64_t vne[1] = {A};
     ggml_tensor* vi = graph_input_tensor(ctx, GGML_TYPE_I32, 1, vne,
         valid_host, (size_t)A * sizeof(int32_t));
-    x = bf16(ctx, ggml_get_rows(ctx, x, vi));
+    ggml_tensor* gathered = ggml_get_rows(ctx, x, vi);
+    x = F ? gathered : bf16(ctx, gathered);
     if (debug && dbg_conv) capture_graph_output(f32(ctx, x), dbg_conv);
 
     for (int li = 0; li < (int)ec.n_layers; ++li) {
         const std::string pre = "enc.blk." + std::to_string(li) + ".";
         ggml_tensor* r = x;
-        ggml_tensor* n = layer_norm(ctx, ml, x, pre + "attn_norm", ec.layer_norm_eps);
-        ggml_tensor* q = linear(ctx, ml, n, pre + "attn.q", true);
-        ggml_tensor* k = linear(ctx, ml, n, pre + "attn.k", true);
-        ggml_tensor* v = linear(ctx, ml, n, pre + "attn.v", true);
-        ggml_tensor* joined = windowed_attention(ctx, s, ec, q, k, v);
-        ggml_tensor* a = linear(ctx, ml, joined, pre + "attn.o", true);
-        x = add_bf16(ctx, r, a);
+        ggml_tensor* n = layer_norm(ctx, ml, x, pre + "attn_norm", ec.layer_norm_eps, F);
+        ggml_tensor* q = linear(ctx, ml, n, pre + "attn.q", true, F);
+        ggml_tensor* k = linear(ctx, ml, n, pre + "attn.k", true, F);
+        ggml_tensor* v = linear(ctx, ml, n, pre + "attn.v", true, F);
+        ggml_tensor* joined = windowed_attention(ctx, s, ec, q, k, v, F);
+        ggml_tensor* a = linear(ctx, ml, joined, pre + "attn.o", true, F);
+        x = add_bf16(ctx, r, a, F);
         r = x;
-        n = layer_norm(ctx, ml, x, pre + "ffn_norm", ec.layer_norm_eps);
-        ggml_tensor* h = linear(ctx, ml, n, pre + "ffn.fc1", true);
-        h = exact_gelu(ctx, h);
-        h = linear(ctx, ml, h, pre + "ffn.fc2", true);
-        x = add_bf16(ctx, r, h);
+        n = layer_norm(ctx, ml, x, pre + "ffn_norm", ec.layer_norm_eps, F);
+        ggml_tensor* h = linear(ctx, ml, n, pre + "ffn.fc1", true, F);
+        h = exact_gelu(ctx, h, F);
+        h = linear(ctx, ml, h, pre + "ffn.fc2", true, F);
+        x = add_bf16(ctx, r, h, F);
         if (debug && dbg_l0 && li == 0) capture_graph_output(f32(ctx, x), dbg_l0);
         if (debug && dbg_l31 && li == 31) capture_graph_output(f32(ctx, x), dbg_l31);
     }
-    x = layer_norm(ctx, ml, x, "enc.ln_post", ec.layer_norm_eps);
+    x = layer_norm(ctx, ml, x, "enc.ln_post", ec.layer_norm_eps, F);
     if (debug && dbg_post) capture_graph_output(f32(ctx, x), dbg_post);
-    x = linear(ctx, ml, x, "enc.proj1", true);
-    x = exact_gelu(ctx, x);
-    return linear(ctx, ml, x, "enc.proj2", true);   // BF16 proj2 output
+    x = linear(ctx, ml, x, "enc.proj1", true, F);
+    x = exact_gelu(ctx, x, F);
+    return linear(ctx, ml, x, "enc.proj2", true, F);   // BF16 proj2 output (F32 in F mode)
 }
 
 // Append the adapter (gate/up SiLU-mul down) to the encoder body output. `x` is
 // the BF16 proj2 output, which is bit-identical to the host f32->bf16 round-trip
 // the standalone apply_adapter performs (those values are BF16-representable, so
 // ggml_fp32_to_bf16 is the identity). Returns the F32 adapter output.
-ggml_tensor* build_adapter(ggml_context* ctx, const MossModel& model, ggml_tensor* x) {
+// In F mode the body output is F32 and the boundaries stay F32 (same math).
+ggml_tensor* build_adapter(ggml_context* ctx, const MossModel& model, ggml_tensor* x, bool F) {
     const ModelLoader& ml = model.loader;
     auto lin = [&](const char* n, ggml_tensor* z) {
-        return ggml_cast(ctx, ggml_mul_mat(ctx, clone_weight(ctx, ml, n), z), GGML_TYPE_BF16);
+        ggml_tensor* w = clone_weight(ctx, ml, n);
+        ggml_tensor* y = ggml_mul_mat(ctx, w, F ? f32(ctx, z) : gemm_act(ctx, w, z));
+        return F ? y : ggml_cast(ctx, y, GGML_TYPE_BF16);
     };
     ggml_tensor* g = lin("adapter.gate.weight", x);
     ggml_tensor* u = lin("adapter.up.weight", x);
     // ATen boundaries: BF16 gate -> F32 SiLU -> BF16, then one BF16 multiply
     // result before the down projection. Generic ggml elementwise is F32-only.
-    ggml_tensor* a = ggml_cast(ctx, ggml_silu(ctx, ggml_cast(ctx, g, GGML_TYPE_F32)), GGML_TYPE_BF16);
-    ggml_tensor* z = ggml_cast(ctx, ggml_mul(ctx, ggml_cast(ctx, a, GGML_TYPE_F32),
-                                             ggml_cast(ctx, u, GGML_TYPE_F32)), GGML_TYPE_BF16);
+    ggml_tensor* a;
+    ggml_tensor* z;
+    if (F) {
+        a = ggml_silu(ctx, g);
+        z = ggml_mul(ctx, a, u);
+    } else {
+        a = ggml_cast(ctx, ggml_silu(ctx, ggml_cast(ctx, g, GGML_TYPE_F32)), GGML_TYPE_BF16);
+        z = ggml_cast(ctx, ggml_mul(ctx, ggml_cast(ctx, a, GGML_TYPE_F32),
+                                    ggml_cast(ctx, u, GGML_TYPE_F32)), GGML_TYPE_BF16);
+    }
     return ggml_cast(ctx, lin("adapter.down.weight", z), GGML_TYPE_F32);
 }
 
@@ -319,7 +373,7 @@ bool encode_audio(const MossModel& model, const MelFeatures& mel,
 // gallocr + captured CUDA graph per distinct shape until exit (the Wave H OOM
 // bug); LRU evicts the least-recently-used shape (freeing its device buffer) at
 // capacity. The parakeet encoder ReplayCache (cpp/parakeet/encoder.{hpp,cpp})
-// uses the same bounded helper. Cleared via register_decode_cache_clearer.
+// uses the same bounded helper. Freed with the owning model.
 // Capture is GPU-only; CPU and the STARLING_MOSS_DEBUG diagnostic path keep the
 // one-shot encode_audio + apply_adapter pair.
 // ---------------------------------------------------------------------------
@@ -342,19 +396,13 @@ struct ShapeKeyHash { size_t operator()(const ShapeKey& k) const noexcept {
 // STARLING_REPLAY_CACHE_SIZE env var is read at first encode, not at process
 // start. reset() (the decode-cache clearer) frees every cached ReplayGraph
 // while the backend is still alive.
-std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>> g_encoder_cache;
-std::once_flag g_encoder_cache_once;
-
-void register_encoder_cache_clearer_once() {
-    std::call_once(g_encoder_cache_once, [] {
-        register_decode_cache_clearer([] { g_encoder_cache.reset(); });
-    });
-}
+using EncoderCache = LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>;
 } // namespace
 
 // Current number of cached encoder graphs (diagnostic / regression-test hook).
-size_t encoder_replay_cache_size() {
-    return g_encoder_cache ? g_encoder_cache->size() : 0;
+size_t encoder_replay_cache_size(const MossModel& model) {
+    const auto* cache = model.loader.find_cache<EncoderCache>();
+    return cache ? cache->size() : 0;
 }
 
 bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
@@ -372,10 +420,8 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
         err = "invalid MOSS mel shape/data"; return false;
     }
 
-    register_encoder_cache_clearer_once();
-    if (!g_encoder_cache)
-        g_encoder_cache = std::unique_ptr<LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>>(
-            new LruCache<ShapeKey, EncoderReplayEntry, ShapeKeyHash>(replay_cache_size()));
+    auto& encoder_cache = model.loader.cache<EncoderCache>();
+    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
 
     const MelShape s = mel_shape(mel.n_frames);
     ShapeKey key{s.C, s.tail};
@@ -383,7 +429,7 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
     // it: the ReplayGraph build lambda captures the stable pool pointers. On a
     // miss at capacity the LRU shape is evicted (its ReplayGraph freed) before
     // this entry is inserted.
-    EncoderReplayEntry& e = *g_encoder_cache->get_or_init(key,
+    EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
         [&](EncoderReplayEntry& entry) {
             entry.shape = s;
             entry.chunks_buf = reinterpret_cast<ggml_bf16_t*>(
@@ -396,7 +442,7 @@ bool encode_audio_and_adapt(const MossModel& model, const MelFeatures& mel,
                                                            entry.chunks_buf, entry.valid_buf,
                                                            /*debug=*/false,
                                                            nullptr, nullptr, nullptr, nullptr);
-                    return build_adapter(ctx, model, body);
+                    return build_adapter(ctx, model, body, encoder_f32(model));
                 });
         });
     // Refresh the two inputs in their stable pool buffers, then re-upload

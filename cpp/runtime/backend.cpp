@@ -13,6 +13,7 @@
 
 #include "graph.hpp"
 #include "imatrix.hpp"
+#include "lru_cache.hpp"
 #include "model_loader.hpp"
 
 #include "ggml.h"
@@ -80,9 +81,47 @@ thread_local std::vector<PendingCapture>* t_pending_captures = nullptr;
 // Side-effect expansion roots registered during the current build (Wave D
 // decode-state write-back cpys): nodes that must execute but are not read back.
 thread_local std::vector<ggml_tensor*>*    t_pending_roots = nullptr;
+// [starling pos-cache] tensors marked persistent during the current build.
+thread_local std::vector<ggml_tensor*>*   t_pending_persistent = nullptr;
+
+// Restore registration state on normal return, exceptions and nested builds.
+struct BuildScope {
+    Backend* previous_backend = t_active_backend;
+    std::vector<PendingInput>* previous_inputs = t_pending_inputs;
+    std::vector<PendingCapture>* previous_captures = t_pending_captures;
+    std::vector<ggml_tensor*>* previous_roots = t_pending_roots;
+    std::vector<ggml_tensor*>* previous_persistent = t_pending_persistent;
+    BuildScope(Backend& backend, std::vector<PendingInput>& inputs,
+               std::vector<PendingCapture>& captures, std::vector<ggml_tensor*>& roots,
+               std::vector<ggml_tensor*>* persistent_marks = nullptr) {
+        t_active_backend = &backend;
+        t_pending_inputs = &inputs;
+        t_pending_captures = &captures;
+        t_pending_roots = &roots;
+        t_pending_persistent = persistent_marks;
+    }
+    ~BuildScope() {
+        t_active_backend = previous_backend;
+        t_pending_inputs = previous_inputs;
+        t_pending_captures = previous_captures;
+        t_pending_roots = previous_roots;
+        t_pending_persistent = previous_persistent;
+    }
+};
 
 constexpr size_t kGraphSize = 32768;  // max nodes in one ggml_cgraph (bumped for
                                           // the moss K-step multistep decode graph)
+
+// Device-class fallback for the per-shape replay-graph LRU caches (see
+// runtime/lru_cache.hpp). kDefaultReplayCacheSize assumes discrete-GPU VRAM:
+// on integrated GPUs — and any card whose reported memory is small — the
+// weights and every cached per-shape encoder graph share one window, and a
+// 4 GB-class model plus 16 cached graphs exhausts an 8 GB GTT mid-stream
+// (observed as radv "not enough memory for command submission" -> device
+// lost). Written once per Backend construction from the chosen device's
+// properties; reads are lock-free.
+std::atomic<size_t> g_device_replay_cache_default{kDefaultReplayCacheSize};
+constexpr size_t kSharedWindowTotalBytes = size_t(12) << 30;  // 12 GiB
 
 // The ggml_backend_sched_eval_callback trampoline feeding the ImatrixCollector
 // (see imatrix.hpp). NOTE: returning true does NOT force the node onto the
@@ -104,6 +143,14 @@ struct Backend::Impl {
     ggml_gallocr_t galloc = nullptr;        // persistent, reused across one-shot computes
     ggml_backend_sched_t sched = nullptr;   // lazy; GPU op offload + imatrix collection
     bool use_sched = false;                 // true iff a GPU backend is active
+
+    ~Impl() {
+        if (shutting_down()) return;
+        if (sched) ggml_backend_sched_free(sched);
+        if (galloc) ggml_gallocr_free(galloc);
+        if (use_sched && cpu_backend) ggml_backend_free(cpu_backend);
+        if (backend) ggml_backend_free(backend);
+    }
 
     // Create the sched on first need: {GPU, CPU} when a GPU is active, the
     // lone CPU backend otherwise (a duplicated entry would confuse sched's
@@ -170,6 +217,16 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
         impl_->backend = ggml_backend_dev_init(chosen, nullptr);
+        // Record the replay-cache default for this device class before any
+        // model can construct its per-shape caches.
+        struct ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(chosen, &props);
+        const bool shared_window =
+            props.type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+            (props.memory_total > 0 && props.memory_total < kSharedWindowTotalBytes);
+        g_device_replay_cache_default.store(
+            shared_window ? kSharedMemoryReplayCacheSize : kDefaultReplayCacheSize,
+            std::memory_order_relaxed);
     }
     if (!impl_->backend) {
         // CPU fallback (always available).
@@ -199,18 +256,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
 }
 
-Backend::~Backend() {
-    // Skip frees if the CUDA driver is already gone (post-shutdown teardown).
-    if (shutting_down()) { delete impl_; return; }
-    if (impl_) {
-        if (impl_->sched)    ggml_backend_sched_free(impl_->sched);
-        if (impl_->galloc)   ggml_gallocr_free(impl_->galloc);
-        // On GPU we own cpu_backend separately; on CPU it aliases backend.
-        if (impl_->use_sched && impl_->cpu_backend) ggml_backend_free(impl_->cpu_backend);
-        if (impl_->backend)  ggml_backend_free(impl_->backend);
-        delete impl_;
-    }
-}
+Backend::~Backend() = default;
 
 void Backend::set_n_threads(int n_threads) {
     n_threads_ = n_threads < 1 ? 1 : n_threads;
@@ -298,25 +344,19 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    ggml_context* ctx = ggml_init(params);
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_owner(ggml_init(params), ggml_free);
+    ggml_context* ctx = ctx_owner.get();
     if (!ctx) return false;
-
-    std::vector<PendingInput>   pin;
+    std::vector<PendingInput> pin;
     std::vector<PendingCapture> pcap;
-    t_active_backend = this;
-    t_pending_inputs = &pin;
-    t_pending_captures = &pcap;
     std::vector<ggml_tensor*> roots;
-    t_pending_roots = &roots;
+    ggml_tensor* out_t;
+    {
+        BuildScope scope(*this, pin, pcap, roots);
+        out_t = build(ctx);
+    }
 
-    ggml_tensor* out_t = build(ctx);
-
-    t_pending_inputs = nullptr;
-    t_pending_captures = nullptr;
-    t_pending_roots = nullptr;
-    t_active_backend = nullptr;
-
-    if (!out_t) { ggml_free(ctx); return false; }
+    if (!out_t) return false;
     ggml_set_output(out_t);  // mark output so the allocator keeps it
 
     // 2. Build the cgraph (capacity = kGraphSize; default 2048 is too small
@@ -354,7 +394,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         }
     } else {
         ggml_backend_sched_t sched = impl_->ensure_sched();
-        if (!sched) { ggml_free(ctx); return false; }
+        if (!sched) return false;
         ggml_backend_sched_reset(sched);
         if (ggml_backend_sched_alloc_graph(sched, gf)) {
             for (const auto& in : pin)
@@ -369,7 +409,6 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         for (const auto& c : pcap) tensor_get_f32(impl_->backend, c.t, *c.dst);
     }
     pin.clear(); pcap.clear();
-    ggml_free(ctx);
     return ok;
 }
 
@@ -394,6 +433,10 @@ void capture_graph_output(ggml_tensor* t, std::vector<float>* dst) {
     if (t_active_backend) t_active_backend->register_capture(t, dst);
 }
 
+void mark_graph_input_persistent(ggml_tensor* t) {
+    if (t_pending_persistent) t_pending_persistent->push_back(t);
+}
+
 void add_graph_root(ggml_tensor* t) {
     // The node is NOT marked output (no readback); the caller just needs it
     // expanded into the cgraph so it executes as a side effect.
@@ -404,13 +447,17 @@ void add_graph_root(ggml_tensor* t) {
 // Zero-copy weight referencing.
 // --------------------------------------------------------------------------- //
 void ensure_weights_realized(const ModelLoader& ml) {
-    const_cast<ModelLoader&>(ml).realize_weights(global_backend());
+    if (!const_cast<ModelLoader&>(ml).realize_weights(global_backend()))
+        throw std::runtime_error(ml.last_error());
+}
+size_t device_replay_cache_default() {
+    return g_device_replay_cache_default.load(std::memory_order_relaxed);
 }
 ggml_tensor* clone_weight_opt(ggml_context* /*ctx*/, const ModelLoader& ml, const char* name) {
     ggml_tensor* t = ml.tensor(name);
     if (!t) return nullptr;
     // Lazily give it a backend buffer on first use.
-    if (!t->buffer) ensure_weights_realized(ml);
+    if (!t->buffer) { ensure_weights_realized(ml); t = ml.tensor(name); }
     return t;
 }
 ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml, const char* name) {
@@ -421,6 +468,7 @@ void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<flo
     ggml_tensor* t = ml.tensor(name);
     if (!t) { out.clear(); return; }
     ensure_weights_realized(ml);
+    t = ml.tensor(name);
     size_t n = (size_t)ggml_nelements(t);
     out.resize(n);
     // Backend tensors may be non-f32 (f16); for host-side math the loader keeps
@@ -450,71 +498,74 @@ ReplayGraph::ReplayGraph(Backend& backend,
         /*.no_alloc   =*/ true,
     };
     ctx_ = ggml_init(params);
-
-    std::vector<PendingInput>   pin;
-    std::vector<PendingCapture> pcap;
-    t_active_backend = &backend_;
-    t_pending_inputs = &pin;
-    t_pending_captures = &pcap;
-    std::vector<ggml_tensor*> roots;
-    t_pending_roots = &roots;
-
-    out_ = build(ctx_);
-
-    t_pending_inputs = nullptr;
-    t_pending_captures = nullptr;
-    t_pending_roots = nullptr;
-    t_active_backend = nullptr;
-
-    if (out_) {
-        ggml_set_output(out_);
-        gf_ = ggml_new_graph_custom(ctx_, kGraphSize, false);
-        // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay memcmp
-        // (patch 0002: "skip per-node replay validation when uid is stable").
-        gf_->uid = ggml_graph_next_uid();
-        ggml_build_forward_expand(gf_, out_);
-        for (const auto& c : pcap) ggml_build_forward_expand(gf_, c.t);
-        // Side-effect roots (Wave D decode-state write-backs into persistent
-        // device buffers): expand so they execute each replay without readback.
-        for (ggml_tensor* r : roots) ggml_build_forward_expand(gf_, r);
-        // Record inputs + captures in registration order (kept across calls).
-        for (const auto& in : pin) {
-            inputs_.push_back(in.t);
-            input_hosts_.push_back(in.host);
+    if (!ctx_) throw std::runtime_error("ReplayGraph context allocation failed");
+    try {
+        std::vector<PendingInput> pin;
+        std::vector<PendingCapture> pcap;
+        std::vector<ggml_tensor*> roots;
+        std::vector<ggml_tensor*> persistent_marks;
+        {
+            BuildScope scope(backend_, pin, pcap, roots, &persistent_marks);
+            out_ = build(ctx_);
         }
-        for (const auto& c : pcap) {
-            captures_.emplace_back(c.t, c.dst);
-        }
-        alloc_internal();
-        // F1: one-time op histogram for this graph (gated). Counts nodes by op
-        // name and, for MUL_MAT, the source (weight) dtype so we can confirm the
-        // f16 tensor-core cuBLAS path vs an f32 fallback. Printed once per ctor.
-        if (replay_timing_on()) {
-            std::fprintf(stderr, "[enc-graph] uid=%u n_nodes=%d\n",
-                         (unsigned)gf_->uid, gf_->n_nodes);
-            std::map<ggml_op, int> hist;
-            int mm_f32 = 0, mm_f16 = 0, mm_other = 0;
-            for (int i = 0; i < gf_->n_nodes; ++i) {
-                ggml_tensor* n = ggml_graph_node(gf_, i);
-                if (!n) continue;
-                hist[n->op]++;
-                if (n->op == GGML_OP_MUL_MAT) {
-                    ggml_tensor* src0 = n->src[0];
-                    if (src0->type == GGML_TYPE_F32) mm_f32++;
-                    else if (src0->type == GGML_TYPE_F16) mm_f16++;
-                    else mm_other++;
+
+        if (out_) {
+            ggml_set_output(out_);
+            gf_ = ggml_new_graph_custom(ctx_, kGraphSize, false);
+            // Stable uid: lets ggml-cuda skip its O(n_nodes) per-replay memcmp
+            // (patch 0002: "skip per-node replay validation when uid is stable").
+            gf_->uid = ggml_graph_next_uid();
+            ggml_build_forward_expand(gf_, out_);
+            for (const auto& c : pcap) ggml_build_forward_expand(gf_, c.t);
+            // Side-effect roots (Wave D decode-state write-backs into persistent
+            // device buffers): expand so they execute each replay without readback.
+            for (ggml_tensor* r : roots) ggml_build_forward_expand(gf_, r);
+            // Record inputs + captures in registration order (kept across calls).
+            for (const auto& in : pin) {
+                inputs_.push_back(in.t);
+                input_hosts_.push_back(in.host);
+            }
+            for (ggml_tensor* t : persistent_marks) {
+                for (size_t i = 0; i < inputs_.size(); ++i)
+                    if (inputs_[i] == t) { persistent_.resize(inputs_.size(), false); persistent_[i] = true; break; }
+            }
+            for (const auto& c : pcap) {
+                captures_.emplace_back(c.t, c.dst);
+            }
+            if (!alloc_internal()) throw std::runtime_error("ReplayGraph allocation failed");
+            // F1: one-time op histogram for this graph (gated). Counts nodes by op
+            // name and, for MUL_MAT, the source (weight) dtype so we can confirm the
+            // f16 tensor-core cuBLAS path vs an f32 fallback. Printed once per ctor.
+            if (replay_timing_on()) {
+                std::fprintf(stderr, "[enc-graph] uid=%u n_nodes=%d\n",
+                             (unsigned)gf_->uid, gf_->n_nodes);
+                std::map<ggml_op, int> hist;
+                int mm_f32 = 0, mm_f16 = 0, mm_other = 0;
+                for (int i = 0; i < gf_->n_nodes; ++i) {
+                    ggml_tensor* n = ggml_graph_node(gf_, i);
+                    if (!n) continue;
+                    hist[n->op]++;
+                    if (n->op == GGML_OP_MUL_MAT) {
+                        ggml_tensor* src0 = n->src[0];
+                        if (src0->type == GGML_TYPE_F32) mm_f32++;
+                        else if (src0->type == GGML_TYPE_F16) mm_f16++;
+                        else mm_other++;
+                    }
                 }
+                for (const auto& kv : hist) {
+                    std::fprintf(stderr, "[enc-graph]   op=%-22s count=%d\n",
+                                 ggml_op_name(kv.first), kv.second);
+                }
+                std::fprintf(stderr,
+                    "[enc-graph]   MUL_MAT dtype: f16=%d f32=%d other=%d\n",
+                    mm_f16, mm_f32, mm_other);
             }
-            for (const auto& kv : hist) {
-                std::fprintf(stderr, "[enc-graph]   op=%-22s count=%d\n",
-                             ggml_op_name(kv.first), kv.second);
-            }
-            std::fprintf(stderr,
-                "[enc-graph]   MUL_MAT dtype: f16=%d f32=%d other=%d\n",
-                mm_f16, mm_f32, mm_other);
         }
+    } catch (...) {
+        if (galloc_) ggml_gallocr_free(galloc_);
+        ggml_free(ctx_);
+        throw;
     }
-    pin.clear(); pcap.clear();
 }
 
 bool ReplayGraph::alloc_internal() {
@@ -523,7 +574,22 @@ bool ReplayGraph::alloc_internal() {
     if (backend_.is_gpu() && !need_sched_) {
         for (int i = 0; i < ggml_graph_n_nodes(gf_); ++i) {
             if (!ggml_backend_supports_op(backend_.handle(), ggml_graph_node(gf_, i))) {
-                need_sched_ = true; break;
+                need_sched_ = true;
+                // STARLING_SCHED_DEBUG names the first unsupported node (the
+                // sched path breaks ReplayGraph input uploads, so any hit here
+                // is a hard error for captured graphs, not a fallback).
+                if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
+                    debug && debug[0] == '1') {
+                    ggml_tensor* n = ggml_graph_node(gf_, i);
+                    std::fprintf(stderr, "[sched-dbg] unsupported node %d/%d: op=%s dst=%s",
+                        i, ggml_graph_n_nodes(gf_), ggml_op_name(n->op), ggml_type_name(n->type));
+                    for (int s = 0; s < 3 && n->src[s]; ++s)
+                        std::fprintf(stderr, " src%d=%s(%s%s)", s, ggml_type_name(n->src[s]->type),
+                            ggml_op_name(n->src[s]->op),
+                            ggml_is_contiguous(n->src[s]) ? ",cont" : ",STRIDED");
+                    std::fprintf(stderr, "\n");
+                }
+                break;
             }
         }
     }
@@ -548,6 +614,7 @@ ReplayGraph::~ReplayGraph() {
 
 void ReplayGraph::set_input(size_t i, const void* host, size_t nbytes) {
     if (i >= inputs_.size()) return;
+    if (inputs_[i]->data == nullptr) return;  // unallocated (dead) input
     // Async H2D on the backend's compute stream; stream ordering guarantees it
     // completes before the next graph_compute reads it. No sync here.
     ggml_backend_tensor_set_async(backend_.handle(), inputs_[i], host, 0, nbytes);
@@ -603,7 +670,7 @@ void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
 
 bool ReplayGraph::compute(std::vector<float>& out) {
     if (!gf_ || !out_) return false;
-    Backend::Impl* impl = backend_.impl_;
+    Backend::Impl* impl = backend_.impl_.get();
     // Fast path: graph_compute_async (skip the sync-wrapping graph_compute so the
     // readbacks can pipeline behind the graph on the same stream), then async
     // readback + single sync.
@@ -616,6 +683,36 @@ bool ReplayGraph::compute(std::vector<float>& out) {
         ok = (ggml_backend_sched_graph_compute(impl->sched, gf_) == GGML_STATUS_SUCCESS);
     }
     if (!ok) return false;
+    if (std::getenv("STARLING_NODE_HIST") && gf_) {
+        // One-shot per-replay node-type histogram (debug aid; off by default).
+        static std::mutex hist_mu;
+        std::lock_guard<std::mutex> lk(hist_mu);
+        std::map<std::string, int> hist;
+        for (int i = 0; i < gf_->n_nodes; ++i) {
+            ggml_tensor* n = gf_->nodes[i];
+            if (!n) continue;
+            hist[ggml_op_name(n->op)]++;
+            if (n->op == GGML_OP_CPY && std::getenv("STARLING_CPY_DEBUG"))
+                std::fprintf(stderr, "[cpy] %s <- %s (op %s)\n", n->name, n->src[0] ? n->src[0]->name : "?", n->src[0] ? ggml_op_name(n->src[0]->op) : "?");
+        }
+        std::string line;
+        for (auto& [k, v] : hist) line += k + "=" + std::to_string(v) + " ";
+        std::fprintf(stderr, "[node-hist] uid=%u n=%d %s\n",
+                     (unsigned)gf_->uid, gf_->n_nodes, line.c_str());
+    }
+    if (std::getenv("STARLING_NODE_SHAPES") && gf_) {
+        static std::mutex shp_mu;
+        std::lock_guard<std::mutex> lk(shp_mu);
+        for (int i = 0; i < gf_->n_nodes; ++i) {
+            ggml_tensor* n = gf_->nodes[i];
+            if (!n || n->op != GGML_OP_MUL_MAT) continue;
+            ggml_tensor* a = n->src[0];
+            ggml_tensor* b = n->src[1];
+            std::fprintf(stderr, "[mm-shape] m=%lld n=%lld k=%lld wtype=%s\n",
+                (long long)a->ne[1], (long long)b->ne[1], (long long)a->ne[0],
+                ggml_type_name(a->type));
+        }
+    }
     const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
     out.resize((size_t)ggml_nelements(out_));
     readback_async_then_sync(impl, out_, out);

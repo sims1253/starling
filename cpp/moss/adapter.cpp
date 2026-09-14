@@ -1,4 +1,5 @@
 #include "adapter.hpp"
+#include "lib/graph_helpers.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "ggml.h"
@@ -9,18 +10,25 @@
 #include <cstring>
 #include <vector>
 namespace starling::ggml::moss {
+using lib::f32;
+using lib::gemm_act;
 bool apply_adapter(const MossModel& model,const AudioEncoding& in,AudioEncoding& out,std::string& err){
     // Must happen before run_graph() takes the global backend mutex.
     ensure_weights_realized(model.loader);
  if(in.n_tokens<=0||in.width!=(int64_t)model.config.adapter_input||in.data.size()!=(size_t)in.n_tokens*in.width){err="invalid MOSS adapter input";return false;}
+ // F32 discipline follows the encoder (GPU + quant); the host entry still
+ // rounds to BF16 (the historical boundary), so CPU-exact inputs are untouched.
+ const bool F = encoder_f32(model);
  std::vector<ggml_bf16_t> host(in.data.size());for(size_t i=0;i<host.size();++i)host[i]=ggml_fp32_to_bf16(in.data[i]);
  bool ok=run_graph([&](ggml_context*c){int64_t ne[2]={in.width,in.n_tokens};auto*x=graph_input_tensor(c,GGML_TYPE_BF16,2,ne,host.data(),host.size()*sizeof(host[0]));
-  auto lin=[&](const char*n,ggml_tensor*z){return ggml_cast(c,ggml_mul_mat(c,clone_weight(c,model.loader,n),z),GGML_TYPE_BF16);};
+  auto lin=[&](const char*n,ggml_tensor*z){ggml_tensor*w=clone_weight(c,model.loader,n);ggml_tensor*y=ggml_mul_mat(c,w,F?f32(c,z):gemm_act(c,w,z));return F?y:ggml_cast(c,y,GGML_TYPE_BF16);};
   auto*g=lin("adapter.gate.weight",x);auto*u=lin("adapter.up.weight",x);
   // ATen boundaries: BF16 gate -> F32 SiLU -> BF16, then one BF16 multiply
   // result before the down projection. Generic ggml elementwise is F32-only.
-  auto*a=ggml_cast(c,ggml_silu(c,ggml_cast(c,g,GGML_TYPE_F32)),GGML_TYPE_BF16);
-  auto*z=ggml_cast(c,ggml_mul(c,ggml_cast(c,a,GGML_TYPE_F32),ggml_cast(c,u,GGML_TYPE_F32)),GGML_TYPE_BF16);
+  ggml_tensor*a,*z;
+  if(F){a=ggml_silu(c,f32(c,g));z=ggml_mul(c,a,f32(c,u));}
+  else{a=ggml_cast(c,ggml_silu(c,ggml_cast(c,g,GGML_TYPE_F32)),GGML_TYPE_BF16);
+  z=ggml_cast(c,ggml_mul(c,ggml_cast(c,a,GGML_TYPE_F32),ggml_cast(c,u,GGML_TYPE_F32)),GGML_TYPE_BF16);}
   return ggml_cast(c,lin("adapter.down.weight",z),GGML_TYPE_F32);
  },out.data);
  if(!ok){err="MOSS adapter graph execution failed";return false;}out.n_tokens=in.n_tokens;out.width=model.config.adapter_output;

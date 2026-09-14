@@ -130,10 +130,10 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                     ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                     ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_in),     bhh));
                 // PyTorch gate order [i, f, g, o] stacked in the 4H dim.
-                ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, 0)));
-                ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)H * sizeof(float))));
-                ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)2 * H * sizeof(float))));
-                ggml_tensor* o  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)3 * H * sizeof(float))));
+                ggml_tensor* i  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, 0));
+                ggml_tensor* f  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, (size_t)H * sizeof(float)));
+                ggml_tensor* gg = ggml_tanh   (ctx, ggml_view_1d(ctx, z, H, (size_t)2 * H * sizeof(float)));
+                ggml_tensor* o  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, (size_t)3 * H * sizeof(float)));
                 // c' = f*c_in + i*g ;  h' = o*tanh(c')
                 ggml_tensor* c_out = ggml_add(ctx, ggml_mul(ctx, f, c_in), ggml_mul(ctx, i, gg));
                 ggml_tensor* h_out = ggml_mul(ctx, o, ggml_tanh(ctx, c_out));
@@ -154,13 +154,14 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
     // host->device upload per step; captures land in stable internal buffers
     // (out_state is .assign()'d every step and can move) and are copied out
     // after compute. Byte-identical to the CPU path (same math, same ops).
+    auto& replay_ = ml_.cache<StepReplay>();
     if (!replay_) {
-        replay_ = std::unique_ptr<StepReplay>(new StepReplay());
-        replay_->h_in.assign(L, nullptr);
-        replay_->c_in.assign(L, nullptr);
-        replay_->cap_c.assign(L, std::vector<float>((size_t)H));
-        replay_->cap_h.assign(L, std::vector<float>((size_t)H));
-        StepReplay* r = replay_.get();  // captures must read this stable addr
+        auto pending = std::unique_ptr<StepReplay>(new StepReplay());
+        pending->h_in.assign(L, nullptr);
+        pending->c_in.assign(L, nullptr);
+        pending->cap_c.assign(L, std::vector<float>((size_t)H));
+        pending->cap_h.assign(L, std::vector<float>((size_t)H));
+        StepReplay* r = pending.get();  // captures must read this stable addr
         const int n_in_blocks = 1 + 2 * L;     // x0 + per-layer h,c
         r->in_buf.assign((size_t)n_in_blocks * H, 0.0f);
         r->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
@@ -190,10 +191,10 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                     ggml_tensor* z = ggml_add(ctx,
                         ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                         ggml_add(ctx, ggml_mul_mat(ctx, Whh, r->h_in[l]), bhh));
-                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, 0)));
-                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)H * sizeof(float))));
-                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)2 * H * sizeof(float))));
-                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, H, (size_t)3 * H * sizeof(float))));
+                    ggml_tensor* i  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, 0));
+                    ggml_tensor* f  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, (size_t)H * sizeof(float)));
+                    ggml_tensor* gg = ggml_tanh   (ctx, ggml_view_1d(ctx, z, H, (size_t)2 * H * sizeof(float)));
+                    ggml_tensor* o  = ggml_sigmoid(ctx, ggml_view_1d(ctx, z, H, (size_t)3 * H * sizeof(float)));
                     ggml_tensor* c_out = ggml_add(ctx, ggml_mul(ctx, f, r->c_in[l]),
                                                   ggml_mul(ctx, i, gg));
                     ggml_tensor* h_out = ggml_mul(ctx, o, ggml_tanh(ctx, c_out));
@@ -205,6 +206,7 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                 return top_h;
             }));
         assert(r->rg->n_inputs() == 1 && "pred step graph must have 1 coalesced input");
+        replay_ = std::move(pending);
     }
 
     // Pack this step's inputs into the single coalesced buffer (host memcpy, no

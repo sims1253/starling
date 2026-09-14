@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,7 +88,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_;
+    std::unique_ptr<Impl> impl_;
     int   n_threads_ = 1;
     std::string device_name_ = "cpu";
 
@@ -120,6 +121,12 @@ void capture_graph_output(ggml_tensor* t, std::vector<float>* dst);
 // must be registered as expansion roots. Must be called from inside a build
 // lambda; the node is expanded into the cgraph alongside the output + captures.
 void add_graph_root(ggml_tensor* t);
+
+// [starling pos-cache] Mark a graph input (registered via graph_input_tensor)
+// as PERSISTENT: it is uploaded once on the first replay and its device
+// buffer contents are kept across replays (the caller must NOT rely on
+// set_input refreshing it). Must be called from inside a build lambda.
+void mark_graph_input_persistent(ggml_tensor* t);
 
 // Reference a loader weight DIRECTLY as a graph leaf (zero per-call copy). The
 // loader gives every weight a backend buffer once (realize_weights); with
@@ -166,6 +173,9 @@ public:
     size_t n_inputs() const { return inputs_.size(); }
     size_t input_nbytes(size_t i) const;
     const void* input_host(size_t i) const;
+    bool input_persistent(size_t i) const {
+        return i < persistent_.size() && persistent_[i];
+    }
 
 private:
     Backend& backend_;
@@ -173,6 +183,7 @@ private:
     ggml_cgraph*  gf_  = nullptr;
     ggml_tensor*  out_ = nullptr;
     std::vector<ggml_tensor*> inputs_;
+    std::vector<bool> persistent_;  // [starling] see mark_graph_input_persistent
     std::vector<const void*> input_hosts_;
     std::vector<std::pair<ggml_tensor*, std::vector<float>*>> captures_;
     bool need_sched_ = false;

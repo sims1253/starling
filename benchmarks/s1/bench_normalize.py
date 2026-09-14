@@ -2,7 +2,7 @@
 
 The single source of truth for s1-mini numbers (the shared ``bench_all.py``
 grid is audio-shaped; s1 is text-in/text-out, so it gets this dedicated
-harness plus its own README sentinel block).
+harness plus its own benchmark sentinel block).
 
 Three modes (combinable):
 
@@ -17,7 +17,7 @@ Three modes (combinable):
                     matrix (styling x structure x context) vs stock.
   --sweep-k         replay-chunk-size sweep for the CUDA pipeline (tunes
                     NormalizePipeline._steps_for_prompt).
-  --update-readme   splice the tables into README.md between the
+  --update-readme   splice the tables into docs/benchmarks.md between the
                     <!-- BENCH:S1:START/END --> sentinels.
 
 Run:
@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "benchmarks"))
 
 OUTPUTS = REPO_ROOT / "outputs"
-README = REPO_ROOT / "README.md"
+BENCHMARK_DOC = REPO_ROOT / "docs" / "benchmarks.md"
 START, END = "<!-- BENCH:S1:START -->", "<!-- BENCH:S1:END -->"
 
 
@@ -373,7 +373,7 @@ def build_markdown(results: dict) -> str:
 
 
 def splice_readme(md: str) -> bool:
-    body = README.read_text()
+    body = BENCHMARK_DOC.read_text()
     if START in body:
         pre, rest = body.split(START, 1)
         _, post = rest.split(END, 1)
@@ -385,7 +385,7 @@ def splice_readme(md: str) -> bool:
         pre, post = body.split(anchor, 1)
         new = (pre + anchor + "\n\n" + START + "\n" + md + "\n" + END + post)
     if new != body:
-        README.write_text(new)
+        BENCHMARK_DOC.write_text(new)
         return True
     return False
 
@@ -424,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update_readme:
         changed = splice_readme(md)
-        print(f"\n[s1-bench] README {'updated' if changed else 'unchanged'}")
+        print(f"\n[s1-bench] docs/benchmarks.md {'updated' if changed else 'unchanged'}")
 
     ok = True
     if args.accuracy:

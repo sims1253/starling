@@ -71,7 +71,7 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
    CPU backend, so it is an offline pass, not a serving mode:
 
    ```bash
-   uv run python benchmarks/imatrix_collect.py \
+   uv run --extra bench python benchmarks/imatrix_collect.py \
        --model models/parakeet-tdt-0.6b-v3-f32.gguf \
        --output models/parakeet-tdt-0.6b-v3.imx.bin \
        --tiers short,medium,long --repeats 2 --wavs path/to/calibration_wavs/
@@ -95,10 +95,11 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
 4. **Verify** by WER against the f32 baseline on the fixtures (and, for
    release gates, the full Open-ASR-Leaderboard sets via
    `benchmarks/wer_leaderboard.py` with `STARLING_GGML_PARAKEET_MODEL`
-   pointing at the quantized file):
+   pointing at the quantized file). Install the scoring dependencies with
+   `uv sync --locked --extra bench`:
 
    ```bash
-   uv run python benchmarks/wer_quant.py --tiers short,medium,long \
+   uv run --extra bench python benchmarks/wer_quant.py --tiers short,medium,long \
        --models f32=models/parakeet-tdt-0.6b-v3-f32.gguf \
                 q8_0=models/parakeet-tdt-0.6b-v3-q8_0.gguf \
                 q4_k_m+imx=models/parakeet-tdt-0.6b-v3-q4_k_m.gguf
@@ -122,8 +123,10 @@ Kept at the source dtype on purpose:
 - **conv weights** (`conv` in the name): the conformer pointwise convs are
   `ggml_cast` to F16 and reshaped before their matmul, the depthwise/subsampling
   convs go through `ggml_conv_*` — no dequant path.
-- **the prediction embedding** `decoder.prediction.embed.weight`: read as a
-  raw F32 host table (`prediction.cpp`), not a matmul.
+- **the prediction embedding** `decoder.prediction.embed.weight`: the engine
+  expands it into a host F32 table (`prediction.cpp`). An explicit recipe
+  rule can change its storage dtype for `general.architecture=parakeet_tdt`;
+  named levels and recipe defaults keep its source dtype.
 - **batch-norm statistics, norms, biases, pos_bias_u/v**: 1-D host-folded or
   broadcast operands.
 - **mel constants** (`preprocessor.*`): the filterbank/window must stay exact.
@@ -171,15 +174,161 @@ convs are `ggml_cast` to F16, the depthwise/subsampling convs take F16
 kernels). Everything else stays F32: 1-D biases/norms/BN statistics feed
 `ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
 
+### Parakeet embedding and compact recipes
+
+Two opt-in recipes retain the IQ2_XXS encoder and its importance matrix:
+
+- `quants/recipes/parakeet-iq2-embedding-q8.recipe` stores the prediction
+  embedding as Q8_0 and preserves every other tensor's existing policy.
+- `quants/recipes/parakeet-iq2-compact.recipe` also stores six 640-wide
+  joint/LSTM matrices as IQ4_NL (32-element blocks, 4.5 bits per weight).
+  This option remains **experimental**: it increased observed word errors
+  in the controlled study below.
+
+A third opt-in recipe targets the speed/memory sweet spot rather than
+minimum size:
+
+- `quants/recipes/parakeet-q4-fullimx.recipe` is uniform Q4_0 with the
+  full-corpus importance matrix (fixtures x2 + 32 real utterances, ~26k
+  observations). On the Vulkan iGPU this beat Q8_0 on every axis — medium
+  fixture 770.7 -> 603.5 ms, peak RSS 972 -> 710 MB — with real-corpus WER
+  3.55 vs the Q8_0 baseline's 3.94. The calibration mix matters: a
+  short-tier-only imatrix measured strictly worse than Q8_0, and uniform
+  Q4_0 beat attention-only and hybrid FFN variants. Requires `--imatrix`;
+  the collection command is in the recipe header.
+
+Named levels and their fallback rules stay unchanged. Other model
+architectures retain the embedding keep-list.
+
+```bash
+cmake -B build-cpu -DSTARLING_GGML_SHARED=ON
+cmake --build build-cpu --target starling-quantize starling_ggml -j
+build-cpu/starling-quantize \
+  --input models/parakeet-tdt-0.6b-v3-f32.gguf \
+  --output models/parakeet-iq2-compact.gguf \
+  --recipe quants/recipes/parakeet-iq2-compact.recipe \
+  --imatrix models/parakeet-imx-prod-25x48.bin --shrink-f16
+```
+
+For embedding-only storage, substitute `parakeet-iq2-embedding-q8.recipe`
+and a separate output filename. To reproduce the baseline, replace
+`--recipe ...` with `--quant iq2_xxs`; keep the source, matrix, and
+`--shrink-f16` identical.
+
+Start from the original floating-point model. The quantizer cannot decode
+an already quantized source. Recipe rules use first-match precedence:
+place any F32 or Q8_0 precision overrides before the compact rules.
+Any regex rule that matches the embedding opts it in, including broad rules
+such as `.* q8_0` or `^decoder\. q8_0`. This changes older custom recipes
+whose broad rules previously left embeddings untouched. A first matching
+Q6_K or other unsupported type now fails with an error; only Q8_0 and F32
+are accepted. `default q8_0` alone still keeps the source embedding dtype.
+
+To preserve an F32 source embedding while applying a broad rule, put its
+exact F32 override first. An override after the broad rule has no effect:
+
+```text
+default q8_0
+^decoder\.prediction\.embed\.weight$ f32
+^decoder\. q6_k
+```
+
+This override stores F32; it does not preserve the storage dtype of an F16
+or BF16 source embedding.
+The embedding has no collected importance entry because the engine reads
+it on the host. Q8_0 does not require one.
+
+The 2026-09-06 CPU study used 300 English and 300 German FLEURS test clips,
+the F32 source, and `parakeet-imx-prod-25x48.bin`. Each model ran in a fresh
+process. Tensor payload comparisons confirmed that only the intended one
+or seven tensors changed. WER is the mean of per-clip WER percentages;
+brackets give 95% bootstrap intervals. MB means decimal megabytes.
+
+| variant | MB | EN WER | DE WER |
+|---------|----|--------|--------|
+| released IQ2 + shrink16 | 325.1 | 8.54 [7.59, 9.54] | 9.35 [8.22, 10.51] |
+| Q8 embedding | 309.7 | 8.53 [7.56, 9.51] | 9.35 [8.22, 10.51] |
+| Q8 embedding + IQ4_NL linears | 303.6 | 8.74 [7.67, 9.84] | 9.75 [8.54, 10.93] |
+
+Paired WER differences from the released IQ2 baseline, in percentage points:
+
+| variant | EN delta [95% CI] | DE delta [95% CI] |
+|---------|-------------------|------------------|
+| Q8 embedding | -0.013 [-0.040, 0.000] | 0.000 [0.000, 0.000] |
+| Q8 embedding + IQ4_NL linears | +0.197 [-0.220, +0.638] | +0.394 [-0.020, +0.823] |
+
+Q8 embedding alone saved 15.40 MB. It changed one English hypothesis,
+removing one word error; all German hypotheses matched the baseline.
+The zero German interval reflects this sample's identical outputs, not
+proof of losslessness on other inputs. IQ4_NL saved another 6.10 MB but
+added 18 English and 24 German word errors relative to the baseline.
+Its paired intervals include zero and extend to +0.64 EN / +0.82 DE
+percentage points. Noninferiority is not established. The measured combined
+size is 303.6 MB; [issue #50](https://github.com/sims1253/starling/issues/50)
+had proposed 285 MB.
+
+Reproduce the evaluation with the exact cached corpus identified in the
+[aggregate study record](quantization-compact-eval.json). To populate a
+new cache, the downloader selects the first 300 valid test clips per config;
+check its manifest against the record before treating it as the same sample.
+
+```bash
+uv run --extra bench python benchmarks/fleurs_download.py \
+  --out models/fleurs_test_big_ende --split test --fleurs en_us:300 --fleurs de_de:300
+STARLING_GGML_DEVICE=cpu STARLING_GGML_LIB="$PWD/build-cpu/libstarling_ggml.so" \
+uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
+  --corpus models/fleurs_test_big_ende --models combined=models/parakeet-iq2-compact.gguf \
+  --include-clips --json /tmp/compact.json
+```
+
+Repeat the scoring command separately for baseline and embedding-only files.
+`--include-clips` retains clip IDs, decoded-audio hashes, references,
+hypotheses, and unrounded WER. The paired analysis matched IDs, audio hashes,
+and references, then sampled 300 per-clip WER differences with replacement
+10,000 times per language using NumPy `default_rng(0)`. Its interval is the
+2.5th–97.5th percentile of the resampled means. The aggregate record contains
+input/output hashes, corpus-manifest construction, counts, timings, and the
+incremental combined-minus-embedding comparison; raw transcripts stay local.
+
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
-All numbers from `benchmarks/wer_quant.py` on the CPU path (the Vulkan fast
-path has a known output discrepancy on this RADV iGPU independent of
-quantization — F32 degrades there too; see the PR notes). The fixtures repeat
-one utterance, so read the deltas against the f32 row, not as leaderboard
-WERs. The imatrix was collected over the same three fixtures (single speaker,
+All numbers from `benchmarks/wer_quant.py` use the CPU path. The dated Vulkan
+retest below records the failures in that build; GPU corpus parity remains
+unvalidated. The fixtures repeat one utterance, so read the deltas against the
+f32 row, not as leaderboard WERs. The imatrix was collected over the same three fixtures (single speaker,
 ~1.5 min audio — deliberately minimal; real calibration would use an hour of
 diverse audio, e.g. Granary-derived clips).
+
+### Vulkan fast-path retest (post-#47, 2026-09-05)
+
+This historical retest used the merged-#39 build, including #47's galloc
+INPUT-reuse patch. F32 showed premature termination with a correct prefix.
+
+Later changes gave each model ownership of its replay caches and freed graphs
+before weights. The current [engine validation record](ggml-engine.md)
+also reports two consecutive Q8_0 short-fixture calls on CPU and Vulkan.
+That limited smoke check does not establish GPU parity for these corpus sweeps.
+
+- Fixtures, f32, same binary, one model per process: CPU
+  `0.00/0.00/0.00` vs `STARLING_GGML_DEVICE=Vulkan0`
+  `60.87/86.96/0.00` (short/medium/long). Single-model runs sidestep the
+  replay-cache hazard present in that build.
+- Repetition sweep (base utterance 7.4 s, k× no gap): k=1–5 emit only the
+  opening phrase ("Well, I don't wish to see it any more,") and stop — the
+  WERs reconcile exactly as deletions (short 13/21 words → 60.87, medium
+  55/63 → 86.96). k=6 (44.6 s) through 10: complete, correct transcripts
+  (long = WER 0.00).
+- Real clips (fleurs_test bg_bg, 8–19 s, 8/8 truncated): correct-prefix
+  truncation after ~5–8 words, WER 72–89 — not a repeated-utterance
+  artifact.
+- Prefix sweep (1–7.4 s of the base): partial audio yields correct partial
+  transcripts — encoder/weights compute fine; only the stop decision is
+  wrong.
+
+In that build, single-window decode (input below ~40 s, bracketed 37.2–44.6 s)
+stopped after the first K-step batch; longer audio used the segmented/composite
+path and completed. GPU sweeps and ladder timings still need validation on the
+current build. The benchmark drivers retain CPU as the measured default.
 
 Clean audio — every level down to q2_k is lossless here:
 
@@ -352,9 +501,11 @@ EN/DE at 300 clips (f32: DE 5.30 [4.45–6.14], EN 6.50 [5.59–7.44]):
 | iq2xxs +imxENDE | 9.20 [8.08–10.34]    | 7.77 [6.83–8.81]        |
 | iq2xxs +imx25| 9.30 [8.14–10.49]       | 8.38 [7.36–9.57]        |
 
-What survives, now with statistical teeth:
+Results from the larger evaluation:
 
-- **q4_k_m is free** for both languages (Δ ≤ 0.07) — bulletproof.
+- **q4_k_m differs by at most 0.07 WER percentage points** in these two
+  language samples. This does not establish lossless quantization for other
+  inputs or languages.
 - **q2_k: English free, German +0.7–1.25**, tail languages +4–7 on the worst
   (lt 22.5→29.1 [26.1–32.2], sl →30.2, ro →17.5 — CIs separate from f32).
   25-language mean 16.90 vs f32's 14.00 (+2.90 at 48 clips/lang, matching
@@ -371,17 +522,6 @@ all-25 land at 9.45 / 9.20 / 9.30 German with fully overlapping CIs, and
 English likewise. At these bit widths the calibration LANGUAGE MIX for
 EN/DE is not a measurable lever once the matrix exists at all; the effects
 that matter are calibrated-vs-uniform (huge) and the bit width itself.
-
-Takeaways:
-
-- **q4_k_m is free**: 704 MB (28% of F32) with zero measurable loss on noisy
-  English AND German. This matches the community GGUF results for parakeet.
-- **At 2 bits, calibration is decisive**: uniform q2_k breaks down
-  (30%/17%) while the imatrix-weighted q2_k matches f32 exactly at the same
-  574 MB, and the calibrated floor reaches 325 MB (13% of F32) before the
-  IQ1 cliff.
-- **At the floor, calibration data must be multilingual** (see the German
-  table): an English-only imatrix cost 16 German WER points at iq2_xxs.
 
 ## Extending to the other engines
 
@@ -402,6 +542,176 @@ profile, so the steps are: convert an f32 base, extend the guard's allowlist
 to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
 tensors (same analysis parakeet got), then run this same sweep. moss-2b and
 qwen3-asr-1.7b follow the same recipe.
+
+### Audex-2b port (2026-09-05) — done, with one engine fix the recipe missed
+
+Executed against the bf16_exact base (`models/audex-2b-bf16-exact.gguf`,
+5802 MB, converted from the pinned `77b7e1a` checkpoint) instead of an f32
+base: the quantizer already dequantizes BF16 sources (`to_f32`), the bf16
+file doubles as the exact baseline, and skipping the 8+ GB f32 duplicate
+saves disk and eval RAM on the 14 GB box.
+
+The audit found the existing name/shape rules sufficient — `enc.conv1/2`
+("conv"), `llm.embed.weight` ("embed"; graph-side `ggml_get_rows` + F32
+cast), `enc.pos_embed` and the mel constants (no `.weight` suffix) are all
+kept automatically; `llm.lm_head.weight` and every encoder/projector/trunk
+linear are plain `ggml_mul_mat` and quantize freely (363 of 719 tensors).
+The conv keep rule is load-bearing: the conv GEMM
+(`cpp/audex/encoder.cpp`, the im2col matmul) takes its activation straight
+from the F32 im2col buffer with no `gemm_act`, so a future rule change
+that quantized conv weights would fail at eval time (the im2col/quantized
+matmul assert), not at load — nothing at graph-build time enforces it.
+The loader allowlist gained `"quantized"`, and the quantizer now stamps
+`starling.numeric_profile=quantized` when it actually quantized at least
+one tensor, instead of inheriting the source's exact-profile string (a
+degenerate all-kept run is numerically identical to the source, so it
+keeps the inherited profile).
+
+**The surprise**: ggml's quantized matmul asserts F32 activations
+(`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in the quantized branch of
+`ggml_compute_forward_mul_mat`,
+`third_party/ggml/src/ggml-cpu/ggml-cpu.c`), and the
+qwen-trunk/audex graphs feed **bf16** activations into every weight GEMM.
+Fix: `gemm_act()` (graph_helpers.hpp) upcasts the activation to F32 only
+when the weight is block-quantized — bf16 is exact in f32, so the
+F32-accumulated GEMM and trailing bf16 round preserve the numerical
+boundary and only the weight carries quantization noise; unquantized
+weights keep the identical bf16 path (no change for any existing
+artifact). `lin()`/`linear_bf16()` and the five lm_head GEMMs (now
+`lm_head_gemm()`) route through it. moss-2b / qwen3-asr get quantization
+for free once their loaders allowlist the profile.
+
+Fixtures (CPU, one model per process): bf16_exact, q8_0 (3484 MB) and
+q4_k_m (2248 MB) produce **byte-identical transcripts at WER 0.00**;
+uniform q2_k (1668 MB) collapses to garbage tokens — the same calibration
+law as parakeet, so sub-Q4 needs the audex imatrix port (STARLING_IMATRIX
+riding the audex graphs) before it is meaningful.
+
+FLEURS test clips, 8 per language, CPU (mean WER):
+
+| model | MB | en_us | de_de |
+|-------|------|-------|-------|
+| bf16_exact | 5802 | 8.42 | 4.33 |
+| q8_0 | 3484 | 8.42 | 3.19 |
+| q4_k_m | 2248 | 6.49 | 6.38 |
+
+n=8 caveat: q8_0 is per-clip IDENTICAL to exact on EN, and DE moves only
+via one near-tie clip flipping 9.1 → 0.0. q4_k_m's means also move by
+single-clip flips — EN clip 3 (20.0 → 0.0) vs clip 6 (9.1 → 13.6), DE
+clip 5 (0.0 → 13.0) — i.e. 6 of 8 clips per language are byte-identical
+to exact and the mean deltas are within flip noise. The parakeet-grade
+"q4 is free" claim needs the 300-clip run (follow-up; ~2 h of CPU
+transcription at ~30 s/clip). Sub-Q4 needs the audex imatrix port first.
+
+Speed (single run, short/medium fixture): bf16 28.3/38.4 s, q8_0 27.1/33.9 s,
+q4_k_m 28.8/33.4 s — size plays, roughly speed-neutral, as with parakeet.
+GPU quantization parity and timings remain untested for this Audex study.
+
+### Moss-transcribe-2b port (2026-09-10) — quants + Vulkan/CPU engine work
+
+Executed against the bf16_exact base
+(`models/moss-transcribe-preview-2b-bf16-exact.gguf`, 4845 MB). All big
+linears have row widths divisible by 32 and 256, so no block-size fallbacks
+(unlike parakeet's 640-row linears). Three engine fixes were load-bearing:
+
+1. Loader allowlist: `cpp/moss/loader.cpp` gains `"quantized"` (audex
+   precedent).
+2. Adapter `mul_mat` passed BF16 activations straight into (now quantized)
+   weights, aborting in ggml-vulkan's `q_f16` path. Fix: route both adapter
+   linears (`cpp/moss/adapter.cpp`, fused `build_adapter`) through the
+   existing `gemm_act()` rule (F32 activations against quantized weights;
+   exact upcast, weight-only noise). Same latent pattern to audit in other
+   engines when they quantize.
+3. `starling-quantize` grew `--f32-1d` (kept 1-D norms/biases stored as F32:
+   bit-identical values, but no CAST graph nodes, so Vulkan's
+   `{NORM,MUL,ADD}` / `{RMS_NORM,MUL}` fusions see consecutive patterns)
+   and a moss-scoped explicit embed rule (`^llm.embed.weight$`, q8_0 or —
+   experimental — q4_0; every other family keeps the parakeet-only gate).
+
+Imatrix collection rides the stock collector (`STARLING_IMATRIX` +
+`STARLING_GGML_DEVICE=cpu`), but on the **Q8_0 model**: the collector only
+observes F32 activations and the BF16 model's GEMMs take BF16, while Q8's
+`gemm_act` routes F32 everywhere. Activation statistics are
+weight-precision agnostic. One pass over fixtures + 32 real-corpus clips:
+394 tensors, ~196k observations. The one-off driver, `.auto/collect_moss_imx.py`,
+was a local session artifact and is not included in this repository. These
+collection counts record that experiment; the committed recipes require the
+resulting imatrix file or a new collection pass over the same Q8_0 model.
+
+Recipes (`quants/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
+
+| recipe | linears | embed (tied head) | size | note |
+|--------|---------|-------------------|------|------|
+| `moss-q4-fullimx` | q4_0 + imx | BF16 exact | 1838 MB | best single-model speed pre-head-quant |
+| `moss-q4e8-fullimx` | q4_0 + imx | q8_0 | 1546 MB | recommended if Q2 tail unacceptable |
+| `moss-q4e4-fullimx` | q4_0 + imx | q4_0 | 1391 MB | safe pick: WER-identical, 28/32 fidelity |
+| `moss-q2e4-fullimx` | q2_k + imx | q4_0 | 900 MB | fastest (-15% vs Q4): short/med WER 0.00, noisier tail |
+
+(Q8_0 uniform, no imatrix, was the stepping stone: 2883 MB. Sub-Q2 linears
+(IQ2_XXS: speed ties, CER 0.11 word errors) and sub-Q4 heads (Q3: tie with
+worse tail; Q2: faster but CER 0.06 with real errors) were tried and
+rejected — Q2_K is the linear floor, Q4 the head floor.)
+
+Fixture WER vs ground truth (`benchmarks/wer.py` LibriSpeech refs), Vulkan:
+
+| model | short | medium | long |
+|-------|-------|--------|------|
+| bf16_exact | 0.00% | 0.00% | 40.00% |
+| q8_0 | 0.00% | 0.00% | 40.00% |
+| q4_0 + imx | 0.00% | 0.00% | 40.00% |
+| q4_0 + q8 head | 0.00% | 0.00% | 40.00% |
+| q4_0 + q4 head | 0.00% | 0.00% | 40.00% |
+| q2_k + q4 head | 0.00% | 0.00% | 90.00%* |
+
+The long-tier 40% is a tiled-audio repetition artifact (the model loses the
+10x repetition count), identical across all five artifacts — no quant
+regression. (*) The Q2 model early-stops after 1 repetition on exact-repeat
+tiles (long WER 90): repetition-specific, verified deterministic and
+order-independent (a stale-script false alarm about nondeterminism was
+chased down to a `sed` chain drift). A 31 s diverse-concatenation clip is
+covered fully (346 vs 350 chars, CER 0.04), and short/med are exact — but
+the tail is noisier generally (see fidelity below), so Q2 needs leaderboard
+WER before any release claim. 32-clip real-corpus fidelity q4-head vs q8-head: 28/32
+byte-identical transcripts, mean normalized CER 0.0035 (the corpus's own
+`reference.json` is index-mismatched — even bf16_exact "hallucinates"
+against it — so fidelity, not accuracy, is the gate there; full Open-ASR
+WER before any release claim). Q2-head fidelity vs q8-head: 16/32 identical,
+mean CER 0.03, max 0.20 — single-word flips on hard audio; acceptable as an
+experimental trade for -15%/-31% but the reason Q4 stays the safe pick.
+
+Speed interleaves quant + engine work (this box: RADV RENOIR uma iGPU +
+6C/12T Zen3; short fixture, steady-state median, RTF in parens):
+
+| step | Vulkan ms | CPU ms |
+|------|-----------|--------|
+| bf16_exact | 5328 (1.40x) | 37857 (0.20x) |
+| + q8_0 | 3205 (2.32x) | 4285 (1.74x) |
+| + q4_0 + imx | 2817 (2.64x) | 3882 (1.92x) |
+| + embed q8_0 | 2614 (2.85x) | 3689 (2.02x) |
+| + F32 K-step decode + rope_ext | 2418 (3.08x) | — |
+| + bucketed K-step attention | 1985 (3.75x) | — |
+| + F32 prefill / encoder | 1874 (3.97x) | — |
+| + q4 head | 1793 (4.15x) | 3165 (2.35x) |
+| + physical-core thread default | — (neutral) | 3381→3150* |
+| + q2_k linears (Q4 head kept) | 1532 (4.85x) | 2507 (2.97x) |
+
+(*) thread default measured on the q4e8 model; q4-head CPU re-measured after.
+Peak RSS (Vulkan): 4765 -> 2932 -> 1930 -> 1657 -> 1644 MB (q4-head: 1504).
+Medium/long Vulkan: ~19 s -> 5.3 s / ~55 s -> 16.2 s (long varies run to
+run; short is the stable gate).
+
+Engine notes (all auto-gated: GPU + quantized linears, CPU/BF16 keep the
+exact discipline; CER-gated per run): `f32_acts` decode (skipped bf16
+round-trips unlock 452 Vulkan `RMS_NORM_MUL[_ROPE]` fusions per K-step
+replay; attention core stays BF16 to avoid full-cache F32 traffic),
+bucketed exact-width K-step attention (128/256/512/1024 prefix views +
+runtime masks; `STARLING_MOSS_NOBUCKET` forces full-cap), `rope_ext`
+(NEOX = half-rotation, matches the engine formula), F32 prefill/encoder,
+physical-core CPU thread default (`STARLING_GGML_THREADS` still wins).
+Dead ends kept for the record: KSTEP=8 (noise, then +7.6% slower),
+`GGML_VK_FLOPS_PER_SUBMIT` one-submit (neutral), `GGML_VK_NO_BARRIERS`
+(4x slower + garbage — never), IQ4_NL (ties Q4_0), F32-on-CPU and CPU
+K-step (correct, zero gain — CPU is GEMV-compute-bound at ~82 ms/tok).
 
 ## Ours vs the community quants (matched levels, 300-clip EN/DE with CIs)
 
@@ -438,8 +748,10 @@ the community repos don't ship: q3_k_m/q2_k/iq2_xxs (634/574/325 MB) exist
 only calibrated (uniform q2_k collapses to 30%/17% where the calibrated
 build matches f32), plus the published imatrix for custom recipes.
 
-Tooling note: `benchmarks/fleurs_download.py` fetches FLEURS corpora over
-HTTP range reads on the parquet shards (~100 MB per config instead of the
+Tooling note: install the corpus dependencies with
+`uv sync --locked --extra bench` before using `benchmarks/fleurs_download.py`.
+Use `uv run --extra bench python benchmarks/fleurs_download.py --help` for options.
+It fetches FLEURS corpora over HTTP range reads on the parquet shards (~100 MB per config instead of the
 2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
 clips to collection/eval — the datasets-library streaming path accumulates
 multi-GB per config and stalled repeatedly next to a loaded model.
@@ -457,4 +769,5 @@ multi-GB per config and stalled repeatedly next to a loaded model.
 The quants' value is size/VRAM, not CPU speed: k-quants are roughly
 speed-neutral on this encoder, and the IQ formats trade inference speed for
 bytes. When both matter, q3_k_m is the measured middle (11.1×). GPU behavior may
-differ (bandwidth-bound, mmvq paths) — untested on this hardware.
+differ (bandwidth-bound, mmvq paths) — unmeasurable on this hardware while the
+Vulkan fast-path truncation bug stands (see the post-#47 retest note above).

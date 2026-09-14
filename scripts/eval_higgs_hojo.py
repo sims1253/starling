@@ -31,12 +31,10 @@ import argparse
 import json
 import os
 import re
-import statistics
 import tempfile
 import xml.etree.ElementTree as ET
 import subprocess
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -211,10 +209,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 cwd=str(REPO), capture_output=True, text=True)
             tail = "\n".join((r.stdout + r.stderr).splitlines()[-12:])
             print("\n".join("    " + line for line in tail.splitlines()[-6:]))
-            summaries = [l for l in r.stdout.splitlines()
-                         if re.fullmatch(r"=+ .* in .*=?=*", l) and "passed" in l]
+            summaries = [line for line in r.stdout.splitlines()
+                         if re.fullmatch(r"=+ .* in .*=?=*", line) and "passed" in line]
             ok = bool(summaries) and not any(
-                re.search(r"\b\d+ (failed|error|errors)\b", l) for l in summaries)
+                re.search(r"\b\d+ (failed|error|errors)\b", line) for line in summaries)
             if not ok:
                 try:
                     root = ET.parse(xml_path).getroot()
@@ -280,7 +278,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "rtfx_cold": round(audio_s / cold, 2),
                     "rtfx_warm": round(audio_s / warm, 2),
                     "chars": len(text),
-                    "phases_cold": [l.strip() for l in phases.splitlines()],
+                    "phases_cold": [line.strip() for line in phases.splitlines()],
                 }
                 print(f"   {name:6s} {audio_s:6.1f}s audio | cold {cold:7.2f}s "
                       f"(RTFx {audio_s / cold:6.2f}) | warm {warm:7.2f}s "

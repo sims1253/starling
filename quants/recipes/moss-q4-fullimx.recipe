@@ -1,0 +1,12 @@
+# starling-quantize recipe: uniform Q4_0 with the full-corpus importance
+# matrix (fixtures + 32 real-corpus utterances, ~196k observations collected
+# on the Q8_0 model so every linear sees F32 activations).
+# The embedding (also the tied lm_head, 622 MB) stays exact: it is excluded
+# from candidates by the tool's embed rule and kept BF16.
+#
+#   build-cpu/starling-quantize \
+#       --input models/moss-transcribe-preview-2b-bf16-exact.gguf \
+#       --output models/moss-transcribe-preview-2b-q4-fullimx.gguf \
+#       --recipe quants/recipes/moss-q4-fullimx.recipe \
+#       --imatrix models/moss-full.imx --f32-1d
+default q4_0

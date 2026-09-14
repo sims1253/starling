@@ -78,7 +78,10 @@ def test_chunkstreamer_reconstructs_full_transcript():
     now = 0.0
     for end in range(SR // 2, len(samples) + 1, SR // 2):
         now += 0.5
-        cs.step(samples[:end], now, tx)
+        partial = cs.step(samples[:end], now, tx)
+        if partial is not None:
+            expected = [w for w, t in words if t < end / SR]
+            assert partial.split() == expected
     final_text = cs.flush(samples, tx)
     assert final_text.split() == truth, f"reconstructed != truth:\n{final_text}"
 
@@ -158,3 +161,57 @@ def test_streamsession_chunked_integration():
         sess.samples = buf[:end]
         sess.stream_step(now)
     assert sess.stream_flush().split() == truth
+
+
+def test_busy_full_window_waits_for_next_step():
+    cs = ChunkStreamer(sample_rate=1, chunk_seconds=12, overlap_seconds=2,
+                       min_seconds=5, partial_interval_seconds=0)
+    samples = np.arange(30)
+    seen = []
+
+    def tx(window):
+        seen.append((int(window[0]), len(window)))
+        return None if len(seen) == 1 else "hello world"
+
+    assert cs.step(samples, 10, tx) is None
+    assert seen == [(0, 12)]
+    assert cs.step(samples, 11, tx) == "hello world"
+    assert seen == [(0, 12), (0, 12), (10, 12), (20, 10)]
+
+
+def test_flush_retries_full_windows_without_repeating_committed_audio(monkeypatch):
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0)
+    cs = ChunkStreamer(sample_rate=1, chunk_seconds=12, overlap_seconds=2,
+                       min_seconds=5, partial_interval_seconds=0)
+    samples = np.arange(30)
+    seen = []
+    busy = True
+
+    def tx(window):
+        seen.append((int(window[0]), len(window)))
+        return None if busy and window[0] == 10 else "hello world"
+
+    assert cs.flush(samples, tx) is None
+    assert cs.boundary == 10
+    assert cs.committed == ["hello", "world"]
+    busy = False
+    assert cs.flush(samples, tx) == "hello world"
+    assert seen.count((0, 12)) == 1
+    assert seen[-2:] == [(10, 12), (20, 10)]
+    assert all(length <= 12 for _, length in seen)
+    assert cs.boundary == len(samples)
+
+
+
+def test_flush_recovers_from_busy_full_window_in_same_commit(monkeypatch):
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0)
+    cs = ChunkStreamer(sample_rate=1, chunk_seconds=12, overlap_seconds=2,
+                       min_seconds=5, partial_interval_seconds=0)
+    seen = []
+
+    def tx(window):
+        seen.append((int(window[0]), len(window)))
+        return None if len(seen) == 1 else "hello world"
+
+    assert cs.flush(np.arange(30), tx) == "hello world"
+    assert seen == [(0, 12), (0, 12), (10, 12), (20, 10)]

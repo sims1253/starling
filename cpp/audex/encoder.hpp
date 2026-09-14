@@ -23,6 +23,6 @@ bool encode_audio_and_project(const AudexModel& model, const MelFeatures& mel,
                               AudioEmbeds& out, std::string& err);
 
 // Number of captured encoder graphs (diagnostic + bounded-LRU test hook).
-size_t encoder_replay_cache_size();
+size_t encoder_replay_cache_size(const AudexModel& model);
 
 } // namespace starling::ggml::audex

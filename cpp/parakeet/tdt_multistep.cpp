@@ -36,7 +36,7 @@
 
 #include "runtime/backend.hpp"   // ReplayGraph, graph_input_tensor, clone_weight,
                                 // capture_graph_output, add_graph_root
-#include "runtime/graph.hpp"     // global_backend, register_decode_cache_clearer
+#include "runtime/graph.hpp"     // global_backend
 
 #include "ggml.h"
 #include "ggml-backend.h"        // ggml_backend_alloc_ctx_tensors / tensor_set (DecodeDevCache)
@@ -89,10 +89,10 @@ bool tdt_kstep_debug() {
 // the LSTM h/c + cc + frame + last_token between replays; it reads back ONLY
 // the emitted-id ring (tokens + post-step frames) for the termination check.
 //
-// Shape is model-level (Hp, L), independent of (T, K), so ONE process-global
-// cache backs every (T, K) graph. Single-threaded decode, so no aliasing. Each
+// Shape is model-level (Hp, L), independent of (T, K), so one model-owned
+// cache backs its (T, K) graphs. Each
 // utterance RE-SEEDS the buffers before its first replay (the eager step-0
-// state). Freed by a registered decode-cache-clearer before backend teardown.
+// state). Freed with the model before backend teardown.
 // ---------------------------------------------------------------------------
 struct DecodeDevCache {
     ggml_context* ctx = nullptr;
@@ -137,35 +137,21 @@ bool DecodeDevCache::init(int Hp_, int L_, ggml_backend_t backend, std::string& 
     return true;
 }
 
-// Process-global decode device cache (one per process; Hp/L are model-level
-// constants, so a single cache backs every (T, K) K-step graph).
-std::unique_ptr<DecodeDevCache> g_decode_dev_cache;
-std::once_flag g_decode_dev_cache_once;
-void ensure_decode_dev_cache_clearer_registered() {
-    std::call_once(g_decode_dev_cache_once, [] {
-        // Register BEFORE the K-step graph clearer's effect matters: both just
-        // drop process-globals before the backend resets. Order between them is
-        // safe (both leak-at-exit under shutting_down(); no cross-deref).
-        register_decode_cache_clearer([] { g_decode_dev_cache.reset(); });
-    });
-}
-// Lazily create the process-global decode device cache. Hp/L come from the
-// prediction net (model-level). Returns nullptr on alloc failure.
-DecodeDevCache* get_decode_dev_cache(int Hp, int L, std::string& e) {
-    ensure_decode_dev_cache_clearer_registered();
-    if (g_decode_dev_cache) return g_decode_dev_cache.get();
-    g_decode_dev_cache = std::unique_ptr<DecodeDevCache>(new DecodeDevCache());
-    if (!g_decode_dev_cache->init(Hp, L, global_backend().handle(), e)) {
-        g_decode_dev_cache.reset();
+DecodeDevCache* get_decode_dev_cache(const ModelLoader& loader, int Hp, int L, std::string& e) {
+    auto& cache = loader.cache<DecodeDevCache>();
+    if (cache) return cache.get();
+    auto pending = std::make_unique<DecodeDevCache>();
+    if (!pending->init(Hp, L, global_backend().handle(), e)) {
         return nullptr;
     }
-    return g_decode_dev_cache.get();
+    cache = std::move(pending);
+    return cache.get();
 }
 
 // ---------------------------------------------------------------------------
 // K-step decode graph: one ReplayGraph capturing K decode steps, with the
 // per-step state (frame_idx, last_token, h/c, cc) chained in-graph. One graph
-// per (T, K); cached process-globally and reused across utterances of the same
+// per (T, K); cached in the loaded model and reused across utterances of the same
 // encoder length (building the graph = ggml build + gallocr alloc + CUDA-graph
 // warmup, expensive enough to amortise).
 // ---------------------------------------------------------------------------
@@ -247,30 +233,13 @@ struct KStepGraph {
     std::vector<float> cap_dbg_dur_i32_f;   // [1] (echo of dur_i32, i32 reinterpreted)
 };
 
-// Process-global cache keyed on (T, K).
+// Per-model graph cache keyed on (T, K).
 namespace {
 struct KKey { int T, K; bool operator==(const KKey& o) const { return T==o.T && K==o.K; } };
 struct KKeyHash { size_t operator()(const KKey& k) const noexcept {
     return (size_t)k.T * 257u + (size_t)k.K; } };
-std::unordered_map<KKey, std::unique_ptr<KStepGraph>, KKeyHash> g_kstep_cache;
-
-// Register the cache clearer exactly once (after main starts, so the clearer
-// vector in graph.cpp is already constructed). shutdown_backend() calls it
-// BEFORE resetting the Backend, freeing the cached graphs' device buffers +
-// captured CUDA graphs while the driver is alive.
-std::once_flag g_register_clearer_once;
-void ensure_clearer_registered() {
-    std::call_once(g_register_clearer_once, [] {
-        register_decode_cache_clearer([] { g_kstep_cache.clear(); });
-    });
-}
+using KStepCache = std::unordered_map<KKey, std::unique_ptr<KStepGraph>, KKeyHash>;
 } // namespace
-
-// Free every cached K-step graph (its ReplayGraph owns a device buffer + a
-// captured CUDA graph). Driven by shutdown_backend() via the registered clearer.
-void clear_kstep_cache() {
-    g_kstep_cache.clear();
-}
 
 // where(m, A, B) = m*A + (1-m)*B for scalar f32 mask m (f32 [1]) and equal-shape
 // f32 operands A,B. ggml has no where/comparison op, so the mask is gathered
@@ -304,11 +273,13 @@ static KStepGraph* get_or_build_kstep(const PredictionNet& pred, const Joint& jo
                                       const std::vector<int32_t>& durations,
                                       DecodeDevCache* dc,
                                       bool device_resident) {
-    ensure_clearer_registered();
+    auto& slot = pred.model_loader().cache<KStepCache>();
+    if (!slot) slot = std::make_unique<KStepCache>();
+    auto& kstep_cache = *slot;
 
     KKey key{ T, K };
-    auto it = g_kstep_cache.find(key);
-    if (it != g_kstep_cache.end()) return it->second.get();
+    auto it = kstep_cache.find(key);
+    if (it != kstep_cache.end()) return it->second.get();
 
     const int Hj = joint.joint_hidden();
     const int Hp = pred.hidden_size();
@@ -623,7 +594,7 @@ static KStepGraph* get_or_build_kstep(const PredictionNet& pred, const Joint& jo
         }));
 
     if (raw->rg == nullptr) return nullptr;
-    it = g_kstep_cache.emplace(key, std::move(kg)).first;
+    it = kstep_cache.emplace(key, std::move(kg)).first;
     return it->second.get();
 }
 
@@ -705,7 +676,7 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     DecodeDevCache* dc = nullptr;
     if (d1) {
         std::string ddc_err;
-        dc = get_decode_dev_cache(Hp, L, ddc_err);
+        dc = get_decode_dev_cache(pred.model_loader(), Hp, L, ddc_err);
         if (!dc) {
             if (dbg) std::fprintf(stderr, "[tdt_multistep] DecodeDevCache alloc failed: %s\n", ddc_err.c_str());
             return std::nullopt;       // caller falls back to the serial loop

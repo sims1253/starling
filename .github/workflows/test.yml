@@ -1,22 +1,9 @@
 name: tests
 
-# CPU-safe cross-platform CI.
-#
-# Starling's heavy GPU work (model byte-exactness, benchmarks, CUDA-graph
-# capture) needs an RTX 5090 / sm_120 and stays out of CI -- it is run manually
-# on the benchmark box. This workflow runs ONLY the CPU-safe subset:
-#
-#   * tests/test_server_routing.py -- pure, GPU-free slug->backend routing,
-#     CLI parsing, config plumbing (no model loaded, no CUDA).
-#   * tests/test_server_robustness.py -- CPU-only regressions for the
-#     robustness fixes (fakes; no GPU, no model, no network).
-#   * an import smoke test of starling._kernels, proving the backend dispatch
-#     resolves correctly on each OS (triton on Linux, torch on Windows).
-#
-# The matrix runs both Linux and Windows to guard the kernel-backend
-# abstraction that landed with cross-platform support (src/starling/_kernels/).
+# CPU regressions run on Linux and Windows; model/GPU checks run separately.
 
 on:
+  workflow_dispatch:
   push:
     branches: [master, main]
   pull_request:
@@ -28,7 +15,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sonar-tests:
+    name: SONAR harness (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Install isolated CPU dependencies
+        run: uv sync --locked --project benchmarks/sonar --python 3.12
+      - name: Harness regressions
+        run: uv run --project benchmarks/sonar python -m unittest discover -s benchmarks/sonar -p 'test_*.py'
+
+  engine-guards:
+    name: Native engine and server guards (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Test portable guards without the deprecated CUDA environment
+        run: >-
+          uv run --no-project --python 3.12
+          --with pytest --with numpy --with scipy --with fastapi --with httpx
+          --with uvicorn --with websockets
+          python -m pytest -q
+          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
+          tests/test_server_routing.py tests/test_server_robustness.py
+          tests/test_server_lifecycle.py tests/test_server_websocket.py
+          tests/test_server_client.py tests/test_stream_chunk.py
+
+      - name: Test native Python bindings with CPU-only PyTorch
+        run: >-
+          uv run --no-project --python 3.12 --with pytest --with numpy --with torch
+          --index https://download.pytorch.org/whl/cpu
+          python -m pytest -q tests/test_benchmark_ggml_adapters.py
+
   cpu-tests:
+    # Deprecated CUDA/Python environment is opt-in; portable CI lives in apps.yml.
+    if: github.event_name == 'workflow_dispatch'
     name: CPU tests (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -46,7 +75,7 @@ jobs:
 
       - name: Install uv
         # astral-sh/setup-uv v10.0.1
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -55,11 +84,11 @@ jobs:
         run: uv venv --python ${{ matrix.python-version }}
 
       - name: Install dependencies
-        # `uv sync --extra dev` resolves from the project. triton is marked
+        # `uv sync --locked --extra dev` resolves from the project. triton is marked
         # `sys_platform == 'linux'` in pyproject.toml, so it is NOT installed
         # on windows-latest (no official Windows wheel) and the kernel package
         # auto-selects the torch backend there instead.
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: CPU-safe server tests
         # No CUDA, no model loading, no network: verifies slug->backend
@@ -67,12 +96,21 @@ jobs:
         # paths, and the CPU-only robustness/lifecycle regressions.
         # test_s1_config.py: pure-Python s1 prompt-contract tests (control
         # line, chunking, budget formula) — no model, no goldens.
-        run: uv run python -m pytest tests/test_server_routing.py tests/test_server_robustness.py tests/test_server_lifecycle.py tests/test_s1_config.py -q
+        run: >-
+          uv run python -m pytest -q
+          tests/test_server_routing.py tests/test_server_robustness.py
+          tests/test_server_lifecycle.py tests/test_server_websocket.py
+          tests/test_server_client.py tests/test_stream_chunk.py
+          tests/test_s1_config.py tests/test_autotune.py tests/test_flags.py
+          tests/test_fp4_quantization.py tests/test_ablation_checks.py
+          tests/test_multistep_controller.py
+          tests/test_kernel_selection.py tests/test_gpu_runner.py
+          tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
+          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
 
-      - name: Import smoke (kernel backend dispatches per-OS)
-        # Only call have_triton() + get_backend_name() (NOT get_backend()) --
-        # both are pure (no backend import, no torch import) and safe on a
-        # CUDA-less runner. Expected output:
-        #   ubuntu : backend: triton  triton: True
-        #   windows: backend: torch   triton: False
+      - name: POSIX GPU lock lifecycle tests
+        if: runner.os == 'Linux'
+        run: uv run python -m pytest tests/test_gpu_session.py tests/test_gpu_lock.py -q
+
+      - name: Kernel backend import smoke
         run: uv run python -c "import starling._kernels as K; print('backend:', K.get_backend_name(), 'triton:', K.have_triton())"

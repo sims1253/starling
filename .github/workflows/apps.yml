@@ -1,0 +1,100 @@
+name: Portable apps and contracts
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
+        with:
+          node-version: 24
+          cache: true
+          run-install: true
+      - run: vp run check
+      - name: Package Electron desktop app
+        run: vp run --filter @starling/desktop package --dir
+
+  browser-and-api:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
+        with:
+          node-version: 24
+          cache: true
+          run-install: true
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Build real HTTP handlers with a deterministic test engine
+        run: |
+          cmake --preset native-cpu
+          cmake --build build/native-cpu --target starling-serve-contract-fixture -j2
+      - run: python -m unittest discover -s backends/native/tests -v
+      - run: python -m unittest discover -s quants/tests -v
+      - run: uv run --project quants --locked starling-quants check
+      - name: Validate OpenAPI
+        run: uv run --no-project --with openapi-spec-validator python -c "import json; from openapi_spec_validator import validate; validate(json.load(open('packages/contracts/openapi.json')))"
+      - name: Install browser
+        run: uv run --no-project --with playwright python -m playwright install --with-deps chromium
+      - name: Recording, recovery, and transcript UI
+        run: vp run test:apps
+      - name: Electron preload and OpenAI upload
+        env:
+          # Hosted Linux restricts Chromium user namespaces. This flag belongs
+          # to the test launcher; application defaults retain sandboxing.
+          STARLING_TEST_NO_SANDBOX: "1"
+        run: |
+          vp run build
+          xvfb-run -a vp run test:electron
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Build and test Android
+        working-directory: apps/mobile
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test portable Swift core
+        working-directory: apps/ios
+        run: swift test
+      - name: Generate Xcode project
+        working-directory: apps/ios
+        run: brew install xcodegen && xcodegen generate
+      - name: Build for iOS Simulator
+        working-directory: apps/ios
+        run: xcodebuild -project StarlingVoice.xcodeproj -scheme StarlingVoice -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build

@@ -1,0 +1,36 @@
+{
+  "name": "starling-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=24.13.1"
+  },
+  "scripts": {
+    "dev": "vp run --filter @starling/desktop dev",
+    "desktop": "vp run --filter @starling/desktop native:dev",
+    "build": "vp run -r build",
+    "typecheck": "tsc -p tsconfig.tools.json && vp run -r typecheck",
+    "test": "vp run -r test",
+    "test:apps": "uv run --no-project --with playwright python scripts/test_desktop_app.py",
+    "quants": "python -m quants.starling_quants",
+    "serve:python": "uv run --extra server starling-python-serve",
+    "build:native": "cmake --preset native-cpu && cmake --build --preset native-cpu",
+    "check": "pnpm run fmt:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
+    "test:quants": "python -m unittest discover -s quants/tests -v",
+    "test:api": "python -m unittest discover -s backends/native/tests -v",
+    "test:electron": "uv run --no-project --with playwright python scripts/test_electron_app.py",
+    "lint": "vp lint --deny-warnings apps/desktop packages/dictation vite.config.ts",
+    "lint:fix": "vp lint --fix apps/desktop packages/dictation vite.config.ts",
+    "fmt": "vp fmt apps/desktop packages/dictation vite.config.ts",
+    "fmt:check": "vp fmt --check apps/desktop packages/dictation vite.config.ts"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.82.0",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "type": "module",
+  "packageManager": "pnpm@12.4.1"
+}

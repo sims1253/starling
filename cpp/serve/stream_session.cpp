@@ -10,7 +10,6 @@
 #include <cctype>
 #include <cmath>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <thread>
 
@@ -168,6 +167,10 @@ std::optional<std::string> ChunkStreamer::step(
     bool finalized = finalize_full_windows(samples, tx);
 
     int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
+    if (tail_len >= chunk_) {  // a full window is still waiting for a retry
+        return finalized ? std::optional<std::string>(join_words(committed_))
+                         : std::nullopt;
+    }
     bool throttled = (now - last_emit_) < partial_interval_;
     if (!finalized && (throttled || tail_len < min_)) {
         return std::nullopt;
@@ -181,42 +184,33 @@ std::optional<std::string> ChunkStreamer::step(
             return finalized ? std::optional<std::string>(join_words(committed_))
                              : std::nullopt;
         }
-        auto words = split_words(*text);
-        auto combined = committed_;
-        combined.insert(combined.end(), words.begin(), words.end());
-        return join_words(combined);
+        return join_words(stitch_words(committed_, split_words(*text),
+                                       max_overlap_words_));
     }
     return finalized ? std::optional<std::string>(join_words(committed_))
                      : std::nullopt;
 }
 
-std::string ChunkStreamer::flush(
+std::optional<std::string> ChunkStreamer::flush(
     const std::vector<float>& samples, const TranscribeFn& tx) {
     constexpr int kMaxRetries = 5;
-    constexpr double kBackoffS = 0.05;
-
-    finalize_full_windows(samples, tx);
-    int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
-    if (tail_len > 0) {
-        std::optional<std::string> text;
-        for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-            text = tx(samples.data() + boundary_, tail_len);
-            if (text.has_value()) break;
-            std::this_thread::sleep_for(
-                std::chrono::microseconds(static_cast<int64_t>(kBackoffS * 1e6)));
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        finalize_full_windows(samples, tx);
+        int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
+        if (tail_len == 0) return join_words(committed_);
+        if (tail_len < chunk_) {
+            auto text = tx(samples.data() + boundary_, tail_len);
+            if (text.has_value()) {
+                committed_ = stitch_words(committed_, split_words(*text),
+                                          max_overlap_words_);
+                boundary_ = static_cast<int64_t>(samples.size());
+                return join_words(committed_);
+            }
         }
-        if (text.has_value()) {
-            committed_ = stitch_words(committed_, split_words(*text),
-                                      max_overlap_words_);
-            boundary_ = static_cast<int64_t>(samples.size());
-        } else {
-            std::fprintf(stderr,
-                "[starling-serve] flush: dropped untranscribed tail (%lld samples) "
-                "after %d retries\n",
-                static_cast<long long>(tail_len), kMaxRetries);
-        }
+        if (attempt + 1 < kMaxRetries)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    return join_words(committed_);
+    return std::nullopt;
 }
 
 void ChunkStreamer::reset() {
@@ -346,7 +340,7 @@ std::optional<std::string> StreamSession::stream_step(double now) {
     return chunker_->step(samples_, now, tx);
 }
 
-std::string StreamSession::stream_flush() {
+std::optional<std::string> StreamSession::stream_flush() {
     if (!chunker_) return "";
     TranscribeFn tx = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
     return chunker_->flush(samples_, tx);

@@ -7,7 +7,6 @@ the specific fixes called out in the review:
 
 * A. malformed audio -> HTTP 400 (not a 500 / dead socket)
 * B. multipart parsing selects the audio field by name / filename / content-type
-* C. WebSocket frame cap + client-mask enforcement
 * D. streaming buffer is bounded (committed prefix trimmed)
 * E. ``ChunkStreamer.flush`` retries the tail on a busy transcriber (bounded)
 * F. ``flags()`` applies overrides, restores defaults, preserves all fields
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import io
 import os
-import struct
 import sys
 import threading
 import time
@@ -33,7 +31,6 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from starling.server import (  # noqa: E402
-    MAX_WS_FRAME_BYTES,
     SAMPLE_RATE,
     STREAM_TRIM_MIN_SAMPLES,
     ServerConfig,
@@ -43,11 +40,10 @@ from starling.server import (  # noqa: E402
     _extract_multipart_payload,
     _transcribe_payload_sync,
     _wav_bytes_to_float32,
-    _ws_read_frame,
 )
 from starling.stream_chunk import (  # noqa: E402
     ChunkStreamer,
-    _FLUSH_TAIL_MAX_RETRIES,
+    _FLUSH_MAX_RETRIES,
 )
 
 
@@ -95,9 +91,6 @@ class _FakeServer:
         # failure). If None, decode + inference succeed with ``result_text``.
         self._exc = exc
         self._result_text = result_text
-        # a real queue_depth()/registry is not needed for the 400 path
-        self._n_waiters = 0
-        self._lock = threading.Lock()
 
     def decode_wav_bytes(self, _wav_bytes: bytes) -> np.ndarray:
         # Argument mirrors StarlingServer.decode_wav_bytes' signature so this
@@ -356,238 +349,6 @@ def test_multipart_zero_score_fallback_ignores_trailing_empty_part() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C. WS frame cap + mask validation
-# ---------------------------------------------------------------------------
-def _ws_frame(*, payload: bytes, opcode: int = 0x1, mask: bool = True,
-              mask_key: bytes = b"\x01\x02\x03\x04") -> bytes:
-    """Build one RFC 6455 client->server frame's wire bytes.
-
-    All client frames are masked per RFC 6455 §5.1 unless ``mask=False``.
-    """
-    b0 = 0x80 | (opcode & 0x0F)  # FIN set
-    n = len(payload)
-    out = bytearray()
-    if n < 126:
-        b1 = (0x80 if mask else 0x00) | n
-        out += struct.pack(">BB", b0, b1)
-    elif n < 65536:
-        b1 = (0x80 if mask else 0x00) | 126
-        out += struct.pack(">BBH", b0, b1, n)
-    else:
-        b1 = (0x80 if mask else 0x00) | 127
-        out += struct.pack(">BBQ", b0, b1, n)
-    if mask:
-        assert len(mask_key) == 4
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    else:
-        out += payload
-    return bytes(out)
-
-
-def _rfile(data: bytes) -> io.BufferedReader:
-    """A file-like rfile backed by BytesIO (has ``.read(n)``)."""
-    return io.BufferedReader(io.BytesIO(data))
-
-
-def test_ws_read_frame_valid_masked_text_frame() -> None:
-    payload = b"hello stream"
-    frame = _ws_frame(payload=payload, opcode=0x1)
-
-    opcode, out = _ws_read_frame(_rfile(frame))
-
-    assert opcode == 0x1
-    assert out == payload
-
-
-def test_ws_read_frame_rejects_unmasked_client_frame() -> None:
-    """An unmasked client->server frame is a protocol violation -> ConnectionError."""
-    frame = _ws_frame(payload=b"sneaky", opcode=0x1, mask=False)
-
-    with pytest.raises(ConnectionError, match="unmasked"):
-        _ws_read_frame(_rfile(frame))
-
-
-def test_ws_read_frame_rejects_oversized_frame_header() -> None:
-    """A frame claiming a payload > MAX_WS_FRAME_BYTES raises before reading body."""
-    huge = MAX_WS_FRAME_BYTES + 1
-    # 127-length extended header with a gigantic declared length, masked.
-    b0 = 0x80 | 0x1  # FIN + text
-    b1 = 0x80 | 127   # masked + 64-bit length
-    header = struct.pack(">BBQ", b0, b1, huge) + b"\x01\x02\x03\x04"
-
-    with pytest.raises(ValueError, match="too large"):
-        _ws_read_frame(_rfile(header))
-
-
-def test_ws_read_frame_allows_max_size_header() -> None:
-    """A frame declaring exactly MAX_WS_FRAME_BYTES passes the size check.
-
-    We only feed the header (no real payload) so the reader will then hit EOF
-    reading the body; the point is the size ValueError must NOT fire.
-    """
-    b0 = 0x80 | 0x1
-    b1 = 0x80 | 127
-    header = struct.pack(">BBQ", b0, b1, MAX_WS_FRAME_BYTES) + b"\x01\x02\x03\x04"
-
-    with pytest.raises(ConnectionError, match="closed mid-frame"):
-        _ws_read_frame(_rfile(header))
-    # If the size check had fired we'd have seen ValueError instead; reaching
-    # the EOF "closed mid-frame" ConnectionError proves the cap allowed it.
-
-
-def test_ws_read_frame_rejects_oversized_fragmented_message() -> None:
-    """The size cap applies across the WHOLE fragmented message, not per frame.
-
-    An unfinished text frame followed by a continuation whose combined payload
-    exceeds MAX_WS_FRAME_BYTES must raise, not return the joined payload.
-    """
-    mask_key = b"\x01\x02\x03\x04"
-
-    def _masked_frame(payload: bytes, opcode: int, *, fin: bool) -> bytes:
-        b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
-        n = len(payload)
-        b1 = 0x80 | (126 if n < 65536 else 127)
-        out = bytearray()
-        if n < 65536:
-            out += struct.pack(">BBH", b0, b1, n)
-        else:
-            out += struct.pack(">BBQ", b0, b1, n)
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-        return bytes(out)
-
-    half = MAX_WS_FRAME_BYTES // 2 + 1  # two halves each under the per-frame cap...
-    first = _masked_frame(b"\x00" * half, opcode=0x1, fin=False)  # unfinished text
-    cont = _masked_frame(b"\x00" * half, opcode=0x0, fin=True)    # ...but combined > cap
-
-    with pytest.raises(ValueError, match="too large"):
-        _ws_read_frame(_rfile(first + cont))
-
-
-def _ws_raw_frame(payload: bytes, opcode: int, *, fin: bool, mask: bool = True,
-                  mask_key: bytes = b"\x01\x02\x03\x04") -> bytes:
-    """Build one masked client->server frame with a controlled FIN bit."""
-    b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
-    n = len(payload)
-    out = bytearray()
-    if n < 126:
-        out += struct.pack(">BB", b0, (0x80 if mask else 0x00) | n)
-    elif n < 65536:
-        out += struct.pack(">BBH", b0, (0x80 if mask else 0x00) | 126, n)
-    else:
-        out += struct.pack(">BBQ", b0, (0x80 if mask else 0x00) | 127, n)
-    if mask:
-        out += mask_key
-        out += bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-    else:
-        out += payload
-    return bytes(out)
-
-
-def test_ws_read_frame_text_fragment_with_interleaved_ping_assembles_message() -> None:
-    """A ping interleaved mid-fragmented TEXT message must not discard the
-    accumulated fragments; the assembled text is returned once FIN arrives."""
-    first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)   # unfinished text
-    ping = _ws_raw_frame(b"ping-body", opcode=0x9, fin=True)  # interleaved ping
-    cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)      # finishing continuation
-
-    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
-
-    assert opcode == 0x1
-    assert out == b"hello"  # fragments preserved across the ping
-
-
-def test_ws_read_frame_binary_fragment_with_interleaved_ping_assembles_message() -> None:
-    """A ping interleaved mid-fragmented BINARY message preserves the fragments."""
-    first = _ws_raw_frame(b"\x01\x02", opcode=0x2, fin=False)  # unfinished binary
-    ping = _ws_raw_frame(b"x", opcode=0x9, fin=True)           # interleaved ping
-    cont = _ws_raw_frame(b"\x03\x04", opcode=0x0, fin=True)    # finishing continuation
-
-    opcode, out = _ws_read_frame(_rfile(first + ping + cont))
-
-    assert opcode == 0x2
-    assert out == b"\x01\x02\x03\x04"
-
-
-def test_ws_read_frame_standalone_ping_when_no_pending_message() -> None:
-    """A ping with no pending fragmented message is surfaced to the caller (so it
-    can pong) -- the common case is unchanged."""
-    ping = _ws_raw_frame(b"keepalive", opcode=0x9, fin=True)
-
-    opcode, out = _ws_read_frame(_rfile(ping))
-
-    assert opcode == 0x9
-    assert out == b"keepalive"
-
-
-def test_ws_read_frame_rejects_non_final_ping() -> None:
-    """RFC 6455 §5.5: a control frame (ping) MUST have FIN set -- it cannot be
-    fragmented. A non-final ping is rejected before any payload handling."""
-    # FIN clear (fin=False) on a ping (0x9).
-    frame = _ws_raw_frame(b"x", opcode=0x9, fin=False)
-
-    with pytest.raises(ValueError, match="control frame .* must have FIN set"):
-        _ws_read_frame(_rfile(frame))
-
-
-def test_ws_read_frame_rejects_ping_payload_over_125_bytes() -> None:
-    """RFC 6455 §5.5: a control frame payload MUST NOT exceed 125 bytes. A
-    126-byte ping is rejected before on_ping could answer it."""
-    # A 126-byte payload uses the 16-bit extended-length encoding; _ws_raw_frame
-    # emits it correctly, but the reader must reject it as an invalid ping.
-    frame = _ws_raw_frame(b"\x00" * 126, opcode=0x9, fin=True)
-
-    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
-        _ws_read_frame(_rfile(frame))
-
-    # And it must also be rejected before invoking on_ping (no pong emitted).
-    pongs: list[bytes] = []
-    with pytest.raises(ValueError, match="payload exceeds 125 bytes"):
-        _ws_read_frame(_rfile(frame), on_ping=pongs.append)
-    assert pongs == []  # on_ping never called for the invalid frame
-
-
-def test_ws_read_frame_mid_fragment_ping_answers_via_callback_before_continuation() -> None:
-    """A ping interleaved mid-fragmented message is answered *immediately* via
-    on_ping, before the continuation frame is read -- not silently held until
-    the message completes. Regression: the original mid-fragment path swallowed
-    the ping, so no pong was ever sent for it."""
-    events: list[str] = []
-    pongs: list[bytes] = []
-
-    def on_ping(payload: bytes) -> None:
-        events.append(f"pong:{payload!r}")
-        pongs.append(payload)
-
-    # Wrap the rfile so reading the continuation records an event after the
-    # ping callback -- proving the callback ran *before* the continuation read.
-    raw_first = _ws_raw_frame(b"hel", opcode=0x1, fin=False)
-    ping = _ws_raw_frame(b"ping", opcode=0x9, fin=True)
-    raw_cont = _ws_raw_frame(b"lo", opcode=0x0, fin=True)
-    rfile = _rfile(raw_first + ping + raw_cont)
-    real_read = rfile.read
-
-    def tracking_read(n: int = -1) -> bytes:
-        data = real_read(n)
-        # Only tag continuation reads (after the ping byte boundary); the
-        # simplest reliable marker is that pong has already been recorded.
-        if pongs and "cont-read" not in events:
-            events.append("cont-read")
-        return data
-
-    rfile.read = tracking_read  # type: ignore[method-assign]
-
-    opcode, out = _ws_read_frame(rfile, on_ping=on_ping)
-
-    assert opcode == 0x1
-    assert out == b"hello"  # message still assembled correctly
-    assert pongs == [b"ping"]  # pong payload captured
-    # The pong callback fired before the continuation frame was read.
-    assert events.index("pong:b'ping'") < events.index("cont-read")
-
-
-# ---------------------------------------------------------------------------
 # D. Streaming buffer is bounded
 # ---------------------------------------------------------------------------
 class _FakeChunker:
@@ -706,7 +467,7 @@ def _chunker() -> ChunkStreamer:
 
 def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:  # noqa: ANN001
     """tx returning None then succeeding commits the tail text."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
 
     calls = {"n": 0}
@@ -725,59 +486,32 @@ def test_flush_commits_tail_when_succeeds_within_retries(monkeypatch) -> None:  
     assert chunker.boundary == len(samples)  # tail finalized
 
 
-def test_flush_drops_tail_when_always_busy_and_logs_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
-    """Always-busy tx: committed text returned WITHOUT the tail, warning logged."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
-    chunker = _chunker()
-
-    calls = {"n": 0}
-
-    def tx(_window: np.ndarray) -> None:
-        calls["n"] += 1
-        return None  # always busy
-
-    # Pre-seed some committed text so we can assert it survives the dropped tail.
-    chunker.committed = ["already", "committed"]
-
-    samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    with caplog.at_level("WARNING", logger="starling.stream_chunk"):
-        out = chunker.flush(samples, tx)
-
-    assert out == "already committed"  # tail dropped, committed kept
-    assert calls["n"] == _FLUSH_TAIL_MAX_RETRIES  # bounded retry count
-    assert any("dropped untranscribed tail" in rec.message for rec in caplog.records)
-
-
-def test_flush_accepts_empty_string_result_without_warning(monkeypatch, caplog) -> None:  # noqa: ANN001
-    """A tx returning '' (silence) is a success: boundary advances, no warning.
-
-    Any non-None result -- including an empty string -- must be treated as
-    successful, advancing the boundary to len(samples) and NOT emitting the
-    busy/dropped-tail warning. Pre-seeded committed text survives unchanged.
-    """
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+def test_flush_retains_tail_when_always_busy(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
     chunker.committed = ["already", "committed"]
-
-    calls = {"n": 0}
-
-    def tx(_window: np.ndarray) -> str:
-        calls["n"] += 1
-        return ""  # silence transcribed to no words (still a success)
-
+    calls = []
     samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
-    with caplog.at_level("WARNING", logger="starling.stream_chunk"):
-        out = chunker.flush(samples, tx)
+    assert chunker.flush(samples, lambda window: calls.append(len(window))) is None
+    assert len(calls) == _FLUSH_MAX_RETRIES
+    assert chunker.boundary == 0
+    assert chunker.committed == ["already", "committed"]
+    assert chunker.flush(samples, lambda window: "tail text") == "already committed tail text"
+    assert chunker.boundary == len(samples)
 
-    assert out == "already committed"  # committed kept, empty tail added nothing
-    assert calls["n"] == 1  # exactly one tx call (success, no retries)
-    assert chunker.boundary == len(samples)  # tail finalized
-    assert not any("dropped untranscribed tail" in rec.message for rec in caplog.records)
+
+def test_flush_accepts_empty_string_result(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
+    chunker = _chunker()
+    chunker.committed = ["already", "committed"]
+    samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+    assert chunker.flush(samples, lambda window: "") == "already committed"
+    assert chunker.boundary == len(samples)
 
 
 def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:  # noqa: ANN001
     """The retry loop must be bounded: flush returns in finite time, not hang."""
-    monkeypatch.setattr("starling.stream_chunk._FLUSH_TAIL_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr("starling.stream_chunk._FLUSH_BACKOFF_SECONDS", 0.0)
     chunker = _chunker()
     samples = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
 
@@ -792,7 +526,7 @@ def test_flush_never_hangs_on_persistent_busy(monkeypatch) -> None:  # noqa: ANN
     t.start()
     # Generous but finite: if flush were unbounded this would time out.
     assert done.wait(timeout=5.0), "flush hung instead of bounding retries"
-    assert result["out"] == ""
+    assert result["out"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -813,25 +547,14 @@ def test_flags_applies_override_and_restores() -> None:
     assert flags_mod.get_default_flags().tolerance_mode is original_tol
 
 
-def test_flags_ignores_unknown_keys() -> None:
-    """An unknown override key does not crash (lenient behavior preserved).
-
-    Validates that the nonexistent override is ignored while every *known* field
-    keeps its established prior default (not just one unrelated field).
-    """
-    import dataclasses
-
+def test_flags_reject_unknown_override_without_changing_defaults() -> None:
     from starling import flags as flags_mod
 
     saved = flags_mod.get_default_flags()
-    saved_snapshot = {fld.name: getattr(saved, fld.name) for fld in dataclasses.fields(saved)}
-
-    with flags_mod.flags(nonexistent_flag=True) as f:
-        # The unknown key is filtered out, so every real field equals its prior default.
-        for fld in dataclasses.fields(f):
-            assert getattr(f, fld.name) == saved_snapshot[fld.name], (
-                f"field {fld.name!r} changed when only an unknown key was passed"
-            )
+    with pytest.raises(TypeError, match="multistep_grap"):
+        with flags_mod.flags(multistep_grap=False):
+            pytest.fail("unknown flag was accepted")
+    assert flags_mod.get_default_flags() is saved
 
 
 def test_flags_preserves_all_existing_fields_on_override() -> None:
@@ -966,53 +689,41 @@ def _make_warmable_server(monkeypatch) -> tuple[StarlingServer, dict]:  # noqa: 
 
 
 def test_warmup_dedupes_concurrent_calls(monkeypatch) -> None:  # noqa: ANN001
-    """Two concurrent warmup() calls run the GPU body exactly once.
-
-    The dedup guards *concurrent in-flight* calls. To exercise it reliably we
-    hold the first caller inside the (faked) GPU work on an Event until the
-    second caller has had a chance to observe ``_warmup_in_progress`` and bail.
-    Without this latch the first call can finish and clear the flag before the
-    second checks it, making the assertion race-dependent (the dedup is still
-    correct — it only guarantees dedup while a call is genuinely in flight).
-    """
+    """The second warmup returns while the first is still in GPU work."""
     server, counters = _make_warmable_server(monkeypatch)
-
-    in_gpu_work = threading.Event()  # the fake body sets this when it starts
-    release_gpu_work = threading.Event()  # the test releases it after a beat
-    barrier = threading.Barrier(2)
-
-    real_fake_transcribe = StarlingServer._transcribe_np
+    in_gpu_work = threading.Event()
+    release_gpu_work = threading.Event()
+    second_done = threading.Event()
 
     def blocking_fake_transcribe(self, _samples: np.ndarray, *, _streaming: bool = False) -> TranscribeResult:  # noqa: ANN001, ARG001
-        in_gpu_work.set()  # signal that the first call is inside the GPU work
-        release_gpu_work.wait(timeout=5.0)  # hold until the test releases us
+        in_gpu_work.set()
+        assert release_gpu_work.wait(timeout=10.0), "GPU work was never released"
         counters["transcribe"] += 1
         return TranscribeResult(text="warm")
 
     monkeypatch.setattr(StarlingServer, "_transcribe_np", blocking_fake_transcribe)
 
-    def call_warmup() -> None:
-        barrier.wait()  # line up both threads, then race into warmup()
+    def second_warmup() -> None:
         server.warmup()
+        second_done.set()
 
-    t1 = threading.Thread(target=call_warmup)
-    t2 = threading.Thread(target=call_warmup)
-    t1.start()
-    t2.start()
+    first = threading.Thread(target=server.warmup, daemon=True)
+    second = threading.Thread(target=second_warmup, daemon=True)
+    first.start()
+    try:
+        assert in_gpu_work.wait(timeout=5.0), "first caller never entered GPU work"
+        second.start()
+        assert second_done.wait(timeout=5.0), "second caller did not deduplicate"
+        assert counters["transcribe"] == 0
+    finally:
+        release_gpu_work.set()
+        first.join(timeout=5.0)
+        if second.ident is not None:
+            second.join(timeout=5.0)
 
-    # Wait until one thread has entered the GPU body (flag is now set), then
-    # give the other thread a moment to observe the flag and dedup out.
-    assert in_gpu_work.wait(timeout=5.0), "first caller never entered GPU work"
-    release_gpu_work.set()  # let the in-flight call finish
-
-    t1.join(timeout=10.0)
-    t2.join(timeout=10.0)
-
-    # Restore the original fake so later tests in the session get the simple counter.
-    monkeypatch.setattr(StarlingServer, "_transcribe_np", real_fake_transcribe)
-
-    assert counters["transcribe"] == 1  # deduped: GPU work ran once
-    assert server._warmup_in_progress is False  # flag reset afterward
+    assert not first.is_alive() and not second.is_alive()
+    assert counters["transcribe"] == 1
+    assert server._warmup_in_progress is False
 
 
 def test_warmup_second_call_after_first_completes_runs_again(monkeypatch) -> None:  # noqa: ANN001
@@ -1041,3 +752,89 @@ def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
 
     monkeypatch.setattr(gpu_lock, "acquire_gpu_lock", boom)
     server.warmup()  # must short-circuit before touching the GPU lock
+
+
+@pytest.mark.parametrize("path", ["/inference", "/transcribe"])
+@pytest.mark.parametrize("multipart", [False, True])
+def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
+    import asyncio
+    import json
+    from starling import server as module
+
+    wav = _wav_bytes(np.zeros(160, dtype=np.float32))
+    body = wav
+    content_type = "audio/wav"
+    if multipart:
+        body = (b'--audio-boundary\r\n'
+                b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+                b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
+        content_type = "multipart/form-data; boundary=audio-boundary"
+    server = StarlingServer()
+    monkeypatch.setattr(server, "_ensure_loaded", lambda: None)
+
+    def transcribe(samples, request_id):
+        assert len(samples) == 160
+        assert request_id == "upload-id"
+        return TranscribeResult(text="accepted")
+
+    monkeypatch.setattr(server, "_run_queued_sync", transcribe)
+    headers = {"content-length": str(len(body)), "content-type": content_type,
+               "x-request-id": "upload-id"}
+    fastapi = pytest.importorskip("fastapi")
+    app = module.create_app(server=server, load_on_startup=False)
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = fastapi.Request({"type": "http", "method": "POST", "path": path,
+                               "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                              receive)
+    route = next(r for r in app.routes if getattr(r, "path", None) == path)
+    result = asyncio.run(route.endpoint(request))
+    status, response = result.status_code, json.loads(result.body)
+    assert status == 200
+    assert response["text"] == "accepted"
+    assert response["request_id"] == "upload-id"
+
+
+@pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
+    import asyncio
+    import json
+    from starling import server as module
+
+    server = StarlingServer()
+    monkeypatch.setattr(server, "_ensure_loaded", lambda: None)
+
+    def fail(*args):
+        raise error_type("private engine details")
+
+    monkeypatch.setattr(server, stage, fail)
+    body = _wav_bytes(np.zeros(160, dtype=np.float32))
+    headers = {"content-type": "audio/wav", "content-length": str(len(body)),
+               "x-request-id": "failed-request"}
+    pytest.importorskip("fastapi")
+    app = module.create_app(server=server, load_on_startup=False)
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(app({"type": "http", "asgi": {"version": "3.0"},
+                     "http_version": "1.1", "method": "POST", "scheme": "http",
+                     "path": "/inference", "query_string": b"", "root_path": "",
+                     "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                    receive, send))
+    status = messages[0]["status"]
+    content_type = dict(messages[0]["headers"])[b"content-type"].decode()
+    payload = b"".join(message.get("body", b"") for message in messages[1:])
+    assert status == 500
+    assert content_type == "application/json"
+    assert json.loads(payload) == {"error": "transcription failed", "text": "",
+                                   "request_id": "failed-request"}
+    record = next(record for record in caplog.records if "failed-request" in record.message)
+    assert record.exc_info[1].args == ("private engine details",)
