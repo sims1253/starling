@@ -3,7 +3,7 @@
 The desktop renderer, Electron main process, preload, development launcher, and
 shared dictation package use TypeScript 7.0.2. Effect is pinned to
 `4.0.0-rc.115`: this is the v4 release candidate, not the v3 stable release.
-Vite builds the React renderer; esbuild bundles the Electron entry points.
+Vite+ builds the React renderer; esbuild bundles the Electron entry points.
 
 ```text
 React UI
@@ -27,18 +27,21 @@ error handling, or schemas must not change transcripts or discard saved audio.
 
 ## Checks
 
-Use Node.js 22.12 or later. Run commands from the repository root:
+Use Node.js 24.13.1 or later and pnpm. Run commands from the repository root:
 
 ```bash
-npm ci
-npm run check
+pnpm install
+pnpm run check
 ```
 
-`check` runs Oxlint, Oxfmt, TypeScript, unit tests, and the production build.
-`npm run lint:fix` applies supported lint fixes. `npm run format` formats the
+`check` runs Oxfmt, Oxlint, TypeScript, Vitest unit tests, and the production
+build. Vite+ (`vp`) provides Oxfmt, Oxlint, and Vitest; their settings live in
+the root `vite.config.ts`.
+`pnpm run lint:fix` applies supported lint fixes. `pnpm run fmt` formats the
 application and shared TypeScript source.
 
-Oxlint and `@oxlint/plugins` are pinned together at 1.83.0. The complete generic
+Keep `@oxlint/plugins` at the Oxlint version that Vite+ bundles (`vp --version`
+lists it; currently 1.82.0). The complete generic
 and Effect [anti-slop rules](https://github.com/dmmulroy/anti-slop) are vendored in
 `tools/oxlint/anti-slop`. That directory includes the upstream revision and
 licenses. Oxlint executes the rules; ESLint is not the lint runner. Review the
@@ -55,9 +58,9 @@ fixture and run the application workflows:
 ```bash
 cmake --preset native-cpu
 cmake --build build/native-cpu --target starling-serve-contract-fixture
-npm run test:apps
-npm run build
-xvfb-run -a npm run test:electron
+pnpm run test:apps
+pnpm run build
+xvfb-run -a pnpm run test:electron
 ```
 
 The last command uses Xvfb on Linux without a display. These tests need Playwright

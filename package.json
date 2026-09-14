@@ -3,38 +3,34 @@
   "private": true,
   "version": "0.1.0",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=24.13.1"
   },
-  "workspaces": [
-    "apps/desktop",
-    "packages/dictation"
-  ],
   "scripts": {
-    "dev": "npm run dev --workspace @starling/desktop",
-    "desktop": "npm run native:dev --workspace @starling/desktop",
-    "build": "npm run build --workspaces --if-present",
-    "typecheck": "tsc -p tsconfig.tools.json && npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "dev": "vp run --filter @starling/desktop dev",
+    "desktop": "vp run --filter @starling/desktop native:dev",
+    "build": "vp run -r build",
+    "typecheck": "tsc -p tsconfig.tools.json && vp run -r typecheck",
+    "test": "vp run -r test",
     "test:apps": "uv run --no-project --with playwright python scripts/test_desktop_app.py",
     "quants": "python -m quants.starling_quants",
     "serve:python": "uv run --extra server starling-python-serve",
     "build:native": "cmake --preset native-cpu && cmake --build --preset native-cpu",
-    "check": "npm run lint && npm run format:check && npm run typecheck && npm test && npm run build",
+    "check": "pnpm run fmt:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
     "test:quants": "python -m unittest discover -s quants/tests -v",
     "test:api": "python -m unittest discover -s backends/native/tests -v",
     "test:electron": "uv run --no-project --with playwright python scripts/test_electron_app.py",
-    "lint": "oxlint --deny-warnings apps/desktop packages/dictation oxlint.config.ts",
-    "lint:fix": "npm run lint -- --fix",
-    "format": "oxfmt --write apps/desktop/src apps/desktop/electron apps/desktop/vite.config.ts packages/dictation/src packages/dictation/test oxlint.config.ts",
-    "format:check": "oxfmt --check apps/desktop/src apps/desktop/electron apps/desktop/vite.config.ts packages/dictation/src packages/dictation/test oxlint.config.ts"
+    "lint": "vp lint --deny-warnings apps/desktop packages/dictation vite.config.ts",
+    "lint:fix": "vp lint --fix apps/desktop packages/dictation vite.config.ts",
+    "fmt": "vp fmt apps/desktop packages/dictation vite.config.ts",
+    "fmt:check": "vp fmt --check apps/desktop packages/dictation vite.config.ts"
   },
   "devDependencies": {
-    "typescript": "7.0.2",
-    "oxlint": "1.83.0",
-    "@oxlint/plugins": "1.83.0",
-    "oxfmt": "0.68.0",
-    "tsx": "4.23.13",
-    "@types/node": "22.20.2"
+    "@oxlint/plugins": "1.82.0",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
   },
-  "type": "module"
+  "type": "module",
+  "packageManager": "pnpm@12.4.1"
 }

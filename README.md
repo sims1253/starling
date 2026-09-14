@@ -44,16 +44,16 @@ Existing `/inference`, `/transcribe`, and `/stream` routes remain available.
 
 ## Run the apps
 
-For the desktop interface, install Node.js 22.12+ and run:
+For the desktop interface, install Node.js 24.13.1+ and pnpm, then run:
 
 ```bash
-npm ci
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
 This starts a browser preview connected through a development proxy to the
 server at `127.0.0.1:8181`. Microphone access requires localhost or HTTPS.
-Run `npm run desktop` for the Electron desktop app after installing its
+Run `pnpm run desktop` for the Electron desktop app after installing its
 [platform prerequisites](apps/desktop/README.md).
 
 - [Desktop: Windows, Linux, macOS](apps/desktop/README.md)

@@ -18,7 +18,7 @@ flowchart LR
   API --> Engine
 ```
 
-Each build system owns its natural boundary. npm workspaces link the desktop
+Each build system owns its natural boundary. pnpm workspaces link the desktop
 interface and TypeScript library. CMake owns the native server and quantizer.
 Gradle owns Android. XcodeGen and Swift Package Manager own iOS. The small Python
 quant catalog is independent of the deprecated Python inference environment.
