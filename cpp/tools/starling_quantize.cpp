@@ -364,6 +364,14 @@ int main(int argc, char** argv) {
     const bool moss_embed_ok = arch_key >= 0 &&
         gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
         std::strcmp(gguf_get_val_str(in, arch_key), "moss_transcribe") == 0;
+    // qwen3-asr ties lm_head to llm.embed.weight (see lib::lm_head_name); the
+    // tied table doubles as the decode vocab projection, where its size
+    // (2048 x 151936) makes it the hottest GEMV in the model — recipe-quantize
+    // it like moss's tied head (q8_0; the engine's get_rows + lm_head_gemm
+    // paths dequantize through the type traits exactly as moss's do).
+    const bool qwen3_embed_ok = arch_key >= 0 &&
+        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
+        std::strcmp(gguf_get_val_str(in, arch_key), "qwen3") == 0;
 
     // Output meta context: no_alloc tensors whose ->data we point at owned
     // host buffers until gguf_write_to_file.
@@ -408,7 +416,7 @@ int main(int argc, char** argv) {
         // (parakeet prediction embed; moss tied embed/lm_head via get_rows).
         if (use_recipe && n_dims == 2 &&
             ((parakeet && name == "decoder.prediction.embed.weight") ||
-             (moss_embed_ok && name == "llm.embed.weight"))) {
+             ((moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight"))) {
             for (const auto& rule : recipe.rules) {
                 if (std::regex_search(name, rule.first)) {
                     // Parakeet prediction embed: q8_0/f32 only (low-precision
@@ -416,12 +424,12 @@ int main(int argc, char** argv) {
                     // embed/lm_head: q8_0 proven, q4_0 experimental (the head
                     // is quality-sensitive; CER-gated per run, leaderboard WER
                     // before any release claim).
-                    const bool moss_head = moss_embed_ok && name == "llm.embed.weight";
+                    const bool tied_head = (moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight";
                     if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32 &&
-                        !(moss_head && rule.second == GGML_TYPE_Q4_0)) {
+                        !(tied_head && rule.second == GGML_TYPE_Q4_0)) {
                         std::fprintf(stderr,
                                      "error: embedding recipe supports only q8_0 or f32%s\n",
-                                     moss_head ? " (moss head: also q4_0)" : "");
+                                     tied_head ? " (tied head: also q4_0)" : "");
                         return 1;
                     }
                     candidates++;
