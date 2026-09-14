@@ -80,6 +80,12 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--version` | n/a | Print version + ABI + backend, exit |
 | `--abi-version` | n/a | Print ABI version integer, exit |
 
+## Standard API compatibility
+
+The native backend also exposes `POST /v1/audio/transcriptions` and
+`GET /v1/models`. Read the [API contract](api.md) for the supported
+OpenAI-compatible subset and the machine-readable capabilities endpoint.
+
 ## API contract
 
 The servers share audio routes and streaming messages. Clients must account

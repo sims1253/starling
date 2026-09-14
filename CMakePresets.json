@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "native-cpu",
+      "displayName": "Native server and quantizer (CPU)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/native-cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STARLING_SERVE": "ON",
+        "STARLING_QUANTIZE": "ON",
+        "STARLING_GGML_TESTS": "ON",
+        "STARLING_GGML_CUDA": "OFF",
+        "STARLING_GGML_METAL": "OFF",
+        "STARLING_GGML_VULKAN": "OFF",
+        "STARLING_GGML_HIP": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "native-cpu",
+      "configurePreset": "native-cpu",
+      "targets": [
+        "starling-serve",
+        "starling-quantize"
+      ]
+    }
+  ]
+}

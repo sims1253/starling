@@ -65,7 +65,7 @@ def quantize(tmp_path):
 
 def test_compact_recipe_changes_only_embedding_and_six_linears(quantize):
     baseline = quantize()
-    compact = quantize((ROOT / "benchmarks/recipes/parakeet-iq2-compact.recipe").read_text())
+    compact = quantize((ROOT / "quants/recipes/parakeet-iq2-compact.recipe").read_text())
     types = gguf.GGMLQuantizationType
     assert baseline[EMBED][:2] == (types.F32, 4 * 640 * 4)
     assert compact[EMBED][:2] == (types.Q8_0, 4 * 640 // 32 * 34)
@@ -79,7 +79,7 @@ def test_compact_recipe_changes_only_embedding_and_six_linears(quantize):
 
 def test_embedding_recipe_preserves_every_other_tensor(quantize):
     baseline = quantize()
-    result = quantize((ROOT / "benchmarks/recipes/parakeet-iq2-embedding-q8.recipe").read_text())
+    result = quantize((ROOT / "quants/recipes/parakeet-iq2-embedding-q8.recipe").read_text())
     assert result[EMBED][:2] == (gguf.GGMLQuantizationType.Q8_0, 4 * 640 // 32 * 34)
     for name in baseline.keys() - {EMBED}:
         assert result[name] == baseline[name]  # dtype, size, and payload hash
@@ -96,7 +96,7 @@ def test_embedding_requires_parakeet_and_explicit_rule(quantize, arch):
 
 
 def test_first_matching_precision_override_is_preserved(quantize):
-    recipe = (ROOT / "benchmarks/recipes/parakeet-iq2-compact.recipe").read_text()
+    recipe = (ROOT / "quants/recipes/parakeet-iq2-compact.recipe").read_text()
     recipe = "^decoder\\.prediction\\.embed\\.weight$ f32\n^joint\\.pred\\.weight$ q8_0\n" + recipe
     result = quantize(recipe)
     assert result[EMBED][0] == gguf.GGMLQuantizationType.F32

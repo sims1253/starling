@@ -9,3 +9,16 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      oxlint:
+        patterns:
+          - oxlint
+          - "@oxlint/plugins"
+  - package-ecosystem: gradle
+    directory: /apps/mobile
+    schedule:
+      interval: weekly

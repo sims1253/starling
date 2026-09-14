@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {"id":"parakeet-q8","model":"parakeet","quant":"q8_0","status":"baseline","requires_imatrix":false,"flags":[]},
+    {"id":"parakeet-q4-calibrated","model":"parakeet","recipe":"parakeet-q4-fullimx.recipe","status":"measured","requires_imatrix":true,"flags":[]},
+    {"id":"parakeet-q2-attn3","model":"parakeet","recipe":"parakeet-q2-attn3.recipe","status":"experimental","requires_imatrix":true,"flags":[]},
+    {"id":"parakeet-iq2-compact","model":"parakeet","recipe":"parakeet-iq2-compact.recipe","status":"experimental","requires_imatrix":true,"flags":["--shrink-f16"]},
+    {"id":"parakeet-iq2-embedding-q8","model":"parakeet","recipe":"parakeet-iq2-embedding-q8.recipe","status":"experimental","requires_imatrix":true,"flags":["--shrink-f16"]},
+    {"id":"moss-q4-calibrated","model":"moss","recipe":"moss-q4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
+    {"id":"moss-q4e8","model":"moss","recipe":"moss-q4e8-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
+    {"id":"moss-q4e4","model":"moss","recipe":"moss-q4e4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
+    {"id":"moss-q2e4","model":"moss","recipe":"moss-q2e4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]}
+  ]
+}

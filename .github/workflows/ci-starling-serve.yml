@@ -15,21 +15,23 @@ on:
     paths:
       - 'cpp/**'
       - 'CMakeLists.txt'
+      - 'backends/native/**'
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
-      - 'benchmarks/recipes/**'
+      - 'quants/recipes/**'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
       - 'cpp/**'
       - 'CMakeLists.txt'
+      - 'backends/native/**'
       - 'third_party/**'
       - 'scripts/apply_ggml_patches.sh'
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
-      - 'benchmarks/recipes/**'
+      - 'quants/recipes/**'
       - '.github/workflows/ci-starling-serve.yml'
   workflow_dispatch:
     inputs:

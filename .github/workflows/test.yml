@@ -3,6 +3,7 @@ name: tests
 # CPU regressions run on Linux and Windows; model/GPU checks run separately.
 
 on:
+  workflow_dispatch:
   push:
     branches: [master, main]
   pull_request:
@@ -30,6 +31,8 @@ jobs:
         run: uv run --project benchmarks/sonar python -m unittest discover -s benchmarks/sonar -p 'test_*.py'
 
   cpu-tests:
+    # Deprecated CUDA/Python environment is opt-in; portable CI lives in apps.yml.
+    if: github.event_name == 'workflow_dispatch'
     name: CPU tests (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:

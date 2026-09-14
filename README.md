@@ -1,63 +1,87 @@
 # Starling
 
-Starling runs speech recognition locally. It has Python pipelines that use
-CUDA graphs on NVIDIA GPUs and native ggml engines for CPU, CUDA, Metal,
-Vulkan, and HIP. Both paths offer an HTTP and WebSocket server.
+Speech recognition that you can serve anywhere, with apps for desktop and phone.
+Starling owns its inference engine: native ggml backends run GGUF models on CPU,
+with optional Metal, Vulkan, HIP, or CUDA acceleration. No Python or NVIDIA GPU
+is required for the main server or the apps.
 
-Models include Parakeet, Granite Speech, Qwen3-ASR, MOSS, and others.
-[S1-mini](docs/models.md) can clean up a transcript after recognition.
-See the [model list](docs/models.md) for architectures and model licenses.
+This is a monorepo for the engine, serving API, quantization tools, shared
+transcription contracts, and applications. The apps are development foundations;
+see the [platform status](docs/monorepo.md) for what works and what still needs
+native device testing.
 
-## Transcribe a file
+## Run the server
 
-For the Python server, you need Linux or Windows, Python 3.10 to 3.12,
-[uv](https://github.com/astral-sh/uv), and an Ampere or newer NVIDIA GPU.
-The project uses CUDA 13.0 PyTorch wheels. On Windows, first set
-`STARLING_GPU_LOCK_DISABLE=1` because the process lock requires POSIX flock.
-Run these commands from the repository:
-
-```bash
-uv sync --extra server
-uv run --extra server starling-python-serve --model parakeet --port 8181
-```
-
-In another terminal, send a WAV file:
-
-```bash
-curl http://127.0.0.1:8181/inference -F "file=@recording.wav"
-```
-
-The response contains `text`, `segments`, `duration_s`, and `request_id`.
-The server keeps the model loaded and queues concurrent requests.
-Read [Python serving](docs/python-serving.md) for streaming, profiles,
-GPU selection, Windows setup, and request limits.
-
-## Run without Python
-
-Build `starling-serve` and load a GGUF model:
+You need CMake, a C++17 compiler, Git, and Bash. Initialize the submodule, build,
+and supply a compatible GGUF model from the [model guide](docs/models.md):
 
 ```bash
 git submodule update --init --recursive
-cmake -B build -DSTARLING_SERVE=ON -DSTARLING_GGML_CUDA=ON
+cmake -B build -DSTARLING_SERVE=ON
 cmake --build build -j --target starling-serve
-./build/starling-serve --model parakeet --gguf model.gguf --port 8181
+./build/starling-serve --model parakeet --gguf /path/to/model.gguf --port 8181
 ```
 
-Use the same curl request above with a 16 kHz WAV file. The native server
-requires 16 kHz audio. See [native serving](docs/native-serving.md) for
-GGUF downloads, CPU and other GPU builds, and API differences.
+The root CMake entry point remains supported. You can also configure the native
+component directly with `cmake -S backends/native -B build/native -DSTARLING_SERVE=ON`,
+or use `cmake --preset native-cpu` with CMake 3.21+ and Ninja.
+
+Use the OpenAI-compatible batch transcription API:
+
+```bash
+curl http://127.0.0.1:8181/v1/audio/transcriptions \
+  -F model=parakeet -F file=@recording.wav
+```
+
+The initial compatible subset accepts 16 kHz WAV and returns `{"text":"…"}`.
+`GET /v1/models` lists the configured model. Unsupported features return errors;
+read the [API contract](docs/api.md) before pointing a third-party client at it.
+Existing `/inference`, `/transcribe`, and `/stream` routes remain available.
+
+## Run the apps
+
+For the desktop interface, install Node.js 22.12+ and run:
+
+```bash
+npm ci
+npm run dev
+```
+
+This starts a browser preview connected through a development proxy to the
+server at `127.0.0.1:8181`. Microphone access requires localhost or HTTPS.
+Run `npm run desktop` for the Electron desktop app after installing its
+[platform prerequisites](apps/desktop/README.md).
+
+- [Desktop: Windows, Linux, macOS](apps/desktop/README.md)
+- [Android recorder and voice keyboard](apps/mobile/README.md)
+- [iOS recorder](apps/ios/README.md)
+
+Recognition returns raw text. Apps retain recordings for review and retry;
+copying or inserting a transcript is an explicit action. Vocabulary hints and
+suggested edits must never silently replace the original. These rules protect
+against destructive processing; they cannot guarantee ASR accuracy.
+
+## Workspace
+
+| Component | Location |
+| --- | --- |
+| Native server and engine build | [`backends/native/`](backends/native/) · engine source in `cpp/` |
+| Quant recipes, catalog, artifact tooling | [`quants/`](quants/) |
+| Desktop app | [`apps/desktop/`](apps/desktop/) |
+| Android app and voice keyboard | [`apps/mobile/`](apps/mobile/) |
+| iOS app | [`apps/ios/`](apps/ios/) |
+| Shared TypeScript client and fidelity rules | [`packages/dictation/`](packages/dictation/) |
+| Language-independent API contract | [`packages/contracts/`](packages/contracts/) |
+| Deprecated Python/CUDA serving | [`backends/python/`](backends/python/) · reference source in `src/starling/` |
+
+The NVIDIA-only Python serving path is deprecated. Its kernels, benchmarks,
+and existing commands remain for research and reproducibility. New app and
+serving work targets the native engine and the portable HTTP contract.
 
 ## Documentation
 
-| I want to… | Read |
-| --- | --- |
-| Choose a model | [Models](docs/models.md) |
-| Configure the Python server | [Python serving](docs/python-serving.md) |
-| Build or use the native server | [Native serving](docs/native-serving.md) |
-| Compare speed and accuracy | [Benchmarks](docs/benchmarks.md) |
-| Reduce model memory use | [Quantization](docs/quantization.md) |
-| Embed or extend a native engine | [ggml engine guide](docs/ggml-engine.md) |
-
-The Python kernels are tuned on an RTX 5090. Benchmark results include
-hardware and workload details; fixture parity alone does not establish
-accuracy across a corpus or across backends.
+[Architecture and platform status](docs/monorepo.md) · [API](docs/api.md) ·
+[TypeScript development](docs/typescript.md) ·
+[Models](docs/models.md) · [Native serving](docs/native-serving.md) ·
+[Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
+[Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md)
