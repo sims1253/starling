@@ -372,6 +372,13 @@ int main(int argc, char** argv) {
     const bool qwen3_embed_ok = arch_key >= 0 &&
         gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
         std::strcmp(gguf_get_val_str(in, arch_key), "qwen3") == 0;
+    // Untied embed/lm_head pairs (granite, audex): the same host-lookup and
+    // GEMV dequant paths as the tied tables. Untouched by a recipe, these
+    // stay BF16 — for granite that alone is ~1.2 GB of the quantized file.
+    const bool untied_head_ok = arch_key >= 0 &&
+        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
+        (std::strcmp(gguf_get_val_str(in, arch_key), "granite") == 0 ||
+         std::strcmp(gguf_get_val_str(in, arch_key), "audex") == 0);
 
     // Output meta context: no_alloc tensors whose ->data we point at owned
     // host buffers until gguf_write_to_file.
@@ -416,7 +423,9 @@ int main(int argc, char** argv) {
         // (parakeet prediction embed; moss tied embed/lm_head via get_rows).
         if (use_recipe && n_dims == 2 &&
             ((parakeet && name == "decoder.prediction.embed.weight") ||
-             ((moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight"))) {
+             ((moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight") ||
+             (untied_head_ok && (name == "llm.embed.weight" ||
+                                 name == "llm.lm_head.weight")))) {
             for (const auto& rule : recipe.rules) {
                 if (std::regex_search(name, rule.first)) {
                     // Parakeet prediction embed: q8_0/f32 only (low-precision
@@ -425,10 +434,14 @@ int main(int argc, char** argv) {
                     // is quality-sensitive; CER-gated per run, leaderboard WER
                     // before any release claim).
                     const bool tied_head = (moss_embed_ok || qwen3_embed_ok) && name == "llm.embed.weight";
-                    if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32 &&
-                        !(tied_head && (rule.second == GGML_TYPE_Q4_0 ||
-                                        rule.second == GGML_TYPE_Q5_K ||
-                                        rule.second == GGML_TYPE_Q6_K))) {
+                    const bool untied_head = untied_head_ok && (name == "llm.embed.weight" ||
+                                                                name == "llm.lm_head.weight");
+                    const bool head_kq_ok = (tied_head || untied_head) &&
+                        (rule.second == GGML_TYPE_Q4_0 ||
+                         rule.second == GGML_TYPE_Q5_K ||
+                         rule.second == GGML_TYPE_Q6_K);
+                    if (rule.second != GGML_TYPE_Q8_0 &&
+                        rule.second != GGML_TYPE_F32 && !head_kq_ok) {
                         std::fprintf(stderr,
                                      "error: embedding recipe supports only q8_0 or f32%s\n",
                                      tied_head ? " (tied head: also q4_0)" : "");

@@ -45,7 +45,14 @@ bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
     // graph inputs are anonymous. This automatically excludes attention
     // score matmuls (both operands are activations).
     if (w->name[0] == '\0') return false;
-    if (x->type != GGML_TYPE_F32) return false;
+    // The parakeet engine feeds every GEMM F32 activations, but the
+    // bf16-oracle engines (qwen3, granite, audex, moss, ...) feed BF16 (F16
+    // in flash/legacy paths). Both upcast to F32 exactly host-side, so
+    // accept them — otherwise collection silently covers zero weights on
+    // those engines.
+    if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_BF16 &&
+        x->type != GGML_TYPE_F16)
+        return false;
 
     if (ask) return true;  // observe this node — NOTE: the callback does NOT
                            // control placement (sched decides in split_graph);
@@ -58,7 +65,19 @@ bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
     const int64_t N = ggml_nelements(x) / (K > 0 ? K : 1);
     if (K <= 0 || N <= 0 || x->data == nullptr) return true;
 
+    std::vector<float> upcast;
     const float* xp = (const float*)x->data;
+    if (x->type == GGML_TYPE_BF16) {
+        upcast.resize((size_t)ggml_nelements(x));
+        ggml_bf16_to_fp32_row((const ggml_bf16_t*)x->data, upcast.data(),
+                              (int64_t)ggml_nelements(x));
+        xp = upcast.data();
+    } else if (x->type == GGML_TYPE_F16) {
+        upcast.resize((size_t)ggml_nelements(x));
+        ggml_fp16_to_fp32_row((const ggml_fp16_t*)x->data, upcast.data(),
+                              (int64_t)ggml_nelements(x));
+        xp = upcast.data();
+    }
     std::lock_guard<std::mutex> lock(mu_);
     Entry& e = entries_[w->name];
     if (e.sums.empty()) {
