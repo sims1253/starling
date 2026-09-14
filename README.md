@@ -1,5 +1,7 @@
 # Starling
 
+<img align="right" src="assets/branding/starling-logo.webp" alt="Starling logo: a watercolor starling and sound wave inside a golden hexagon" width="160" height="160">
+
 Speech recognition that you can serve anywhere, with apps for desktop and phone.
 Starling owns its inference engine: native ggml backends run GGUF models on CPU,
 with optional Metal, Vulkan, HIP, or CUDA acceleration. No Python or NVIDIA GPU
@@ -9,6 +11,8 @@ This is a monorepo for the engine, serving API, quantization tools, shared
 transcription contracts, and applications. The apps are development foundations;
 see the [platform status](docs/monorepo.md) for what works and what still needs
 native device testing.
+
+<br clear="right">
 
 ## Run the server
 
