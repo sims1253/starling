@@ -40,7 +40,7 @@ Existing `/inference`, `/transcribe`, and `/stream` routes remain available.
 
 ## Run the apps
 
-For the desktop interface, install Node.js 22.12+ and run:
+For the desktop interface, install Node.js 24.13.1+ and pnpm, then run:
 
 ```bash
 pnpm install
