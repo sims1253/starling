@@ -15,7 +15,7 @@
     "test": "tsx --test test/**/*.test.ts"
   },
   "devDependencies": {
-    "@types/node": "22.20.2",
+    "@types/node": "26.5.1",
     "fake-indexeddb": "^6.2.2",
     "tsx": "4.23.13",
     "typescript": "7.0.2"

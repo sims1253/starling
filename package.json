@@ -34,7 +34,7 @@
     "@oxlint/plugins": "1.83.0",
     "oxfmt": "0.68.0",
     "tsx": "4.23.13",
-    "@types/node": "22.20.2"
+    "@types/node": "26.5.1"
   },
   "type": "module"
 }
