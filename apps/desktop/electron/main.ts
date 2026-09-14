@@ -404,7 +404,7 @@ ipcMain.handle("starling:diagnostics", (event) => {
 });
 
 ipcMain.on("starling:renderer-ready", (event) => {
-  validateSender(event);
+  if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
   rendererReady = true;
 
   if (pendingToggle) {
@@ -445,6 +445,10 @@ function createWindow(): BrowserWindow {
     if (!trustedRenderer(url)) event.preventDefault();
   });
 
+  window.webContents.on("will-frame-navigate", (event) => {
+    if (!trustedRenderer(event.url)) event.preventDefault();
+  });
+
   if (rendererUrl) void window.loadURL(rendererUrl);
   else void window.loadFile(packagedRenderer);
 
@@ -453,15 +457,21 @@ function createWindow(): BrowserWindow {
 
 void app.whenReady().then(() => {
   session.defaultSession.setPermissionCheckHandler(
-    (contents, permission) =>
-      permission === "media" && contents !== null && trustedRenderer(contents.getURL()),
+    (contents, permission, _requestingOrigin, details) =>
+      permission === "media" &&
+      contents !== null &&
+      details.isMainFrame &&
+      details.mediaType === "audio" &&
+      trustedRenderer(details.requestingUrl ?? ""),
   );
-  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+  session.defaultSession.setPermissionRequestHandler((_contents, permission, callback, details) => {
     callback(
       permission === "media" &&
         "mediaTypes" in details &&
-        details.mediaTypes?.includes("audio") === true &&
-        trustedRenderer(contents.getURL()),
+        details.mediaTypes?.length === 1 &&
+        details.mediaTypes.every((type) => type === "audio") &&
+        details.isMainFrame &&
+        trustedRenderer(details.requestingUrl),
     );
   });
   let window = createWindow();

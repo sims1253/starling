@@ -347,7 +347,7 @@ export default function App() {
     anchor.href = url;
     anchor.download = `starling-${selected.createdAt.replace(/[:.]/g, "-")}.txt`;
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
   function exportAudio() {

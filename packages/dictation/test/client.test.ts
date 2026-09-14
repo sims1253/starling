@@ -4,6 +4,7 @@ import { Effect, Fiber } from "effect";
 
 import {
   DictationHttpError,
+  DictationInputError,
   DictationProtocolError,
   DictationTimeoutError,
   StarlingClient,
@@ -57,6 +58,19 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(result.durationSeconds, 0.1);
     assert.equal(result.requestId, "server-id");
     assert.deepEqual(result.segments, [{ text: "never", startSeconds: 0, endSeconds: 0.1 }]);
+  });
+
+  it("requires an explicit model before uploading through OpenAI", async () => {
+    for (const options of [{}, { model: "" }, { model: "   " }]) {
+      const client = new StarlingClient({
+        baseUrl: "http://localhost:8181",
+        protocol: "openai",
+        ...options,
+        fetch: async () => assert.fail("Missing models must fail before sending audio"),
+      });
+
+      await assert.rejects(client.transcribe(prepared), DictationInputError);
+    }
   });
 
   it("uses the standard OpenAI fields and accepts text-only JSON", async () => {
@@ -151,6 +165,7 @@ describe("StarlingClient protocol compatibility", () => {
     const client = new StarlingClient({
       baseUrl: "http://localhost:8181",
       protocol: "openai",
+      model: "missing-model",
       fetch: async () =>
         new Response(JSON.stringify({ error: { message: "unknown model" } }), {
           status: 404,

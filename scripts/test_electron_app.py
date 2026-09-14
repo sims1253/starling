@@ -79,17 +79,19 @@ def check_transport_failures(page, stack):
 
 
 def main():
-    executable = ROOT / "node_modules/electron/dist/electron"
-    if os.name == "nt":
-        executable = executable.with_name("electron.exe")
-    elif os.uname().sysname == "Darwin":
-        executable = ROOT / "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
     packaged = os.environ.get("STARLING_ELECTRON_EXECUTABLE")
     if packaged:
         executable = Path(packaged).resolve()
+    else:
+        # Resolve from the workspace that declares Electron; npm may hoist it
+        # or install it under apps/desktop/node_modules.
+        executable = Path(subprocess.check_output(
+            ["node", "-e", "console.log = console.error; process.stdout.write(require('electron'))"],
+            cwd=ROOT / "apps/desktop", text=True,
+        ).strip())
     fixture = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
     if not executable.is_file() or not fixture.is_file():
-        raise RuntimeError("Install Electron and build starling-serve-contract-fixture first")
+        raise RuntimeError(f"Missing Electron executable ({executable}) or contract fixture ({fixture})")
     with ExitStack() as stack:
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="starling-electron-test-")))
         server_log = stack.enter_context((directory / "server.log").open("w+"))
@@ -101,7 +103,7 @@ def main():
         wait_ready(endpoint + "/health", server)
         environment = {**os.environ, "XDG_CONFIG_HOME": str(directory / "config")}
         environment.pop("STARLING_RENDERER_URL", None)
-        args = [str(executable), f"--remote-debugging-port={debug_port}", f"--user-data-dir={directory / 'userdata'}"]
+        args = [str(executable), "--use-fake-device-for-media-stream", f"--remote-debugging-port={debug_port}", f"--user-data-dir={directory / 'userdata'}"]
         if not packaged:
             args.append(str(ROOT / "apps/desktop/dist-electron/main.mjs"))
         if os.environ.get("STARLING_TEST_NO_SANDBOX") == "1":
@@ -129,6 +131,12 @@ def main():
                 page.locator('input[type="file"]').set_input_files(audio_file())
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
                 page.get_by_role("button", name="Import an audio file", exact=True).click(trial=True)
+                page.get_by_role("button", name="Start recording").click()
+                expect(page.get_by_role("button", name="Stop recording")).to_be_visible()
+                page.wait_for_timeout(400)  # Collect several microphone buffers.
+                page.get_by_role("button", name="Stop recording").click()
+                expect(page.locator(".history-row")).to_have_count(2)
+                expect(page.locator(".transcript-body")).to_contain_text(RAW)
                 check_transport_failures(page, stack)
                 diagnostic = None if packaged else page.evaluate("window.starlingDesktop.diagnostics()")
                 report = {"launch_to_ui_ms": launch_to_ui_ms, "shell": diagnostic,

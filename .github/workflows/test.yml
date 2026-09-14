@@ -30,6 +30,31 @@ jobs:
       - name: Harness regressions
         run: uv run --project benchmarks/sonar python -m unittest discover -s benchmarks/sonar -p 'test_*.py'
 
+  engine-guards:
+    name: Native engine and server guards (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+      - name: Test portable guards without the deprecated CUDA environment
+        run: >-
+          uv run --no-project --python 3.12
+          --with pytest --with numpy --with scipy --with fastapi --with httpx
+          --with uvicorn --with websockets
+          python -m pytest -q
+          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
+          tests/test_server_routing.py tests/test_server_robustness.py
+          tests/test_server_lifecycle.py tests/test_server_websocket.py
+          tests/test_server_client.py tests/test_stream_chunk.py
+
+      - name: Test native Python bindings with CPU-only PyTorch
+        run: >-
+          uv run --no-project --python 3.12 --with pytest --with numpy --with torch
+          --index https://download.pytorch.org/whl/cpu
+          python -m pytest -q tests/test_benchmark_ggml_adapters.py
+
   cpu-tests:
     # Deprecated CUDA/Python environment is opt-in; portable CI lives in apps.yml.
     if: github.event_name == 'workflow_dispatch'

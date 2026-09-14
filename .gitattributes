@@ -1,2 +1,5 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+
 # Keep upstream lint rule implementations collapsed in GitHub reviews.
 tools/oxlint/anti-slop/** linguist-vendored

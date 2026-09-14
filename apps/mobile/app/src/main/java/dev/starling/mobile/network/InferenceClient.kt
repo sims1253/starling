@@ -87,6 +87,7 @@ class InferenceClient {
         val multipart = MultipartRequest(boundary, audioFile, fields)
         val url = URL(inferenceUrl(endpoint, config.protocol))
         val connection = (url.openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
             requestMethod = "POST"
             connectTimeout = CONNECT_TIMEOUT_MILLIS
             readTimeout = READ_TIMEOUT_MILLIS
@@ -104,9 +105,27 @@ class InferenceClient {
             }
 
             val status = connection.responseCode
-            if (status !in 200..299) {
+            if (status in 300..399) {
                 return InferenceResult.Failure(
-                    message = "Starling backend returned HTTP $status",
+                    "Server redirect blocked (HTTP $status). Set the final endpoint explicitly.",
+                    false,
+                )
+            }
+            if (status !in 200..299) {
+                val detail = runCatching {
+                    connection.errorStream?.let { stream ->
+                        BufferedInputStream(stream).use { readBounded(it, MAX_RESPONSE_BYTES) }
+                    }?.let { bytes ->
+                        val payload = JSONObject(bytes.toString(Charsets.UTF_8))
+                        val error = payload.opt("error")
+                        sequenceOf(
+                            (error as? JSONObject)?.opt("message"),
+                            payload.opt("detail"), error, payload.opt("message"),
+                        ).filterIsInstance<String>().firstOrNull { it.isNotBlank() }
+                    }
+                }.getOrNull()
+                return InferenceResult.Failure(
+                    message = detail ?: "Starling backend returned HTTP $status",
                     retryable = status == 408 || status == 425 || status == 429 || status >= 500,
                 )
             }

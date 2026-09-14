@@ -411,7 +411,7 @@ export class StarlingClient {
     this.protocol = options.protocol ?? "starling";
     this.endpoint =
       options.endpoint ?? (this.protocol === "openai" ? "/v1/audio/transcriptions" : "/inference");
-    this.model = options.model ?? "starling";
+    this.model = options.model?.trim() ?? "";
     this.auth = options.auth;
     this.headers = options.headers ?? {};
     this.timeoutMs = options.timeoutMs ?? 120_000;
@@ -433,6 +433,10 @@ export class StarlingClient {
     const prepare = prepareSource(source);
 
     return Effect.fnUntraced(function* (client: StarlingClient) {
+      if (client.protocol === "openai" && !client.model) {
+        return yield* new DictationInputError("Enter the model name served by the backend");
+      }
+
       const prepared = yield* prepare;
       const requestId = options.requestId ?? generatedRequestId();
 
