@@ -210,6 +210,21 @@ ggml_tensor* build_tower_layer(ggml_context* c, const HojoModel& m,
     };
     ggml_tensor* qh = to_heads(q), * kh = to_heads(k), * vh = to_heads(v);
     // Bidirectional attention with the block-diagonal additive mask.
+    // Flash (GPU default, STARLING_HOJO_NO_FATTN kill-switch): the [T, T]
+    // 0/-inf mask rides ggml_flash_attn_ext's additive f16 mask; the F32
+    // q/k/v already match the FA contract. The manual chain stays the CPU
+    // oracle (this machine's iGPU cannot host the 12 GB weights, so the
+    // flash path is build- and parity-validated only).
+    const char* no_fattn = std::getenv("STARLING_HOJO_NO_FATTN");
+    const bool use_flash = global_backend().is_gpu() &&
+                           !(no_fattn && std::string(no_fattn) == "1");
+    ggml_tensor* joined;
+    if (use_flash) {
+        ggml_tensor* mf = ggml_cast(c, mask, GGML_TYPE_F16);
+        ggml_tensor* fa = ggml_flash_attn_ext(c, qh, kh, vh, mf,
+                                              scale, 0.0f, 0.0f);  // [D, H, T, 1]
+        joined = ggml_reshape_2d(c, fa, (int64_t) D * H, T);        // [d_model, T]
+    } else {
     // scores = kh^T @ qh -> [T, T, H]; scale; softmax(mask); @ vh.
     ggml_tensor* sc = ggml_mul_mat(c, kh, qh);                 // [T, T, H]
     sc = ggml_scale(c, f32(c, sc), scale);
@@ -217,7 +232,8 @@ ggml_tensor* build_tower_layer(ggml_context* c, const HojoModel& m,
     ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));  // [T, D, H]
     ggml_tensor* co = ggml_mul_mat(c, vt, prob);                      // [D, T, H]
     co = ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3));               // [D, H, T]
-    ggml_tensor* joined = ggml_reshape_2d(c, co, (int64_t) D * H, T);  // [d_model, T]
+    joined = ggml_reshape_2d(c, co, (int64_t) D * H, T);              // [d_model, T]
+    }
     ggml_tensor* a = linear(c, ml, joined, p + "attn.o", true);
     x = ggml_add(c, f32(c, r), f32(c, a));
     r = x;

@@ -150,6 +150,16 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
     const int n_full = (W > 0) ? (A / W) : 0;   // number of full-size windows
     const int tail_S = A - n_full * W;          // 0, or the trailing partial window
 
+    // Flash (GPU default, STARLING_MOSS_NO_FATTN kill-switch): one fused
+    // ggml_flash_attn_ext per layer per window batch — windows ride the
+    // batch dim (ne3), heads ne2, maskless bidirectional within each window.
+    // F32 q per the ggml-vulkan FA contract (exact upcast; already F32 in F
+    // mode); bf16 K/V accepted as a pair. The manual chains stay the CPU /
+    // exactness oracle.
+    const char* no_fattn = std::getenv("STARLING_MOSS_NO_FATTN");
+    const bool use_flash = global_backend().is_gpu() &&
+                           !(no_fattn && std::string(no_fattn) == "1");
+
     // Batched attention over the n_full full windows (each size W).
     ggml_tensor* joined_full = nullptr;
     if (n_full > 0) {
@@ -161,6 +171,15 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
             return ggml_cont(ctx, ggml_permute(ctx, vw, 0, 2, 1, 3));
         };
         ggml_tensor* qw = batch(q), * kw = batch(k), * vw = batch(v);
+        if (use_flash) {
+            ggml_tensor* fa = ggml_flash_attn_ext(ctx, F ? qw : f32(ctx, qw),
+                                                  kw, vw, /*mask=*/nullptr,
+                                                  scale, 0.0f, 0.0f);
+            // [D,H,W,n_full] heads-major -> [d_model, W*n_full]; token order
+            // (window j, pos w) -> column w + j*W (concat of the windows).
+            joined_full = ggml_reshape_2d(ctx, fa, ec.d_model, (int64_t)W * n_full);
+            if (!F) joined_full = bf16(ctx, joined_full);
+        } else {
         // BF16 QK GEMM result and BF16 scalar multiply boundaries, followed by
         // F32 softmax and BF16 probabilities (same boundaries as the per-window path).
         // In F mode the boundaries stay F32 (identical math otherwise).
@@ -177,6 +196,7 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
         // [D,H,W,n_full] contiguous -> [d_model=D*H, W*n_full], token order
         // (window j, pos w) -> column w + j*W == concat(window_0..window_{n_full-1}).
         joined_full = ggml_reshape_2d(ctx, co, ec.d_model, (int64_t)W * n_full);
+        }
     }
 
     // Tail window (size tail_S): identical op sequence to one original per-window.
@@ -190,6 +210,13 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
             return ggml_cont(ctx, ggml_permute(ctx, vw, 0, 2, 1, 3));   // [D,tail_S,H]
         };
         ggml_tensor* qw = window(q), * kw = window(k), * vw = window(v);
+        if (use_flash) {
+            ggml_tensor* fa = ggml_flash_attn_ext(ctx, F ? qw : f32(ctx, qw),
+                                                  kw, vw, /*mask=*/nullptr,
+                                                  scale, 0.0f, 0.0f);
+            joined_tail = ggml_reshape_2d(ctx, fa, ec.d_model, tail_S);
+            if (!F) joined_tail = bf16(ctx, joined_tail);
+        } else {
         ggml_tensor* scores = ggml_mul_mat(ctx, kw, qw);
         if (!F) scores = bf16(ctx, scores);
         scores = ggml_scale(ctx, F ? scores : f32(ctx, scores), scale);
@@ -201,6 +228,7 @@ ggml_tensor* windowed_attention(ggml_context* ctx, const MelShape& s,
         if (!F) co = bf16(ctx, co);
         co = ggml_cont(ctx, ggml_permute(ctx, co, 0, 2, 1, 3));
         joined_tail = ggml_reshape_2d(ctx, co, ec.d_model, tail_S);
+        }
     }
 
     if (joined_full && joined_tail)

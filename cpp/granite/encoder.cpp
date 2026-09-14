@@ -176,8 +176,6 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     // Content scores: [D, r, H, nblk] x [D, c, H, nblk] -> [r, c, H, nblk].
     ggml_tensor* k_ = ggml_cont(c, ggml_permute(c, k4, 0, 2, 1, 3));
     ggml_tensor* q_ = ggml_cont(c, ggml_permute(c, q4, 0, 2, 1, 3));
-    ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k_, q_));
-    sc = bf16(c, ggml_scale(c, f32(c, sc), scale));
 
     // Shaw bias in one batched matmul: q as [D, H*nblk, c] against the baked
     // bias table viewed [D, r, c] (contraction over ne0, batch over c).
@@ -191,6 +189,39 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     // (ggml_permute is scatter-style: old dim i lands at position i_k.)
     pos = ggml_reshape_4d(c, pos, CS, H, nblk, CS);
     pos = ggml_cont(c, ggml_permute(c, pos, 0, 2, 3, 1));
+
+    // Flash (GPU default, STARLING_GRANITE_NO_FATTN kill-switch): the q-
+    // dependent Shaw bias cannot fold into FA's QK^T, but it rides FA's
+    // additive mask exactly like parakeet's rel-pos skew — FA computes
+    // softmax(scale * qk + mask), and the manual oracle computes
+    // softmax(scale*sc + scale*pos + blk_mask), so the mask is
+    // f16(scale*pos + blk_mask) (already scaled above). F32 q per the
+    // ggml-vulkan contract (exact upcast of the bf16 core); bf16 K/V pair.
+    // The manual chain stays the CPU / exactness oracle.
+    const char* no_fattn = std::getenv("STARLING_GRANITE_NO_FATTN");
+    const bool use_flash = global_backend().is_gpu() &&
+                           !(no_fattn && std::string(no_fattn) == "1");
+    if (use_flash) {
+        ggml_tensor* bias = f32(c, pos);
+        if (s.pad > 0) {
+            int64_t mne[4] = {CS, CS, 1, nblk};
+            ggml_tensor* mask = graph_input_tensor(c, GGML_TYPE_F32, 4, mne,
+                                                   s.blk_mask.data(),
+                                                   s.blk_mask.size() * sizeof(float));
+            bias = ggml_add(c, bias, mask);
+        }
+        ggml_tensor* mf = ggml_cast(c, bias, GGML_TYPE_F16);
+        ggml_tensor* v_ = ggml_cont(c, ggml_permute(c, v4, 0, 2, 1, 3));  // [D, r, H, nblk]
+        ggml_tensor* fa = ggml_flash_attn_ext(c, f32(c, q_), k_, v_, mf,
+                                              scale, 0.0f, 0.0f);   // [D, H, c, nblk]
+        // heads -> features and drop the pad: [D, H, CS, nblk] -> [hidden, T_pad] -> [:, :T].
+        ggml_tensor* cof = bf16(c, ggml_reshape_2d(c, fa, hidden, T_pad));
+        ggml_tensor* outf = ggml_view_2d(c, cof, hidden, T, cof->nb[1], 0);
+        return lib::linear_bf16(c, ml, outf, p + "attn_o", true);
+    }
+
+    ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k_, q_));
+    sc = bf16(c, ggml_scale(c, f32(c, sc), scale));
 
     ggml_tensor* tot = lib::addb(c, sc, pos);
     if (s.pad > 0) {

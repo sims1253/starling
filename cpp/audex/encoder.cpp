@@ -142,6 +142,22 @@ ggml_tensor* encoder_layer(ggml_context* c, const AudexModel& m, int li,
             ggml_reshape_3d(c, z, D, H, T), 0, 2, 1, 3));
     };
     ggml_tensor* q4 = to_heads(q), * k4 = to_heads(k), * v4 = to_heads(v);
+    // Flash (GPU default, STARLING_AUDEX_NO_FATTN kill-switch): the reference
+    // attends every frame bidirectionally with the query pre-scaled at
+    // projection time, so FA runs maskless with scale 1.0; F32 q per the
+    // ggml-vulkan FA contract (exact upcast), bf16 K/V accepted as a pair.
+    // The manual chain stays the CPU / exactness oracle.
+    const char* no_fattn = std::getenv("STARLING_AUDEX_NO_FATTN");
+    const bool use_flash = global_backend().is_gpu() &&
+                           !(no_fattn && std::string(no_fattn) == "1");
+    ggml_tensor* a;
+    if (use_flash) {
+        ggml_tensor* fa = ggml_flash_attn_ext(c, f32(c, q4), k4, v4,
+                                              /*mask=*/nullptr,
+                                              1.0f, 0.0f, 0.0f);    // [D, H, T, 1]
+        ggml_tensor* co = bf16(c, ggml_reshape_2d(c, fa, hidden, T)); // [hidden, T]
+        a = lib::linear_bf16(c, ml, co, p + "attn_o", true);
+    } else {
     // Scores with KEYS innermost (softmax runs over ne0): [T(k), T(q), H].
     // NO additive mask — the reference attends every frame bidirectionally.
     ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k4, q4));
@@ -155,7 +171,8 @@ ggml_tensor* encoder_layer(ggml_context* c, const AudexModel& m, int li,
     ggml_tensor* co = bf16(c, ggml_mul_mat(c, vt, pr));               // [D, T, H]
     co = ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3));               // [D, H, T]
     co = ggml_reshape_2d(c, co, hidden, T);
-    ggml_tensor* a = lib::linear_bf16(c, ml, co, p + "attn_o", true);
+    a = lib::linear_bf16(c, ml, co, p + "attn_o", true);
+    }
     if (stage_wants(stop->name, "attnm")) { stop->hit = true; return a; }
     x = lib::addb(c, x, a);
     if (stage_wants(stop->name, "attn")) { stop->hit = true; return x; }
