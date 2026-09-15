@@ -23,10 +23,16 @@ network response from being inserted into a field that has changed.
   retained for compatibility but is deprecated for new app deployments.
 - A device or emulator with a microphone. Android 8.0 / API 26 is the minimum.
 
-No Python, GPU, model file, or embedded inference runtime is bundled in this
-app. An in-process native Android engine is a future extension; a failed or
-unreachable server is surfaced and the local recording remains available for
-retry.
+No Python or GPU runtime is bundled. An optional **on-device engine**
+(experimental) embeds the repository's native Parakeet engine
+(`libstarling_ggml`) for offline transcription: import a Parakeet-TDT GGUF
+(for example `models/parakeet-tdt-0.6b-v3-q4_0.gguf`) through
+**Import model (.gguf)**, then select **This device** under *Transcribe on*.
+The model stays in app-private storage and is loaded on first use; no server
+or network is needed. Server transcription remains the default. When a
+transcription fails — unreachable server or missing model — the failure is
+surfaced and the local recording remains available for retry. Building the
+app additionally requires the Android NDK and CMake SDK packages.
 
 ## Build and run
 
