@@ -23,6 +23,7 @@
 #include "runtime/model_loader.hpp"
 #include "ggml.h"
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,11 @@ struct MelPolicy {
 
     bool norm_in_double = false;  // clamp+normalize with double intermediates
     bool emit_bf16 = true;        // bf16 copy alongside f32
+    // Fixed global log-mel max (streaming-safe normalization): when finite,
+    // replaces the computed per-utterance max as the clamp/normalize reference.
+    // NaN (default) keeps the legacy per-utterance max and is byte-identical
+    // for every existing engine.
+    double fixed_log_mel_max = std::numeric_limits<double>::quiet_NaN();
     const char* dump_env = nullptr;   // e.g. "STARLING_HIGGS_MEL_DUMP"
     const char* label = "GGUF";       // error-message prefix ("<label> mel ...")
 };

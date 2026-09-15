@@ -55,9 +55,11 @@ MODEL_LABELS = {
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
     "ark": "ark-asr-3b",
+    "ark06": "ark-asr-0.6b",
     "cohere": "cohere-transcribe-03-2026",
     "higgs": "higgs-audio-v3-stt",
     "audex": "nemotron-labs-audex-2b",
+    "voxtral": "voxtral-mini-4b-realtime",
 }
 
 

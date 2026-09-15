@@ -1,4 +1,5 @@
 #include "loader.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -109,6 +110,19 @@ bool ArkModel::load(const char* path, std::string& err) {
     a.clear();
     if (m.kv_arr_int("ark.prompt_suffix", a))
         for (auto v : a) c.prompt_suffix.push_back((int32_t) v);
+    a.clear();
+    // Greedy suppression ids (absent key = no suppression). The entries must
+    // be in-vocab and must not include the EOS id, which stays emittable.
+    if (m.kv_arr_int("ark.bad_words_ids", a)) {
+        for (auto v : a) {
+            if (v < 0 || v >= (int64_t) c.llm.vocab || v == (int64_t) c.eos_token_id) {
+                err = "ARK GGUF ark.bad_words_ids entry out of range or is EOS";
+                return false;
+            }
+            c.bad_words_ids.push_back((int32_t) v);
+        }
+        std::sort(c.bad_words_ids.begin(), c.bad_words_ids.end());
+    }
 
     // --- Validate untrusted GGUF metadata (mirror moss/loader.cpp). The
     // consumers divide by these (encoder head grouping; llm head grouping
