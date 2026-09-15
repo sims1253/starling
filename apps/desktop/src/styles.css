@@ -5,7 +5,7 @@
   font-synthesis: none;
   --ink: #e8e5dc;
   --muted: #98998e;
-  --dim: #6e7067;
+  --dim: #93958e;
   --panel: #20211c;
   --line: rgba(232, 229, 220, 0.105);
   --lime: #d9ff6a;
@@ -158,6 +158,7 @@ body::before {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(560px, 1fr) 350px;
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
 }
 .capture-pane {
@@ -376,7 +377,7 @@ kbd {
   color: #ffd8cf;
 }
 .error-banner small {
-  color: #ad8279;
+  color: #b28a81;
 }
 .error-banner button {
   background: 0;
@@ -398,6 +399,7 @@ kbd {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 .history-head {
   height: 92px;
@@ -417,8 +419,11 @@ kbd {
   margin: 0;
 }
 .history-list {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding-bottom: 0;
+  color-scheme: dark;
 }
 .history-empty {
   color: var(--dim);
@@ -444,7 +449,7 @@ kbd {
   transition: 0.18s;
 }
 .history-row:hover {
-  background: rgba(255, 255, 255, 0.025);
+  background: rgba(255, 255, 255, 0.07);
 }
 .history-row.active {
   background: rgba(217, 255, 106, 0.055);
@@ -501,6 +506,7 @@ kbd {
   grid-template-rows: auto minmax(0, 1fr) auto;
   background: #e8e4d9;
   color: #24251e;
+  color-scheme: light;
   box-shadow: 0 -24px 70px rgba(0, 0, 0, 0.25);
   animation: drawer 0.4s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
@@ -522,11 +528,11 @@ kbd {
   border-bottom: 1px solid rgba(36, 37, 30, 0.12);
 }
 .transcript-head .eyebrow {
-  color: #747568;
+  color: #5c5d51;
   margin: 0 0 3px;
 }
 .transcript-head > div > span {
-  color: #7d7d71;
+  color: #626358;
   font-size: 10px;
 }
 .transcript-actions {
@@ -667,8 +673,14 @@ kbd {
   border-color: #747e3d;
   box-shadow: 0 0 0 2px rgba(116, 126, 61, 0.1);
 }
+.settings-card input:focus-visible,
+.settings-card select:focus-visible {
+  outline: 2px solid #747e3d;
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px rgba(116, 126, 61, 0.22);
+}
 .settings-card label small {
-  color: #858579;
+  color: #65665b;
   font-weight: 400;
   line-height: 1.5;
 }
@@ -697,7 +709,7 @@ kbd {
 .settings-callout span:last-child {
   font-family: var(--mono);
   font-size: 9px;
-  color: #737468;
+  color: #5a5b50;
 }
 .settings-footer {
   display: flex;
@@ -786,7 +798,17 @@ kbd {
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* At the 620px window minimum the open transcript drawer leaves too little
+   capture-pane height; trim its padding so the import button clears the drawer. */
+@media (max-height: 660px) {
+  .has-transcript .capture-pane {
+    padding-top: 10px;
+    padding-bottom: 4px;
   }
 }
 

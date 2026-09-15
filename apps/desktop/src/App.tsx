@@ -30,6 +30,8 @@ type Connection = "checking" | "ready" | "busy" | "offline";
 
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 
+const SETTINGS_FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled])";
+
 const store = new IndexedDbSessionStore();
 
 function formatDuration(ms?: number) {
@@ -46,6 +48,20 @@ function formatWhen(iso: string) {
   return today
     ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
     : date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function takeTitle(session: DictationSession) {
+  return (
+    session.transcript?.text ||
+    (session.status === "failed" ? "Saved. Retry available" : "Transcribing…")
+  );
+}
+
+function historyRowLabel(session: DictationSession) {
+  const title = takeTitle(session);
+  const brief = title.length > 60 ? `${title.slice(0, 60)}…` : title;
+
+  return `${brief}, ${formatWhen(session.createdAt)}`;
 }
 
 function messageFrom(cause: unknown) {
@@ -91,13 +107,20 @@ export default function App() {
   const activeUploadsRef = useRef(new Set<string>());
   const [error, setError] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const [expectedTerms, setExpectedTerms] = useState(
-    () => localStorage.getItem("starling:terms") ?? "auth",
+    () => localStorage.getItem("starling:terms") ?? "",
   );
 
   const fileRef = useRef<HTMLInputElement>(null);
+  const settingsGearRef = useRef<HTMLButtonElement>(null);
+  const settingsDialogRef = useRef<HTMLElement>(null);
+  const endpointInputRef = useRef<HTMLInputElement>(null);
+
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+
   const { recording, elapsedMs, levels, start, stop } = useRecorder();
 
   const selected = sessions.find((session) => session.id === selectedId);
@@ -159,7 +182,14 @@ export default function App() {
             },
             onFailure: (failure) => {
               setConnection("offline");
-              setError(failure.message);
+              // The bridge keeps validation reasons (bad scheme, embedded
+              // credentials) verbatim; only transport failures arrive
+              // pre-wrapped, and those are the ones worth naming the target.
+              setError(
+                failure.message.startsWith("Could not reach the transcription server")
+                  ? `Could not reach the transcription server at ${target}.`
+                  : failure.message,
+              );
             },
           }),
         ),
@@ -200,6 +230,45 @@ export default function App() {
 
     return () => URL.revokeObjectURL(url);
   }, [selected]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+
+    endpointInputRef.current?.focus();
+    const gear = settingsGearRef.current;
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeSettings();
+
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const items = Array.from(
+        settingsDialogRef.current?.querySelectorAll<HTMLElement>(SETTINGS_FOCUSABLE) ?? [],
+      );
+
+      const active = items.findIndex((item) => item === document.activeElement);
+      const last = items.length - 1;
+
+      const next = event.shiftKey
+        ? items[active <= 0 ? last : active - 1]
+        : items[active === -1 || active === last ? 0 : active + 1];
+
+      if (!next) return;
+      event.preventDefault();
+      next.focus();
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      gear?.focus();
+    };
+  }, [closeSettings, settingsOpen]);
 
   const transcribe = useCallback(
     async (session: DictationSession) => {
@@ -287,7 +356,8 @@ export default function App() {
 
       const capture = await stop();
 
-      if (!capture || capture.audio.samples.length === 0)
+      // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
+      if (!capture || capture.audio.samples.length === 0 || capture.durationMs < 250)
         throw new Error("No microphone audio was captured.");
       const prepared = await prepareWav16k(capture.audio);
       await saveAndTranscribe(prepared.blob, capture.durationMs);
@@ -395,6 +465,21 @@ export default function App() {
     }
   }
 
+  function openSettings() {
+    setDraftEndpoint(endpoint);
+    setSettingsOpen(true);
+  }
+
+  async function testConnection() {
+    setTestingConnection(true);
+
+    try {
+      await checkHealth(draftEndpoint);
+    } finally {
+      setTestingConnection(false);
+    }
+  }
+
   function saveSettings() {
     const clean = draftEndpoint.trim().replace(/\/$/, "");
 
@@ -404,14 +489,14 @@ export default function App() {
     localStorage.setItem("starling:protocol", protocol);
     localStorage.setItem("starling:model", model);
     localStorage.setItem("starling:terms", expectedTerms);
-    setSettingsOpen(false);
+    closeSettings();
     void checkHealth(clean);
   }
 
   return (
     <div className={`app-shell ${selected ? "has-transcript" : ""}`}>
       <header className="topbar">
-        <div className="brand" aria-label="Starling home">
+        <div className="brand">
           <span className="brand-mark">
             <span />
           </span>
@@ -426,8 +511,9 @@ export default function App() {
           )}
         </div>
         <button
+          ref={settingsGearRef}
           className="icon-button"
-          onClick={() => setSettingsOpen(true)}
+          onClick={openSettings}
           aria-label="Open server settings"
         >
           <Settings2 size={19} />
@@ -462,7 +548,7 @@ export default function App() {
             </button>
             <div className="record-meta">
               <span>
-                {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Tap to record"}
+                {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Click to record"}
               </span>
               <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
             </div>
@@ -542,17 +628,13 @@ export default function App() {
                 key={session.id}
                 className={`history-row ${session.id === selectedId ? "active" : ""}`}
                 onClick={() => setSelectedId(session.id)}
+                aria-label={historyRowLabel(session)}
               >
                 <span className={`take-state ${session.status}`}>
                   {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
                 </span>
                 <span className="take-copy">
-                  <strong>
-                    {session.transcript?.text ||
-                      (session.status === "failed"
-                        ? "Saved. Retry available"
-                        : "Sending to server…")}
-                  </strong>
+                  <strong>{takeTitle(session)}</strong>
                   <small>
                     {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
                     {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
@@ -632,19 +714,16 @@ export default function App() {
       {settingsOpen && (
         <div
           className="modal-layer"
-          onMouseDown={(event) => event.target === event.currentTarget && setSettingsOpen(false)}
+          onMouseDown={(event) => event.target === event.currentTarget && closeSettings()}
         >
           <section
+            ref={settingsDialogRef}
             className="settings-card"
             role="dialog"
             aria-modal="true"
             aria-labelledby="settings-title"
           >
-            <button
-              className="settings-close"
-              onClick={() => setSettingsOpen(false)}
-              aria-label="Close settings"
-            >
+            <button className="settings-close" onClick={closeSettings} aria-label="Close settings">
               <X size={18} />
             </button>
             <p className="eyebrow">CONNECTION</p>
@@ -656,6 +735,7 @@ export default function App() {
             <label>
               Server endpoint
               <input
+                ref={endpointInputRef}
                 value={draftEndpoint}
                 onChange={(event) => setDraftEndpoint(event.target.value)}
                 placeholder="http://127.0.0.1:8181"
@@ -705,8 +785,12 @@ export default function App() {
               </div>
             </div>
             <div className="settings-footer">
-              <button className="secondary" onClick={() => void checkHealth(draftEndpoint)}>
-                Test connection
+              <button
+                className="secondary"
+                disabled={testingConnection}
+                onClick={() => void testConnection()}
+              >
+                {testingConnection ? "Testing…" : "Test connection"}
               </button>
               <button className="primary" onClick={saveSettings}>
                 Save settings

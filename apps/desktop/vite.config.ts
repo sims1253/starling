@@ -10,6 +10,8 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: {
+    // IPv4 loopback so the dev launcher's 127.0.0.1 health poll and renderer URL resolve.
+    host: "127.0.0.1",
     port: 1420,
     strictPort: true,
     proxy: {
