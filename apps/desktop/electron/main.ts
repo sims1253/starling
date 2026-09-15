@@ -456,20 +456,22 @@ function createWindow(): BrowserWindow {
 }
 
 void app.whenReady().then(() => {
+  // clipboard-sanitized-write backs navigator.clipboard.writeText; clipboard reads stay denied.
   session.defaultSession.setPermissionCheckHandler(
     (contents, permission, _requestingOrigin, details) =>
-      permission === "media" &&
+      (permission === "clipboard-sanitized-write" ||
+        (permission === "media" && details.mediaType === "audio")) &&
       contents !== null &&
       details.isMainFrame &&
-      details.mediaType === "audio" &&
       trustedRenderer(details.requestingUrl ?? ""),
   );
   session.defaultSession.setPermissionRequestHandler((_contents, permission, callback, details) => {
     callback(
-      permission === "media" &&
-        "mediaTypes" in details &&
-        details.mediaTypes?.length === 1 &&
-        details.mediaTypes.every((type) => type === "audio") &&
+      (permission === "clipboard-sanitized-write" ||
+        (permission === "media" &&
+          "mediaTypes" in details &&
+          details.mediaTypes?.length === 1 &&
+          details.mediaTypes.every((type) => type === "audio"))) &&
         details.isMainFrame &&
         trustedRenderer(details.requestingUrl),
     );
