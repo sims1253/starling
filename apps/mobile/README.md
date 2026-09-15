@@ -70,6 +70,19 @@ Input in Android settings, then select it from the keyboard switcher. Switching
 apps or editor fields while a request is in flight leaves the transcript in
 Starling and disables insertion for the old target.
 
+### Voice input inside other keyboards
+
+Starling also registers as a system speech recognizer
+(`StarlingRecognitionService`). Keyboards that use Android's `SpeechRecognizer`
+API — for example the open-source HeliBoard, OpenBoard, or AnySoftKeyboard —
+then show their own microphone button and transcribe through Starling, without
+switching keyboards. Tap **Set Starling as voice input** and choose Starling
+Voice Recognition as the voice input service. Closed keyboards such as Gboard
+or SwiftKey keep their bundled engines and cannot delegate to a custom
+recognizer. Dictation returns one final result (the server response is
+batch), and every dictation stays visible in Saved recordings, including
+failed uploads, so it can be retried or deleted there.
+
 ## API compatibility
 
 Starling legacy mode sends a multipart field named `file` to `/inference`,
