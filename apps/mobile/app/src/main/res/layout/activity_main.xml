@@ -138,6 +138,50 @@
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/engine_heading"
+            android:textColor="@color/starling_ink"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/engine_input"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/engine_server"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/engine_server" />
+
+            <RadioButton
+                android:id="@+id/engine_on_device"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/engine_on_device" />
+        </RadioGroup>
+
+        <TextView
+            android:id="@+id/on_device_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/import_model_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/import_model" />
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
