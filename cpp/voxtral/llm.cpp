@@ -51,8 +51,8 @@ const lib::QwenDecodeSpec kSpec = {
 
 lib::QwenDecodeCtx decode_ctx(const VoxtralModel& m) {
     const auto& lc = m.config.llm;
-    // Materialize the model's spec once. Stored on the model because the
-    // spec address keys the process-global decode caches.
+    // Materialize the model's spec once (decode state is keyed per loader
+    // post-#71; the model simply owns the spec alongside its loader).
     if (!m.decode_spec_ready) {
         m.decode_spec = kSpec;
         m.decode_spec_ready = true;

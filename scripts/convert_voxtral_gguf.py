@@ -24,11 +24,13 @@ VoxtralRealtimeFeatureExtractor on tests/fixtures/{short,medium,long}.wav):
   remainder (short 142, medium 328, long 979).
 
 Tokenizer: decode-only raw bytes, no merges. tekken.json (parsed with plain
-json, not a tokenizer class) holds 1000 specials (ids 0..999, CONTROL type)
-plus 150000 rank-ordered tokens; only ids < 131072 are kept (tekken's tail
-131072..149999 is unusable). Token strings are latin-1 of the base64-decoded
-token_bytes (exact byte round-trip); the C++ side concats bytes and skips
-CONTROL ids.
+json, not a tokenizer class) holds 1000 specials (ids 0..999) plus 150000
+rank-ordered tokens; only ids < 131072 are kept (tekken's tail
+131072..149999 is unusable). ASCII pieces are stored verbatim; pieces with
+bytes >= 0x80 ride in llama.cpp's <0xXX> escaped form flagged TokenType.BYTE
+(GGUF strings are UTF-8, so raw high bytes would double-encode). The C++
+side unescapes BYTE pieces and skips every id below voxtral.num_special
+(stock skip_special_tokens=True), not just CONTROL ones.
 """
 from __future__ import annotations
 import argparse, base64, json, math
