@@ -154,7 +154,7 @@ class MainActivity : Activity() {
             recordingMessage.text = getString(R.string.recording_storage_error)
             return
         }
-        val error = capture.start(application.recordings.partialFile(recording))
+        val error = capture.start(this, application.recordings.partialFile(recording))
         if (error != null) {
             runCatching { application.recordings.markFailed(recording.id, error) }
             recordingMessage.text = error

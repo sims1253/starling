@@ -1,6 +1,7 @@
 package dev.starling.mobile.audio
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -16,6 +17,9 @@ sealed interface CaptureResult {
 /**
  * Owns one microphone capture at a time. The worker always closes the WAV
  * writer, including when Android tears down the audio device or the service.
+ * Mic access is attributed through the context passed to [start]: callers
+ * pass their own context, or one created for the recognition client they
+ * act for.
  */
 class AudioCapture {
     private val lock = Any()
@@ -31,7 +35,7 @@ class AudioCapture {
     fun isRecording(): Boolean = synchronized(lock) { state != State.IDLE }
 
     @SuppressLint("MissingPermission")
-    fun start(outputFile: File): String? = synchronized(lock) {
+    fun start(context: Context, outputFile: File): String? = synchronized(lock) {
         if (state != State.IDLE || worker?.isAlive == true) {
             return@synchronized "A recording is already stopping"
         }
@@ -45,13 +49,18 @@ class AudioCapture {
 
         val bufferSize = maxOf(minBuffer * 2, WavWriter.SAMPLE_RATE / 2)
         val audioRecord = try {
-            AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                WavWriter.SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize,
-            )
+            AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(WavWriter.SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build(),
+                )
+                .setBufferSizeInBytes(bufferSize)
+                .setContext(context)
+                .build()
         } catch (_: IllegalArgumentException) {
             return@synchronized "Unable to initialize the microphone"
         } catch (_: SecurityException) {

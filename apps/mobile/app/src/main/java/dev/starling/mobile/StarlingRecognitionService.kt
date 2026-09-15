@@ -1,8 +1,10 @@
 package dev.starling.mobile
 
 import android.Manifest
+import android.content.ContextParams
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -41,24 +43,44 @@ class StarlingRecognitionService : RecognitionService() {
 
     override fun onStartListening(recognizerIntent: Intent?, callback: Callback) {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            callback.error(SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS)
+            callback.deliverError(SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS)
             return
         }
-        activeRecording?.let { finishAndTranscribe(activeCallback ?: callback) }
+        // Finishing a still-live session here is defensive only: the framework
+        // answers a second start with ERROR_RECOGNIZER_BUSY without calling us.
+        val previous = activeCallback
+        if (activeRecording != null && previous != null) {
+            finishAndTranscribe(previous)
+        }
         val recording = runCatching { application.recordings.create() }.getOrElse {
-            callback.error(SpeechRecognizer.ERROR_CLIENT)
+            callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
             return
         }
-        val error = capture.start(application.recordings.partialFile(recording))
+        // Attribute mic access to the calling keyboard so its identity, not
+        // ours, is checked and shown during data delivery (API 33+).
+        val captureContext = if (Build.VERSION.SDK_INT >= 33) {
+            runCatching {
+                createContext(
+                    ContextParams.Builder()
+                        .setNextAttributionSource(callback.callingAttributionSource)
+                        .build(),
+                )
+            }.getOrElse { this }
+        } else {
+            this
+        }
+        val error = capture.start(captureContext, application.recordings.partialFile(recording))
         if (error != null) {
             runCatching { application.recordings.markFailed(recording.id, error) }
-            callback.error(SpeechRecognizer.ERROR_CLIENT)
+            callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
             return
         }
         mainHandler.removeCallbacks(listenTimeout)
         mainHandler.postDelayed(listenTimeout, MAX_LISTEN_MILLIS)
         activeRecording = recording
         activeCallback = callback
+        // Keyboards wait for this before showing their "speak now" state.
+        callback.deliverReadyForSpeech()
     }
 
     override fun onStopListening(callback: Callback) {
@@ -68,16 +90,16 @@ class StarlingRecognitionService : RecognitionService() {
 
     override fun onCancel(callback: Callback) {
         if (activeCallback != callback) return
+        val recording = activeRecording ?: return
         mainHandler.removeCallbacks(listenTimeout)
-        val recording = activeRecording
         activeRecording = null
         activeCallback = null
         // The recording itself was the user's intent; keep it, skip upload.
         when (val result = capture.stop()) {
             is CaptureResult.Completed ->
-                runCatching { application.recordings.commitAudio(recording ?: return, result.durationSeconds) }
+                runCatching { application.recordings.commitAudio(recording, result.durationSeconds) }
             is CaptureResult.Failed ->
-                runCatching { application.recordings.markFailed(recording?.id ?: return, result.message) }
+                runCatching { application.recordings.markFailed(recording.id, result.message) }
             CaptureResult.AlreadyStopped -> Unit
         }
     }
@@ -105,7 +127,7 @@ class StarlingRecognitionService : RecognitionService() {
         activeRecording = null
         activeCallback = null
         if (recording == null) {
-            callback.error(SpeechRecognizer.ERROR_CLIENT)
+            callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
             return
         }
         when (val result = capture.stop()) {
@@ -114,7 +136,7 @@ class StarlingRecognitionService : RecognitionService() {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrNull()
                 if (finalized == null) {
-                    callback.error(SpeechRecognizer.ERROR_CLIENT)
+                    callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
                     return
                 }
                 val config = application.backendSettings.load()
@@ -122,7 +144,7 @@ class StarlingRecognitionService : RecognitionService() {
                     if (completed.status == RecordingStatus.TRANSCRIBED &&
                         completed.rawTranscript != null
                     ) {
-                        callback.results(
+                        callback.deliverResults(
                             Bundle().apply {
                                 putStringArrayList(
                                     RecognizerIntent.EXTRA_RESULTS,
@@ -133,13 +155,31 @@ class StarlingRecognitionService : RecognitionService() {
                     } else {
                         // The upload failed but the recording is retained and
                         // retryable from the app; report a network-class error.
-                        callback.error(SpeechRecognizer.ERROR_NETWORK)
+                        callback.deliverError(SpeechRecognizer.ERROR_NETWORK)
                     }
                 }
             }
-            is CaptureResult.Failed -> callback.error(SpeechRecognizer.ERROR_CLIENT)
-            CaptureResult.AlreadyStopped -> callback.error(SpeechRecognizer.ERROR_CLIENT)
+            is CaptureResult.Failed -> {
+                runCatching { application.recordings.markFailed(recording.id, result.message) }
+                callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
+            }
+            CaptureResult.AlreadyStopped -> callback.deliverError(SpeechRecognizer.ERROR_CLIENT)
         }
+    }
+
+    // Terminal deliveries are binder calls into the host keyboard's process.
+    // A dead listener binder must not crash this process; the recording is
+    // already durable, so a swallowed delivery failure loses nothing.
+    private fun Callback.deliverResults(bundle: Bundle) {
+        runCatching { results(bundle) }
+    }
+
+    private fun Callback.deliverError(errorCode: Int) {
+        runCatching { error(errorCode) }
+    }
+
+    private fun Callback.deliverReadyForSpeech() {
+        runCatching { readyForSpeech(Bundle()) }
     }
 
     companion object {
