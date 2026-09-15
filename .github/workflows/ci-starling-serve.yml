@@ -90,7 +90,7 @@ jobs:
       # real-model GGUF, like loader_guard_test above.
       - name: Voxtral engine tests (tiny GGUF generated in-workflow)
         run: |
-          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu transformers
           python scripts/make_voxtral_tiny_gguf.py
           ./build/voxtral_encoder_test
           ./build/voxtral_engine_test
