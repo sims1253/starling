@@ -59,7 +59,8 @@ function takeTitle(session: DictationSession) {
 
 function historyRowLabel(session: DictationSession) {
   const title = takeTitle(session);
-  const brief = title.length > 60 ? `${title.slice(0, 60)}…` : title;
+  const codePoints = Array.from(title);
+  const brief = codePoints.length > 60 ? `${codePoints.slice(0, 60).join("")}…` : title;
 
   return `${brief}, ${formatWhen(session.createdAt)}`;
 }
@@ -357,8 +358,10 @@ export default function App() {
       const capture = await stop();
 
       // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
-      if (!capture || capture.audio.samples.length === 0 || capture.durationMs < 250)
+      if (!capture || capture.audio.samples.length === 0)
         throw new Error("No microphone audio was captured.");
+
+      if (capture.durationMs < 250) throw new Error("Recording was too short to keep.");
       const prepared = await prepareWav16k(capture.audio);
       await saveAndTranscribe(prepared.blob, capture.durationMs);
     } catch (caught) {

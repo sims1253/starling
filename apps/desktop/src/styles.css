@@ -169,6 +169,7 @@ body::before {
   flex-direction: column;
   align-items: center;
   overflow-y: auto;
+  color-scheme: dark;
 }
 .capture-copy {
   align-self: flex-start;
