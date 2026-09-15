@@ -13,7 +13,8 @@ proj input == d_model*downsample, per-tensor shapes match the metadata):
   llm block (schema only; the encoder test never runs it): 2 layers, hidden
        128, 8q/2kv x head_dim 16 (QW 128, KVW 32), inter 256, vocab 512,
        ada bottleneck 4, time_embedding_dim 128.
-  tokenizer: 512-entry gpt2 table (ids >= 256 decode as latin-1 bytes, so the
+  tokenizer: 512-entry gpt2 table (ids >= 256 are single-byte pieces; bytes
+  >= 0x80 ride in <0xXX> + TokenType.BYTE form, so the
        loader-guard decode spot-checks still exercise CONTROL skipping).
   prompt_prefix: [1] + [32]*38 (same shape as the real prefix).
 
@@ -59,9 +60,10 @@ def bf16(a: torch.Tensor) -> torch.Tensor:
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    # F.rms_norm semantics: normalize + affine in f32, ONE bf16 round.
-    y = F.rms_norm(x.float(), (x.shape[-1],)).to(torch.float32)
-    return bf16(y * w.float()).to(x.dtype == torch.bfloat16 and torch.bfloat16 or x.dtype)
+    # Stock VoxtralRealtimeRMSNorm: TWO bf16 stores — round the normalized
+    # value, then round the weight multiply.
+    y = bf16(F.rms_norm(x.float(), (x.shape[-1],)))
+    return bf16(y.float() * w.float())
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -170,11 +172,12 @@ def main() -> None:
     x = F.pad(x, (2, 0))
     x = F.conv1d(x.float(), W["enc.conv1.weight"].float(),
                  W["enc.conv1.bias"].float(), stride=1)
-    # Exact GELU (erf, approximate="none"): 0.5*x*(1+erf(x/sqrt2)).
+    x = bf16(x)  # Conv1d stores its output before GELU (stock discipline)
     x = bf16(0.5 * x.float() * (1.0 + torch.erf(x.float() / math.sqrt(2.0))))
     x = F.pad(x, (1, 0))
     x = F.conv1d(x.float(), W["enc.conv2.weight"].float(),
                  W["enc.conv2.bias"].float(), stride=2)
+    x = bf16(x)  # Conv1d stores its output before GELU (stock discipline)
     x = bf16(0.5 * x.float() * (1.0 + torch.erf(x.float() / math.sqrt(2.0))))
     h = bf16(x.permute(0, 2, 1)).squeeze(0)  # [T_enc, D_MODEL]
     ref["embedder"] = h.flatten().tolist()
@@ -247,9 +250,9 @@ def main() -> None:
         n = rms_norm(h, W[p + "ffn_norm.weight"], 1e-5)
         gg = lin(n, W[p + "ffn.gate.weight"], None)
         u = lin(n, W[p + "ffn.up.weight"], None)
-        # SwiGLU product in f32 with ONE bf16 round (the oracle order: silu
-        # and the product stay f32 until the store).
-        ffn = lin(bf16(F.silu(gg.float()) * u.float()),
+        # SwiGLU under stock's store discipline: bf16(silu(g)) materializes
+        # BEFORE the up-multiply, and the product is its own bf16 store.
+        ffn = lin(bf16(bf16(F.silu(gg.float())).float() * u.float()),
                   W[p + "ffn.down.weight"], W[p + "ffn.down.bias"])
         if i == 0:
             stages["ffn0"] = ffn.flatten().tolist()
@@ -367,7 +370,9 @@ def main() -> None:
         n = rms2(h, W[p + "ffn_norm.weight"], 1e-5)
         mod = tlin(gelu_exact(tlin(bf16(W["llm.t_cond"]), W[p + "ada.fc0.weight"])),
                    W[p + "ada.fc2.weight"])
-        n = bf16(n.float() * (1.0 + mod.float()))
+        # Stock ada scale is two bf16 stores: round (1 + m), then round
+        # the product (mirrors apply_ada).
+        n = bf16(n.float() * bf16(1.0 + mod.float()).float())
         if st is not None and i == 0:
             st["tscaled"] = n.flatten().tolist()
         g = tlin(n, W[p + "ffn.gate.weight"])
@@ -480,13 +485,23 @@ def main() -> None:
             "right_pad_tokens": 17, "max_new_tokens": 200})
     w.add_key_value("voxtral.prompt_prefix", [1] + [32] * 38, V.ARRAY, V.INT32)
     # Tokenizer: 512-entry gpt2 table (ids 0..255 CONTROL specials like the
-    # real tekken head, ids 256..511 latin-1 single bytes).
+    # real tekken head, ids 256..511 single bytes). Bytes >= 0x80 use the same
+    # <0xXX> + TokenType.BYTE escaping as the real converter (GGUF strings are
+    # UTF-8; raw high bytes would double-encode).
     w.add_tokenizer_model("gpt2")
-    toks = [f"<s{i}>" for i in range(256)] + \
-        [bytes([i - 256]).decode("latin-1") for i in range(256, VOCAB)]
+    toks = [f"<s{i}>" for i in range(256)]
+    types = [gguf.TokenType.CONTROL] * 256 + [gguf.TokenType.NORMAL] * 256
+    for i in range(256, VOCAB):
+        b = i - 256
+        if b < 0x80:
+            toks.append(chr(b))
+        else:
+            toks.append(f"<0x{b:02X}>")
+            types[i] = gguf.TokenType.BYTE
     w.add_token_list(toks)
     w.add_token_scores([0.0] * VOCAB)
-    w.add_token_types([gguf.TokenType.CONTROL] * 256 + [gguf.TokenType.NORMAL] * 256)
+    w.add_token_types(types)
+    w.add_key_value("voxtral.num_special", 256, V.UINT32)
     w.add_bos_token_id(1)
     w.add_eos_token_id(2)
     w.add_pad_token_id(11)

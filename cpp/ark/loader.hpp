@@ -10,8 +10,8 @@ struct ArkModel {
     ModelLoader loader;
     bool load(const char* gguf_path, std::string& err);
     // kSpec patched with this model's suppression list, materialized once on
-    // first use (decode_ctx is const and the spec address keys the shared
-    // decode caches, so the patched copy must live as long as the model).
+    // first use (decode_ctx is const, and banned_ids must point into storage
+    // that outlives the model).
     mutable lib::QwenDecodeSpec decode_spec;
     mutable bool decode_spec_ready = false;
 };

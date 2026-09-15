@@ -81,8 +81,8 @@ struct QwenDecodeSpec {
     // initializers (audex sets mlp_activation) stay valid. Points into the
     // owning model's config storage, which outlives inference; nullptr/0
     // disables suppression: no masking branch runs and the graphs keep their
-    // exact historical op sequence. The spec ADDRESS keys the process-global
-    // decode caches, so a patched spec must live in the model, not a temp.
+    // exact historical op sequence. Must point into storage that outlives
+    // inference (the owning model's config).
     const int32_t* banned_ids = nullptr;
     size_t n_banned = 0;
     // Voxtral's AdaRMSNorm (MLP branch only): h = h * (1 + fc2(gelu(fc0(t_cond))))

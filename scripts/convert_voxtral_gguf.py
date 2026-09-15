@@ -269,15 +269,32 @@ def tokenizer(w: gguf.GGUFWriter, snapshot: Path) -> None:
     for entry in tek["vocab"]:
         idx = NUM_SPECIAL + entry["rank"]
         if idx < VOCAB_SIZE:  # tekken's tail 131072..149999 is unusable; drop it
-            # latin-1 preserves the raw bytes exactly (C++ decodes the same way).
-            tokens[idx] = base64.b64decode(entry["token_bytes"]).decode("latin-1")
+            piece = base64.b64decode(entry["token_bytes"])
+            if piece.isascii():
+                tokens[idx] = piece.decode("ascii")
+            else:
+                # GGUF strings are UTF-8: a byte >= 0x80 in a latin-1 str
+                # would double-encode. Store non-ASCII pieces in llama.cpp's
+                # <0xXX> escaped form and mark them BYTE; the C++ tokenizer
+                # unescapes them back to raw bytes on load.
+                tokens[idx] = "".join(
+                    chr(b) if b < 0x80 else f"<0x{b:02X}>" for b in piece)
+                types[idx] = gguf.TokenType.BYTE
     for i, t in enumerate(tokens):
         if not t:
             tokens[i] = "[PAD" + str(i) + "]"
+    # Guard the round-trip: every stored string must be pure ASCII (a
+    # non-ASCII str would reach the GGUF double-encoded and decode as
+    # mojibake on the native side).
+    for i, t in enumerate(tokens):
+        assert t.isascii(), f"token {i} is not ASCII after escaping: {t!r}"
     w.add_tokenizer_model("gpt2")
     w.add_token_list(tokens)
     w.add_token_scores([0.0] * len(tokens))
     w.add_token_types(types)
+    # Ids below this are the tekken specials; the C++ tokenizer skips them all
+    # (stock skip_special_tokens=True), not just CONTROL-typed ones.
+    w.add_key_value("voxtral.num_special", NUM_SPECIAL, V.UINT32)
     # Decode-only: no merges (the C++ side concats raw token bytes).
     w.add_bos_token_id(1)
     w.add_eos_token_id(2)

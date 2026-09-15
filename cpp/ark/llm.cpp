@@ -33,8 +33,8 @@ lib::QwenDecodeCtx decode_ctx(const ArkModel& m) {
     const auto& lc = m.config.llm;
     // Materialize the model's spec once: kSpec plus the GGUF's suppression
     // list (0.6B carries ark.bad_words_ids; an empty 3B list leaves the
-    // decode byte-identical). Stored on the model because the spec address
-    // keys the process-global decode caches.
+    // decode byte-identical). Stored on the model so banned_ids points into
+    // storage that outlives inference.
     if (!m.decode_spec_ready) {
         m.decode_spec = kSpec;
         m.decode_spec.banned_ids = m.config.bad_words_ids.empty()

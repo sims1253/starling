@@ -163,8 +163,11 @@ ggml_tensor* apply_ada(ggml_context* c, const QwenDecodeSpec& s,
     const int64_t H = n->ne[0];
     ggml_tensor* ones = weight(c, ml, "llm.ada_ones");  // [hidden] f32
     ggml_tensor* sum = ggml_add(c, f32(c, ones), f32(c, mod));  // [hidden, 1]
+    // Stock runs h * (1 + m) as two bf16 stores: round (1 + m) first (it is
+    // [hidden, 1], so the round is free), then round the product.
+    sum = bf16(c, sum);
     ggml_tensor* tpl = ggml_new_tensor_2d(c, GGML_TYPE_F32, H, S);
-    ggml_tensor* scale = ggml_repeat(c, sum, tpl);  // [hidden, S]
+    ggml_tensor* scale = ggml_repeat(c, f32(c, sum), tpl);  // [hidden, S]
     return bf16(c, ggml_mul(c, f32(c, n), scale));
 }
 

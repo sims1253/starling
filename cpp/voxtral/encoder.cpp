@@ -92,15 +92,19 @@ std::vector<float> host_causal_conv1d_gelu(const ModelLoader& ml,
                     acc += (double) wf[((size_t) oc * IC + c) * K + k] *
                            (double) x[(size_t) c * (L + left_pad) + t * stride + k];
             float v = (float) acc;
+            // Stock stores the Conv1d output to bf16 before GELU, and the
+            // GELU output is a bf16 store as well.
+            v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
             v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));  // exact GELU
-            y[(size_t) oc * OL + t] = v;
+            y[(size_t) oc * OL + t] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
         }
     }
     return y;
 }
 
-// Host RMSNorm: f32 normalize, affine in f32 with the bf16 weight, one bf16
-// round (mirrors rms_single). `x` is row-major [T, W].
+// Host RMSNorm: f32 normalize, then the stock two-store discipline — round
+// the normalized value to bf16, round the weight multiply again (mirrors
+// rms_two_round). `x` is row-major [T, W].
 std::vector<float> host_rms_norm(const std::vector<float>& x, int64_t T, int64_t W,
                                  const std::vector<float>& w, float eps) {
     std::vector<float> y((size_t) T * W);
@@ -112,20 +116,24 @@ std::vector<float> host_rms_norm(const std::vector<float>& x, int64_t T, int64_t
         }
         const float s = (float)(1.0 / std::sqrt(ms / (double) W + (double) eps));
         for (int64_t d = 0; d < W; ++d) {
-            const float v = x[(size_t) t * W + d] * s * w[d];
-            y[(size_t) t * W + d] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
+            // Stock VoxtralRealtimeRMSNorm is two stores: the normalized
+            // value rounds to bf16, then the weight multiply rounds again.
+            const float n = ggml_bf16_to_fp32(
+                ggml_fp32_to_bf16(x[(size_t) t * W + d] * s));
+            y[(size_t) t * W + d] = ggml_bf16_to_fp32(
+                ggml_fp32_to_bf16(n * w[d]));
         }
     }
     return y;
 }
 
 // ---- graph builders --------------------------------------------------------
-// RMSNorm in f32 with the affine in f32 and ONE bf16 round at the end (the
-// F.rms_norm semantics the stock VoxtralRealtimeRMSNorm runs: weight * normed
-// computed in the activation dtype, one store).
-ggml_tensor* rms_single(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
-                        const std::string& n, float eps) {
-    return lib::rms_single(c, ml, x, n + ".weight", eps);
+// RMSNorm with stock VoxtralRealtimeRMSNorm's two bf16 stores: the normalized
+// value rounds to bf16 (lib::rms), then the weight multiply rounds again —
+// the same discipline the shared decoder stack's spec_rms selects.
+ggml_tensor* rms_two_round(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
+                           const std::string& n, float eps) {
+    return lib::rms(c, ml, x, n + ".weight", eps);
 }
 ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
     return lib::gelu_erf_bf16(c, x);
@@ -254,7 +262,7 @@ ggml_tensor* build_encoder_layers(ggml_context* ctx, const VoxtralModel& model,
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
         const std::string pre = "enc.blk." + std::to_string(li) + ".";
         ggml_tensor* r = x;
-        ggml_tensor* n = rms_single(ctx, ml, x, pre + "attn_norm", ec.rms_norm_eps);
+        ggml_tensor* n = rms_two_round(ctx, ml, x, pre + "attn_norm", ec.rms_norm_eps);
         // q/v/o have bias, k has NO bias (Whisper convention, kept here).
         ggml_tensor* q = linear_bf16_oracle(ctx, ml, n, pre + "attn.q", true);
         ggml_tensor* k = lib::linear_bf16(ctx, ml, n, pre + "attn.k", false);
@@ -275,14 +283,14 @@ ggml_tensor* build_encoder_layers(ggml_context* ctx, const VoxtralModel& model,
             capture_graph_output(a, cap->l0_a);
         x = lib::addb(ctx, r, a);
         r = x;
-        n = rms_single(ctx, ml, x, pre + "ffn_norm", ec.rms_norm_eps);
-        // SwiGLU: silu(gate) * up computed in f32 with ONE bf16 round (the
-        // oracle order: no intermediate store of the silu output), then down
-        // WITH bias under the oracle round order.
+        n = rms_two_round(ctx, ml, x, pre + "ffn_norm", ec.rms_norm_eps);
+        // SwiGLU under stock's store discipline: bf16(silu(g)) is
+        // materialized BEFORE the up-multiply (two stores), then down WITH
+        // bias under the oracle round order.
         ggml_tensor* g = lib::linear_bf16(ctx, ml, n, pre + "ffn.gate", false);
         ggml_tensor* u = lib::linear_bf16(ctx, ml, n, pre + "ffn.up", false);
-        ggml_tensor* h = bf16(ctx, ggml_mul(ctx, ggml_silu(ctx, f32(ctx, g)),
-                                            f32(ctx, u)));
+        ggml_tensor* si = bf16(ctx, ggml_silu(ctx, f32(ctx, g)));
+        ggml_tensor* h = bf16(ctx, ggml_mul(ctx, f32(ctx, si), f32(ctx, u)));
         h = linear_bf16_oracle(ctx, ml, h, pre + "ffn.down", true);
         if (cap && (int64_t) li == 0 && cap->l0_ffn)
             capture_graph_output(h, cap->l0_ffn);
@@ -293,7 +301,7 @@ ggml_tensor* build_encoder_layers(ggml_context* ctx, const VoxtralModel& model,
                     capture_graph_output(f32(ctx, x), &(*cap->layer_outs)[di]);
         }
     }
-    return rms_single(ctx, ml, x, "enc.final_norm", ec.rms_norm_eps);
+    return rms_two_round(ctx, ml, x, "enc.final_norm", ec.rms_norm_eps);
 }
 
 // Projector: group-by-downsample reshape [Dm, T_enc] -> [Dm*ds, N], then
@@ -562,7 +570,8 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
                                   ggml_reshape_2d(ctx, f32(ctx, weight(ctx, model.loader,
                                                                       "enc.conv1.bias")),
                                                   Dm, 1));
-                    return exact_gelu(ctx, c1);  // bf16 [Dm, mel_T]
+                    // Stock stores the Conv1d bf16 output before GELU.
+                    return exact_gelu(ctx, bf16(ctx, c1));  // bf16 [Dm, mel_T]
                 });
             // Body graph: conv2 (one GEMM over the host-staged [(mel_T+1),
             // Dm] padded conv1 rows, strided windows gathered on the host
@@ -583,7 +592,8 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
                                   ggml_reshape_2d(ctx, f32(ctx, weight(ctx, model.loader,
                                                                       "enc.conv2.bias")),
                                                   Dm, 1));
-                    ggml_tensor* g2 = exact_gelu(ctx, c2);  // bf16 [Dm, T_enc]
+                    // Same Conv1d-before-GELU bf16 store on the second conv.
+                    ggml_tensor* g2 = exact_gelu(ctx, bf16(ctx, c2));  // bf16 [Dm, T_enc]
                     if (dbg && dbg->embedder)
                         capture_graph_output(f32(ctx, g2), dbg->embedder);
                     int64_t mne[2] = {T_enc, T_enc};

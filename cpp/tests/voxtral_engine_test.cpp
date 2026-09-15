@@ -236,6 +236,16 @@ int main(int argc, char** argv) {
         std::printf("    text=%s\n", got_text.c_str());
     }
 
+    // Tokenizer byte fidelity: BYTE-escaped pieces must come back as the
+    // exact raw bytes (ids 256+0xC3 / 256+0xA9 = UTF-8 "é"), never mojibake,
+    // and no special id (< 256) may contribute text.
+    {
+        check(tok.decode({0x100 + 0xC3, 0x100 + 0xA9}) == "\xC3\xA9",
+              "BYTE pieces round-trip to exact UTF-8 bytes (é)");
+        check(tok.decode({5, 0x100 + 'h', 7, 0x100 + 'i'}) == "hi",
+              "special ids (< 256) never contribute text");
+    }
+
     {
         GenerateResult limited;
         options.max_new_tokens = 0;

@@ -94,6 +94,34 @@ int main(int argc, char** argv) {
             check(tok.decode({1, 22177, 32, 4304, 2}).empty() == false &&
                   tok.decode({1, 22177, 32, 4304, 2}) == "Hello world",
                   "tokenizer skips CONTROL ids (1, 32, 2)");
+            // Byte fidelity: pieces with bytes >= 0x80 ride in <0xXX> +
+            // TokenType.BYTE form and must decode to the exact UTF-8 bytes
+            // ("héllo" = 68 C3 A9 6C 6C 6F), never double-encoded mojibake.
+            // A missing "é" piece means the GGUF predates the escaping
+            // converter and must be regenerated.
+            auto id_of = [&](const std::string& p) -> int32_t {
+                for (size_t i = 1000; i < tok.vocab_size(); ++i)
+                    if (tok.piece((int32_t) i) == p) return (int32_t) i;
+                return -1;
+            };
+            const int32_t ih = id_of("h"), ie = id_of("\xC3\xA9");
+            const int32_t il = id_of("l"), io = id_of("o");
+            if (ih < 0 || ie < 0 || il < 0 || io < 0) {
+                check(false, "tokenizer carries 'héllo' pieces",
+                      "regenerate the GGUF with the BYTE-escaping converter");
+            } else {
+                check(tok.decode({ih, ie, il, il, io}) == "h\xC3\xA9llo",
+                      "tokenizer round-trips non-ASCII bytes (héllo)");
+            }
+            // No special id (CONTROL or not) may contribute text: skip is by
+            // id range, matching stock skip_special_tokens=True.
+            {
+                const std::string base = tok.decode({ih, il});
+                bool leaks = false;
+                for (int32_t sp = 0; sp < 1000 && (size_t) sp < tok.vocab_size(); ++sp)
+                    if (tok.decode({sp, ih, il}) != base) { leaks = true; break; }
+                check(!leaks, "no special id (< 1000) contributes text");
+            }
         }
     }
 
