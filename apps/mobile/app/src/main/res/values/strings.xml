@@ -2,6 +2,7 @@
 <resources>
     <string name="app_name">Starling Mobile</string>
     <string name="keyboard_name">Starling Voice Input</string>
+    <string name="recognition_service_name">Starling Voice Recognition</string>
     <string name="screen_title">Starling Mobile</string>
     <string name="screen_subtitle">Private voice input for your own Starling server</string>
     <string name="backend_heading">Backend connection</string>
@@ -44,6 +45,8 @@
     <string name="delete_recording_error">Could not delete the recording files.</string>
     <string name="open_keyboard_settings">Enable Starling keyboard</string>
     <string name="keyboard_intro">Enable the keyboard in Android Settings, then choose it from the keyboard switcher.</string>
+    <string name="open_voice_input_settings">Set Starling as voice input</string>
+    <string name="voice_input_intro">Keyboards that use Android speech recognition (such as HeliBoard) show their own microphone button; pick Starling Voice Recognition under Voice input to transcribe through your server. Closed keyboards like Gboard keep their own engine.</string>
     <string name="keyboard_record">Record</string>
     <string name="keyboard_stop">Stop</string>
     <string name="keyboard_insert">Insert transcript</string>

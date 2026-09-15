@@ -73,6 +73,9 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
         }
+        findViewById<Button>(R.id.open_voice_input_button).setOnClickListener {
+            startActivity(Intent(android.provider.Settings.ACTION_VOICE_INPUT_SETTINGS))
+        }
 
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshRecordings()
