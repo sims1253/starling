@@ -3,6 +3,7 @@ package dev.starling.mobile.network
 import android.os.Handler
 import android.os.Looper
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
@@ -12,6 +13,7 @@ import java.util.concurrent.Executors
 class TranscriptionCoordinator(
     private val store: RecordingStore,
     private val settings: BackendSettings,
+    private val onDevice: OnDeviceBackend,
 ) {
     private val executor: ExecutorService = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "starling-transcription").apply { isDaemon = true }
@@ -34,7 +36,12 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val result = client.transcribe(store.audioFile(queued), config)
+                val audioFile = store.audioFile(queued)
+                val result = if (config.engine == TranscriptionEngine.ON_DEVICE) {
+                    onDevice.transcribe(audioFile, config)
+                } else {
+                    client.transcribe(audioFile, config)
+                }
                 val completed = when (result) {
                     is InferenceResult.Success -> runCatching {
                         store.markTranscribed(id, result.rawTranscript)

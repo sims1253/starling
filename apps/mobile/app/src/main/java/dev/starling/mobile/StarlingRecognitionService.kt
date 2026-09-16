@@ -13,6 +13,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.network.TranscriptionEngine
 import java.util.concurrent.TimeUnit
 
 /**
@@ -21,9 +22,10 @@ import java.util.concurrent.TimeUnit
  * here once Starling is selected as the voice input service, so dictation
  * works inside a normal keyboard without switching IMEs.
  *
- * The transcript is delivered once, after the batch server response. The
+ * The transcript is delivered once, after the batch transcription completes
+ * (on the configured server or on this device). The
  * audio and its outcome stay durable in the recordings store, so a failed
- * upload remains retryable from the app. No partial results are produced.
+ * transcription remains retryable from the app. No partial results are produced.
  * Session transitions are decided by [RecognitionSessionGuard], which is
  * unit-tested separately.
  */
@@ -117,9 +119,17 @@ class StarlingRecognitionService : RecognitionService() {
                             )
                         }
                     } else {
-                        // The upload failed but the recording is retained and
-                        // retryable from the app; report a network-class error.
-                        sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_NETWORK) }
+                        // The transcription failed but the recording is retained
+                        // and retryable from the app; report the class the host
+                        // keyboard can act on (network for the server path,
+                        // client for a local engine problem such as a missing
+                        // model).
+                        val errorCode = if (config.engine == TranscriptionEngine.ON_DEVICE) {
+                            SpeechRecognizer.ERROR_CLIENT
+                        } else {
+                            SpeechRecognizer.ERROR_NETWORK
+                        }
+                        sessions.deliver(ending.session.owner) { it.error(errorCode) }
                     }
                 }
             }

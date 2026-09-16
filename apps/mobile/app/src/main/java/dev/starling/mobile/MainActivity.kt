@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -20,12 +21,15 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendProtocol
 import dev.starling.mobile.network.EndpointPolicy
 import dev.starling.mobile.network.EndpointValidation
+import dev.starling.mobile.network.TranscriptionEngine
 import java.text.DateFormat
 import java.util.Date
+import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
     private lateinit var endpointInput: EditText
@@ -33,6 +37,9 @@ class MainActivity : Activity() {
     private lateinit var protocolInput: RadioGroup
     private lateinit var openAiProtocolInput: RadioButton
     private lateinit var modelInput: EditText
+    private lateinit var engineInput: RadioGroup
+    private lateinit var engineOnDeviceInput: RadioButton
+    private lateinit var onDeviceStatus: TextView
     private lateinit var endpointMessage: TextView
     private lateinit var recordingMessage: TextView
     private lateinit var recordButton: Button
@@ -52,6 +59,9 @@ class MainActivity : Activity() {
         protocolInput = findViewById(R.id.protocol_input)
         openAiProtocolInput = findViewById(R.id.protocol_openai)
         modelInput = findViewById(R.id.model_input)
+        engineInput = findViewById(R.id.engine_input)
+        engineOnDeviceInput = findViewById(R.id.engine_on_device)
+        onDeviceStatus = findViewById(R.id.on_device_status)
         endpointMessage = findViewById(R.id.endpoint_message)
         recordingMessage = findViewById(R.id.recording_message)
         recordButton = findViewById(R.id.record_button)
@@ -64,9 +74,13 @@ class MainActivity : Activity() {
         findViewById<RadioButton>(R.id.protocol_starling).isChecked =
             config.protocol == BackendProtocol.STARLING
         modelInput.setText(config.model)
+        engineOnDeviceInput.isChecked = config.engine == TranscriptionEngine.ON_DEVICE
+        findViewById<RadioButton>(R.id.engine_server).isChecked =
+            config.engine == TranscriptionEngine.REMOTE
         protocolInput.setOnCheckedChangeListener { _, _ -> updateProtocolFields() }
         updateProtocolFields()
         findViewById<Button>(R.id.save_endpoint_button).setOnClickListener { saveEndpoint() }
+        findViewById<Button>(R.id.import_model_button).setOnClickListener { importModel() }
         recordButton.setOnClickListener {
             if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
         }
@@ -78,6 +92,7 @@ class MainActivity : Activity() {
         }
 
         recordingMessage.text = getString(R.string.ready_to_record)
+        refreshOnDeviceStatus()
         refreshRecordings()
     }
 
@@ -111,6 +126,11 @@ class MainActivity : Activity() {
             allowTrustedLanHttp = allowHttpInput.isChecked,
             protocol = protocol,
             model = modelInput.text.toString().trim(),
+            engine = if (engineOnDeviceInput.isChecked) {
+                TranscriptionEngine.ON_DEVICE
+            } else {
+                TranscriptionEngine.REMOTE
+            },
         )
         if (config.protocol == BackendProtocol.OPENAI && config.model.isEmpty()) {
             endpointMessage.setText(R.string.model_required)
@@ -128,6 +148,50 @@ class MainActivity : Activity() {
     private fun updateProtocolFields() {
         if (!::modelInput.isInitialized) return
         modelInput.visibility = if (openAiProtocolInput.isChecked) View.VISIBLE else View.GONE
+    }
+
+    private fun importModel() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/octet-stream"
+        }
+        startActivityForResult(intent, REQUEST_IMPORT_MODEL)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_IMPORT_MODEL || resultCode != RESULT_OK) return
+        val uri: Uri = data?.data ?: return
+        onDeviceStatus.setText(R.string.on_device_importing)
+        val resolver = contentResolver
+        thread {
+            val input = runCatching { resolver.openInputStream(uri) }.getOrNull()
+            val result = if (input == null) {
+                OnDeviceEngine.ImportResult.Rejected("The selected file could not be opened.")
+            } else {
+                application.onDeviceEngine.importModel(input)
+            }
+            runOnUiThread {
+                when (result) {
+                    is OnDeviceEngine.ImportResult.Imported -> {
+                        recordingMessage.setText(R.string.on_device_imported)
+                    }
+                    is OnDeviceEngine.ImportResult.Rejected -> recordingMessage.text = result.reason
+                }
+                refreshOnDeviceStatus()
+            }
+        }
+    }
+
+    private fun refreshOnDeviceStatus() {
+        val engine = application.onDeviceEngine
+        onDeviceStatus.text = when {
+            engine.hasModel() -> {
+                val sizeMb = engine.modelSizeBytes() / (1024 * 1024)
+                getString(R.string.on_device_model_present, sizeMb)
+            }
+            else -> getString(R.string.on_device_status_no_model)
+        }
     }
 
     private fun requestOrStartRecording() {
@@ -301,5 +365,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_RECORD_AUDIO = 4001
+        private const val REQUEST_IMPORT_MODEL = 4002
     }
 }

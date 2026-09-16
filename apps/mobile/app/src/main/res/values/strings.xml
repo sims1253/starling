@@ -19,8 +19,16 @@
     <string name="model_hint">Model slug (required for OpenAI mode)</string>
     <string name="model_required">Enter the model slug served by this backend.</string>
     <string name="protocol_help">OpenAI mode sends file, model, and response_format=json. Use the slug reported by /v1/models.</string>
+    <string name="engine_heading">Transcribe on</string>
+    <string name="engine_server">Starling server</string>
+    <string name="engine_on_device">This device (experimental)</string>
+    <string name="on_device_status_no_model">No on-device model imported yet.</string>
+    <string name="on_device_model_present">Model imported: parakeet.gguf (%1$d MB). Transcribes offline on this device.</string>
+    <string name="on_device_importing">Importing model…</string>
+    <string name="on_device_imported">Model imported. On-device transcription is ready.</string>
+    <string name="import_model">Import model (.gguf)</string>
     <string name="record_heading">Record</string>
-    <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before upload.</string>
+    <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before transcription.</string>
     <string name="start_recording">Start recording</string>
     <string name="stop_and_transcribe">Stop and transcribe</string>
     <string name="recording_now">Recording… tap Stop and transcribe when finished.</string>
@@ -46,7 +54,7 @@
     <string name="open_keyboard_settings">Enable Starling keyboard</string>
     <string name="keyboard_intro">Enable the keyboard in Android Settings, then choose it from the keyboard switcher.</string>
     <string name="open_voice_input_settings">Set Starling as voice input</string>
-    <string name="voice_input_intro">Keyboards that use Android speech recognition (such as HeliBoard) show their own microphone button; pick Starling Voice Recognition under Voice input to transcribe through your server. Closed keyboards like Gboard keep their own engine.</string>
+    <string name="voice_input_intro">Keyboards that use Android speech recognition (such as HeliBoard) show their own microphone button; pick Starling Voice Recognition under Voice input to dictate with Starling, on your server or on this device. Closed keyboards like Gboard keep their own engine.</string>
     <string name="keyboard_record">Record</string>
     <string name="keyboard_stop">Stop</string>
     <string name="keyboard_insert">Insert transcript</string>
