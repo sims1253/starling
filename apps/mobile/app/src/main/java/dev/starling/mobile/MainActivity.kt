@@ -73,6 +73,9 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
         }
+        findViewById<Button>(R.id.open_voice_input_button).setOnClickListener {
+            startActivity(Intent(android.provider.Settings.ACTION_VOICE_INPUT_SETTINGS))
+        }
 
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshRecordings()
@@ -151,7 +154,7 @@ class MainActivity : Activity() {
             recordingMessage.text = getString(R.string.recording_storage_error)
             return
         }
-        val error = capture.start(application.recordings.partialFile(recording))
+        val error = capture.start(this, application.recordings.partialFile(recording))
         if (error != null) {
             runCatching { application.recordings.markFailed(recording.id, error) }
             recordingMessage.text = error
