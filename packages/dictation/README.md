@@ -8,12 +8,15 @@ and cancellation. The Promise methods shown below remain available. Server
 responses and saved IndexedDB sessions are decoded with Effect Schema.
 See [workspace tooling](../../docs/typescript.md) for versions and checks.
 
-The package keeps three boundaries explicit:
+The package keeps four boundaries explicit:
 
 - audio is converted to mono 16 kHz PCM16 WAV before upload, so it works with
   both the Python and native servers;
 - inference returns the server's raw text unchanged;
-- any fidelity warning or edit is advisory data and never mutates raw text.
+- any fidelity warning or edit is advisory data and never mutates raw text;
+- every request is sent with `redirect: "manual"` and 3xx responses fail with
+  the same "Server redirect blocked" wording as the Electron bridge, so audio
+  and credentials are never re-sent to an origin the user did not configure.
 
 Captured WAVs can be written to `IndexedDbSessionStore` before inference. The
 store retains audio through attempts, failures, and successful transcription;
