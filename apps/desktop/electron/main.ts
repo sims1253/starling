@@ -496,8 +496,9 @@ function createWindow(): BrowserWindow {
       return;
     }
 
-    // Discard: destroy skips this handler, and a quit that our
-    // preventDefault aborted has to be restarted explicitly.
+    // Discard: destroy() skips this handler. A quit in progress still
+    // completes once the last window is gone; the explicit restart is a
+    // cross-version safety net, not a requirement on current Electron.
     window.destroy();
 
     if (quitting) app.quit();
