@@ -58,16 +58,19 @@ class MainActivity : Activity() {
 
         // Edge-to-edge is enforced with targetSdk 35 and the deprecated
         // status/navigation bar color items no longer reserve any space. Pad
-        // the scroll root for the system bars plus the display cutout so the
-        // title clears the status bar and the buttons clear the gesture bar.
+        // the scroll root for the system bars, the soft keyboard (the window
+        // is no longer resized for it), and the display cutout so the title
+        // clears the status bar and the controls clear the gesture bar.
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main_root)) { view, windowInsets ->
-            val systemBars = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val bars = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime(),
+            )
             val cutout = windowInsets.displayCutout
             view.setPadding(
-                maxOf(systemBars.left, cutout?.safeInsetLeft ?: 0),
-                maxOf(systemBars.top, cutout?.safeInsetTop ?: 0),
-                maxOf(systemBars.right, cutout?.safeInsetRight ?: 0),
-                maxOf(systemBars.bottom, cutout?.safeInsetBottom ?: 0),
+                maxOf(bars.left, cutout?.safeInsetLeft ?: 0),
+                maxOf(bars.top, cutout?.safeInsetTop ?: 0),
+                maxOf(bars.right, cutout?.safeInsetRight ?: 0),
+                maxOf(bars.bottom, cutout?.safeInsetBottom ?: 0),
             )
             WindowInsetsCompat.CONSUMED
         }

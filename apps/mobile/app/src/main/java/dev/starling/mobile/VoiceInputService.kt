@@ -46,8 +46,13 @@ class VoiceInputService : InputMethodService() {
     }
 
     override fun onCreateInputView(): View {
-        val parent = FrameLayout(this)
-        val view = LayoutInflater.from(this).inflate(R.layout.keyboard_view, parent, false)
+        // InputMethodService.setInputView() re-parameters whatever view it is
+        // handed with MATCH_PARENT/WRAP_CONTENT, so a fixed height on the
+        // returned root would be discarded before the first measure. The
+        // keyboard therefore lives inside a container that wraps the
+        // @dimen/keyboard_height child, which keeps the height stable.
+        val container = FrameLayout(this)
+        val view = LayoutInflater.from(this).inflate(R.layout.keyboard_view, container, true)
         applyWindowInsets(view)
         keyboardView = view
         recordButton = view.findViewById(R.id.keyboard_record_button)
@@ -60,7 +65,7 @@ class VoiceInputService : InputMethodService() {
         }
         insertButton?.setOnClickListener { insertReadyTranscript() }
         renderIdle()
-        return view
+        return container
     }
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {

@@ -4,6 +4,11 @@
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">@color/starling_accent</item>
         <item name="android:windowLightStatusBar">true</item>
+        <!-- Still honored on Android 14 and below, where edge-to-edge is not
+             enforced; Android 15+ ignores these items under enforced
+             edge-to-edge, where the MainActivity insets listener applies. -->
+        <item name="android:statusBarColor">@color/starling_surface</item>
+        <item name="android:navigationBarColor">@color/starling_surface</item>
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
 </resources>
