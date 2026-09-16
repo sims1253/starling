@@ -99,6 +99,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var recorder: AVAudioRecorder?
     private var interruptionObserver: (any NSObjectProtocol)?
     private var routeChangeObserver: (any NSObjectProtocol)?
+    private var mediaServicesResetObserver: (any NSObjectProtocol)?
 
     init(coordinator: AudioSessionCoordinator) {
         self.coordinator = coordinator
@@ -195,6 +196,15 @@ final class AudioRecorder: NSObject, ObservableObject {
                 self?.handleRouteChange(rawReason.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)))
             }
         }
+        mediaServicesResetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleMediaServicesReset()
+            }
+        }
     }
 
     private func stopObservingSessionState() {
@@ -204,8 +214,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         if let routeChangeObserver {
             NotificationCenter.default.removeObserver(routeChangeObserver)
         }
+        if let mediaServicesResetObserver {
+            NotificationCenter.default.removeObserver(mediaServicesResetObserver)
+        }
         interruptionObserver = nil
         routeChangeObserver = nil
+        mediaServicesResetObserver = nil
     }
 
     private func handleInterruption(_ type: AVAudioSession.InterruptionType?) {
@@ -224,6 +238,16 @@ final class AudioRecorder: NSObject, ObservableObject {
         guard reason == .oldDeviceUnavailable else { return }
         forcedStop(
             message: "The microphone became unavailable. The audio captured so far was saved to history."
+        )
+    }
+
+    /// A media services reset invalidates every audio object, including a
+    /// running recorder whose delegate is not called, so capture is finalized
+    /// with the audio gathered so far.
+    private func handleMediaServicesReset() {
+        guard isRecording else { return }
+        forcedStop(
+            message: "The audio system restarted. The audio captured so far was saved to history."
         )
     }
 }
