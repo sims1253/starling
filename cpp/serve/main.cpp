@@ -201,8 +201,46 @@ static std::string json_escape(const std::string& s) {
 // top-level field. A candidate only qualifies when it starts outside any
 // string at depth 1, the previous non-whitespace char is `{` or `,`, and the
 // next non-whitespace char is `:`. Escapes (\", \\, \n, \t, \uXXXX) are
-// decoded; \u escapes encode a UTF-8 BMP codepoint. Returns false when the
-// field is absent or malformed.
+// decoded; a \u escape encodes UTF-8, with a valid surrogate pair combining
+// into one 4-byte sequence (issue #123).
+// Returns false when the field is absent or malformed.
+
+// Parse exactly four hex digits at body[start..start+4) into *out.
+// Returns false on a non-hex byte (malformed \u escape).
+static bool json_hex4(const std::string& body, size_t start, unsigned& out) {
+    if (start + 4 > body.size()) return false;
+    unsigned v = 0;
+    for (int i = 0; i < 4; ++i) {
+        char h = body[start + i];
+        v <<= 4;
+        if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+        else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+        else return false;
+    }
+    out = v;
+    return true;
+}
+
+// Append code point cp (<= 0x10FFFF) to out as UTF-8.
+static void json_append_utf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xc0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 63));
+    } else if (cp < 0x10000) {
+        out += (char)(0xe0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 63));
+        out += (char)(0x80 | (cp & 63));
+    } else {
+        out += (char)(0xf0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 63));
+        out += (char)(0x80 | ((cp >> 6) & 63));
+        out += (char)(0x80 | (cp & 63));
+    }
+}
+
 static bool json_get_string(const std::string& body, const std::string& key,
                             std::string& out) {
     // Pass 1: in-string/escape state + enclosing depth per byte.
@@ -268,25 +306,33 @@ static bool json_get_string(const std::string& body, const std::string& key,
             case 'b':  out += '\b'; break;
             case 'f':  out += '\f'; break;
             case 'u': {
-                if (q + 4 >= body.size()) return false;
                 unsigned cp = 0;
-                for (int i = 1; i <= 4; ++i) {
-                    char h = body[q + i];
-                    cp <<= 4;
-                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
-                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
-                    else return false;
+                if (!json_hex4(body, q + 1, cp)) return false;
+                // Surrogate pairs (issue #123): "\ud83d\ude00" is ONE code
+                // point and must decode to one 4-byte UTF-8 sequence, not to
+                // two 3-byte sequences (surrogate code points have no UTF-8
+                // encoding — that output was invalid UTF-8 while the raw
+                // character decoded correctly). An unpaired surrogate half
+                // decodes to U+FFFD (REPLACEMENT CHARACTER): JSON only
+                // permits paired escapes, but rejecting the whole request
+                // over one stray half would 400 transcripts that common
+                // serializers emit and other parsers accept; replacement is
+                // the WHATWG encoding standard's interoperable policy.
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    unsigned lo = 0;
+                    if (q + 10 < body.size() && body[q + 5] == '\\'
+                        && body[q + 6] == 'u'
+                        && json_hex4(body, q + 7, lo)
+                        && lo >= 0xdc00 && lo <= 0xdfff) {
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                        q += 6;  // consume the low escape's "\u" too
+                    } else {
+                        cp = 0xfffd;  // unpaired high surrogate
+                    }
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    cp = 0xfffd;      // unpaired low surrogate
                 }
-                if (cp < 0x80) out += (char)cp;
-                else if (cp < 0x800) {
-                    out += (char)(0xc0 | (cp >> 6));
-                    out += (char)(0x80 | (cp & 63));
-                } else {
-                    out += (char)(0xe0 | (cp >> 12));
-                    out += (char)(0x80 | ((cp >> 6) & 63));
-                    out += (char)(0x80 | (cp & 63));
-                }
+                json_append_utf8(out, cp);
                 q += 4;
                 break;
             }

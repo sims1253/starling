@@ -325,6 +325,24 @@ def test_normalize_endpoints(binary: Path, tr: TestResults):
         tr.check("normalize '#' request id -> 400",
                  r.status_code == 400 and "invalid request id" in r.json().get("error", ""),
                  f"{r.status_code} {r.text[:120]}")
+
+        # \u escape handling (issue #123): a valid surrogate pair parses (and
+        # decodes to the same UTF-8 as the raw character — pinned byte-for-
+        # byte by the fixture echo in backends/native/tests), unpaired halves
+        # parse via U+FFFD replacement, and malformed hex stays a 400. All
+        # parse outcomes are distinguishable on the placeholder: parsed
+        # bodies reach the engine path (503), malformed ones fail at 400.
+        r = post('{"transcript": "hi \\ud83d\\ude00 bye"}')
+        tr.check("normalize escaped surrogate pair -> 503",
+                 r.status_code == 503, f"{r.status_code} {r.text[:120]}")
+
+        r = post('{"transcript": "lone \\ud83d half"}')
+        tr.check("normalize unpaired surrogate -> 503",
+                 r.status_code == 503, f"{r.status_code} {r.text[:120]}")
+
+        r = post('{"transcript": "bad \\uZZZZ"}')
+        tr.check("normalize malformed \\u escape -> 400",
+                 r.status_code == 400, f"{r.status_code} {r.text[:120]}")
     finally:
         audio_server.stop()
         s1_server.stop()

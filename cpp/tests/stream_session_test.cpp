@@ -74,12 +74,80 @@ static void test_stitch_punctuation() {
     CHECK(r[3] == "foo");
 }
 
+// ---- non-ASCII stitch keys (issue #118) ------------------------------------
+// std::isalnum is false for every byte >= 0x80 in the default C locale, so the
+// old byte filter mapped Cyrillic/CJK words to "" and runs of empty keys then
+// matched as an overlap, deleting the new chunk's words at every window
+// boundary. These tests pin the conservative UTF-8-aware keys.
+static void test_stitch_unicode_disjoint() {
+    // Disjoint Cyrillic chunks must keep ALL words (the empty-key bug
+    // returned just the committed half: ["привет", "мир"]).
+    auto r = stitch_words({u8"привет", u8"мир"}, {u8"совсем", u8"другое"});
+    CHECK(r.size() == 4);
+    CHECK(r[0] == u8"привет");
+    CHECK(r[1] == u8"мир");
+    CHECK(r[2] == u8"совсем");
+    CHECK(r[3] == u8"другое");
+
+    // Disjoint CJK chunks keep all words too.
+    r = stitch_words({u8"你好", u8"世界"}, {u8"再见", u8"朋友"});
+    CHECK(r.size() == 4);
+    CHECK(r[0] == u8"你好");
+    CHECK(r[3] == u8"朋友");
+}
+
+static void test_stitch_unicode_overlap() {
+    // A genuine Cyrillic overlap still dedupes across the window boundary.
+    auto r = stitch_words({u8"привет", u8"мир", u8"тут"}, {u8"мир", u8"тут", u8"ок"});
+    CHECK(r.size() == 4);  // ["привет", "мир", "тут", "ок"]
+    CHECK(r[0] == u8"привет");
+    CHECK(r[2] == u8"тут");
+    CHECK(r[3] == u8"ок");
+
+    // CJK overlap dedupes.
+    r = stitch_words({u8"今天", u8"天气", u8"很好"}, {u8"天气", u8"很好", u8"吗"});
+    CHECK(r.size() == 4);
+    CHECK(r[3] == u8"吗");
+
+    // Mixed-script boundary: a shared Cyrillic run inside ASCII text dedupes.
+    r = stitch_words({"hello", u8"мир", u8"тут"}, {u8"мир", u8"тут", "ok"});
+    CHECK(r.size() == 4);  // ["hello", "мир", "тут", "ok"]
+    CHECK(r[0] == "hello");
+    CHECK(r[3] == "ok");
+
+    // ASCII punctuation around non-ASCII words is still stripped for keys.
+    r = stitch_words({u8"привет,", u8"мир."}, {u8"привет", u8"мир", "!"});
+    CHECK(r.size() == 3);  // committed spelling kept: ["привет,", "мир.", "!"]
+    CHECK(r[0] == u8"привет,");
+    CHECK(r[2] == "!");
+}
+
+static void test_stitch_empty_keys_never_match() {
+    // Words that normalize to "" (pure ASCII punctuation) must never count as
+    // an overlap run — defense in depth for issue #118: matching empty keys
+    // would drop the new chunk's leading words.
+    auto r = stitch_words({"--", ";;"}, {"..", ",,", "word"});
+    CHECK(r.size() == 5);
+    CHECK(r[4] == "word");
+}
+
 // ---- norm_word test -------------------------------------------------------
 static void test_norm_word() {
     CHECK(norm_word("Hello") == "hello");
     CHECK(norm_word("World!") == "world");
     CHECK(norm_word("it's") == "it's");
     CHECK(norm_word("") == "");
+
+    // Non-ASCII words keep their UTF-8 bytes: no more empty keys (issue #118).
+    CHECK(norm_word(u8"привет") == u8"привет");
+    CHECK(norm_word(u8"你好") == u8"你好");
+    CHECK(norm_word(u8"café") == u8"café");
+    // ASCII inside UTF-8 text: punctuation stripped, ASCII lowercased,
+    // non-ASCII bytes kept verbatim (no Unicode case folding — the key only
+    // has to be deterministic and identical across chunk boundaries).
+    CHECK(norm_word(u8"Привет, World!") == u8"Приветworld");
+    // Pure-ASCII punctuation still normalizes to the empty string.
+    CHECK(norm_word("--") == "");
 }
 
 // ---- split/join tests -----------------------------------------------------
@@ -144,7 +212,7 @@ static void test_chunk_streamer_partial() {
 
 static void test_chunk_streamer_flush() {
     ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
-    TranscribeFn tx = [&](const float* s, int64_t n) -> std::optional<std::string> {
+    TranscribeFn tx = [](const float*, int64_t) -> std::optional<std::string> {
         return "flushed";
     };
 
@@ -152,6 +220,29 @@ static void test_chunk_streamer_flush() {
     std::vector<float> samples(8000, 0.0f);
     auto text = cs.flush(samples, tx);
     CHECK(text == "flushed");
+}
+
+static void test_chunk_streamer_unicode_boundary() {
+    // Cyrillic transcripts on two overlapping windows (issue #118): the
+    // shared boundary words dedupe AND every unique word survives. With the
+    // old empty-key normalization the second window's words were dropped
+    // entirely at the boundary.
+    ChunkStreamer cs(16000, 1.0, 0.5, 0.5, 0.0);
+    int call = 0;
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+        ++call;
+        return call == 1 ? u8"привет мир сегодня" : u8"мир сегодня хорошая";
+    };
+
+    // 1 s of audio: one full window [0,16000) finalizes, then the tail
+    // [8000,16000) is transcribed for the partial — the tail's transcript
+    // overlaps the window's by two words.
+    std::vector<float> samples(16000, 0.0f);
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(*result == u8"привет мир сегодня хорошая");
+    CHECK(call == 2);
+    CHECK(cs.boundary() == 8000);
 }
 
 // ---- model slug mapping tests ---------------------------------------------
@@ -393,11 +484,15 @@ int main() {
     test_stitch_empty();
     test_stitch_no_match();
     test_stitch_punctuation();
+    test_stitch_unicode_disjoint();
+    test_stitch_unicode_overlap();
+    test_stitch_empty_keys_never_match();
     test_norm_word();
     test_split_join();
     test_chunk_streamer_basic();
     test_chunk_streamer_partial();
     test_chunk_streamer_flush();
+    test_chunk_streamer_unicode_boundary();
     test_chunk_streamer_rebase();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
