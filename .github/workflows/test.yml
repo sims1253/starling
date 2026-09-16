@@ -55,6 +55,14 @@ jobs:
           --index https://download.pytorch.org/whl/cpu
           python -m pytest -q tests/test_benchmark_ggml_adapters.py
 
+      - name: Test ark06/voxtral Python pipelines with CPU-only PyTorch
+        run: >-
+          uv run --no-project --python 3.12 --with pytest --with numpy --with soundfile
+          --with torch --index https://download.pytorch.org/whl/cpu
+          python -m pytest -q tests/test_ark06_pipeline.py tests/test_voxtral_pipeline.py
+        env:
+          PYTHONPATH: src
+
   cpu-tests:
     # Deprecated CUDA/Python environment is opt-in; portable CI lives in apps.yml.
     if: github.event_name == 'workflow_dispatch'

@@ -64,7 +64,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, s1, audex |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, s1, audex, voxtral |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -253,6 +253,8 @@ and input; the filename alone does not guarantee it. See the
 | parakeet | `scripts/convert_parakeet_gguf.py` |
 | moss | `scripts/convert_moss_gguf.py` |
 | ark | `scripts/convert_ark_gguf.py` |
+| ark06 | `scripts/convert_ark06_gguf.py` |
+| voxtral | `scripts/convert_voxtral_gguf.py` |
 | higgs | `scripts/convert_higgs_gguf.py` |
 | hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |

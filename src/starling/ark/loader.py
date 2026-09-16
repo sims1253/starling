@@ -19,8 +19,9 @@ def load_model_and_processor(
     attn_impl: str = "eager",
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    model_id: str | None = None,
 ) -> tuple[Any, Any]:
-    """Load the ARK-ASR-3B model and processor.
+    """Load an ARK-ASR model and processor.
 
     The model ships custom modeling code, so ``trust_remote_code=True`` is
     required for both the model and the processor. The decoder is loaded with
@@ -32,21 +33,24 @@ def load_model_and_processor(
         attn_impl: Attention implementation for the Qwen2.5 decoder.
         dtype: Model dtype (bf16 is the checkpoint dtype).
         device: Target device.
+        model_id: HF hub repo id. Defaults to the 3B MODEL_ID; the 0.6B track
+            passes its own id (same remote modeling code, same submodule layout).
 
     Returns:
         ``(model, processor)`` with the model in eval mode.
     """
     from transformers import AutoModelForCausalLM, AutoProcessor
 
+    resolved = model_id or MODEL_ID
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        resolved,
         dtype=dtype,
         device_map=device,
         trust_remote_code=True,
         attn_implementation=attn_impl,
     )
     model.eval()
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(resolved, trust_remote_code=True)
     return model, processor
 
 

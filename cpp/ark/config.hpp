@@ -68,6 +68,10 @@ struct Config {
     uint32_t max_new_tokens = 200;
     std::string default_instruction = "Transcribe the audio to text.";
     std::vector<int32_t> prompt_prefix, prompt_suffix;  // baked token-id arrays
+    // Greedy suppression ids (sorted; the model card bans every special and
+    // codec id except EOS from generation). Empty when the GGUF carries no
+    // ark.bad_words_ids key, which disables suppression entirely.
+    std::vector<int32_t> bad_words_ids;
 };
 
 // Number of LLM audio tokens implied by an (uncapped) mel-frame count.

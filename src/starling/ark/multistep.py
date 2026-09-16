@@ -20,6 +20,7 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
         dtype: torch.dtype = torch.bfloat16,
         prefill_use_graph: bool = True,
         graph_pool=None,
+        bad_token_ids: Optional[set[int]] = None,
     ) -> None:
         super().__init__(
             language_model,
@@ -30,6 +31,7 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
             dtype=dtype,
             prefill_use_graph=prefill_use_graph,
             graph_pool=graph_pool,
+            bad_token_ids=bad_token_ids,
         )
         self._init_multistep(steps_per_replay, device)
 
