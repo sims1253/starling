@@ -154,6 +154,9 @@ struct SessionDetailView: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            // Playback reconfigures the shared audio session and must not
+            // compete with an active recording.
+            .disabled(model.recorder.isRecording)
 
             if let audioURL = model.audioURLs[current.id] {
                 ShareLink(item: audioURL) {

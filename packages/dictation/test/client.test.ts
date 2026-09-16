@@ -161,6 +161,53 @@ describe("StarlingClient protocol compatibility", () => {
     );
   });
 
+  it("blocks redirects with the Electron bridge wording instead of following them", async () => {
+    let capturedRedirect: string | undefined;
+
+    const fetcher: typeof fetch = async (_input, init) => {
+      capturedRedirect = init?.redirect;
+
+      return new Response("", {
+        status: 302,
+        statusText: "Found",
+        headers: { Location: "https://elsewhere.example/inference" },
+      });
+    };
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: fetcher,
+    });
+
+    await assert.rejects(
+      client.transcribe(prepared),
+      (cause) =>
+        cause instanceof DictationHttpError &&
+        cause.status === 302 &&
+        cause.message === "Server redirect blocked (302). Set the final endpoint explicitly.",
+    );
+    assert.equal(capturedRedirect, "manual");
+  });
+
+  it("sends every request with redirect manual and still accepts ordinary successes", async () => {
+    const capturedRedirects: Array<string | undefined> = [];
+
+    const fetcher: typeof fetch = async (_input, init) => {
+      capturedRedirects.push(init?.redirect);
+
+      return new Response(JSON.stringify({ status: "ready" }), { status: 200 });
+    };
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: fetcher,
+    });
+
+    assert.equal((await client.health()).status, "ready");
+    await client.cancel("request-id");
+    assert.deepEqual(capturedRedirects, ["manual", "manual"]);
+  });
+
   it("surfaces nested OpenAI error messages", async () => {
     const client = new StarlingClient({
       baseUrl: "http://localhost:8181",

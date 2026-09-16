@@ -8,10 +8,19 @@ retry, and export until the user explicitly deletes them.
 
 Capture begins in an app-private `Pending` directory. Promotion removes that
 staged file only after the history copy and manifest are durable; pending files
-are recovered on the next launch after an interruption. Successful retries
-keep earlier raw transcripts in the session manifest. Network requests use an
-ephemeral URL session and refuse redirects, so audio cannot silently follow a
-server redirect to a destination the user did not configure.
+are recovered on the next launch after an interruption, and one unreadable
+session directory is skipped and reported instead of hiding the whole history.
+Sessions left mid-request by an app exit become retryable failures on the next
+launch while keeping their audio, transcripts, and attempt counts. Successful
+retries keep earlier raw transcripts in the session manifest. Network requests
+use an ephemeral URL session and refuse redirects, so audio cannot silently
+follow a server redirect to a destination the user did not configure.
+
+Recording owns the process-wide audio session exclusively: history playback
+neither reconfigures nor deactivates the session while capture is active, and
+a capture ended by the system — a call, Siri, or a disconnected microphone —
+is finalized with the audio gathered so far saved to history instead of
+continuing to show a running timer.
 
 The app supports the primary OpenAI-compatible endpoint and the legacy
 Starling endpoint:

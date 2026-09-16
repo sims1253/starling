@@ -5,17 +5,26 @@ import StarlingVoiceCore
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var sessions: [SessionRecord] = []
+    @Published private(set) var unreadableSessionCount = 0
     @Published private(set) var isWorking = false
     @Published var selectedSession: SessionRecord?
     @Published var errorMessage: String?
 
-    let recorder = AudioRecorder()
-    let playback = AudioPlayback()
+    let recorder: AudioRecorder
+    let playback: AudioPlayback
     private let repository: SessionRepository
     private(set) var audioURLs: [UUID: URL] = [:]
 
     init(repository: SessionRepository) {
         self.repository = repository
+        let coordinator = AudioSessionCoordinator()
+        recorder = AudioRecorder(coordinator: coordinator)
+        playback = AudioPlayback(coordinator: coordinator)
+        // Capture can end without the stop button (a call, Siri, a lost
+        // microphone route). Keep the audio captured so far in history.
+        recorder.onForcedStop = { [weak self] capture, message in
+            Task { await self?.preserveInterruptedRecording(capture, message: message) }
+        }
         Task { await recoverAndReload() }
     }
 
@@ -24,6 +33,9 @@ final class AppModel: ObservableObject {
             await finishRecording(configuration: configuration)
         } else {
             do {
+                // Capture owns the shared audio session exclusively; playback
+                // gives it up before recording starts.
+                playback.stop()
                 let stagingURL = try await repository.stagingRecordingURL()
                 try await recorder.start(at: stagingURL)
             } catch {
@@ -70,18 +82,34 @@ final class AppModel: ObservableObject {
 
     func reload() async {
         do {
-            let loaded = try await repository.list()
+            let listing = try await repository.list()
             var urls: [UUID: URL] = [:]
-            for record in loaded {
+            for record in listing.sessions {
                 urls[record.id] = await repository.recordingURL(for: record)
             }
-            sessions = loaded
+            sessions = listing.sessions
+            unreadableSessionCount = listing.damagedDirectories.count
             audioURLs = urls
             if let selectedID = selectedSession?.id {
-                selectedSession = loaded.first { $0.id == selectedID }
+                selectedSession = listing.sessions.first { $0.id == selectedID }
             }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Commit audio whose capture ended without the stop button so it stays
+    /// reviewable and retryable, and tell the user what happened.
+    private func preserveInterruptedRecording(_ capture: CapturedAudio, message: String) async {
+        do {
+            _ = try await repository.commitStagedRecording(
+                at: capture.url,
+                durationMilliseconds: capture.durationMilliseconds
+            )
+            await reload()
+            errorMessage = message
+        } catch {
+            errorMessage = "Recording ended unexpectedly and its audio could not be saved: \(error.localizedDescription)"
         }
     }
 
@@ -105,7 +133,14 @@ final class AppModel: ObservableObject {
         do {
             _ = try await repository.recoverPendingRecordings()
         } catch {
-            errorMessage = "A pending recording could not be recovered: \(error.localizedDescription)"
+            errorMessage = error.localizedDescription
+        }
+        // A fresh process has no requests in flight; sessions still marked
+        // transcribing belong to an interrupted attempt and become retryable.
+        do {
+            _ = try await repository.reconcileInterruptedTranscriptions()
+        } catch {
+            errorMessage = error.localizedDescription
         }
         await reload()
     }

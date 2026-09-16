@@ -280,6 +280,23 @@ function ensureOk(response: BufferedResponse): Effect.Effect<BufferedResponse, D
   );
 }
 
+function ensureNotRedirected(
+  response: BufferedResponse,
+): Effect.Effect<BufferedResponse, DictationHttpError> {
+  if (response.status >= 300 && response.status < 400) {
+    return Effect.fail(
+      new DictationHttpError(
+        response.status,
+        response.statusText,
+        response.body,
+        `Server redirect blocked (${response.status}). Set the final endpoint explicitly.`,
+      ),
+    );
+  }
+
+  return Effect.succeed(response);
+}
+
 function protocolError(label: string): DictationProtocolError {
   return new DictationProtocolError(`dictation server returned invalid ${label} JSON`);
 }
@@ -561,7 +578,10 @@ export class StarlingClient {
   ): Effect.Effect<BufferedResponse, DictationClientError> {
     const request = Effect.tryPromise({
       try: async (signal) => {
-        const response = await this.fetcher(url, { ...init, signal });
+        // Redirects are blocked with the same policy as the Electron bridge
+        // and the iOS client: audio and credentials must never silently
+        // follow a server redirect to an origin the user did not configure.
+        const response = await this.fetcher(url, { ...init, signal, redirect: "manual" });
         const body = await response.text();
 
         return {
@@ -573,7 +593,7 @@ export class StarlingClient {
         } satisfies BufferedResponse;
       },
       catch: (cause) => new DictationTransportError(describeCause(cause)),
-    }).pipe(Effect.flatMap(ensureOk));
+    }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
 
     return withTimeout(request, this.timeoutMs);
   }
