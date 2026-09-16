@@ -4,8 +4,6 @@
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">@color/starling_accent</item>
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:statusBarColor">@color/starling_surface</item>
-        <item name="android:navigationBarColor">@color/starling_surface</item>
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
 </resources>

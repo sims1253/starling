@@ -48,6 +48,7 @@ android {
 }
 
 dependencies {
+    implementation("androidx.core:core:1.16.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20260814")
     testImplementation("com.squareup.okhttp3:mockwebserver:5.5.0")
