@@ -1,0 +1,21 @@
+[package]
+name = "starling-dictation"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of @starling/dictation: audio prep, transcription client, session storage, fidelity analysis, capture and playback"
+
+[dependencies]
+cpal = "0.15"
+dirs = "6"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
