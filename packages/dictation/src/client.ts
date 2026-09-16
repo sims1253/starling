@@ -201,6 +201,7 @@ const AudioSourceSchema = Schema.Union([
 interface BufferedResponse {
   readonly body: string;
   readonly ok: boolean;
+  readonly opaqueRedirect: boolean;
   readonly requestId: string | null;
   readonly status: number;
   readonly statusText: string;
@@ -283,13 +284,19 @@ function ensureOk(response: BufferedResponse): Effect.Effect<BufferedResponse, D
 function ensureNotRedirected(
   response: BufferedResponse,
 ): Effect.Effect<BufferedResponse, DictationHttpError> {
-  if (response.status >= 300 && response.status < 400) {
+  // Node and Electron surface the real 3xx for redirect: "manual"; a Chromium
+  // renderer hands back an opaque redirect instead. Both are refused with the
+  // Electron bridge wording so audio and credentials are never re-sent to an
+  // origin the user did not configure.
+  if (response.opaqueRedirect || (response.status >= 300 && response.status < 400)) {
+    const status = response.opaqueRedirect ? undefined : response.status;
+
     return Effect.fail(
       new DictationHttpError(
         response.status,
         response.statusText,
         response.body,
-        `Server redirect blocked (${response.status}). Set the final endpoint explicitly.`,
+        `Server redirect blocked${status ? ` (${status})` : ""}. Set the final endpoint explicitly.`,
       ),
     );
   }
@@ -587,6 +594,7 @@ export class StarlingClient {
         return {
           body,
           ok: response.ok,
+          opaqueRedirect: response.type === "opaqueredirect",
           requestId: response.headers.get("X-Request-Id"),
           status: response.status,
           statusText: response.statusText,

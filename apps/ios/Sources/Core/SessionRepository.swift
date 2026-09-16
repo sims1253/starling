@@ -145,12 +145,13 @@ public actor SessionRepository {
         let destinationAudio = recordingURL(for: SessionRecord(id: id))
         if fileManager.fileExists(atPath: destinationDirectory.path) {
             if !fileManager.fileExists(atPath: destinationAudio.path) {
-                let leftover = (try? fileManager.contentsOfDirectory(
+                // A directory whose contents cannot even be enumerated stays
+                // an obstruction: it must not look empty and get deleted.
+                guard let leftover = try? fileManager.contentsOfDirectory(
                     at: destinationDirectory,
                     includingPropertiesForKeys: nil,
                     options: [.skipsHiddenFiles]
-                )) ?? []
-                guard leftover.isEmpty else {
+                ), leftover.isEmpty else {
                     throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destinationDirectory.path])
                 }
             }

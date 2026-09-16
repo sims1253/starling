@@ -189,6 +189,25 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(capturedRedirect, "manual");
   });
 
+  it("rejects browser-opaque redirects with the redirect-blocked message", async () => {
+    // A Chromium renderer resolves redirect: "manual" to an opaque response
+    // with no readable status; only its type says "this was a redirect".
+    const opaque = new Response("", { status: 302 });
+    Object.defineProperty(opaque, "type", { value: "opaqueredirect" });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: async () => opaque,
+    });
+
+    await assert.rejects(
+      client.transcribe(prepared),
+      (cause) =>
+        cause instanceof DictationHttpError &&
+        cause.message === "Server redirect blocked. Set the final endpoint explicitly.",
+    );
+  });
+
   it("sends every request with redirect manual and still accepts ordinary successes", async () => {
     const capturedRedirects: Array<string | undefined> = [];
 

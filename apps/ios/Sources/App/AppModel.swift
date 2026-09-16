@@ -7,6 +7,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessions: [SessionRecord] = []
     @Published private(set) var unreadableSessionCount = 0
     @Published private(set) var isWorking = false
+    /// True for the whole start-recording path (staging, permission, session
+    /// claim), so history actions can stay locked before capture begins.
+    @Published private(set) var isStartingCapture = false
     @Published var selectedSession: SessionRecord?
     @Published var errorMessage: String?
 
@@ -32,6 +35,8 @@ final class AppModel: ObservableObject {
         if recorder.isRecording {
             await finishRecording(configuration: configuration)
         } else {
+            isStartingCapture = true
+            defer { isStartingCapture = false }
             do {
                 // Capture owns the shared audio session exclusively; playback
                 // gives it up before recording starts.
