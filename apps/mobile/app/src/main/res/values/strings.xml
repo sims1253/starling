@@ -54,7 +54,7 @@
     <string name="open_keyboard_settings">Enable Starling keyboard</string>
     <string name="keyboard_intro">Enable the keyboard in Android Settings, then choose it from the keyboard switcher.</string>
     <string name="open_voice_input_settings">Set Starling as voice input</string>
-    <string name="voice_input_intro">Keyboards that use Android speech recognition (such as HeliBoard) show their own microphone button; pick Starling Voice Recognition under Voice input to transcribe through your server. Closed keyboards like Gboard keep their own engine.</string>
+    <string name="voice_input_intro">Keyboards that use Android speech recognition (such as HeliBoard) show their own microphone button; pick Starling Voice Recognition under Voice input to dictate with Starling, on your server or on this device. Closed keyboards like Gboard keep their own engine.</string>
     <string name="keyboard_record">Record</string>
     <string name="keyboard_stop">Stop</string>
     <string name="keyboard_insert">Insert transcript</string>

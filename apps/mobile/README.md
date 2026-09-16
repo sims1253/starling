@@ -85,9 +85,10 @@ then show their own microphone button and transcribe through Starling, without
 switching keyboards. Tap **Set Starling as voice input** and choose Starling
 Voice Recognition as the voice input service. Closed keyboards such as Gboard
 or SwiftKey keep their bundled engines and cannot delegate to a custom
-recognizer. Dictation returns one final result (the server response is
-batch), and every dictation stays visible in Saved recordings, including
-failed uploads, so it can be retried or deleted there.
+recognizer. Dictation returns one final result (transcription is batch,
+whether it runs on your Starling server or on this device), and every
+dictation stays visible in Saved recordings, including failed
+transcriptions, so it can be retried or deleted there.
 
 ## API compatibility
 
