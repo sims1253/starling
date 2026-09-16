@@ -3,9 +3,11 @@
     <style name="Theme.StarlingMobile" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">@color/starling_accent</item>
+        <!-- targetSdk 35 enforces edge-to-edge: the deprecated bar color items
+             are ignored and the insets are consumed by the layout instead
+             (fitsSystemWindows on the activity root). The light status bar
+             flag keeps the system icons readable on the light surface behind. -->
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:statusBarColor">@color/starling_surface</item>
-        <item name="android:navigationBarColor">@color/starling_surface</item>
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
 </resources>

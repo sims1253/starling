@@ -33,6 +33,7 @@
     <string name="stop_and_transcribe">Stop and transcribe</string>
     <string name="recording_now">Recording… tap Stop and transcribe when finished.</string>
     <string name="sending_recording">Saved privately. Contacting Starling…</string>
+    <string name="recording_limit_reached">Recording reached the two-hour limit and stopped. Sending it now…</string>
     <string name="transcription_saved">Transcript saved verbatim.</string>
     <string name="transcription_failed_retry">Transcription failed. The recording is retained; try Retry.</string>
     <string name="recording_storage_error">Could not create a private recording file.</string>

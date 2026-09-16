@@ -17,14 +17,24 @@ import java.util.UUID
  * when a response arrives and makes an interrupted write recoverable: the
  * previous metadata file remains in place until the replacement is complete.
  */
-class RecordingStore(context: Context) {
-    private val directory = File(context.applicationContext.filesDir, "recordings")
+class RecordingStore(private val directory: File) {
+    constructor(context: Context) : this(
+        File(context.applicationContext.filesDir, "recordings"),
+    )
+
     private val lock = Any()
 
     init {
         if (!directory.exists() && !directory.mkdirs()) {
             throw IOException("Unable to create private recording directory")
         }
+        // A crash between the temporary write and the rename in save() would
+        // leave an unnamed .<id>.json.tmp behind forever: list() filters on
+        // the .json suffix and delete() never looks for it. They are write
+        // temporaries with no committed state, so sweep them on open.
+        directory
+            .listFiles { file -> file.isFile && file.name.startsWith(".") && file.name.endsWith(".json.tmp") }
+            ?.forEach { temporary -> temporary.delete() }
     }
 
     fun create(): Recording = synchronized(lock) {
@@ -124,7 +134,11 @@ class RecordingStore(context: Context) {
         val metadata = metadataFile(id)
         val audio = File(directory, "$id.wav")
         val partial = File(directory, "$id.wav.part")
-        val failures = listOf(metadata, audio, partial)
+        // A crash between save()'s write and rename can orphan the metadata
+        // temporary; the init sweep misses files created after this store
+        // opened, so try to take it with the recording as well.
+        val metadataTemporary = File(directory, ".$id.json.tmp")
+        val failures = listOf(metadata, audio, partial, metadataTemporary)
             .filter { it.exists() && !it.delete() }
         if (failures.isNotEmpty()) {
             throw IOException("Unable to delete recording files")

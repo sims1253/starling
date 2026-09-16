@@ -26,7 +26,7 @@ class StarlingApplication : Application() {
         onDeviceEngine = OnDeviceEngine(File(filesDir, "models"))
         transcription = TranscriptionCoordinator(
             recordings,
-            backendSettings,
+            backendSettings::load,
             OnDeviceBackend(onDeviceEngine),
         )
     }

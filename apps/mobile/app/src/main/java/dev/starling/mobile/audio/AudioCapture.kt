@@ -10,7 +10,8 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 sealed interface CaptureResult {
-    data class Completed(val durationSeconds: Double) : CaptureResult
+    /** [limitReached] is set when the capture stopped itself at the duration cap. */
+    data class Completed(val durationSeconds: Double, val limitReached: Boolean = false) : CaptureResult
     data class Failed(val message: String) : CaptureResult
     data object AlreadyStopped : CaptureResult
 }
@@ -31,6 +32,7 @@ class AudioCapture {
     private var worker: Thread? = null
     private var writer: WavWriter? = null
     private var workerError: String? = null
+    private var limitReached = false
     private var state = State.IDLE
 
     fun isRecording(): Boolean = synchronized(lock) { state != State.IDLE }
@@ -98,6 +100,7 @@ class AudioCapture {
         recorder = audioRecord
         writer = wavWriter
         workerError = null
+        limitReached = false
         writerBytes = 0
         stopRequested = false
         state = State.RECORDING
@@ -155,18 +158,22 @@ class AudioCapture {
             synchronized(lock) { state = State.STOPPING }
             return CaptureResult.Failed("The microphone did not stop cleanly; the partial recording was kept")
         }
-        val (error, bytes) = synchronized(lock) {
+        val (error, bytes, atLimit) = synchronized(lock) {
             val capturedError = workerError
             val capturedBytes = writerBytes
+            val capturedLimit = limitReached
             recorder = null
             worker = null
             writer = null
             state = State.IDLE
-            capturedError to capturedBytes
+            Triple(capturedError, capturedBytes, capturedLimit)
         }
         if (error != null) return CaptureResult.Failed(error)
 
-        return CaptureResult.Completed(bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE))
+        return CaptureResult.Completed(
+            bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE),
+            atLimit,
+        )
     }
 
     private var writerBytes: Long = 0
@@ -181,6 +188,14 @@ class AudioCapture {
                     count > 0 -> {
                         wavWriter.write(buffer, count)
                         bytesWritten += count
+                        if (bytesWritten >= MAX_CAPTURE_BYTES) {
+                            // Stop well before the WAV 32-bit RIFF sizes could
+                            // overflow (~18 hours). The WAV is finalized
+                            // normally below; the surfaced stop reports the cap
+                            // so the surface can tell the user it ended there.
+                            synchronized(lock) { limitReached = true }
+                            break
+                        }
                     }
                     count == AudioRecord.ERROR_DEAD_OBJECT -> {
                         throw IllegalStateException("The microphone became unavailable")
@@ -220,5 +235,13 @@ class AudioCapture {
     companion object {
         private val STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(3)
         private val FORCED_STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(1)
+
+        /**
+         * Hard cap on one capture: two hours of 16 kHz mono PCM16. Keeps the
+         * finalized WAV far below the 32-bit RIFF size ceiling that WavWriter
+         * writes, and matches the maximum session any capture surface expects.
+         */
+        val MAX_CAPTURE_BYTES: Long =
+            TimeUnit.HOURS.toSeconds(2) * WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE
     }
 }

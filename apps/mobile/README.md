@@ -17,7 +17,8 @@ network response from being inserted into a field that has changed.
 ## Prerequisites
 
 - Android Studio Ladybug or newer, or JDK 17 with the Android SDK.
-- Android SDK platform 35 and build-tools 35.0.0 installed.
+- Android SDK platform 35 installed. Build-tools are selected automatically by
+  the Android Gradle Plugin; no specific version needs to be installed.
 - A running Starling native server (`starling-serve`). Native serving is the
   supported portable path and requires a 16 kHz WAV. The Python/CUDA server is
   retained for compatibility but is deprecated for new app deployments.

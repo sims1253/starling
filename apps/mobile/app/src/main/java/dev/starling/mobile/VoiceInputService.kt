@@ -149,7 +149,9 @@ class VoiceInputService : InputMethodService() {
                     statusView?.setText(R.string.recording_finalize_error)
                     return
                 }
-                statusView?.setText(R.string.keyboard_sending)
+                statusView?.setText(
+                    if (result.limitReached) R.string.recording_limit_reached else R.string.keyboard_sending,
+                )
                 val config = application.backendSettings.load()
                 application.transcription.transcribe(finalized.id, config) { completed ->
                     // The audio and exact transcript are already durable. If a

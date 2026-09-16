@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The IME window does not paint the theme background, so the opaque
+     surface here is what makes the keyboard legible over the app behind it
+     (the lint Overdraw warning assumes an activity window and is a false
+     positive for an InputMethodService view). -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
+    android:layout_height="240dp"
+    android:background="@color/starling_surface"
     android:orientation="vertical"
-    android:padding="10dp">
+    android:padding="16dp"
+    tools:ignore="Overdraw">
 
     <TextView
         android:id="@+id/keyboard_status"
@@ -17,6 +24,8 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
+        android:ellipsize="end"
+        android:maxLines="4"
         android:textColor="@color/starling_ink"
         android:textIsSelectable="true"
         android:textSize="15sp"

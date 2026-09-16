@@ -93,6 +93,14 @@ class MainActivity : Activity() {
 
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshOnDeviceStatus()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Recordings can change while this Activity is paused: dictation via
+        // the voice keyboard or the recognition service writes to the same
+        // store. The listing is a small directory read, so refresh on every
+        // resume instead of only after this screen's own actions.
         refreshRecordings()
     }
 
@@ -106,6 +114,15 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         if (activeRecording != null) stopAndQueueRecording()
         super.onDestroy()
+    }
+
+    /**
+     * Runs [update] only while this instance is still live. Transcription
+     * and import callbacks arrive after rotation or finish, and a destroyed
+     * Activity's views must not be mutated.
+     */
+    private fun runIfAlive(update: () -> Unit) {
+        if (!isFinishing && !isDestroyed) update()
     }
 
     private fun saveEndpoint(): BackendConfig? {
@@ -172,13 +189,15 @@ class MainActivity : Activity() {
                 application.onDeviceEngine.importModel(input)
             }
             runOnUiThread {
-                when (result) {
-                    is OnDeviceEngine.ImportResult.Imported -> {
-                        recordingMessage.setText(R.string.on_device_imported)
+                runIfAlive {
+                    when (result) {
+                        is OnDeviceEngine.ImportResult.Imported -> {
+                            recordingMessage.setText(R.string.on_device_imported)
+                        }
+                        is OnDeviceEngine.ImportResult.Rejected -> recordingMessage.text = result.reason
                     }
-                    is OnDeviceEngine.ImportResult.Rejected -> recordingMessage.text = result.reason
+                    refreshOnDeviceStatus()
                 }
-                refreshOnDeviceStatus()
             }
         }
     }
@@ -245,17 +264,12 @@ class MainActivity : Activity() {
                     refreshRecordings()
                     return
                 }
-                recordingMessage.setText(R.string.sending_recording)
+                recordingMessage.setText(
+                    if (result.limitReached) R.string.recording_limit_reached else R.string.sending_recording,
+                )
                 val config = application.backendSettings.load()
                 application.transcription.transcribe(finalized.id, config) {
-                    recordingMessage.setText(
-                        if (it.status == RecordingStatus.TRANSCRIBED) {
-                            R.string.transcription_saved
-                        } else {
-                            R.string.transcription_failed_retry
-                        },
-                    )
-                    refreshRecordings()
+                    runIfAlive { showTranscriptionOutcome(it) }
                 }
                 refreshRecordings()
             }
@@ -279,6 +293,23 @@ class MainActivity : Activity() {
         } else {
             recordingMessage.setText(R.string.microphone_permission_required)
         }
+    }
+
+    /**
+     * Maps a transcription callback to the status line. TRANSCRIBING means
+     * the request was deduplicated against one already in flight (for
+     * example a double-tapped Retry), so the message stays at "contacting"
+     * until the original request reports its final outcome.
+     */
+    private fun showTranscriptionOutcome(recording: Recording) {
+        recordingMessage.setText(
+            when (recording.status) {
+                RecordingStatus.TRANSCRIBED -> R.string.transcription_saved
+                RecordingStatus.TRANSCRIBING -> R.string.sending_recording
+                else -> R.string.transcription_failed_retry
+            },
+        )
+        refreshRecordings()
     }
 
     private fun refreshRecordings() {
@@ -338,14 +369,7 @@ class MainActivity : Activity() {
             val config = application.backendSettings.load()
             recordingMessage.setText(R.string.sending_recording)
             application.transcription.transcribe(recording.id, config) {
-                recordingMessage.setText(
-                    if (it.status == RecordingStatus.TRANSCRIBED) {
-                        R.string.transcription_saved
-                    } else {
-                        R.string.transcription_failed_retry
-                    },
-                )
-                refreshRecordings()
+                runIfAlive { showTranscriptionOutcome(it) }
             }
             refreshRecordings()
         }
