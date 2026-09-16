@@ -181,6 +181,9 @@ class AudioCapture {
                     count > 0 -> {
                         wavWriter.write(buffer, count)
                         bytesWritten += count
+                        if (bytesWritten >= MAX_CAPTURE_BYTES) {
+                            throw IllegalStateException(CAP_REACHED_MESSAGE)
+                        }
                     }
                     count == AudioRecord.ERROR_DEAD_OBJECT -> {
                         throw IllegalStateException("The microphone became unavailable")
@@ -220,5 +223,18 @@ class AudioCapture {
     companion object {
         private val STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(3)
         private val FORCED_STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(1)
+
+        /**
+         * Terminal cap for a single capture. The WAV header only breaks down
+         * after ~18.2 hours, but the file is kept and the user gets a clear
+         * message only when the stop is deliberate and early: two hours of
+         * 16 kHz mono PCM16 (~220 MiB) stays far inside the RIFF size limit.
+         */
+        private val MAX_CAPTURE_SECONDS = TimeUnit.HOURS.toSeconds(2)
+        private val MAX_CAPTURE_BYTES =
+            (WavWriter.SAMPLE_RATE * WavWriter.CHANNELS * WavWriter.BYTES_PER_SAMPLE).toLong() *
+                MAX_CAPTURE_SECONDS
+        private const val CAP_REACHED_MESSAGE =
+            "The recording reached the 2-hour limit and was stopped"
     }
 }
