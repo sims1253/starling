@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit
  * The transcript is delivered once, after the batch transcription completes
  * (on the configured server or on this device). The
  * audio and its outcome stay durable in the recordings store, so a failed
- * upload remains retryable from the app. No partial results are produced.
+ * transcription remains retryable from the app. No partial results are produced.
  * Session transitions are decided by [RecognitionSessionGuard], which is
  * unit-tested separately.
  */

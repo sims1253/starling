@@ -28,7 +28,7 @@
     <string name="on_device_imported">Model imported. On-device transcription is ready.</string>
     <string name="import_model">Import model (.gguf)</string>
     <string name="record_heading">Record</string>
-    <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before upload.</string>
+    <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before transcription.</string>
     <string name="start_recording">Start recording</string>
     <string name="stop_and_transcribe">Stop and transcribe</string>
     <string name="recording_now">Recording… tap Stop and transcribe when finished.</string>
