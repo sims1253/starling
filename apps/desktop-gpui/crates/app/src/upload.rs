@@ -21,6 +21,19 @@ impl StarlingApp {
             match handle.stop() {
                 Ok(pcm) => {
                     self.levels = vec![0.06; 52];
+                    let clipped = pcm
+                        .samples
+                        .iter()
+                        .filter(|sample| sample.abs() >= 0.999)
+                        .count();
+                    let ratio = clipped as f64 / pcm.samples.len().max(1) as f64;
+                    if ratio > 0.02 {
+                        self.capture_warning = Some(format!(
+                            "That recording was heavily clipped ({ratio:.0}% of samples at full \
+                             scale). The microphone input level is too high — lower it in your \
+                             sound settings and record again for a cleaner take."
+                        ));
+                    }
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
@@ -55,6 +68,7 @@ impl StarlingApp {
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
+                    self.capture_warning = None;
                     cx.notify();
                 }
                 Err(err) => {

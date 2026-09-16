@@ -65,6 +65,29 @@ Different by design:
 - Single process, so `STARLING_DIAGNOSTICS` reports one RSS instead of
   per-process Chromium metrics.
 
+## First real finding from the comparison
+
+Recording the same phrase in both apps produced a clean transcript in Electron
+and `牵牵牵…` garbage in the gpui port. Root cause, with receipts:
+
+- The saved WAV from the gpui take had **RMS 0.56 with 11% of samples pinned
+  at full scale** — destroyed audio; the model never stood a chance.
+- WirePlumber stores this laptop's internal-mic route at **100% / 0 dB**
+  (`~/.local/state/wireplumber/default-routes`), which saturates the codec's
+  ADC on close speech.
+- The port captures raw (cpal → downmix → encode is transparent, proven with
+  an instrumented probe), while Chromium's getUserMedia pipeline attenuates /
+  limits even with the app's constraints disabling AGC — so Electron "just
+  works" on the same hot source.
+
+Fixes in the port: an **attenuation-only auto gain** in the capture callback
+(never amplifies; quiet input passes bit-exact; pulls hot-but-unclipped peaks
+toward −2.9 dBFS, live-probed: peak 0.99 → 0.87 under the same conditions),
+and a **"Recording clipped" banner** when a take still arrives with >2%
+full-scale samples, telling the user to lower their mic level. Raw sources at
+100% that clip at the ADC remain unfixable in software — lower the input gain
+if you see the banner.
+
 ## Caveats
 
 - gpui 0.2.2 is the crates.io release (Oct 2025), not Zed `main`.

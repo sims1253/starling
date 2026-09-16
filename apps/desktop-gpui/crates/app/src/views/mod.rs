@@ -55,13 +55,22 @@ pub(crate) fn spinner(id: &'static str, size: f32, color: Rgba) -> gpui::Animati
     )
 }
 
-/// The 7px status dot: lime (optionally with glow) when ready, blinking amber
-/// when busy/checking, coral when offline.
+/// The 7px status dot with its 4px halo ring (styles.css box-shadow): lime
+/// (optionally with glow) when ready, blinking amber when busy/checking, coral
+/// when offline.
 pub(crate) fn status_dot(connection: Connection, glow: bool) -> gpui::AnyElement {
+    let halo = |color: u32| {
+        vec![gpui::BoxShadow {
+            color: gpui::rgba(color).into(),
+            offset: point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: px(4.),
+        }]
+    };
     let base = div().size(px(7.)).rounded_full();
     match connection {
         Connection::Ready => {
-            let mut dot = base.bg(theme::LIME);
+            let mut dot = base.bg(theme::LIME).shadow(halo(0xD9FF6A14));
             if glow {
                 dot = dot.shadow(vec![
                     gpui::BoxShadow {
@@ -82,6 +91,7 @@ pub(crate) fn status_dot(connection: Connection, glow: bool) -> gpui::AnyElement
         }
         Connection::Busy | Connection::Checking => base
             .bg(theme::AMBER)
+            .shadow(halo(0xEFC26B14))
             .with_animation(
                 ElementId::Name("dot-blink".into()),
                 Animation::new(Duration::from_millis(1200))
@@ -90,7 +100,10 @@ pub(crate) fn status_dot(connection: Connection, glow: bool) -> gpui::AnyElement
                 |el, delta| el.opacity(delta),
             )
             .into_any_element(),
-        Connection::Offline => base.bg(theme::CORAL).into_any_element(),
+        Connection::Offline => base
+            .bg(theme::CORAL)
+            .shadow(halo(0xFF745B14))
+            .into_any_element(),
     }
 }
 

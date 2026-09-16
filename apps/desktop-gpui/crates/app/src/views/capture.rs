@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, Context, Div, ElementId, FontWeight, Window, div, ease_in_out, point,
-    prelude::*, px, rgba,
+    Animation, AnimationExt, Context, Div, ElementId, FontWeight, Stateful, Window, div,
+    ease_in_out, point, prelude::*, px, rgba,
 };
 
 use crate::app::StarlingApp;
@@ -322,7 +322,8 @@ fn render_import_button(cx: &mut Context<StarlingApp>) -> impl IntoElement {
 
 fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<impl IntoElement> {
     if app.error.is_none() && app.unsaved.is_empty() {
-        return None;
+        let message = app.capture_warning.clone()?;
+        return Some(quality_banner(message, cx));
     }
     let error = app.error.clone();
     let unsaved_count = app.unsaved.len();
@@ -427,4 +428,53 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
     }
 
     Some(banner)
+}
+
+/// A non-fatal notice (shown instead of the error banner when nothing failed):
+/// e.g. a take that was saved and sent but arrived heavily clipped.
+fn quality_banner(message: String, cx: &mut Context<StarlingApp>) -> Stateful<Div> {
+    div()
+        .id("quality-banner")
+        .absolute()
+        .left(px(28.))
+        .right(px(28.))
+        .bottom(px(28.))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.))
+        .p(px(14.))
+        .bg(theme::ERROR_BG)
+        .border_1()
+        .border_color(theme::ERROR_LINE)
+        .rounded(px(7.))
+        .text_size(px(11.))
+        .text_color(theme::ERROR_TEXT)
+        .child(icon("icons/alert-circle.svg", 18., theme::ERROR_TEXT))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .flex_1()
+                .child(
+                    div()
+                        .text_color(theme::ERROR_TITLE)
+                        .child("Recording clipped"),
+                )
+                .child(message)
+                .child(div().text_color(theme::ERROR_SUBTLE).child(
+                    "The take was still saved and sent; heavily clipped audio transcribes poorly.",
+                )),
+        )
+        .child(
+            div()
+                .id("dismiss-quality")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.capture_warning = None;
+                    cx.notify();
+                }))
+                .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),
+        )
 }

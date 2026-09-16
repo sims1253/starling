@@ -166,3 +166,7 @@ Match `apps/desktop/src/styles.css` + `App.tsx` closely:
 - Electron multi-process metrics → single process RSS.
 - Global hotkey on Wayland is best-effort (portal limitations); Electron has
   the same class of issues via X11-only paths.
+- Chromium's capture chain (high-pass/limiter) masks hot mic sources; the
+  native port adds an attenuation-only capture auto-gain plus a "Recording
+  clipped" banner when a take still arrives heavily clipped (see
+  COMPARISON.md).

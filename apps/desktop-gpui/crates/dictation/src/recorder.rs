@@ -13,8 +13,9 @@
 //! The stream is requested as f32 / 1 channel / 16 kHz when the device
 //! supports it; otherwise the device default config is used and any format
 //! (integer samples, >1 channels) is converted to mono f32 inside the
-//! callback. Resampling to 16 kHz happens in [`crate::audio`] at WAV-encode
-//! time, driven by the UI layer — not here.
+//! callback, where an attenuation-only auto gain also keeps hot sources below
+//! the WAV clamp. Resampling to 16 kHz happens in [`crate::audio`] at
+//! WAV-encode time, driven by the UI layer — not here.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -31,12 +32,74 @@ const PREFERRED_SAMPLE_RATE: u32 = 16_000;
 /// Maximum samples kept in the live-level ring (`latest_window`).
 const RING_CAPACITY: usize = 4_096;
 
+/// Peak the capture auto-gain pulls hot input down toward. Chosen to leave
+/// encode headroom (the WAV clamp saturates at 1.0) while staying transparent
+/// for normal speech.
+const AUTO_GAIN_TARGET_PEAK: f32 = 0.72;
+
+/// Samples per gain update; a linear ramp across the block keeps the step
+/// inaudible.
+const AUTO_GAIN_BLOCK: usize = 256;
+
+/// Fraction of the remaining reduction closed per block when input is hot
+/// (~16 ms at 16 kHz, so speech onsets converge within a couple of blocks).
+const AUTO_GAIN_ATTACK: f32 = 0.9;
+
+/// Fraction of the distance back to unity per block when input cools down.
+const AUTO_GAIN_RELEASE: f32 = 0.06;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecorderError {
     #[error("{0}")]
     Device(String),
     #[error("No microphone audio was captured.")]
     Empty,
+}
+
+/// Attenuation-only auto gain for the capture path.
+///
+/// Raw sources can run hot enough to saturate the WAV clamp (a 100% route
+/// gain clips close speech at the device, and anything near the ceiling
+/// clips as soon as the speaker raises their voice). This pulls recent peaks
+/// toward [`AUTO_GAIN_TARGET_PEAK`] with a fast attack and slow release, and
+/// never amplifies: input below the target passes at unity gain, bit-exact.
+#[derive(Debug)]
+pub struct Attenuator {
+    gain: f32,
+    target: f32,
+}
+
+impl Default for Attenuator {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            target: 1.0,
+        }
+    }
+}
+
+impl Attenuator {
+    /// Applies the current ramp to `samples` in place.
+    pub fn process(&mut self, samples: &mut [f32]) {
+        for block in samples.chunks_mut(AUTO_GAIN_BLOCK) {
+            let peak = block.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let mut target = self.target;
+            if peak > AUTO_GAIN_TARGET_PEAK {
+                let wanted = (AUTO_GAIN_TARGET_PEAK / peak).min(1.0);
+                target += (wanted - target) * AUTO_GAIN_ATTACK;
+            } else {
+                target += (1.0 - target) * AUTO_GAIN_RELEASE;
+            }
+            let start = self.gain;
+            let delta = target - start;
+            let steps = block.len().max(1) as f32;
+            for (index, sample) in block.iter_mut().enumerate() {
+                *sample *= start + delta * (index as f32 / steps);
+            }
+            self.gain = target;
+            self.target = target;
+        }
+    }
 }
 
 /// State shared between the cpal audio callback and the [`RecorderHandle`].
@@ -47,6 +110,8 @@ struct Shared {
     chunk_rx: Mutex<mpsc::Receiver<Vec<f32>>>,
     /// Most recent samples, capped at [`RING_CAPACITY`], for level metering.
     ring: Mutex<VecDeque<f32>>,
+    /// Capture auto-gain, driven inside the audio callback.
+    attenuator: Mutex<Attenuator>,
 }
 
 /// Average interleaved frames down to mono. Frames shorter than `channels`
@@ -190,6 +255,7 @@ pub fn start_recording() -> Result<RecorderHandle, RecorderError> {
         chunk_tx,
         chunk_rx: Mutex::new(chunk_rx),
         ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
+        attenuator: Mutex::new(Attenuator::default()),
     });
 
     let stream = open_stream(&device, sample_format, &stream_config, &shared)?;
@@ -280,7 +346,10 @@ where
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let interleaved: Vec<f32> = data.iter().map(|&sample| sample_to_f32(sample)).collect();
-            let mono = downmix_to_mono(&interleaved, channels);
+            let mut mono = downmix_to_mono(&interleaved, channels);
+            if let Ok(mut attenuator) = shared.attenuator.lock() {
+                attenuator.process(&mut mono);
+            }
             shared.push_chunk(mono);
         },
         |err| eprintln!("starling dictation: microphone stream error: {err}"),
@@ -353,6 +422,70 @@ mod tests {
         assert_eq!(ring.front(), Some(&1_904.0)); // 6000 - 4096 dropped
         assert_eq!(ring.back(), Some(&5_999.0));
         assert_eq!(take_latest(&ring, 3), vec![5_997.0, 5_998.0, 5_999.0]);
+    }
+
+    #[test]
+    fn attenuator_passes_quiet_input_bit_exact() {
+        let mut att = Attenuator::default();
+        let quiet: Vec<f32> = (0..2_000).map(|i| 0.05 * (i as f32 * 0.03).sin()).collect();
+        let mut processed = quiet.clone();
+        att.process(&mut processed);
+        assert_eq!(processed, quiet);
+    }
+
+    #[test]
+    fn attenuator_pulls_hot_peaks_toward_target() {
+        let mut att = Attenuator::default();
+        let mut hot: Vec<f32> = (0..16_000)
+            .map(|i| 0.98 * (i as f32 * 0.05).sin())
+            .collect();
+        att.process(&mut hot);
+        // The first block still passes at unity gain (no lookahead), so judge
+        // convergence after the attack has had a few blocks to act.
+        let converged_peak = hot[1_024..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            converged_peak <= AUTO_GAIN_TARGET_PEAK + 0.05,
+            "converged peak {converged_peak} should sit near the target"
+        );
+        assert!(converged_peak > 0.4, "must not crush the signal");
+        assert!(
+            hot.iter().all(|s| s.abs() <= 0.98 + 1e-6),
+            "output must never exceed the input envelope"
+        );
+    }
+
+    #[test]
+    fn attenuator_never_amplifies() {
+        let mut att = Attenuator::default();
+        let input: Vec<f32> = (0..8_000)
+            .map(|i| ((i as f32 * 0.013).sin() * 0.8).clamp(-0.99, 0.99))
+            .collect();
+        let mut output = input.clone();
+        att.process(&mut output);
+        for (in_sample, out_sample) in input.iter().zip(&output) {
+            assert!(
+                out_sample.abs() <= in_sample.abs() + 1e-6,
+                "output {out_sample} exceeds input {in_sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn attenuator_ramp_is_zipper_free() {
+        let mut att = Attenuator::default();
+        let mut samples: Vec<f32> = (0..16_000).map(|_| 0.95).collect();
+        att.process(&mut samples);
+        for pair in samples.windows(2) {
+            let jump = (pair[0] - pair[1]).abs();
+            assert!(jump < 0.02, "adjacent jump {jump} too large");
+        }
+        let tail_peak = samples[samples.len() - 1_000..]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(*s));
+        assert!(
+            (0.6..=0.95).contains(&tail_peak),
+            "steady hot input should settle near the target, tail peak {tail_peak}"
+        );
     }
 
     /// Live round-trip against the real microphone. Skips itself (rather than

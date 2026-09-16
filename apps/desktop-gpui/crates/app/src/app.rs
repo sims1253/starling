@@ -65,6 +65,7 @@ pub struct StarlingApp {
     pub selected_id: Option<String>,
     pub active_ids: HashSet<String>,
     pub error: Option<String>,
+    pub capture_warning: Option<String>,
     pub unsaved: Vec<UnsavedWav>,
     pub confirm_discard: bool,
     pub copied: bool,
@@ -128,6 +129,7 @@ impl StarlingApp {
 
         Self {
             error: store_error.clone(),
+            capture_warning: None,
             store,
             store_error,
             player,

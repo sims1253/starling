@@ -95,10 +95,18 @@ pub fn render_settings_modal(
                 .gap(px(12.))
                 .child(
                     field_label("API format")
+                        .flex_1()
+                        .min_w_0()
                         .mt(px(0.))
                         .child(protocol_toggle(selected_protocol, cx)),
                 )
-                .child(field_label("Model").mt(px(0.)).child(draft_model)),
+                .child(
+                    field_label("Model")
+                        .flex_1()
+                        .min_w_0()
+                        .mt(px(0.))
+                        .child(draft_model),
+                ),
         )
         .child(
             field_label("Words to watch").child(draft_terms).child(
