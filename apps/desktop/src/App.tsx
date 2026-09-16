@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
+import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
@@ -131,6 +132,16 @@ export default function App() {
     Array<{ id: string; blob: Blob; createdAt: string }>
   >([]);
 
+  // True from Stop until the capture is either durably stored or parked in
+  // unsavedWavs; that window holds the only copy in memory.
+  const [finalizing, setFinalizing] = useState(false);
+
+  const pendingAudioRef = useRef<PendingAudioState>({
+    recording: false,
+    finalizing: false,
+    unsavedCount: 0,
+  });
+
   const busy = activeIds.size > 0;
 
   const fidelity = useMemo(
@@ -221,6 +232,35 @@ export default function App() {
   useEffect(() => {
     void checkHealth();
   }, [checkHealth]);
+
+  // Mirror audio that exists only in this window's memory (#121) to the main
+  // process, so closing Starling can warn before the only copy is destroyed.
+  useEffect(() => {
+    const state: PendingAudioState = {
+      recording,
+      finalizing,
+      unsavedCount: unsavedWavs.length,
+    };
+
+    pendingAudioRef.current = state;
+    window.starlingDesktop?.setPendingAudio(state);
+  }, [recording, finalizing, unsavedWavs.length]);
+
+  // Second line of defense for reloads: the main process asks before honoring
+  // a blocked unload, but only this handler knows the live state.
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      const state = pendingAudioRef.current;
+
+      if (!state.recording && !state.finalizing && state.unsavedCount === 0) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+
+    window.addEventListener("beforeunload", onBeforeUnload);
+
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
 
   useEffect(() => {
     if (!selected) return;
@@ -355,15 +395,23 @@ export default function App() {
         return;
       }
 
-      const capture = await stop();
+      // From Stop until store.create persists the capture (or it is parked in
+      // unsavedWavs), the only copy lives in this window's memory (#121).
+      setFinalizing(true);
 
-      // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
-      if (!capture || capture.audio.samples.length === 0)
-        throw new Error("No microphone audio was captured.");
+      try {
+        const capture = await stop();
 
-      if (capture.durationMs < 250) throw new Error("Recording was too short to keep.");
-      const prepared = await prepareWav16k(capture.audio);
-      await saveAndTranscribe(prepared.blob, capture.durationMs);
+        // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
+        if (!capture || capture.audio.samples.length === 0)
+          throw new Error("No microphone audio was captured.");
+
+        if (capture.durationMs < 250) throw new Error("Recording was too short to keep.");
+        const prepared = await prepareWav16k(capture.audio);
+        await saveAndTranscribe(prepared.blob, capture.durationMs);
+      } finally {
+        setFinalizing(false);
+      }
     } catch (caught) {
       setError(messageFrom(caught));
     }

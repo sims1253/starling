@@ -43,6 +43,14 @@ export type HealthInput = typeof HealthInputSchema.Type;
 
 export type TranscribeInput = typeof TranscribeInputSchema.Type;
 
+export const PendingAudioStateSchema = Schema.Struct({
+  recording: Schema.Boolean,
+  finalizing: Schema.Boolean,
+  unsavedCount: Schema.Finite,
+});
+
+export type PendingAudioState = typeof PendingAudioStateSchema.Type;
+
 export interface DesktopProcessMetric {
   readonly pid: number;
   readonly type: string;
@@ -64,4 +72,5 @@ export interface StarlingDesktopBridge {
   diagnostics(): Promise<DesktopDiagnostics>;
   ready(): void;
   onToggleRecording(callback: () => void): () => void;
+  setPendingAudio(state: PendingAudioState): void;
 }

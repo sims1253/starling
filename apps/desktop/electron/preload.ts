@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   DesktopDiagnostics,
   HealthInput,
+  PendingAudioState,
   ServerHealth,
   StarlingDesktopBridge,
   TranscribeInput,
@@ -22,6 +23,7 @@ const bridge: StarlingDesktopBridge = Object.freeze({
   transcribe: (input: TranscribeInput) => invoke<TranscriptionResult>("starling:transcribe", input),
   diagnostics: () => invoke<DesktopDiagnostics>("starling:diagnostics"),
   ready: () => ipcRenderer.send("starling:renderer-ready"),
+  setPendingAudio: (state: PendingAudioState) => ipcRenderer.send("starling:pending-audio", state),
   onToggleRecording: (callback: () => void) => {
     const listener = (): void => callback();
     ipcRenderer.on("starling:toggle-recording", listener);
