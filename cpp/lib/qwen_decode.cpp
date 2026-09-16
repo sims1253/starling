@@ -1050,8 +1050,9 @@ int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
 // reduction width differs, so CER-gated. <env>_NOBUCKET forces full-capacity.
 //
 // Graph cache keyed on (K, W): positions stay runtime inputs, so a handful of
-// graphs serve every decode step and every utterance; graphs are cached
-// process-globally and reused across reps / same-prompt runs.
+// graphs serve every decode step and every utterance; graphs live in the
+// loader-keyed SpecState (state_for) and are reused across reps / same-prompt
+// runs.
 // ===========================================================================
 
 int kstep_K(const QwenDecodeSpec& spec) {
