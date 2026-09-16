@@ -154,7 +154,9 @@ final class SessionRepositoryTests: XCTestCase {
 
         let listing = try await relaunched.list()
         XCTAssertEqual(listing.sessions.map(\.id), [healthy])
-        let durableURL = await relaunched.recordingURL(for: healthy)
+        let durableURL = await relaunched.recordingURL(
+            for: try XCTUnwrap(listing.sessions.first { $0.id == healthy })
+        )
         XCTAssertEqual(try Data(contentsOf: durableURL), audio)
         // The blocked staged audio stays recoverable instead of vanishing.
         XCTAssertEqual(try Data(contentsOf: blockedStaged), Data("blocked".utf8))
