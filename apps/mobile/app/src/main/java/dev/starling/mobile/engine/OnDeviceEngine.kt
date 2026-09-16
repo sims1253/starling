@@ -1,6 +1,7 @@
 package dev.starling.mobile.engine
 
 import dev.starling.mobile.network.InferenceResult
+import java.io.DataInputStream
 import java.io.File
 import java.io.InputStream
 
@@ -51,9 +52,8 @@ class OnDeviceEngine(modelDir: File) {
             val header = ByteArray(ModelFiles.GGUF_MAGIC_SIZE)
             runCatching {
                 temporary.inputStream().use { headerStream ->
-                    if (headerStream.read(header) != header.size) {
-                        throw IllegalStateException("short read")
-                    }
+                    // A single read may legally return short.
+                    DataInputStream(headerStream).readFully(header)
                 }
             }.onFailure {
                 temporary.delete()
@@ -89,6 +89,11 @@ class OnDeviceEngine(modelDir: File) {
             )
         }
         if (handle == 0L) {
+            val abi = StarlingNative.abiVersion()
+            if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
+                loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
+                return InferenceResult.Failure("The on-device engine is incompatible: $loadError", false)
+            }
             val loaded = StarlingNative.load(modelFile.absolutePath)
             if (loaded == 0L) {
                 val reason = StarlingNative.lastError(0L) ?: "the model could not be loaded"
@@ -110,13 +115,28 @@ class OnDeviceEngine(modelDir: File) {
                 false,
             )
         }
-        val text = StarlingNative.transcribe(handle, decoded.samples, decoded.sampleRate)
-            ?: return InferenceResult.Failure(
-                "The on-device engine returned an error: ${
-                    StarlingNative.lastError(handle) ?: "unknown error"
-                }",
-                false,
-            )
+        // Bound each engine call like the serving layer (30 s step, 2 s
+        // overlap): one full-attention pass over the whole clip would scale
+        // quadratically with the recording length.
+        val windows = ChunkedTranscription.planWindows(decoded.samples.size, decoded.sampleRate)
+        val texts = ArrayList<String>(windows.size)
+        for (window in windows) {
+            val samples = if (window.start == 0 && window.endExclusive == decoded.samples.size) {
+                decoded.samples
+            } else {
+                decoded.samples.copyOfRange(window.start, window.endExclusive)
+            }
+            val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
+                ?: return InferenceResult.Failure(
+                    "The on-device engine returned an error: ${
+                        StarlingNative.lastError(handle) ?: "unknown error"
+                    }",
+                    false,
+                )
+            texts.add(text)
+        }
+        // A single window is the direct path; joining would only normalize.
+        val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
         InferenceResult.Success(text)
     }
 
