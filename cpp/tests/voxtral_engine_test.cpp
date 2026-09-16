@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -92,13 +93,23 @@ int main(int argc, char** argv) {
     using namespace starling::ggml;
     using namespace starling::ggml::voxtral;
 
-    VoxtralModel model;
-    std::string err;
-    if (!model.load((root + "/models/tiny/voxtral-tiny.gguf").c_str(), err)) {
+    const std::string tiny_path = root + "/models/tiny/voxtral-tiny.gguf";
+    if (!std::filesystem::exists(tiny_path)) {
         // Absent fixture is a clean skip (CI generates it in-workflow; a
         // fresh clone without the generator run stays green).
-        std::printf("[SKIP] tiny GGUF absent or invalid: %s\n", err.c_str());
+        std::printf("[SKIP] tiny GGUF not generated (%s)\n", tiny_path.c_str());
         return 0;
+    }
+    VoxtralModel model;
+    std::string err;
+    if (!model.load(tiny_path.c_str(), err)) {
+        // The fixture exists (CI generates it in the same workflow step,
+        // right before this binary runs), so a load failure is a real
+        // regression — loader guard or generator drift — and must fail the
+        // gate, not skip it.
+        check(false, "tiny GGUF loads", err);
+        std::printf("ENGINE TEST FAILED\n");
+        return 1;
     }
     check(true, "tiny GGUF loads (decoder tensors validate)");
     check(model.loader.tensor("llm.ada_ones") != nullptr,
