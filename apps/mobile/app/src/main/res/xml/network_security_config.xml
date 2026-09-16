@@ -3,7 +3,7 @@
     Android's network policy is enabled for cleartext because users may point
     this client at an explicit private-LAN HTTP server. EndpointPolicy applies
     the narrower runtime rule: HTTP requires a checked opt-in and a loopback,
-    private, link-local, or .local host. The default endpoint is HTTPS.
+    private, link-local, CGNAT, or .local host. The default endpoint is HTTPS.
     No credentials are accepted in endpoint URLs.
 -->
 <network-security-config>
