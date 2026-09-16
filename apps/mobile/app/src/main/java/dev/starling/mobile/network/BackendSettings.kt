@@ -79,7 +79,8 @@ sealed interface EndpointValidation {
 
 /**
  * Runtime policy for the editable endpoint. Cleartext is accepted only after
- * an explicit checkbox and only for loopback/private/link-local addresses or
+ * an explicit checkbox and only for loopback/private/link-local addresses,
+ * CGNAT 100.64.0.0/10 (assigned by Tailscale-style VPN overlays), or
  * a .local mDNS name. Remote HTTP endpoints are rejected.
  */
 object EndpointPolicy {
@@ -110,7 +111,7 @@ object EndpointPolicy {
             }
             if (!isTrustedCleartextHost(host)) {
                 return EndpointValidation.Invalid(
-                    "HTTP is limited to localhost, private LAN, link-local, or .local hosts",
+                    "HTTP is limited to localhost, private LAN, link-local, CGNAT, or .local hosts",
                 )
             }
         }
@@ -141,10 +142,13 @@ object EndpointPolicy {
         if (values.any { it !in 0..255 }) return false
         val first = values[0]
         val second = values[1]
+        // 100.64.0.0/10 is shared CGNAT space, not RFC1918; Tailscale-style
+        // VPN overlays hand out addresses from it, so it is trusted like a LAN.
         return first == 10 ||
             (first == 172 && second in 16..31) ||
             (first == 192 && second == 168) ||
             (first == 169 && second == 254) ||
+            (first == 100 && second in 64..127) ||
             first == 127
     }
 }

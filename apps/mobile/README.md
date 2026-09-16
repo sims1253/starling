@@ -55,10 +55,12 @@ address such as:
 ```text
 http://127.0.0.1:8181       # emulator: http://10.0.2.2:8181
 http://192.168.1.20:8181   # physical device on the same LAN
+http://100.101.42.1:8181   # Tailscale/CGNAT VPN overlay
 ```
 
-The HTTP setting accepts only loopback, RFC1918 private, link-local, or
-`.local` hosts. Remote HTTP URLs and credentials embedded in URLs are rejected.
+The HTTP setting accepts only loopback, RFC1918 private, link-local, CGNAT
+(`100.64.0.0/10`, as assigned by Tailscale-style VPN overlays), or `.local`
+hosts. Remote HTTP URLs and credentials embedded in URLs are rejected.
 The Android network policy is configured for this explicit private-LAN opt-in;
 HTTPS remains the default and is recommended whenever available. Existing
 Starling deployments have no authentication layer, so expose a server through
