@@ -35,8 +35,10 @@ std::vector<std::string> split_words(const std::string& s);
 // Join words with a single space (matching Python's " ".join()).
 std::string join_words(const std::vector<std::string>& words);
 
-// Normalize a word for overlap matching: lowercase, strip punctuation.
-// Direct port of _norm() from stream_chunk.py.
+// Normalize a word for overlap matching: lowercase ASCII, strip ASCII
+// punctuation/whitespace, keep non-ASCII (UTF-8) bytes verbatim. Port of
+// _norm() from stream_chunk.py, conservatively Unicode-aware (issue #118):
+// the key is deterministic per word and identical across chunk boundaries.
 std::string norm_word(const std::string& word);
 
 // Transcribe function: takes a window of mono float32 samples, returns text or

@@ -15,17 +15,38 @@ void starling_ggml_free(starling_ggml_ctx* ctx) { delete ctx; }
 void starling_ggml_shutdown() {}
 const char* starling_ggml_last_error(starling_ggml_ctx*) { return "fixture error"; }
 void starling_ggml_free_string(char* text) { std::free(text); }
-char* starling_ggml_transcribe_pcm(starling_ggml_ctx*, const float*, int64_t, int) {
-    const char* raw = u8"5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. caf\u00e9 \U0001F399";
-    auto* text = static_cast<char*>(std::malloc(std::strlen(raw) + 1));
-    std::strcpy(text, raw);
-    return text;
+static char* echo(const char* text) {
+    auto* copy = static_cast<char*>(std::malloc(std::strlen(text) + 1));
+    std::strcpy(copy, text);
+    return copy;
 }
-char* starling_ggml_normalize_text(starling_ggml_ctx*, const char*, const char*, const char*, const char*) { return nullptr; }
+
+char* starling_ggml_transcribe_pcm(starling_ggml_ctx*, const float*, int64_t, int) {
+    return echo(u8"5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. caf\u00e9 \U0001F399");
+}
+// Echo the transcript back: the /normalize contract tests pin the JSON
+// transport decoding (raw UTF-8 vs \u escapes) byte-for-byte against the
+// engine input, without a real text model (issue #123).
+char* starling_ggml_normalize_text(starling_ggml_ctx*, const char* transcript, const char*, const char*, const char*) {
+    return echo(transcript);
+}
 }
 namespace starling::ggml::lib {
-const ModelDescriptor entry = {STARLING_GGML_PARAKEET_TDT, "parakeet", nullptr, nullptr, nullptr, "", false, "", nullptr};
-const ModelDescriptor* model_registry(size_t* count) { if (count) *count = 1; return &entry; }
-const ModelDescriptor* find_model(starling_ggml_model kind) { return kind == entry.kind ? &entry : nullptr; }
-const ModelDescriptor* find_model_by_slug(const std::string& slug) { return slug == entry.slug ? &entry : nullptr; }
+// s1 registers a normalize entry point so the fixture can serve /normalize.
+char* fixture_normalize(void*, const char* transcript, const char*, const char*, const char*, const char**) {
+    return echo(transcript);
+}
+const ModelDescriptor entries[] = {
+    {STARLING_GGML_PARAKEET_TDT, "parakeet", nullptr, nullptr, nullptr, "", false, "", nullptr},
+    {STARLING_GGML_S1, "s1", nullptr, nullptr, nullptr, "", false, "", fixture_normalize},
+};
+const ModelDescriptor* model_registry(size_t* count) { if (count) *count = 2; return entries; }
+const ModelDescriptor* find_model(starling_ggml_model kind) {
+    for (const auto& e : entries) if (e.kind == kind) return &e;
+    return nullptr;
+}
+const ModelDescriptor* find_model_by_slug(const std::string& slug) {
+    for (const auto& e : entries) if (slug == e.slug) return &e;
+    return nullptr;
+}
 }

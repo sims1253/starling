@@ -38,6 +38,27 @@ def test_stitch_normalizes_case_and_punctuation():
     assert out == ["say", "hello", "world.", "again"]
 
 
+def test_stitch_non_ascii_words_survive_and_dedupe():
+    # Shared fixture with the C++ port (issue #118): \w is Unicode-aware here,
+    # so non-ASCII words must never lose words to empty normalization keys —
+    # the native port regressed on exactly these fixtures before it became
+    # UTF-8 aware.
+    assert stitch_words(["привет", "мир"], ["совсем", "другое"]) == [
+        "привет", "мир", "совсем", "другое",
+    ]
+    assert stitch_words(["你好", "世界"], ["再见", "朋友"]) == ["你好", "世界", "再见", "朋友"]
+    assert stitch_words(
+        ["привет", "мир", "тут"], ["мир", "тут", "ок"]
+    ) == ["привет", "мир", "тут", "ок"]
+
+
+def test_stitch_empty_keys_never_match():
+    # Words that normalize to "" (pure punctuation) must never count as an
+    # overlap run — defense in depth for issue #118, shared fixture with the
+    # C++ port: matching empty keys would drop the new chunk's leading words.
+    assert stitch_words(["--", ";;"], ["..", ",,", "word"]) == ["--", ";;", "..", ",,", "word"]
+
+
 def test_stitch_tolerates_one_word_error_in_overlap():
     # overlap region "quick brown fox" vs "quick BROWN-ish fox": longest run
     # ("fox") still splices without dropping the tail or duplicating it wholesale

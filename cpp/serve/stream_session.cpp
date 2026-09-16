@@ -19,16 +19,50 @@ namespace starling::serve {
 
 std::string norm_word(const std::string& word) {
     // Lowercase, strip non-word chars (port of _norm() from stream_chunk.py).
+    //
+    // UTF-8 aware (issue #118): the previous byte-wise filter kept only bytes
+    // where std::isalnum is true, which is false for every byte >= 0x80 in the
+    // default C locale — Cyrillic/CJK words normalized to "" and runs of empty
+    // keys then matched as overlap runs, deleting words at every streaming
+    // window boundary. Conservatively decode UTF-8 code points, lowercase
+    // ASCII A-Z only, keep code points >= 0x80 verbatim (no Unicode case
+    // folding), and strip ASCII whitespace/punctuation as before. The only
+    // property the overlap matcher needs: the key is deterministic per word
+    // and identical across chunk boundaries, which verbatim bytes guarantee.
     std::string out;
     out.reserve(word.size());
-    for (char c : word) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        if (uc >= 'A' && uc <= 'Z') {
-            out += static_cast<char>(uc - 'A' + 'a');
-        } else if (std::isalnum(uc) || c == '\'') {
-            out += c;
+    size_t i = 0;
+    while (i < word.size()) {
+        unsigned char uc = static_cast<unsigned char>(word[i]);
+        if (uc < 0x80) {
+            if (uc >= 'A' && uc <= 'Z') {
+                out += static_cast<char>(uc - 'A' + 'a');
+            } else if (std::isalnum(uc) || uc == '\'') {
+                out += static_cast<char>(uc);
+            }
+            // else: strip punctuation
+            ++i;
+            continue;
         }
-        // else: strip punctuation
+        // Multi-byte UTF-8: copy the whole code point verbatim. A truncated
+        // or otherwise invalid sequence copies its lead byte alone — either
+        // way the same input always produces the same key.
+        size_t len = 0;
+        if (uc >= 0xc2 && uc <= 0xdf) len = 2;
+        else if (uc >= 0xe0 && uc <= 0xef) len = 3;
+        else if (uc >= 0xf0 && uc <= 0xf4) len = 4;
+        bool valid = len > 0 && i + len <= word.size();
+        for (size_t j = 1; valid && j < len; ++j) {
+            unsigned char cc = static_cast<unsigned char>(word[i + j]);
+            if (cc < 0x80 || cc > 0xbf) valid = false;
+        }
+        if (valid) {
+            out.append(word, i, len);
+            i += len;
+        } else {
+            out += word[i];
+            ++i;
+        }
     }
     return out;
 }
@@ -74,7 +108,10 @@ static Match find_longest_match(
     std::vector<std::vector<int>> dp(na + 1, std::vector<int>(nb + 1, 0));
     for (int i = 1; i <= na; ++i) {
         for (int j = 1; j <= nb; ++j) {
-            if (a[a_lo + i - 1] == b[b_lo + j - 1]) {
+            // Empty keys never participate in a match (issue #118 defense in
+            // depth): words that normalize to "" (pure punctuation like "--")
+            // would otherwise align as runs and drop unrelated boundary words.
+            if (!a[a_lo + i - 1].empty() && a[a_lo + i - 1] == b[b_lo + j - 1]) {
                 dp[i][j] = dp[i-1][j-1] + 1;
                 if (dp[i][j] > best_k) {
                     best_k = dp[i][j];
