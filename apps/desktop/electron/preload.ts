@@ -1,10 +1,26 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { HealthInput, StarlingDesktopBridge, TranscribeInput } from "./ipc.js";
+import type {
+  DesktopDiagnostics,
+  HealthInput,
+  ServerHealth,
+  StarlingDesktopBridge,
+  TranscribeInput,
+  TranscriptionResult,
+} from "./ipc.js";
+import { readableRejection } from "./ipc-errors.js";
+
+async function invoke<T>(channel: string, ...args: ReadonlyArray<unknown>): Promise<T> {
+  try {
+    return await ipcRenderer.invoke(channel, ...args);
+  } catch (cause) {
+    throw new Error(readableRejection(channel, cause));
+  }
+}
 
 const bridge: StarlingDesktopBridge = Object.freeze({
-  health: (input: HealthInput) => ipcRenderer.invoke("starling:health", input),
-  transcribe: (input: TranscribeInput) => ipcRenderer.invoke("starling:transcribe", input),
-  diagnostics: () => ipcRenderer.invoke("starling:diagnostics"),
+  health: (input: HealthInput) => invoke<ServerHealth>("starling:health", input),
+  transcribe: (input: TranscribeInput) => invoke<TranscriptionResult>("starling:transcribe", input),
+  diagnostics: () => invoke<DesktopDiagnostics>("starling:diagnostics"),
   ready: () => ipcRenderer.send("starling:renderer-ready"),
   onToggleRecording: (callback: () => void) => {
     const listener = (): void => callback();

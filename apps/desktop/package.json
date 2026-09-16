@@ -15,7 +15,8 @@
     "native:dev": "pnpm run build:electron && node electron/dev.ts",
     "desktop": "pnpm run native:dev",
     "package": "pnpm run build && electron-builder",
-    "build:electron": "tsc -p tsconfig.electron.json && node electron/build.ts"
+    "build:electron": "tsc -p tsconfig.electron.json && node electron/build.ts",
+    "test": "vp test run"
   },
   "devDependencies": {
     "@starling/dictation": "workspace:*",
