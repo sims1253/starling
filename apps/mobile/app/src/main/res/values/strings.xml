@@ -38,6 +38,7 @@
     <string name="recording_storage_error">Could not create a private recording file.</string>
     <string name="recording_finalize_error">Could not finalize the private WAV recording. It was retained for inspection.</string>
     <string name="recording_already_stopped">Recording was already stopped.</string>
+    <string name="recording_capped">Recording stopped at the 2-hour limit. Transcribing the captured audio…</string>
     <string name="microphone_permission_required">Microphone permission is required to record.</string>
     <string name="recordings_heading">Saved recordings</string>
     <string name="no_recordings">No recordings yet.</string>

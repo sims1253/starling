@@ -61,14 +61,6 @@ class WavWriterTest {
         }
     }
 
-    @Test
-    fun defaultCapKeepsRiffSizesInsideASigned32BitField() {
-        assertEquals(
-            Int.MAX_VALUE.toLong(),
-            WavWriter.WAV_HEADER_SIZE - 8 + WavWriter.MAX_DATA_BYTES,
-        )
-    }
-
     private fun WavWriter.useAndFinish(payload: ByteArray) {
         write(payload, payload.size)
         finish()

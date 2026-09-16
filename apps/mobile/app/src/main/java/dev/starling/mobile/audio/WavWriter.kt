@@ -73,8 +73,8 @@ internal class WavWriter(
 
         /**
          * Largest payload the 32-bit RIFF size fields can express without
-         * overflow (~18.2 hours of audio at 32 KB/s). The writer refuses to
-         * grow past this bound instead of finalizing a corrupt header.
+         * overflow (~18.6 hours of audio at 32,000 B/s). The writer refuses
+         * to grow past this bound instead of finalizing a corrupt header.
          */
         const val MAX_DATA_BYTES: Long = Int.MAX_VALUE.toLong() - (WAV_HEADER_SIZE - 8)
         private const val EXCEEDED_MESSAGE = "The recording exceeded the maximum WAV size"
