@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PcmAudio } from "@starling/dictation";
+import { discardRecorderHandles, RecorderSession, type RecorderHandles } from "./recorderSession";
 
 const BAR_COUNT = 52;
 
@@ -7,72 +8,58 @@ export function useRecorder() {
   const [recording, setRecording] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [levels, setLevels] = useState<number[]>(() => Array(BAR_COUNT).fill(0.06));
-  const streamRef = useRef<MediaStream | undefined>(undefined);
-  const contextRef = useRef<AudioContext | undefined>(undefined);
-  const processorRef = useRef<ScriptProcessorNode | undefined>(undefined);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | undefined>(undefined);
-  const analyserRef = useRef<AnalyserNode | undefined>(undefined);
   const animationRef = useRef<number | undefined>(undefined);
   const timerRef = useRef<number | undefined>(undefined);
   const startingRef = useRef(false);
+  const recordingRef = useRef(false);
+  const aliveRef = useRef(true);
   const startedAtRef = useRef(0);
   const chunksRef = useRef<Float32Array[]>([]);
+  const [session] = useState(() => new RecorderSession());
 
-  const release = useCallback(async () => {
+  const stopVisualization = useCallback(() => {
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
+
+    animationRef.current = undefined;
 
     if (timerRef.current) window.clearInterval(timerRef.current);
 
-    if (processorRef.current) processorRef.current.onaudioprocess = null;
-
-    try {
-      processorRef.current?.disconnect();
-    } catch {
-      /* already disconnected */
-    }
-
-    try {
-      sourceRef.current?.disconnect();
-    } catch {
-      /* already disconnected */
-    }
-
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-
-    try {
-      await contextRef.current?.close();
-    } catch {
-      /* already closed */
-    }
-
-    streamRef.current = undefined;
-    contextRef.current = undefined;
-    processorRef.current = undefined;
-    sourceRef.current = undefined;
-    analyserRef.current = undefined;
+    timerRef.current = undefined;
   }, []);
 
-  useEffect(() => () => void release(), [release]);
+  useEffect(() => {
+    aliveRef.current = true;
 
-  const drawLevels = useCallback(function drawFrame() {
-    const analyser = analyserRef.current;
+    return () => {
+      aliveRef.current = false;
+      stopVisualization();
+      void session.release();
+    };
+  }, [session, stopVisualization]);
 
-    if (!analyser) return;
-    const bins = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(bins);
-    const stride = Math.max(1, Math.floor(bins.length / BAR_COUNT));
-    setLevels(
-      Array.from({ length: BAR_COUNT }, (_, index) => {
-        const value = bins[index * stride] ?? 0;
+  const drawLevels = useCallback(
+    function drawFrame() {
+      const analyser = session.current()?.analyser;
 
-        return Math.max(0.045, Math.pow(value / 255, 1.45));
-      }),
-    );
-    animationRef.current = requestAnimationFrame(drawFrame);
-  }, []);
+      if (!analyser) return;
+      const bins = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(bins);
+      const stride = Math.max(1, Math.floor(bins.length / BAR_COUNT));
+      setLevels(
+        Array.from({ length: BAR_COUNT }, (_, index) => {
+          const value = bins[index * stride] ?? 0;
+
+          return Math.max(0.045, Math.pow(value / 255, 1.45));
+        }),
+      );
+      animationRef.current = requestAnimationFrame(drawFrame);
+    },
+    [session],
+  );
 
   const start = useCallback(async () => {
-    if (recording || startingRef.current) return;
+    // Refs, not the `recording` snapshot: guards must hold between renders.
+    if (recordingRef.current || startingRef.current) return;
     startingRef.current = true;
     let stream: MediaStream | undefined;
     let context: AudioContext | undefined;
@@ -92,7 +79,7 @@ export function useRecorder() {
       const processor = context.createScriptProcessor(4096, 1, 1);
       const silent = context.createGain();
       silent.gain.value = 0;
-      chunksRef.current = [];
+      const handles: RecorderHandles = { stream, context, source, analyser, processor };
       processor.onaudioprocess = (event) => {
         chunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
       };
@@ -101,11 +88,18 @@ export function useRecorder() {
       source.connect(processor);
       processor.connect(silent);
       silent.connect(context.destination);
-      streamRef.current = stream;
-      contextRef.current = context;
-      sourceRef.current = source;
-      analyserRef.current = analyser;
-      processorRef.current = processor;
+
+      if (!aliveRef.current) {
+        // Unmounted while permission was pending; nobody will stop this
+        // capture later, so release the hardware immediately.
+        await discardRecorderHandles(handles);
+
+        return;
+      }
+
+      session.install(handles);
+      chunksRef.current = [];
+      recordingRef.current = true;
       startedAtRef.current = performance.now();
       setElapsedMs(0);
       setRecording(true);
@@ -127,17 +121,18 @@ export function useRecorder() {
     } finally {
       startingRef.current = false;
     }
-  }, [drawLevels, recording]);
+  }, [drawLevels, session]);
 
   const stop = useCallback(async (): Promise<
     { audio: PcmAudio; durationMs: number } | undefined
   > => {
-    const context = contextRef.current;
+    const handles = session.current();
 
-    if (!recording || !context) return;
+    if (!recordingRef.current || !handles) return;
+    recordingRef.current = false;
     setRecording(false);
 
-    if (processorRef.current) processorRef.current.onaudioprocess = null;
+    handles.processor.onaudioprocess = null;
     const durationMs = performance.now() - startedAtRef.current;
     const chunks = chunksRef.current.splice(0);
     const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -149,12 +144,16 @@ export function useRecorder() {
       offset += chunk.length;
     }
 
-    const sampleRate = context.sampleRate;
+    const sampleRate = handles.context.sampleRate;
     setLevels(Array(BAR_COUNT).fill(0.06));
-    await release();
+    stopVisualization();
+
+    // release() detaches synchronously, so a start() racing this await keeps
+    // its own handles and remains stoppable (#119).
+    await session.release();
 
     return { audio: { samples, sampleRate, channels: 1 }, durationMs };
-  }, [recording, release]);
+  }, [session, stopVisualization]);
 
   return { recording, elapsedMs, levels, start, stop };
 }

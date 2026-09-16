@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   globalShortcut,
   ipcMain,
   session,
@@ -10,11 +11,13 @@ import { Data, Effect, Option, Schema } from "effect";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
+import { parsePendingAudio, pendingAudioWarning } from "./closeGuard.js";
 import {
   HealthInputSchema,
   TranscribeInputSchema,
   type DesktopDiagnostics,
   type HealthInput,
+  type PendingAudioState,
   type TranscribeInput,
   type TranscriptionResult,
   type ServerHealth,
@@ -39,6 +42,12 @@ let readyToShowMs: number | undefined;
 let rendererReady = false;
 
 let pendingToggle = false;
+
+// The renderer's mirror of audio that exists only in its memory (#121). The
+// close guard reads it synchronously when a close or quit must be gated.
+let pendingAudio: PendingAudioState = { recording: false, finalizing: false, unsavedCount: 0 };
+
+let quitting = false;
 
 class RequestInputError extends Data.TaggedError("RequestInputError")<{
   readonly message: string;
@@ -413,8 +422,17 @@ ipcMain.on("starling:renderer-ready", (event) => {
   }
 });
 
+ipcMain.on("starling:pending-audio", (event, state: PendingAudioState) => {
+  if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
+  const parsed = parsePendingAudio(state);
+
+  if (parsed) pendingAudio = parsed;
+});
+
 function createWindow(): BrowserWindow {
   rendererReady = false;
+  pendingAudio = { recording: false, finalizing: false, unsavedCount: 0 };
 
   const window = new BrowserWindow({
     title: "Starling",
@@ -447,6 +465,51 @@ function createWindow(): BrowserWindow {
 
   window.webContents.on("will-frame-navigate", (event) => {
     if (!trustedRenderer(event.url)) event.preventDefault();
+  });
+
+  // Closing the window, quitting the app, or reloading the renderer destroys
+  // audio that exists only in renderer memory (#121). Only an explicit
+  // Discard in a native dialog may proceed past this gate.
+  const confirmDiscard = (detail: string): boolean =>
+    dialog.showMessageBoxSync(window, {
+      type: "warning",
+      title: "Discard unsaved audio?",
+      message: "Discard unsaved audio?",
+      detail,
+      buttons: ["Discard", "Cancel"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }) === 0;
+
+  window.on("close", (event) => {
+    const detail = pendingAudioWarning(pendingAudio);
+
+    if (!detail) return;
+
+    event.preventDefault();
+
+    if (!confirmDiscard(detail)) {
+      // cancelled: keep the window open and abort any quit in progress
+      quitting = false;
+
+      return;
+    }
+
+    // Discard: destroy skips this handler, and a quit that our
+    // preventDefault aborted has to be restarted explicitly.
+    window.destroy();
+
+    if (quitting) app.quit();
+  });
+
+  // The renderer's beforeunload handler blocks reloads while audio is at
+  // risk; preventDefault here ignores that handler and lets the reload
+  // through — only after an explicit Discard.
+  window.webContents.on("will-prevent-unload", (event) => {
+    const detail = pendingAudioWarning(pendingAudio) ?? "Reload discards unsaved audio.";
+
+    if (confirmDiscard(detail)) event.preventDefault();
   });
 
   if (rendererUrl) void window.loadURL(rendererUrl);
@@ -495,6 +558,10 @@ void app.whenReady().then(() => {
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) window = createWindow();
   });
+});
+
+app.on("before-quit", () => {
+  quitting = true;
 });
 
 app.on("will-quit", () => globalShortcut.unregisterAll());
