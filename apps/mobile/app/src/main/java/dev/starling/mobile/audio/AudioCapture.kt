@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -49,7 +50,7 @@ class AudioCapture {
 
         val bufferSize = maxOf(minBuffer * 2, WavWriter.SAMPLE_RATE / 2)
         val audioRecord = try {
-            AudioRecord.Builder()
+            val builder = AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
                 .setAudioFormat(
                     AudioFormat.Builder()
@@ -59,8 +60,12 @@ class AudioCapture {
                         .build(),
                 )
                 .setBufferSizeInBytes(bufferSize)
-                .setContext(context)
-                .build()
+            if (Build.VERSION.SDK_INT >= 31) {
+                // Mic attribution via a context needs API 31; below it the
+                // capture stays self-attributed as it always was.
+                builder.setContext(context)
+            }
+            builder.build()
         } catch (_: IllegalArgumentException) {
             return@synchronized "Unable to initialize the microphone"
         } catch (_: SecurityException) {
