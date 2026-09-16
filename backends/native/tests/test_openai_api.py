@@ -29,26 +29,36 @@ def wav(rate=16000):
     return output.getvalue()
 
 
+def start_fixture(model):
+    """Spawn the contract fixture with `model` and wait for /health.
+
+    Returns (base_url, process); the caller terminates the process.
+    """
+    binary = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
+    if not binary.is_file():
+        raise RuntimeError(f"Build the contract fixture first: {binary}")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen([str(binary), "--model", model, "--gguf", __file__, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(base + "/health", timeout=1).close()
+            return base, process
+        except OSError:
+            time.sleep(0.05)
+    process.terminate()
+    process.wait(timeout=5)
+    raise RuntimeError("Fixture server did not start")
+
+
 class OpenAIContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        binary = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
-        if not binary.is_file():
-            raise RuntimeError(f"Build the contract fixture first: {binary}")
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        cls.base = f"http://127.0.0.1:{port}"
-        cls.process = subprocess.Popen([str(binary), "--model", "parakeet", "--gguf", __file__, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.base, cls.process = start_fixture("parakeet")
         cls.addClassCleanup(cls.stop)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                urllib.request.urlopen(cls.base + "/health", timeout=1).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        raise RuntimeError("Fixture server did not start")
 
     @classmethod
     def stop(cls):
@@ -149,23 +159,8 @@ class NormalizeContract(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        binary = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
-        if not binary.is_file():
-            raise RuntimeError(f"Build the contract fixture first: {binary}")
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        cls.base = f"http://127.0.0.1:{port}"
-        cls.process = subprocess.Popen([str(binary), "--model", "s1", "--gguf", __file__, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.base, cls.process = start_fixture("s1")
         cls.addClassCleanup(cls.stop)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                urllib.request.urlopen(cls.base + "/health", timeout=1).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        raise RuntimeError("Fixture server did not start")
 
     @classmethod
     def stop(cls):
@@ -184,8 +179,10 @@ class NormalizeContract(unittest.TestCase):
     def test_raw_and_escaped_supplementary_chars_decode_identically(self):
         # Emoji U+1F600 and supplementary-plane CJK U+20BB7, raw and as
         # \uD8XX\uDXXX surrogate-pair escapes: identical decoded transcripts.
+        # ensure_ascii=False keeps the first body raw UTF-8 (json.dumps would
+        # otherwise \u-escape it too, exercising only the escape path).
         expected = "hi 😀 𠮷 bye"
-        status_raw, body_raw = self.request(json.dumps({"transcript": expected}))
+        status_raw, body_raw = self.request(json.dumps({"transcript": expected}, ensure_ascii=False))
         status_escaped, body_escaped = self.request('{"transcript": "hi \\ud83d\\ude00 \\ud842\\udfb7 bye"}')
         self.assertEqual((status_raw, status_escaped), (200, 200))
         self.assertEqual(body_raw["text"], expected)

@@ -52,6 +52,14 @@ def stitch_words(
     head = new[:max_overlap]
     a = [_norm(w) for w in tail]
     b = [_norm(w) for w in head]
+    # Empty keys (words that normalize to "", e.g. pure punctuation) never
+    # participate in a match: runs of empty keys would align unrelated
+    # boundary words and drop them (issue #118 defense in depth; kept in
+    # lockstep with the C++ port in cpp/serve/stream_session.cpp). The
+    # sentinels are unique per side and position and cannot collide with a
+    # real key -- ``_norm`` strips ``\x00`` along with other non-word chars.
+    a = [key or f"\x00tail-{i}" for i, key in enumerate(a)]
+    b = [key or f"\x00head-{i}" for i, key in enumerate(b)]
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
     m = sm.find_longest_match(0, len(a), 0, len(b))
     if m.size >= min_match:
