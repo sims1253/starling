@@ -219,7 +219,9 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     private func handleRouteChange(_ reason: AVAudioSession.RouteChangeReason?) {
         guard isRecording else { return }
-        guard reason == .oldDeviceUnavailable || reason == .mediaServicesWereReset else { return }
+        // Only the loss of the current input device ends capture; other route
+        // changes (a category switch, new outputs) leave the recorder running.
+        guard reason == .oldDeviceUnavailable else { return }
         forcedStop(
             message: "The microphone became unavailable. The audio captured so far was saved to history."
         )
