@@ -46,12 +46,22 @@ Data locations (both created on demand):
 - sessions: `~/.local/share/starling-gpui/sessions/<uuid>/{manifest.json,recording.wav}`
 - settings: `~/.config/starling-gpui/settings.json`
 
-The app talks to the same servers as the Electron app: a `starling-serve`
-endpoint (`GET /health`, `POST /transcribe` with raw `audio/wav`) or an
-OpenAI-compatible endpoint (`GET /v1/models`,
-`POST /v1/audio/transcriptions` multipart). Start one with
-`pnpm run serve:python` from the repository root and keep the default
-`http://127.0.0.1:8181`.
+The app talks to the same servers as the Electron app: a native
+`starling-serve` (ggml) endpoint (`GET /health`, `POST /transcribe` with raw
+`audio/wav`, `x-request-id` honored) or an OpenAI-compatible endpoint
+(`GET /v1/models`, `POST /v1/audio/transcriptions` multipart). Start the
+native server from a checkout with built binaries (the Python serving path is
+deprecated):
+
+```bash
+build-cpu/starling-serve --model ark \
+  --gguf models/ark-asr-0.6b-bf16-exact.gguf   # binds 127.0.0.1:8181
+```
+
+Verified end-to-end in this configuration: health flips the topbar to
+`ark ready`, and `POST /transcribe` returns
+`{text, segments: [{text, start_s, end_s}], duration_s, request_id}` —
+the exact wire shape this client normalizes.
 
 ## Hotkeys
 
