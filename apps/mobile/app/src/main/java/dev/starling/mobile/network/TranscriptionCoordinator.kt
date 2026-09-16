@@ -22,17 +22,23 @@ class TranscriptionCoordinator(
     private val client = InferenceClient()
     private val activeIds = ConcurrentHashMap.newKeySet<String>()
 
+    /**
+     * Returns whether the request was actually queued. A duplicate call for
+     * an id that is already in flight is rejected without a callback, so the
+     * caller must not show a pending message before checking this result.
+     */
     fun transcribe(
         id: String,
         config: BackendConfig = settings.load(),
         callback: (Recording) -> Unit = {},
-    ) {
+    ): Boolean {
         // A double tap must not race two responses that overwrite the same
         // durable raw-transcript field.
-        if (!activeIds.add(id)) return
+        if (!activeIds.add(id)) return false
         val queued = runCatching { store.markTranscribing(id) }.getOrElse { exception ->
             activeIds.remove(id)
-            return callbackFailure(id, exception.message ?: "Unable to queue the recording", callback)
+            callbackFailure(id, exception.message ?: "Unable to queue the recording", callback)
+            return false
         }
         executor.execute {
             try {
@@ -59,7 +65,11 @@ class TranscriptionCoordinator(
                 activeIds.remove(id)
             }
         }
+        return true
     }
+
+    /** Whether a transcription request for this id is currently in flight. */
+    fun isActive(id: String): Boolean = id in activeIds
 
     fun shutdown() {
         executor.shutdownNow()
