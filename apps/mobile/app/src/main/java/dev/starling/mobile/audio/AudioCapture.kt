@@ -10,7 +10,16 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 sealed interface CaptureResult {
-    data class Completed(val durationSeconds: Double) : CaptureResult
+    /**
+     * The capture produced a complete, finalized WAV. [cappedAtLimit] is true
+     * when it ended at the maximum recording duration instead of an explicit
+     * stop: the audio is valid up to the cap and must be committed through
+     * the normal completed path so it stays transcribable.
+     */
+    data class Completed(
+        val durationSeconds: Double,
+        val cappedAtLimit: Boolean = false,
+    ) : CaptureResult
     data class Failed(val message: String) : CaptureResult
     data object AlreadyStopped : CaptureResult
 }
@@ -31,6 +40,7 @@ class AudioCapture {
     private var worker: Thread? = null
     private var writer: WavWriter? = null
     private var workerError: String? = null
+    private var cappedAtLimit = false
     private var state = State.IDLE
 
     fun isRecording(): Boolean = synchronized(lock) { state != State.IDLE }
@@ -98,6 +108,7 @@ class AudioCapture {
         recorder = audioRecord
         writer = wavWriter
         workerError = null
+        cappedAtLimit = false
         writerBytes = 0
         stopRequested = false
         state = State.RECORDING
@@ -155,18 +166,23 @@ class AudioCapture {
             synchronized(lock) { state = State.STOPPING }
             return CaptureResult.Failed("The microphone did not stop cleanly; the partial recording was kept")
         }
-        val (error, bytes) = synchronized(lock) {
+        val (error, bytes, capped) = synchronized(lock) {
             val capturedError = workerError
             val capturedBytes = writerBytes
+            val wasCapped = cappedAtLimit
             recorder = null
             worker = null
             writer = null
+            cappedAtLimit = false
             state = State.IDLE
-            capturedError to capturedBytes
+            Triple(capturedError, capturedBytes, wasCapped)
         }
         if (error != null) return CaptureResult.Failed(error)
 
-        return CaptureResult.Completed(bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE))
+        return CaptureResult.Completed(
+            durationSeconds = bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE),
+            cappedAtLimit = capped,
+        )
     }
 
     private var writerBytes: Long = 0
@@ -189,6 +205,14 @@ class AudioCapture {
                         throw IllegalStateException("The microphone returned an audio read error")
                     }
                     else -> Thread.yield()
+                }
+                if (bytesWritten >= MAX_CAPTURE_BYTES) {
+                    // End at the cap like an explicit stop: the WAV written so
+                    // far is complete and valid, and stop() must return it on
+                    // the completed path so it is committed and stays
+                    // transcribable instead of being stranded as failed.
+                    synchronized(lock) { cappedAtLimit = true }
+                    break
                 }
             }
         } catch (exception: Exception) {
@@ -220,5 +244,18 @@ class AudioCapture {
     companion object {
         private val STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(3)
         private val FORCED_STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(1)
+
+        /**
+         * Terminal cap for a single capture: two hours of 16 kHz mono PCM16
+         * (~220 MiB). The WAV RIFF sizes would only overflow after ~18.6
+         * hours, but this earlier bound also keeps the file under
+         * InferenceClient's 256 MiB upload limit with margin. A capture that
+         * reaches the cap ends like an explicit stop and is committed as a
+         * completed recording.
+         */
+        private val MAX_CAPTURE_SECONDS = TimeUnit.HOURS.toSeconds(2)
+        private val MAX_CAPTURE_BYTES =
+            (WavWriter.SAMPLE_RATE * WavWriter.CHANNELS * WavWriter.BYTES_PER_SAMPLE).toLong() *
+                MAX_CAPTURE_SECONDS
     }
 }

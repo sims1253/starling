@@ -5,7 +5,6 @@ plugins {
 android {
     namespace = "dev.starling.mobile"
     compileSdk = 35
-    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "dev.starling.mobile"

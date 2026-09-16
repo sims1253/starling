@@ -25,6 +25,7 @@ class RecordingStore(context: Context) {
         if (!directory.exists() && !directory.mkdirs()) {
             throw IOException("Unable to create private recording directory")
         }
+        sweepOrphanedTemporaries()
     }
 
     fun create(): Recording = synchronized(lock) {
@@ -124,7 +125,8 @@ class RecordingStore(context: Context) {
         val metadata = metadataFile(id)
         val audio = File(directory, "$id.wav")
         val partial = File(directory, "$id.wav.part")
-        val failures = listOf(metadata, audio, partial)
+        val temporary = File(directory, ".$id.json.tmp")
+        val failures = listOf(metadata, audio, partial, temporary)
             .filter { it.exists() && !it.delete() }
         if (failures.isNotEmpty()) {
             throw IOException("Unable to delete recording files")
@@ -134,6 +136,18 @@ class RecordingStore(context: Context) {
     private fun update(id: String, transform: (Recording) -> Recording): Recording {
         val current = get(id)
         return transform(current).also(::save)
+    }
+
+    /**
+     * Remove metadata temporaries leaked by a crash between the write and the
+     * rename in [save]. Nothing ever reads them back (list() only considers
+     * .json files), so deleting them on open is safe and keeps the directory
+     * from growing without bound on crash-prone devices.
+     */
+    private fun sweepOrphanedTemporaries() {
+        directory.listFiles { file ->
+            file.isFile && file.name.startsWith(".") && file.name.endsWith(".json.tmp")
+        }?.forEach { file -> file.delete() }
     }
 
     private fun save(recording: Recording) {
