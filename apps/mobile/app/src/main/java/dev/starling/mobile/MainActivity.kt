@@ -96,6 +96,14 @@ class MainActivity : Activity() {
         refreshRecordings()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Recordings can appear outside this Activity's own actions (voice
+        // keyboard, recognition service, a transcription that finished while
+        // backgrounded), so the list is refreshed on every resume.
+        refreshRecordings()
+    }
+
     override fun onStop() {
         // A backgrounded Activity should never keep the microphone open. The
         // finalized file stays in app-private storage and can be retried later.
@@ -245,9 +253,11 @@ class MainActivity : Activity() {
                     refreshRecordings()
                     return
                 }
-                recordingMessage.setText(R.string.sending_recording)
                 val config = application.backendSettings.load()
-                application.transcription.transcribe(finalized.id, config) {
+                val queued = application.transcription.transcribe(finalized.id, config) {
+                    // The Activity may have been destroyed (for example by a
+                    // rotation) while the request was in flight.
+                    if (isDestroyed || isFinishing) return@transcribe
                     recordingMessage.setText(
                         if (it.status == RecordingStatus.TRANSCRIBED) {
                             R.string.transcription_saved
@@ -257,6 +267,7 @@ class MainActivity : Activity() {
                     )
                     refreshRecordings()
                 }
+                if (queued) recordingMessage.setText(R.string.sending_recording)
                 refreshRecordings()
             }
             is CaptureResult.Failed -> {
@@ -330,14 +341,21 @@ class MainActivity : Activity() {
             status.append(it)
         }
 
-        retry.visibility = if (recording.status == RecordingStatus.PENDING ||
+        // Retry is hidden while a transcription for this recording is still
+        // in flight, so a double tap cannot queue a second request. A
+        // TRANSCRIBING row without an active request (for example after a
+        // process restart) still offers Retry to recover it.
+        retry.visibility = if ((recording.status == RecordingStatus.PENDING ||
             recording.status == RecordingStatus.FAILED ||
-            recording.status == RecordingStatus.TRANSCRIBING
+            recording.status == RecordingStatus.TRANSCRIBING) &&
+            !application.transcription.isActive(recording.id)
         ) View.VISIBLE else View.GONE
         retry.setOnClickListener {
             val config = application.backendSettings.load()
-            recordingMessage.setText(R.string.sending_recording)
-            application.transcription.transcribe(recording.id, config) {
+            val queued = application.transcription.transcribe(recording.id, config) {
+                // The Activity may have been destroyed (for example by a
+                // rotation) while the request was in flight.
+                if (isDestroyed || isFinishing) return@transcribe
                 recordingMessage.setText(
                     if (it.status == RecordingStatus.TRANSCRIBED) {
                         R.string.transcription_saved
@@ -347,6 +365,7 @@ class MainActivity : Activity() {
                 )
                 refreshRecordings()
             }
+            if (queued) recordingMessage.setText(R.string.sending_recording)
             refreshRecordings()
         }
         delete.setOnClickListener {
