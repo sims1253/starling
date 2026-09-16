@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Night variant of Theme.StarlingMobile. The dark framework Material parent
+         switches widget colors (button/radio/checkbox text and tints) to dark-mode
+         defaults; the palette itself is overridden in values-night/colors.xml. -->
+    <style name="Theme.StarlingMobile" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/starling_accent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">@color/starling_surface</item>
+        <item name="android:navigationBarColor">@color/starling_surface</item>
+        <item name="android:windowBackground">@color/starling_surface</item>
+    </style>
+</resources>
