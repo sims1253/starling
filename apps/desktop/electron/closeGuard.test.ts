@@ -83,6 +83,17 @@ describe("pendingAudioReloadWarning", () => {
       "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start. Reload also permanently deletes 2 unsaved recordings.",
     );
   });
+
+  it("promises recovery for a journaled finalize instead of deletion", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, finalizing: true, journaled: true }),
+      "Reload interrupts the save; the audio saved so far is kept and offered as a recovered take on the next start.",
+    );
+  });
+
+  it("does not warn about a journaled finalize with nothing else at risk", () => {
+    assert.equal(pendingAudioWarning({ ...clean, finalizing: true, journaled: true }), undefined);
+  });
 });
 
 describe("parsePendingAudio", () => {

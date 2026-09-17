@@ -145,6 +145,10 @@ export default function App() {
   const streamRef = useRef<StreamingDictation | undefined>(undefined);
   // Set when the capture rate cannot be streamed; Stop then uses the batch path.
   const streamBailedRef = useRef(false);
+  // True from Stop until the streamed take is finalized (persisted and
+  // transcribed or handed to batch): its audio stays durable throughout, so
+  // the close guard must keep reporting it as journaled.
+  const streamingFinalizeRef = useRef(false);
 
   const selected = sessions.find((session) => session.id === selectedId);
   const [audioUrl, setAudioUrl] = useState<string>();
@@ -266,7 +270,10 @@ export default function App() {
       recording,
       finalizing,
       unsavedCount: unsavedWavs.length,
-      journaled: recording && streamRef.current !== undefined ? true : undefined,
+      journaled:
+        (recording && streamRef.current !== undefined) || streamingFinalizeRef.current
+          ? true
+          : undefined,
     };
 
     pendingAudioRef.current = state;
@@ -503,12 +510,19 @@ export default function App() {
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
 
-      if (!stream) return false;
+      if (!stream) {
+        streamingFinalizeRef.current = false;
+
+        return false;
+      }
 
       if (bailed) {
         setPartialText(undefined);
         setStreamStatus(undefined);
         await stream.abandon();
+        // The journal is gone; the recorder's memory-only capture carries
+        // this take through the batch path, so it is no longer journaled.
+        streamingFinalizeRef.current = false;
 
         return false;
       }
@@ -519,6 +533,7 @@ export default function App() {
 
       if (!result.session) {
         // The durable save failed; the assembled WAV is the only copy.
+        streamingFinalizeRef.current = false;
         parkUnsavedWav(result.wav);
         throw new Error(
           `Local storage failed: ${messageFrom(result.failure ?? "unknown storage failure")} Keep this window open and download the unsaved WAV to recover it.`,
@@ -580,7 +595,10 @@ export default function App() {
       }
 
       // From Stop until the capture is durably stored (or parked in
-      // unsavedWavs), the only copy lives in this window's memory (#121).
+      // unsavedWavs), the only copy lives in this window's memory (#121) —
+      // except a streamed take, whose journal/session keeps it durable, so
+      // the close guard reports it as journaled for the whole finalize.
+      streamingFinalizeRef.current = streamRef.current !== undefined;
       setFinalizing(true);
 
       try {
@@ -604,6 +622,7 @@ export default function App() {
         const prepared = await prepareWav16k(capture.audio);
         await saveAndTranscribe(prepared.blob, capture.durationMs);
       } finally {
+        streamingFinalizeRef.current = false;
         setFinalizing(false);
       }
     } catch (caught) {

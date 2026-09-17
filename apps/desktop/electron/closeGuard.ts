@@ -20,7 +20,11 @@ export function pendingAudioWarning(state: PendingAudioState): string | undefine
     );
   }
 
-  if (state.finalizing) atRisk.push("a recording that is still being saved");
+  // A journaled take between Stop and the end of its finalize is durable
+  // either way — the journal resurrects it, or the session is already
+  // persisted — so closing cannot delete it and it is never listed.
+  if (state.finalizing && state.journaled !== true)
+    atRisk.push("a recording that is still being saved");
 
   if (state.unsavedCount > 0)
     atRisk.push(`${state.unsavedCount} unsaved recording${state.unsavedCount === 1 ? "" : "s"}`);
@@ -42,13 +46,18 @@ export function pendingAudioReloadWarning(state: PendingAudioState): string | un
 
   const atRisk: Array<string> = [];
 
-  if (state.finalizing) atRisk.push("a recording that is still being saved");
-
   if (state.unsavedCount > 0)
     atRisk.push(`${state.unsavedCount} unsaved recording${state.unsavedCount === 1 ? "" : "s"}`);
 
-  const kept =
-    "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start.";
+  // A journaled take is durable whether live or finalizing: the reload
+  // interrupts it, but recovery offers the saved audio again on next start,
+  // so it is never listed as deleted. Only memory-only audio keeps the
+  // deletion wording.
+  if (!state.recording && !state.finalizing && atRisk.length === 0) return undefined;
+
+  const kept = state.recording
+    ? "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start."
+    : "Reload interrupts the save; the audio saved so far is kept and offered as a recovered take on the next start.";
 
   if (atRisk.length === 0) return kept;
 
