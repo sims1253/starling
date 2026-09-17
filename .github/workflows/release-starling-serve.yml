@@ -1,16 +1,20 @@
 # Build and publish starling-serve release binaries.
 #
-# Triggered on a version tag (v*). Produces six release binaries:
+# Triggered on a version tag (v*). Produces nine release binaries:
 #   starling-serve-linux-cuda          (GCC + CUDA, NVIDIA)
 #   starling-serve-linux-rocm          (Clang + ROCm/HIP, AMD)
 #   starling-serve-linux-vulkan        (GCC + Vulkan, Intel/AMD/NVIDIA)
+#   starling-serve-linux-cpu           (GCC, CPU only — no GPU required)
 #   starling-serve-windows-cuda.exe    (MSVC + CUDA, NVIDIA, static CRT)
 #   starling-serve-windows-vulkan.exe  (MSVC + Vulkan, static CRT)
+#   starling-serve-windows-cpu.exe     (MSVC, CPU only, static CRT)
 #   starling-serve-macos-metal         (Clang + Metal, Apple Silicon)
+#   starling-serve-macos-cpu           (Clang, CPU only, Apple Silicon)
 #
 # Each binary is stripped, packaged, checksummed, and uploaded to the GitHub
-# release. A download manager picks the right artifact for the detected
-# platform + GPU.
+# release. The npm package `starling-serve` (packages/serve) is the download
+# manager: it picks the right artifact for the detected platform + backend,
+# downloads it on first run, verifies both checksum layers, and execs it.
 
 name: Release starling-serve binaries
 
@@ -111,6 +115,60 @@ jobs:
         with:
           name: starling-serve-linux-vulkan
           path: starling-serve-linux-vulkan.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Linux CPU (no GPU required; x86_64 executable)
+  # ---------------------------------------------------------------------------
+  linux-cpu:
+    needs: runtime-contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Build starling-serve (CPU)
+        run: |
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
+            -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
+          cp build/starling-serve starling-serve-linux-cpu
+          sha256sum starling-serve-linux-cpu > starling-serve-linux-cpu.sha256
+          tar czf starling-serve-linux-cpu.tar.gz \
+            starling-serve-linux-cpu starling-serve-linux-cpu.sha256 RUNTIME.md
+
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-linux-cpu --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-linux-cpu --abi-version
+
+      - name: Verify extracted archive without the build environment
+        run: |
+          abi=$(awk '/^#define STARLING_GGML_ABI_VERSION / { print $3 }' cpp/include/starling_ggml.h)
+          test -n "$abi"
+          scripts/release-runtime/check-linux-cpu.sh \
+            starling-serve-linux-cpu.tar.gz "${RELEASE_TAG#v}" "$abi"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-serve-linux-cpu
+          path: starling-serve-linux-cpu.tar.gz
 
   # ---------------------------------------------------------------------------
   # Linux CUDA (NVIDIA path)
@@ -346,6 +404,59 @@ jobs:
           path: starling-serve-windows-cuda.zip
 
   # ---------------------------------------------------------------------------
+  # Windows CPU (MSVC, CPU only, static CRT)
+  # ---------------------------------------------------------------------------
+  windows-cpu:
+    needs: runtime-contract
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Apply ggml patches
+        # Validate early with Git Bash; CMake repeats this check before building.
+        shell: bash
+        run: bash scripts/apply_ggml_patches.sh
+
+      - name: Build starling-serve (CPU, static CRT)
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
+            -DSTARLING_SERVE=ON `
+            "-DSTARLING_SERVE_VERSION=$version" `
+            -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release --target starling-serve
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item docs/release-runtime.md RUNTIME.md
+          Copy-Item build\Release\starling-serve.exe starling-serve-windows-cpu.exe
+          $hash = (Get-FileHash starling-serve-windows-cpu.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  starling-serve-windows-cpu.exe" | Set-Content -Encoding ascii starling-serve-windows-cpu.sha256
+          7z a starling-serve-windows-cpu.zip starling-serve-windows-cpu.exe starling-serve-windows-cpu.sha256 RUNTIME.md
+
+      - name: Verify binary metadata
+        shell: pwsh
+        run: |
+          $version = .\starling-serve-windows-cpu.exe --version
+          $version
+          $expected = "starling-serve $($env:RELEASE_TAG -replace '^v', '')"
+          if ($version -notcontains $expected) { throw "Expected version line: $expected" }
+          .\starling-serve-windows-cpu.exe --abi-version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-serve-windows-cpu
+          path: starling-serve-windows-cpu.zip
+
+  # ---------------------------------------------------------------------------
   # macOS Metal (Apple Silicon)
   # ---------------------------------------------------------------------------
   macos-metal:
@@ -391,10 +502,53 @@ jobs:
           path: starling-serve-macos-metal.tar.gz
 
   # ---------------------------------------------------------------------------
+  # macOS CPU (Apple Silicon, CPU only)
+  # ---------------------------------------------------------------------------
+  macos-cpu:
+    needs: runtime-contract
+    # The standard macos-14 label is an Apple Silicon runner.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build starling-serve (CPU)
+        run: |
+          cmake -S . -B build -DSTARLING_SERVE=ON \
+            -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
+            -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+          cmake --build build -j --target starling-serve
+
+      - name: Strip and package
+        run: |
+          strip build/starling-serve
+          cp docs/release-runtime.md RUNTIME.md
+          cp build/starling-serve starling-serve-macos-cpu
+          shasum -a 256 starling-serve-macos-cpu > starling-serve-macos-cpu.sha256
+          tar czf starling-serve-macos-cpu.tar.gz \
+            starling-serve-macos-cpu starling-serve-macos-cpu.sha256 RUNTIME.md
+
+      - name: Verify binary metadata
+        run: |
+          version="$(./starling-serve-macos-cpu --version)"
+          printf '%s\n' "$version"
+          grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
+          ./starling-serve-macos-cpu --abi-version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-serve-macos-cpu
+          path: starling-serve-macos-cpu.tar.gz
+
+  # ---------------------------------------------------------------------------
   # Release: upload all artifacts
   # ---------------------------------------------------------------------------
   release:
-    needs: [linux-vulkan, linux-cuda, linux-rocm, windows-vulkan, windows-cuda, macos-metal]
+    needs: [linux-vulkan, linux-cuda, linux-rocm, linux-cpu, windows-vulkan, windows-cuda, windows-cpu, macos-metal, macos-cpu]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -423,9 +577,12 @@ jobs:
             artifacts/starling-serve-linux-vulkan/starling-serve-linux-vulkan.tar.gz
             artifacts/starling-serve-linux-cuda/starling-serve-linux-cuda.tar.gz
             artifacts/starling-serve-linux-rocm/starling-serve-linux-rocm.tar.gz
+            artifacts/starling-serve-linux-cpu/starling-serve-linux-cpu.tar.gz
             artifacts/starling-serve-windows-vulkan/starling-serve-windows-vulkan.zip
             artifacts/starling-serve-windows-cuda/starling-serve-windows-cuda.zip
+            artifacts/starling-serve-windows-cpu/starling-serve-windows-cpu.zip
             artifacts/starling-serve-macos-metal/starling-serve-macos-metal.tar.gz
+            artifacts/starling-serve-macos-cpu/starling-serve-macos-cpu.tar.gz
           body: |
             ## starling-serve release binaries
 
@@ -435,30 +592,39 @@ jobs:
             | `starling-serve-linux-cuda.tar.gz` | Linux x86_64 | CUDA | NVIDIA |
             | `starling-serve-linux-rocm.tar.gz` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
             | `starling-serve-linux-vulkan.tar.gz` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
+            | `starling-serve-linux-cpu.tar.gz` | Linux x86_64 | CPU | No GPU required |
             | `starling-serve-windows-cuda.zip` | Windows x86_64 | CUDA | NVIDIA (static application CRT) |
             | `starling-serve-windows-vulkan.zip` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (static application CRT) |
+            | `starling-serve-windows-cpu.zip` | Windows x86_64 | CPU | No GPU required (static application CRT) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
+            | `starling-serve-macos-cpu.tar.gz` | macOS arm64 | CPU | Apple Silicon, no GPU needed |
 
             ### Runtime requirements
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
             accelerator runtime libraries are not bundled. CUDA requires the 13.3
             runtime and cuBLAS; ROCm requires the build's matching HIP/BLAS runtime.
-            Only Linux Vulkan is smoke-tested outside its SDK build environment.
-            These startup checks do not verify GPU inference.
+            The CPU builds need only the platform C/C++ runtime. Linux Vulkan and
+            Linux CPU are smoke-tested outside their build environment in a clean
+            container. These startup checks do not verify GPU inference.
 
             ### Usage
             ```bash
-            # Verify compatibility
+            # One command via npm (downloads the right archive for this machine):
+            npx starling-serve --model parakeet --gguf model.gguf --port 8181
+
+            # Or with a manual download:
             ./starling-serve --version
             ./starling-serve --abi-version
-
-            # Serve a model
             ./starling-serve --model parakeet --gguf model.gguf --port 8181
             ```
 
             ### Choosing an artifact
-            Download `linux-cuda` or `windows-cuda` for NVIDIA, `linux-rocm` for AMD
-            on Linux, `windows-vulkan` for AMD/Intel on Windows, and `macos-metal`
-            for Apple Silicon. The Linux Vulkan build is also a cross-vendor fallback.
+            `npx starling-serve` picks for you (override with
+            `--starling-backend` or `STARLING_SERVE_BACKEND`). Manually: download
+            `linux-cpu` / `windows-cpu` / `macos-cpu` when no GPU is available,
+            `linux-cuda` or `windows-cuda` for NVIDIA, `linux-rocm` for AMD on
+            Linux, `windows-vulkan` for AMD/Intel on Windows, and `macos-metal`
+            for Apple Silicon. The Linux Vulkan build is also a cross-vendor
+            fallback.
           draft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-rc') }}

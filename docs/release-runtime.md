@@ -18,11 +18,14 @@ checked-out tag. For a manual release, select a workflow ref with the same versi
 | Artifact | Runtime prerequisites | Verification before upload |
 | --- | --- | --- |
 | `linux-vulkan` | x86_64 Ubuntu 22.04 with `libstdc++6`, `libgomp1`, and `libvulkan1`; a vendor Vulkan driver and supported GPU for inference | Extracted archive, checksum, loader dependencies, version, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
+| `linux-cpu` | x86_64 Ubuntu 22.04 with `libstdc++6` and `libgomp1`; no GPU or driver required | Extracted archive, checksum, loader dependencies, version, backend, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
 | `linux-cuda` | x86_64 Linux compatible with the Ubuntu 22.04 build; CUDA 13.3 runtime and cuBLAS libraries, their dependencies, and a compatible NVIDIA driver | Version and ABI on the build runner only |
 | `linux-rocm` | x86_64 Linux compatible with the Ubuntu 22.04 build; HIP runtime, rocBLAS, hipBLAS, and their dependencies from the same ROCm release used to build the executable; a compatible AMD driver and GPU | Version and ABI on the build runner only |
 | `windows-cuda` | x86_64 Windows; CUDA 13.3 runtime and cuBLAS DLLs, their dependencies, and a compatible NVIDIA driver; runtime DLL directories on `PATH` | Version and ABI on the build runner only |
 | `windows-vulkan` | x86_64 Windows; Vulkan loader and vendor Vulkan driver | Version and ABI on the build runner only |
+| `windows-cpu` | x86_64 Windows; no GPU or driver required | Version and ABI on the build runner only |
 | `macos-metal` | Apple Silicon with macOS 14 or later; Metal supplied by macOS | Version and ABI on the build runner only |
+| `macos-cpu` | Apple Silicon with macOS 14 or later; no GPU required | Version and ABI on the build runner only |
 
 The Linux builds also use the system C/C++ runtime. The Windows executable uses
 the static MSVC runtime; this does not remove dependencies of vendor DLLs.
@@ -34,8 +37,9 @@ these libraries through its loader configuration or `LD_LIBRARY_PATH`.
 The ROCm build currently uses the vendor's `latest` repository. It has no fixed
 runtime version contract yet. Consult the build log for the installed version;
 ROCm archives have not been verified on a machine without the development SDK.
-The CUDA, Windows Vulkan, and macOS archives also lack that separate check.
-Do not treat their build-runner metadata checks as a clean-machine guarantee.
+The CUDA, Windows (Vulkan and CPU), and macOS (Metal and CPU) archives also
+lack that separate check. Do not treat their build-runner metadata checks as a
+clean-machine guarantee.
 
 ## Linux Vulkan archive check
 
@@ -57,3 +61,17 @@ This check covers executable startup. It does not load a model or prove that a
 GPU can run inference. Before claiming support for a GPU, run a representative
 model on that hardware and record the artifact checksum, OS, driver version,
 runtime version, model, and result. That hardware validation remains separate.
+
+## Linux CPU archive check
+
+Same procedure against the CPU image, which installs only `libstdc++6` and
+`libgomp1`:
+
+```bash
+scripts/release-runtime/check-linux-cpu.sh \
+  starling-serve-linux-cpu.tar.gz 0.1.0 6
+```
+
+The check additionally requires `backend: cpu` in the `--version` output so a
+misconfigured GPU build cannot ship under the CPU name. The same startup-only
+scope as above applies.
