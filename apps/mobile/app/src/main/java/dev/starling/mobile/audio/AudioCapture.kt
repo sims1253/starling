@@ -208,10 +208,19 @@ class AudioCapture {
      * blocking read, interrupts, and joins once more before settling.
      */
     private fun forcedRelease() {
-        val (audioRecord, captureThread) = synchronized(lock) { recorder to worker }
-        if (captureThread?.isAlive != true) {
-            // A concurrent stop already settled the capture while this task
-            // was queued.
+        val (audioRecord, captureThread) = synchronized(lock) {
+            // A task left queued after the capture settled (and possibly
+            // relaunched through start()) must not touch whatever is
+            // capturing now.
+            if (state != State.STOPPING) return
+            recorder to worker
+        }
+        if (captureThread == null || !captureThread.isAlive) {
+            // The worker exited on its own after stop() armed this task,
+            // so nobody else will settle the capture or deliver the
+            // pending callbacks.
+            val (error, bytes, capped) = workerOutcome()
+            finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = true)
             return
         }
 
@@ -257,10 +266,14 @@ class AudioCapture {
     /**
      * Returns the capture to IDLE after its worker has exited (and thereby
      * closed the WAV writer in its finally block), clears the device
-     * references, and hands the result to every registered callback.
+     * references, and hands the result to every registered callback. A
+     * delayed settler that lost the race to another stop's settlement (and
+     * a possible relaunch through start()) must not clobber the new state;
+     * the winner has already drained and delivered the callbacks.
      */
     private fun finishSettlement(result: CaptureResult, fromEscalation: Boolean) {
         val callbacks = synchronized(lock) {
+            if (state != State.STOPPING) return
             recorder = null
             worker = null
             writer = null

@@ -278,8 +278,10 @@ class MainActivity : Activity() {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
                     application.recordings.markFailed(recording.id, "Unable to finalize the private WAV recording")
-                    recordingMessage.setText(R.string.recording_finalize_error)
-                    refreshRecordings()
+                    updateRecordingViews {
+                        recordingMessage.setText(R.string.recording_finalize_error)
+                        refreshRecordings()
+                    }
                     return
                 }
                 val config = application.backendSettings.load()
@@ -296,18 +298,31 @@ class MainActivity : Activity() {
                     )
                     refreshRecordings()
                 }
-                if (queued) recordingMessage.setText(R.string.sending_recording)
-                refreshRecordings()
+                if (queued) updateRecordingViews { recordingMessage.setText(R.string.sending_recording) }
+                updateRecordingViews { refreshRecordings() }
             }
             is CaptureResult.Failed -> {
                 runCatching { application.recordings.markFailed(recording.id, result.message) }
-                recordingMessage.text = result.message
-                refreshRecordings()
+                updateRecordingViews {
+                    recordingMessage.text = result.message
+                    refreshRecordings()
+                }
             }
             CaptureResult.AlreadyStopped -> {
-                recordingMessage.setText(R.string.recording_already_stopped)
+                updateRecordingViews { recordingMessage.setText(R.string.recording_already_stopped) }
             }
         }
+    }
+
+    /**
+     * An escalated stop settles after a delay, so its outcome can arrive
+     * once the Activity is destroyed. The store settlement beside each of
+     * these calls must still run — the finalized audio stays retryable —
+     * but the views do not outlive the Activity.
+     */
+    private fun updateRecordingViews(update: () -> Unit) {
+        if (isDestroyed || isFinishing) return
+        update()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
