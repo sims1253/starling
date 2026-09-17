@@ -1,8 +1,16 @@
-import { Data, Predicate, Schema } from "effect";
+import { Data, Option, Predicate, Schema } from "effect";
 
+import { STARLING_SAMPLE_RATE, wav16kHeader } from "./audio.js";
 import { TranscriptionResultSchema, type TranscriptionResult } from "./client.js";
 
 export const DICTATION_SESSION_SCHEMA_VERSION = 1;
+
+/**
+ * IndexedDB schema version. 2 adds the streaming-capture journal stores; the
+ * `sessions` records themselves are unchanged, so persisted v1 sessions load
+ * without migration.
+ */
+const DICTATION_DATABASE_VERSION = 2;
 
 export type DictationSessionStatus = "captured" | "transcribing" | "transcribed" | "failed";
 
@@ -21,6 +29,10 @@ export const DictationSessionSchema = Schema.Struct({
   /** Earlier successful recognition results, retained when a retry succeeds. */
   transcriptHistory: Schema.optional(Schema.Array(TranscriptionResultSchema)),
   lastError: Schema.optional(Schema.String),
+  /** True when the final transcript arrived over the streaming connection. */
+  streamed: Schema.optional(Schema.Boolean),
+  /** Why live streaming failed here; kept for review even after a batch retry succeeds. */
+  streamError: Schema.optional(Schema.String),
 });
 
 export type DictationSession = (typeof DictationSessionSchema)["Type"];
@@ -31,13 +43,24 @@ export interface CreateSessionInput {
   readonly durationMs?: number | undefined;
 }
 
+export interface SaveTranscriptOptions {
+  /** Mark the transcript as delivered by the live streaming path. */
+  readonly streamed?: boolean;
+}
+
 export interface DictationSessionStore {
   create(input: CreateSessionInput): Promise<DictationSession>;
   get(id: string): Promise<DictationSession | undefined>;
   list(): Promise<readonly DictationSession[]>;
   markAttempt(id: string): Promise<DictationSession>;
-  saveTranscript(id: string, transcript: TranscriptionResult): Promise<DictationSession>;
+  saveTranscript(
+    id: string,
+    transcript: TranscriptionResult,
+    options?: SaveTranscriptOptions,
+  ): Promise<DictationSession>;
   saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession>;
+  /** Record why live streaming failed without changing the session status. */
+  noteStreamError(id: string, message: string): Promise<DictationSession>;
   delete(id: string): Promise<void>;
 }
 
@@ -53,6 +76,8 @@ export interface DictationSessionManifest {
   readonly transcript?: TranscriptionResult;
   readonly transcriptHistory?: readonly TranscriptionResult[];
   readonly lastError?: string;
+  readonly streamed?: boolean;
+  readonly streamError?: string;
 }
 
 export interface DictationSessionExport {
@@ -72,6 +97,8 @@ interface ManifestDraft {
   transcript?: TranscriptionResult;
   transcriptHistory?: readonly TranscriptionResult[];
   lastError?: string;
+  streamed?: boolean;
+  streamError?: string;
 }
 
 export class DictationStorageError extends Data.TaggedError("DictationStorageError")<{
@@ -164,6 +191,8 @@ interface SessionDraft {
   transcript?: TranscriptionResult | undefined;
   transcriptHistory?: readonly TranscriptionResult[] | undefined;
   lastError?: string | undefined;
+  streamed?: boolean | undefined;
+  streamError?: string | undefined;
 }
 
 function freezeSession(value: DictationSession): DictationSession {
@@ -182,6 +211,10 @@ function freezeSession(value: DictationSession): DictationSession {
   if (value.transcript !== undefined) session.transcript = freezeTranscript(value.transcript);
 
   if (value.lastError !== undefined) session.lastError = value.lastError;
+
+  if (value.streamed !== undefined) session.streamed = value.streamed;
+
+  if (value.streamError !== undefined) session.streamError = value.streamError;
 
   return Object.freeze(session);
 }
@@ -205,10 +238,17 @@ function initialSession(input: CreateSessionInput): DictationSession {
   return freezeSession(session);
 }
 
-function updatedSession(
-  current: DictationSession,
-  update: Partial<Pick<DictationSession, "status" | "attemptCount" | "transcript" | "lastError">>,
-): DictationSession {
+/** Mutable draft of the fields `updatedSession` may change. */
+type SessionUpdate = Partial<{
+  status: DictationSessionStatus;
+  attemptCount: number;
+  transcript: TranscriptionResult;
+  lastError: string | undefined;
+  streamed: boolean;
+  streamError: string;
+}>;
+
+function updatedSession(current: DictationSession, update: SessionUpdate): DictationSession {
   return freezeSession({
     ...current,
     ...update,
@@ -238,10 +278,133 @@ export function exportDictationSession(session: DictationSession): DictationSess
 
   if (session.lastError !== undefined) manifest.lastError = session.lastError;
 
+  if (session.streamed !== undefined) manifest.streamed = session.streamed;
+
+  if (session.streamError !== undefined) manifest.streamError = session.streamError;
+
   return Object.freeze({ manifest: Object.freeze(manifest), wav: session.wav });
 }
 
-export class MemorySessionStore implements DictationSessionStore {
+export interface CreateStreamCaptureInput {
+  readonly id?: string | undefined;
+  readonly createdAt?: string | undefined;
+}
+
+export interface FinishedStreamCapture {
+  readonly wav: Blob;
+  readonly durationMs: number;
+  /** Present unless durable persistence failed; then `wav` is the only copy. */
+  readonly session?: DictationSession;
+  readonly failure?: unknown;
+}
+
+/**
+ * A recording being persisted chunk by chunk while it is captured. Chunks are
+ * raw PCM16 16 kHz mono bytes; the canonical WAV header is stamped on
+ * assembly, so the journal plus `wav16kHeader` reproduce `encodeWav16k`
+ * output exactly.
+ */
+export interface DictationStreamCapture {
+  readonly sessionId: string;
+  /**
+   * Journal one chunk. Rejects when durable persistence fails; the in-memory
+   * mirror is still retained so `finish` can assemble the WAV.
+   */
+  append(pcm16: Uint8Array): Promise<void>;
+  /** Frames journaled so far. */
+  appendedFrames(): number;
+  /** Assemble the WAV and persist the session (source-of-truth save). */
+  finish(durationMs?: number): Promise<FinishedStreamCapture>;
+  /** Drop the journal without creating a session (recording discarded). */
+  abandon(): Promise<void>;
+}
+
+export interface DictationStreamCaptureStore {
+  beginStreamCapture(input?: CreateStreamCaptureInput): Promise<DictationStreamCapture>;
+  /** Assemble journals orphaned by a crash mid-recording into retryable sessions. */
+  recoverStreamCaptures(): Promise<readonly DictationSession[]>;
+}
+
+function assertPcm16Chunk(pcm16: Uint8Array): void {
+  if (!(pcm16 instanceof Uint8Array) || pcm16.byteLength === 0 || pcm16.byteLength % 2 !== 0) {
+    throw new TypeError("stream capture chunks must be non-empty PCM16 (an even number of bytes)");
+  }
+}
+
+function assemblePcm16Wav(chunks: readonly Uint8Array[]) {
+  const dataBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const parts: BlobPart[] = [wav16kHeader(dataBytes)];
+
+  for (const chunk of chunks) {
+    // Copy into a fresh ArrayBuffer-backed view: IndexedDB can hand back
+    // SharedArrayBuffer-backed buffers, which Blob rejects.
+    parts.push(new Uint8Array(chunk));
+  }
+
+  return {
+    wav: new Blob(parts, { type: "audio/wav" }),
+    durationMs: (dataBytes / 2 / STARLING_SAMPLE_RATE) * 1_000,
+  };
+}
+
+function streamCaptureId(input: CreateStreamCaptureInput): string {
+  const id = input.id ?? sessionId();
+
+  if (!id || /[\r\n]/.test(id)) {
+    throw new TypeError("stream capture id must be non-empty and contain no newlines");
+  }
+
+  return id;
+}
+
+class MemoryStreamCapture implements DictationStreamCapture {
+  readonly sessionId: string;
+  private readonly store: MemorySessionStore;
+  private readonly chunks: Uint8Array[] = [];
+  private closed = false;
+
+  constructor(store: MemorySessionStore, sessionId: string) {
+    this.store = store;
+    this.sessionId = sessionId;
+  }
+
+  async append(pcm16: Uint8Array): Promise<void> {
+    assertPcm16Chunk(pcm16);
+
+    if (this.closed)
+      throw new DictationStorageError(`stream capture ${this.sessionId} already closed`);
+    this.chunks.push(pcm16);
+  }
+
+  appendedFrames(): number {
+    return this.chunks.reduce((frames, chunk) => frames + chunk.byteLength / 2, 0);
+  }
+
+  async finish(durationMs?: number): Promise<FinishedStreamCapture> {
+    this.closed = true;
+    const assembled = assemblePcm16Wav(this.chunks);
+    const duration = durationMs ?? assembled.durationMs;
+
+    try {
+      const session = await this.store.create({
+        id: this.sessionId,
+        wav: assembled.wav,
+        durationMs: duration,
+      });
+
+      return Object.freeze({ wav: assembled.wav, durationMs: duration, session });
+    } catch (failure) {
+      return Object.freeze({ wav: assembled.wav, durationMs: duration, failure });
+    }
+  }
+
+  async abandon(): Promise<void> {
+    this.closed = true;
+    this.chunks.length = 0;
+  }
+}
+
+export class MemorySessionStore implements DictationSessionStore, DictationStreamCaptureStore {
   private readonly sessions = new Map<string, DictationSession>();
 
   async create(input: CreateSessionInput): Promise<DictationSession> {
@@ -276,14 +439,20 @@ export class MemorySessionStore implements DictationSessionStore {
     );
   }
 
-  async saveTranscript(id: string, transcript: TranscriptionResult): Promise<DictationSession> {
-    return this.update(id, (current) =>
-      updatedSession(current, {
-        status: "transcribed",
-        transcript: freezeTranscript(transcript),
-        lastError: undefined,
-      }),
-    );
+  async saveTranscript(
+    id: string,
+    transcript: TranscriptionResult,
+    options?: SaveTranscriptOptions,
+  ): Promise<DictationSession> {
+    const update: SessionUpdate = {
+      status: "transcribed",
+      transcript: freezeTranscript(transcript),
+      lastError: undefined,
+    };
+
+    if (options?.streamed === true) update.streamed = true;
+
+    return this.update(id, (current) => updatedSession(current, update));
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
@@ -295,8 +464,20 @@ export class MemorySessionStore implements DictationSessionStore {
     );
   }
 
+  async noteStreamError(id: string, message: string): Promise<DictationSession> {
+    return this.update(id, (current) => updatedSession(current, { streamError: message }));
+  }
+
   async delete(id: string): Promise<void> {
     this.sessions.delete(id);
+  }
+
+  async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
+    return new MemoryStreamCapture(this, streamCaptureId(input));
+  }
+
+  async recoverStreamCaptures(): Promise<readonly DictationSession[]> {
+    return [];
   }
 
   private update(
@@ -320,6 +501,21 @@ export interface IndexedDbSessionStoreOptions {
 
 const OBJECT_STORE = "sessions";
 
+const STREAM_META_STORE = "stream-captures";
+
+const STREAM_CHUNK_STORE = "stream-chunks";
+
+interface StreamMetaRecord {
+  readonly id: string;
+  readonly createdAt: string;
+}
+
+interface StreamChunkRecord {
+  readonly captureId: string;
+  readonly index: number;
+  readonly pcm: Uint8Array;
+}
+
 const decodeSession = Schema.decodeUnknownSync(DictationSessionSchema);
 
 const decodeSessions = Schema.decodeUnknownSync(Schema.Array(DictationSessionSchema));
@@ -328,7 +524,219 @@ function invalidStoredSession<Cause>(cause: Cause): DictationStorageError {
   return new DictationStorageError("stored dictation session is invalid", { cause });
 }
 
-export class IndexedDbSessionStore implements DictationSessionStore {
+function runIdbRequest<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(new DictationStorageError("an IndexedDB request failed", { cause: request.error }));
+  });
+}
+
+function runIdbTransaction(
+  database: IDBDatabase,
+  stores: readonly string[],
+  mode: IDBTransactionMode,
+  work: (transaction: IDBTransaction) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // SAFETY: the DOM signature asks for a mutable string[] but IndexedDB
+    // never mutates the store-name list it reads.
+    const transaction = database.transaction(stores as string[], mode);
+    work(transaction);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () =>
+      reject(
+        new DictationStorageError("an IndexedDB transaction failed", {
+          cause: transaction.error,
+        }),
+      );
+    transaction.onabort = () =>
+      reject(
+        new DictationStorageError("an IndexedDB transaction was aborted", {
+          cause: transaction.error,
+        }),
+      );
+  });
+}
+
+class IndexedDbStreamCapture implements DictationStreamCapture {
+  readonly sessionId: string;
+  private readonly createSession: (input: CreateSessionInput) => Promise<DictationSession>;
+  private readonly openDatabase: () => Promise<IDBDatabase>;
+  private readonly chunks: Uint8Array[] = [];
+  private writeChain: Promise<void> = Promise.resolve();
+  private nextIndex = 0;
+  private closed = false;
+  private durable = true;
+
+  constructor(
+    sessionId: string,
+    createSession: (input: CreateSessionInput) => Promise<DictationSession>,
+    openDatabase: () => Promise<IDBDatabase>,
+  ) {
+    this.sessionId = sessionId;
+    this.createSession = createSession;
+    this.openDatabase = openDatabase;
+  }
+
+  append(pcm16: Uint8Array): Promise<void> {
+    assertPcm16Chunk(pcm16);
+
+    if (this.closed) {
+      return Promise.reject(
+        new DictationStorageError(`stream capture ${this.sessionId} already closed`),
+      );
+    }
+
+    // The in-memory mirror is the assembly source and the crash fallback;
+    // the journal makes journaled chunks survive a crash mid-recording.
+    this.chunks.push(pcm16);
+
+    if (!this.durable) return Promise.resolve();
+
+    const index = this.nextIndex;
+    this.nextIndex += 1;
+    this.writeChain = this.writeChain.then(() => this.writeChunk(index, pcm16));
+
+    return this.writeChain;
+  }
+
+  appendedFrames(): number {
+    return this.chunks.reduce((frames, chunk) => frames + chunk.byteLength / 2, 0);
+  }
+
+  async finish(durationMs?: number): Promise<FinishedStreamCapture> {
+    this.closed = true;
+    await this.writeChain.catch(() => {
+      /* durability was already reported to the appender */
+    });
+
+    const assembled = assemblePcm16Wav(this.chunks);
+    const duration = durationMs ?? assembled.durationMs;
+
+    try {
+      const session = await this.createSession({
+        id: this.sessionId,
+        wav: assembled.wav,
+        durationMs: duration,
+      });
+
+      await this.discard().catch(() => {
+        /* recovery sweeps journals whose session already exists */
+      });
+
+      return Object.freeze({ wav: assembled.wav, durationMs: duration, session });
+    } catch (failure) {
+      return Object.freeze({ wav: assembled.wav, durationMs: duration, failure });
+    }
+  }
+
+  async abandon(): Promise<void> {
+    this.closed = true;
+
+    if (this.durable) await this.discard();
+  }
+
+  private async writeChunk(index: number, pcm16: Uint8Array): Promise<void> {
+    if (!this.durable || this.closed) return;
+
+    try {
+      const database = await this.openDatabase();
+      const record: StreamChunkRecord = { captureId: this.sessionId, index, pcm: pcm16 };
+
+      await runIdbTransaction(database, [STREAM_CHUNK_STORE], "readwrite", (transaction) => {
+        transaction.objectStore(STREAM_CHUNK_STORE).put(record);
+      });
+    } catch (cause) {
+      // One durable failure stops journaling (later chunks stay memory-only);
+      // the rejection tells the caller to stop trusting the journal.
+      this.durable = false;
+
+      throw new DictationStorageError("failed to journal streaming audio", { cause });
+    }
+  }
+
+  private async discard(): Promise<void> {
+    const database = await this.openDatabase();
+
+    await deleteStreamCapture(database, this.sessionId);
+  }
+}
+
+const decodeStreamChunkRecord = Schema.decodeUnknownOption(
+  Schema.Struct({
+    captureId: Schema.String,
+    index: Schema.Finite,
+    pcm: Schema.instanceOf(Uint8Array),
+  }),
+);
+
+const decodeStreamMetaRecord = Schema.decodeUnknownOption(
+  Schema.Struct({ id: Schema.NonEmptyString }),
+);
+
+function isStreamChunkRecord(value: unknown): value is StreamChunkRecord {
+  const decoded = decodeStreamChunkRecord(value);
+
+  if (Option.isNone(decoded)) return false;
+  const { index, pcm } = decoded.value;
+
+  return Number.isInteger(index) && index >= 0 && pcm.byteLength > 0 && pcm.byteLength % 2 === 0;
+}
+
+function isStreamMetaRecord(value: unknown): value is StreamMetaRecord {
+  return Option.isSome(decodeStreamMetaRecord(value));
+}
+
+async function readStreamChunks(database: IDBDatabase, captureId: string): Promise<Uint8Array[]> {
+  const transaction = database.transaction([STREAM_CHUNK_STORE], "readonly");
+  const request = transaction.objectStore(STREAM_CHUNK_STORE).getAll();
+  const records = await runIdbRequest(request);
+
+  return records
+    .filter(
+      (record): record is StreamChunkRecord =>
+        isStreamChunkRecord(record) && record.captureId === captureId,
+    )
+    .sort((left, right) => left.index - right.index)
+    .map((record) => record.pcm);
+}
+
+function deleteStreamCapture(database: IDBDatabase, captureId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction([STREAM_META_STORE, STREAM_CHUNK_STORE], "readwrite");
+    const cursorRequest = transaction.objectStore(STREAM_CHUNK_STORE).openCursor();
+
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+
+      if (cursor) {
+        if (isStreamChunkRecord(cursor.value) && cursor.value.captureId === captureId) {
+          cursor.delete();
+        }
+
+        cursor.continue();
+      }
+    };
+
+    transaction.objectStore(STREAM_META_STORE).delete(captureId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () =>
+      reject(
+        new DictationStorageError("failed to delete a streaming capture journal", {
+          cause: transaction.error,
+        }),
+      );
+    transaction.onabort = () =>
+      reject(
+        new DictationStorageError("streaming capture journal delete was aborted", {
+          cause: transaction.error,
+        }),
+      );
+  });
+}
+
+export class IndexedDbSessionStore implements DictationSessionStore, DictationStreamCaptureStore {
   private readonly databaseName: string;
   private readonly factory: IDBFactory | undefined;
   private databasePromise: Promise<IDBDatabase> | undefined;
@@ -421,14 +829,20 @@ export class IndexedDbSessionStore implements DictationSessionStore {
     );
   }
 
-  async saveTranscript(id: string, transcript: TranscriptionResult): Promise<DictationSession> {
-    return this.update(id, (current) =>
-      updatedSession(current, {
-        status: "transcribed",
-        transcript: freezeTranscript(transcript),
-        lastError: undefined,
-      }),
-    );
+  async saveTranscript(
+    id: string,
+    transcript: TranscriptionResult,
+    options?: SaveTranscriptOptions,
+  ): Promise<DictationSession> {
+    const update: SessionUpdate = {
+      status: "transcribed",
+      transcript: freezeTranscript(transcript),
+      lastError: undefined,
+    };
+
+    if (options?.streamed === true) update.streamed = true;
+
+    return this.update(id, (current) => updatedSession(current, update));
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
@@ -438,6 +852,10 @@ export class IndexedDbSessionStore implements DictationSessionStore {
         lastError: errorText(cause),
       }),
     );
+  }
+
+  async noteStreamError(id: string, message: string): Promise<DictationSession> {
+    return this.update(id, (current) => updatedSession(current, { streamError: message }));
   }
 
   async delete(id: string): Promise<void> {
@@ -461,6 +879,71 @@ export class IndexedDbSessionStore implements DictationSessionStore {
     });
   }
 
+  async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
+    const id = streamCaptureId(input);
+    const createdAt = input.createdAt ?? new Date().toISOString();
+    const database = await this.database();
+    const record: StreamMetaRecord = { id, createdAt };
+
+    await runIdbTransaction(database, [STREAM_META_STORE], "readwrite", (transaction) => {
+      transaction.objectStore(STREAM_META_STORE).add(record);
+    });
+
+    return new IndexedDbStreamCapture(
+      id,
+      (sessionInput) => this.create(sessionInput),
+      () => this.database(),
+    );
+  }
+
+  async recoverStreamCaptures(): Promise<readonly DictationSession[]> {
+    const database = await this.database();
+
+    const metas = await runIdbRequest(
+      database.transaction(STREAM_META_STORE, "readonly").objectStore(STREAM_META_STORE).getAll(),
+    );
+
+    const recovered: DictationSession[] = [];
+
+    for (const candidate of metas) {
+      const meta = isStreamMetaRecord(candidate) ? candidate : undefined;
+
+      if (!meta) {
+        continue;
+      }
+
+      try {
+        const chunks = await readStreamChunks(database, meta.id);
+
+        if (chunks.length === 0 || (await this.get(meta.id))) {
+          await deleteStreamCapture(database, meta.id);
+
+          continue;
+        }
+
+        const assembled = assemblePcm16Wav(chunks);
+
+        const created = await this.create({
+          id: meta.id,
+          wav: assembled.wav,
+          durationMs: assembled.durationMs,
+        });
+
+        const marked = await this.saveFailure(
+          meta.id,
+          "Recovered after the app closed during recording. The audio is intact; retry when ready.",
+        );
+
+        await deleteStreamCapture(database, meta.id);
+        recovered.push(marked ?? created);
+      } catch {
+        // A journal that cannot be assembled now stays for the next attempt.
+      }
+    }
+
+    return Object.freeze(recovered);
+  }
+
   close(): void {
     void this.databasePromise?.then((database) => database.close());
     this.databasePromise = undefined;
@@ -475,7 +958,7 @@ export class IndexedDbSessionStore implements DictationSessionStore {
 
     if (!this.databasePromise) {
       this.databasePromise = new Promise((resolve, reject) => {
-        const request = this.factory?.open(this.databaseName, DICTATION_SESSION_SCHEMA_VERSION);
+        const request = this.factory?.open(this.databaseName, DICTATION_DATABASE_VERSION);
 
         if (!request) {
           reject(new DictationStorageError("IndexedDB is unavailable in this environment"));
@@ -490,6 +973,18 @@ export class IndexedDbSessionStore implements DictationSessionStore {
             const store = database.createObjectStore(OBJECT_STORE, { keyPath: "id" });
             store.createIndex("updatedAt", "updatedAt");
             store.createIndex("status", "status");
+          }
+
+          // Version 2: the streaming-capture journal. Session records are
+          // untouched, so persisted v1 sessions load unchanged.
+          if (!database.objectStoreNames.contains(STREAM_META_STORE)) {
+            database.createObjectStore(STREAM_META_STORE, { keyPath: "id" });
+          }
+
+          if (!database.objectStoreNames.contains(STREAM_CHUNK_STORE)) {
+            database
+              .createObjectStore(STREAM_CHUNK_STORE, { keyPath: ["captureId", "index"] })
+              .createIndex("captureId", "captureId", { unique: false });
           }
         };
 
