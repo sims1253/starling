@@ -6,7 +6,12 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 sealed interface CaptureResult {
@@ -42,6 +47,15 @@ class AudioCapture {
     private var workerError: String? = null
     private var cappedAtLimit = false
     private var state = State.IDLE
+
+    // Guarded by [lock]: completion callbacks of stop() calls that are
+    // still waiting for the worker, and whether a background task for the
+    // forced-release phase is already in flight so concurrent stops share
+    // it instead of stacking one task per call.
+    private val stopCallbacks = mutableListOf<(CaptureResult) -> Unit>()
+    private var escalationArmed = false
+    private var stopExecutor: ExecutorService? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     fun isRecording(): Boolean = synchronized(lock) { state != State.IDLE }
 
@@ -118,17 +132,41 @@ class AudioCapture {
     }
 
     /**
-     * Stops and closes the capture synchronously. This is intentionally safe
-     * to call from Activity/IME lifecycle teardown so no open microphone or
-     * incomplete WAV writer is left behind.
+     * Stops the capture and delivers the outcome to [onSettled] exactly
+     * once. The fast path stays synchronous and safe to call from
+     * Activity/IME lifecycle teardown: the recorder is stopped and the
+     * worker gets [CaptureStopPolicy.FAST_STOP_WAIT_MILLIS] to exit, which
+     * healthy devices do in milliseconds. If the worker is still alive —
+     * an AudioRecord.read wedged past the recorder stop — the forced
+     * release phase continues on a background daemon executor instead of
+     * blocking the caller for the rest of the grace window plus the forced
+     * join (up to ~3.6 s). In that escalated case [onSettled] fires later,
+     * once, on the main thread; otherwise it fires synchronously on the
+     * calling thread before stop() returns. Every outcome, including
+     * [CaptureResult.AlreadyStopped], reaches the callback, so no caller
+     * can silently lose the result.
+     *
+     * The state machine is unchanged: the capture returns to IDLE only
+     * after the worker has exited and closed the WAV writer, and a worker
+     * that survives even the forced release keeps the capture in STOPPING
+     * so a later start() cannot race the zombie or its writer, while a
+     * later stop() can keep waiting for it.
      */
-    fun stop(): CaptureResult {
-        val (audioRecord, captureThread) = synchronized(lock) {
-            if (state == State.IDLE) return CaptureResult.AlreadyStopped
-            stopRequested = true
-            state = State.STOPPING
-            recorder to worker
+    fun stop(onSettled: (CaptureResult) -> Unit) {
+        val pending = synchronized(lock) {
+            if (state == State.IDLE) {
+                null
+            } else {
+                stopRequested = true
+                state = State.STOPPING
+                stopCallbacks.add(onSettled)
+                recorder to worker
+            }
+        } ?: run {
+            onSettled(CaptureResult.AlreadyStopped)
+            return
         }
+        val (audioRecord, captureThread) = pending
 
         try {
             audioRecord?.stop()
@@ -138,12 +176,52 @@ class AudioCapture {
 
         if (captureThread != null) {
             try {
-                captureThread.join(STOP_WAIT_MILLIS)
+                captureThread.join(CaptureStopPolicy.FAST_STOP_WAIT_MILLIS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
-        if (captureThread?.isAlive == true) {
+
+        val (error, bytes, capped) = workerOutcome()
+        if (captureThread?.isAlive != true) {
+            // The worker exited: settle inline on the calling thread,
+            // exactly like the synchronous stop this replaces.
+            finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = false)
+            return
+        }
+
+        // The worker outlived the fast wait. Escalate the forced-release
+        // phase to the background instead of blocking the caller.
+        val executor = synchronized(lock) {
+            if (escalationArmed) null else {
+                escalationArmed = true
+                stopExecutor()
+            }
+        }
+        executor?.execute(::forcedRelease)
+    }
+
+    /**
+     * The forced-release phase on the stop executor: what stop() used to
+     * run inline after its long join. Gives the worker the rest of the
+     * grace window, then releases the AudioRecord to unblock a wedged
+     * blocking read, interrupts, and joins once more before settling.
+     */
+    private fun forcedRelease() {
+        val (audioRecord, captureThread) = synchronized(lock) { recorder to worker }
+        if (captureThread?.isAlive != true) {
+            // A concurrent stop already settled the capture while this task
+            // was queued.
+            return
+        }
+
+        try {
+            captureThread.join(CaptureStopPolicy.ESCALATED_GRACE_MILLIS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+
+        if (captureThread.isAlive) {
             // Releasing AudioRecord unblocks a blocking read on affected
             // devices. The partial WAV remains available for explicit cleanup.
             try {
@@ -153,36 +231,95 @@ class AudioCapture {
             }
             captureThread.interrupt()
             try {
-                captureThread.join(FORCED_STOP_WAIT_MILLIS)
+                captureThread.join(CaptureStopPolicy.FORCED_STOP_WAIT_MILLIS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
 
-        if (captureThread?.isAlive == true) {
-            // Keep STOPPING and the worker reference while a device refuses to
-            // unblock. A subsequent stop can continue waiting, and start()
-            // cannot race a zombie worker or its writer.
-            synchronized(lock) { state = State.STOPPING }
-            return CaptureResult.Failed("The microphone did not stop cleanly; the partial recording was kept")
+        val (error, bytes, capped) = workerOutcome()
+        if (captureThread.isAlive) {
+            // Keep STOPPING and the worker reference while a device refuses
+            // to unblock. A subsequent stop can continue waiting, and start()
+            // cannot race a zombie worker or its writer. The registered
+            // callbacks still learn the outcome; only the state is retained.
+            val callbacks = synchronized(lock) {
+                state = State.STOPPING
+                escalationArmed = false
+                drainStopCallbacks()
+            }
+            deliver(callbacks, CaptureStopPolicy.ZOMBIE_RESULT, fromEscalation = true)
+            return
         }
-        val (error, bytes, capped) = synchronized(lock) {
-            val capturedError = workerError
-            val capturedBytes = writerBytes
-            val wasCapped = cappedAtLimit
+        finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = true)
+    }
+
+    /**
+     * Returns the capture to IDLE after its worker has exited (and thereby
+     * closed the WAV writer in its finally block), clears the device
+     * references, and hands the result to every registered callback.
+     */
+    private fun finishSettlement(result: CaptureResult, fromEscalation: Boolean) {
+        val callbacks = synchronized(lock) {
             recorder = null
             worker = null
             writer = null
             cappedAtLimit = false
+            escalationArmed = false
             state = State.IDLE
-            Triple(capturedError, capturedBytes, wasCapped)
+            drainStopCallbacks()
         }
-        if (error != null) return CaptureResult.Failed(error)
+        deliver(callbacks, result, fromEscalation)
+    }
 
-        return CaptureResult.Completed(
-            durationSeconds = bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE),
-            cappedAtLimit = capped,
-        )
+    private fun drainStopCallbacks(): List<(CaptureResult) -> Unit> {
+        val drained = stopCallbacks.toList()
+        stopCallbacks.clear()
+        return drained
+    }
+
+    /**
+     * Escalated results are delivered on the main thread, where the
+     * lifecycle callbacks that own the capture and its recording run; the
+     * stop executor itself has no looper. Fast-path results were produced
+     * on the calling thread and are delivered inline, before stop()
+     * returns, like the synchronous stop this replaces.
+     */
+    private fun deliver(
+        callbacks: List<(CaptureResult) -> Unit>,
+        result: CaptureResult,
+        fromEscalation: Boolean,
+    ) {
+        if (fromEscalation) {
+            callbacks.forEach { mainHandler.post { it(result) } }
+        } else {
+            callbacks.forEach { it(result) }
+        }
+    }
+
+    private fun workerOutcome(): Triple<String?, Long, Boolean> = synchronized(lock) {
+        Triple(workerError, writerBytes, cappedAtLimit)
+    }
+
+    /**
+     * Lazily created single-thread executor for the escalated stop phase.
+     * Its daemon thread dies after [ESCALATION_EXECUTOR_IDLE_MILLIS]
+     * without a task, so nothing stays alive between captures.
+     */
+    private fun stopExecutor(): ExecutorService {
+        stopExecutor?.let { return it }
+        return ThreadPoolExecutor(
+            1,
+            1,
+            ESCALATION_EXECUTOR_IDLE_MILLIS,
+            TimeUnit.MILLISECONDS,
+            LinkedBlockingQueue(),
+        ) { runnable ->
+            Thread(runnable, "starling-audio-stop").apply { isDaemon = true }
+        }.apply {
+            allowCoreThreadTimeOut(true)
+            stopExecutor = this
+        }
     }
 
     private var writerBytes: Long = 0
@@ -242,8 +379,12 @@ class AudioCapture {
     private enum class State { IDLE, RECORDING, STOPPING }
 
     companion object {
-        private val STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(3)
-        private val FORCED_STOP_WAIT_MILLIS = TimeUnit.SECONDS.toMillis(1)
+        /**
+         * How long the single stop-executor thread may idle before it
+         * exits. Escalated stops are rare, so between captures the
+         * executor holds no live thread.
+         */
+        private val ESCALATION_EXECUTOR_IDLE_MILLIS = TimeUnit.SECONDS.toMillis(1)
 
         /**
          * Terminal cap for a single capture: two hours of 16 kHz mono PCM16

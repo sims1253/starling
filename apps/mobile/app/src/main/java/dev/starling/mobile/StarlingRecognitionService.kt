@@ -12,6 +12,7 @@ import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import dev.starling.mobile.audio.AudioCapture
+import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.network.TranscriptionEngine
 import java.util.concurrent.TimeUnit
@@ -94,7 +95,19 @@ class StarlingRecognitionService : RecognitionService() {
 
     private fun endSession(ending: RecognitionSessionGuard.Ending<Callback>) {
         mainHandler.removeCallbacks(listenTimeout)
-        when (val settlement = sessions.settle(ending, capture.stop())) {
+        // The capture settles inline on this main thread in the common
+        // case; when the microphone refuses to stop, the outcome is
+        // delivered later, still on the main thread, so the host callback,
+        // the watchdog, and onDestroy never block on the forced-release
+        // wait.
+        capture.stop { result -> settleEndedSession(ending, result) }
+    }
+
+    private fun settleEndedSession(
+        ending: RecognitionSessionGuard.Ending<Callback>,
+        result: CaptureResult,
+    ) {
+        when (val settlement = sessions.settle(ending, result)) {
             is RecognitionSessionGuard.Settlement.Transcribe -> {
                 val finalized = runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)

@@ -264,7 +264,15 @@ class MainActivity : Activity() {
         activeRecording = null
         recordButton.setText(R.string.start_recording)
 
-        when (val result = capture.stop()) {
+        // The capture settles inline on this main thread in the common
+        // case; when the microphone refuses to stop, the outcome is
+        // delivered later, still on the main thread, so onStop/onDestroy
+        // never block on the forced-release wait.
+        capture.stop { result -> settleStoppedRecording(recording, result) }
+    }
+
+    private fun settleStoppedRecording(recording: Recording, result: CaptureResult) {
+        when (result) {
             is CaptureResult.Completed -> {
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)
