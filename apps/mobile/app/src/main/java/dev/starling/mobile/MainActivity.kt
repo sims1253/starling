@@ -17,6 +17,8 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
@@ -53,6 +55,25 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // Edge-to-edge is enforced with targetSdk 35 and the deprecated
+        // status/navigation bar color items no longer reserve any space. Pad
+        // the scroll root for the system bars, the soft keyboard (the window
+        // is no longer resized for it), and the display cutout so the title
+        // clears the status bar and the controls clear the gesture bar.
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main_root)) { view, windowInsets ->
+            val bars = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime(),
+            )
+            val cutout = windowInsets.displayCutout
+            view.setPadding(
+                maxOf(bars.left, cutout?.safeInsetLeft ?: 0),
+                maxOf(bars.top, cutout?.safeInsetTop ?: 0),
+                maxOf(bars.right, cutout?.safeInsetRight ?: 0),
+                maxOf(bars.bottom, cutout?.safeInsetBottom ?: 0),
+            )
+            WindowInsetsCompat.CONSUMED
+        }
 
         endpointInput = findViewById(R.id.endpoint_input)
         allowHttpInput = findViewById(R.id.allow_http_input)

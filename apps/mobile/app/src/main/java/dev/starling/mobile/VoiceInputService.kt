@@ -11,6 +11,8 @@ import android.view.inputmethod.InputConnection
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
@@ -44,8 +46,14 @@ class VoiceInputService : InputMethodService() {
     }
 
     override fun onCreateInputView(): View {
-        val parent = FrameLayout(this)
-        val view = LayoutInflater.from(this).inflate(R.layout.keyboard_view, parent, false)
+        // InputMethodService.setInputView() re-parameters whatever view it is
+        // handed with MATCH_PARENT/WRAP_CONTENT, so a fixed height on the
+        // returned root would be discarded before the first measure. The
+        // keyboard therefore lives inside a container that wraps the
+        // @dimen/keyboard_height child, which keeps the height stable.
+        val container = FrameLayout(this)
+        val view = LayoutInflater.from(this).inflate(R.layout.keyboard_view, container, true)
+        applyWindowInsets(view)
         keyboardView = view
         recordButton = view.findViewById(R.id.keyboard_record_button)
         insertButton = view.findViewById(R.id.keyboard_insert_button)
@@ -57,7 +65,7 @@ class VoiceInputService : InputMethodService() {
         }
         insertButton?.setOnClickListener { insertReadyTranscript() }
         renderIdle()
-        return view
+        return container
     }
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
@@ -203,6 +211,29 @@ class VoiceInputService : InputMethodService() {
         readyTranscript = null
         insertButton?.visibility = View.GONE
         statusView?.setText(R.string.keyboard_inserted)
+    }
+
+    /**
+     * The IME window also draws edge to edge with targetSdk 35, so without
+     * extra padding the navigation bar would overlap the bottom button row.
+     * The base padding is captured once because insets can be dispatched
+     * more than once.
+     */
+    private fun applyWindowInsets(view: View) {
+        val baseLeft = view.paddingLeft
+        val baseTop = view.paddingTop
+        val baseRight = view.paddingRight
+        val baseBottom = view.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(view) { v, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(
+                baseLeft + systemBars.left,
+                baseTop,
+                baseRight + systemBars.right,
+                baseBottom + systemBars.bottom,
+            )
+            WindowInsetsCompat.CONSUMED
+        }
     }
 
     private fun renderIdle() {
