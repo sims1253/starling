@@ -105,6 +105,13 @@ class StreamClient(
     private val finalTimeoutMillis: Long = FINAL_TIMEOUT_MILLIS,
     private val keepaliveIntervalMillis: Long = KEEPALIVE_INTERVAL_MILLIS,
     private val busyRetryDelaysMillis: LongArray = BUSY_RETRY_DELAYS_MILLIS,
+    /**
+     * Test seam invoked inside the locked backlog drain after each flushed
+     * chunk, so a test can observe the drain in progress and prove that
+     * audio arriving meanwhile queues behind the backlog instead of jumping
+     * it. A no-op in production.
+     */
+    private val drainObserver: () -> Unit = {},
 ) {
     /**
      * Opens a stream to [url] (from [streamUrl]). [events] is invoked on the
@@ -262,6 +269,7 @@ class StreamClient(
                                 flushFailed = true
                                 break
                             }
+                            drainObserver()
                         }
                         backlog.clear()
                         backlogBytes = 0

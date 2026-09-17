@@ -12,6 +12,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -192,9 +193,9 @@ class StreamClientTest {
     }
 
     @Test fun backlogChunksAlwaysPrecedeChunksSentAfterLive() {
-        // Regression guard for the atomic backlog drain: a chunk buffered
-        // before the socket opened must never reach the server behind a
-        // chunk sent after the Live event, whatever the interleaving.
+        // Basic pre/post ordering: the Live event follows the drain, so a
+        // chunk sent after it can never race the flush. The overlapping case
+        // (a sender still active while the drain runs) is covered below.
         val harness = StreamHarness(headersDelayMillis = 300)
         try {
             val session = harness.connect()
@@ -206,6 +207,87 @@ class StreamClientTest {
             harness.awaitAudioCount(2)
             assertArrayEquals(early, harness.audio()[0].toByteArray())
             assertArrayEquals(late, harness.audio()[1].toByteArray())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test fun chunksArrivingDuringTheBacklogDrainNeverJumpAheadOfIt() {
+        // Deterministic guard for the atomic backlog drain. Once the drain of
+        // a large backlog begins (signaled through a test seam), a second
+        // thread bursts chunks at the session. The drain holds the lock for
+        // the whole flush, so every burst chunk must reach the server behind
+        // the entire backlog — a per-chunk-lock drain would interleave them
+        // mid-flush, reordering the PCM the server reassembles into a
+        // garbled final transcript with no failure signal.
+        val drainStarted = CountDownLatch(1)
+        val harness = StreamHarness(
+            headersDelayMillis = 300,
+            client = StreamClient(
+                finalTimeoutMillis = 5_000,
+                drainObserver = { drainStarted.countDown() },
+            ),
+        )
+        try {
+            val session = harness.connect()
+            val backlogCount = 50_000
+            val chunk = ByteArray(8)
+            for (sequence in 0 until backlogCount) {
+                chunk[0] = (sequence ushr 8).toByte()
+                chunk[1] = sequence.toByte()
+                session.onAudio(chunk, chunk.size)
+            }
+            val markerCount = 32
+            val marker = ByteArray(8) { 0x7f }
+            val racer = Thread {
+                try {
+                    assertTrue(drainStarted.await(5, TimeUnit.SECONDS))
+                    repeat(markerCount) { session.onAudio(marker, marker.size) }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }.also { it.start() }
+
+            // The backlog path must actually have been taken.
+            assertTrue("the delayed upgrade never drained a backlog", drainStarted.await(5, TimeUnit.SECONDS))
+            harness.awaitAudioCount(backlogCount + markerCount, timeoutMillis = 10_000)
+            racer.join(5_000)
+
+            val audio = harness.audio()
+            assertEquals(backlogCount + markerCount, audio.size)
+            // Every backlog chunk preceded every burst chunk, in order.
+            audio.take(backlogCount).forEachIndexed { index, frame ->
+                assertEquals(index, ((frame[0].toInt() and 0xff) shl 8) or (frame[1].toInt() and 0xff))
+            }
+            audio.drop(backlogCount).forEach { frame ->
+                assertArrayEquals(marker, frame.toByteArray())
+            }
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test fun keepaliveMissesAreForgivenWhileACommitFinalizes() {
+        // While a commit is being finalized the server's read loop may stop
+        // answering pings; those misses must not kill the stream inside the
+        // final budget. The stall here exceeds two ping intervals before the
+        // final arrives.
+        val harness = StreamHarness(
+            serverBehavior = { text, socket ->
+                if (text == COMMIT) {
+                    Thread.sleep(450)
+                    socket.send("""{"type":"final","text":"late final"}""")
+                }
+            },
+            client = StreamClient(
+                finalTimeoutMillis = 5_000,
+                keepaliveIntervalMillis = 100,
+            ),
+        )
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            assertEquals(CommitOutcome.Final("late final"), session.finish())
         } finally {
             harness.close()
         }
@@ -298,16 +380,16 @@ class StreamClientTest {
             }
         }
 
-        fun awaitAudioCount(count: Int) {
-            await("$count audio frames") { serverStream.audio.size >= count }
+        fun awaitAudioCount(count: Int, timeoutMillis: Long = 5_000) {
+            await("$count audio frames", timeoutMillis) { serverStream.audio.size >= count }
         }
 
         fun awaitServerTexts(count: Int, predicate: (List<String>) -> Boolean) {
             await("$count server text frames") { predicate(serverStream.texts.toList()) }
         }
 
-        private fun await(what: String, condition: () -> Boolean) {
-            val deadline = System.currentTimeMillis() + 5_000
+        private fun await(what: String, timeoutMillis: Long = 5_000, condition: () -> Boolean) {
+            val deadline = System.currentTimeMillis() + timeoutMillis
             while (System.currentTimeMillis() < deadline) {
                 if (condition()) return
                 Thread.sleep(20)
