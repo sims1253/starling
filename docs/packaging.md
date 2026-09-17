@@ -80,6 +80,13 @@ re-hashes the binary against that marker, so on-disk corruption or tampering
 is caught before exec and triggers a re-download. Cache entries are never
 evicted automatically; delete the directory to reclaim space.
 
+During a download, a hidden `.starling-serve-*` staging directory appears
+next to the cache entry (staging inside the cache keeps the final move a
+same-filesystem rename — a system temp dir can sit on another device, where
+that rename would fail). It is removed when the install finishes or fails; a
+hard-killed run may leave one behind, but it is never mistaken for a verified
+cache entry and the next successful run needs nothing from it.
+
 Offline machines: run once anywhere with network and copy the whole
 `releases/<tag>/` entry (binary and marker), or point `STARLING_SERVE_CACHE`
 at a pre-populated directory.
@@ -92,8 +99,8 @@ at a pre-populated directory.
   hash against the release's consolidated `SHA256SUMS.txt`, and the extracted
   executable's hash against the `.sha256` file shipped inside the archive.
 - The launcher extracts only the two named members it needs from the archive
-  (never a wildcard) into a temporary directory, then moves the verified
-  binary into the cache.
+  (never a wildcard) into a staging directory inside the cache, then moves the
+  verified binary into place with a same-filesystem rename.
 - No code from the release runs before both checks pass.
 
 ## Release-side checklist (owner steps)

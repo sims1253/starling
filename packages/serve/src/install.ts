@@ -16,7 +16,6 @@
  */
 import { createWriteStream } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
@@ -119,7 +118,13 @@ export async function ensureBinary(options: EnsureOptions): Promise<EnsureResult
 
   log(`Downloading starling-serve ${tag} (${os}-${backend}) from ${repo}...`);
   await mkdir(dirname(binaryPath), { recursive: true });
-  const workDir = await mkdtemp(join(tmpdir(), "starling-serve-"));
+  // Stage inside the release directory, not os.tmpdir(): the verified binary
+  // is rename(2)d to binaryPath, and a cross-device rename fails with EXDEV
+  // after the whole download already succeeded — /tmp is a tmpfs on several
+  // distros, and STARLING_SERVE_CACHE may live on another volume entirely.
+  // The dotted mkdtemp name can never collide with the cached binary itself,
+  // so an interrupted download just re-runs; the finally below cleans up.
+  const workDir = await mkdtemp(join(dirname(binaryPath), ".starling-serve-"));
 
   try {
     const fetchImpl = options.fetchImpl ?? fetch;

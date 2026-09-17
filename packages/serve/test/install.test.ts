@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, describe, it } from "vite-plus/test";
 import { resolveTarExecutable, tarArgs, type ExecFileFn } from "../src/archive.js";
 import {
@@ -130,9 +130,38 @@ describe("ensureBinary first-run install", () => {
     assert.equal(invocation.file, resolveTarExecutable());
     assert.equal(invocation.args[0], "-xzf");
     assert.ok(invocation.args.indexOf("-C") > 0);
+    // Staging happens inside the cache's release directory, so the final move
+    // is a same-filesystem rename even when os.tmpdir() is another device.
+    const destDir = invocation.args[invocation.args.indexOf("-C") + 1];
+    assert.ok(
+      destDir !== undefined && destDir.startsWith(join(h.cacheDir, "releases", TAG) + sep),
+      `staging dir ${destDir} is not inside ${join(h.cacheDir, "releases", TAG)}`,
+    );
     assert.deepEqual(invocation.args.slice(invocation.args.indexOf("-C") + 2), [
       BINARY,
       `${BINARY}.sha256`,
+    ]);
+  });
+
+  it("stages next to the cached binary and removes the staging dir on failure", async () => {
+    const h = await harness({
+      tamperArchive: (archive) => Buffer.concat([archive, Buffer.from("x")]),
+    });
+
+    await assert.rejects(ensure(h), (cause) => cause instanceof ChecksumMismatchError);
+
+    // The finally cleanup removed the staging dir; nothing that a later run
+    // could mistake for a verified cache entry is left behind.
+    assert.deepEqual(await readdir(join(h.cacheDir, "releases", TAG)), []);
+  });
+
+  it("leaves only the binary and its marker after a successful install", async () => {
+    const h = await harness();
+    await ensure(h);
+
+    assert.deepEqual((await readdir(join(h.cacheDir, "releases", TAG))).sort(), [
+      BINARY,
+      `${BINARY}.verified`,
     ]);
   });
 
