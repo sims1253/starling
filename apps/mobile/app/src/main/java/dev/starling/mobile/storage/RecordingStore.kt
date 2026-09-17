@@ -3,6 +3,7 @@ package dev.starling.mobile.storage
 import android.content.Context
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.TranscriptionProvenance
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -108,13 +109,18 @@ class RecordingStore(context: Context) {
         }
     }
 
-    fun markTranscribed(id: String, rawTranscript: String): Recording = synchronized(lock) {
+    fun markTranscribed(
+        id: String,
+        rawTranscript: String,
+        provenance: TranscriptionProvenance = TranscriptionProvenance.BATCH_UPLOAD,
+    ): Recording = synchronized(lock) {
         // Deliberately do not trim, normalize, or otherwise clean this value.
         update(id) {
             it.copy(
                 status = RecordingStatus.TRANSCRIBED,
                 rawTranscript = rawTranscript,
                 errorMessage = null,
+                provenance = provenance,
             )
         }
     }
@@ -162,6 +168,7 @@ class RecordingStore(context: Context) {
             .put("attempts", recording.attempts)
             .put("raw_transcript", recording.rawTranscript ?: JSONObject.NULL)
             .put("error_message", recording.errorMessage ?: JSONObject.NULL)
+            .put("provenance", recording.provenance?.name ?: JSONObject.NULL)
 
         FileOutputStream(temporary).use { output ->
             output.write(json.toString().toByteArray(Charsets.UTF_8))
@@ -190,6 +197,10 @@ class RecordingStore(context: Context) {
             rawTranscript = json.optionalString("raw_transcript"),
             errorMessage = json.optionalString("error_message"),
             attempts = json.optInt("attempts", 0),
+            provenance = json.optionalString("provenance")
+                ?.let { value ->
+                    runCatching { TranscriptionProvenance.valueOf(value) }.getOrNull()
+                },
         )
     }
 

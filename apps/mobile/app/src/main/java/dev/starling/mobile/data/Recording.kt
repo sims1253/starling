@@ -12,6 +12,18 @@ enum class RecordingStatus {
     FAILED,
 }
 
+/**
+ * How the stored transcript was produced. Provenance only records what
+ * happened; it never changes the text itself.
+ */
+enum class TranscriptionProvenance {
+    /** Live `WS /stream` session: partials while recording, final on commit. */
+    LIVE_STREAM,
+
+    /** Multipart upload of the saved WAV after the recording finished. */
+    BATCH_UPLOAD,
+}
+
 data class Recording(
     val id: String,
     val createdAtMillis: Long,
@@ -21,4 +33,5 @@ data class Recording(
     val rawTranscript: String? = null,
     val errorMessage: String? = null,
     val attempts: Int = 0,
+    val provenance: TranscriptionProvenance? = null,
 )

@@ -30,11 +30,26 @@ sealed interface CaptureResult {
 }
 
 /**
+ * Observer for the PCM chunks of a live capture. Invoked on the capture
+ * worker thread, after the chunk has been written to the WAV: the WAV write
+ * stays the source of truth and this listener only observes it. The [bytes]
+ * buffer is the capture loop's scratch buffer — it is only valid during the
+ * call, so an implementation that retains the audio must copy it. A throwing
+ * listener can never fail or interrupt the recording; its exception is
+ * swallowed on the spot.
+ */
+fun interface AudioChunkListener {
+    fun onChunk(bytes: ByteArray, count: Int)
+}
+
+/**
  * Owns one microphone capture at a time. The worker always closes the WAV
  * writer, including when Android tears down the audio device or the service.
  * Mic access is attributed through the context passed to [start]: callers
  * pass their own context, or one created for the recognition client they
- * act for.
+ * act for. An optional [AudioChunkListener] observes the same PCM chunks the
+ * worker writes to the WAV; it exists for live streaming and cannot affect
+ * the capture, its stop choreography, or the two-hour cap.
  */
 class AudioCapture {
     private val lock = Any()
@@ -60,7 +75,11 @@ class AudioCapture {
     fun isRecording(): Boolean = synchronized(lock) { state != State.IDLE }
 
     @SuppressLint("MissingPermission")
-    fun start(context: Context, outputFile: File): String? = synchronized(lock) {
+    fun start(
+        context: Context,
+        outputFile: File,
+        onChunk: AudioChunkListener? = null,
+    ): String? = synchronized(lock) {
         if (state != State.IDLE || worker?.isAlive == true) {
             return@synchronized "A recording is already stopping"
         }
@@ -126,7 +145,7 @@ class AudioCapture {
         writerBytes = 0
         stopRequested = false
         state = State.RECORDING
-        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize) }, "starling-audio-capture")
+        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk) }, "starling-audio-capture")
             .also { it.start() }
         null
     }
@@ -337,7 +356,12 @@ class AudioCapture {
 
     private var writerBytes: Long = 0
 
-    private fun captureLoop(audioRecord: AudioRecord, wavWriter: WavWriter, bufferSize: Int) {
+    private fun captureLoop(
+        audioRecord: AudioRecord,
+        wavWriter: WavWriter,
+        bufferSize: Int,
+        onChunk: AudioChunkListener?,
+    ) {
         val buffer = ByteArray(bufferSize)
         var bytesWritten = 0L
         try {
@@ -347,6 +371,11 @@ class AudioCapture {
                     count > 0 -> {
                         wavWriter.write(buffer, count)
                         bytesWritten += count
+                        // Observer of the durable write above, never a gate on
+                        // it: the recording must survive any streaming failure.
+                        if (onChunk != null) {
+                            runCatching { onChunk.onChunk(buffer, count) }
+                        }
                     }
                     count == AudioRecord.ERROR_DEAD_OBJECT -> {
                         throw IllegalStateException("The microphone became unavailable")

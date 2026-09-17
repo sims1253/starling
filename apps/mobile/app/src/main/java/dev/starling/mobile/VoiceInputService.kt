@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
+import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -14,16 +15,30 @@ import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import dev.starling.mobile.audio.AudioCapture
+import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.TranscriptionProvenance
+import dev.starling.mobile.network.StreamEvent
+import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.ui.InputTargetGuard
 import dev.starling.mobile.ui.RequestGenerationGuard
 
 /**
- * Lightweight voice keyboard. It never reads surrounding editor text and
- * never inserts a transcript from an asynchronous callback: insertion is a
- * separate, explicit user action guarded by the original InputConnection.
+ * Lightweight voice keyboard. It never reads surrounding editor text or
+ * package names. Two text paths exist, both guarded by the editor target
+ * the recording started against:
+ *
+ * - **Live streaming** (Starling server): while recording, growing partial
+ *   transcripts are shown through `setComposingText`, the Android dictation
+ *   idiom — composing text is ephemeral, replaces itself with each partial,
+ *   and is removed when the stream fails. The single `commitText` happens
+ *   only when the server's final transcript arrives after Stop.
+ * - **Batch transcription** (fallback after any streaming failure, on-device
+ *   engine, or OpenAI-shaped endpoint): no asynchronous insertion at all;
+ *   the transcript is shown first and `commitText` is a separate, explicit
+ *   user action on the Insert button.
  */
 class VoiceInputService : InputMethodService() {
     private val application by lazy { starlingApplication() }
@@ -40,6 +55,20 @@ class VoiceInputService : InputMethodService() {
     private var recordingTarget: InputTargetGuard.Snapshot<InputConnection>? = null
     private var activeRequestGeneration = 0L
     private var readyTranscript: ReadyTranscript? = null
+
+    // Live-stream state. The session is set before the capture starts and
+    // is read by the capture worker through the chunk listener; composingTarget
+    // is the editor snapshot the composing region belongs to, main thread
+    // only, kept until the stream's final text settles it.
+    @Volatile
+    private var streamSession: StreamSession? = null
+    private var composingTarget: InputTargetGuard.Snapshot<InputConnection>? = null
+
+    // Whether the current editor can process composing text. TYPE_NULL
+    // (non-rich) editors cannot: there, setComposingText inserts each
+    // partial at the cursor, so growing partials would duplicate. Those
+    // targets degrade to the explicit Insert flow for the final text.
+    private var composingSupported = false
 
     override fun onCreate() {
         super.onCreate()
@@ -71,6 +100,8 @@ class VoiceInputService : InputMethodService() {
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         if (activeRecording != null) stopAndQueueRecording()
+        composingSupported = ((attribute?.inputType ?: InputType.TYPE_NULL) and
+            InputType.TYPE_MASK_CLASS) != InputType.TYPE_NULL
         val connection = currentInputConnection
         if (connection != null) targetGuard.targetStarted(connection) else targetGuard.targetFinished()
         // A response belonging to a previous editor must never become an
@@ -114,19 +145,37 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.keyboard_no_target)
             return
         }
-        // Invalidate any earlier request whose callback may still be queued.
+        // Invalidate any earlier request whose callbacks may still be queued.
         val requestGeneration = requestGuard.begin()
         val recording = runCatching { application.recordings.create() }.getOrElse {
             statusView?.setText(R.string.recording_storage_error)
             return
         }
-        val error = capture.start(this, application.recordings.partialFile(recording))
+        // The live stream is an observer of the capture; null means this
+        // configuration records in the plain batch mode.
+        val config = application.backendSettings.load()
+        var session: StreamSession? = null
+        session = application.transcription.beginStreaming(config) { event ->
+            // Events from a superseded session must not touch the state of
+            // the recording that replaced it.
+            if (streamSession === session) onStreamEvent(event)
+        }
+        val error = capture.start(
+            this,
+            application.recordings.partialFile(recording),
+            onChunk = session?.let { streaming ->
+                AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
+            },
+        )
         if (error != null) {
+            session?.close()
             runCatching { application.recordings.markFailed(recording.id, error) }
             statusView?.text = error
             return
         }
         activeRecording = recording
+        streamSession = session
+        composingTarget = if (session == null || !composingSupported) null else target
         recordingTarget = target
         activeRequestGeneration = requestGeneration
         readyTranscript = null
@@ -134,7 +183,54 @@ class VoiceInputService : InputMethodService() {
         transcriptView?.text = null
         insertButton?.visibility = View.GONE
         recordButton?.setText(R.string.keyboard_stop)
-        statusView?.setText(R.string.keyboard_recording)
+        statusView?.setText(
+            if (session == null) R.string.keyboard_recording else R.string.keyboard_streaming,
+        )
+    }
+
+    /**
+     * Live-stream events, already marshalled to the main thread. Composing
+     * text is written only while the recorded editor target is still the
+     * focused one, and is removed when the stream fails — the batch
+     * fallback then takes over after Stop.
+     */
+    private fun onStreamEvent(event: StreamEvent) {
+        when (event) {
+            StreamEvent.Live -> if (activeRecording != null) {
+                statusView?.setText(R.string.keyboard_streaming)
+            }
+            is StreamEvent.Partial -> {
+                val target = composingTarget ?: return
+                val connection = currentInputConnection
+                if (targetGuard.isCurrent(target, connection)) {
+                    // The server's partial grows over the whole session, so
+                    // each one replaces the composing region entirely.
+                    connection.setComposingText(event.text, 1)
+                } else {
+                    // The editor changed under the recording; the composing
+                    // region died with the old editor's connection.
+                    composingTarget = null
+                }
+            }
+            is StreamEvent.Interrupted -> {
+                clearComposingText()
+                statusView?.text = getString(R.string.keyboard_stream_interrupted, event.reason)
+            }
+        }
+    }
+
+    /**
+     * Removes any composing region this keyboard owns, without committing
+     * its partial text, so a failed stream leaves the editor unchanged.
+     */
+    private fun clearComposingText() {
+        val target = composingTarget ?: return
+        composingTarget = null
+        val connection = currentInputConnection
+        if (targetGuard.isCurrent(target, connection)) {
+            connection.setComposingText("", 0)
+            connection.finishComposingText()
+        }
     }
 
     private fun stopAndQueueRecording() {
@@ -143,9 +239,11 @@ class VoiceInputService : InputMethodService() {
         // or recording may replace the fields below while this request waits.
         val requestTarget = recordingTarget
         val requestGeneration = activeRequestGeneration
+        val session = streamSession
         activeRecording = null
         recordingTarget = null
         activeRequestGeneration = 0L
+        streamSession = null
         recordButton?.setText(R.string.keyboard_record)
 
         // The capture settles inline on this main thread in the common
@@ -153,7 +251,7 @@ class VoiceInputService : InputMethodService() {
         // delivered later, still on the main thread, so input teardown and
         // onDestroy never block on the forced-release wait.
         capture.stop { result ->
-            settleStoppedRecording(recording, requestTarget, requestGeneration, result)
+            settleStoppedRecording(recording, requestTarget, requestGeneration, session, result)
         }
     }
 
@@ -161,13 +259,16 @@ class VoiceInputService : InputMethodService() {
         recording: Recording,
         requestTarget: InputTargetGuard.Snapshot<InputConnection>?,
         requestGeneration: Long,
+        session: StreamSession?,
         result: CaptureResult,
     ) {
         when (result) {
             is CaptureResult.Completed -> {
+                // The WAV is finalized and durable before any network use.
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
+                    session?.close()
                     application.recordings.markFailed(recording.id, "Unable to finalize the private WAV recording")
                     statusView?.setText(R.string.recording_finalize_error)
                     return
@@ -176,38 +277,117 @@ class VoiceInputService : InputMethodService() {
                     if (result.cappedAtLimit) R.string.recording_capped else R.string.keyboard_sending,
                 )
                 val config = application.backendSettings.load()
-                application.transcription.transcribe(finalized.id, config) { completed ->
-                    // The audio and exact transcript are already durable. If a
-                    // newer recording started, this response may update only
-                    // the store; it must not change this keyboard's UI.
-                    if (!requestGuard.isCurrent(requestGeneration)) return@transcribe
-                    if (completed.status == RecordingStatus.TRANSCRIBED &&
-                        completed.rawTranscript != null && requestTarget != null
-                    ) {
-                        val snapshot = requestTarget
-                        val current = currentInputConnection
-                        if (targetGuard.isCurrent(snapshot, current)) {
-                            readyTranscript = ReadyTranscript(completed.rawTranscript, snapshot)
-                            transcriptView?.visibility = View.VISIBLE
-                            transcriptView?.text = completed.rawTranscript
-                            insertButton?.visibility = View.VISIBLE
-                            statusView?.setText(R.string.keyboard_ready_to_insert)
-                        } else {
-                            transcriptView?.visibility = View.VISIBLE
-                            transcriptView?.text = completed.rawTranscript
-                            insertButton?.visibility = View.GONE
-                            statusView?.setText(R.string.keyboard_target_changed)
-                        }
-                    } else {
-                        statusView?.setText(R.string.keyboard_transcription_failed)
-                    }
+                val settled: (Recording) -> Unit = { completed ->
+                    onTranscriptionSettled(completed, requestTarget, requestGeneration)
+                }
+                if (session != null) {
+                    // Commit the live stream; the coordinator falls back to
+                    // the batch upload of the same saved WAV on any failure.
+                    application.transcription.finishStreaming(session, finalized.id, config, settled)
+                } else {
+                    application.transcription.transcribe(finalized.id, config, settled)
                 }
             }
             is CaptureResult.Failed -> {
+                // Nothing will be transcribed; drop the server session and
+                // any composing region the live stream left in the editor.
+                session?.close()
+                clearComposingText()
                 runCatching { application.recordings.markFailed(recording.id, result.message) }
                 statusView?.text = result.message
             }
-            CaptureResult.AlreadyStopped -> statusView?.setText(R.string.recording_already_stopped)
+            CaptureResult.AlreadyStopped -> {
+                session?.close()
+                clearComposingText()
+                statusView?.setText(R.string.recording_already_stopped)
+            }
+        }
+    }
+
+    /**
+     * One settlement for both the batch and the streamed path: the audio and
+     * exact transcript are already durable, so a superseded request may
+     * update only the store.
+     */
+    private fun onTranscriptionSettled(
+        completed: Recording,
+        requestTarget: InputTargetGuard.Snapshot<InputConnection>?,
+        requestGeneration: Long,
+    ) {
+        if (!requestGuard.isCurrent(requestGeneration)) return
+        if (completed.status != RecordingStatus.TRANSCRIBED || completed.rawTranscript == null) {
+            // Any composing region is stale by now; the editor must not
+            // keep partial text the failed stream produced.
+            clearComposingText()
+            statusView?.setText(R.string.keyboard_transcription_failed)
+            return
+        }
+        val text = completed.rawTranscript
+        if (completed.provenance == TranscriptionProvenance.LIVE_STREAM) {
+            settleLiveFinal(text, requestTarget)
+            return
+        }
+        // Batch result (first attempt or fallback after a stream failure):
+        // the explicit Insert flow, with any leftover composing removed.
+        clearComposingText()
+        if (requestTarget != null) {
+            val current = currentInputConnection
+            if (targetGuard.isCurrent(requestTarget, current)) {
+                readyTranscript = ReadyTranscript(text, requestTarget)
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = text
+                insertButton?.visibility = View.VISIBLE
+                statusView?.setText(R.string.keyboard_ready_to_insert)
+            } else {
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = text
+                insertButton?.visibility = View.GONE
+                statusView?.setText(R.string.keyboard_target_changed)
+            }
+        } else {
+            statusView?.setText(R.string.keyboard_transcription_failed)
+        }
+    }
+
+    /**
+     * Final text of a healthy live stream. The single asynchronous
+     * `commitText` of the composing path — and only into the editor the
+     * composing region belongs to.
+     */
+    private fun settleLiveFinal(
+        text: String,
+        requestTarget: InputTargetGuard.Snapshot<InputConnection>?,
+    ) {
+        val target = composingTarget
+        val connection = currentInputConnection
+        when {
+            target != null && targetGuard.isCurrent(target, connection) -> {
+                // commitText replaces the composing region and finishes
+                // composing in one step.
+                connection.commitText(text, 1)
+                composingTarget = null
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = text
+                insertButton?.visibility = View.GONE
+                statusView?.setText(R.string.keyboard_inserted)
+            }
+            requestTarget != null && targetGuard.isCurrent(requestTarget, connection) -> {
+                // The stream stayed healthy but composing never started (or
+                // was cleared when the editor flickered): degrade to the
+                // explicit Insert flow rather than dropping the text.
+                readyTranscript = ReadyTranscript(text, requestTarget)
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = text
+                insertButton?.visibility = View.VISIBLE
+                statusView?.setText(R.string.keyboard_ready_to_insert)
+            }
+            else -> {
+                composingTarget = null
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = text
+                insertButton?.visibility = View.GONE
+                statusView?.setText(R.string.keyboard_target_changed)
+            }
         }
     }
 
