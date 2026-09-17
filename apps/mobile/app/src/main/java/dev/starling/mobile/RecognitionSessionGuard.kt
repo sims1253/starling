@@ -50,6 +50,12 @@ class RecognitionSessionGuard<T : Any> {
         session = Session(recording, owner)
     }
 
+    /**
+     * Whether [owner] still owns the live session. Used to gate partial
+     * deliveries that may race a session ending underneath them.
+     */
+    fun isLive(owner: T): Boolean = session?.owner == owner
+
     /** The owning client stopped: finalize the audio for transcription. */
     fun stopListening(owner: T): Ending<T>? = endIfOwned(owner) { Ending.Finalize(it) }
 
