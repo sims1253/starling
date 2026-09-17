@@ -5,13 +5,14 @@ import {
   globalShortcut,
   ipcMain,
   session,
+  type IpcMainEvent,
   type IpcMainInvokeEvent,
 } from "electron";
 import { Data, Effect, Option, Schema } from "effect";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
-import { parsePendingAudio, pendingAudioWarning } from "./closeGuard.js";
+import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
 import {
   HealthInputSchema,
   TranscribeInputSchema,
@@ -62,14 +63,28 @@ const DISCARD_CLEANUP_BUDGET_MS = 400;
  */
 function discardPendingAudio(window: BrowserWindow): Promise<void> {
   return new Promise((resolve) => {
-    const settle = (): void => resolve();
+    let settled = false;
+
+    const settle = (): void => {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timer);
+      ipcMain.removeListener("starling:discard-cleaned", onCleaned);
+      resolve();
+    };
 
     const timer = setTimeout(settle, DISCARD_CLEANUP_BUDGET_MS);
 
-    ipcMain.once("starling:discard-cleaned", () => {
-      clearTimeout(timer);
+    const onCleaned = (event: IpcMainEvent): void => {
+      // Same trust rule as every renderer→main channel: an unconfirmed
+      // sender simply never confirms, and the budget expires instead.
+      if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
       settle();
-    });
+    };
+
+    ipcMain.on("starling:discard-cleaned", onCleaned);
 
     window.webContents.send("starling:discard-pending");
   });
@@ -508,7 +523,13 @@ function createWindow(): BrowserWindow {
       noLink: true,
     }) === 0;
 
+  // Bumped by every close request; a discard winding down checks it before
+  // destroying so a second dialog the user cancelled is never overridden.
+  let closeRequests = 0;
+
   window.on("close", (event) => {
+    closeRequests += 1;
+
     const detail = pendingAudioWarning(pendingAudio);
 
     if (!detail) return;
@@ -527,8 +548,14 @@ function createWindow(): BrowserWindow {
     // renderer times out and keeps the journal (fail-safe toward recovery).
     // destroy() skips this handler. A quit in progress still completes once
     // the last window is gone; the explicit restart is a cross-version
-    // safety net, not a requirement on current Electron.
+    // safety net, not a requirement on current Electron. If another close
+    // request arrived while this budget ran — the nested dialog lets the
+    // user reconsider — this flow stands down for that decision instead.
+    const request = closeRequests;
+
     void discardPendingAudio(window).then(() => {
+      if (request !== closeRequests) return;
+
       window.destroy();
 
       if (quitting) app.quit();
@@ -537,9 +564,11 @@ function createWindow(): BrowserWindow {
 
   // The renderer's beforeunload handler blocks reloads while audio is at
   // risk; preventDefault here ignores that handler and lets the reload
-  // through — only after an explicit Discard.
+  // through — only after an explicit Discard. A reload cannot wait out the
+  // journal delete, so a journaled take is told it will be recovered, not
+  // deleted.
   window.webContents.on("will-prevent-unload", (event) => {
-    const detail = pendingAudioWarning(pendingAudio) ?? "Reload discards unsaved audio.";
+    const detail = pendingAudioReloadWarning(pendingAudio) ?? "Reload discards unsaved audio.";
 
     if (confirmDiscard(detail)) event.preventDefault();
   });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vite-plus/test";
-import { parsePendingAudio, pendingAudioWarning } from "./closeGuard.js";
+import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
 import type { PendingAudioState } from "./ipc.js";
 
 const clean: PendingAudioState = { recording: false, finalizing: false, unsavedCount: 0 };
@@ -53,6 +53,34 @@ describe("pendingAudioWarning", () => {
     assert.equal(
       pendingAudioWarning({ recording: true, finalizing: true, unsavedCount: 2 }),
       "Closing now permanently deletes the live recording, a recording that is still being saved, and 2 unsaved recordings.",
+    );
+  });
+});
+
+describe("pendingAudioReloadWarning", () => {
+  it("keeps the deletion wording for memory-only audio", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, recording: true }),
+      pendingAudioWarning({ ...clean, recording: true }),
+    );
+  });
+
+  it("promises recovery, not deletion, for a journaled recording", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, recording: true, journaled: true }),
+      "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start.",
+    );
+  });
+
+  it("still names memory-only audio a reload destroys alongside the journal", () => {
+    assert.equal(
+      pendingAudioReloadWarning({
+        recording: true,
+        finalizing: false,
+        unsavedCount: 2,
+        journaled: true,
+      }),
+      "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start. Reload also permanently deletes 2 unsaved recordings.",
     );
   });
 });

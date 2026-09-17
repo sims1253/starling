@@ -30,6 +30,31 @@ export function pendingAudioWarning(state: PendingAudioState): string | undefine
   return `Closing now permanently deletes ${joinAtRisk(atRisk)}.`;
 }
 
+/**
+ * Wording for the reload gate. Unlike closing, a reload cannot give the
+ * renderer time to delete a durable streaming journal mid-unload, so a
+ * journaled take is NOT deleted: recovery offers it again on next start,
+ * and the dialog must not promise otherwise. Memory-only audio is still
+ * destroyed by the reload and keeps the deletion wording.
+ */
+export function pendingAudioReloadWarning(state: PendingAudioState): string | undefined {
+  if (state.journaled !== true) return pendingAudioWarning(state);
+
+  const atRisk: Array<string> = [];
+
+  if (state.finalizing) atRisk.push("a recording that is still being saved");
+
+  if (state.unsavedCount > 0)
+    atRisk.push(`${state.unsavedCount} unsaved recording${state.unsavedCount === 1 ? "" : "s"}`);
+
+  const kept =
+    "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start.";
+
+  if (atRisk.length === 0) return kept;
+
+  return `${kept} Reload also permanently deletes ${joinAtRisk(atRisk)}.`;
+}
+
 /** Mutable draft of the normalized mirror; `journaled` stays absent unless true. */
 type MutablePendingAudio = {
   recording: boolean;
