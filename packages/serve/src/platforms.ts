@@ -79,6 +79,18 @@ export function supportedBackends(os: string, arch: string): readonly Backend[] 
   return [];
 }
 
+/**
+ * The marketing OS name used in release asset stems: `windows`/`macos`, not
+ * the Node platform ids (see the workflow's windows-* and macos-* jobs).
+ */
+function assetOsName(os: string): string {
+  if (os === "win32") return "windows";
+
+  if (os === "darwin") return "macos";
+
+  return os;
+}
+
 export function resolveArtifact(os: string, arch: string, backend: Backend): ArtifactSpec {
   const supported = supportedBackends(os, arch);
 
@@ -90,7 +102,7 @@ export function resolveArtifact(os: string, arch: string, backend: Backend): Art
     throw new UnsupportedBackendError(os, arch, backend, supported);
   }
 
-  const suffix = `${os === "win32" ? "windows" : os}-${backend}`;
+  const suffix = `${assetOsName(os)}-${backend}`;
   const archiveExt = os === "win32" ? (".zip" as const) : (".tar.gz" as const);
   const binary = os === "win32" ? `${baseName(suffix)}.exe` : baseName(suffix);
 

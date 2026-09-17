@@ -42,15 +42,16 @@ describe("platform + backend → artifact mapping", () => {
     }
   });
 
-  it("maps darwin/arm64 to cpu and metal tarballs", () => {
+
+  it("maps darwin/arm64 to the macos-named cpu and metal tarballs", () => {
     assert.deepEqual(resolveArtifact("darwin", "arm64", "cpu"), {
-      archive: "starling-serve-darwin-cpu.tar.gz",
-      binary: "starling-serve-darwin-cpu",
+      archive: "starling-serve-macos-cpu.tar.gz",
+      binary: "starling-serve-macos-cpu",
       archiveExt: ".tar.gz",
     });
     assert.deepEqual(resolveArtifact("darwin", "arm64", "metal"), {
-      archive: "starling-serve-darwin-metal.tar.gz",
-      binary: "starling-serve-darwin-metal",
+      archive: "starling-serve-macos-metal.tar.gz",
+      binary: "starling-serve-macos-metal",
       archiveExt: ".tar.gz",
     });
   });
