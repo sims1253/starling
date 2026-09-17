@@ -10,6 +10,9 @@ Linux toolkit series. Linux installs that series' metapackage, which can select 
 later patch. Runtime guidance names the shared major/minor series. When changing
 it, update the CUDA requirements here, in the native serving guide, and in the
 release body; `scripts/release-runtime/check-contract.py` checks their agreement.
+The pinned ROCm apt repository works the same way: the versioned URL in the
+workflow is the source of truth, and the checker requires the `linux-rocm` row
+here, the serving guide, and the release body to restate that exact version.
 Release preflight also compares the executing workflow's CUDA version with the
 checked-out tag. For a manual release, select a workflow ref with the same version.
 
