@@ -4,11 +4,39 @@ import { describe, it } from "vite-plus/test";
 import {
   AudioFormatError,
   decodePcm16Wav,
+  encodePcm16kMono,
   encodeWav16k,
   prepareWav16k,
   resampleTo16k,
   STARLING_SAMPLE_RATE,
+  wav16kHeader,
 } from "../src/audio.js";
+
+describe("PCM16 streaming primitives", () => {
+  it("encodes mono float samples as little-endian PCM16", () => {
+    const bytes = encodePcm16kMono(Float32Array.from([0, 1, -1, 0.5, -0.5, Number.NaN]));
+    const view = new DataView(bytes.buffer);
+
+    assert.deepEqual(
+      Array.from({ length: bytes.byteLength / 2 }, (_, index) => view.getInt16(index * 2, true)),
+      [0, 32_767, -32_768, 16_384, -16_384, 0],
+    );
+  });
+
+  it("stamps a header identical to the one encodeWav16k writes", () => {
+    const samples = new Float32Array(3_200);
+    const wav = encodeWav16k({ samples, sampleRate: 16_000 });
+
+    assert.deepEqual(wav.slice(0, 44), wav16kHeader(samples.length * 2));
+    assert.equal(String.fromCharCode(...wav16kHeader(4).slice(0, 4)), "RIFF");
+    assert.equal(new DataView(wav16kHeader(4).buffer).getUint32(40, true), 4);
+  });
+
+  it("rejects headers for sizes that cannot be PCM16", () => {
+    assert.throws(() => wav16kHeader(3), AudioFormatError);
+    assert.throws(() => wav16kHeader(0xffff_ffff), AudioFormatError);
+  });
+});
 
 describe("canonical WAV preparation", () => {
   it("mixes stereo and resamples to the native server's required format", async () => {

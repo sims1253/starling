@@ -2,6 +2,8 @@
 
 The desktop client records mono microphone audio, converts it to PCM16 16 kHz WAV, saves the WAV locally in IndexedDB, and then sends it to the selected server. A failed or interrupted request leaves the recording available to play, download, and retry. Transcript text is displayed and exported exactly as returned by the server.
 
+When the server is a native `starling-serve` and "Live streaming transcript" is enabled in settings, recording additionally streams PCM16 chunks over the server's `WS /stream` endpoint and shows partial transcripts while you speak. Each chunk is journaled to local storage before it is streamed, the WAV is finalized before the streamed result is accepted, and any stream failure falls back to the batch upload of the saved WAV. The streaming connection assumes a loopback or trusted endpoint without authentication, like the native server's default; batch uploads keep the proxy-auth support of the shared client.
+
 ## Run the browser preview
 
 Start `starling-serve` on `127.0.0.1:8181`, then from the repository root run:
@@ -11,7 +13,7 @@ pnpm install
 pnpm run dev
 ```
 
-Vite proxies `/api` to `http://127.0.0.1:8181`. Set `STARLING_API_TARGET` before the dev command to change the proxy destination.
+Vite proxies `/api` to `http://127.0.0.1:8181`, including WebSocket upgrades on `/api/stream` for live streaming. Set `STARLING_API_TARGET` before the dev command to change the proxy destination.
 
 ## Run the native app
 
@@ -25,11 +27,11 @@ pnpm run desktop
 - Windows microphone privacy settings must allow desktop apps.
 - Linux needs a working PipeWire or PulseAudio microphone source.
 
-The native app sends requests through its sandboxed Electron preload bridge, so a local server does not need browser CORS headers. `Cmd+Shift+Space` on macOS or `Ctrl+Shift+Space` on Windows/Linux focuses Starling and toggles recording. It does not inject text into another app; copying and export are explicit actions.
+The native app sends batch requests through its sandboxed Electron preload bridge, so a local server does not need browser CORS headers. The live streaming socket connects directly from the renderer, which works for loopback endpoints; WebSockets carry no credentials, so authenticated remote proxies should keep streaming off and use batch uploads. `Cmd+Shift+Space` on macOS or `Ctrl+Shift+Space` on Windows/Linux focuses Starling and toggles recording. It does not inject text into another app; copying and export are explicit actions.
 
 Create an unpacked application directory with `pnpm --filter @starling/desktop package --dir`, or build the platform installer with `pnpm --filter @starling/desktop package`. Packaging targets macOS, Windows, AppImage, and Debian packages. Each installer is built on its native host.
 
-Audio is held in memory while the microphone is live and becomes durable when recording stops, before the upload starts. A process or device crash during an active recording cannot be recovered in this foundation.
+Batch-mode audio (imports, or recordings with live streaming disabled or unavailable) is held in memory while the microphone is live and becomes durable when recording stops, before the upload starts; a process or device crash during that capture still cannot be recovered in this foundation. Live-streamed recordings journal each chunk to IndexedDB as it is captured, so a crash mid-recording leaves recoverable audio, and journals are recovered as retryable sessions on the next start.
 
 If local storage fails, Starling keeps each unsaved WAV in memory and shows a
 download button for it. Downloading does not discard that copy: a download can

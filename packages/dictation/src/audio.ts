@@ -155,16 +155,29 @@ function pcm16(sample: number): number {
   return clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
 }
 
-/** Encode arbitrary floating-point PCM as mono 16 kHz PCM16 WAV. */
-export function encodeWav16k(audio: PcmAudio): Uint8Array {
-  const samples = resampleTo16k(audio);
-  const dataSize = samples.length * 2;
+/** Encode mono 16 kHz floating-point samples as little-endian PCM16 bytes. */
+export function encodePcm16kMono(samples: Float32Array): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(samples.length * 2);
+  const view = new DataView(bytes.buffer);
 
-  if (dataSize > 0xffff_ffff - 36) {
-    throw new AudioFormatError({ message: "audio is too large for a WAV file" });
+  for (let index = 0; index < samples.length; index += 1) {
+    view.setInt16(index * 2, pcm16(samples[index] ?? 0), true);
   }
 
-  const bytes = new Uint8Array(44 + dataSize);
+  return bytes;
+}
+
+/**
+ * The canonical 44-byte WAV header for PCM16 16 kHz mono data of `dataBytes`
+ * bytes. Streaming captures persist raw PCM16 chunks and stamp this header on
+ * assembly, producing bytes identical to `encodeWav16k`.
+ */
+export function wav16kHeader(dataBytes: number): Uint8Array<ArrayBuffer> {
+  if (dataBytes > 0xffff_ffff - 36 || dataBytes % 2 !== 0) {
+    throw new AudioFormatError({ message: "invalid PCM16 data size for a WAV file" });
+  }
+
+  const bytes = new Uint8Array(44);
   const view = new DataView(bytes.buffer);
 
   const writeAscii = (offset: number, value: string): void => {
@@ -174,7 +187,7 @@ export function encodeWav16k(audio: PcmAudio): Uint8Array {
   };
 
   writeAscii(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
+  view.setUint32(4, 36 + dataBytes, true);
   writeAscii(8, "WAVE");
   writeAscii(12, "fmt ");
   view.setUint32(16, 16, true);
@@ -185,7 +198,23 @@ export function encodeWav16k(audio: PcmAudio): Uint8Array {
   view.setUint16(32, 2, true);
   view.setUint16(34, 16, true);
   writeAscii(36, "data");
-  view.setUint32(40, dataSize, true);
+  view.setUint32(40, dataBytes, true);
+
+  return bytes;
+}
+
+/** Encode arbitrary floating-point PCM as mono 16 kHz PCM16 WAV. */
+export function encodeWav16k(audio: PcmAudio): Uint8Array {
+  const samples = resampleTo16k(audio);
+  const dataSize = samples.length * 2;
+
+  if (dataSize > 0xffff_ffff - 36) {
+    throw new AudioFormatError({ message: "audio is too large for a WAV file" });
+  }
+
+  const bytes = new Uint8Array(44 + dataSize);
+  bytes.set(wav16kHeader(dataSize), 0);
+  const view = new DataView(bytes.buffer);
 
   for (let index = 0; index < samples.length; index += 1) {
     view.setInt16(44 + index * 2, pcm16(samples[index] ?? 0), true);

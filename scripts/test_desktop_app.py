@@ -83,7 +83,9 @@ def main():
         log_directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="starling-app-test-"))
         server_log = stack.enter_context(open(Path(log_directory) / "server.log", "w+"))
         frontend_log = stack.enter_context(open(Path(log_directory) / "frontend.log", "w+"))
-        server = subprocess.Popen([str(binary), "--model", "parakeet", "--gguf", __file__, "--port", str(backend_port)], cwd=ROOT, start_new_session=os.name != "nt", stdout=server_log, stderr=subprocess.STDOUT)
+        server = subprocess.Popen([str(binary), "--model", "parakeet", "--gguf", __file__, "--port", str(backend_port),
+                                   "--min-chunk-seconds", "0.05", "--stream-chunk-seconds", "0.2",
+                                   "--stream-overlap-seconds", "0.05", "--partial-interval-seconds", "0.05"], cwd=ROOT, start_new_session=os.name != "nt", stdout=server_log, stderr=subprocess.STDOUT)
         stack.callback(stop, server)
         wait_ready(f"http://127.0.0.1:{backend_port}/health", server)
         environment = {**os.environ, "STARLING_API_TARGET": f"http://127.0.0.1:{backend_port}"}
@@ -159,13 +161,53 @@ def main():
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
                 page.unroute(upload)
 
-                # Fake microphone supplies real PCM through the browser capture path.
+                # The overlap block saved settings with the OpenAI API format;
+                # live streaming is Starling-API-only, so restore it first.
+                page.get_by_role("button", name="Open server settings").click()
+                page.get_by_label(re.compile(r"^API format")).select_option("starling")
+                page.get_by_role("button", name="Save settings", exact=True).click()
+
+                # Fake microphone supplies real PCM through the browser capture
+                # path. Live streaming is on by default for the Starling API:
+                # partials appear while recording and Stop commits the stream.
                 page.get_by_role("button", name="Start recording").click()
                 expect(page.get_by_role("button", name="Stop recording")).to_be_visible()
-                page.wait_for_timeout(400)  # Collect several audio processing buffers.
+                expect(page.locator(".live-stream.live")).to_be_visible()
+                expect(page.locator(".live-text")).to_contain_text(RAW, timeout=10_000)
+                page.wait_for_timeout(700)  # Collect several audio processing buffers.
                 page.get_by_role("button", name="Stop recording").click()
                 expect(page.locator(".history-row")).to_have_count(5)
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
+
+                # A streaming socket that cannot connect must degrade to the
+                # batch upload of the saved WAV: same transcript, nothing lost.
+                # (A page-level WebSocket stub keeps this deterministic across
+                # browsers; network-level WS routing is not universally wired.)
+                page.evaluate("""() => {
+                    window.realWebSocket = window.WebSocket;
+                    window.WebSocket = function (url, protocols) {
+                        if (String(url).includes("/stream")) {
+                            // Fail like an unreachable server: error, then close, never open.
+                            const socket = new EventTarget();
+                            setTimeout(() => {
+                                socket.dispatchEvent(new Event("error"));
+                                socket.dispatchEvent(new CloseEvent("close", { code: 1006 }));
+                            }, 0);
+                            return Object.assign(socket, { readyState: 0, send() {}, close() {} });
+                        }
+                        return protocols === undefined
+                            ? new window.realWebSocket(url)
+                            : new window.realWebSocket(url, protocols);
+                    };
+                }""")
+                page.get_by_role("button", name="Start recording").click()
+                expect(page.get_by_role("button", name="Stop recording")).to_be_visible()
+                expect(page.locator(".live-stream.unavailable")).to_be_visible()
+                page.wait_for_timeout(500)
+                page.get_by_role("button", name="Stop recording").click()
+                expect(page.locator(".history-row")).to_have_count(6)
+                expect(page.locator(".transcript-body")).to_contain_text(RAW)
+                page.evaluate("() => { window.WebSocket = window.realWebSocket; }")
 
                 # Storage failure must leave every take recoverable, even if
                 # a later recording saves successfully or a download is cancelled.
@@ -178,10 +220,10 @@ def main():
                 for number in [1, 2]:
                     page.locator('input[type="file"]').set_input_files(audio_file())
                     expect(page.get_by_role("button", name=f"Download WAV {number}", exact=True)).to_be_visible()
-                expect(page.locator(".history-row")).to_have_count(5)
+                expect(page.locator(".history-row")).to_have_count(6)
                 page.evaluate("() => { IDBObjectStore.prototype.add = window.savedIdbAdd; }")
                 page.locator('input[type="file"]').set_input_files(audio_file())
-                expect(page.locator(".history-row")).to_have_count(6)
+                expect(page.locator(".history-row")).to_have_count(7)
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
                 with page.expect_download() as download_event:
                     page.get_by_role("button", name="Download WAV 1", exact=True).click()
@@ -197,7 +239,7 @@ def main():
                     page.screenshot(path=screenshot, full_page=True, animations="disabled")
                 assert not failures, "Unhandled browser exceptions: " + "; ".join(failures)
                 browser.close()
-            print("Desktop browser checks passed: import/resample, raw text, copy, durable reload, failed upload/retry, overlapping uploads, settings changes, microphone capture, storage failure recovery")
+            print("Desktop browser checks passed: import/resample, raw text, copy, durable reload, failed upload/retry, overlapping uploads, settings changes, microphone capture with live streaming and blocked-socket fallback, storage failure recovery")
         except BaseException:
             frontend_log.seek(0)
             print(frontend_log.read()[-4000:])

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vite-plus/test";
-import { parsePendingAudio, pendingAudioWarning } from "./closeGuard.js";
+import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
 import type { PendingAudioState } from "./ipc.js";
 
 const clean: PendingAudioState = { recording: false, finalizing: false, unsavedCount: 0 };
@@ -21,6 +21,13 @@ describe("pendingAudioWarning", () => {
     assert.equal(
       pendingAudioWarning({ ...clean, recording: true }),
       "Closing now permanently deletes the live recording.",
+    );
+  });
+
+  it("says how much a journaled (streaming) recording has saved", () => {
+    assert.equal(
+      pendingAudioWarning({ ...clean, recording: true, journaled: true }),
+      "Closing now permanently deletes the live recording (including the audio saved so far).",
     );
   });
 
@@ -50,6 +57,45 @@ describe("pendingAudioWarning", () => {
   });
 });
 
+describe("pendingAudioReloadWarning", () => {
+  it("keeps the deletion wording for memory-only audio", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, recording: true }),
+      pendingAudioWarning({ ...clean, recording: true }),
+    );
+  });
+
+  it("promises recovery, not deletion, for a journaled recording", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, recording: true, journaled: true }),
+      "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start.",
+    );
+  });
+
+  it("still names memory-only audio a reload destroys alongside the journal", () => {
+    assert.equal(
+      pendingAudioReloadWarning({
+        recording: true,
+        finalizing: false,
+        unsavedCount: 2,
+        journaled: true,
+      }),
+      "Reload stops the live recording; the audio saved so far is kept and offered as a recovered take on the next start. Reload also permanently deletes 2 unsaved recordings.",
+    );
+  });
+
+  it("promises recovery for a journaled finalize instead of deletion", () => {
+    assert.equal(
+      pendingAudioReloadWarning({ ...clean, finalizing: true, journaled: true }),
+      "Reload interrupts the save; the audio saved so far is kept and offered as a recovered take on the next start.",
+    );
+  });
+
+  it("does not warn about a journaled finalize with nothing else at risk", () => {
+    assert.equal(pendingAudioWarning({ ...clean, finalizing: true, journaled: true }), undefined);
+  });
+});
+
 describe("parsePendingAudio", () => {
   it("accepts the renderer's mirror state", () => {
     assert.deepEqual(parsePendingAudio({ recording: true, finalizing: false, unsavedCount: 3 }), {
@@ -57,6 +103,11 @@ describe("parsePendingAudio", () => {
       finalizing: false,
       unsavedCount: 3,
     });
+
+    assert.deepEqual(
+      parsePendingAudio({ recording: true, finalizing: false, unsavedCount: 1, journaled: true }),
+      { recording: true, finalizing: false, unsavedCount: 1, journaled: true },
+    );
   });
 
   it("clamps counts to whole non-negative numbers", () => {

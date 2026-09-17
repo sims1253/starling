@@ -352,6 +352,59 @@ kbd {
 .has-transcript .record-meta kbd {
   display: none;
 }
+.live-stream {
+  width: min(620px, 100%);
+  margin: 2px 0 10px;
+  min-height: 22px;
+}
+.live-stream .live-text {
+  margin: 0;
+  max-height: 68px;
+  overflow: hidden;
+  font: 400 15px/1.55 var(--serif);
+  color: var(--ink);
+  mask-image: linear-gradient(#000 72%, transparent);
+}
+.live-stream .live-text em {
+  color: var(--muted);
+}
+.live-stream .live-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+.live-stream.interrupted .live-note,
+.live-stream.unavailable .live-note {
+  color: #c9a15f;
+}
+.live-stream .live-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.settings-check {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.settings-check input[type="checkbox"] {
+  width: auto;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: #747e3d;
+}
+.settings-check input[type="checkbox"]:disabled {
+  opacity: 0.45;
+}
+.settings-check span {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
 .error-banner {
   position: absolute;
   bottom: 28px;
