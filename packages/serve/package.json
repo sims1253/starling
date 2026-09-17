@@ -1,0 +1,36 @@
+{
+  "name": "starling-serve",
+  "version": "0.2.0",
+  "description": "One-command launcher for the starling-serve native speech-recognition server. Detects your platform, downloads the matching prebuilt binary from GitHub Releases on first run, verifies its SHA-256 checksum, and runs it.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sims1253/starling.git",
+    "directory": "packages/serve"
+  },
+  "bin": {
+    "starling-serve": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vp test run",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "pnpm run typecheck && pnpm run build && pnpm run test"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

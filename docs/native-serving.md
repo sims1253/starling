@@ -4,9 +4,29 @@
 `libstarling_ggml` and does not require Python, PyTorch, Transformers, or Triton.
 GPU builds still need the platform's driver and runtime libraries.
 
-Start with [build](#build) and [usage](#usage), or see
-[release artifacts](#release-artifacts) for binary prerequisites. The
-[API contract](#api-contract) covers differences from `starling.server`.
+Start with [build](#build) and [usage](#usage), [install with npm](#install-with-npm)
+for the prebuilt path, or see [release artifacts](#release-artifacts) for
+binary prerequisites. The [API contract](#api-contract) covers differences
+from `starling.server`.
+
+## Install with npm
+
+The `starling-serve` npm package ([packages/serve](../packages/serve/)) is a
+launcher: it picks the release artifact for your platform and backend,
+downloads it from GitHub Releases on first run, verifies both checksum layers,
+caches it, and execs it with the arguments you pass. No compiler or GPU
+required, and no postinstall script — see [packaging](packaging.md) for why.
+
+```bash
+npx starling-serve --model parakeet --gguf model.gguf --port 8181
+pnpm dlx starling-serve --model parakeet --gguf model.gguf --port 8181
+```
+
+The launcher defaults to `metal` on Apple Silicon, `vulkan` on Linux when the
+Vulkan loader is present (`cpu` otherwise), and `cpu` on Windows. Force a
+backend with `--starling-backend cuda` or `STARLING_SERVE_BACKEND=cuda`. The
+full matrix, cache layout, and environment overrides are documented in
+[packaging](packaging.md).
 
 ## Build
 
@@ -264,13 +284,14 @@ and input; the filename alone does not guarantee it. See the
 
 ## Release artifacts
 
-The release workflow packages six executables with SHA-256 checksums in
+The release workflow packages nine executables with SHA-256 checksums in
 `.tar.gz` archives on Linux/macOS and `.zip` archives on Windows. It links
 Starling and ggml into the executable, but does not bundle accelerator runtime
 libraries. These are not fully static binaries.
 
 | Backend | Runtime prerequisites |
 | --- | --- |
+| CPU | None beyond the platform C/C++ runtime (`libstdc++6` and `libgomp1` on Linux; the Windows build uses the static CRT). |
 | CUDA | Compatible NVIDIA driver and CUDA runtime/cuBLAS libraries. The workflow builds with CUDA 13.3. |
 | ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow installs ROCm from its `latest` repository. |
 | Vulkan | Vulkan loader and a compatible GPU driver. |
@@ -288,9 +309,12 @@ Choose the executable for your operating system, CPU architecture, and GPU:
 | `starling-serve-linux-cuda` | Linux x86_64 | CUDA | NVIDIA |
 | `starling-serve-linux-rocm` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
 | `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
+| `starling-serve-linux-cpu` | Linux x86_64 | CPU | No GPU required |
 | `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (static application CRT) |
 | `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (static application CRT) |
+| `starling-serve-windows-cpu.exe` | Windows x86_64 | CPU | No GPU required (static application CRT) |
 | `starling-serve-macos-metal` | macOS arm64 | Metal | Apple Silicon |
+| `starling-serve-macos-cpu` | macOS arm64 | CPU | Apple Silicon, no GPU needed |
 
 ### GPU selection
 
