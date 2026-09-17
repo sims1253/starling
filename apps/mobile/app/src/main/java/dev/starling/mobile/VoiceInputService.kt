@@ -148,7 +148,22 @@ class VoiceInputService : InputMethodService() {
         activeRequestGeneration = 0L
         recordButton?.setText(R.string.keyboard_record)
 
-        when (val result = capture.stop()) {
+        // The capture settles inline on this main thread in the common
+        // case; when the microphone refuses to stop, the outcome is
+        // delivered later, still on the main thread, so input teardown and
+        // onDestroy never block on the forced-release wait.
+        capture.stop { result ->
+            settleStoppedRecording(recording, requestTarget, requestGeneration, result)
+        }
+    }
+
+    private fun settleStoppedRecording(
+        recording: Recording,
+        requestTarget: InputTargetGuard.Snapshot<InputConnection>?,
+        requestGeneration: Long,
+        result: CaptureResult,
+    ) {
+        when (result) {
             is CaptureResult.Completed -> {
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)

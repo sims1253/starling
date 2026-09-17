@@ -264,14 +264,24 @@ class MainActivity : Activity() {
         activeRecording = null
         recordButton.setText(R.string.start_recording)
 
-        when (val result = capture.stop()) {
+        // The capture settles inline on this main thread in the common
+        // case; when the microphone refuses to stop, the outcome is
+        // delivered later, still on the main thread, so onStop/onDestroy
+        // never block on the forced-release wait.
+        capture.stop { result -> settleStoppedRecording(recording, result) }
+    }
+
+    private fun settleStoppedRecording(recording: Recording, result: CaptureResult) {
+        when (result) {
             is CaptureResult.Completed -> {
                 val finalized = runCatching {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
                     application.recordings.markFailed(recording.id, "Unable to finalize the private WAV recording")
-                    recordingMessage.setText(R.string.recording_finalize_error)
-                    refreshRecordings()
+                    updateRecordingViews {
+                        recordingMessage.setText(R.string.recording_finalize_error)
+                        refreshRecordings()
+                    }
                     return
                 }
                 val config = application.backendSettings.load()
@@ -288,18 +298,31 @@ class MainActivity : Activity() {
                     )
                     refreshRecordings()
                 }
-                if (queued) recordingMessage.setText(R.string.sending_recording)
-                refreshRecordings()
+                if (queued) updateRecordingViews { recordingMessage.setText(R.string.sending_recording) }
+                updateRecordingViews { refreshRecordings() }
             }
             is CaptureResult.Failed -> {
                 runCatching { application.recordings.markFailed(recording.id, result.message) }
-                recordingMessage.text = result.message
-                refreshRecordings()
+                updateRecordingViews {
+                    recordingMessage.text = result.message
+                    refreshRecordings()
+                }
             }
             CaptureResult.AlreadyStopped -> {
-                recordingMessage.setText(R.string.recording_already_stopped)
+                updateRecordingViews { recordingMessage.setText(R.string.recording_already_stopped) }
             }
         }
+    }
+
+    /**
+     * An escalated stop settles after a delay, so its outcome can arrive
+     * once the Activity is destroyed. The store settlement beside each of
+     * these calls must still run — the finalized audio stays retryable —
+     * but the views do not outlive the Activity.
+     */
+    private fun updateRecordingViews(update: () -> Unit) {
+        if (isDestroyed || isFinishing) return
+        update()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
