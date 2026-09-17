@@ -9,7 +9,16 @@ import { PendingAudioStateSchema, type PendingAudioState } from "./ipc.js";
 export function pendingAudioWarning(state: PendingAudioState): string | undefined {
   const atRisk: Array<string> = [];
 
-  if (state.recording) atRisk.push("the live recording");
+  if (state.recording) {
+    // A journaled (streaming) recording is durable up to its last chunk;
+    // Discard removes that journal too, so it is deleted with the take —
+    // but the wording must not imply no audio exists yet.
+    atRisk.push(
+      state.journaled === true
+        ? "the live recording (including the audio saved so far)"
+        : "the live recording",
+    );
+  }
 
   if (state.finalizing) atRisk.push("a recording that is still being saved");
 
@@ -20,6 +29,14 @@ export function pendingAudioWarning(state: PendingAudioState): string | undefine
 
   return `Closing now permanently deletes ${joinAtRisk(atRisk)}.`;
 }
+
+/** Mutable draft of the normalized mirror; `journaled` stays absent unless true. */
+type MutablePendingAudio = {
+  recording: boolean;
+  finalizing: boolean;
+  unsavedCount: number;
+  journaled?: boolean;
+};
 
 function joinAtRisk(items: ReadonlyArray<string>): string {
   if (items.length === 1) return items[0];
@@ -39,9 +56,13 @@ export function parsePendingAudio(state: PendingAudioState): PendingAudioState |
 
   if (Option.isNone(decoded)) return undefined;
 
-  return {
+  const normalized: MutablePendingAudio = {
     recording: decoded.value.recording,
     finalizing: decoded.value.finalizing,
     unsavedCount: Math.max(0, Math.trunc(decoded.value.unsavedCount)),
   };
+
+  if (decoded.value.journaled === true) normalized.journaled = true;
+
+  return normalized;
 }

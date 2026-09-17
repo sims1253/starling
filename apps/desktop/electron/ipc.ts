@@ -47,6 +47,12 @@ export const PendingAudioStateSchema = Schema.Struct({
   recording: Schema.Boolean,
   finalizing: Schema.Boolean,
   unsavedCount: Schema.Finite,
+  /**
+   * The live recording is being journaled to storage chunk by chunk (the
+   * streaming capture path). Older renderers omit it; the close guard then
+   * assumes the stricter memory-only wording.
+   */
+  journaled: Schema.optionalKey(Schema.Boolean),
 });
 
 export type PendingAudioState = typeof PendingAudioStateSchema.Type;
@@ -73,4 +79,11 @@ export interface StarlingDesktopBridge {
   ready(): void;
   onToggleRecording(callback: () => void): () => void;
   setPendingAudio(state: PendingAudioState): void;
+  /**
+   * The main process chose an explicit Discard in the close guard; the
+   * renderer drops its durable streaming journal, then reports back via
+   * discardCleanedUp so the window is not destroyed mid-delete.
+   */
+  onDiscardPending(callback: () => void): () => void;
+  discardCleanedUp(): void;
 }

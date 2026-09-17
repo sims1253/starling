@@ -24,6 +24,13 @@ describe("pendingAudioWarning", () => {
     );
   });
 
+  it("says how much a journaled (streaming) recording has saved", () => {
+    assert.equal(
+      pendingAudioWarning({ ...clean, recording: true, journaled: true }),
+      "Closing now permanently deletes the live recording (including the audio saved so far).",
+    );
+  });
+
   it("names a capture that is still being saved", () => {
     assert.equal(
       pendingAudioWarning({ ...clean, finalizing: true }),
@@ -57,6 +64,11 @@ describe("parsePendingAudio", () => {
       finalizing: false,
       unsavedCount: 3,
     });
+
+    assert.deepEqual(
+      parsePendingAudio({ recording: true, finalizing: false, unsavedCount: 1, journaled: true }),
+      { recording: true, finalizing: false, unsavedCount: 1, journaled: true },
+    );
   });
 
   it("clamps counts to whole non-negative numbers", () => {

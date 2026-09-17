@@ -49,6 +49,32 @@ let pendingAudio: PendingAudioState = { recording: false, finalizing: false, uns
 
 let quitting = false;
 
+// How long an explicit Discard waits for the renderer to delete a durable
+// streaming journal before the window is destroyed anyway.
+const DISCARD_CLEANUP_BUDGET_MS = 400;
+
+/**
+ * After an explicit Discard, ask the renderer to drop its durable streaming
+ * journal, then wait (bounded) for the confirmation so the window is not
+ * destroyed mid-delete. A renderer that never replies — hung, or an older
+ * build without the channel — times out and the journal survives, which
+ * recovery turns into a retryable session on next start: fail-safe.
+ */
+function discardPendingAudio(window: BrowserWindow): Promise<void> {
+  return new Promise((resolve) => {
+    const settle = (): void => resolve();
+
+    const timer = setTimeout(settle, DISCARD_CLEANUP_BUDGET_MS);
+
+    ipcMain.once("starling:discard-cleaned", () => {
+      clearTimeout(timer);
+      settle();
+    });
+
+    window.webContents.send("starling:discard-pending");
+  });
+}
+
 class RequestInputError extends Data.TaggedError("RequestInputError")<{
   readonly message: string;
 }> {}
@@ -496,12 +522,17 @@ function createWindow(): BrowserWindow {
       return;
     }
 
-    // Discard: destroy() skips this handler. A quit in progress still
-    // completes once the last window is gone; the explicit restart is a
-    // cross-version safety net, not a requirement on current Electron.
-    window.destroy();
+    // Discard: give a responsive renderer a beat to drop its durable
+    // streaming journal, so the take cannot resurrect on next start; a hung
+    // renderer times out and keeps the journal (fail-safe toward recovery).
+    // destroy() skips this handler. A quit in progress still completes once
+    // the last window is gone; the explicit restart is a cross-version
+    // safety net, not a requirement on current Electron.
+    void discardPendingAudio(window).then(() => {
+      window.destroy();
 
-    if (quitting) app.quit();
+      if (quitting) app.quit();
+    });
   });
 
   // The renderer's beforeunload handler blocks reloads while audio is at

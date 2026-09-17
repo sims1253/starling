@@ -30,6 +30,13 @@ const bridge: StarlingDesktopBridge = Object.freeze({
 
     return () => ipcRenderer.removeListener("starling:toggle-recording", listener);
   },
+  onDiscardPending: (callback: () => void) => {
+    const listener = (): void => callback();
+    ipcRenderer.on("starling:discard-pending", listener);
+
+    return () => ipcRenderer.removeListener("starling:discard-pending", listener);
+  },
+  discardCleanedUp: () => ipcRenderer.send("starling:discard-cleaned"),
 });
 
 contextBridge.exposeInMainWorld("starlingDesktop", bridge);

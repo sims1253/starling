@@ -74,6 +74,11 @@ function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+/** Stable-enough id for WAVs parked in memory when storage fails. */
+function unsavedWavId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `unsaved-${Date.now()}-${Math.random()}`;
+}
+
 async function nativeTranscribe(
   endpoint: string,
   protocol: TranscriptionProtocol,
@@ -254,11 +259,14 @@ export default function App() {
 
   // Mirror audio that exists only in this window's memory (#121) to the main
   // process, so closing Starling can warn before the only copy is destroyed.
+  // A streaming take additionally journals chunks durably; the guard needs
+  // to know so its warning does not claim no audio exists yet.
   useEffect(() => {
     const state: PendingAudioState = {
       recording,
       finalizing,
       unsavedCount: unsavedWavs.length,
+      journaled: recording && streamRef.current !== undefined ? true : undefined,
     };
 
     pendingAudioRef.current = state;
@@ -388,10 +396,9 @@ export default function App() {
       try {
         created = await store.create({ wav, durationMs });
       } catch (caught) {
-        const id = globalThis.crypto?.randomUUID?.() ?? `unsaved-${Date.now()}-${Math.random()}`;
         setUnsavedWavs((current) => [
           ...current,
-          { id, blob: wav, createdAt: new Date().toISOString() },
+          { id: unsavedWavId(), blob: wav, createdAt: new Date().toISOString() },
         ]);
         throw new Error(
           `Local storage failed: ${messageFrom(caught)} Keep this window open and download the unsaved WAV to recover it.`,
@@ -404,13 +411,10 @@ export default function App() {
     [refresh, transcribe],
   );
 
-  const parkingId = (): string =>
-    globalThis.crypto?.randomUUID?.() ?? `unsaved-${Date.now()}-${Math.random()}`;
-
   const parkUnsavedWav = useCallback((wav: Blob): void => {
     setUnsavedWavs((current) => [
       ...current,
-      { id: parkingId(), blob: wav, createdAt: new Date().toISOString() },
+      { id: unsavedWavId(), blob: wav, createdAt: new Date().toISOString() },
     ]);
   }, []);
 
@@ -474,6 +478,19 @@ export default function App() {
     setStreamStatus(undefined);
     await stream?.abandon().catch(() => {});
   }, []);
+
+  // After an explicit Discard in the close guard, drop the durable journal
+  // of the in-flight streaming take so it cannot resurrect on next start,
+  // then tell the main process it is safe to destroy the window.
+  useEffect(() => {
+    const bridge = window.starlingDesktop;
+
+    if (!bridge?.onDiscardPending) return;
+
+    return bridge.onDiscardPending(() => {
+      void discardStreamingTake().finally(() => bridge.discardCleanedUp());
+    });
+  }, [discardStreamingTake]);
 
   /**
    * Finalize a streamed take. Returns false when the stream was never usable
@@ -544,7 +561,20 @@ export default function App() {
 
         // 16 kHz lets each chunk stream as-is; any other actual rate is
         // reported per chunk and degrades that take to batch mode.
-        await start(onChunk ? { sampleRate: 16_000, onChunk } : undefined);
+        if (onChunk) {
+          try {
+            await start({ sampleRate: 16_000, onChunk });
+          } catch (cause) {
+            // Capture setup failed after the stream was wired: drop its
+            // journal and socket so neither lingers until the next start.
+            await discardStreamingTake();
+            throw cause;
+          }
+
+          return;
+        }
+
+        await start();
 
         return;
       }
