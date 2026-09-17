@@ -191,6 +191,26 @@ class StreamClientTest {
         }
     }
 
+    @Test fun backlogChunksAlwaysPrecedeChunksSentAfterLive() {
+        // Regression guard for the atomic backlog drain: a chunk buffered
+        // before the socket opened must never reach the server behind a
+        // chunk sent after the Live event, whatever the interleaving.
+        val harness = StreamHarness(headersDelayMillis = 300)
+        try {
+            val session = harness.connect()
+            val early = harness.pcm(8)
+            session.onAudio(early, early.size)
+            harness.awaitLive()
+            val late = harness.pcm(8)
+            session.onAudio(late, late.size)
+            harness.awaitAudioCount(2)
+            assertArrayEquals(early, harness.audio()[0].toByteArray())
+            assertArrayEquals(late, harness.audio()[1].toByteArray())
+        } finally {
+            harness.close()
+        }
+    }
+
     @Test fun keepalivePingsAreAnsweredAndKeepTheSessionAlive() {
         val harness = StreamHarness(
             serverBehavior = { text, socket ->

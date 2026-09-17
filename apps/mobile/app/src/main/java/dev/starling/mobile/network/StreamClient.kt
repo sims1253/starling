@@ -241,30 +241,41 @@ class StreamClient(
         // WebSocketListener — OkHttp reader/writer threads.
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            val flush = synchronized(lock) {
+            var flushFailed = false
+            val dead = synchronized(lock) {
                 when {
-                    settled.get() || closedByClient || interruptedReason != null -> null
+                    settled.get() || closedByClient || interruptedReason != null -> true
                     else -> {
                         connected = true
                         awaitingPong = false
                         missedPongs = 0
-                        val pending = backlog.toList()
+                        // Drain the whole backlog under the same lock hold
+                        // that made this connection live. Releasing between
+                        // chunks would let an onAudio call direct-send a
+                        // newer chunk ahead of older backlog chunks, and the
+                        // server reassembles PCM in arrival order — a
+                        // garbled final transcript with no failure signal.
+                        // sendLocked only enqueues, so this costs one lock
+                        // acquisition either way.
+                        while (backlog.isNotEmpty()) {
+                            if (!sendLocked(backlog.removeFirst())) {
+                                flushFailed = true
+                                break
+                            }
+                        }
                         backlog.clear()
                         backlogBytes = 0
-                        pending
+                        false
                     }
                 }
             }
-            if (flush == null) {
+            if (dead) {
                 runCatching { webSocket.close(NORMAL_CLOSE, null) }
                 return
             }
-            for (chunk in flush) {
-                val accepted = synchronized(lock) { !settled.get() && sendLocked(chunk) }
-                if (!accepted) {
-                    fail("the stream connection stopped accepting audio")
-                    return
-                }
+            if (flushFailed) {
+                fail("the stream connection stopped accepting audio")
+                return
             }
             events(StreamEvent.Live)
         }
@@ -385,6 +396,15 @@ class StreamClient(
             synchronized(lock) {
                 when {
                     settled.get() || closedByClient || !connected || interruptedReason != null -> Unit
+                    // While a commit is being finalized the server's read
+                    // loop may legitimately stop answering pings; declaring
+                    // the stream dead there would trigger a redundant batch
+                    // upload long before the documented final budget ends.
+                    // Keep pinging so a resumed server resets the counter,
+                    // but leave miss counting to the recording phase — a
+                    // dead server during commit is caught by onFailure or
+                    // the final timeout instead.
+                    finishing -> sendTextLocked(PING_FRAME)
                     awaitingPong -> {
                         missedPongs++
                         if (missedPongs >= MISSED_PONG_LIMIT) {

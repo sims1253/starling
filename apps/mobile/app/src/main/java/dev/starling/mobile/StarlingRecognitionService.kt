@@ -183,21 +183,28 @@ class StarlingRecognitionService : RecognitionService() {
                     application.transcription.transcribe(finalized.id, config, settled)
                 }
             }
-            is RecognitionSessionGuard.Settlement.Keep ->
-                // The recording itself was the user's intent; keep it, skip upload.
+            is RecognitionSessionGuard.Settlement.Keep -> {
+                // The recording itself was the user's intent; keep it, skip
+                // upload, and drop the server session so no keepalive keeps
+                // it alive after the host cancelled.
+                session?.close()
                 runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
                 }
+            }
             is RecognitionSessionGuard.Settlement.Fail -> {
+                session?.close()
                 runCatching { application.recordings.markFailed(settlement.recordingId, settlement.message) }
                 settlement.errorCode?.let { code ->
                     sessions.deliver(ending.session.owner) { it.error(code) }
                 }
             }
-            is RecognitionSessionGuard.Settlement.Empty ->
+            is RecognitionSessionGuard.Settlement.Empty -> {
+                session?.close()
                 settlement.errorCode?.let { code ->
                     sessions.deliver(ending.session.owner) { it.error(code) }
                 }
+            }
         }
     }
 

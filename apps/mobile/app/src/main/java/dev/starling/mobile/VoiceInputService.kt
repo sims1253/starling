@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
+import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -56,12 +57,18 @@ class VoiceInputService : InputMethodService() {
     private var readyTranscript: ReadyTranscript? = null
 
     // Live-stream state. The session is set before the capture starts and
-    // read by the capture worker through the chunk listener; composingTarget
+    // is read by the capture worker through the chunk listener; composingTarget
     // is the editor snapshot the composing region belongs to, main thread
     // only, kept until the stream's final text settles it.
     @Volatile
     private var streamSession: StreamSession? = null
     private var composingTarget: InputTargetGuard.Snapshot<InputConnection>? = null
+
+    // Whether the current editor can process composing text. TYPE_NULL
+    // (non-rich) editors cannot: there, setComposingText inserts each
+    // partial at the cursor, so growing partials would duplicate. Those
+    // targets degrade to the explicit Insert flow for the final text.
+    private var composingSupported = false
 
     override fun onCreate() {
         super.onCreate()
@@ -93,6 +100,8 @@ class VoiceInputService : InputMethodService() {
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         if (activeRecording != null) stopAndQueueRecording()
+        composingSupported = ((attribute?.inputType ?: InputType.TYPE_NULL) and
+            InputType.TYPE_MASK_CLASS) != InputType.TYPE_NULL
         val connection = currentInputConnection
         if (connection != null) targetGuard.targetStarted(connection) else targetGuard.targetFinished()
         // A response belonging to a previous editor must never become an
@@ -166,7 +175,7 @@ class VoiceInputService : InputMethodService() {
         }
         activeRecording = recording
         streamSession = session
-        composingTarget = if (session == null) null else target
+        composingTarget = if (session == null || !composingSupported) null else target
         recordingTarget = target
         activeRequestGeneration = requestGeneration
         readyTranscript = null

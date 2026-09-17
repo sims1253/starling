@@ -381,13 +381,16 @@ class MainActivity : Activity() {
         // The Activity may have been destroyed (for example by a rotation)
         // while the request was in flight; the store settlement already ran.
         if (isDestroyed || isFinishing) return
-        recordingMessage.setText(
-            if (completed.status == RecordingStatus.TRANSCRIBED) {
-                R.string.transcription_saved
-            } else {
-                R.string.transcription_failed_retry
-            },
-        )
+        if (completed.status == RecordingStatus.TRANSCRIBED) {
+            // The verbatim final is in the recordings list now; a leftover
+            // live partial next to it could read as the final text.
+            liveTranscript.visibility = View.GONE
+            recordingMessage.setText(R.string.transcription_saved)
+        } else {
+            // Keep the last partial visible: it is the only text the user
+            // has while the recording waits for a retry.
+            recordingMessage.setText(R.string.transcription_failed_retry)
+        }
         refreshRecordings()
     }
 
