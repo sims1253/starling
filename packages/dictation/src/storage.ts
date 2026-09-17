@@ -634,7 +634,12 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
   async abandon(): Promise<void> {
     this.closed = true;
 
-    if (this.durable) await this.discard();
+    // Unconditional and best-effort, like finish(): a journal that stopped
+    // being durable mid-take still has rows in the store, and a take the
+    // user discarded must not resurrect via recovery.
+    await this.discard().catch(() => {
+      /* recovery sweeps journals that could not be deleted */
+    });
   }
 
   private async writeChunk(index: number, pcm16: Uint8Array): Promise<void> {

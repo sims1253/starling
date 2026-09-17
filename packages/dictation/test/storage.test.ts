@@ -349,6 +349,41 @@ describe("streaming capture journal", () => {
     }
   });
 
+  it("clears every journal row on abandon even after journaling failed mid-take", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "stream-abandon-test", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+    const capture = await store.beginStreamCapture({ id: "abandoned" });
+
+    await capture.append(chunkOf(10));
+
+    const originalPut = IDBObjectStore.prototype.put;
+
+    IDBObjectStore.prototype.put = function patchedPut(
+      this: IDBObjectStore,
+      value: { captureId?: string },
+    ): IDBRequest {
+      if (value?.captureId) {
+        throw new DOMException("Test journal is full", "QuotaExceededError");
+      }
+
+      return originalPut.call(this, value);
+    };
+
+    try {
+      await assert.rejects(capture.append(chunkOf(10)), DictationStorageError);
+
+      // The first chunk is still journaled; a discard must not resurrect it.
+      await capture.abandon();
+    } finally {
+      IDBObjectStore.prototype.put = originalPut;
+    }
+
+    assert.equal((await store.recoverStreamCaptures()).length, 0);
+    assert.equal(await store.get("abandoned"), undefined);
+    store.close();
+  });
+
   it("opens v1 databases at the journal schema version without touching sessions", async () => {
     const factory = new IDBFactory();
     const options = { databaseName: "stream-upgrade-test", indexedDB: factory };
