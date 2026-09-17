@@ -604,7 +604,7 @@ jobs:
             ### Runtime requirements
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
             accelerator runtime libraries are not bundled. CUDA requires the 13.3
-            runtime and cuBLAS; ROCm requires the build's matching HIP/BLAS runtime.
+            runtime and cuBLAS; ROCm requires the 7.2.4 HIP/BLAS runtime.
             The CPU builds need only the platform C/C++ runtime. Linux Vulkan and
             Linux CPU are smoke-tested outside their build environment in a clean
             container. These startup checks do not verify GPU inference.
