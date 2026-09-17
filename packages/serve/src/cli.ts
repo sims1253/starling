@@ -13,7 +13,7 @@
  *   STARLING_SERVE_CACHE     cache directory override
  */
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import type { EventEmitter } from "node:events";
@@ -261,8 +261,33 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value && value.trim() !== "" ? value : undefined;
 }
 
-function isEntryPoint(): boolean {
-  return process.argv[1] === fileURLToPath(import.meta.url);
+/**
+ * True when this module is the Node entry point. npm/npx/pnpm run the bin
+ * through a `node_modules/.bin` symlink, so the invoked `argv[1]` is the
+ * symlink while this module's own path is already resolved to the real file —
+ * the raw strings never match. Both sides are therefore resolved to their
+ * realpaths before comparing, which is invariant to how the bin was linked.
+ */
+export function isEntryPoint(
+  invokedPath: string | undefined = process.argv[1],
+  modulePath: string = fileURLToPath(import.meta.url),
+): boolean {
+  if (invokedPath === undefined) {
+    return false;
+  }
+
+  try {
+    return samePath(realpathSync(invokedPath), realpathSync(modulePath));
+  } catch {
+    // The invoked path does not resolve to this file (another script, a stale
+    // path): this module was imported, not executed.
+    return false;
+  }
+}
+
+/** Path equality that tolerates Windows case-insensitive filesystems. */
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
 // Only self-execute when invoked as the bin; imports (tests, programmatic use)

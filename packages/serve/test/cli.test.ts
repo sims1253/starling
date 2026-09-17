@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "vite-plus/test";
 import {
+  isEntryPoint,
   parseWrapperArgs,
   runCli,
   WrapperUsageError,
@@ -103,6 +104,39 @@ describe("wrapper argument parsing", () => {
 
     assert.equal(parsed.backend, undefined);
     assert.deepEqual(parsed.forward, ["--backendish", "--starling"]);
+  });
+});
+
+describe("entry-point guard", () => {
+  it("recognizes the bin when invoked through a .bin-style symlink", async () => {
+    // npm/npx/pnpm execute node with argv[1] = the node_modules/.bin symlink
+    // while the module itself is the link target; the guard must match those.
+    const dir = await mkdtemp(join(tmpdir(), "starling-entry-"));
+    cleanups.push(dir);
+    const modulePath = join(dir, "dist", "cli.js");
+    await mkdir(dirname(modulePath), { recursive: true });
+    await writeFile(modulePath, "");
+    const binLink = join(dir, "bin-starling-serve");
+    await symlink(modulePath, binLink);
+
+    assert.equal(isEntryPoint(binLink, modulePath), true);
+    // Symmetric: the module path given as the symlink resolves to the same file.
+    assert.equal(isEntryPoint(modulePath, binLink), true);
+    assert.equal(isEntryPoint(join(dir, "dist", "cli.js"), modulePath), true);
+  });
+
+  it("does not fire when another script is invoked or argv[1] is absent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "starling-entry-"));
+    cleanups.push(dir);
+    const modulePath = join(dir, "dist", "cli.js");
+    await mkdir(dirname(modulePath), { recursive: true });
+    await writeFile(modulePath, "");
+    const other = join(dir, "other.js");
+    await writeFile(other, "");
+
+    assert.equal(isEntryPoint(other, modulePath), false);
+    assert.equal(isEntryPoint(join(dir, "missing.js"), modulePath), false);
+    assert.equal(isEntryPoint(undefined, modulePath), false);
   });
 });
 
