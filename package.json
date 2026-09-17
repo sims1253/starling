@@ -19,10 +19,10 @@
     "test:quants": "python -m unittest discover -s quants/tests -v",
     "test:api": "python -m unittest discover -s backends/native/tests -v",
     "test:electron": "uv run --no-project --with playwright python scripts/test_electron_app.py",
-    "lint": "vp lint --deny-warnings apps/desktop packages/dictation vite.config.ts",
-    "lint:fix": "vp lint --fix apps/desktop packages/dictation vite.config.ts",
-    "fmt": "vp fmt apps/desktop packages/dictation vite.config.ts",
-    "fmt:check": "vp fmt --check apps/desktop packages/dictation vite.config.ts"
+    "lint": "vp lint --deny-warnings apps/desktop packages/dictation packages/serve vite.config.ts",
+    "lint:fix": "vp lint --fix apps/desktop packages/dictation packages/serve vite.config.ts",
+    "fmt": "vp fmt apps/desktop packages/dictation packages/serve vite.config.ts",
+    "fmt:check": "vp fmt --check apps/desktop packages/dictation packages/serve vite.config.ts"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.82.0",
