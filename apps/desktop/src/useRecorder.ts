@@ -4,6 +4,17 @@ import { discardRecorderHandles, RecorderSession, type RecorderHandles } from ".
 
 const BAR_COUNT = 52;
 
+export interface RecorderStartOptions {
+  /**
+   * Preferred capture rate. Requesting 16 kHz lets chunks stream to the
+   * server without resampling; the actual rate is reported per chunk because
+   * the browser may not honor the request.
+   */
+  readonly sampleRate?: number;
+  /** Receives each captured chunk (mono, at the actual context sample rate). */
+  readonly onChunk?: (chunk: Float32Array, sampleRate: number) => void;
+}
+
 export function useRecorder() {
   const [recording, setRecording] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -57,71 +68,78 @@ export function useRecorder() {
     [session],
   );
 
-  const start = useCallback(async () => {
-    // Refs, not the `recording` snapshot: guards must hold between renders.
-    if (recordingRef.current || startingRef.current) return;
-    startingRef.current = true;
-    let stream: MediaStream | undefined;
-    let context: AudioContext | undefined;
-
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
-      context = new AudioContext();
-      const source = context.createMediaStreamSource(stream);
-      const analyser = context.createAnalyser();
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      const silent = context.createGain();
-      silent.gain.value = 0;
-      const handles: RecorderHandles = { stream, context, source, analyser, processor };
-      processor.onaudioprocess = (event) => {
-        chunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-      };
-
-      source.connect(analyser);
-      source.connect(processor);
-      processor.connect(silent);
-      silent.connect(context.destination);
-
-      if (!aliveRef.current) {
-        // Unmounted while permission was pending; nobody will stop this
-        // capture later, so release the hardware immediately.
-        await discardRecorderHandles(handles);
-
-        return;
-      }
-
-      session.install(handles);
-      chunksRef.current = [];
-      recordingRef.current = true;
-      startedAtRef.current = performance.now();
-      setElapsedMs(0);
-      setRecording(true);
-      timerRef.current = window.setInterval(
-        () => setElapsedMs(performance.now() - startedAtRef.current),
-        100,
-      );
-      drawLevels();
-    } catch (error) {
-      stream?.getTracks().forEach((track) => track.stop());
+  const start = useCallback(
+    async (options?: RecorderStartOptions) => {
+      // Refs, not the `recording` snapshot: guards must hold between renders.
+      if (recordingRef.current || startingRef.current) return;
+      startingRef.current = true;
+      let stream: MediaStream | undefined;
+      let context: AudioContext | undefined;
 
       try {
-        await context?.close();
-      } catch {
-        /* context was not fully initialized */
-      }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+        context = new AudioContext(
+          options?.sampleRate !== undefined ? { sampleRate: options.sampleRate } : undefined,
+        );
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        const processor = context.createScriptProcessor(4096, 1, 1);
+        const silent = context.createGain();
+        silent.gain.value = 0;
+        const handles: RecorderHandles = { stream, context, source, analyser, processor };
+        processor.onaudioprocess = (event) => {
+          const chunk = new Float32Array(event.inputBuffer.getChannelData(0));
+          chunksRef.current.push(chunk);
+          options?.onChunk?.(chunk, handles.context.sampleRate);
+        };
 
-      throw error;
-    } finally {
-      startingRef.current = false;
-    }
-  }, [drawLevels, session]);
+        source.connect(analyser);
+        source.connect(processor);
+        processor.connect(silent);
+        silent.connect(context.destination);
+
+        if (!aliveRef.current) {
+          // Unmounted while permission was pending; nobody will stop this
+          // capture later, so release the hardware immediately.
+          await discardRecorderHandles(handles);
+
+          return;
+        }
+
+        session.install(handles);
+        chunksRef.current = [];
+        recordingRef.current = true;
+        startedAtRef.current = performance.now();
+        setElapsedMs(0);
+        setRecording(true);
+        timerRef.current = window.setInterval(
+          () => setElapsedMs(performance.now() - startedAtRef.current),
+          100,
+        );
+        drawLevels();
+      } catch (error) {
+        stream?.getTracks().forEach((track) => track.stop());
+
+        try {
+          await context?.close();
+        } catch {
+          /* context was not fully initialized */
+        }
+
+        throw error;
+      } finally {
+        startingRef.current = false;
+      }
+    },
+    [drawLevels, session],
+  );
 
   const stop = useCallback(async (): Promise<
     { audio: PcmAudio; durationMs: number } | undefined

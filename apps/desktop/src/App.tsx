@@ -2,9 +2,11 @@ import { Effect, Match } from "effect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   analyzeTranscript,
+  encodePcm16kMono,
   IndexedDbSessionStore,
   prepareWav16k,
   StarlingClient,
+  StarlingStream,
   type DictationSession,
   type TranscriptionProtocol,
   type TranscriptionResult,
@@ -19,12 +21,14 @@ import {
   FileAudio,
   LoaderCircle,
   Mic,
+  Radio,
   RefreshCw,
   Settings2,
   Trash2,
   X,
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
+import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
@@ -100,6 +104,11 @@ export default function App() {
   );
 
   const [model, setModel] = useState(() => localStorage.getItem("starling:model") ?? "parakeet");
+
+  const [streamLive, setStreamLive] = useState(
+    () => localStorage.getItem("starling:streaming") !== "0",
+  );
+
   const [draftEndpoint, setDraftEndpoint] = useState(endpoint);
   const [connection, setConnection] = useState<Connection>("checking");
   const [serverModel, setServerModel] = useState("server");
@@ -124,6 +133,13 @@ export default function App() {
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   const { recording, elapsedMs, levels, start, stop } = useRecorder();
+
+  // Live transcription state for the take in progress.
+  const [partialText, setPartialText] = useState<string>();
+  const [streamStatus, setStreamStatus] = useState<{ state: StreamingState; detail?: string }>();
+  const streamRef = useRef<StreamingDictation | undefined>(undefined);
+  // Set when the capture rate cannot be streamed; Stop then uses the batch path.
+  const streamBailedRef = useRef(false);
 
   const selected = sessions.find((session) => session.id === selectedId);
   const [audioUrl, setAudioUrl] = useState<string>();
@@ -225,6 +241,9 @@ export default function App() {
             : [],
         ),
       );
+      // Streaming captures journal audio as it arrives; anything the app
+      // left behind becomes a retryable session instead of orphaned bytes.
+      await store.recoverStreamCaptures();
       await refresh();
     })().catch((caught) => setError(`Could not open saved recordings: ${messageFrom(caught)}`));
   }, [refresh]);
@@ -385,17 +404,152 @@ export default function App() {
     [refresh, transcribe],
   );
 
+  const parkingId = (): string =>
+    globalThis.crypto?.randomUUID?.() ?? `unsaved-${Date.now()}-${Math.random()}`;
+
+  const parkUnsavedWav = useCallback((wav: Blob): void => {
+    setUnsavedWavs((current) => [
+      ...current,
+      { id: parkingId(), blob: wav, createdAt: new Date().toISOString() },
+    ]);
+  }, []);
+
+  /** Wire live streaming for the next take; undefined means "use batch mode". */
+  const beginStreamingTake = useCallback(async (): Promise<
+    ((chunk: Float32Array, sampleRate: number) => void) | undefined
+  > => {
+    setPartialText(undefined);
+    setStreamStatus({ state: "connecting" });
+    streamBailedRef.current = false;
+
+    let transport: StarlingStream;
+
+    try {
+      transport = new StarlingStream({ baseUrl: endpoint });
+    } catch {
+      setStreamStatus(undefined);
+
+      return undefined;
+    }
+
+    let capture;
+
+    try {
+      capture = await store.beginStreamCapture();
+    } catch {
+      setStreamStatus(undefined);
+
+      return undefined;
+    }
+
+    const controller = new StreamingDictation(transport, capture, {
+      onPartial: (text) => setPartialText(text),
+      onStateChange: (state, detail) => setStreamStatus({ state, detail }),
+    });
+
+    streamRef.current = controller;
+
+    void controller.connect();
+
+    return (chunk, sampleRate) => {
+      if (sampleRate === 16_000) {
+        controller.onChunk(encodePcm16kMono(chunk));
+
+        return;
+      }
+
+      // Unexpected capture rate: never stream or journal resampled guesses.
+      if (!streamBailedRef.current) {
+        streamBailedRef.current = true;
+        controller.fail("The microphone capture rate is not supported for live streaming.");
+      }
+    };
+  }, [endpoint]);
+
+  const discardStreamingTake = useCallback(async (): Promise<void> => {
+    const stream = streamRef.current;
+    streamRef.current = undefined;
+    streamBailedRef.current = false;
+    setPartialText(undefined);
+    setStreamStatus(undefined);
+    await stream?.abandon().catch(() => {});
+  }, []);
+
+  /**
+   * Finalize a streamed take. Returns false when the stream was never usable
+   * and the caller should save the recorder's own capture via the batch path.
+   */
+  const finishStreamingTake = useCallback(
+    async (durationMs: number): Promise<boolean> => {
+      const stream = streamRef.current;
+      streamRef.current = undefined;
+      const bailed = streamBailedRef.current;
+      streamBailedRef.current = false;
+
+      if (!stream) return false;
+
+      if (bailed) {
+        setPartialText(undefined);
+        setStreamStatus(undefined);
+        await stream.abandon();
+
+        return false;
+      }
+
+      const result = await stream.finish(durationMs);
+      setPartialText(undefined);
+      setStreamStatus(undefined);
+
+      if (!result.session) {
+        // The durable save failed; the assembled WAV is the only copy.
+        parkUnsavedWav(result.wav);
+        throw new Error(
+          `Local storage failed: ${messageFrom(result.failure ?? "unknown storage failure")} Keep this window open and download the unsaved WAV to recover it.`,
+        );
+      }
+
+      await refresh();
+
+      if (result.streamed && result.transcript) {
+        await store.saveTranscript(result.session.id, result.transcript, { streamed: true });
+        setSelectedId(result.session.id);
+        setConnection("ready");
+        await refresh();
+      } else {
+        if (result.streamNote) {
+          await store.noteStreamError(result.session.id, result.streamNote).catch(() => {});
+        }
+
+        await transcribe(result.session);
+      }
+
+      return true;
+    },
+    [parkUnsavedWav, refresh, transcribe],
+  );
+
   const toggleRecording = useCallback(async () => {
     setError(undefined);
 
     try {
       if (!recording) {
-        await start();
+        let onChunk: ((chunk: Float32Array, sampleRate: number) => void) | undefined;
+
+        if (streamLive && protocol === "starling") {
+          onChunk = await beginStreamingTake();
+        } else {
+          setPartialText(undefined);
+          setStreamStatus(undefined);
+        }
+
+        // 16 kHz lets each chunk stream as-is; any other actual rate is
+        // reported per chunk and degrades that take to batch mode.
+        await start(onChunk ? { sampleRate: 16_000, onChunk } : undefined);
 
         return;
       }
 
-      // From Stop until store.create persists the capture (or it is parked in
+      // From Stop until the capture is durably stored (or parked in
       // unsavedWavs), the only copy lives in this window's memory (#121).
       setFinalizing(true);
 
@@ -403,10 +557,20 @@ export default function App() {
         const capture = await stop();
 
         // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
-        if (!capture || capture.audio.samples.length === 0)
+        if (!capture || capture.audio.samples.length === 0) {
+          await discardStreamingTake();
           throw new Error("No microphone audio was captured.");
+        }
 
-        if (capture.durationMs < 250) throw new Error("Recording was too short to keep.");
+        if (capture.durationMs < 250) {
+          await discardStreamingTake();
+          throw new Error("Recording was too short to keep.");
+        }
+
+        if (streamRef.current && (await finishStreamingTake(capture.durationMs))) {
+          return;
+        }
+
         const prepared = await prepareWav16k(capture.audio);
         await saveAndTranscribe(prepared.blob, capture.durationMs);
       } finally {
@@ -415,7 +579,17 @@ export default function App() {
     } catch (caught) {
       setError(messageFrom(caught));
     }
-  }, [recording, saveAndTranscribe, start, stop]);
+  }, [
+    beginStreamingTake,
+    discardStreamingTake,
+    finishStreamingTake,
+    protocol,
+    recording,
+    saveAndTranscribe,
+    start,
+    stop,
+    streamLive,
+  ]);
 
   useEffect(() => {
     const bridge = window.starlingDesktop;
@@ -539,6 +713,7 @@ export default function App() {
     localStorage.setItem("starling:endpoint", clean);
     localStorage.setItem("starling:protocol", protocol);
     localStorage.setItem("starling:model", model);
+    localStorage.setItem("starling:streaming", streamLive ? "1" : "0");
     localStorage.setItem("starling:terms", expectedTerms);
     closeSettings();
     void checkHealth(clean);
@@ -604,6 +779,28 @@ export default function App() {
               <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
             </div>
           </div>
+
+          {recording && streamStatus && (
+            <div className={`live-stream ${streamStatus.state}`}>
+              {streamStatus.state === "live" && (
+                <p className="live-text" aria-live="polite">
+                  {partialText || <em>Listening for the first words…</em>}
+                </p>
+              )}
+              {streamStatus.state === "connecting" && (
+                <p className="live-note">
+                  <Radio size={15} /> Connecting live transcription…
+                </p>
+              )}
+              {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
+                <p className="live-note" role="status">
+                  <CircleAlert size={15} />
+                  {streamStatus.detail ?? "Live transcription is unavailable."} The recording is
+                  still saved and will be transcribed when you stop.
+                </p>
+              )}
+            </div>
+          )}
 
           <button
             className="import-button"
@@ -753,6 +950,14 @@ export default function App() {
               <p>{selected.transcript.text || <em>The model returned an empty transcript.</em>}</p>
             )}
           </div>
+          {selected.streamError && selected.transcript ? (
+            <div className="fidelity-note">
+              <CircleAlert size={15} />
+              <span>
+                {selected.streamError} This transcript came from a full upload of the saved WAV.
+              </span>
+            </div>
+          ) : null}
           {fidelity?.warnings.length ? (
             <div className="fidelity-note">
               <CircleAlert size={15} />
@@ -814,6 +1019,22 @@ export default function App() {
                 />
               </label>
             </div>
+            <label className="settings-check">
+              <input
+                type="checkbox"
+                checked={streamLive}
+                disabled={protocol === "openai"}
+                onChange={(event) => setStreamLive(event.target.checked)}
+              />
+              <span>
+                Live streaming transcript
+                <small>
+                  Streams audio to a Starling native server while you speak. Requires the Starling
+                  API format; recordings always save locally first and fall back to a full upload if
+                  the stream fails.
+                </small>
+              </span>
+            </label>
             <label>
               Words to watch
               <input

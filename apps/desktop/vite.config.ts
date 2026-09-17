@@ -15,6 +15,13 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     proxy: {
+      // Listed before "/api" so the longer prefix wins: WebSocket upgrades
+      // for live streaming need ws:true and the same /api strip.
+      "/api/stream": {
+        target: apiTarget.replace(/^http/, "ws"),
+        ws: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
       "/api": {
         target: apiTarget,
         changeOrigin: true,
