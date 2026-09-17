@@ -24,7 +24,7 @@ export type ExecFileFn = (
 export const defaultExecFile: ExecFileFn = promisify(execFileCb);
 
 /**
- * Resolve the tar executable to run on `platform`.
+ * Resolve the tar executable for an explicit platform and Windows directory.
  *
  * A bare `"tar"` goes through `PATH` — and in a Git Bash session the MSYS
  * directories precede `System32`, so it resolves to Git for Windows' GNU tar,
@@ -32,11 +32,14 @@ export const defaultExecFile: ExecFileFn = promisify(execFileCb);
  * ships bsdtar (reads both zip and tar.gz) as
  * `<SystemRoot>\System32\tar.exe`; preferring it explicitly sidesteps PATH
  * ordering entirely. Other platforms (and Windows images without the bundled
- * bsdtar) use the `PATH` lookup.
+ * bsdtar) use the `PATH` lookup. `systemRoot` comes from `SystemRoot` /
+ * `windir` and is read by the caller so an explicit `undefined` — meaning
+ * "absent" — stays `undefined` here (a parameter default would collapse it
+ * back to the environment and make the resolution host-dependent).
  */
 export function resolveTarExecutable(
-  platform: string = process.platform,
-  systemRoot: string | undefined = process.env["SystemRoot"] ?? process.env["windir"],
+  platform: string,
+  systemRoot: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
 ): string {
   if (platform !== "win32" || systemRoot === undefined) {
@@ -73,7 +76,13 @@ export async function extractBinary(
   execFile: ExecFileFn = defaultExecFile,
 ): Promise<{ binaryPath: string; checksumPath: string }> {
   const members: readonly string[] = [spec.binary, spec.checksum];
-  await execFile(resolveTarExecutable(), tarArgs(archivePath, members, destDir, spec.archiveExt));
+
+  const tar = resolveTarExecutable(
+    process.platform,
+    process.env["SystemRoot"] ?? process.env["windir"],
+  );
+
+  await execFile(tar, tarArgs(archivePath, members, destDir, spec.archiveExt));
 
   return {
     binaryPath: join(destDir, spec.binary),

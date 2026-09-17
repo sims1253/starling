@@ -127,7 +127,10 @@ describe("ensureBinary first-run install", () => {
     const invocation = invocations[0];
     assert.equal(invocations.length, 1);
     assert.ok(invocation);
-    assert.equal(invocation.file, resolveTarExecutable());
+    assert.equal(
+      invocation.file,
+      resolveTarExecutable(process.platform, process.env["SystemRoot"] ?? process.env["windir"]),
+    );
     assert.equal(invocation.args[0], "-xzf");
     assert.ok(invocation.args.indexOf("-C") > 0);
     // Staging happens inside the cache's release directory, so the final move
@@ -330,8 +333,14 @@ describe("tar argument construction", () => {
 
 describe("tar executable resolution", () => {
   it("uses the PATH lookup on non-Windows platforms", () => {
-    assert.equal(resolveTarExecutable("linux"), "tar");
-    assert.equal(resolveTarExecutable("darwin"), "tar");
+    assert.equal(
+      resolveTarExecutable("linux", "C:\\Windows", () => true),
+      "tar",
+    );
+    assert.equal(
+      resolveTarExecutable("darwin", "C:\\Windows", () => true),
+      "tar",
+    );
   });
 
   it("prefers System32 bsdtar on Windows so Git Bash's GNU tar cannot shadow it", () => {

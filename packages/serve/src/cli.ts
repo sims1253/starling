@@ -267,9 +267,11 @@ function nonEmpty(value: string | undefined): string | undefined {
  * symlink while this module's own path is already resolved to the real file —
  * the raw strings never match. Both sides are therefore resolved to their
  * realpaths before comparing, which is invariant to how the bin was linked.
+ * `invokedPath` is taken by the caller (a parameter default would collapse an
+ * explicitly-absent `argv[1]` back to the real one).
  */
 export function isEntryPoint(
-  invokedPath: string | undefined = process.argv[1],
+  invokedPath: string | undefined,
   modulePath: string = fileURLToPath(import.meta.url),
 ): boolean {
   if (invokedPath === undefined) {
@@ -292,6 +294,6 @@ function samePath(left: string, right: string): boolean {
 
 // Only self-execute when invoked as the bin; imports (tests, programmatic use)
 // stay side-effect free.
-if (isEntryPoint()) {
+if (isEntryPoint(process.argv[1])) {
   await runCli();
 }
