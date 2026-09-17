@@ -55,7 +55,10 @@ Only the two named archive members needed by the launcher are extracted.
 ## Requirements
 
 - Node.js 20 or newer.
-- `tar` on `PATH` (present by default on Linux, macOS, and Windows 10+).
+- `tar` on `PATH` (present by default on Linux and macOS). On Windows the
+  launcher runs the bsdtar bundled with Windows 10+
+  (`System32\tar.exe`) directly, so Git Bash's GNU `tar` — which cannot read
+  the zip Windows releases are packaged as — never interferes.
 - GPU backends additionally need the vendor driver and runtime libraries; see
   the release
   [runtime requirements](https://github.com/sims1253/starling/blob/master/docs/release-runtime.md).

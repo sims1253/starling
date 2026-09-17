@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "vite-plus/test";
-import { tarArgs, type ExecFileFn } from "../src/archive.js";
+import { resolveTarExecutable, tarArgs, type ExecFileFn } from "../src/archive.js";
 import {
   ChecksumMismatchError,
   DownloadError,
@@ -127,7 +127,7 @@ describe("ensureBinary first-run install", () => {
     const invocation = invocations[0];
     assert.equal(invocations.length, 1);
     assert.ok(invocation);
-    assert.equal(invocation.file, "tar");
+    assert.equal(invocation.file, resolveTarExecutable());
     assert.equal(invocation.args[0], "-xzf");
     assert.ok(invocation.args.indexOf("-C") > 0);
     assert.deepEqual(invocation.args.slice(invocation.args.indexOf("-C") + 2), [
@@ -296,5 +296,30 @@ describe("tar argument construction", () => {
       "/dest",
       "m.exe",
     ]);
+  });
+});
+
+describe("tar executable resolution", () => {
+  it("uses the PATH lookup on non-Windows platforms", () => {
+    assert.equal(resolveTarExecutable("linux"), "tar");
+    assert.equal(resolveTarExecutable("darwin"), "tar");
+  });
+
+  it("prefers System32 bsdtar on Windows so Git Bash's GNU tar cannot shadow it", () => {
+    assert.equal(
+      resolveTarExecutable("win32", "C:\\Windows", () => true),
+      "C:\\Windows\\System32\\tar.exe",
+    );
+  });
+
+  it("falls back to the PATH lookup when the System32 bsdtar is absent", () => {
+    assert.equal(
+      resolveTarExecutable("win32", "C:\\Windows", () => false),
+      "tar",
+    );
+    assert.equal(
+      resolveTarExecutable("win32", undefined, () => true),
+      "tar",
+    );
   });
 });

@@ -38,7 +38,13 @@ export {
   type EnsureResult,
 } from "./install.js";
 
-export { defaultExecFile, extractBinary, tarArgs, type ExecFileFn } from "./archive.js";
+export {
+  defaultExecFile,
+  extractBinary,
+  resolveTarExecutable,
+  tarArgs,
+  type ExecFileFn,
+} from "./archive.js";
 
 export {
   packageVersion,
