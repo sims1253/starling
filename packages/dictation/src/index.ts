@@ -5,3 +5,5 @@ export * from "./client.js";
 export * from "./fidelity.js";
 
 export * from "./storage.js";
+
+export * from "./streaming.js";
