@@ -97,7 +97,7 @@ describe("cache directory resolution", () => {
 
   it("uses OS-conventional roots", () => {
     const darwin = defaultCacheDir("darwin");
-    assert.match(darwin, /Library\/Caches\/starling-serve$/);
+    assert.match(darwin, /Library[\\/]Caches[\\/]starling-serve$/);
     const win32 = defaultCacheDir("win32");
     assert.match(win32, /[\\/]starling-serve[\\/]cache$/);
     const linuxXdg = defaultCacheDirWithEnv("linux", { XDG_CACHE_HOME: "/xdg" });
