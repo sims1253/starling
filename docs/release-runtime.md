@@ -20,7 +20,7 @@ checked-out tag. For a manual release, select a workflow ref with the same versi
 | `linux-vulkan` | x86_64 Ubuntu 22.04 with `libstdc++6`, `libgomp1`, and `libvulkan1`; a vendor Vulkan driver and supported GPU for inference | Extracted archive, checksum, loader dependencies, version, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
 | `linux-cpu` | x86_64 Ubuntu 22.04 with `libstdc++6` and `libgomp1`; no GPU or driver required | Extracted archive, checksum, loader dependencies, version, backend, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
 | `linux-cuda` | x86_64 Linux compatible with the Ubuntu 22.04 build; CUDA 13.3 runtime and cuBLAS libraries, their dependencies, and a compatible NVIDIA driver | Version and ABI on the build runner only |
-| `linux-rocm` | x86_64 Linux compatible with the Ubuntu 22.04 build; HIP runtime, rocBLAS, hipBLAS, and their dependencies from the same ROCm release used to build the executable; a compatible AMD driver and GPU | Version and ABI on the build runner only |
+| `linux-rocm` | x86_64 Linux compatible with the Ubuntu 22.04 build; ROCm 7.2.4 HIP runtime, rocBLAS, hipBLAS, and their dependencies; a compatible AMD driver and GPU | Version and ABI on the build runner only |
 | `windows-cuda` | x86_64 Windows; CUDA 13.3 runtime and cuBLAS DLLs, their dependencies, and a compatible NVIDIA driver; runtime DLL directories on `PATH` | Version and ABI on the build runner only |
 | `windows-vulkan` | x86_64 Windows; Vulkan loader and vendor Vulkan driver | Version and ABI on the build runner only |
 | `windows-cpu` | x86_64 Windows; no GPU or driver required | Version and ABI on the build runner only |
@@ -34,9 +34,11 @@ runtime packages through the vendor's supported installer or package repository,
 so their transitive dependencies are installed too. Linux must be able to find
 these libraries through its loader configuration or `LD_LIBRARY_PATH`.
 
-The ROCm build currently uses the vendor's `latest` repository. It has no fixed
-runtime version contract yet. Consult the build log for the installed version;
-ROCm archives have not been verified on a machine without the development SDK.
+The ROCm build installs the toolkit from the vendor's versioned `7.2.4`
+repository (`https://repo.radeon.com/rocm/apt/7.2.4`, jammy `main`). ROCm 7.2.4
+is the archive's runtime contract: run the `linux-rocm` archive against the
+ROCm 7.2.4 HIP/BLAS runtime. ROCm archives have not been verified on a machine
+without the development SDK.
 The CUDA, Windows (Vulkan and CPU), and macOS (Metal and CPU) archives also
 lack that separate check. Do not treat their build-runner metadata checks as a
 clean-machine guarantee.
