@@ -147,8 +147,9 @@ export default function App() {
   const streamBailedRef = useRef(false);
   // True from Stop until the streamed take is finalized (persisted and
   // transcribed or handed to batch): its audio stays durable throughout, so
-  // the close guard must keep reporting it as journaled.
-  const streamingFinalizeRef = useRef(false);
+  // the close guard must keep reporting it as journaled. State, not a ref:
+  // the pending-audio mirror must re-run the moment durability ends.
+  const [streamingFinalize, setStreamingFinalize] = useState(false);
 
   const selected = sessions.find((session) => session.id === selectedId);
   const [audioUrl, setAudioUrl] = useState<string>();
@@ -271,14 +272,12 @@ export default function App() {
       finalizing,
       unsavedCount: unsavedWavs.length,
       journaled:
-        (recording && streamRef.current !== undefined) || streamingFinalizeRef.current
-          ? true
-          : undefined,
+        (recording && streamRef.current !== undefined) || streamingFinalize ? true : undefined,
     };
 
     pendingAudioRef.current = state;
     window.starlingDesktop?.setPendingAudio(state);
-  }, [recording, finalizing, unsavedWavs.length]);
+  }, [recording, finalizing, streamingFinalize, unsavedWavs.length]);
 
   // Second line of defense for reloads: the main process asks before honoring
   // a blocked unload, but only this handler knows the live state.
@@ -511,7 +510,7 @@ export default function App() {
       streamBailedRef.current = false;
 
       if (!stream) {
-        streamingFinalizeRef.current = false;
+        setStreamingFinalize(false);
 
         return false;
       }
@@ -522,7 +521,7 @@ export default function App() {
         await stream.abandon();
         // The journal is gone; the recorder's memory-only capture carries
         // this take through the batch path, so it is no longer journaled.
-        streamingFinalizeRef.current = false;
+        setStreamingFinalize(false);
 
         return false;
       }
@@ -533,7 +532,7 @@ export default function App() {
 
       if (!result.session) {
         // The durable save failed; the assembled WAV is the only copy.
-        streamingFinalizeRef.current = false;
+        setStreamingFinalize(false);
         parkUnsavedWav(result.wav);
         throw new Error(
           `Local storage failed: ${messageFrom(result.failure ?? "unknown storage failure")} Keep this window open and download the unsaved WAV to recover it.`,
@@ -598,7 +597,7 @@ export default function App() {
       // unsavedWavs), the only copy lives in this window's memory (#121) —
       // except a streamed take, whose journal/session keeps it durable, so
       // the close guard reports it as journaled for the whole finalize.
-      streamingFinalizeRef.current = streamRef.current !== undefined;
+      setStreamingFinalize(streamRef.current !== undefined);
       setFinalizing(true);
 
       try {
@@ -622,7 +621,7 @@ export default function App() {
         const prepared = await prepareWav16k(capture.audio);
         await saveAndTranscribe(prepared.blob, capture.durationMs);
       } finally {
-        streamingFinalizeRef.current = false;
+        setStreamingFinalize(false);
         setFinalizing(false);
       }
     } catch (caught) {
