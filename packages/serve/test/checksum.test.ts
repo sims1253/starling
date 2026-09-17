@@ -101,7 +101,7 @@ describe("cache directory resolution", () => {
     const win32 = defaultCacheDir("win32");
     assert.match(win32, /[\\/]starling-serve[\\/]cache$/);
     const linuxXdg = defaultCacheDirWithEnv("linux", { XDG_CACHE_HOME: "/xdg" });
-    assert.equal(linuxXdg, "/xdg/starling-serve");
+    assert.equal(linuxXdg, join("/xdg", "starling-serve"));
     const linuxDefault = defaultCacheDirWithEnv("linux", {});
     assert.match(linuxDefault, /\.cache[\\/]starling-serve$/);
   });
