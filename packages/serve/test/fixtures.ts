@@ -20,6 +20,12 @@ export interface FixtureOptions {
   readonly tag: string;
   readonly archiveName: string;
   readonly binaryName: string;
+  /**
+   * Name of the `.sha256` member inside the archive. Defaults to the binary
+   * stem without `.exe` — the workflow ships
+   * `starling-serve-windows-cpu.sha256` next to `starling-serve-windows-cpu.exe`.
+   */
+  readonly checksumName?: string;
   /** Tamper hooks: mutate members before checksums are computed. */
   readonly tamperBinary?: (content: Buffer) => Buffer;
   readonly tamperInnerChecksum?: (content: string) => string;
@@ -36,6 +42,7 @@ export function buildReleaseFixture(options: FixtureOptions): ReleaseFixture {
     Buffer.from(`#!/bin/sh\necho starling-serve test\n`, "utf8");
 
   const binarySha = sha256(binaryContent);
+  const checksumName = options.checksumName ?? `${options.binaryName.replace(/\.exe$/, "")}.sha256`;
 
   const innerChecksum =
     options.tamperInnerChecksum?.(`${binarySha}  ${options.binaryName}\n`) ??
@@ -45,7 +52,7 @@ export function buildReleaseFixture(options: FixtureOptions): ReleaseFixture {
 
   let archive = tarGz([
     { name: options.binaryName, mode: 0o755, content: binaryContent },
-    { name: `${options.binaryName}.sha256`, content: innerChecksum },
+    { name: checksumName, content: innerChecksum },
     { name: "RUNTIME.md", content: runtime },
   ]);
 

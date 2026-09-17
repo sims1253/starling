@@ -14,21 +14,25 @@ describe("platform + backend → artifact mapping", () => {
     assert.deepEqual(resolveArtifact("linux", "x64", "cpu"), {
       archive: "starling-serve-linux-cpu.tar.gz",
       binary: "starling-serve-linux-cpu",
+      checksum: "starling-serve-linux-cpu.sha256",
       archiveExt: ".tar.gz",
     });
     assert.deepEqual(resolveArtifact("linux", "x64", "vulkan"), {
       archive: "starling-serve-linux-vulkan.tar.gz",
       binary: "starling-serve-linux-vulkan",
+      checksum: "starling-serve-linux-vulkan.sha256",
       archiveExt: ".tar.gz",
     });
     assert.deepEqual(resolveArtifact("linux", "x64", "cuda"), {
       archive: "starling-serve-linux-cuda.tar.gz",
       binary: "starling-serve-linux-cuda",
+      checksum: "starling-serve-linux-cuda.sha256",
       archiveExt: ".tar.gz",
     });
     assert.deepEqual(resolveArtifact("linux", "x64", "rocm"), {
       archive: "starling-serve-linux-rocm.tar.gz",
       binary: "starling-serve-linux-rocm",
+      checksum: "starling-serve-linux-rocm.sha256",
       archiveExt: ".tar.gz",
     });
   });
@@ -42,16 +46,30 @@ describe("platform + backend → artifact mapping", () => {
     }
   });
 
+  it("names the in-archive checksum member without the Windows .exe suffix", () => {
+    // The workflow ships starling-serve-windows-cpu.sha256 next to
+    // starling-serve-windows-cpu.exe; POSIX stems are unchanged.
+    assert.equal(
+      resolveArtifact("win32", "x64", "cpu").checksum,
+      "starling-serve-windows-cpu.sha256",
+    );
+    assert.equal(
+      resolveArtifact("linux", "x64", "cpu").checksum,
+      "starling-serve-linux-cpu.sha256",
+    );
+  });
 
   it("maps darwin/arm64 to the macos-named cpu and metal tarballs", () => {
     assert.deepEqual(resolveArtifact("darwin", "arm64", "cpu"), {
       archive: "starling-serve-macos-cpu.tar.gz",
       binary: "starling-serve-macos-cpu",
+      checksum: "starling-serve-macos-cpu.sha256",
       archiveExt: ".tar.gz",
     });
     assert.deepEqual(resolveArtifact("darwin", "arm64", "metal"), {
       archive: "starling-serve-macos-metal.tar.gz",
       binary: "starling-serve-macos-metal",
+      checksum: "starling-serve-macos-metal.sha256",
       archiveExt: ".tar.gz",
     });
   });

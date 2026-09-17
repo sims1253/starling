@@ -45,11 +45,11 @@ export async function extractBinary(
   destDir: string,
   execFile: ExecFileFn = defaultExecFile,
 ): Promise<{ binaryPath: string; checksumPath: string }> {
-  const members: readonly string[] = [spec.binary, `${spec.binary}.sha256`];
+  const members: readonly string[] = [spec.binary, spec.checksum];
   await execFile("tar", tarArgs(archivePath, members, destDir, spec.archiveExt));
 
   return {
     binaryPath: join(destDir, spec.binary),
-    checksumPath: join(destDir, `${spec.binary}.sha256`),
+    checksumPath: join(destDir, spec.checksum),
   };
 }

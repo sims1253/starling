@@ -28,6 +28,12 @@ export interface ArtifactSpec {
   readonly archive: string;
   /** Executable member inside the archive, e.g. `starling-serve-linux-cpu.exe`. */
   readonly binary: string;
+  /**
+   * Checksum member inside the archive: the binary's stem plus `.sha256` —
+   * the workflow ships `starling-serve-windows-cpu.sha256` next to
+   * `starling-serve-windows-cpu.exe`, without the `.exe`.
+   */
+  readonly checksum: string;
   /** Archive container format; Windows releases are zip, everything else tar.gz. */
   readonly archiveExt: ".tar.gz" | ".zip";
 }
@@ -106,7 +112,12 @@ export function resolveArtifact(os: string, arch: string, backend: Backend): Art
   const archiveExt = os === "win32" ? (".zip" as const) : (".tar.gz" as const);
   const binary = os === "win32" ? `${baseName(suffix)}.exe` : baseName(suffix);
 
-  return { archive: `${baseName(suffix)}${archiveExt}`, binary, archiveExt };
+  return {
+    archive: `${baseName(suffix)}${archiveExt}`,
+    binary,
+    checksum: `${baseName(suffix)}.sha256`,
+    archiveExt,
+  };
 }
 
 function baseName(suffix: string): string {

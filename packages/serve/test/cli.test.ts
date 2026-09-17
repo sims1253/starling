@@ -11,6 +11,7 @@ import {
   type SpawnFn,
   type SpawnedProcess,
 } from "../src/cli.js";
+import { resolveArtifact } from "../src/platforms.js";
 import { buildReleaseFixture, fakeFetch } from "./fixtures.js";
 
 const cleanups: string[] = [];
@@ -25,19 +26,11 @@ afterEach(async () => {
   }
 });
 
-/** The cpu artifact for the host platform (all CI matrices have one). */
+/** The cpu artifact names for the host platform, straight from the mapping. */
 function hostCpuArtifact() {
-  const os = process.platform === "win32" ? "windows" : process.platform;
+  const spec = resolveArtifact(process.platform, process.arch, "cpu");
 
-  const archiveName =
-    process.platform === "win32"
-      ? `starling-serve-${os}-cpu.zip`
-      : `starling-serve-${os}-cpu.tar.gz`;
-
-  const stem = process.platform === "win32" ? archiveName.slice(0, -4) : archiveName.slice(0, -7);
-  const binaryName = process.platform === "win32" ? `${stem}.exe` : stem;
-
-  return { archiveName, binaryName };
+  return { archiveName: spec.archive, binaryName: spec.binary, checksumName: spec.checksum };
 }
 
 class FakeChild extends EventEmitter implements SpawnedProcess {
@@ -114,13 +107,14 @@ describe("wrapper argument parsing", () => {
 });
 
 function cliHarness() {
-  const { archiveName, binaryName } = hostCpuArtifact();
+  const { archiveName, binaryName, checksumName } = hostCpuArtifact();
 
   const fixture = buildReleaseFixture({
     repo: "sims1253/starling",
     tag: "v0.2.0",
     archiveName,
     binaryName,
+    checksumName,
   });
 
   return { fixture, binaryName };
