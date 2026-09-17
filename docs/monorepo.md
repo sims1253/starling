@@ -70,8 +70,12 @@ separate platform integration.
 
 ## Fidelity requirements
 
-The save completes before the app sends audio to a server. A network failure
-changes the session status but does not remove the WAV.
+Audio is durable before the app relies on a server. Batch uploads start only
+after the completed WAV is saved; live streaming captures journal every chunk
+to storage as it arrives, offer a chunk to the server only after that chunk is
+journaled, and finalize the WAV before the streamed result is accepted as the
+transcript. A network failure changes the session status but does not remove
+the WAV.
 
 ```mermaid
 sequenceDiagram
@@ -98,6 +102,25 @@ sequenceDiagram
   App->>Store: Remove audio and text
 ```
 
+### Streaming captures
+
+The desktop app can stream audio to the server's `WS /stream` endpoint while
+the microphone is live and show partial transcripts. The streaming path keeps
+the same guarantees:
+
+1. The capture requests 16 kHz mono PCM16. Every chunk is appended to a
+   durable IndexedDB journal first; only then is it sent to the server.
+2. On Stop the journal is assembled into the canonical WAV and the session is
+   persisted before the client asks the server to commit. The streamed final
+   is accepted only if the socket carried the whole take without errors.
+3. If anything fails mid-take — the socket drops, the server's live buffer
+   fills, journaling hits a storage error — the recording continues locally,
+   the failure is recorded on the session, and Stop falls back to the batch
+   upload of the saved WAV. A streaming failure can shorten nothing; at worst
+   it costs the live preview.
+4. Journals orphaned by a crash mid-recording are recovered on the next start
+   as retryable sessions with their audio intact.
+
 1. Keep the raw recognition text. Any future cleanup result is a separate,
    explicitly reviewed edit.
 2. Preserve list numbers, negations, domain terms, corrections, short answers,
@@ -109,11 +132,14 @@ sequenceDiagram
 6. Keep reported audio duration separate from recognized content coverage.
    Segment boundaries often describe chunks, not word-level coverage.
 
-Desktop recording currently buffers active capture in memory until Stop; a crash
-before capture is saved can lose that active take. Browser storage can be cleared
-or evicted. Native mobile recording writes audio into app-private files. None of
-these paths promises recovery from every OS or storage failure. Use saved audio
-exports for recordings that must outlive the app.
+Non-streaming desktop captures (imports, streaming disabled or unavailable)
+buffer active capture in memory until Stop, exactly as before: a crash before
+capture is saved can still lose that active take. Streaming captures journal
+chunks as they arrive, so a crash mid-recording leaves recoverable audio up to
+the last journaled chunk. Browser storage can be cleared or evicted. Native
+mobile recording writes audio into app-private files. None of these paths
+promises recovery from every OS or storage failure. Use saved audio exports
+for recordings that must outlive the app.
 
 The text fixtures cover the six failure modes raised in the original request.
 They test preservation and recovery behavior, not real-world recognition
