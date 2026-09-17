@@ -243,7 +243,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential wget gnupg2
           wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/rocm.gpg > /dev/null
-          echo "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/rocm.gpg] https://repo.radeon.com/rocm/apt/latest jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          # Pinned ROCm release; docs/release-runtime.md states this release as
+          # the linux-rocm archive's runtime contract.
+          echo "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/rocm.gpg] https://repo.radeon.com/rocm/apt/7.2.4 jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y rocm-dev hip-runtime-amd hipblas-dev rocblas-dev
@@ -602,7 +604,7 @@ jobs:
             ### Runtime requirements
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
             accelerator runtime libraries are not bundled. CUDA requires the 13.3
-            runtime and cuBLAS; ROCm requires the build's matching HIP/BLAS runtime.
+            runtime and cuBLAS; ROCm requires the 7.2.4 HIP/BLAS runtime.
             The CPU builds need only the platform C/C++ runtime. Linux Vulkan and
             Linux CPU are smoke-tested outside their build environment in a clean
             container. These startup checks do not verify GPU inference.

@@ -293,7 +293,7 @@ libraries. These are not fully static binaries.
 | --- | --- |
 | CPU | None beyond the platform C/C++ runtime (`libstdc++6` and `libgomp1` on Linux; the Windows build uses the static CRT). |
 | CUDA | Compatible NVIDIA driver and CUDA runtime/cuBLAS libraries. The workflow builds with CUDA 13.3. |
-| ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow installs ROCm from its `latest` repository. |
+| ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow builds with ROCm 7.2.4. |
 | Vulkan | Vulkan loader and a compatible GPU driver. |
 | Metal | Apple Silicon macOS with the system Metal frameworks. |
 

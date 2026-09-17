@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check CUDA install pins and concrete runtime guidance against the release version."""
+"""Check CUDA and ROCm install pins and concrete runtime guidance against the release version."""
 import argparse
 from pathlib import Path
 import re
@@ -43,6 +43,25 @@ def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | Non
         found = re.findall(pattern, text, re.M)
         if found != [series]:
             errors.append(f"{path}: {label} must state CUDA {series} once; found {found}")
+
+    # The ROCm release is an exact versioned apt repository, not a series:
+    # the install URL is the single source of truth and the docs restate it.
+    rocm_pins = re.findall(r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", workflow)
+    if len(rocm_pins) != 1:
+        errors.append(f"{WORKFLOW}: expected one pinned rocm/apt/<version> repository URL")
+        return errors
+    rocm = rocm_pins[0]
+
+    rocm_references = [
+        (WORKFLOW, workflow, r"ROCm requires the (\d+\.\d+(?:\.\d+)?) HIP/BLAS runtime", "release body"),
+        (DOCS[0], docs[DOCS[0]], r"^\| `linux-rocm` \|.*?ROCm (\d+\.\d+(?:\.\d+)?)", "Linux prerequisites"),
+        (DOCS[0], docs[DOCS[0]], r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", "pinned repository"),
+        (DOCS[1], docs[DOCS[1]], r"The workflow builds with ROCm (\d+\.\d+(?:\.\d+)?)\.", "serving guide"),
+    ]
+    for path, text, pattern, label in rocm_references:
+        found = re.findall(pattern, text, re.M)
+        if found != [rocm]:
+            errors.append(f"{path}: {label} must state ROCm {rocm} once; found {found}")
     return errors
 
 
@@ -58,7 +77,7 @@ def main() -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("CUDA installers and runtime guidance agree")
+    print("CUDA and ROCm installers and runtime guidance agree")
     return 0
 
 

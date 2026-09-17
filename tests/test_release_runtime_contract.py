@@ -1,4 +1,4 @@
-"""Release documentation must agree with both CUDA installer configurations."""
+"""Release documentation must agree with the CUDA and ROCm installer configurations."""
 import importlib.util
 from pathlib import Path
 import re
@@ -37,6 +37,30 @@ def test_rejects_independent_version_drift(path, old, new):
     new = (new.replace("@BAD_VERSION@", bad_series + ".0")
               .replace("@BAD_SERIES@", bad_series)
               .replace("@BAD_PACKAGE@", bad_series.replace(".", "-")))
+    text = workflow if path == contract.WORKFLOW else docs[path]
+    assert old in text
+    changed = text.replace(old, new)
+    if path == contract.WORKFLOW:
+        workflow = changed
+    else:
+        docs[path] = changed
+    assert contract.check(workflow, docs)
+
+
+@pytest.mark.parametrize("path, old, new", [
+    (contract.WORKFLOW, 'ROCm requires the @ROCM@ HIP/BLAS runtime', 'ROCm requires the @BAD_ROCM@ HIP/BLAS runtime'),
+    (contract.WORKFLOW, 'rocm/apt/@ROCM@', 'rocm/apt/@BAD_ROCM@'),
+    (contract.DOCS[0], 'ROCm @ROCM@ HIP runtime', 'ROCm @BAD_ROCM@ HIP runtime'),
+    (contract.DOCS[0], 'rocm/apt/@ROCM@', 'rocm/apt/@BAD_ROCM@'),
+    (contract.DOCS[1], 'The workflow builds with ROCm @ROCM@.', 'The workflow builds with ROCm @BAD_ROCM@.'),
+])
+def test_rejects_independent_rocm_version_drift(path, old, new):
+    workflow, docs = inputs()
+    rocm = re.search(r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", workflow).group(1)
+    old = old.replace("@ROCM@", rocm)
+    parts = [int(p) + (i == 0) for i, p in enumerate(rocm.split("."))]
+    bad_rocm = ".".join(str(p) for p in parts)
+    new = new.replace("@BAD_ROCM@", bad_rocm)
     text = workflow if path == contract.WORKFLOW else docs[path]
     assert old in text
     changed = text.replace(old, new)
