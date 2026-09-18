@@ -1,0 +1,130 @@
+import type { DictationSession, TranscriptionResult } from "@starling/dictation";
+import type { StreamingDictation } from "./streamingDictation";
+
+export interface StreamedFinalize {
+  /** True when the stream delivered the final transcript itself. */
+  readonly streamed: boolean;
+  /** Present when the take was persisted and transcribed. */
+  readonly session?: DictationSession;
+  readonly transcript?: TranscriptionResult;
+  /** Present when no durable write happened because the take was discarded. */
+  readonly discarded?: boolean;
+  /** Why the take fell back to the batch path, for session visibility. */
+  readonly streamNote?: string;
+  /** True when the caller should save the recorder capture via batch. */
+  readonly batchFallback: boolean;
+}
+
+/** The durable writes a streamed finalize performs, injected for tests. */
+export interface StreamingFinalizeStore {
+  saveTranscript(
+    id: string,
+    transcript: TranscriptionResult,
+    options?: { streamed?: boolean },
+  ): Promise<DictationSession>;
+  noteStreamError(id: string, message: string): Promise<DictationSession>;
+  delete(id: string): Promise<void>;
+}
+
+export interface StreamingFinalizeDeps {
+  readonly stream: StreamingDictation;
+  readonly durationMs: number;
+  /** The take generation Stop settled on; false once Discard bumps it (#160). */
+  readonly isCurrentTake: () => boolean;
+  readonly parkUnsavedWav: (wav: Blob) => void;
+  readonly refresh: () => Promise<void>;
+  readonly setSelectedId: (id: string) => void;
+  readonly setConnectionReady: () => void;
+  readonly transcribe: (session: DictationSession) => Promise<void>;
+}
+
+function messageFrom(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Finalize the streamed take Stop was issued against, honouring a close-guard
+ * Discard that lands while the finalize is in flight (#160).
+ *
+ * The generation is captured synchronously by the caller and re-validated
+ * before each durable write; a stale finalize performs no session write at
+ * all — no saveTranscript, no noteStreamError, no batch transcribe — cleans
+ * up anything provisional its own finish created, and leaves the state the
+ * Discard settled untouched.
+ *
+ * Returns batchFallback when the stream was never usable and the caller
+ * should save the recorder's own capture via the batch path.
+ */
+export async function finishStreamingTake(
+  deps: StreamingFinalizeDeps,
+  store: StreamingFinalizeStore,
+): Promise<StreamedFinalize> {
+  const { stream, durationMs, isCurrentTake } = deps;
+
+  if (stream.journaledChunkCount === 0) {
+    // The microphone never reached this controller's journal — its session
+    // would be a header-only WAV: drop the empty journal and keep the
+    // recorder's capture through the batch path (#143).
+    await stream.abandon().catch(() => {});
+
+    return { streamed: false, batchFallback: true };
+  }
+
+  const result = await stream.finish(durationMs, () => !isCurrentTake());
+
+  if (result.session === undefined) {
+    if (!isCurrentTake()) {
+      // The journal drained into a Discard: the capture layer already
+      // dropped the journal, so nothing was written and there is nothing
+      // to undo (#160).
+      return { streamed: false, discarded: true, batchFallback: false };
+    }
+
+    // The durable save failed; the assembled WAV is the only copy.
+    deps.parkUnsavedWav(result.wav);
+    throw new Error(
+      `Local storage failed: ${messageFrom(result.failure ?? "unknown storage failure")} Keep this window open and download the unsaved WAV to recover it.`,
+    );
+  }
+
+  if (!isCurrentTake()) {
+    // The Discard landed after the capture layer's own probe: remove only
+    // the provisional row this finalize created, never touching the state
+    // the Discard settled (#160).
+    await store.delete(result.session.id).catch(() => {});
+
+    return { streamed: false, discarded: true, batchFallback: false };
+  }
+
+  await deps.refresh();
+
+  // A Discard that lands between the save and the transcript write settles
+  // the session without the take: skip the write and remove the provisional
+  // row this finalize created, instead of transcribing a dropped take.
+  if (!isCurrentTake()) {
+    await store.delete(result.session.id).catch(() => {});
+
+    return { streamed: false, discarded: true, batchFallback: false };
+  }
+
+  if (result.streamed && result.transcript) {
+    await store.saveTranscript(result.session.id, result.transcript, { streamed: true });
+    deps.setSelectedId(result.session.id);
+    deps.setConnectionReady();
+    await deps.refresh();
+  } else {
+    if (result.streamNote) {
+      await store.noteStreamError(result.session.id, result.streamNote).catch(() => {});
+    }
+
+    if (!isCurrentTake()) {
+      await store.delete(result.session.id).catch(() => {});
+
+      return { streamed: false, discarded: true, batchFallback: false };
+    }
+
+    await deps.transcribe(result.session);
+  }
+
+  return { streamed: result.streamed, session: result.session, batchFallback: false };
+}

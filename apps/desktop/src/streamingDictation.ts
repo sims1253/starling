@@ -23,7 +23,7 @@ export interface StreamingTransport {
 
 export interface StreamingCapture {
   append(pcm16: Uint8Array): Promise<void>;
-  finish(durationMs?: number): Promise<FinishedStreamCapture>;
+  finish(durationMs?: number, isCancelled?: () => boolean): Promise<FinishedStreamCapture>;
   abandon(): Promise<void>;
 }
 
@@ -136,13 +136,31 @@ export class StreamingDictation {
     this.transport.close();
   }
 
-  /** Drain every chunk, finalize the WAV (source of truth), then commit. */
-  async finish(durationMs?: number): Promise<StreamingDictationResult> {
+  /**
+   * Drain every chunk, finalize the WAV (source of truth), then commit. The
+   * cancellation probe runs after every await, before each durable write: a
+   * discarded take finalizes nothing and leaves the session unwritten, so a
+   * close-guard Discard racing Stop cannot be resurrected (#160).
+   */
+  async finish(
+    durationMs?: number,
+    isCancelled?: () => boolean,
+  ): Promise<StreamingDictationResult> {
     await this.pipeline;
 
     // The durable save completes before anything is accepted as final, per
     // the fidelity contract.
-    const finished = await this.capture.finish(durationMs);
+    const finished = await this.capture.finish(durationMs, isCancelled);
+
+    // The take was discarded while the journal drained: the commit RPC would
+    // transcribe audio the user explicitly dropped, so skip it. A provisional
+    // session the capture layer committed before its own probe fired still
+    // flows back, so the finalize can delete that row.
+    if (isCancelled?.()) {
+      this.close();
+
+      return Object.freeze({ ...finished, streamed: false });
+    }
 
     if (this.canCommit()) {
       try {

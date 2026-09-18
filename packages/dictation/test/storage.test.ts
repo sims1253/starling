@@ -323,6 +323,53 @@ describe("streaming capture journal", () => {
     await assert.rejects(capture.append(chunkOf(2)), DictationStorageError);
   });
 
+  it("skips the session write when the take is cancelled before finishing", async () => {
+    // The #160 probe: a close-guard Discard that lands while the streamed
+    // finalize is in flight must leave no session row behind.
+    const store = new MemorySessionStore();
+    const capture = await store.beginStreamCapture({ id: "discarded-live" });
+    await capture.append(chunkOf(10));
+
+    const finished = await capture.finish(250, () => true);
+
+    assert.equal(finished.session, undefined);
+    assert.equal(finished.failure, undefined);
+    assert.equal(finished.durationMs, 250);
+    assert.ok(finished.wav.size > 44);
+    assert.equal(await store.get("discarded-live"), undefined);
+    assert.equal((await store.list()).length, 0);
+  });
+
+  it("still persists the session when the take is not cancelled", async () => {
+    const store = new MemorySessionStore();
+    const capture = await store.beginStreamCapture({ id: "kept-live" });
+    await capture.append(chunkOf(10));
+
+    const finished = await capture.finish(250, () => false);
+
+    assert.ok(finished.session);
+    assert.equal(finished.session.id, "kept-live");
+    assert.ok(await store.get("kept-live"));
+  });
+
+  it("clears the IndexedDB journal and writes no session once cancelled", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "stream-cancel-test", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+    const capture = await store.beginStreamCapture({ id: "discarded" });
+
+    await capture.append(chunkOf(10));
+
+    const finished = await capture.finish(250, () => true);
+
+    assert.equal(finished.session, undefined);
+    assert.equal(await store.get("discarded"), undefined);
+    // The journal is gone, so the discarded take cannot resurrect on start.
+    assert.equal((await store.recoverStreamCaptures()).length, 0);
+    assert.equal(await store.get("discarded"), undefined);
+    store.close();
+  });
+
   it("rejects chunks that are not PCM16 frames", async () => {
     const store = new MemorySessionStore();
     const capture = await store.beginStreamCapture();
