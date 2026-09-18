@@ -369,7 +369,10 @@ void e2e_checks(void* handle) {
     constexpr double kToneW = 6.283185307179586 * 220.0;
     std::vector<float> pcm(multi_n);
     for (int64_t i = 0; i < multi_n; ++i)
-        pcm[i] = 0.2f * std::sinf((float) (kToneW * i / 16000.0));
+        // std::sin's float overload, not std::sinf: the C99 float math
+        // functions are not reliably in namespace std on older libstdc++
+        // (CI's GCC 11 rejects std::sinf).
+        pcm[i] = 0.2f * std::sin((float) (kToneW * i / 16000.0));
 
     char* text = nullptr;
     const char* err = nullptr;
