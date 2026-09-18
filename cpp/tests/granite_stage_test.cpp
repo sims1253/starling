@@ -363,9 +363,13 @@ void e2e_checks(void* handle) {
     // 2.5 s of audio at chunk_seconds=1 -> chunks of 1 s, 1 s, 0.5 s (the
     // last zero-padded to a full chunk).
     const int64_t multi_n = 40000, single_n = 8000;
+    // 2*pi*220 Hz test tone, spelled out (M_PI is not portable to the MSVC
+    // test targets, which do not get _USE_MATH_DEFINES). The exact frequency
+    // is irrelevant to the zero-weight model.
+    constexpr double kToneW = 6.283185307179586 * 220.0;
     std::vector<float> pcm(multi_n);
     for (int64_t i = 0; i < multi_n; ++i)
-        pcm[i] = 0.2f * std::sinf((float) (2.0 * M_PI * 220.0 * i / 16000.0));
+        pcm[i] = 0.2f * std::sinf((float) (kToneW * i / 16000.0));
 
     char* text = nullptr;
     const char* err = nullptr;
