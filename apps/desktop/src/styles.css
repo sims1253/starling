@@ -524,6 +524,15 @@ kbd {
   background: 0;
   cursor: pointer;
 }
+.history-warning .damaged-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.history-warning .dismiss-damaged {
+  color: var(--coral);
+  border-color: rgba(255, 116, 91, 0.4);
+}
 .history-row {
   width: 100%;
   min-height: 78px;

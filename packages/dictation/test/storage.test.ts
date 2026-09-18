@@ -772,6 +772,132 @@ describe("damaged history isolation", () => {
     );
     assert.deepEqual(report.invalid, []);
   });
+
+  it("deletes a quarantined entry by its raw key and leaves healthy sessions", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "dismiss-damaged", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "healthy", wav, durationMs: 10 });
+    const damaged = await store.create({ id: "damaged", wav, durationMs: 30 });
+
+    await overwriteStoredSession(factory, options.databaseName, {
+      ...damaged,
+      status: "uploading",
+    });
+
+    const [entry] = (await store.listReport()).invalid;
+
+    assert.ok(entry);
+    assert.equal(entry.id, "damaged");
+    assert.equal(entry.key, "damaged");
+
+    if (entry.key === undefined) throw new Error("quarantined entry carries no key");
+    await store.deleteInvalid(entry.key);
+
+    const report = await store.listReport();
+
+    assert.deepEqual(report.invalid, []);
+    // The healthy row survives the dismissal untouched.
+    assert.deepEqual(
+      report.sessions.map((session) => session.id),
+      ["healthy"],
+    );
+    assert.equal((await store.get("healthy"))?.id, "healthy");
+    store.close();
+  });
+
+  it("deletes a quarantined entry whose raw key is non-string", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "dismiss-numeric-key", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+    const session = await store.create({ id: "numeric-key", wav });
+
+    // A raw record whose id is a number: the report shows "(unknown id)" but
+    // the entry keeps the numeric key IndexedDB stored it under.
+    await overwriteStoredSession(factory, options.databaseName, {
+      ...session,
+      id: 42,
+      status: "uploading",
+    });
+
+    const [entry] = (await store.listReport()).invalid;
+
+    assert.ok(entry);
+    assert.equal(entry.id, "(unknown id)");
+    assert.equal(entry.key, 42);
+
+    if (entry.key === undefined) throw new Error("quarantined entry carries no key");
+    await store.deleteInvalid(entry.key);
+
+    assert.deepEqual((await store.listReport()).invalid, []);
+    store.close();
+  });
+
+  it("keeps a repaired record when dismissal races the repair", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "dismiss-vs-repair", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+    const damaged = await store.create({ id: "repaired", wav });
+
+    await overwriteStoredSession(factory, options.databaseName, {
+      ...damaged,
+      status: "uploading",
+    });
+
+    const [entry] = (await store.listReport()).invalid;
+
+    if (!entry?.key) throw new Error("quarantined entry carries no key");
+
+    // Another window restores a healthy record under the key before the
+    // dismissal lands: the delete must not race the repair.
+    await overwriteStoredSession(factory, options.databaseName, damaged);
+    await store.deleteInvalid(entry.key);
+
+    const report = await store.listReport();
+
+    assert.deepEqual(report.invalid, []);
+    assert.deepEqual(
+      report.sessions.map((session) => session.id),
+      ["repaired"],
+    );
+    store.close();
+  });
+
+  it("dismissing a missing or healthy key resolves without touching history", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "dismiss-absent", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "healthy", wav });
+
+    await store.deleteInvalid("nothing-there");
+    await store.deleteInvalid("healthy");
+
+    const report = await store.listReport();
+
+    assert.deepEqual(report.invalid, []);
+    assert.deepEqual(
+      report.sessions.map((session) => session.id),
+      ["healthy"],
+    );
+    store.close();
+  });
+
+  it("treats memory-store dismissal as a no-op over healthy history", async () => {
+    const store = new MemorySessionStore();
+
+    await store.create({ id: "healthy", wav });
+    await store.deleteInvalid("healthy");
+
+    const report = await store.listReport();
+
+    assert.deepEqual(
+      report.sessions.map((session) => session.id),
+      ["healthy"],
+    );
+    assert.deepEqual(report.invalid, []);
+  });
 });
 
 /**

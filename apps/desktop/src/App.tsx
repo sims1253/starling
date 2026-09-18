@@ -850,18 +850,45 @@ export default function App() {
   }
 
   // Quarantined history entries stay in the database untouched; this only
-  // rescues audio that survived the damage so it can be downloaded.
-  function exportDamagedAudio(id: string) {
-    const entry = damaged.find((item) => item.id === id);
-    const wav = entry && invalidSessionWav(entry);
+  // rescues audio that survived the damage so it can be downloaded. Entries
+  // are matched by position because best-effort ids are not unique — several
+  // "(unknown id)" entries can share one label with different raw keys.
+  function exportDamagedAudio(index: number) {
+    const entry = damaged[index];
+
+    if (!entry) return;
+    const wav = invalidSessionWav(entry);
 
     if (wav) {
       const url = URL.createObjectURL(wav);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `starling-damaged-${id.replace(/[^a-z0-9-]/gi, "").slice(0, 8)}.wav`;
+      anchor.download = `starling-damaged-${entry.id.replace(/[^a-z0-9-]/gi, "").slice(0, 8)}.wav`;
       anchor.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    }
+  }
+
+  // Dismiss one quarantined entry by its raw record key, then refresh so the
+  // banner drops it without a reload. Confirm first: the damaged record may
+  // hold the only copy of audio that survived (#155).
+  async function dismissDamagedEntry(index: number) {
+    const entry = damaged[index];
+
+    if (!entry || entry.key === undefined) return;
+
+    if (
+      !window.confirm(
+        "Delete this damaged recording? It cannot be read, and deleting it is permanent. Download its WAV first if you want to keep the audio.",
+      )
+    )
+      return;
+
+    try {
+      await store.deleteInvalid(entry.key);
+      await refresh();
+    } catch (caught) {
+      setError(`Could not delete the damaged recording: ${messageFrom(caught)}`);
     }
   }
 
@@ -1066,23 +1093,33 @@ export default function App() {
                     Damaged entries are kept untouched; the list below shows every recording that is
                     still readable.
                   </small>
-                  {damaged.some((entry) => invalidSessionWav(entry) !== undefined) && (
-                    <div className="recovery-actions">
-                      {damaged.map((entry, index) => {
-                        const wav = invalidSessionWav(entry);
+                  <div className="recovery-actions">
+                    {damaged.map((entry, index) => {
+                      const wav = invalidSessionWav(entry);
 
-                        return wav ? (
-                          <button
-                            key={`${entry.id}-${index}`}
-                            className="recover-audio"
-                            onClick={() => exportDamagedAudio(entry.id)}
-                          >
-                            Download WAV {index + 1}
-                          </button>
-                        ) : null;
-                      })}
-                    </div>
-                  )}
+                      return (
+                        <span key={`${entry.id}-${index}`} className="damaged-entry">
+                          {wav ? (
+                            <button
+                              className="recover-audio"
+                              onClick={() => exportDamagedAudio(index)}
+                            >
+                              Download WAV {index + 1}
+                            </button>
+                          ) : null}
+                          {entry.key !== undefined ? (
+                            <button
+                              className="recover-audio dismiss-damaged"
+                              onClick={() => void dismissDamagedEntry(index)}
+                              aria-label={`Delete damaged recording ${index + 1}`}
+                            >
+                              Delete entry {index + 1}
+                            </button>
+                          ) : null}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
             )}
