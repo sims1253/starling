@@ -86,6 +86,11 @@ export interface DictationSessionStore {
     transcript: TranscriptionResult,
     options?: SaveTranscriptOptions,
   ): Promise<DictationSession>;
+  /**
+   * Downgrade an in-flight session (`transcribing`/`captured`) to `failed`.
+   * A session a live owner already settled keeps its state, so a sweep
+   * racing a settling write cannot overwrite it (#162).
+   */
   saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession>;
   /** Record why live streaming failed without changing the session status. */
   noteStreamError(id: string, message: string): Promise<DictationSession>;
@@ -561,10 +566,12 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
     try {
       return await this.update(id, (current) =>
-        updatedSession(current, {
-          status: "failed",
-          lastError: errorText(cause),
-        }),
+        current.status === "transcribing" || current.status === "captured"
+          ? updatedSession(current, {
+              status: "failed",
+              lastError: errorText(cause),
+            })
+          : current,
       );
     } finally {
       this.transcribing.delete(id);
@@ -611,6 +618,24 @@ export interface GrantedWebLock {
   readonly name: string;
 }
 
+/** One entry of a lock-manager snapshot: the store only reads names. */
+export interface HeldWebLock {
+  /**
+   * Optional like the DOM LockInfo it mirrors: a snapshot entry without a
+   * name can never be an attempt signal, so the probe skips it.
+   */
+  readonly name?: string;
+}
+
+/** The slice of a lock-manager snapshot the store enumerates signals from. */
+export interface WebLockSnapshot {
+  /**
+   * Optional like the DOM LockManagerSnapshot it mirrors: a snapshot
+   * without a listing carries no observable signal, so the probe reads none.
+   */
+  readonly held?: readonly HeldWebLock[];
+}
+
 /** Acquisition options the store asks its lock manager for. */
 export interface WebLockRequestOptions {
   readonly mode: "exclusive";
@@ -619,8 +644,9 @@ export interface WebLockRequestOptions {
 
 /**
  * The slice of the Web Locks API the store depends on: exclusive,
- * never-queueing acquisition. `navigator.locks` satisfies this structurally;
- * tests substitute an in-memory fake to drive both ownership branches.
+ * never-queueing acquisition plus snapshot enumeration. `navigator.locks`
+ * satisfies this structurally; tests substitute an in-memory fake to drive
+ * both ownership branches.
  */
 export interface WebLocksLike {
   request<Result>(
@@ -628,6 +654,12 @@ export interface WebLocksLike {
     options: WebLockRequestOptions,
     granted: (lock: GrantedWebLock | null) => Promise<Result> | Result,
   ): Promise<Result>;
+  /**
+   * Currently held locks. The store enumerates per-attempt signals through
+   * this instead of probing a single name, so every admitted attempt stays
+   * visible even after a contender for the same session settles first (#162).
+   */
+  query(): Promise<WebLockSnapshot>;
 }
 
 /**
@@ -635,11 +667,14 @@ export interface WebLocksLike {
  * navigator.locks (Node, older embedders) run unlocked: capture ownership is
  * then tracked only within the environment, which two live stores in one
  * realm honor but two separate windows cannot.
+ *
+ * The DOM LockManager satisfies WebLocksLike structurally: request() takes
+ * the same exclusive/ifAvailable shape, and query() reports held locks under
+ * the same `held[].name` shape the store enumerates per-attempt signals
+ * through.
  */
 function navigatorLocks(): WebLocksLike | undefined {
-  const locks = globalThis.navigator?.locks;
-
-  return locks ?? undefined;
+  return globalThis.navigator?.locks ?? undefined;
 }
 
 export interface IndexedDbSessionStoreOptions {
@@ -743,8 +778,33 @@ function captureLockName(databaseName: string, captureId: string): string {
   return `starling:dictation:${databaseName}:capture:${captureId}`;
 }
 
-function attemptLockName(databaseName: string, sessionId: string): string {
-  return `starling:dictation:${databaseName}:transcribe:${sessionId}`;
+function attemptLockPrefix(databaseName: string): string {
+  return `starling:dictation:${databaseName}:transcribe:`;
+}
+
+/**
+ * One admitted attempt's cross-window signal. The trailing signal is unique
+ * per markAttempt (never a separator), so every admitted attempt holds its
+ * own lock: a contender that outlives the first settler still reads as
+ * in-flight instead of looking abandoned (#162).
+ */
+function attemptLockName(databaseName: string, sessionId: string, signal: string): string {
+  return `${attemptLockPrefix(databaseName)}${sessionId}:${signal}`;
+}
+
+/**
+ * True when a held lock name is a per-attempt signal for this session. The
+ * session id is matched exactly — split at the last separator, since only
+ * the signal follows it — so an id containing separators can never collide
+ * with another session's signal.
+ */
+function isAttemptSignalFor(lockName: string, lockPrefix: string, sessionId: string): boolean {
+  if (!lockName.startsWith(lockPrefix)) return false;
+
+  const rest = lockName.slice(lockPrefix.length);
+  const separator = rest.lastIndexOf(":");
+
+  return separator >= 0 && rest.slice(0, separator) === sessionId;
 }
 
 /**
@@ -755,7 +815,14 @@ function attemptLockName(databaseName: string, sessionId: string): string {
  */
 const liveCaptureRegistry = new Set<string>();
 
-const liveAttemptRegistry = new Set<string>();
+/**
+ * Within-environment attempt signals. Every admitted attempt contributes its
+ * signal to its session's set, so concurrent attempts for one session stay
+ * visible until each settles; keyed by the exact session key with signals
+ * as set members (never name suffixes), so attempts neither hide each other
+ * nor collide across sessions.
+ */
+const liveAttemptSignals = new Map<string, Set<string>>();
 
 function captureRegistryKey(databaseName: string, captureId: string): string {
   return `capture\u0000${databaseName}\u0000${captureId}`;
@@ -763,6 +830,44 @@ function captureRegistryKey(databaseName: string, captureId: string): string {
 
 function attemptRegistryKey(databaseName: string, sessionId: string): string {
   return `attempt\u0000${databaseName}\u0000${sessionId}`;
+}
+
+/**
+ * Fresh identity for one admitted attempt signal. Uniqueness is the whole
+ * contract, plus one constraint: never a `:` or NUL separator, so the
+ * liveness probe can split the lock name at its last separator and match
+ * the session id exactly. randomUUID (and the fallback below) satisfy both.
+ */
+function attemptSignal(): string {
+  return sessionId();
+}
+
+/** One owned signal's key in `attemptLocks`: split at the last separator. */
+function ownedAttemptKey(id: string, signal: string): string {
+  return `${id}\u0000${signal}`;
+}
+
+function trackAttemptSignal(databaseName: string, sessionId: string, signal: string): void {
+  const key = attemptRegistryKey(databaseName, sessionId);
+  let signals = liveAttemptSignals.get(key);
+
+  if (!signals) {
+    signals = new Set();
+    liveAttemptSignals.set(key, signals);
+  }
+
+  signals.add(signal);
+}
+
+function discardAttemptSignal(databaseName: string, sessionId: string, signal: string): void {
+  const key = attemptRegistryKey(databaseName, sessionId);
+  const signals = liveAttemptSignals.get(key);
+
+  if (!signals) return;
+
+  signals.delete(signal);
+
+  if (signals.size === 0) liveAttemptSignals.delete(key);
 }
 
 /** One lock handshake: the grant signal plus the held lock's release latch. */
@@ -1051,6 +1156,13 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   /** Identifies this instance in journal ownership metadata. */
   private readonly ownerId: string;
   private readonly openCaptures = new Map<string, IndexedDbStreamCapture>();
+  /**
+   * Every admitted transcription attempt's release latch keyed by an
+   * attempt-local signal: more than one attempt for a session may be open
+   * at once, and each must be visible to other windows until it settles.
+   * Lockless and contended attempts hold no latch — the registry carries
+   * their signal alone — but still get their entry so settlement clears it.
+   */
   private readonly attemptLocks = new Map<string, (() => void) | undefined>();
   private databasePromise: Promise<IDBDatabase> | undefined;
 
@@ -1157,7 +1269,8 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   async markAttempt(id: string): Promise<DictationSession> {
-    await this.holdAttemptSignal(id);
+    const signal = attemptSignal();
+    await this.holdAttemptSignal(id, signal);
 
     try {
       return await this.update(id, (current) =>
@@ -1168,7 +1281,7 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
         }),
       );
     } catch (failure) {
-      this.releaseAttemptSignal(id);
+      this.releaseAttemptSignal(id, signal);
 
       throw failure;
     }
@@ -1193,20 +1306,30 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
       // The settling write can reject (quota, abort, session deleted from
       // another window): the attempt signal must not outlive its attempt,
       // or every other window's liveness probe reports true forever.
-      this.releaseAttemptSignal(id);
+      this.releaseAttemptSignals(id);
     }
   }
 
+  /**
+   * The confirmed-interruption half of the startup sweep: downgrade one
+   * session from an in-flight state to failed, never touching a session a
+   * live owner already settled or moved on. The sweep's transcriptionInFlight
+   * probe stays a read-only hint; this single conditional write is the
+   * enforcement, so a saveTranscript that commits between the probe and the
+   * mark cannot last-writer-lose its transcript to a failure (#162).
+   */
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
     try {
       return await this.update(id, (current) =>
-        updatedSession(current, {
-          status: "failed",
-          lastError: errorText(cause),
-        }),
+        current.status === "transcribing" || current.status === "captured"
+          ? updatedSession(current, {
+              status: "failed",
+              lastError: errorText(cause),
+            })
+          : current,
       );
     } finally {
-      this.releaseAttemptSignal(id);
+      this.releaseAttemptSignals(id);
     }
   }
 
@@ -1214,20 +1337,33 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
     return this.update(id, (current) => updatedSession(current, { streamError: message }));
   }
 
+  /**
+   * True while ANY live owner (this window or another) holds an attempt
+   * signal for the session. A contended second attempt carries its own
+   * signal, so it stays visible even after the first settler's release —
+   * the sweep must not mistake a live contender for a dead owner (#162).
+   */
   async transcriptionInFlight(id: string): Promise<boolean> {
-    if (this.attemptLocks.has(id)) return true;
-
-    if (liveAttemptRegistry.has(attemptRegistryKey(this.databaseName, id))) return true;
+    if (liveAttemptSignals.has(attemptRegistryKey(this.databaseName, id))) return true;
 
     if (!this.locks) return false;
 
-    // A lock nobody holds acquires briefly and releases right away; one
-    // another window still holds never arrives, which is the answer sought.
-    const release = await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id));
+    const lockPrefix = attemptLockPrefix(this.databaseName);
 
-    release?.();
+    try {
+      const snapshot = await this.locks.query();
 
-    return release === undefined;
+      return (
+        snapshot.held?.some(
+          (held) => held.name !== undefined && isAttemptSignalFor(held.name, lockPrefix, id),
+        ) ?? false
+      );
+    } catch {
+      // A snapshot the manager cannot produce says nothing about liveness:
+      // report in-flight, as the single-name probe did on rejection, so a
+      // transient manager failure never manufactures an interruption.
+      return true;
+    }
   }
 
   async delete(id: string): Promise<void> {
@@ -1249,7 +1385,7 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
           }),
         );
     });
-    this.releaseAttemptSignal(id);
+    this.releaseAttemptSignals(id);
   }
 
   async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
@@ -1358,8 +1494,8 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
       capture.orphan();
     }
 
-    for (const id of this.attemptLocks.keys()) {
-      this.releaseAttemptSignal(id);
+    for (const id of this.attemptSignalsOwned()) {
+      this.releaseAttemptSignals(id);
     }
 
     // A failed open already rejected to its caller; closing afterwards must
@@ -1463,29 +1599,73 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   /**
    * Best-effort in-flight signal for one transcription attempt, so another
    * window's startup sweep can tell a live attempt from a dead owner's
-   * leftover. The signal is advisory: contention never blocks a retry.
+   * leftover. The signal is advisory: contention never blocks a retry. Every
+   * admitted attempt holds its own lock (`transcribe:<id>:<signal>`), so a
+   * contended attempt stays visible even after the lock winner settles — a
+   * sweep probing between the winner's release and the contender's settle
+   * still reads in-flight (#162).
    */
-  private async holdAttemptSignal(id: string): Promise<void> {
-    if (this.attemptLocks.has(id)) return;
-
+  private async holdAttemptSignal(id: string, signal: string): Promise<void> {
+    // The lock is held until this attempt settles. A contended or lockless
+    // environment hands back no latch, but the registry still carries the
+    // signal — so the latch map gets its entry either way and settlement
+    // always finds and discards the registry signal (#162).
     const release = this.locks
-      ? await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id))
+      ? await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id, signal))
       : undefined;
 
-    // Contended or lockless, the attempt is still live as far as this
-    // environment is concerned — the registry carries the signal alone then.
-    this.attemptLocks.set(id, release);
-    liveAttemptRegistry.add(attemptRegistryKey(this.databaseName, id));
+    this.attemptLocks.set(ownedAttemptKey(id, signal), release);
+    trackAttemptSignal(this.databaseName, id, signal);
   }
 
-  private releaseAttemptSignal(id: string): void {
-    if (!this.attemptLocks.has(id)) return;
+  /**
+   * End every attempt signal this store holds for a session. Settling writes
+   * and deletion cannot know which local signal a foreign write belonged to,
+   * and a signal that outlives its attempt would pin every other window's
+   * liveness probe true forever — so releasing all local signals is the only
+   * correct granularity here.
+   */
+  private releaseAttemptSignals(id: string): void {
+    const prefix = `${id}\u0000`;
+    const owned: string[] = [];
 
-    const release = this.attemptLocks.get(id);
+    for (const key of this.attemptLocks.keys()) {
+      if (key.startsWith(prefix)) owned.push(key);
+    }
 
-    this.attemptLocks.delete(id);
-    liveAttemptRegistry.delete(attemptRegistryKey(this.databaseName, id));
-    release?.();
+    for (const key of owned) {
+      const release = this.attemptLocks.get(key);
+
+      this.attemptLocks.delete(key);
+      discardAttemptSignal(this.databaseName, id, key.slice(prefix.length));
+      release?.();
+    }
+  }
+
+  /**
+   * Session ids this store holds attempt signals for. Rebuilt from the
+   * signal keys on each close() so concurrent attempts for one session are
+   * all released, never just the first.
+   */
+  private attemptSignalsOwned(): string[] {
+    const owned = new Set<string>();
+
+    for (const key of this.attemptLocks.keys()) {
+      const separator = key.indexOf("\u0000");
+
+      if (separator >= 0) owned.add(key.slice(0, separator));
+    }
+
+    return [...owned];
+  }
+
+  /** End one attempt's signal after its markAttempt write rejects. */
+  private releaseAttemptSignal(id: string, signal: string): void {
+    const owned = ownedAttemptKey(id, signal);
+
+    this.attemptLocks.get(owned)?.();
+    this.attemptLocks.delete(owned);
+    discardAttemptSignal(this.databaseName, id, signal);
   }
 
   private database(): Promise<IDBDatabase> {

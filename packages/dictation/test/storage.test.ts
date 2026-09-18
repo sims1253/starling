@@ -12,6 +12,7 @@ import {
   invalidSessionWav,
   type GrantedWebLock,
   type WebLockRequestOptions,
+  type WebLockSnapshot,
   type WebLocksLike,
 } from "../src/storage.js";
 import { decodePcm16Wav } from "../src/audio.js";
@@ -798,6 +799,12 @@ class MemoryWebLocks implements WebLocksLike {
       this.held.delete(name);
     }
   }
+
+  async query(): Promise<WebLockSnapshot> {
+    return Object.freeze({
+      held: Object.freeze([...this.held].map((name) => Object.freeze({ name }))),
+    });
+  }
 }
 
 describe("cross-window capture ownership", () => {
@@ -812,6 +819,7 @@ describe("cross-window capture ownership", () => {
 
         return inner.request(name, options, granted);
       },
+      query: () => inner.query(),
     };
 
     const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
@@ -1126,6 +1134,143 @@ describe("cross-window capture ownership", () => {
 
     assert.equal((await second.get("late-attempt"))?.status, "failed");
     second.close();
+  });
+
+  it("keeps a contended second attempt visible after the lock winner settles", async () => {
+    // Edge 1 (#162): two windows transcribe the same session. Lock
+    // contention admits both, but only the winner holds a cross-window lock;
+    // when the winner settles first, the loser's own signal must still read
+    // as in-flight so no startup sweep marks it interrupted.
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-contended", indexedDB: factory, webLocks };
+    const first = new IndexedDbSessionStore(options);
+    const second = new IndexedDbSessionStore(options);
+
+    await first.create({ id: "contended", wav });
+    await first.markAttempt("contended");
+    await second.markAttempt("contended");
+
+    // The second window's own admission left the session transcribing; the
+    // winner completing must not make the live contender look abandoned to
+    // a fresh sweep window holding no signal of its own.
+    await first.saveTranscript("contended", { text: "winner lands", segments: [] });
+
+    const sweeper = new IndexedDbSessionStore(options);
+
+    assert.equal(await sweeper.transcriptionInFlight("contended"), true);
+
+    // What App.tsx's startup sweep does with a still-live signal: nothing —
+    // the contender's session is never marked interrupted.
+    if (!(await sweeper.transcriptionInFlight("contended"))) {
+      await sweeper.saveFailure(
+        "contended",
+        "Interrupted before the server returned a transcript.",
+      );
+    }
+
+    assert.equal((await sweeper.get("contended"))?.status, "transcribed");
+    assert.equal((await sweeper.get("contended"))?.transcript?.text, "winner lands");
+
+    await second.saveTranscript("contended", { text: "contender lands", segments: [] });
+
+    assert.equal(await sweeper.transcriptionInFlight("contended"), false);
+    assert.equal((await sweeper.get("contended"))?.transcript?.text, "contender lands");
+    first.close();
+    second.close();
+    sweeper.close();
+  });
+
+  it("never lets a late interruption overwrite a settled transcript", async () => {
+    // Edge 2 (#162): the sweep's transcriptionInFlight probe can pass while
+    // a live owner still holds its signal, and the owner's saveTranscript
+    // can then commit before the sweep's saveFailure. The marking write is
+    // conditional, so the settled transcript survives the race either way.
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-settled-race", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+    const sweeper = new IndexedDbSessionStore(options);
+
+    await owner.create({ id: "racing", wav });
+    await owner.markAttempt("racing");
+
+    // The sweep probed while the owner was live, then the owner settled
+    // before the marking write ran — the exact #162 interleave.
+    assert.equal(await sweeper.transcriptionInFlight("racing"), true);
+    await owner.saveTranscript("racing", { text: "settled first", segments: [] });
+
+    const marked = await sweeper.saveFailure(
+      "racing",
+      "Interrupted before the server returned a transcript.",
+    );
+
+    assert.equal(marked.status, "transcribed");
+    assert.equal(marked.transcript?.text, "settled first");
+
+    const stored = await owner.get("racing");
+
+    assert.equal(stored?.status, "transcribed");
+    assert.equal(stored?.transcript?.text, "settled first");
+    assert.equal(stored?.lastError, undefined);
+    owner.close();
+    sweeper.close();
+  });
+
+  it("reads a foreign window's attempt signal through the lock snapshot", async () => {
+    // The registry path above only works within one realm; a real
+    // cross-window sweep starts with an empty registry and can only see a
+    // foreign attempt through the per-attempt lock name enumeration.
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-foreign", indexedDB: factory, webLocks };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "foreign", wav });
+
+    let releaseForeign!: () => void;
+
+    const held = new Promise<void>((resolve) => {
+      releaseForeign = resolve;
+    });
+
+    const holding = webLocks.request(
+      "starling:dictation:ownership-foreign:transcribe:foreign:9f1c",
+      { mode: "exclusive", ifAvailable: true },
+      () => held,
+    );
+
+    assert.equal(await store.transcriptionInFlight("foreign"), true);
+
+    releaseForeign();
+    await held;
+    await holding;
+
+    assert.equal(await store.transcriptionInFlight("foreign"), false);
+    store.close();
+  });
+
+  it("clears a lockless attempt's signal when its attempt settles", async () => {
+    // No webLocks in this environment: the registry carries the signal
+    // alone, and settlement must still clear it — a leaked signal would
+    // pin every later probe in-flight and freeze the sweep forever.
+    const factory = new IDBFactory();
+
+    const store = new IndexedDbSessionStore({
+      databaseName: "lockless-signal",
+      indexedDB: factory,
+      webLocks: undefined,
+    });
+
+    await store.create({ id: "lockless", wav });
+    await store.markAttempt("lockless");
+
+    assert.equal(await store.transcriptionInFlight("lockless"), true);
+
+    await store.saveTranscript("lockless", { text: "settled", segments: [] });
+
+    assert.equal(await store.transcriptionInFlight("lockless"), false);
+    store.close();
   });
 
   it("releases the attempt signal when the settling write fails", async () => {
