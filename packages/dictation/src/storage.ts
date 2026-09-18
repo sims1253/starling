@@ -889,7 +889,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     // discarded while the journal drained must not be persisted (#160).
     if (isCancelled?.()) {
       await this.discard().catch(() => {
-        /* recovery sweeps journals that could not be deleted */
+        /* a journal that could not be deleted stays claimed by this window */
       });
 
       const assembled = assemblePcm16Wav(this.chunks);
@@ -912,7 +912,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
       });
 
       await this.discard().catch(() => {
-        /* recovery sweeps journals whose session already exists */
+        /* the post-close sweep consumes a journal that could not be deleted */
       });
 
       return Object.freeze({ wav: assembled.wav, durationMs: duration, session });
@@ -928,7 +928,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     // being durable mid-take still has rows in the store, and a take the
     // user discarded must not resurrect via recovery.
     await this.discard().catch(() => {
-      /* recovery sweeps journals that could not be deleted */
+      /* a journal that could not be deleted stays claimed by this window */
     });
   }
 
@@ -951,7 +951,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     }
   }
 
-  /** The journal is gone or going; the capture's ownership ends with it. */
+  /** The journal is gone; the capture's ownership ends with it. */
   private releaseOwnership(): void {
     if (this.ownershipReleased) return;
     this.ownershipReleased = true;
@@ -960,13 +960,14 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
   }
 
   private async discard(): Promise<void> {
-    try {
-      const database = await this.openDatabase();
+    const database = await this.openDatabase();
 
-      await deleteStreamCapture(database, this.sessionId);
-    } finally {
-      this.releaseOwnership();
-    }
+    await deleteStreamCapture(database, this.sessionId);
+
+    // Ownership ends with the journal, and only then: a delete that failed
+    // keeps the capture claimed, so no sweep can promote a journal its
+    // owner discarded into a resurrected session while this window lives.
+    this.releaseOwnership();
   }
 }
 

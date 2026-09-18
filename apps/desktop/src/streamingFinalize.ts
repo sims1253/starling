@@ -47,10 +47,11 @@ function messageFrom(cause: unknown): string {
  * Discard that lands while the finalize is in flight (#160).
  *
  * The generation is captured synchronously by the caller and re-validated
- * before each durable write; a stale finalize performs no session write at
- * all — no saveTranscript, no noteStreamError, no batch transcribe — cleans
- * up anything provisional its own finish created, and leaves the state the
- * Discard settled untouched.
+ * before and after each durable write; a stale finalize performs no session
+ * write — no saveTranscript, no noteStreamError, no batch transcribe —
+ * cleans up anything provisional its own finish created, undoes its own
+ * streamed save when the Discard lands mid-write, and never falls through
+ * to the batch path. The state the Discard settled is left untouched.
  *
  * Returns batchFallback when the stream was never usable and the caller
  * should save the recorder's own capture via the batch path.
@@ -66,6 +67,13 @@ export async function finishStreamingTake(
     // would be a header-only WAV: drop the empty journal and keep the
     // recorder's capture through the batch path (#143).
     await stream.abandon().catch(() => {});
+
+    // A Discard that landed while the journal was dropped must not fall
+    // through to the batch path either: the recorder capture is discarded
+    // with the take.
+    if (!isCurrentTake()) {
+      return { streamed: false, discarded: true, batchFallback: false };
+    }
 
     return { streamed: false, batchFallback: true };
   }
@@ -109,6 +117,16 @@ export async function finishStreamingTake(
 
   if (result.streamed && result.transcript) {
     await store.saveTranscript(result.session.id, result.transcript, { streamed: true });
+
+    // A Discard that landed during the save settles the session without
+    // the take: undo this finalize's completed write instead of surfacing
+    // the dropped take.
+    if (!isCurrentTake()) {
+      await store.delete(result.session.id).catch(() => {});
+
+      return { streamed: false, discarded: true, batchFallback: false };
+    }
+
     deps.setSelectedId(result.session.id);
     deps.setConnectionReady();
     await deps.refresh();

@@ -131,6 +131,7 @@ class FakeStore {
   saved: Array<{ id: string; streamed?: boolean }> = [];
   noted: Array<{ id: string; message: string }> = [];
   deleted: string[] = [];
+  selected: string[] = [];
   sessions = new Map<string, DictationSession>([["take-one", session()]]);
   transcribed: string[] = [];
 
@@ -188,7 +189,7 @@ function handlersFor(
         throw new Error("parked unexpectedly");
       }),
     refresh: () => Promise.resolve(),
-    setSelectedId: () => {},
+    setSelectedId: (id) => store.selected.push(id),
     setConnectionReady: () => {},
     transcribe: (next: DictationSession) => {
       store.transcribed.push(next.id);
@@ -238,6 +239,51 @@ describe("finishStreamingTake", () => {
     expect(result.batchFallback).toBe(false);
     expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
     expect(store.deleted).toEqual([]);
+  });
+
+  it("undoes the streamed save when Discard lands during the write", async () => {
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 1;
+    stream.finishResult = Object.freeze({
+      wav,
+      durationMs: 500,
+      session: session(),
+      streamed: true,
+      transcript,
+    });
+
+    // Current through the pre-save probes (calls 1–2), stale at the
+    // post-save probe (call 3): the completed row is this finalize's to
+    // remove, and the dropped take must not be surfaced.
+    let probes = 0;
+
+    const result = await finishStreamingTake(
+      handlersFor(stream, store, () => ++probes < 3),
+      store,
+    );
+
+    expect(result.discarded).toBe(true);
+    expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
+    expect(store.deleted).toEqual(["take-one"]);
+    expect(store.selected).toEqual([]);
+  });
+
+  it("does not fall through to the batch path when Discard lands on an empty journal", async () => {
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 0;
+
+    const result = await finishStreamingTake(
+      handlersFor(stream, store, () => false),
+      store,
+    );
+
+    expect(result).toEqual({ streamed: false, discarded: true, batchFallback: false });
+    expect(stream.abandons).toBe(1);
+    expect(store.saved).toEqual([]);
+    expect(store.deleted).toEqual([]);
+    expect(store.transcribed).toEqual([]);
   });
 
   it("writes nothing when Discard lands while the finalize is in flight", async () => {
