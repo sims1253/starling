@@ -86,6 +86,11 @@ export interface DictationSessionStore {
     transcript: TranscriptionResult,
     options?: SaveTranscriptOptions,
   ): Promise<DictationSession>;
+  /**
+   * Downgrade an in-flight session (`transcribing`/`captured`) to `failed`.
+   * A session a live owner already settled keeps its state, so a sweep
+   * racing a settling write cannot overwrite it (#162).
+   */
   saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession>;
   /** Record why live streaming failed without changing the session status. */
   noteStreamError(id: string, message: string): Promise<DictationSession>;
@@ -561,10 +566,12 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
     try {
       return await this.update(id, (current) =>
-        updatedSession(current, {
-          status: "failed",
-          lastError: errorText(cause),
-        }),
+        current.status === "transcribing" || current.status === "captured"
+          ? updatedSession(current, {
+              status: "failed",
+              lastError: errorText(cause),
+            })
+          : current,
       );
     } finally {
       this.transcribing.delete(id);
@@ -1153,8 +1160,10 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
    * Every admitted transcription attempt's release latch keyed by an
    * attempt-local signal: more than one attempt for a session may be open
    * at once, and each must be visible to other windows until it settles.
+   * Lockless and contended attempts hold no latch — the registry carries
+   * their signal alone — but still get their entry so settlement clears it.
    */
-  private readonly attemptLocks = new Map<string, () => void>();
+  private readonly attemptLocks = new Map<string, (() => void) | undefined>();
   private databasePromise: Promise<IDBDatabase> | undefined;
 
   constructor(options: IndexedDbSessionStoreOptions = {}) {
@@ -1350,10 +1359,10 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
         ) ?? false
       );
     } catch {
-      // A snapshot the manager cannot produce carries no observable signal;
-      // report none and let the conditional saveFailure below carry the
-      // safety for sessions that settled mid-sweep.
-      return false;
+      // A snapshot the manager cannot produce says nothing about liveness:
+      // report in-flight, as the single-name probe did on rejection, so a
+      // transient manager failure never manufactures an interruption.
+      return true;
     }
   }
 
@@ -1597,20 +1606,15 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
    * still reads in-flight (#162).
    */
   private async holdAttemptSignal(id: string, signal: string): Promise<void> {
-    if (this.locks) {
-      const name = attemptLockName(this.databaseName, id, signal);
+    // The lock is held until this attempt settles. A contended or lockless
+    // environment hands back no latch, but the registry still carries the
+    // signal — so the latch map gets its entry either way and settlement
+    // always finds and discards the registry signal (#162).
+    const release = this.locks
+      ? await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id, signal))
+      : undefined;
 
-      // The lock is held until this attempt settles; releasing only this
-      // signal on settle keeps concurrent attempts for the session visible.
-      const release = await acquireNamedLock(this.locks, name);
-
-      if (release) {
-        this.attemptLocks.set(ownedAttemptKey(id, signal), release);
-      }
-    }
-
-    // Contended or lockless, the attempt is still live as far as this
-    // environment is concerned — the registry carries the signal alone then.
+    this.attemptLocks.set(ownedAttemptKey(id, signal), release);
     trackAttemptSignal(this.databaseName, id, signal);
   }
 

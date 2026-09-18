@@ -1217,6 +1217,62 @@ describe("cross-window capture ownership", () => {
     sweeper.close();
   });
 
+  it("reads a foreign window's attempt signal through the lock snapshot", async () => {
+    // The registry path above only works within one realm; a real
+    // cross-window sweep starts with an empty registry and can only see a
+    // foreign attempt through the per-attempt lock name enumeration.
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-foreign", indexedDB: factory, webLocks };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "foreign", wav });
+
+    let releaseForeign!: () => void;
+
+    const held = new Promise<void>((resolve) => {
+      releaseForeign = resolve;
+    });
+
+    const holding = webLocks.request(
+      "starling:dictation:ownership-foreign:transcribe:foreign:9f1c",
+      { mode: "exclusive", ifAvailable: true },
+      () => held,
+    );
+
+    assert.equal(await store.transcriptionInFlight("foreign"), true);
+
+    releaseForeign();
+    await held;
+    await holding;
+
+    assert.equal(await store.transcriptionInFlight("foreign"), false);
+    store.close();
+  });
+
+  it("clears a lockless attempt's signal when its attempt settles", async () => {
+    // No webLocks in this environment: the registry carries the signal
+    // alone, and settlement must still clear it — a leaked signal would
+    // pin every later probe in-flight and freeze the sweep forever.
+    const factory = new IDBFactory();
+
+    const store = new IndexedDbSessionStore({
+      databaseName: "lockless-signal",
+      indexedDB: factory,
+      webLocks: undefined,
+    });
+
+    await store.create({ id: "lockless", wav });
+    await store.markAttempt("lockless");
+
+    assert.equal(await store.transcriptionInFlight("lockless"), true);
+
+    await store.saveTranscript("lockless", { text: "settled", segments: [] });
+
+    assert.equal(await store.transcriptionInFlight("lockless"), false);
+    store.close();
+  });
+
   it("releases the attempt signal when the settling write fails", async () => {
     const factory = new IDBFactory();
     const webLocks = new MemoryWebLocks();
