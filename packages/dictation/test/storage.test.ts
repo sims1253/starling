@@ -212,6 +212,64 @@ async function wavBytes(wav: Blob): Promise<Uint8Array> {
 /** Raw stored-record shape for fixtures that damage one field at a time. */
 type DamagedStoredRecord = { wav?: Blob };
 
+/** A representative v1 session record, as written before the journal stores existed. */
+type VersionOneSession = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  status: string;
+  wav: Blob;
+  durationMs?: number;
+  attemptCount: number;
+  transcript?: { text: string; segments: [] };
+};
+
+/**
+ * Build a genuine version-1 database: `sessions` plus its indexes only, one
+ * session inserted through the raw connection, exactly like the store did
+ * before streaming captures raised the version to 2.
+ */
+async function openVersionOneSessionDatabase(
+  factory: IDBFactory,
+  databaseName: string,
+  session: VersionOneSession,
+): Promise<IDBDatabase> {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = factory.open(databaseName, 1);
+
+    request.onupgradeneeded = () => {
+      const store = request.result.createObjectStore("sessions", { keyPath: "id" });
+
+      store.createIndex("updatedAt", "updatedAt");
+      store.createIndex("status", "status");
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction("sessions", "readwrite");
+
+    transaction.objectStore("sessions").put(session);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+
+  return database;
+}
+
+/** Versionless open attaches at whatever version the store last created. */
+function openAtCurrentVersion(factory: IDBFactory, databaseName: string): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open(databaseName);
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
 describe("streaming capture journal", () => {
   it("assembles journaled PCM16 chunks into a canonical WAV session", async () => {
     const store = new MemorySessionStore();
@@ -388,18 +446,108 @@ describe("streaming capture journal", () => {
     store.close();
   });
 
-  it("opens v1 databases at the journal schema version without touching sessions", async () => {
+  it("upgrades real version-1 databases to the journal schema without touching sessions", async () => {
     const factory = new IDBFactory();
-    const options = { databaseName: "stream-upgrade-test", indexedDB: factory };
+    const databaseName = "v1-upgrade-test";
+
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "v1-session",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "transcribed",
+      wav,
+      durationMs: 25,
+      attemptCount: 1,
+      transcript: { text: "written before streaming existed", segments: [] },
+    });
+
+    // The fixture is a genuine pre-journal database: version 1 with only the
+    // sessions store, exactly as the store created it before the bump.
+    assert.equal(v1.version, 1);
+    assert.deepEqual([...v1.objectStoreNames], ["sessions"]);
+    assert.deepEqual([...v1.transaction("sessions").objectStore("sessions").indexNames].sort(), [
+      "status",
+      "updatedAt",
+    ]);
+    v1.close();
+
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+    const restored = await store.get("v1-session");
+
+    assert.ok(restored);
+    assert.equal(restored.createdAt, "2025-09-01T10:00:00.000Z");
+    assert.equal(restored.updatedAt, "2025-09-01T10:00:01.000Z");
+    assert.equal(restored.status, "transcribed");
+    assert.equal(restored.durationMs, 25);
+    assert.equal(restored.transcript?.text, "written before streaming existed");
+    assert.deepEqual(
+      new Uint8Array(await restored.wav.arrayBuffer()),
+      new Uint8Array([82, 73, 70, 70]),
+    );
+    assert.equal(restored.streamed, undefined);
+    assert.equal(restored.streamError, undefined);
+
+    // The journal stores and the captureId index arrive with the upgrade.
+    const upgraded = await openAtCurrentVersion(factory, databaseName);
+    const upgradedChunks = upgraded.transaction("stream-chunks", "readonly");
+
+    assert.equal(upgraded.version, 2);
+    assert.ok(upgraded.objectStoreNames.contains("stream-captures"));
+    assert.ok(upgraded.objectStoreNames.contains("stream-chunks"));
+    assert.ok(upgradedChunks.objectStore("stream-chunks").indexNames.contains("captureId"));
+    upgraded.close();
+
+    // They also work: a capture journaled after the upgrade assembles into a
+    // canonical WAV session through the new stores.
+    const capture = await store.beginStreamCapture({ id: "post-upgrade" });
+
+    await capture.append(chunkOf(1_000));
+
+    const finished = await capture.finish();
+
+    assert.ok(finished.session);
+    assert.equal(finished.session.id, "post-upgrade");
+    assert.equal(decodePcm16Wav(await wavBytes(finished.wav)).samples.length, 1_000);
+    assert.equal((await store.get("post-upgrade"))?.status, "captured");
+    store.close();
+  });
+
+  it("keeps a stalled v1 connection from blocking the upgrade silently", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "v1-blocked-upgrade";
+
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "stuck",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "captured",
+      wav,
+      attemptCount: 0,
+    });
+
+    // Deliberately no versionchange handler and no close: the open v1
+    // connection pins the database at version 1.
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    await assert.rejects(
+      store.get("stuck"),
+      (cause) => cause instanceof DictationStorageError && /blocked/.test(cause.message),
+    );
+    v1.close();
+    store.close();
+  });
+
+  it("reopens current-version databases without re-running the upgrade", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "stream-reopen-test", indexedDB: factory };
     const first = new IndexedDbSessionStore(options);
 
-    await first.create({ id: "v1-session", wav });
+    await first.create({ id: "current-session", wav });
     first.close();
 
-    // A store that predates streaming (opened before the version bump) wrote
-    // plain v1 session records; reopening must read them back unchanged.
+    // A same-version reopen must read plain session records back unchanged.
     const second = new IndexedDbSessionStore(options);
-    const restored = await second.get("v1-session");
+    const restored = await second.get("current-session");
 
     assert.ok(restored);
     assert.equal(restored?.streamed, undefined);

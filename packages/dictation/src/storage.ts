@@ -1036,7 +1036,12 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   close(): void {
-    void this.databasePromise?.then((database) => database.close());
+    // A failed open already rejected to its caller; closing afterwards must
+    // not re-surface that failure as an unhandled rejection.
+    void this.databasePromise?.then(
+      (database) => database.close(),
+      () => undefined,
+    );
     this.databasePromise = undefined;
   }
 
