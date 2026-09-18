@@ -244,7 +244,10 @@ so the client must fall back to its authoritative local recording. The
 machine-readable reason codes are `malformed_wav`, `sample_rate_mismatch`,
 and `odd_pcm_length`. As with the buffer cap, the connection stays alive
 (control frames keep working) and `{"type":"reset"}` clears the invalidation
-and re-enables audio.
+and re-enables audio. The deprecated Python server does not share this
+contract: it resamples non-16 kHz WAVs and silently drops malformed chunks
+(see [divergence note](python-serving.md#divergence-from-the-native-server-on-invalid-stream-audio));
+clients should rely on the contract documented here.
 
 Control frames (JSON text):
 

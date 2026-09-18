@@ -126,6 +126,29 @@ has been transcribed. If retries remain busy, the server sends
 `{"type":"error","message":"server busy"}` and retains the audio. Retry `commit`
 after a delay; use `reset` only to discard the buffered session.
 
+### Divergence from the native server on invalid stream audio
+
+The native server rejects invalid `WS /stream` audio loudly: a malformed WAV,
+a non-16 kHz WAV, or an odd-length PCM16 frame produces one error frame and
+invalidates the take until `reset` (see [invalid audio
+frames](native-serving.md#ws-stream)). This server keeps the older, lenient
+behavior instead (issue #156):
+
+- a malformed WAV chunk (RIFF/WAVE magic but undecodable) is dropped with a
+  server-side `log.warning` and no error frame — the session keeps accepting
+  audio (`StreamSession.append_wav` in `src/starling/server.py`);
+- an odd trailing PCM16 byte is discarded with a `log.warning`, keeping the
+  rest of the frame (`_pcm16_bytes_to_float32`);
+- a non-16 kHz WAV is resampled to 16 kHz via scipy and accepted — the native
+  server has no resampler, so this is a genuine feature difference.
+
+This divergence is intentional: this serving path is deprecated (see above)
+and [slated for retirement after the first native-server
+release](https://github.com/sims1253/starling/issues/19), so the native
+rejection/invalidation contract was deliberately not ported here. Clients
+should code against the [native contract](native-serving.md#ws-stream): do
+not rely on resampling or silent drops surviving in future releases.
+
 Profiles provide supported defaults for the main workloads:
 
 | profile | intended workload | graph/optimization policy |
