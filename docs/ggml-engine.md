@@ -81,22 +81,99 @@ added to `starling_ggml.h` with the usual ABI bump (the Python binding's
 
 ## Correctness contract
 
-Byte-exact transcripts vs the golden references (`golden/parakeet_tdt_*.txt`
-for parakeet, `golden/moss_*.txt` for moss), asserted by
-`tests/test_ggml_parity.py` (skipped if the ggml binaries aren't built).
+The executable contract is the versioned manifest
+`tests/native_parity_manifest.json` (loader/validator:
+`tests/parity_contract.py`, self-tests: `tests/test_native_parity_contract.py`).
+It keys every gate by model, backend, GGUF sha256 and pinned reference
+revision, records the token-suppression / tie-breaking / normalization /
+stop-and-truncation policies, and the table below is GENERATED from it
+(`uv run python tests/parity_contract.py --write-docs`; a test fails when the
+table and the manifest disagree). The engine gates live in
+`tests/test_ggml_parity.py`; every gate there is claimed by exactly one
+manifest target.
 
-- **parakeet-tdt (in-tree `StarlingGgmlParakeet`)**: byte-exact text on
-  short/medium/long and exact non-blank content-token streams. Blank cadence
+<!-- parity-manifest:v1 begin -->
+This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, revision `r1-167-parity-contract`) — edit the manifest, then run `uv run python tests/parity_contract.py --write-docs`. `tests/test_native_parity_contract.py` fails if this table and the manifest disagree. V = validated backend, - = unvalidated.
+
+| Target | Model | Engine | Contract class | Fixtures | Backends (V/-) | Required |
+| --- | --- | --- | --- | --- | --- | --- |
+| `moss.intree.text` | MOSS-Transcribe-preview-2B | starling-ggml-moss | exact-text | short, medium, long | cpu:V, cuda:- | yes |
+| `moss.intree.mel` | MOSS-Transcribe-preview-2B | cpp-test:moss_mel_test | component-tol | short, medium, long | cpu:V, cuda:- | yes |
+| `moss.intree.encoder` | MOSS-Transcribe-preview-2B | cpp-test:moss_encoder_test | component-tol | short, medium, long | cpu:V, cuda:- | yes |
+| `qwen_decode.shared_fixture` | MOSS-Transcribe-preview-2B LLM trunk (shared lib/qwen_decode stack) | cpp-test:moss_llm_test | component-tol | short, medium, long | cpu:V, cuda:V | yes |
+| `qwen_decode.shared_fixture.token_stream` | MOSS-Transcribe-preview-2B LLM trunk (shared lib/qwen_decode stack) | cpp-test:moss_llm_test | exact-tokens | short, medium, long | cpu:-, cuda:V | yes |
+| `parakeet.intree.text` | parakeet-tdt-0.6b-v3 | starling-ggml-parakeet | exact-text + long:corpus-quality | short, medium, long | cpu:V, cuda:V | yes |
+| `parakeet.intree.ids` | parakeet-tdt-0.6b-v3 | starling-ggml-parakeet | exact-tokens + long:corpus-quality | short, medium, long | cpu:V, cuda:V | yes |
+| `moss.crispasr.external` | MOSS-Transcribe-preview-2B (CrispASR f16 build) | crispasr-moss-transcribe (external, DEPRECATED) | exact-text + medium:corpus-quality + long:corpus-quality | short, medium, long | cpu:-, cuda:V | no |
+| `parakeet.external` | parakeet-tdt-0.6b-v3 (f16 GGUF) | parakeet.cpp-server (external; renamed SMOKE-QUALITY gate) | exact-text + long:corpus-quality | short, medium, long | cpu:-, cuda:V | no |
+| `moss.intree.kstep_regression` | MOSS-Transcribe-preview-2B | cpp-test:moss_kstep_oob_test | smoke (non-certifying) | synthetic_maxcache_boundary | cpu:-, cuda:V | no |
+| `ark.intree.text` | ark-asr-3b (BAAI/ARK-ASR-3B) | starling-ggml-ark | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `higgs.intree.text` | bosonai/higgs-audio-v3-stt | starling-ggml-higgs | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `hojo.intree.text` | HojoAI/Hojo-ASR-V1 | starling-ggml-hojo | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `granite.intree.text` | ibm-granite/granite-speech-4.1-2b | starling-ggml-granite | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `qwen3.intree.text` | Qwen/Qwen3-ASR-1.7B | starling-ggml-qwen3 | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `audex.intree.text` | nvidia/nemotron-labs-audex-2b | starling-ggml-audex | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `s1.intree.text` | superwhisper/s1-mini | starling-ggml-s1 | exact-text | short, medium, long | cpu:-, cuda:V | no |
+| `s1.intree.control_matrix_smoke` | superwhisper/s1-mini | starling-ggml-s1 | smoke (non-certifying) | control_matrix_16_cells | cpu:-, cuda:V | no |
+<!-- parity-manifest:v1 end -->
+
+Semantics:
+
+- **Contract classes.** `exact_token_equality` / `exact_text_equality` compare
+  the ENTIRE applicable output — a matching prefix, a single incorrect token,
+  and a shifted EOS boundary are all failures (proven by the negative tests in
+  `tests/test_native_parity_contract.py`). `component_numerical_tolerance`
+  names metric, aggregation, normalization and margin per component.
+  `corpus_quality_acceptance` is the explicitly documented approximate path:
+  its tolerance block is recorded in the manifest BEFORE any candidate is
+  evaluated, never invented at failure time. `smoke_non_certifying` marks
+  renamed smoke checks that certify nothing.
+- **Required vs unavailable coverage.** A REQUIRED target whose assets are all
+  present but which executes zero tests FAILS (a skip-vacuum is a broken gate,
+  not a green one). Genuinely unavailable coverage — gitignored GGUFs/goldens
+  on a CPU CI runner — is reported distinctly by the accounting tests and only
+  fails under `STARLING_PARITY_STRICT=1`. A present GGUF or golden whose
+  sha256 differs from the manifest pin FAILS outright: never measure — or
+  silently regenerate — the wrong reference (`scripts/moss_golden.py` refuses
+  to overwrite existing goldens without `--force`).
+- **Reference updates are reviewed changes.** Every tolerance or reference
+  change must appear as a justified `changelog` entry in the manifest; the
+  MOSS reference record (device, library versions, per-fixture output hashes)
+  lives in `golden/moss_reference_provenance.json`, produced by the capture
+  script.
+
+Model notes:
+
+- **parakeet-tdt (in-tree `StarlingGgmlParakeet`)**: short/medium are
+  byte-exact text AND exact non-blank content-token streams. Blank cadence
   differs on short/long but blanks are not linguistic tokens and are discarded
-  by detokenization. Both gates live in `tests/test_ggml_parity.py`.
-- **moss (in-tree `StarlingGgmlMoss`)**: exact eager greedy token IDs and text
-  on short/medium/long. The reference explicitly propagates eager attention to
-  nested model configs and uses exact-width `DynamicCache`; padded StaticCache
-  reduction-order noise is not a golden contract. Component ULP tolerances are
-  documented alongside the component tests.
-- **moss (legacy external CrispASR)**: short is byte-exact; medium/long retain
-  the historical normalized-CER gate and single-chunk workaround. This engine
-  is deprecated and does not define Starling's in-tree correctness.
+  by detokenization. LONG is the documented approximate path (manifest targets
+  `parakeet.intree.text` / `parakeet.intree.ids`): transformers 5.14 SDPA
+  kernel-path drift on the 74 s decode — the golden was captured via HF
+  `model.generate` whose SDPA reduction order differs from the in-tree eager
+  loop — gated by raw-transcript difflib ratio >= 0.90 plus a >= 0.65
+  content-token match-rate floor, WER-verified benign (3.18% ==
+  starling-vs-stock).
+- **moss (in-tree `StarlingGgmlMoss`)**: exact text on short/medium/long —
+  no tolerance. Manifest target `moss.intree.text` pins the reference
+  (fresh capture: eager greedy, exact-width `DynamicCache`, device/library
+  versions/output hashes recorded) and the GGUF sha256; the historical
+  normalized-CER < 0.10 escape hatch on the long fixture was guarding a stale
+  reference, not engine drift, and is removed (issue #167). Component ULP and
+  max-abs tolerances (mel, encoder/adapter, shared-Qwen decoder fixture) are
+  recorded per component in the manifest and enforced by the
+  `build/moss_*_test` binaries. The decoder's exact-token fixture
+  (`qwen_decode.shared_fixture.token_stream`) is CUDA-scoped for medium/long:
+  `cpp/moss/llm.cpp` documents that CPU bf16 GEMMs are not bit-identical to
+  cuBLAS (fallback only), and on CPU the medium/long id streams flip near-tie
+  argmax positions vs the eager reference — reported, not gated, there; short
+  and all component gates are enforced everywhere, and end-to-end CPU text
+  exactness is carried by `moss.intree.text`.
+- **moss (legacy external CrispASR)**: short is byte-exact; medium/long carry
+  the historical normalized-CER smoke gate (renamed
+  `test_ggml_moss_crispasr_approx_smoke` — a smoke gate, not certification)
+  and single-chunk workaround. This engine is deprecated and does not define
+  Starling's in-tree correctness.
 - **granite (in-tree `StarlingGgmlGranite`)**: greedy path only (the
   self-speculative CTC-drafting path stays Python-side and is byte-identical
   to greedy by construction). Exact text on short/medium/long against
@@ -123,6 +200,11 @@ for parakeet, `golden/moss_*.txt` for moss), asserted by
   clip at the mel level, per-chunk budget min(200, ceil(dur*5)+32),
   whitespace-collapsed join) and the `_decode_response` quote extraction
   (first-to-last single-quote span, ported in `capi_audex.cpp`).
+
+Entries whose golden references are gitignored assets are marked `required: no`
+in the manifest and carry an UNPINNED reference note until a recapture pins
+their hashes; their backend statuses are the recorded historical validations,
+not new measurements.
 
 ### granite engine notes
 

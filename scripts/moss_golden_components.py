@@ -4,6 +4,15 @@ This deliberately uses ``starling.moss.reference`` for the audio-encoder and
 embedding-merge stages.  The prefill forward below is the prefill portion of
 ``greedy_generate`` verbatim, so its logits are the distribution whose argmax
 seeds that reference decoder.
+
+The capture device defaults to CUDA when available and falls back to CPU
+(``STARLING_GOLDEN_DEVICE=cpu|cuda`` overrides); the chosen device and library
+versions are recorded in each ``moss_<fixture>_meta.json`` so a component run
+can prove WHICH reference it was measured against (issue #167). The captured
+ids are asserted equal to ``moss_<fixture>_ids.pt`` (the ``moss_golden.py``
+reference) before anything is written — a component capture that disagrees
+with the text-golden reference aborts rather than staging a second,
+contradicting reference.
 """
 
 from __future__ import annotations
@@ -91,18 +100,43 @@ def main() -> int:
     gdir.mkdir(exist_ok=True)
     rows: list[tuple[str, str, str, str]] = []
 
-    with with_gpu_lock(session="ggml-goldens", model="MOSS-Transcribe-preview-2B", eta_min=15,
-                       note="capturing staged MOSS C++ reference goldens"):
-        print("[moss-components] loading model ...")
-        model, proc = load_model_and_processor()
+    import os
+    import subprocess
+
+    env_dev = os.environ.get("STARLING_GOLDEN_DEVICE")
+    if env_dev in ("cpu", "cuda"):
+        device = env_dev
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    try:
+        rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                             capture_output=True, text=True, check=True
+                             ).stdout.strip()
+    except Exception:
+        rev = "unknown"
+    capture_provenance = {
+        "device": device,
+        "torch": torch.__version__,
+        "transformers": __import__("transformers").__version__,
+        "repo_revision": rev,
+        "reference_path": "starling.moss.reference (eager greedy, exact-width DynamicCache)",
+    }
+    print(f"[moss-components] loading model ... (device={device})")
+
+    from contextlib import nullcontext
+
+    def _capture() -> None:
+        model, proc = load_model_and_processor(device=device)
         for name in NAMES:
             wav, sr = load_wav(REPO / "tests" / "fixtures" / f"{name}.wav")
             seconds = wav.shape[0] / sr
             raw = proc(wav.numpy())
             # Preserve the processor's tensor (bf16) for the reference forward.
-            inp = {key: (value.cuda() if isinstance(value, torch.Tensor) else value) for key, value in raw.items()}
+            inp = {key: (value.to(device) if isinstance(value, torch.Tensor) else value) for key, value in raw.items()}
 
-            torch.cuda.synchronize()
+            if device == "cuda":
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             with torch.inference_mode():
                 encoder_hidden = audio_features(model, inp["audio_data"], inp["audio_data_seqlens"])
@@ -111,7 +145,8 @@ def main() -> int:
                 audio_embeds = model.model.audio_adapter(encoder_hidden)
                 prefill_logits = last_prefill_logits(model, inputs_embeds)
                 ids = greedy_generate(model, inputs_embeds, max_new_tokens=200, max_cache_len=2048)
-            torch.cuda.synchronize()
+            if device == "cuda":
+                torch.cuda.synchronize()
 
             expected_ids = torch.load(gdir / f"moss_{name}_ids.pt", map_location="cpu", weights_only=True)
             assert torch.equal(ids.cpu(), expected_ids), (
@@ -145,11 +180,19 @@ def main() -> int:
                 "n_audio_tokens": int(inp["audio_input_mask"].sum().item()),
                 "first_generated_token_id": first_token,
                 "reference_ids_file": f"moss_{name}_ids.pt",
+                "capture": capture_provenance,
                 "tensors": {stage: shape_dtype(tensor) for stage, tensor in saved.items()},
             }
             (gdir / f"moss_{name}_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
             elapsed = time.perf_counter() - t0
             print(f"[moss-components] {name}: ids verified, {elapsed:.1f}s")
+
+    # The GPU lock only arbitrates CUDA captures; a CPU capture needs no lock.
+    lock = with_gpu_lock(session="ggml-goldens", model="MOSS-Transcribe-preview-2B",
+                         eta_min=15, note="capturing staged MOSS C++ reference goldens") \
+        if device == "cuda" else nullcontext()
+    with lock:
+        _capture()
 
     verify_saved(gdir)
     print("\nfixture  stage            shape                 dtype")
