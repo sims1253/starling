@@ -686,9 +686,7 @@ export default function App() {
     // The startup sweep may still be deciding which journals and attempts
     // are abandoned; a take started now could race it (#144).
     if (!startupRecoveryDoneRef.current) {
-      setError(
-        "Still restoring recordings from a previous session. Try again in a moment.",
-      );
+      setError("Still restoring recordings from a previous session. Try again in a moment.");
 
       return;
     }
