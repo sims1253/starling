@@ -548,7 +548,7 @@ export default function App() {
         return false;
       }
 
-      if (stream.journaledFrameCount === 0) {
+      if (stream.journaledChunkCount === 0) {
         // The microphone never reached this controller's journal — its
         // session would be a header-only WAV: drop the empty journal and
         // keep the recorder's capture through the batch path (#143).
@@ -600,9 +600,9 @@ export default function App() {
     // shared by the record button and the global shortcut: a toggle issued
     // while a begin/start/stop/finalize transition is in flight is ignored
     // instead of interleaving with it (#143).
-    const stopping = lifecycle.current() === "recording";
+    const shouldStop = lifecycle.current() === "recording";
 
-    if (stopping) {
+    if (shouldStop) {
       if (!lifecycle.beginStop()) return;
 
       // The controller bound to the take being stopped, read before any

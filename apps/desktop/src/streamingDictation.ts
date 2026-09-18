@@ -56,7 +56,7 @@ export class StreamingDictation {
   private complete = true;
   private queue: Uint8Array[] = [];
   /** Nonzero chunks journaled; zero means the microphone never arrived here. */
-  private journaledFrames = 0;
+  private journaledChunks = 0;
   private pipeline: Promise<void> = Promise.resolve();
   private stopEvents: () => void;
 
@@ -78,8 +78,8 @@ export class StreamingDictation {
   }
 
   /** Chunks durably journaled so far; zero means no audio ever arrived. */
-  get journaledFrameCount(): number {
-    return this.journaledFrames;
+  get journaledChunkCount(): number {
+    return this.journaledChunks;
   }
 
   /**
@@ -110,7 +110,7 @@ export class StreamingDictation {
   onChunk(pcm16: Uint8Array): void {
     if (pcm16.byteLength === 0) return;
 
-    this.journaledFrames += 1;
+    this.journaledChunks += 1;
     this.pipeline = this.pipeline
       .then(() => this.capture.append(pcm16))
       .then(() => {
@@ -168,7 +168,7 @@ export class StreamingDictation {
       ...finished,
       streamed: false,
       streamNote:
-        this.journaledFrames === 0
+        this.journaledChunks === 0
           ? "No audio reached the live stream; the saved WAV carries the take."
           : (this.detail ??
             "Live streaming did not finish before the recording stopped; using the saved WAV."),
@@ -191,7 +191,7 @@ export class StreamingDictation {
       // An empty journal assembles a header-only WAV whose zero-duration
       // commit the server answers with an empty success; never accept that
       // as a final — the recorder's capture must carry the take (#143).
-      this.journaledFrames > 0
+      this.journaledChunks > 0
     );
   }
 

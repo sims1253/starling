@@ -355,7 +355,7 @@ describe("StreamingDictation", () => {
     await controller.connect();
     await drained();
 
-    expect(controller.journaledFrameCount).toBe(0);
+    expect(controller.journaledChunkCount).toBe(0);
 
     const result = await controller.finish(900);
 
@@ -365,19 +365,19 @@ describe("StreamingDictation", () => {
     expect(transport.closeCalls).toBe(1);
   });
 
-  it("counts only nonzero chunks toward the journaled frame count", async () => {
+  it("counts only nonzero chunks toward the journaled chunk count", async () => {
     const transport = new FakeTransport();
     const capture = new FakeCapture();
     const controller = new StreamingDictation(transport, capture);
 
     controller.onChunk(new Uint8Array(0));
-    expect(controller.journaledFrameCount).toBe(0);
+    expect(controller.journaledChunkCount).toBe(0);
 
     await controller.connect();
     controller.onChunk(frame(4));
     controller.onChunk(frame(4));
     await drained();
 
-    expect(controller.journaledFrameCount).toBe(2);
+    expect(controller.journaledChunkCount).toBe(2);
   });
 });
