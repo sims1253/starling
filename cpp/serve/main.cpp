@@ -119,22 +119,28 @@ static Args parse_args(int argc, char** argv) {
         auto next_int = [&](const char* name) -> int {
             std::string v = next(name);
             if (a.error) return 0;
-            try { return std::stoi(v); }
-            catch (...) {
+            // Strict parse: bare std::stoi accepts partial parses like "3abc"
+            // and silently truncates out-of-range values (issue #146).
+            auto parsed = serve::parse_int_strict(v);
+            if (!parsed.has_value()) {
                 std::fprintf(stderr, "error: %s requires an integer, got '%s'\n", name, v.c_str());
                 a.error = true;
                 return 0;
             }
+            return *parsed;
         };
         auto next_double = [&](const char* name) -> double {
             std::string v = next(name);
             if (a.error) return 0.0;
-            try { return std::stod(v); }
-            catch (...) {
-                std::fprintf(stderr, "error: %s requires a number, got '%s'\n", name, v.c_str());
+            // Strict parse: bare std::stod accepts partial parses like "3abc"
+            // and non-finite tokens like "nan"/"inf" (issue #146).
+            auto parsed = serve::parse_double_strict(v);
+            if (!parsed.has_value()) {
+                std::fprintf(stderr, "error: %s requires a finite number, got '%s'\n", name, v.c_str());
                 a.error = true;
                 return 0.0;
             }
+            return *parsed;
         };
         if (arg == "--model")          a.model = next("--model");
         else if (arg == "--gguf")      a.gguf = next("--gguf");
@@ -427,6 +433,22 @@ int main(int argc, char** argv) {
     }
     if (args.error) {
         usage(argv[0]);
+        return 1;
+    }
+    // Validate the stream window configuration BEFORE the model is loaded
+    // (issue #146): out-of-range values used to surface much later, when the
+    // chunker derived a negative-length transcription window mid-session.
+    // (The stream flags already passed the strict finite-number parse above.)
+    if (auto err = serve::stream_window_config_error(
+            serve::kSampleRate, args.stream_chunk, args.stream_overlap,
+            args.min_chunk, args.partial_interval);
+        !err.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (args.max_stream_seconds < 0.0) {
+        std::fprintf(stderr,
+            "error: --max-stream-seconds must be nonnegative (0 = unlimited)\n");
         return 1;
     }
     if (args.model.empty() || args.gguf.empty()) {
