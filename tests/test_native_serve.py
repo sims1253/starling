@@ -693,6 +693,127 @@ def test_websocket_stream_cap(binary: Path, model: str, tr: TestResults):
         server.stop()
 
 
+def test_websocket_stream_audio_rejection(binary: Path, model: str,
+                                           tr: TestResults):
+    """Invalid stream audio is refused loudly, not silently dropped (issue #145).
+
+    A malformed WAV / non-16 kHz WAV / odd-length PCM frame gets ONE error
+    frame and invalidates the take: further audio is ignored and commit is
+    refused (never a successful final covering an incomplete capture).
+    reset re-arms everything. On the placeholder model the recovery probe
+    asserts commit answers "server busy" (audio accepted, inference
+    attempted) rather than an empty successful final (audio still ignored).
+    """
+    try:
+        import asyncio
+        import websockets
+    except ImportError:
+        tr.check("websockets module available", False, "not installed")
+        return
+
+    port = _free_port()
+    server = ServeProc(binary, model, "/dev/null", "127.0.0.1", port,
+                       eager=False)
+    try:
+        half = pcm16_bytes(np.zeros(8000, dtype=np.float32))  # 0.5 s PCM16
+        wav8k = make_wav(np.zeros(8000, dtype=np.float32), sr=8000)
+        wav48k = make_wav(np.zeros(48000, dtype=np.float32), sr=48000)
+        # RIFF/WAVE magic but truncated before fmt: fails the WAV decoder.
+        malformed = b"RIFF\x00\x00\x00\x00WAVEjunk"
+
+        async def run():
+            uri = f"ws://127.0.0.1:{port}/stream"
+
+            async def scenario(frame, needle, reason, label):
+                async with websockets.connect(uri, max_size=None) as ws:
+                    await ws.send(frame)
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    data = json.loads(resp)
+                    tr.check(f"ws {label} sends error frame",
+                             data.get("type") == "error"
+                             and needle in data.get("message", ""), str(data))
+
+                    # One error frame only: a second refused frame stays
+                    # silent (the ping proves nothing else was queued).
+                    await ws.send(frame)
+                    await asyncio.sleep(0.2)
+                    await ws.send(json.dumps({"type": "ping"}))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    tr.check(f"ws {label}: one error frame, connection alive",
+                             json.loads(resp).get("type") == "pong", str(resp))
+
+                    # The invalidated take cannot silently succeed.
+                    await ws.send(json.dumps({"type": "commit"}))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    data = json.loads(resp)
+                    tr.check(f"ws {label}: commit refused, no successful final",
+                             data.get("type") == "error"
+                             and reason in data.get("message", ""), str(data))
+
+                    # reset restores normal operation: valid audio is
+                    # accepted again.
+                    await ws.send(json.dumps({"type": "reset"}))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    tr.check(f"ws {label}: reset -> reset_ack",
+                             json.loads(resp).get("type") == "reset_ack",
+                             str(resp))
+                    await ws.send(half)
+                    await asyncio.sleep(0.2)
+                    await ws.send(json.dumps({"type": "commit"}))
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    data = json.loads(resp)
+                    tr.check(f"ws {label}: reset restores audio acceptance",
+                             data == {"type": "error",
+                                      "message": "server busy"}, str(data))
+
+            await scenario(malformed, "malformed", "malformed_wav",
+                           "malformed WAV")
+            await scenario(wav8k, "sample rate", "sample_rate_mismatch",
+                           "8 kHz WAV")
+            await scenario(wav48k, "sample rate", "sample_rate_mismatch",
+                           "48 kHz WAV")
+            await scenario(half + b"\x00", "odd", "odd_pcm_length",
+                           "odd PCM")
+
+            # valid-invalid-valid: valid audio before the rejection stays,
+            # valid audio after it is ignored until reset.
+            async with websockets.connect(uri, max_size=None) as ws:
+                await ws.send(half)  # accepted silently
+                await asyncio.sleep(0.2)
+                await ws.send(wav8k)
+                resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                data = json.loads(resp)
+                tr.check("ws valid-invalid-valid: invalid frame reported",
+                         data.get("type") == "error"
+                         and "sample rate" in data.get("message", ""),
+                         str(data))
+                await ws.send(half)  # ignored: take already invalidated
+                await asyncio.sleep(0.2)
+                await ws.send(json.dumps({"type": "commit"}))
+                resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                data = json.loads(resp)
+                tr.check("ws valid-invalid-valid: commit refused",
+                         data.get("type") == "error"
+                         and "sample_rate_mismatch" in data.get("message", ""),
+                         str(data))
+                await ws.send(json.dumps({"type": "reset"}))
+                await asyncio.wait_for(ws.recv(), timeout=5.0)
+                await ws.send(half)
+                await asyncio.sleep(0.2)
+                await ws.send(json.dumps({"type": "commit"}))
+                resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                data = json.loads(resp)
+                tr.check("ws valid-invalid-valid: reset restores acceptance",
+                         data == {"type": "error",
+                                  "message": "server busy"}, str(data))
+
+        asyncio.run(run())
+    except Exception as e:
+        tr.check("ws audio rejection test completed", False, str(e))
+    finally:
+        server.stop()
+
+
 # ---- real-model tests (require --gguf) --------------------------------------
 
 def test_real_roundtrip(base_url: str, tr: TestResults, samples: np.ndarray,
@@ -1205,6 +1326,8 @@ def main():
         if not args.no_server:
             print("\nTesting WebSocket stream cap (--max-stream-seconds):")
             test_websocket_stream_cap(args.binary, args.model, tr)
+            print("\nTesting WebSocket invalid-audio rejection (issue #145):")
+            test_websocket_stream_audio_rejection(args.binary, args.model, tr)
 
         # ---- phase 2: real-model suite ----
         if gguf is not None and samples is not None:

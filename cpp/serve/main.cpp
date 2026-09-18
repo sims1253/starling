@@ -192,6 +192,45 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
+// ---- WS /stream binary-frame rejection --------------------------------------
+// Describe a refused binary audio frame as a structured WS error frame,
+// mirroring the buffer-cap error style. A refused frame invalidates the take
+// (or trips the buffer cap); the session then ignores audio until reset.
+static std::string ws_append_error(serve::AppendOutcome outcome,
+                                   const serve::StreamSession& session,
+                                   double max_stream_seconds) {
+    std::ostringstream ss;
+    ss << "{\"type\":\"error\",\"message\":\"";
+    switch (outcome) {
+    case serve::AppendOutcome::MalformedWav:
+        ss << "malformed WAV frame rejected; audio ignored until reset";
+        break;
+    case serve::AppendOutcome::RateMismatch:
+        ss << "WAV sample rate mismatch: expected " << serve::kSampleRate
+           << "; audio ignored until reset";
+        break;
+    case serve::AppendOutcome::OddPcmLength:
+        ss << "odd-length PCM frame rejected (split sample);"
+           << " audio ignored until reset";
+        break;
+    case serve::AppendOutcome::Overflowed:
+        ss << "stream buffer limit reached (" << max_stream_seconds
+           << " s live buffer); audio ignored until reset";
+        break;
+    case serve::AppendOutcome::TakeInvalid:
+        // Only reached on a frame AFTER the invalidating one (whose own
+        // outcome carried the reason); repeat that reason, not a generic.
+        // invalid_reason_ is an internal [a-z_] code: safe to embed raw.
+        ss << "take invalidated (" << session.invalid_reason()
+           << "); audio ignored until reset";
+        break;
+    case serve::AppendOutcome::Accepted:
+        break;
+    }
+    ss << "\"}";
+    return ss.str();
+}
+
 // ---- flat JSON string-field extraction (POST /normalize) ------------------
 // Extracts a top-level "key": "value" string field from a flat JSON object
 // (the /normalize request shape: string fields, no nesting). A single pass
@@ -883,9 +922,10 @@ int main(int argc, char** argv) {
         [&server, &cfg](const httplib::Request&,
                         httplib::ws::WebSocket& ws) {
             serve::StreamSession session(server.get());
-            // Sent once when the per-connection buffer cap trips; re-armed on
-            // reset so a fresh dictation gets a fresh error if it overflows.
-            bool cap_error_sent = false;
+            // Sent once when a binary frame is refused (buffer cap, malformed
+            // WAV, sample-rate mismatch, odd PCM length); re-armed on reset
+            // so a fresh dictation gets a fresh error if it is refused.
+            bool reject_error_sent = false;
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
@@ -919,6 +959,21 @@ int main(int argc, char** argv) {
                     }
 
                     if (type == "commit") {
+                        // An invalidated take (a rejected binary frame) holds
+                        // incomplete audio: committing it as an ordinary
+                        // successful final would silently miss speech, so the
+                        // commit is refused and the client falls back to its
+                        // authoritative local WAV after a reset (issue #145).
+                        // The busy-retry path below is untouched: it retains
+                        // VALID audio, while this path refuses INVALID audio.
+                        if (session.take_invalid()) {
+                            std::ostringstream ss;
+                            ss << "{\"type\":\"error\",\"message\":\"take "
+                               << "invalidated (" << session.invalid_reason()
+                               << "); reset and resend\"}";
+                            ws.send(ss.str());
+                            continue;
+                        }
                         double dur = session.buffered_seconds();
                         std::string text;
                         if (dur > 0.0) {
@@ -937,16 +992,17 @@ int main(int argc, char** argv) {
                            << dur << "}],\"duration_s\":" << dur << "}";
                         ws.send(ss.str());
                         session.reset();
-                        // reset() re-enables audio (clears the buffer cap);
-                        // re-arm the one-shot error frame with it.
-                        cap_error_sent = false;
+                        // reset() re-enables audio (clears the buffer cap and
+                        // any take invalidation); re-arm the one-shot error
+                        // frame with it.
+                        reject_error_sent = false;
                         continue;
                     } else if (type == "ping") {
                         ws.send("{\"type\":\"pong\"}");
                         continue;
                     } else if (type == "reset") {
                         session.reset();
-                        cap_error_sent = false;
+                        reject_error_sent = false;
                         ws.send("{\"type\":\"reset_ack\"}");
                         continue;
                     } else {
@@ -960,26 +1016,28 @@ int main(int argc, char** argv) {
 
                 if (rr == httplib::ws::ReadResult::Binary) {
                     // Audio data. Enforce the per-connection buffer cap
-                    // (--max-stream-seconds): a frame that would exceed it is
-                    // refused, reported once as an error frame, and the
-                    // session stops accepting audio until it is reset.
-                    if (!session.overflowed()) {
+                    // (--max-stream-seconds) and the frame-validity policy
+                    // (issue #145): a refused frame is reported once as an
+                    // error frame, and the session stops accepting audio
+                    // until it is reset.
+                    serve::AppendOutcome outcome = serve::AppendOutcome::Accepted;
+                    if (!session.overflowed() && !session.take_invalid()) {
                         if (msg.size() >= 12 && msg.substr(0, 4) == "RIFF"
                             && msg.substr(8, 4) == "WAVE") {
-                            session.append_wav(msg);
+                            outcome = session.append_wav(msg);
                         } else {
-                            session.append_pcm(msg);
+                            outcome = session.append_pcm(msg);
                         }
+                    } else if (session.take_invalid()) {
+                        outcome = serve::AppendOutcome::TakeInvalid;
+                    } else {
+                        outcome = serve::AppendOutcome::Overflowed;
                     }
-                    if (session.overflowed()) {
-                        if (!cap_error_sent) {
-                            cap_error_sent = true;
-                            std::ostringstream ss;
-                            ss << "{\"type\":\"error\",\"message\":\"stream buffer"
-                               << " limit reached (" << cfg.max_stream_seconds
-                               << " s live buffer); audio ignored until"
-                               << " reset\"}";
-                            ws.send(ss.str());
+                    if (outcome != serve::AppendOutcome::Accepted) {
+                        if (!reject_error_sent) {
+                            reject_error_sent = true;
+                            ws.send(ws_append_error(
+                                outcome, session, cfg.max_stream_seconds));
                         }
                         continue;
                     }

@@ -215,13 +215,46 @@ cap. It only fires when the un-finalized buffer itself grows past the limit
 (e.g. streaming faster than the engine finalizes, or a session where
 transcription never succeeds).
 
+**Invalid audio frames** (issue #145): a binary frame the server cannot accept
+is refused with one error frame, exactly like the buffer cap:
+
+- a malformed WAV (fails decoding),
+- a WAV whose sample rate is not 16 kHz (the native server has no resampler;
+  the HTTP paths reject the same inputs with `400`),
+- raw PCM16 with an odd byte count: frames are sequences of whole int16
+  samples, so an odd length means a sample was split at a transport boundary.
+  The dangling byte is not silently dropped — the client should re-send on
+  whole-sample boundaries.
+
+```json
+{"type":"error","message":"WAV sample rate mismatch: expected 16000; audio ignored until reset"}
+{"type":"error","message":"malformed WAV frame rejected; audio ignored until reset"}
+{"type":"error","message":"odd-length PCM frame rejected (split sample); audio ignored until reset"}
+```
+
+A refused frame also **invalidates the take**: all further binary frames are
+ignored (no more partials), and `{"type":"commit"}` is refused with
+
+```json
+{"type":"error","message":"take invalidated (sample_rate_mismatch); reset and resend"}
+```
+
+instead of a successful `final` — the buffered audio is provably incomplete,
+so the client must fall back to its authoritative local recording. The
+machine-readable reason codes are `malformed_wav`, `sample_rate_mismatch`,
+and `odd_pcm_length`. As with the buffer cap, the connection stays alive
+(control frames keep working) and `{"type":"reset"}` clears the invalidation
+and re-enables audio.
+
 Control frames (JSON text):
 
 - `{"type":"commit"}`: finalize all buffered audio. Returns `final` on success;
   if bounded retries stay busy, returns `{"type":"error","message":"server busy"}`
-  and retains the audio. Retry `commit` after a delay.
+  and retains the audio. Retry `commit` after a delay. A commit on an
+  invalidated take (see above) is refused with an error instead.
 - `{"type":"reset"}`: discard buffer without finalizing (returns reset_ack;
-  also re-enables audio after a buffer-cap error)
+  also re-enables audio after a buffer-cap error or an invalid-audio
+  rejection)
 - `{"type":"ping"}`: heartbeat (returns pong)
 
 ## Architecture

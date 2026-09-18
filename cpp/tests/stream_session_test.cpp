@@ -436,6 +436,122 @@ static void test_stream_session_busy_retry() {
     CHECK(session.buffered_seconds() == 1.5);
 }
 
+// Build a minimal mono PCM16 RIFF/WAVE container around raw little-endian
+// sample bytes (the same shape audio_parser_test's make_wav produces;
+// StreamSession decodes it via audio::wav_bytes_to_float32).
+static std::string make_wav_bytes(int sample_rate, const std::string& pcm) {
+    auto le32 = [](uint32_t v) {
+        std::string s(4, '\0');
+        s[0] = static_cast<char>(v & 0xff);
+        s[1] = static_cast<char>((v >> 8) & 0xff);
+        s[2] = static_cast<char>((v >> 16) & 0xff);
+        s[3] = static_cast<char>((v >> 24) & 0xff);
+        return s;
+    };
+    auto le16 = [](uint16_t v) {
+        std::string s(2, '\0');
+        s[0] = static_cast<char>(v & 0xff);
+        s[1] = static_cast<char>((v >> 8) & 0xff);
+        return s;
+    };
+    const uint32_t data_size = static_cast<uint32_t>(pcm.size());
+    std::string h = "RIFF";
+    h += le32(36 + data_size);
+    h += "WAVE";
+    h += "fmt ";
+    h += le32(16);       // fmt chunk size
+    h += le16(1);        // PCM
+    h += le16(1);        // mono
+    h += le32(static_cast<uint32_t>(sample_rate));
+    h += le32(static_cast<uint32_t>(sample_rate) * 2);  // byte rate
+    h += le16(2);        // block align
+    h += le16(16);       // bits per sample
+    h += "data";
+    h += le32(data_size);
+    h += pcm;
+    return h;
+}
+
+static void test_stream_session_append_rejection() {
+    // issue #145: a refused binary frame (malformed WAV, non-16 kHz WAV,
+    // odd-length PCM) must be observable to the caller as a typed outcome
+    // and must invalidate the take: further audio is refused (TakeInvalid)
+    // until reset(), so an incomplete capture is never mistaken for a whole
+    // one. This pins the session half of the policy; the WS transport half
+    // (error frames + refused commit) is covered by test_native_serve.py.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return "ok";
+    });
+
+    // (1) Malformed RIFF/WAVE frame: decoder refuses, take invalidated.
+    // (Explicit length: the literal embeds NULs, so the const char*
+    // constructor would truncate it to "RIFF".)
+    const std::string malformed("RIFF\x00\x00\x00\x00WAVEjunk", 16);
+    CHECK(session.append_wav(malformed) == AppendOutcome::MalformedWav);
+    CHECK(session.take_invalid());
+    CHECK(session.invalid_reason() == "malformed_wav");
+    CHECK(session.buffered_seconds() == 0.0);
+
+    // (2) Further audio is refused with TakeInvalid (same reason).
+    CHECK(session.append_pcm(pcm_for_range(0, 1600)) == AppendOutcome::TakeInvalid);
+    CHECK(session.buffered_seconds() == 0.0);
+    CHECK(session.append_wav(malformed) == AppendOutcome::TakeInvalid);
+
+    // (3) reset() clears the invalidation and re-enables audio.
+    session.reset();
+    CHECK(!session.take_invalid());
+    CHECK(session.invalid_reason().empty());
+    CHECK(session.append_pcm(pcm_for_range(0, 1600)) == AppendOutcome::Accepted);
+    CHECK(session.buffered_seconds() == 0.1);
+
+    // (4) Valid -> invalid -> valid (the issue's regression sequence):
+    // audio before the rejection is retained, audio after it is refused.
+    session.reset();
+    CHECK(session.append_pcm(pcm_for_range(0, 8000)) == AppendOutcome::Accepted);
+    const std::string wav8k = make_wav_bytes(8000, std::string(16000, '\0'));
+    CHECK(session.append_wav(wav8k) == AppendOutcome::RateMismatch);
+    CHECK(session.invalid_reason() == "sample_rate_mismatch");
+    CHECK(session.buffered_seconds() == 0.5);  // pre-rejection audio kept
+    CHECK(session.append_pcm(pcm_for_range(8000, 8000)) == AppendOutcome::TakeInvalid);
+    CHECK(session.buffered_seconds() == 0.5);  // post-rejection audio refused
+    session.reset();
+    CHECK(session.append_pcm(pcm_for_range(0, 8000)) == AppendOutcome::Accepted);
+    CHECK(session.buffered_seconds() == 0.5);
+    CHECK(session.stream_flush() == "ok");     // clean take finalizes normally
+
+    // (5) 48 kHz WAV is refused the same way as 8 kHz.
+    session.reset();
+    const std::string wav48k = make_wav_bytes(48000, std::string(96000, '\0'));
+    CHECK(session.append_wav(wav48k) == AppendOutcome::RateMismatch);
+    CHECK(session.invalid_reason() == "sample_rate_mismatch");
+    CHECK(session.buffered_seconds() == 0.0);
+
+    // (6) Odd-length raw PCM (a split int16 sample): the whole frame is
+    // refused and the take invalidated — the dangling byte is not silently
+    // dropped.
+    session.reset();
+    std::string odd = pcm_for_range(0, 800);
+    odd.push_back('\x7f');
+    CHECK(session.append_pcm(odd) == AppendOutcome::OddPcmLength);
+    CHECK(session.invalid_reason() == "odd_pcm_length");
+    CHECK(session.buffered_seconds() == 0.0);
+    // Even-length frames stay accepted no-ops/append as before.
+    session.reset();
+    CHECK(session.append_pcm(std::string()) == AppendOutcome::Accepted);
+    CHECK(!session.take_invalid());
+
+    // (7) A 16 kHz WAV still appends (the rejection is about validity,
+    // not the WAV container itself).
+    session.reset();
+    const std::string wav16k =
+        make_wav_bytes(16000, pcm_for_range(0, 8000));
+    CHECK(session.append_wav(wav16k) == AppendOutcome::Accepted);
+    CHECK(!session.take_invalid());
+    CHECK(session.buffered_seconds() == 0.5);
+}
+
 static void test_bounded_retry_recovery() {
     for (bool flush : {false, true}) {
         ChunkStreamer cs(1, 12, 2, 5, 0);
@@ -496,6 +612,7 @@ int main() {
     test_chunk_streamer_rebase();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
+    test_stream_session_append_rejection();
     test_bounded_retry_recovery();
     test_model_mapping();
 

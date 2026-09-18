@@ -290,14 +290,25 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     };
 }
 
-void StreamSession::append_pcm(const std::string& bytes) {
-    if (overflow_) return;  // capped: refuse audio until reset()
+AppendOutcome StreamSession::append_pcm(const std::string& bytes) {
+    if (overflow_) return AppendOutcome::Overflowed;  // capped: refuse until reset()
+    if (take_invalid_) return AppendOutcome::TakeInvalid;  // rejected take: refuse until reset()
     const size_t nbytes = bytes.size();
-    if (nbytes == 0) return;
+    if (nbytes == 0) return AppendOutcome::Accepted;
+    // Raw PCM is a sequence of whole int16 samples: an odd byte count means
+    // a sample was split mid-frame at a transport boundary. The old code
+    // silently dropped the dangling byte, hiding a misaligned client from
+    // itself; reject the frame and invalidate the take instead (issue #145).
+    if (nbytes % 2 == 1) {
+        std::fprintf(stderr,
+            "[starling-serve] dropping odd-length PCM chunk (len=%zu)\n",
+            bytes.size());
+        take_invalid_ = true;
+        invalid_reason_ = "odd_pcm_length";
+        return AppendOutcome::OddPcmLength;
+    }
     size_t nsamples = nbytes / 2;
-    // Drop odd trailing byte.
-    if (nbytes % 2 == 1) nsamples = (nbytes - 1) / 2;
-    if (nsamples == 0) return;
+    if (nsamples == 0) return AppendOutcome::Accepted;
     // Cap the LIVE buffer (samples_ memory). Finalized audio is trimmed from
     // samples_, so a long dictation session without commits keeps memory
     // bounded while the cumulative audio grows freely.
@@ -306,7 +317,7 @@ void StreamSession::append_pcm(const std::string& bytes) {
                + static_cast<double>(nsamples) / kSampleRate
              > max_buffer_seconds_) {
         overflow_ = true;
-        return;
+        return AppendOutcome::Overflowed;
     }
     const auto* src = reinterpret_cast<const int16_t*>(bytes.data());
     size_t old = samples_.size();
@@ -315,16 +326,17 @@ void StreamSession::append_pcm(const std::string& bytes) {
         samples_[old + i] = static_cast<float>(src[i]) / 32768.0f;
     }
     maybe_trim_samples();
+    return AppendOutcome::Accepted;
 }
 
-void StreamSession::append_wav(const std::string& bytes) {
-    if (overflow_) return;  // capped: refuse audio until reset()
+AppendOutcome StreamSession::append_wav(const std::string& bytes) {
+    if (overflow_) return AppendOutcome::Overflowed;  // capped: refuse until reset()
+    if (take_invalid_) return AppendOutcome::TakeInvalid;  // rejected take: refuse until reset()
     // Check for RIFF/WAVE header.
     if (bytes.size() < 12 || bytes.substr(0, 4) != "RIFF"
         || bytes.substr(8, 4) != "WAVE") {
         // Treat as raw PCM16.
-        append_pcm(bytes);
-        return;
+        return append_pcm(bytes);
     }
     std::vector<float> decoded;
     int sr = 0;
@@ -332,15 +344,20 @@ void StreamSession::append_wav(const std::string& bytes) {
         std::fprintf(stderr,
             "[starling-serve] dropping malformed WAV chunk (len=%zu)\n",
             bytes.size());
-        return;
+        take_invalid_ = true;
+        invalid_reason_ = "malformed_wav";
+        return AppendOutcome::MalformedWav;
     }
-    // Resample if needed (simple: if sr != 16k, we can't resample in C++ easily;
-    // assume 16k or let the engine handle it — the C API checks).
+    // No C++ resampler exists (the Python server resamples via scipy): a
+    // non-16 kHz WAV must be rejected loudly, not dropped silently — the
+    // client hears nothing back otherwise and blames the model (issue #145).
     if (sr != kSampleRate) {
         std::fprintf(stderr,
             "[starling-serve] dropping WAV chunk: sample rate %d != %d\n",
             sr, kSampleRate);
-        return;
+        take_invalid_ = true;
+        invalid_reason_ = "sample_rate_mismatch";
+        return AppendOutcome::RateMismatch;
     }
     if (!decoded.empty()) {
         if (max_buffer_seconds_ > 0.0
@@ -348,13 +365,14 @@ void StreamSession::append_wav(const std::string& bytes) {
                    + static_cast<double>(decoded.size()) / kSampleRate
                  > max_buffer_seconds_) {
             overflow_ = true;
-            return;
+            return AppendOutcome::Overflowed;
         }
         size_t old = samples_.size();
         samples_.resize(old + decoded.size());
         std::copy(decoded.begin(), decoded.end(), samples_.begin() + old);
     }
     maybe_trim_samples();
+    return AppendOutcome::Accepted;
 }
 
 void StreamSession::maybe_trim_samples() {
@@ -388,6 +406,8 @@ void StreamSession::reset() {
     last_partial_ts_ = 0.0;
     trimmed_samples_ = 0;
     overflow_ = false;
+    take_invalid_ = false;
+    invalid_reason_.clear();
     if (chunker_) chunker_->reset();
 }
 
