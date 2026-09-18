@@ -780,6 +780,7 @@ describe("cross-window capture ownership", () => {
         databaseName: "host-locks",
         indexedDB: factory,
       });
+
       const withHost = await defaulted.beginStreamCapture({ id: "host-owned" });
 
       await withHost.abandon();
