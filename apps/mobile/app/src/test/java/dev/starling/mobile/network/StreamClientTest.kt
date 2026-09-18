@@ -417,6 +417,58 @@ class StreamClientTest {
         }
     }
 
+    @Test fun closeDuringTheBusyRetryWindowCancelsTheScheduledRetry() {
+        // One busy answer schedules a retry well in the future; close()
+        // during that window must cancel the scheduled commit, not just
+        // settle the waiter — nothing may outlive the session's terminal
+        // state (#147).
+        val harness = StreamHarness(
+            serverBehavior = { text, socket ->
+                if (text == COMMIT) socket.send("""{"type":"error","message":"server busy"}""")
+            },
+            client = StreamClient(
+                finalTimeoutMillis = 60_000,
+                busyRetryDelaysMillis = longArrayOf(1_500),
+            ),
+        )
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            val finished = CountDownLatch(1)
+            val outcome = AtomicReference<CommitOutcome>()
+            val worker = Thread {
+                outcome.set(session.finish())
+                finished.countDown()
+            }.apply {
+                isDaemon = true
+                start()
+            }
+            // The busy answer reached the server, so the client has (or is
+            // imminently about to) schedule the retry; give its reader
+            // thread a beat so the retry really is pending.
+            harness.awaitServerTexts(1) { texts -> texts.count { it == COMMIT } == 1 }
+            Thread.sleep(250)
+            session.close()
+            assertTrue(
+                "close() must release a pending finish() immediately, not at the retry or final timeout",
+                finished.await(5, TimeUnit.SECONDS),
+            )
+            worker.join(5_000)
+            assertTrue("the finish worker is still blocked in finish()", !worker.isAlive)
+            assertEquals(CommitOutcome.Fallback("the stream was closed before commit"), outcome.get())
+            // The retry was scheduled 1.5 s out; well past that delay no
+            // second COMMIT may reach the server.
+            Thread.sleep(2_000)
+            assertTrue(
+                "the cancelled busy retry must never reach the server",
+                harness.serverTexts().count { it == COMMIT } == 1,
+            )
+            harness.awaitServerTermination()
+        } finally {
+            harness.close()
+        }
+    }
+
     private companion object {
         const val COMMIT = """{"type":"commit"}"""
         const val PING = """{"type":"ping"}"""
