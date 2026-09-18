@@ -1489,15 +1489,16 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
             cause: transaction.error,
           }),
         );
-      transaction.onabort = () => {
-        if (request.result !== undefined) {
-          reject(
-            new DictationStorageError("damaged dictation session dismissal was aborted", {
-              cause: transaction.error,
-            }),
-          );
-        }
-      };
+      // Reject unconditionally: a double settle after the catch's own reject
+      // is a harmless no-op, and a guarded reject here could leave the
+      // promise pending forever when the transaction aborts after an empty
+      // read — the sibling delete() relies on the same idiom.
+      transaction.onabort = () =>
+        reject(
+          new DictationStorageError("damaged dictation session dismissal was aborted", {
+            cause: transaction.error,
+          }),
+        );
     });
   }
 

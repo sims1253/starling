@@ -1090,8 +1090,8 @@ export default function App() {
                       : `${damaged.length} saved recordings could not be read`}
                   </strong>
                   <small>
-                    Damaged entries are kept untouched; the list below shows every recording that is
-                    still readable.
+                    Damaged entries are kept until you delete them; the list below shows every
+                    recording that is still readable.
                   </small>
                   <div className="recovery-actions">
                     {damaged.map((entry, index) => {
