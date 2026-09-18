@@ -18,7 +18,13 @@ export {
   type Os,
 } from "./platforms.js";
 
-export { DEFAULT_REPO, normalizeTag, releaseAssetUrl, releaseTag } from "./release.js";
+export {
+  DEFAULT_REPO,
+  normalizeRepo,
+  normalizeTag,
+  releaseAssetUrl,
+  releaseTag,
+} from "./release.js";
 
 export {
   assertChecksum,
@@ -28,7 +34,14 @@ export {
   sha256File,
 } from "./checksum.js";
 
-export { cacheDir, defaultCacheDir, releaseCachePath, verifiedMarkerPath } from "./cache.js";
+export {
+  assertCacheComponent,
+  cacheDir,
+  defaultCacheDir,
+  InvalidCacheComponentError,
+  releaseCachePath,
+  verifiedMarkerPath,
+} from "./cache.js";
 
 export {
   DownloadError,

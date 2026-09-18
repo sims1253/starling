@@ -1,11 +1,49 @@
 /**
- * Cache directory resolution. Extracted binaries are stored per release tag so
- * several versions can coexist; `STARLING_SERVE_CACHE` overrides the location.
+ * Cache directory resolution. Extracted binaries are stored per repository and
+ * release tag so versions — and alternate `STARLING_SERVE_REPO` sources — can
+ * coexist without one source's binary ever shadowing another's;
+ * `STARLING_SERVE_CACHE` overrides the location.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const CACHE_ENV = "STARLING_SERVE_CACHE";
+
+/**
+ * Characters allowed in a single cache path component. Anything else —
+ * notably `/` and `\` — could escape the cache root when the value comes
+ * from the environment (`STARLING_SERVE_REPO`, `STARLING_SERVE_RELEASE`).
+ */
+const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
+
+export class InvalidCacheComponentError extends Error {
+  constructor(
+    readonly component: string,
+    readonly value: string,
+  ) {
+    super(
+      `Invalid ${component} ${JSON.stringify(value)} for the serve cache: ` +
+        `path components may only contain letters, digits, ".", "_", and "-" ` +
+        `so values from the environment cannot escape the cache directory.`,
+    );
+    this.name = "InvalidCacheComponentError";
+  }
+}
+
+/**
+ * Throw unless `value` is safe to embed as one path level below the cache
+ * root. Exported for unit tests; everyone else should go through
+ * {@link releaseCachePath}.
+ */
+export function assertCacheComponent(component: string, value: string): void {
+  // `.` and `..` pass the character class but would collapse the layout, and
+  // `\` is a separator on Windows, so they are rejected explicitly; the empty
+  // string fails the class itself. With separators and dot-segments gone, a
+  // component can never escape the cache root through `join`.
+  if (value === "." || value === ".." || value.includes("\\") || !SAFE_COMPONENT.test(value)) {
+    throw new InvalidCacheComponentError(component, value);
+  }
+}
 
 /**
  * Default cache root following OS conventions:
@@ -42,9 +80,30 @@ export function cacheDir(env: NodeJS.ProcessEnv = process.env): string {
   return override && override.trim() !== "" ? override : defaultCacheDir();
 }
 
-/** Layout inside the cache root: `<root>/releases/<tag>/<binary>`. */
-export function releaseCachePath(root: string, tag: string, binary: string): string {
-  return join(root, "releases", tag, binary);
+/**
+ * Layout inside the cache root, namespaced by repository provenance:
+ * `<root>/releases/<owner>/<repo>/<tag>/<binary>`. The repository namespace
+ * keeps an alternate `STARLING_SERVE_REPO` source from ever shadowing the
+ * default release's binary (or vice versa) when tags and asset names match.
+ * `repo` is the normalized `owner/name` coordinate (see
+ * {@link normalizeRepo} in `release.ts`).
+ *
+ * Every component is validated so values from the environment or config
+ * cannot escape the cache root; see {@link assertCacheComponent}.
+ */
+export function releaseCachePath(root: string, repo: string, tag: string, binary: string): string {
+  const [owner, name, ...extra] = repo.split("/");
+
+  if (owner === undefined || name === undefined || extra.length > 0) {
+    throw new InvalidCacheComponentError("repository", repo);
+  }
+
+  assertCacheComponent("repository owner", owner);
+  assertCacheComponent("repository name", name);
+  assertCacheComponent("release tag", tag);
+  assertCacheComponent("binary name", binary);
+
+  return join(root, "releases", owner, name, tag, binary);
 }
 
 /** Marker written next to a verified binary: `<binary>.verified`. */

@@ -10,7 +10,15 @@ import {
   parseChecksum,
   sha256File,
 } from "../src/checksum.js";
-import { cacheDir, defaultCacheDir, releaseCachePath, verifiedMarkerPath } from "../src/cache.js";
+import {
+  assertCacheComponent,
+  cacheDir,
+  defaultCacheDir,
+  InvalidCacheComponentError,
+  releaseCachePath,
+  verifiedMarkerPath,
+} from "../src/cache.js";
+import { normalizeRepo } from "../src/release.js";
 import { sha256 } from "./fixtures.js";
 
 const cleanups: string[] = [];
@@ -106,10 +114,54 @@ describe("cache directory resolution", () => {
     assert.match(linuxDefault, /\.cache[\\/]starling-serve$/);
   });
 
-  it("lays out binaries per release tag and marks verification", () => {
-    const path = releaseCachePath("/cache", "v0.2.0", "starling-serve-linux-cpu");
-    assert.equal(path, join("/cache", "releases", "v0.2.0", "starling-serve-linux-cpu"));
+  it("lays out binaries per repository and release tag and marks verification", () => {
+    const path = releaseCachePath(
+      "/cache",
+      "sims1253/starling",
+      "v0.2.0",
+      "starling-serve-linux-cpu",
+    );
+
+    assert.equal(
+      path,
+      join("/cache", "releases", "sims1253", "starling", "v0.2.0", "starling-serve-linux-cpu"),
+    );
+
     assert.equal(verifiedMarkerPath(path), `${path}.verified`);
+  });
+});
+
+describe("cache path safety", () => {
+  it("rejects components that could escape the cache root", () => {
+    for (const bad of ["..", ".", "", "a/b", "a\\b", "na me", "tag\x00"]) {
+      assert.throws(() => assertCacheComponent("release tag", bad), InvalidCacheComponentError);
+    }
+
+    for (const repo of ["../evil", "a/b/c", "owner/", "/name", ""]) {
+      assert.throws(
+        () => releaseCachePath("/cache", repo, "v0.2.0", "b"),
+        InvalidCacheComponentError,
+      );
+    }
+
+    assert.throws(
+      () => releaseCachePath("/cache", "sims1253/starling", "../v0.2.0", "b"),
+      InvalidCacheComponentError,
+    );
+
+    assert.throws(
+      () => releaseCachePath("/cache", "sims1253/starling", "v0.2.0", "b/c"),
+      InvalidCacheComponentError,
+    );
+  });
+
+  it("normalizes repository coordinates case-insensitively and rejects malformed ones", () => {
+    assert.equal(normalizeRepo(" sims1253/Starling "), "sims1253/starling");
+    assert.equal(normalizeRepo("sims1253/starling"), "sims1253/starling");
+
+    for (const bad of ["../evil", "a/b/c", "owner/", "", "starling"]) {
+      assert.throws(() => normalizeRepo(bad), InvalidCacheComponentError);
+    }
   });
 });
 

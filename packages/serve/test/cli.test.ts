@@ -187,7 +187,10 @@ describe("runCli", () => {
 
     assert.ok(child);
     assert.equal(spawned.length, 1);
-    assert.equal(spawned[0]?.file, join(cacheDir, "releases", "v0.2.0", binaryName));
+    assert.equal(
+      spawned[0]?.file,
+      join(cacheDir, "releases", "sims1253", "starling", "v0.2.0", binaryName),
+    );
     assert.deepEqual(spawned[0]?.args, ["--model", "parakeet", "--port", "8181"]);
     // The CLI flag wins over STARLING_SERVE_BACKEND.
     assert.match(logs.join("\n"), /cpu/);
