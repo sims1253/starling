@@ -13,8 +13,9 @@ export const CACHE_ENV = "STARLING_SERVE_CACHE";
  * Characters allowed in a single cache path component. Anything else —
  * notably `/` and `\` — could escape the cache root when the value comes
  * from the environment (`STARLING_SERVE_REPO`, `STARLING_SERVE_RELEASE`).
+ * `+` stays allowed so semver build-metadata tags (`v0.2.0+build.1`) work.
  */
-const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
+const SAFE_COMPONENT = /^[A-Za-z0-9._+-]+$/;
 
 export class InvalidCacheComponentError extends Error {
   constructor(
@@ -23,7 +24,7 @@ export class InvalidCacheComponentError extends Error {
   ) {
     super(
       `Invalid ${component} ${JSON.stringify(value)} for the serve cache: ` +
-        `path components may only contain letters, digits, ".", "_", and "-" ` +
+        `path components may only contain letters, digits, ".", "_", "-", and "+" ` +
         `so values from the environment cannot escape the cache directory.`,
     );
     this.name = "InvalidCacheComponentError";

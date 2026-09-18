@@ -132,7 +132,9 @@ describe("cache directory resolution", () => {
 });
 
 describe("cache path safety", () => {
-  it("rejects components that could escape the cache root", () => {
+  it("accepts semver build-metadata tags and rejects components that could escape the cache root", () => {
+    assert.doesNotThrow(() => assertCacheComponent("release tag", "v0.2.0+build.1"));
+
     for (const bad of ["..", ".", "", "a/b", "a\\b", "na me", "tag\x00"]) {
       assert.throws(() => assertCacheComponent("release tag", bad), InvalidCacheComponentError);
     }
