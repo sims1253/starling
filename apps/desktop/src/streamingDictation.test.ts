@@ -344,4 +344,40 @@ describe("StreamingDictation", () => {
     expect(result.streamed).toBe(false);
     expect(result.streamNote ?? "").toMatch(/not supported/);
   });
+
+  it("never commits a take whose journal stayed empty", async () => {
+    // The #143 wrong-take shape: the microphone belonged to another
+    // controller, so this one reaches Stop with zero journaled frames.
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    await controller.connect();
+    await drained();
+
+    expect(controller.journaledChunkCount).toBe(0);
+
+    const result = await controller.finish(900);
+
+    expect(result.streamed).toBe(false);
+    expect(transport.commits).toBe(0);
+    expect(result.streamNote ?? "").toMatch(/no audio reached the live stream/i);
+    expect(transport.closeCalls).toBe(1);
+  });
+
+  it("counts only nonzero chunks toward the journaled chunk count", async () => {
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    controller.onChunk(new Uint8Array(0));
+    expect(controller.journaledChunkCount).toBe(0);
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    controller.onChunk(frame(4));
+    await drained();
+
+    expect(controller.journaledChunkCount).toBe(2);
+  });
 });

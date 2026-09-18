@@ -55,6 +55,8 @@ export class StreamingDictation {
   /** False the moment any audio might not have reached the server intact. */
   private complete = true;
   private queue: Uint8Array[] = [];
+  /** Nonzero chunks journaled; zero means the microphone never arrived here. */
+  private journaledChunks = 0;
   private pipeline: Promise<void> = Promise.resolve();
   private stopEvents: () => void;
 
@@ -73,6 +75,11 @@ export class StreamingDictation {
 
   get streamingState(): StreamingState {
     return this.state;
+  }
+
+  /** Chunks durably journaled so far; zero means no audio ever arrived. */
+  get journaledChunkCount(): number {
+    return this.journaledChunks;
   }
 
   /**
@@ -103,6 +110,7 @@ export class StreamingDictation {
   onChunk(pcm16: Uint8Array): void {
     if (pcm16.byteLength === 0) return;
 
+    this.journaledChunks += 1;
     this.pipeline = this.pipeline
       .then(() => this.capture.append(pcm16))
       .then(() => {
@@ -160,8 +168,10 @@ export class StreamingDictation {
       ...finished,
       streamed: false,
       streamNote:
-        this.detail ??
-        "Live streaming did not finish before the recording stopped; using the saved WAV.",
+        this.journaledChunks === 0
+          ? "No audio reached the live stream; the saved WAV carries the take."
+          : (this.detail ??
+            "Live streaming did not finish before the recording stopped; using the saved WAV."),
     });
   }
 
@@ -174,7 +184,14 @@ export class StreamingDictation {
 
   private canCommit(): boolean {
     return (
-      this.state === "live" && this.complete && this.transport.isOpen && this.queue.length === 0
+      this.state === "live" &&
+      this.complete &&
+      this.transport.isOpen &&
+      this.queue.length === 0 &&
+      // An empty journal assembles a header-only WAV whose zero-duration
+      // commit the server answers with an empty success; never accept that
+      // as a final — the recorder's capture must carry the take (#143).
+      this.journaledChunks > 0
     );
   }
 

@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
+import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
 import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
@@ -153,6 +154,15 @@ export default function App() {
   // the close guard must keep reporting it as journaled. State, not a ref:
   // the pending-audio mirror must re-run the moment durability ends.
   const [streamingFinalize, setStreamingFinalize] = useState(false);
+
+  // One take transitions at a time: the record button and the global shortcut
+  // both claim the lifecycle before awaiting anything, so a start or stop
+  // issued mid-transition cannot interleave with it (#143).
+  const [lifecycle] = useState(() => new TakeLifecycle());
+  const [takePhase, setTakePhase] = useState<TakePhase>("idle");
+  // Identity of the take being started, captured before any await; bumped
+  // whenever the current take is invalidated so late work disposes itself.
+  const takeSeqRef = useRef(0);
 
   const selected = sessions.find((session) => session.id === selectedId);
   const [audioUrl, setAudioUrl] = useState<string>();
@@ -443,58 +453,76 @@ export default function App() {
   }, []);
 
   /** Wire live streaming for the next take; undefined means "use batch mode". */
-  const beginStreamingTake = useCallback(async (): Promise<
-    ((chunk: Float32Array, sampleRate: number) => void) | undefined
-  > => {
-    setPartialText(undefined);
-    setStreamStatus({ state: "connecting" });
-    streamBailedRef.current = false;
+  const beginStreamingTake = useCallback(
+    async (
+      takeId: number,
+    ): Promise<((chunk: Float32Array, sampleRate: number) => void) | undefined> => {
+      setPartialText(undefined);
+      setStreamStatus({ state: "connecting" });
+      streamBailedRef.current = false;
 
-    let transport: StarlingStream;
+      let transport: StarlingStream;
 
-    try {
-      transport = new StarlingStream({ baseUrl: endpoint });
-    } catch {
-      setStreamStatus(undefined);
+      try {
+        transport = new StarlingStream({ baseUrl: endpoint });
+      } catch {
+        setStreamStatus(undefined);
 
-      return undefined;
-    }
-
-    let capture;
-
-    try {
-      capture = await store.beginStreamCapture();
-    } catch {
-      setStreamStatus(undefined);
-
-      return undefined;
-    }
-
-    const controller = new StreamingDictation(transport, capture, {
-      onPartial: (text) => setPartialText(text),
-      onStateChange: (state, detail) => setStreamStatus({ state, detail }),
-    });
-
-    streamRef.current = controller;
-
-    void controller.connect();
-
-    return (chunk, sampleRate) => {
-      if (sampleRate === 16_000) {
-        controller.onChunk(encodePcm16kMono(chunk));
-
-        return;
+        return undefined;
       }
 
-      // Unexpected capture rate: never stream or journal resampled guesses.
-      if (!streamBailedRef.current) {
-        streamBailedRef.current = true;
-        controller.fail("The microphone capture rate is not supported for live streaming.");
+      let capture;
+
+      try {
+        capture = await store.beginStreamCapture();
+      } catch {
+        setStreamStatus(undefined);
+
+        return undefined;
       }
-    };
-  }, [endpoint]);
+
+      if (takeSeqRef.current !== takeId) {
+        // This take was invalidated (for example discarded) while the journal
+        // was being created: dispose the provisional journal and socket so
+        // neither can be mistaken for a live take later (#143).
+        transport.close();
+        await capture.abandon().catch(() => {});
+        setStreamStatus(undefined);
+
+        return undefined;
+      }
+
+      const controller = new StreamingDictation(transport, capture, {
+        onPartial: (text) => setPartialText(text),
+        onStateChange: (state, detail) => setStreamStatus({ state, detail }),
+      });
+
+      streamRef.current = controller;
+
+      void controller.connect();
+
+      return (chunk, sampleRate) => {
+        if (sampleRate === 16_000) {
+          controller.onChunk(encodePcm16kMono(chunk));
+
+          return;
+        }
+
+        // Unexpected capture rate: never stream or journal resampled guesses.
+        if (!streamBailedRef.current) {
+          streamBailedRef.current = true;
+          controller.fail("The microphone capture rate is not supported for live streaming.");
+        }
+      };
+    },
+    [endpoint],
+  );
 
   const discardStreamingTake = useCallback(async (): Promise<void> => {
+    // Invalidate the in-flight take identity: a beginStreamingTake that is
+    // still awaiting storage must not install its controller after this.
+    takeSeqRef.current += 1;
+
     const stream = streamRef.current;
     streamRef.current = undefined;
     streamBailedRef.current = false;
@@ -517,21 +545,15 @@ export default function App() {
   }, [discardStreamingTake]);
 
   /**
-   * Finalize a streamed take. Returns false when the stream was never usable
-   * and the caller should save the recorder's own capture via the batch path.
+   * Finalize the streamed take this Stop was issued against. Returns false
+   * when the stream was never usable and the caller should save the
+   * recorder's own capture via the batch path.
    */
   const finishStreamingTake = useCallback(
-    async (durationMs: number): Promise<boolean> => {
-      const stream = streamRef.current;
+    async (stream: StreamingDictation, durationMs: number): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
-
-      if (!stream) {
-        setStreamingFinalize(false);
-
-        return false;
-      }
 
       if (bailed) {
         setPartialText(undefined);
@@ -539,6 +561,18 @@ export default function App() {
         await stream.abandon();
         // The journal is gone; the recorder's memory-only capture carries
         // this take through the batch path, so it is no longer journaled.
+        setStreamingFinalize(false);
+
+        return false;
+      }
+
+      if (stream.journaledChunkCount === 0) {
+        // The microphone never reached this controller's journal — its
+        // session would be a header-only WAV: drop the empty journal and
+        // keep the recorder's capture through the batch path (#143).
+        setPartialText(undefined);
+        setStreamStatus(undefined);
+        await stream.abandon().catch(() => {});
         setStreamingFinalize(false);
 
         return false;
@@ -580,42 +614,26 @@ export default function App() {
   const toggleRecording = useCallback(async () => {
     setError(undefined);
 
-    try {
-      if (!recording) {
-        let onChunk: ((chunk: Float32Array, sampleRate: number) => void) | undefined;
+    // The lifecycle guard is claimed synchronously, before any await, and is
+    // shared by the record button and the global shortcut: a toggle issued
+    // while a begin/start/stop/finalize transition is in flight is ignored
+    // instead of interleaving with it (#143).
+    const shouldStop = lifecycle.current() === "recording";
 
-        if (streamLive && protocol === "starling") {
-          onChunk = await beginStreamingTake();
-        } else {
-          setPartialText(undefined);
-          setStreamStatus(undefined);
-        }
+    if (shouldStop) {
+      if (!lifecycle.beginStop()) return;
 
-        // 16 kHz lets each chunk stream as-is; any other actual rate is
-        // reported per chunk and degrades that take to batch mode.
-        if (onChunk) {
-          try {
-            await start({ sampleRate: 16_000, onChunk });
-          } catch (cause) {
-            // Capture setup failed after the stream was wired: drop its
-            // journal and socket so neither lingers until the next start.
-            await discardStreamingTake();
-            throw cause;
-          }
+      // The controller bound to the take being stopped, read before any
+      // await: Stop must finalize the take that was recorded (#143).
+      const stream = streamRef.current;
 
-          return;
-        }
-
-        await start();
-
-        return;
-      }
+      setTakePhase("stopping");
 
       // From Stop until the capture is durably stored (or parked in
       // unsavedWavs), the only copy lives in this window's memory (#121) —
       // except a streamed take, whose journal/session keeps it durable, so
       // the close guard reports it as journaled for the whole finalize.
-      setStreamingFinalize(streamRef.current !== undefined);
+      setStreamingFinalize(stream !== undefined);
       setFinalizing(true);
 
       try {
@@ -632,25 +650,83 @@ export default function App() {
           throw new Error("Recording was too short to keep.");
         }
 
-        if (streamRef.current && (await finishStreamingTake(capture.durationMs))) {
+        if (stream && (await finishStreamingTake(stream, capture.durationMs))) {
           return;
         }
 
         const prepared = await prepareWav16k(capture.audio);
         await saveAndTranscribe(prepared.blob, capture.durationMs);
+      } catch (caught) {
+        setError(messageFrom(caught));
       } finally {
+        lifecycle.endStop();
+        setTakePhase("idle");
         setStreamingFinalize(false);
         setFinalizing(false);
       }
+
+      return;
+    }
+
+    if (!lifecycle.beginStart()) return;
+
+    setTakePhase("starting");
+
+    try {
+      // Everything this start allocates belongs to this take alone; the
+      // identity is captured before any await (#143).
+      const takeId = ++takeSeqRef.current;
+      let onChunk: ((chunk: Float32Array, sampleRate: number) => void) | undefined;
+
+      if (streamLive && protocol === "starling") {
+        onChunk = await beginStreamingTake(takeId);
+      } else {
+        setPartialText(undefined);
+        setStreamStatus(undefined);
+      }
+
+      // 16 kHz lets each chunk stream as-is; any other actual rate is
+      // reported per chunk and degrades that take to batch mode.
+      if (onChunk) {
+        let started = false;
+
+        try {
+          started = await start({ sampleRate: 16_000, onChunk });
+        } catch (cause) {
+          // Capture setup failed after the stream was wired: drop its
+          // journal and socket so neither lingers until the next start.
+          await discardStreamingTake();
+          throw cause;
+        }
+
+        if (!started) {
+          // The recorder rejected this start — a preceding stop is still
+          // releasing its audio context: dispose the provisional journal
+          // and socket of the take that never recorded (#143).
+          await discardStreamingTake();
+
+          return;
+        }
+      } else if (!(await start())) {
+        return;
+      }
+
+      lifecycle.endStart(true);
+      setTakePhase("recording");
     } catch (caught) {
       setError(messageFrom(caught));
+    } finally {
+      if (lifecycle.current() === "starting") {
+        lifecycle.endStart(false);
+        setTakePhase("idle");
+      }
     }
   }, [
     beginStreamingTake,
     discardStreamingTake,
     finishStreamingTake,
+    lifecycle,
     protocol,
-    recording,
     saveAndTranscribe,
     start,
     stop,
@@ -848,6 +924,7 @@ export default function App() {
             <button
               className="record-button"
               onClick={() => void toggleRecording()}
+              disabled={takePhase === "starting" || takePhase === "stopping"}
               aria-label={recording ? "Stop recording" : "Start recording"}
             >
               <span className="record-button-inner">
