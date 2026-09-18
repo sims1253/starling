@@ -10,6 +10,9 @@ import {
   MemorySessionStore,
   exportDictationSession,
   invalidSessionWav,
+  type GrantedWebLock,
+  type WebLockRequestOptions,
+  type WebLocksLike,
 } from "../src/storage.js";
 import { decodePcm16Wav } from "../src/audio.js";
 
@@ -720,5 +723,296 @@ describe("damaged history isolation", () => {
       ["healthy"],
     );
     assert.deepEqual(report.invalid, []);
+  });
+});
+
+/**
+ * In-memory stand-in for navigator.locks with the semantics the store relies
+ * on: one exclusive holder per name, and `ifAvailable` reporting contention
+ * as a null grant instead of queueing.
+ */
+class MemoryWebLocks implements WebLocksLike {
+  private readonly held = new Set<string>();
+
+  async request<Result>(
+    name: string,
+    options: WebLockRequestOptions,
+    granted: (lock: GrantedWebLock | null) => Promise<Result> | Result,
+  ): Promise<Result> {
+    if (options.ifAvailable && this.held.has(name)) {
+      return granted(null);
+    }
+
+    this.held.add(name);
+
+    try {
+      return await granted({ name });
+    } finally {
+      this.held.delete(name);
+    }
+  }
+}
+
+describe("cross-window capture ownership", () => {
+  it("does not consume a journal another window is still recording into", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-live", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+    const capture = await owner.beginStreamCapture({ id: "owned-live" });
+
+    await capture.append(chunkOf(1_000));
+
+    const second = new IndexedDbSessionStore(options);
+
+    // Tab B's startup recovery leaves the live journal alone: no session is
+    // created under the capture id, and no journal row is removed.
+    assert.deepEqual(await second.recoverStreamCaptures(), []);
+    assert.equal(await second.get("owned-live"), undefined);
+
+    // The owner keeps journaling and finishes with every frame durable.
+    await capture.append(chunkOf(500, 2));
+
+    const finished = await capture.finish();
+
+    if (!finished.session) throw new Error("finish failed under a concurrent sweep");
+
+    const decoded = decodePcm16Wav(await wavBytes(finished.session.wav));
+
+    assert.equal(decoded.samples.length, 1_500);
+    assert.equal(decoded.samples[999], 1 / 0x8000);
+    assert.equal(decoded.samples[1_000], 2 / 0x8000);
+
+    // History shows the owner's own take, not a recovery-marked partial.
+    const listed = await second.listReport();
+
+    assert.deepEqual(
+      listed.sessions.map((session) => [session.id, session.status]),
+      [["owned-live", "captured"]],
+    );
+    assert.deepEqual(await second.recoverStreamCaptures(), []);
+    owner.close();
+    second.close();
+  });
+
+  it("keeps hands off a live journal when web locks are unavailable", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "ownership-fallback", indexedDB: factory, webLocks: undefined };
+    const owner = new IndexedDbSessionStore(options);
+    const capture = await owner.beginStreamCapture({ id: "fallback-live" });
+
+    await capture.append(chunkOf(1_000));
+
+    // Unlocked fallback: ownership is tracked within the environment, which
+    // still keeps two live stores from consuming each other's journals.
+    const second = new IndexedDbSessionStore(options);
+
+    assert.deepEqual(await second.recoverStreamCaptures(), []);
+    assert.equal(await second.get("fallback-live"), undefined);
+
+    await capture.append(chunkOf(500, 2));
+
+    const finished = await capture.finish();
+
+    if (!finished.session) throw new Error("finish failed in the unlocked fallback");
+
+    assert.equal(decodePcm16Wav(await wavBytes(finished.session.wav)).samples.length, 1_500);
+    owner.close();
+    second.close();
+  });
+
+  it("recovers a journal once its owner is terminated", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-terminated", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+    const capture = await owner.beginStreamCapture({ id: "terminated" });
+
+    await capture.append(chunkOf(1_000));
+    await capture.append(chunkOf(500, 2));
+
+    // The owning window goes away; its lock and registry claims end with it.
+    owner.close();
+
+    const second = new IndexedDbSessionStore(options);
+    const recovered = await second.recoverStreamCaptures();
+
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.id, "terminated");
+    assert.equal(recovered[0]?.status, "failed");
+    assert.match(recovered[0]?.lastError ?? "", /Recovered after the app closed/);
+
+    const restored = await second.get("terminated");
+
+    if (!restored) throw new Error("recovered session missing");
+
+    const decoded = decodePcm16Wav(await wavBytes(restored.wav));
+
+    assert.equal(decoded.samples.length, 1_500);
+    assert.equal(decoded.samples[999], 1 / 0x8000);
+    assert.equal(decoded.samples[1_000], 2 / 0x8000);
+
+    // The journal was consumed exactly once.
+    assert.deepEqual(await second.recoverStreamCaptures(), []);
+    second.close();
+  });
+
+  it("keeps an active empty capture discoverable instead of deleting it", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "ownership-empty", indexedDB: factory, webLocks: undefined };
+    const owner = new IndexedDbSessionStore(options);
+    const capture = await owner.beginStreamCapture({ id: "empty-live" });
+
+    const second = new IndexedDbSessionStore(options);
+
+    // Zero chunks, live owner: the metadata must survive so chunks appended
+    // afterwards stay recoverable.
+    assert.deepEqual(await second.recoverStreamCaptures(), []);
+
+    await capture.append(chunkOf(1_000));
+    owner.close();
+
+    const third = new IndexedDbSessionStore(options);
+    const recovered = await third.recoverStreamCaptures();
+
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.id, "empty-live");
+
+    const restored = await third.get("empty-live");
+
+    if (!restored) throw new Error("recovered session missing");
+
+    assert.equal(decodePcm16Wav(await wavBytes(restored.wav)).samples.length, 1_000);
+    second.close();
+    third.close();
+  });
+
+  it("leaves a journal recoverable when promotion crashes mid-transaction", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "promotion-crash", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+    const capture = await owner.beginStreamCapture({ id: "crashed" });
+
+    await capture.append(chunkOf(1_000));
+    owner.close();
+
+    const originalAdd = IDBObjectStore.prototype.add;
+
+    IDBObjectStore.prototype.add = function patchedAdd(
+      this: IDBObjectStore,
+      value: { id?: string; status?: string },
+    ): IDBRequest {
+      const request = originalAdd.call(this, value);
+
+      if (value?.id === "crashed" && value?.status === "failed") {
+        // Die right after the recovered session was queued: the insert and
+        // the journal delete must roll back together.
+        this.transaction.abort();
+      }
+
+      return request;
+    };
+
+    const sweeper = new IndexedDbSessionStore(options);
+
+    try {
+      assert.deepEqual(await sweeper.recoverStreamCaptures(), []);
+    } finally {
+      IDBObjectStore.prototype.add = originalAdd;
+    }
+
+    // Neither half of the aborted promotion survived.
+    assert.equal(await sweeper.get("crashed"), undefined);
+
+    // The intact journal still promotes cleanly on the next sweep.
+    const recovered = await sweeper.recoverStreamCaptures();
+
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.id, "crashed");
+
+    const restored = await sweeper.get("crashed");
+
+    if (!restored) throw new Error("recovered session missing");
+
+    assert.equal(decodePcm16Wav(await wavBytes(restored.wav)).samples.length, 1_000);
+    sweeper.close();
+  });
+
+  it("refuses to begin a capture another window already owns", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-begin", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+
+    await owner.beginStreamCapture({ id: "claimed" });
+
+    const second = new IndexedDbSessionStore(options);
+
+    await assert.rejects(
+      second.beginStreamCapture({ id: "claimed" }),
+      (cause) =>
+        cause instanceof DictationStorageError && /owned by another window/.test(cause.message),
+    );
+    owner.close();
+    second.close();
+  });
+
+  it("does not treat another window's in-flight transcription as interrupted", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-attempt", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+
+    await owner.create({ id: "attempt", wav });
+    await owner.markAttempt("attempt");
+
+    const second = new IndexedDbSessionStore(options);
+
+    assert.equal(await second.transcriptionInFlight("attempt"), true);
+
+    // What App.tsx's startup sweep does: only an owner whose signal is gone
+    // gets interrupted, so the live attempt is left alone.
+    if (!(await second.transcriptionInFlight("attempt"))) {
+      await second.saveFailure("attempt", "Interrupted before the server returned a transcript.");
+    }
+
+    assert.equal((await second.get("attempt"))?.status, "transcribing");
+
+    // The owner completes and its in-flight signal ends with the attempt.
+    await owner.saveTranscript("attempt", { text: "done live", segments: [] });
+
+    assert.equal(await second.transcriptionInFlight("attempt"), false);
+    assert.equal((await second.get("attempt"))?.status, "transcribed");
+    assert.equal((await second.get("attempt"))?.transcript?.text, "done live");
+    owner.close();
+    second.close();
+  });
+
+  it("interrupts a transcribing session once its owner is gone", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-dead-attempt", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+
+    await owner.create({ id: "late-attempt", wav });
+    await owner.markAttempt("late-attempt");
+    owner.close();
+
+    // A real window's lock release settles asynchronously with its close;
+    // give the claim a tick to end before judging the attempt abandoned.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const second = new IndexedDbSessionStore(options);
+
+    assert.equal(await second.transcriptionInFlight("late-attempt"), false);
+
+    await second.saveFailure(
+      "late-attempt",
+      "Interrupted before the server returned a transcript.",
+    );
+
+    assert.equal((await second.get("late-attempt"))?.status, "failed");
+    second.close();
   });
 });

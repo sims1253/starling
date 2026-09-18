@@ -171,6 +171,10 @@ export default function App() {
     unsavedCount: 0,
   });
 
+  // Startup recovery must settle before a new take can begin (#144): a Start
+  // that raced the sweep would journal into a database still being recovered.
+  const startupRecoveryDoneRef = useRef(false);
+
   const busy = activeIds.size > 0;
 
   const fidelity = useMemo(
@@ -249,18 +253,24 @@ export default function App() {
       try {
         const saved = await store.listReport();
 
-        await Promise.all(
-          saved.sessions.flatMap((session) =>
-            session.status === "transcribing"
-              ? [
-                  store.saveFailure(
-                    session.id,
-                    "Interrupted before the server returned a transcript. Your audio is ready to retry.",
-                  ),
-                ]
-              : [],
-          ),
-        );
+        const interrupted: Array<Promise<DictationSession>> = [];
+
+        for (const session of saved.sessions) {
+          // Another window may still own this attempt (#144); only an
+          // owner whose signal is gone is treated as interrupted.
+          if (session.status !== "transcribing") continue;
+
+          if (await store.transcriptionInFlight(session.id)) continue;
+
+          interrupted.push(
+            store.saveFailure(
+              session.id,
+              "Interrupted before the server returned a transcript. Your audio is ready to retry.",
+            ),
+          );
+        }
+
+        await Promise.all(interrupted);
       } catch (caught) {
         setError(`Could not open saved recordings: ${messageFrom(caught)}`);
       }
@@ -273,7 +283,12 @@ export default function App() {
           setError(`Could not recover streaming captures: ${messageFrom(caught)}`),
         );
       await refresh();
-    })().catch((caught) => setError(`Could not open saved recordings: ${messageFrom(caught)}`));
+    })()
+      .catch((caught) => setError(`Could not open saved recordings: ${messageFrom(caught)}`))
+      .finally(() => {
+        // However recovery ended, the sweep has run: takes may begin.
+        startupRecoveryDoneRef.current = true;
+      });
   }, [refresh]);
 
   useEffect(() => {
@@ -582,6 +597,14 @@ export default function App() {
 
     try {
       if (!recording) {
+        // The startup sweep may still be deciding which journals and
+        // attempts are abandoned; a take started now could race it (#144).
+        if (!startupRecoveryDoneRef.current) {
+          throw new Error(
+            "Still restoring recordings from a previous session. Try again in a moment.",
+          );
+        }
+
         let onChunk: ((chunk: Float32Array, sampleRate: number) => void) | undefined;
 
         if (streamLive && protocol === "starling") {
