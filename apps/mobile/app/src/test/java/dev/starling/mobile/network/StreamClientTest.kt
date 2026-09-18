@@ -15,6 +15,7 @@ import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class StreamClientTest {
     // URL derivation — the same trusted-host policy as the batch client.
@@ -152,6 +153,61 @@ class StreamClientTest {
             val outcome = session.finish()
             assertEquals(CommitOutcome.Final("after busy"), outcome)
             assertTrue(harness.serverTexts().count { it == COMMIT } == 2)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test fun busyExhaustionDropsTheSocketInsteadOfLeakingIt() {
+        // Every commit answers busy, so the bounded retries run out and the
+        // client must fall back — while dropping the connection instead of
+        // leaving it open behind the batch upload.
+        val harness = StreamHarness(
+            serverBehavior = { text, socket ->
+                if (text == COMMIT) socket.send("""{"type":"error","message":"server busy"}""")
+            },
+            client = StreamClient(
+                finalTimeoutMillis = 5_000,
+                busyRetryDelaysMillis = longArrayOf(50),
+            ),
+        )
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            val outcome = session.finish()
+            assertEquals(
+                CommitOutcome.Fallback("the server stayed busy while finalizing the stream"),
+                outcome,
+            )
+            // The initial commit plus exactly one scheduled retry.
+            harness.awaitServerTexts(2) { texts -> texts.count { it == COMMIT } == 2 }
+            // Asserted before any harness teardown: the server must see the
+            // socket go away once the retries are exhausted.
+            harness.awaitServerTermination()
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test fun commitErrorFrameDropsTheSocketInsteadOfLeakingIt() {
+        // A non-busy error frame during commit fails the stream: the client
+        // falls back and must not keep the failed-commit connection open.
+        val harness = StreamHarness(
+            serverBehavior = { text, socket ->
+                if (text == COMMIT) {
+                    socket.send("""{"type":"error","message":"the audio could not be transcribed"}""")
+                }
+            },
+        )
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            val outcome = session.finish()
+            assertEquals(
+                CommitOutcome.Fallback("the audio could not be transcribed"),
+                outcome,
+            )
+            harness.awaitServerTermination()
         } finally {
             harness.close()
         }
@@ -324,6 +380,95 @@ class StreamClientTest {
         }
     }
 
+    @Test fun closeDuringAPendingCommitReleasesTheFinishWaiterImmediately() {
+        // The server accepts the commit and never answers, so only close()
+        // may release the waiter: the final timeout is configured far
+        // beyond the test's own join budget, and a regression parks the
+        // (daemon) worker for that whole budget and fails the join fast
+        // instead of hanging the suite for the timeout.
+        val harness = StreamHarness(client = StreamClient(finalTimeoutMillis = 60_000))
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            val finished = CountDownLatch(1)
+            val outcome = AtomicReference<CommitOutcome>()
+            val worker = Thread {
+                outcome.set(session.finish())
+                finished.countDown()
+            }.apply {
+                isDaemon = true
+                start()
+            }
+            // The commit must actually be pending before cancelling.
+            harness.awaitServerTexts(1) { texts -> texts.count { it == COMMIT } == 1 }
+            session.close()
+            assertTrue(
+                "close() must release a pending finish() immediately, not at the final timeout",
+                finished.await(5, TimeUnit.SECONDS),
+            )
+            worker.join(5_000)
+            assertTrue("the finish worker is still blocked in finish()", !worker.isAlive)
+            assertEquals(CommitOutcome.Fallback("the stream was closed before commit"), outcome.get())
+            // Asserted before any harness teardown: cancelling mid-commit
+            // must drop the socket, not just settle the outcome.
+            harness.awaitServerTermination()
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test fun closeDuringTheBusyRetryWindowCancelsTheScheduledRetry() {
+        // One busy answer schedules a retry well in the future; close()
+        // during that window must cancel the scheduled commit, not just
+        // settle the waiter — nothing may outlive the session's terminal
+        // state (#147).
+        val harness = StreamHarness(
+            serverBehavior = { text, socket ->
+                if (text == COMMIT) socket.send("""{"type":"error","message":"server busy"}""")
+            },
+            client = StreamClient(
+                finalTimeoutMillis = 60_000,
+                busyRetryDelaysMillis = longArrayOf(1_500),
+            ),
+        )
+        try {
+            val session = harness.connect()
+            harness.awaitLive()
+            val finished = CountDownLatch(1)
+            val outcome = AtomicReference<CommitOutcome>()
+            val worker = Thread {
+                outcome.set(session.finish())
+                finished.countDown()
+            }.apply {
+                isDaemon = true
+                start()
+            }
+            // The busy answer reached the server, so the client has (or is
+            // imminently about to) schedule the retry; give its reader
+            // thread a beat so the retry really is pending.
+            harness.awaitServerTexts(1) { texts -> texts.count { it == COMMIT } == 1 }
+            Thread.sleep(250)
+            session.close()
+            assertTrue(
+                "close() must release a pending finish() immediately, not at the retry or final timeout",
+                finished.await(5, TimeUnit.SECONDS),
+            )
+            worker.join(5_000)
+            assertTrue("the finish worker is still blocked in finish()", !worker.isAlive)
+            assertEquals(CommitOutcome.Fallback("the stream was closed before commit"), outcome.get())
+            // The retry was scheduled 1.5 s out; well past that delay no
+            // second COMMIT may reach the server.
+            Thread.sleep(2_000)
+            assertTrue(
+                "the cancelled busy retry must never reach the server",
+                harness.serverTexts().count { it == COMMIT } == 1,
+            )
+            harness.awaitServerTermination()
+        } finally {
+            harness.close()
+        }
+    }
+
     private companion object {
         const val COMMIT = """{"type":"commit"}"""
         const val PING = """{"type":"ping"}"""
@@ -388,6 +533,19 @@ class StreamClientTest {
             await("$count server text frames") { predicate(serverStream.texts.toList()) }
         }
 
+        /**
+         * Server-side proof that the client dropped its connection: any of
+         * the terminal socket callbacks counts, whether the client closed
+         * gracefully or cancelled. Awaited before harness teardown so a
+         * leaked socket cannot be masked by server shutdown.
+         */
+        fun awaitServerTermination(timeoutMillis: Long = 5_000) {
+            assertTrue(
+                "the client never dropped its stream socket",
+                serverStream.terminated.await(timeoutMillis, TimeUnit.MILLISECONDS),
+            )
+        }
+
         private fun await(what: String, timeoutMillis: Long = 5_000, condition: () -> Boolean) {
             val deadline = System.currentTimeMillis() + timeoutMillis
             while (System.currentTimeMillis() < deadline) {
@@ -407,6 +565,7 @@ class StreamClientTest {
         ) : WebSocketListener() {
             val audio = mutableListOf<ByteString>()
             val texts = mutableListOf<String>()
+            val terminated = CountDownLatch(1)
 
             @Volatile
             var socket: WebSocket? = null
@@ -427,6 +586,15 @@ class StreamClientTest {
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
+                terminated.countDown()
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                terminated.countDown()
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                terminated.countDown()
             }
         }
     }

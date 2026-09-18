@@ -11,6 +11,8 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 
 namespace starling::serve {
@@ -168,19 +170,141 @@ std::vector<std::string> stitch_words(
 
 // ---- ChunkStreamer --------------------------------------------------------
 
+std::optional<double> parse_double_strict(const std::string& text) {
+    // Full-string parse: std::stod accepts partial parses ("3abc" -> 3) and
+    // non-finite tokens ("nan", "inf"); the CLI must reject both (issue #146).
+    try {
+        std::size_t pos = 0;
+        const double value = std::stod(text, &pos);
+        // Allow trailing whitespace only; anything else is junk.
+        while (pos < text.size()
+               && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+        if (pos != text.size()) return std::nullopt;
+        if (!std::isfinite(value)) return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<int> parse_int_strict(const std::string& text) {
+    try {
+        std::size_t pos = 0;
+        const long value = std::stol(text, &pos);
+        while (pos < text.size()
+               && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+        if (pos != text.size()) return std::nullopt;
+        if (value < std::numeric_limits<int>::min()
+            || value > std::numeric_limits<int>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<int>(value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::string stream_window_config_error(int sample_rate, double chunk_seconds,
+                                       double overlap_seconds, double min_seconds,
+                                       double partial_interval) {
+    if (sample_rate <= 0) {
+        return "stream sample rate must be positive (got "
+               + std::to_string(sample_rate) + ")";
+    }
+    const struct {
+        const char* name;
+        double value;
+    } fields[] = {
+        {"stream chunk seconds", chunk_seconds},
+        {"stream overlap seconds", overlap_seconds},
+        {"stream min chunk seconds", min_seconds},
+        {"stream partial interval seconds", partial_interval},
+    };
+    for (const auto& f : fields) {
+        if (!std::isfinite(f.value)) {
+            return std::string(f.name) + " must be a finite number";
+        }
+    }
+    if (chunk_seconds < 0.0) {
+        return "stream chunk seconds must be nonnegative "
+               "(0 selects whole-buffer mode)";
+    }
+    if (overlap_seconds < 0.0) {
+        return "stream overlap seconds must be nonnegative";
+    }
+    if (min_seconds < 0.0) {
+        return "stream min chunk seconds must be nonnegative";
+    }
+    if (partial_interval < 0.0) {
+        return "stream partial interval seconds must be nonnegative";
+    }
+    // The sample counters (chunk_, overlap_, min_) are ints: reject windows
+    // whose sample counts do not fit, before the narrowing casts overflow.
+    const double max_seconds =
+        static_cast<double>(std::numeric_limits<int>::max()) / sample_rate;
+    if (chunk_seconds > 0.0) {
+        if (chunk_seconds * sample_rate < 1.0) {
+            return "stream chunk seconds too small: the window is shorter "
+                   "than one sample at this rate";
+        }
+        if (overlap_seconds >= chunk_seconds) {
+            return "stream overlap seconds must be smaller than "
+                   "stream chunk seconds";
+        }
+        if (chunk_seconds > max_seconds) {
+            return "stream chunk seconds too large: the window does not fit "
+                   "the sample counters";
+        }
+    }
+    if (min_seconds > max_seconds) {
+        return "stream min chunk seconds too large: the minimum does not fit "
+               "the sample counters";
+    }
+    return "";
+}
+
 ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
                              double overlap_seconds, double min_seconds,
                              double partial_interval)
-    : sr_(sample_rate),
-      chunk_(static_cast<int>(chunk_seconds * sample_rate)),
-      overlap_(static_cast<int>(
-          std::min(overlap_seconds, chunk_seconds * 0.5) * sample_rate)),
-      advance_(std::max(1, chunk_ - overlap_)),
-      min_(static_cast<int>(min_seconds * sample_rate)),
-      partial_interval_(partial_interval),
-      max_overlap_words_(std::max(8, static_cast<int>(overlap_seconds * 6) + 6)) {
-    if (chunk_ < 1) chunk_ = 1;
-    if (overlap_ < 0) overlap_ = 0;
+    : sr_(0),
+      chunk_(0),
+      overlap_(0),
+      advance_(1),
+      min_(0),
+      partial_interval_(0.0),
+      max_overlap_words_(0) {
+    // Validate the whole configuration before deriving anything, then build
+    // the members in dependency order (issue #146). The old member-init list
+    // computed advance_ from the unclamped overlap_: a negative overlap was
+    // baked into advance_ (every window advanced chunk+|overlap| samples,
+    // skipping audio), and the body's late `overlap_ < 0` clamp could not fix
+    // it — flush() could then hand the transcriber a negative-length window.
+    if (chunk_seconds <= 0.0) {
+        // 0 selects the legacy whole-buffer mode at the CLI; a chunker needs
+        // a real window.
+        throw std::invalid_argument(
+            "stream chunk seconds must be positive to build a chunked stream");
+    }
+    const std::string err = stream_window_config_error(
+        sample_rate, chunk_seconds, overlap_seconds, min_seconds,
+        partial_interval);
+    if (!err.empty()) throw std::invalid_argument(err);
+
+    sr_ = sample_rate;
+    chunk_ = static_cast<int>(chunk_seconds * sample_rate);
+    // Normalize overlap before deriving advance_: clamp to [0, chunk/2] (the
+    // documented cap; overlap >= chunk was already rejected above).
+    overlap_ = static_cast<int>(
+        std::max(0.0, std::min(overlap_seconds, chunk_seconds * 0.5))
+        * sample_rate);
+    advance_ = std::max(1, chunk_ - overlap_);
+    min_ = static_cast<int>(min_seconds * sample_rate);
+    partial_interval_ = partial_interval;
+    max_overlap_words_ = std::max(8, static_cast<int>(overlap_seconds * 6) + 6);
 }
 
 bool ChunkStreamer::finalize_full_windows(
@@ -214,7 +338,7 @@ std::optional<std::string> ChunkStreamer::step(
     }
     last_emit_ = now;
 
-    if (tail_len >= min_) {
+    if (tail_len > 0 && tail_len >= min_) {
         auto text = tx(samples.data() + boundary_, tail_len);
         if (!text.has_value()) {
             // Busy on the tail.
@@ -235,7 +359,10 @@ std::optional<std::string> ChunkStreamer::flush(
         finalize_full_windows(samples, tx);
         int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
         if (tail_len == 0) return join_words(committed_);
-        if (tail_len < chunk_) {
+        // Guard the tail's sign as well (issue #146): the window geometry is
+        // validated at construction, but the transcriber contract (a
+        // nonempty window inside the buffer) is enforced here regardless.
+        if (tail_len > 0 && tail_len < chunk_) {
             auto text = tx(samples.data() + boundary_, tail_len);
             if (text.has_value()) {
                 committed_ = stitch_words(committed_, split_words(*text),

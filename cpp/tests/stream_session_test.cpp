@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -594,6 +596,162 @@ static void test_bounded_retry_recovery() {
     CHECK(cs.boundary() == 30);
 }
 
+// ---- stream window config validation (issue #146) --------------------------
+// Negative/NaN/oversized stream window values used to reach the chunker, whose
+// member-init list computed advance_ from the unclamped overlap_: a negative
+// --stream-overlap-seconds made windows skip audio and let flush() call the
+// transcriber with a negative sample count. Validation now rejects these at
+// the CLI (before model load) and at construction, and every callback must
+// stay within (0, chunk].
+
+static void test_strict_number_parsing() {
+    // Full-string, finite-only parses for CLI flags (std::stod/std::stoi
+    // alone accept partial parses and non-finite tokens).
+    CHECK(parse_double_strict("3.5") == 3.5);
+    CHECK(parse_double_strict(" 2.5 ") == 2.5);
+    CHECK(parse_double_strict("-0.25") == -0.25);
+    CHECK(!parse_double_strict("3abc").has_value());   // trailing junk
+    CHECK(!parse_double_strict("nan").has_value());
+    CHECK(!parse_double_strict("inf").has_value());
+    CHECK(!parse_double_strict("-infinity").has_value());
+    CHECK(!parse_double_strict("").has_value());
+    CHECK(parse_int_strict("42") == 42);
+    CHECK(parse_int_strict(" -7 ") == -7);
+    CHECK(!parse_int_strict("8181abc").has_value());   // trailing junk
+    CHECK(!parse_int_strict("3.5").has_value());
+    CHECK(!parse_int_strict("99999999999999").has_value());  // out of int range
+    CHECK(!parse_int_strict("").has_value());
+}
+
+static void test_stream_window_config_error() {
+    auto err = [](double chunk, double overlap, double min, double partial) {
+        return stream_window_config_error(16000, chunk, overlap, min, partial);
+    };
+    // The shipped defaults and the legacy whole-buffer switch are valid.
+    CHECK(err(12.0, 3.0, 5.0, 3.0).empty());
+    CHECK(err(0.0, 3.0, 5.0, 3.0).empty());
+    // Everything else must be rejected with an error message.
+    CHECK(!err(-12.0, 3.0, 5.0, 3.0).empty());            // negative chunk
+    CHECK(!err(12.0, -3.0, 5.0, 3.0).empty());            // negative overlap
+    CHECK(!err(12.0, 12.0, 5.0, 3.0).empty());            // overlap == chunk
+    CHECK(!err(12.0, 13.0, 5.0, 3.0).empty());            // overlap > chunk
+    CHECK(!err(12.0, 3.0, -5.0, 3.0).empty());            // negative min
+    CHECK(!err(12.0, 3.0, 5.0, -3.0).empty());            // negative partial
+    CHECK(err(12.0, 3.0, 5.0, 0.0).empty());              // zero partial is fine
+    CHECK(!err(1e-9, 3.0, 5.0, 3.0).empty());             // sub-sample window
+    CHECK(!err(1e12, 3.0, 5.0, 3.0).empty());             // sample-count overflow
+    CHECK(!err(12.0, 3.0, 1e12, 3.0).empty());            // min-count overflow
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(!err(nan, 3.0, 5.0, 3.0).empty());
+    CHECK(!err(12.0, nan, 5.0, 3.0).empty());
+    CHECK(!err(12.0, 3.0, inf, 3.0).empty());
+    CHECK(!err(12.0, 3.0, 5.0, nan).empty());
+    CHECK(!stream_window_config_error(0, 12.0, 3.0, 5.0, 3.0).empty());  // bad rate
+}
+
+static void test_chunk_streamer_rejects_invalid_config() {
+    auto ctor_throws = [](int sr, double chunk, double overlap,
+                          double min, double partial) {
+        try {
+            ChunkStreamer(sr, chunk, overlap, min, partial);
+        } catch (const std::invalid_argument&) {
+            return true;
+        } catch (...) {
+            return true;
+        }
+        return false;
+    };
+    // The issue #146 repro (12 s window, -3 s overlap) and its neighbors.
+    CHECK(ctor_throws(16000, 12.0, -3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 12.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 13.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 0.0, 3.0, 5.0, 0.0));   // legacy mode is CLI-only
+    CHECK(ctor_throws(16000, -12.0, 3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 1e-9, 0.0, 5.0, 0.0));  // sub-sample window
+    CHECK(ctor_throws(16000, 1e12, 3.0, 5.0, 0.0));  // sample-count overflow
+    CHECK(ctor_throws(16000, 12.0, 3.0, -5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 3.0, 5.0, -1.0));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(ctor_throws(16000, nan, 3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, inf, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 3.0, nan, 0.0));
+    CHECK(ctor_throws(0, 12.0, 3.0, 5.0, 0.0));
+    // Valid configurations still construct.
+    CHECK(!ctor_throws(16000, 12.0, 3.0, 5.0, 3.0));
+    CHECK(!ctor_throws(1, 12.0, 2.0, 5.0, 0.0));     // existing sr=1 tests
+}
+
+static void test_chunk_streamer_overlap_clamped_to_half_chunk() {
+    // Overlap above half the chunk keeps its documented clamp (half the
+    // chunk): 1 s chunks with 0.75 s requested overlap advance 0.5 s.
+    ChunkStreamer cs(16000, 1.0, 0.75, 0.5, 0.0);
+    TranscribeFn tx = [](const float*, int64_t) -> std::optional<std::string> {
+        return "w";
+    };
+    std::vector<float> samples(16000, 0.0f);
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(cs.boundary() == 8000);  // advance = 16000 - 8000
+}
+
+static void test_chunk_streamer_windows_stay_in_range() {
+    // The issue #146 invariant: every transcriber callback receives a
+    // nonempty window of at most one chunk, inside the buffered samples.
+    ChunkStreamer cs(16000, 12.0, 3.0, 5.0, 0.0);
+    std::vector<float> samples(16000 * 30, 0.0f);
+    const float* base = samples.data();
+    const float* end = base + samples.size();
+    int calls = 0;
+    TranscribeFn tx = [&](const float* data, int64_t n) -> std::optional<std::string> {
+        ++calls;
+        CHECK(n > 0);
+        CHECK(n <= 16000 * 12);
+        CHECK(data >= base);
+        CHECK(data + n <= end);
+        return "w";
+    };
+    auto partial = cs.step(samples, 1.0, tx);
+    CHECK(partial.has_value());
+    auto final_text = cs.flush(samples, tx);
+    CHECK(final_text.has_value());
+    CHECK(calls == 4);  // three 12 s windows + the 3 s flush tail
+}
+
+static void test_chunk_streamer_never_transcribes_empty_window() {
+    // min=0 with an exactly-consumed buffer: the partial-tail branch must
+    // not call the transcriber with a zero-length window.
+    ChunkStreamer cs(16000, 1.0, 0.0, 0.0, 0.0);
+    int calls = 0;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        ++calls;
+        CHECK(n > 0);
+        return "w";
+    };
+    std::vector<float> samples(16000, 0.0f);  // exactly one window
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(calls == 1);  // the full window only; no empty partial
+}
+
+static void test_stream_session_rejects_invalid_window_config() {
+    // StreamSession builds its ChunkStreamer from the server config: an
+    // invalid stream window config must fail at construction, never reach a
+    // live transcription session (the CLI rejects it even earlier).
+    ServerConfig cfg = test_cfg();
+    cfg.stream_overlap_seconds = -3.0;
+    StarlingServer server(cfg);
+    bool threw = false;
+    try {
+        StreamSession session(&server);
+        (void)session;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // ---- main -----------------------------------------------------------------
 int main() {
     test_stitch_basic();
@@ -614,6 +772,13 @@ int main() {
     test_stream_session_busy_retry();
     test_stream_session_append_rejection();
     test_bounded_retry_recovery();
+    test_strict_number_parsing();
+    test_stream_window_config_error();
+    test_chunk_streamer_rejects_invalid_config();
+    test_chunk_streamer_overlap_clamped_to_half_chunk();
+    test_chunk_streamer_windows_stay_in_range();
+    test_chunk_streamer_never_transcribes_empty_window();
+    test_stream_session_rejects_invalid_window_config();
     test_model_mapping();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);

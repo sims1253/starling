@@ -45,6 +45,27 @@ std::string norm_word(const std::string& word);
 // std::nullopt if the transcriber is busy (should retry without advancing state).
 using TranscribeFn = std::function<std::optional<std::string>(const float*, int64_t)>;
 
+// ---- stream window config validation (issue #146) ---------------------------
+// Strict numeric parse for CLI flags: the whole string must be one finite
+// number. std::stod/std::stoi alone accept partial parses ("3abc" -> 3) and
+// std::stod also accepts non-finite tokens ("nan", "inf"); both must be
+// rejected before the values reach the chunker.
+std::optional<double> parse_double_strict(const std::string& text);
+std::optional<int> parse_int_strict(const std::string& text);
+
+// Validate the stream window configuration: finite values, nonnegative
+// overlap/min/partial-interval, and the window/overlap relationships (the
+// window must span at least one sample and its sample counts must fit the
+// int counters; overlap must stay below the chunk). Returns an empty string
+// when valid, otherwise a human-readable error.
+//
+// `chunk_seconds == 0` is valid ONLY at the CLI level (it selects the legacy
+// whole-buffer mode and no chunker is constructed); ChunkStreamer's
+// constructor rejects it separately because a chunker needs a real window.
+std::string stream_window_config_error(int sample_rate, double chunk_seconds,
+                                       double overlap_seconds, double min_seconds,
+                                       double partial_interval);
+
 // Outcome of appending one binary audio frame to the session
 // (StreamSession::append_pcm / append_wav). A rejection invalidates the take:
 // the session refuses further audio and the WS layer reports the failure to
@@ -62,6 +83,8 @@ enum class AppendOutcome {
 
 // ChunkStreamer: rolling fixed-window overlapping-chunk transcription state.
 // Direct port of ChunkStreamer from src/starling/stream_chunk.py.
+// Throws std::invalid_argument when the window configuration is invalid
+// (see stream_window_config_error; chunk_seconds must be positive here).
 class ChunkStreamer {
 public:
     ChunkStreamer(int sample_rate, double chunk_seconds, double overlap_seconds,

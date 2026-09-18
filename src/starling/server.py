@@ -1643,6 +1643,42 @@ def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
 # ===========================================================================
 # CLI
 # ===========================================================================
+def _finite_float(value: str) -> float:
+    """argparse type: a fully-parsed, finite float.
+
+    ``type=float`` alone accepts ``nan``/``inf`` tokens (junk like ``3abc``
+    is already rejected by ``float()``); stream window config must be finite
+    (issue #146).
+    """
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"requires a finite number, got {value!r}")
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(f"requires a finite number, got {value!r}")
+    return parsed
+
+
+def _validate_stream_args(args: argparse.Namespace) -> None:
+    """Reject invalid stream window config BEFORE the model is loaded.
+
+    The chunker derives its window geometry from these values; an
+    out-of-range value used to surface much later as a broken transcription
+    window mid-session (issue #146).  Mirrors the starling-serve CLI checks.
+    """
+    from .stream_chunk import stream_window_config_error
+
+    error = stream_window_config_error(
+        sample_rate=SAMPLE_RATE,
+        chunk_seconds=args.stream_chunk_seconds,
+        overlap_seconds=args.stream_overlap_seconds,
+        min_seconds=args.min_chunk_seconds,
+        partial_interval_seconds=args.partial_interval_seconds,
+    )
+    if error is not None:
+        raise SystemExit(f"error: {error}")
+
+
 def _build_arg_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=prog,
@@ -1664,29 +1700,29 @@ def _build_arg_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--max-chunk-seconds",
-        type=float,
+        type=_finite_float,
         default=DEFAULT_MAX_CHUNK_SECONDS,
         help=f"max audio chunk length per transcription for chunked backends, "
              f"including parakeet (default {DEFAULT_MAX_CHUNK_SECONDS}s)",
     )
     p.add_argument(
         "--min-chunk-seconds",
-        type=float,
+        type=_finite_float,
         default=DEFAULT_MIN_CHUNK_SECONDS,
         help=f"minimum buffered audio before the first WS /stream partial (default {DEFAULT_MIN_CHUNK_SECONDS}s)",
     )
     p.add_argument(
         "--partial-interval-seconds",
-        type=float,
+        type=_finite_float,
         default=DEFAULT_PARTIAL_INTERVAL_SECONDS,
         help=f"minimum wall-clock gap between WS /stream partials (default {DEFAULT_PARTIAL_INTERVAL_SECONDS}s)",
     )
     p.add_argument(
-        "--stream-chunk-seconds", type=float, default=12.0,
+        "--stream-chunk-seconds", type=_finite_float, default=12.0,
         help="fixed WS stream window in seconds; 0 restores whole-buffer mode",
     )
     p.add_argument(
-        "--stream-overlap-seconds", type=float, default=3.0,
+        "--stream-overlap-seconds", type=_finite_float, default=3.0,
         help="overlap between fixed WS stream windows (default 3)",
     )
     p.add_argument(
@@ -1769,6 +1805,9 @@ def _build_arg_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
 def run(argv: Optional[list[str]] = None, *, prog: str | None = None) -> int:
     """CLI entry point. Loads the model, builds the app, and serves forever."""
     args = _build_arg_parser(prog=prog).parse_args(argv)
+    # Reject invalid stream window config before the model is touched
+    # (issue #146).
+    _validate_stream_args(args)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

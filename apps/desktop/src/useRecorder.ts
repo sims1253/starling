@@ -23,6 +23,8 @@ export function useRecorder() {
   const timerRef = useRef<number | undefined>(undefined);
   const startingRef = useRef(false);
   const recordingRef = useRef(false);
+  // True while stop() is still releasing the audio context (#143).
+  const stoppingRef = useRef(false);
   const aliveRef = useRef(true);
   const startedAtRef = useRef(0);
   const chunksRef = useRef<Float32Array[]>([]);
@@ -68,10 +70,19 @@ export function useRecorder() {
     [session],
   );
 
+  /**
+   * Start a capture. Resolves false when the start was rejected — another
+   * start is in flight, or a preceding stop is still releasing its audio
+   * context — so the caller knows this call does not own the microphone;
+   * resolves true once it does. Setup failures still reject.
+   */
   const start = useCallback(
-    async (options?: RecorderStartOptions) => {
+    async (options?: RecorderStartOptions): Promise<boolean> => {
       // Refs, not the `recording` snapshot: guards must hold between renders.
-      if (recordingRef.current || startingRef.current) return;
+      if (recordingRef.current || startingRef.current || stoppingRef.current) {
+        return false;
+      }
+
       startingRef.current = true;
       let stream: MediaStream | undefined;
       let context: AudioContext | undefined;
@@ -110,7 +121,7 @@ export function useRecorder() {
           // capture later, so release the hardware immediately.
           await discardRecorderHandles(handles);
 
-          return;
+          return false;
         }
 
         session.install(handles);
@@ -124,6 +135,8 @@ export function useRecorder() {
           100,
         );
         drawLevels();
+
+        return true;
       } catch (error) {
         stream?.getTracks().forEach((track) => track.stop());
 
@@ -147,30 +160,39 @@ export function useRecorder() {
     const handles = session.current();
 
     if (!recordingRef.current || !handles) return;
+
     recordingRef.current = false;
-    setRecording(false);
+    stoppingRef.current = true;
 
-    handles.processor.onaudioprocess = null;
-    const durationMs = performance.now() - startedAtRef.current;
-    const chunks = chunksRef.current.splice(0);
-    const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const samples = new Float32Array(length);
-    let offset = 0;
+    try {
+      handles.processor.onaudioprocess = null;
+      const durationMs = performance.now() - startedAtRef.current;
+      const chunks = chunksRef.current.splice(0);
+      const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const samples = new Float32Array(length);
+      let offset = 0;
 
-    for (const chunk of chunks) {
-      samples.set(chunk, offset);
-      offset += chunk.length;
+      for (const chunk of chunks) {
+        samples.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      const sampleRate = handles.context.sampleRate;
+      setLevels(Array(BAR_COUNT).fill(0.06));
+      stopVisualization();
+
+      // release() detaches synchronously, so a start() racing this await keeps
+      // its own handles and remains stoppable (#119). `recording` is published
+      // and starts are re-accepted only after the release completes, so no new
+      // capture is taken against a context that is still closing (#143).
+      await session.release();
+
+      setRecording(false);
+
+      return { audio: { samples, sampleRate, channels: 1 }, durationMs };
+    } finally {
+      stoppingRef.current = false;
     }
-
-    const sampleRate = handles.context.sampleRate;
-    setLevels(Array(BAR_COUNT).fill(0.06));
-    stopVisualization();
-
-    // release() detaches synchronously, so a start() racing this await keeps
-    // its own handles and remains stoppable (#119).
-    await session.release();
-
-    return { audio: { samples, sampleRate, channels: 1 }, durationMs };
   }, [session, stopVisualization]);
 
   return { recording, elapsedMs, levels, start, stop };
