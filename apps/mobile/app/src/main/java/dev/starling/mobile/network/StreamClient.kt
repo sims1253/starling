@@ -130,7 +130,11 @@ class StreamClient(
 
         // Guarded by [lock]. `settled` is the single terminal flag: once set,
         // the outcome is fixed, late socket callbacks are ignored, and
-        // finish() returns the stored outcome.
+        // finish() returns the stored outcome. Every terminal transition
+        // goes through [settleLocked], which settles exactly once, releases
+        // all finish() waiters, cancels keepalive and pending retries,
+        // clears the backlog, and drops the owned socket — so no terminal
+        // path can leak the server connection or leave a waiter blocked.
         private var socket: WebSocket? = null
         private var connected = false
         private var closedByClient = false
@@ -142,6 +146,7 @@ class StreamClient(
         private val backlog = ArrayDeque<ByteString>()
         private var backlogBytes = 0L
         private var keepalive: ScheduledFuture<*>? = null
+        private var pendingRetry: ScheduledFuture<*>? = null
         private var finishLatch: CountDownLatch? = null
         private val settled = AtomicBoolean(false)
 
@@ -193,6 +198,7 @@ class StreamClient(
 
         override fun finish(): CommitOutcome {
             val latch = CountDownLatch(1)
+            var awaitOn: CountDownLatch? = null
             val early: CommitOutcome? = synchronized(lock) {
                 if (!settled.get()) {
                     when {
@@ -200,12 +206,15 @@ class StreamClient(
                         interruptedReason != null ->
                             settleLocked(CommitOutcome.Fallback(interruptedReason!!))
                         !connected -> {
-                            runCatching { socket?.cancel() }
                             settleLocked(CommitOutcome.Fallback("the stream connection never opened"))
                         }
                         else -> {
                             finishing = true
-                            finishLatch = latch
+                            // Concurrent finish() callers await the same
+                            // latch: overwriting it would orphan the first
+                            // waiter's latch, parking it for the whole final
+                            // timeout even after the outcome settled.
+                            awaitOn = finishLatch ?: latch.also { finishLatch = it }
                             if (!sendTextLocked(COMMIT_FRAME)) {
                                 settleLocked(
                                     CommitOutcome.Fallback("the stream connection stopped accepting the commit"),
@@ -218,7 +227,7 @@ class StreamClient(
             }
             if (early != null) return early
             val completed = try {
-                latch.await(finalTimeoutMillis, TimeUnit.MILLISECONDS)
+                (awaitOn ?: latch).await(finalTimeoutMillis, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
@@ -226,7 +235,6 @@ class StreamClient(
             if (!completed) {
                 synchronized(lock) {
                     if (!settled.get()) {
-                        runCatching { socket?.cancel() }
                         settleLocked(CommitOutcome.Fallback("the final transcript timed out"))
                     }
                 }
@@ -238,10 +246,13 @@ class StreamClient(
             synchronized(lock) {
                 if (closedByClient) return
                 closedByClient = true
-                cancelKeepaliveLocked()
-                backlog.clear()
-                backlogBytes = 0
-                runCatching { socket?.close(NORMAL_CLOSE, "recording ended") }
+                if (!settled.get()) {
+                    // A finish() blocked on the latch must be released
+                    // immediately: cancelling the socket alone only unblocks
+                    // it once the socket callbacks run, and onClosing/onClosed
+                    // route to fail(), which stays silent after this flag.
+                    settleLocked(CommitOutcome.Fallback("the stream was closed before commit"))
+                }
             }
         }
 
@@ -297,7 +308,6 @@ class StreamClient(
                 is StreamMessage.Final -> {
                     synchronized(lock) {
                         if (finishing && !settled.get()) {
-                            runCatching { socket?.close(NORMAL_CLOSE, "final received") }
                             settleLocked(CommitOutcome.Final(message.text))
                         }
                     }
@@ -350,7 +360,10 @@ class StreamClient(
          * any state: a session that already settled or was closed stays
          * silent, an interrupted session keeps its first reason, and a
          * finish() waiting for its outcome is released with Fallback
-         * immediately instead of burning the whole timeout.
+         * immediately instead of burning the whole timeout. Every failure is
+         * terminal for the socket whether a commit is pending or not, so it
+         * funnels through [settleLocked]: the server frees its session right
+         * away and nothing here can outlive the recording.
          */
         private fun fail(reason: String, bufferLimitReached: Boolean = false) {
             val notify: Boolean
@@ -361,42 +374,43 @@ class StreamClient(
                     interruptedReason = reason
                 }
                 connected = false
-                cancelKeepaliveLocked()
-                if (finishing) {
-                    settleLocked(CommitOutcome.Fallback(interruptedReason!!))
-                } else {
-                    // The socket is unusable for this session either way
-                    // (dead, or live-but-refusing after a buffer cap): drop it
-                    // so the server frees the session immediately.
-                    runCatching { socket?.cancel() }
-                }
+                settleLocked(CommitOutcome.Fallback(interruptedReason!!))
             }
             if (notify) events(StreamEvent.Interrupted(reason, bufferLimitReached))
         }
 
         /** Retries commit after the documented bounded delay on server busy. */
         private fun retryCommit() {
-            val delayMillis: Long? = synchronized(lock) {
+            var exhausted = false
+            synchronized(lock) {
                 if (!finishing || settled.get()) return
                 val index = busyRetries
                 busyRetries++
-                if (index >= busyRetryDelaysMillis.size) null else busyRetryDelaysMillis[index]
-            }
-            if (delayMillis == null) {
-                fail("the server stayed busy while finalizing the stream")
-                return
-            }
-            scheduler.schedule({
-                synchronized(lock) {
-                    if (finishing && !settled.get() && connected) {
-                        if (!sendTextLocked(COMMIT_FRAME)) {
-                            settleLocked(
-                                CommitOutcome.Fallback("the stream connection stopped accepting the commit"),
-                            )
+                if (index >= busyRetryDelaysMillis.size) {
+                    exhausted = true
+                } else {
+                    // Scheduled while holding the lock so a concurrent
+                    // settle cancels this exact future: a retry queued
+                    // outside the lock could outlive the session and send a
+                    // commit on a dropped socket.
+                    pendingRetry?.let { pending -> runCatching { pending.cancel(false) } }
+                    pendingRetry = scheduler.schedule({
+                        synchronized(lock) {
+                            pendingRetry = null
+                            if (finishing && !settled.get() && connected) {
+                                if (!sendTextLocked(COMMIT_FRAME)) {
+                                    settleLocked(
+                                        CommitOutcome.Fallback("the stream connection stopped accepting the commit"),
+                                    )
+                                }
+                            }
                         }
-                    }
+                    }, busyRetryDelaysMillis[index], TimeUnit.MILLISECONDS)
                 }
-            }, delayMillis, TimeUnit.MILLISECONDS)
+            }
+            if (exhausted) {
+                fail("the server stayed busy while finalizing the stream")
+            }
         }
 
         private fun keepaliveTick() {
@@ -430,16 +444,39 @@ class StreamClient(
             failReason?.let(::fail)
         }
 
+        /**
+         * The single terminal funnel. Exactly once (CAS): fixes the outcome,
+         * releases every finish() waiter, cancels the keepalive and any
+         * pending busy retry, clears the backlog, and drops the owned socket
+         * so no terminal path — final, fallback, close, or timeout — can leak
+         * the server connection. The socket is closed and then cancelled:
+         * a live server gets the graceful handshake if the writer can flush
+         * it, while the cancel guarantees the connection is dropped even
+         * when the peer is wedged (e.g. mid-commit) and would never ack.
+         */
         private fun settleLocked(result: CommitOutcome) {
             if (!settled.compareAndSet(false, true)) return
             outcome = result
             cancelKeepaliveLocked()
+            cancelPendingRetryLocked()
+            backlog.clear()
+            backlogBytes = 0
+            socket?.let { webSocket ->
+                runCatching { webSocket.close(NORMAL_CLOSE, "stream session settled") }
+                runCatching { webSocket.cancel() }
+            }
+            socket = null
             finishLatch?.countDown()
         }
 
         private fun cancelKeepaliveLocked() {
             keepalive?.let { future -> runCatching { future.cancel(false) } }
             keepalive = null
+        }
+
+        private fun cancelPendingRetryLocked() {
+            pendingRetry?.let { future -> runCatching { future.cancel(false) } }
+            pendingRetry = null
         }
     }
 

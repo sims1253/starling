@@ -118,6 +118,11 @@ class TranscriptionCoordinator(
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
+                // Safeguard: the session this worker was handed must never
+                // outlive it, whatever finish() returned — close() settles
+                // and drops the socket, and is a no-op when the client
+                // already cleaned up on its own.
+                session.close()
             }
         }
         return true
