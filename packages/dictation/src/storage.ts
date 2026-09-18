@@ -538,24 +538,24 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
 
     if (options?.streamed === true) update.streamed = true;
 
-    const saved = await this.update(id, (current) => updatedSession(current, update));
-
-    this.transcribing.delete(id);
-
-    return saved;
+    try {
+      return await this.update(id, (current) => updatedSession(current, update));
+    } finally {
+      this.transcribing.delete(id);
+    }
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
-    const saved = await this.update(id, (current) =>
-      updatedSession(current, {
-        status: "failed",
-        lastError: errorText(cause),
-      }),
-    );
-
-    this.transcribing.delete(id);
-
-    return saved;
+    try {
+      return await this.update(id, (current) =>
+        updatedSession(current, {
+          status: "failed",
+          lastError: errorText(cause),
+        }),
+      );
+    } finally {
+      this.transcribing.delete(id);
+    }
   }
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
@@ -1153,24 +1153,27 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
 
     if (options?.streamed === true) update.streamed = true;
 
-    const saved = await this.update(id, (current) => updatedSession(current, update));
-
-    this.releaseAttemptSignal(id);
-
-    return saved;
+    try {
+      return await this.update(id, (current) => updatedSession(current, update));
+    } finally {
+      // The settling write can reject (quota, abort, session deleted from
+      // another window): the attempt signal must not outlive its attempt,
+      // or every other window's liveness probe reports true forever.
+      this.releaseAttemptSignal(id);
+    }
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
-    const saved = await this.update(id, (current) =>
-      updatedSession(current, {
-        status: "failed",
-        lastError: errorText(cause),
-      }),
-    );
-
-    this.releaseAttemptSignal(id);
-
-    return saved;
+    try {
+      return await this.update(id, (current) =>
+        updatedSession(current, {
+          status: "failed",
+          lastError: errorText(cause),
+        }),
+      );
+    } finally {
+      this.releaseAttemptSignal(id);
+    }
   }
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
@@ -1312,6 +1315,11 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
     // From every other window's point of view this owner just terminated:
     // its claims end here, so abandoned journals become recoverable. Map
     // iteration tolerates the deletions these releases make.
+    //
+    // Precondition: captures have been finished or abandoned and attempts
+    // have settled (saveTranscript/saveFailure/delete) before close() —
+    // closing with work still in flight strands that work's journal and
+    // leaves its chunks orphaned for every future sweep.
     for (const capture of this.openCaptures.values()) {
       capture.orphan();
     }

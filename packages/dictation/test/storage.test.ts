@@ -834,6 +834,10 @@ describe("cross-window capture ownership", () => {
     // The owning window goes away; its lock and registry claims end with it.
     owner.close();
 
+    // A real window's lock release settles asynchronously with its close;
+    // give the claim a tick to end before judging the journal abandoned.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
     const second = new IndexedDbSessionStore(options);
     const recovered = await second.recoverStreamCaptures();
 
@@ -1013,6 +1017,34 @@ describe("cross-window capture ownership", () => {
     );
 
     assert.equal((await second.get("late-attempt"))?.status, "failed");
+    second.close();
+  });
+
+  it("releases the attempt signal when the settling write fails", async () => {
+    const factory = new IDBFactory();
+    const webLocks = new MemoryWebLocks();
+    const options = { databaseName: "ownership-failed-save", indexedDB: factory, webLocks };
+    const owner = new IndexedDbSessionStore(options);
+
+    await owner.create({ id: "doomed", wav });
+    await owner.markAttempt("doomed");
+
+    assert.equal(await owner.transcriptionInFlight("doomed"), true);
+
+    // The session disappears from another window (or the settling write
+    // aborts): the attempt signal must still be released, or every other
+    // window's liveness probe reports true forever.
+    const second = new IndexedDbSessionStore(options);
+    await second.delete("doomed");
+
+    await assert.rejects(owner.saveTranscript("doomed", { text: "never lands", segments: [] }));
+
+    assert.equal(await owner.transcriptionInFlight("doomed"), false);
+
+    await assert.rejects(owner.saveFailure("doomed", "also never lands"));
+
+    assert.equal(await owner.transcriptionInFlight("doomed"), false);
+    owner.close();
     second.close();
   });
 });
