@@ -51,12 +51,20 @@ export interface SaveTranscriptOptions {
 export interface InvalidStoredSession {
   /** Best-effort id taken from the raw record; "(unknown id)" when absent. */
   readonly id: string;
+  /**
+   * The record's raw IndexedDB key, captured when the listing reads it. The
+   * reported id is best-effort — an "(unknown id)" entry's key can be
+   * non-string (a number) or empty under `keyPath: "id"` — so dismissal
+   * deletes by this key, never by the id. Absent for listings that never
+   * read keys (the memory store never quarantines, so it never sets one).
+   */
+  readonly key?: IDBValidKey | undefined;
   /** Why the record failed schema validation. */
   readonly cause: unknown;
   /**
    * The raw IndexedDB record, retained untouched in the database. Damaged
-   * entries are quarantined out of the listing — never deleted — so
-   * recoverable audio stays exportable.
+   * entries are quarantined out of the listing — never silently deleted — so
+   * recoverable audio stays exportable until explicitly dismissed.
    */
   readonly record: unknown;
 }
@@ -101,6 +109,16 @@ export interface DictationSessionStore {
    */
   transcriptionInFlight(id: string): Promise<boolean>;
   delete(id: string): Promise<void>;
+  /**
+   * Dismiss one quarantined history entry by its raw record key, as reported
+   * on `InvalidStoredSession.key`. The record is re-read and re-validated in
+   * the same transaction as the delete: an entry another window repaired
+   * since the listing is kept, since the damaged record the user saw is no
+   * longer what the key holds (#155). Resolves when the key holds nothing,
+   * a healthy record, or a repaired entry — dismissal is best-effort, never
+   * an error. Healthy sessions are outside this method's reach; use delete().
+   */
+  deleteInvalid(key: IDBValidKey): Promise<void>;
 }
 
 export interface DictationSessionManifest {
@@ -591,6 +609,15 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
     this.transcribing.delete(id);
   }
 
+  /**
+   * The memory store writes through the schema, so no record can be damaged:
+   * there is nothing quarantined to dismiss. Kept on the interface so the
+   * banner dismisses entries without knowing which store backs it.
+   */
+  async deleteInvalid(_key: IDBValidKey): Promise<void> {
+    return undefined;
+  }
+
   async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
     return new MemoryStreamCapture(this, streamCaptureId(input));
   }
@@ -717,21 +744,41 @@ const decodeSession = Schema.decodeUnknownSync(DictationSessionSchema);
 const decodeSessionId = Schema.decodeUnknownOption(Schema.Struct({ id: Schema.NonEmptyString }));
 
 /**
+ * Mutable draft of a quarantine entry: `key` is attached after the best-effort
+ * id is known, only when the listing read the record's raw IndexedDB key.
+ */
+interface InvalidSessionDraft {
+  id: string;
+  key?: IDBValidKey | undefined;
+  cause: DictationStorageError;
+  record: unknown;
+}
+
+/**
  * Validate one stored record without touching the database: damaged entries
  * are reported with their raw record so recoverable audio stays exportable.
+ * Callers that read the record's key pass it in, so dismissal can delete by
+ * the raw key even when the reported id is best-effort ("(unknown id)").
  */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- A raw IndexedDB row is unknown by definition; this function is the boundary that parses it.
-function isolateStoredSession(record: unknown): DictationSession | InvalidStoredSession {
+// A raw IndexedDB row is unknown by definition; this function is the boundary that parses it.
+function isolateStoredSession(
+  record: unknown, // oxlint-disable-line anti-slop/no-unknown-parameters -- see above
+  key?: IDBValidKey,
+): DictationSession | InvalidStoredSession {
   try {
     return freezeSession(decodeSession(record));
   } catch (cause) {
     const decodedId = decodeSessionId(record);
 
-    return Object.freeze({
+    const isolated: InvalidSessionDraft = {
       id: Option.isSome(decodedId) ? decodedId.value.id : "(unknown id)",
       cause: invalidStoredSession(cause),
       record,
-    });
+    };
+
+    if (key !== undefined) isolated.key = key;
+
+    return Object.freeze(isolated);
   }
 }
 
@@ -1222,42 +1269,53 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   /**
-   * Decode records one at a time: a single damaged or incompatible entry is
-   * quarantined into `invalid` instead of rejecting the whole listing, so
-   * healthy history stays visible and recoverable audio is never deleted.
+   * Decode records one at a time with a key cursor: a single damaged or
+   * incompatible entry is quarantined into `invalid` instead of rejecting the
+   * whole listing, so healthy history stays visible and recoverable audio is
+   * never deleted. The cursor (not getAll) hands over each record's raw key,
+   * which quarantine entries carry for later dismissal (#155).
    */
   async listReport(): Promise<DictationHistory> {
     const database = await this.database();
 
     return new Promise((resolve, reject) => {
       const transaction = database.transaction(OBJECT_STORE, "readonly");
-      const request = transaction.objectStore(OBJECT_STORE).getAll();
+      const sessions: DictationSession[] = [];
+      const invalid: InvalidStoredSession[] = [];
+      const cursorRequest = transaction.objectStore(OBJECT_STORE).openCursor();
 
-      request.onsuccess = () => {
+      cursorRequest.onsuccess = () => {
         try {
-          const sessions: DictationSession[] = [];
-          const invalid: InvalidStoredSession[] = [];
+          const cursor = cursorRequest.result;
 
-          for (const record of request.result) {
-            const isolated = isolateStoredSession(record);
+          if (!cursor) {
+            sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+            resolve(
+              Object.freeze({
+                sessions: Object.freeze(sessions),
+                invalid: Object.freeze(invalid),
+              }),
+            );
 
-            if ("record" in isolated) invalid.push(isolated);
-            else sessions.push(isolated);
+            return;
           }
 
-          sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+          const isolated = isolateStoredSession(cursor.value, cursor.primaryKey);
 
-          resolve(
-            Object.freeze({ sessions: Object.freeze(sessions), invalid: Object.freeze(invalid) }),
-          );
+          if ("record" in isolated) invalid.push(isolated);
+          else sessions.push(isolated);
+
+          cursor.continue();
         } catch (cause) {
           reject(new DictationStorageError("failed to list dictation sessions", { cause }));
         }
       };
 
-      request.onerror = () =>
+      cursorRequest.onerror = () =>
         reject(
-          new DictationStorageError("failed to list dictation sessions", { cause: request.error }),
+          new DictationStorageError("failed to list dictation sessions", {
+            cause: cursorRequest.error,
+          }),
         );
       transaction.onabort = () =>
         reject(
@@ -1386,6 +1444,62 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
         );
     });
     this.releaseAttemptSignals(id);
+  }
+
+  /**
+   * One quarantined-entry dismissal: re-read the key in a write transaction
+   * and delete only when the record still fails validation, so the check and
+   * the delete cannot race a concurrent repair (#155).
+   */
+  async deleteInvalid(key: IDBValidKey): Promise<void> {
+    const database = await this.database();
+
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction(OBJECT_STORE, "readwrite");
+      const store = transaction.objectStore(OBJECT_STORE);
+      const request = store.get(key);
+
+      request.onsuccess = () => {
+        try {
+          // Nothing there, or a repaired entry another window restored since
+          // the listing: the damaged record the user saw is already gone, so
+          // dismissal succeeds without deleting.
+          if (request.result === undefined) return;
+
+          if ("record" in isolateStoredSession(request.result)) store.delete(key);
+        } catch (cause) {
+          transaction.abort();
+          reject(
+            new DictationStorageError("failed to dismiss a damaged dictation session", { cause }),
+          );
+        }
+      };
+
+      request.onerror = () =>
+        reject(
+          new DictationStorageError("failed to dismiss a damaged dictation session", {
+            cause: request.error,
+          }),
+        );
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () =>
+        reject(
+          new DictationStorageError("failed to dismiss a damaged dictation session", {
+            cause: transaction.error,
+          }),
+        );
+      // Reject unconditionally: a double settle after the catch's own reject
+      // is a harmless no-op, and a guarded reject here could leave the
+      // promise pending forever when the transaction aborts after an empty
+      // read — the sibling delete() relies on the same idiom.
+      transaction.onabort = () =>
+        reject(
+          new DictationStorageError("damaged dictation session dismissal was aborted", {
+            cause: transaction.error,
+          }),
+        );
+    });
   }
 
   async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
