@@ -1138,10 +1138,11 @@ def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:
     if len(data) == 0:
         return np.zeros(0, dtype=np.float32)
     if len(data) % 2 == 1:
-        # Odd byte count can't be whole int16 samples; drop the trailing byte
-        # rather than silently misaligning the whole stream.
-        log.warning("dropping odd trailing PCM byte (len=%d)", len(data))
-        data = data[:-1]
+        # Raw PCM frames are sequences of whole int16 samples: an odd byte
+        # count means a sample was split mid-frame at a transport boundary.
+        # Refuse loudly instead of silently misaligning the stream; callers
+        # (StreamSession.append_pcm) invalidate the take (issue #173).
+        raise ValueError(f"odd PCM16 byte count cannot be whole int16 samples: {len(data)}")
     return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
 
@@ -1161,6 +1162,27 @@ def _resample_audio(samples: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Streaming session (WS /stream)
 # ---------------------------------------------------------------------------
+class AppendOutcome(str, Enum):
+    """Outcome of appending one binary audio frame to a ``StreamSession``.
+
+    Mirrors ``AppendOutcome`` in ``cpp/serve/stream_session.hpp`` (issue #145
+    there, issue #173 here). A rejection invalidates the take: the session
+    refuses further audio until ``reset()`` and the WS layer reports the
+    failure as a structured error frame instead of committing an incomplete
+    capture as an ordinary successful final. ``reset()`` clears the
+    invalidation and re-arms audio acceptance.
+
+    Divergence from the native enum: there is no ``RateMismatch`` here. The
+    Python server resamples non-16 kHz WAVs via scipy (the native server has
+    no resampler, so it rejects them); see docs/python-serving.md.
+    """
+
+    ACCEPTED = "accepted"            # audio appended (empty frames are no-ops)
+    MALFORMED_WAV = "malformed_wav"  # RIFF/WAVE frame the WAV decoder rejects
+    ODD_PCM_LENGTH = "odd_pcm_length"  # raw PCM16 with an odd byte count
+    TAKE_INVALID = "take_invalid"    # refused: the take was already invalidated
+
+
 @dataclass
 class StreamSession:
     """Per-connection rolling audio buffer + streaming state.
@@ -1182,6 +1204,15 @@ class StreamSession:
     # (should_emit_partial, stream_step) keep using the live buffer only via
     # ``live_seconds`` / ``buffered_seconds`` so chunker behaviour is unchanged.
     trimmed_samples: int = 0
+    # Set when an append rejection (malformed WAV / odd PCM length) invalidated
+    # the current take (issue #173). While set, appends are refused
+    # (TAKE_INVALID) and commit must not emit an ordinary successful final --
+    # the buffered audio is incomplete, so the client must reset() and fall
+    # back to its authoritative local recording. reset() clears it.
+    take_invalid: bool = False
+    # Machine-readable code for the rejection that invalidated the take
+    # ("malformed_wav", "odd_pcm_length"). Empty unless take_invalid.
+    invalid_reason: str = ""
 
     def __post_init__(self) -> None:
         cfg = self.server.config
@@ -1246,31 +1277,56 @@ class StreamSession:
         self.trimmed_samples += b
         chunker.boundary = 0
 
-    def append_pcm(self, pcm16_bytes: bytes) -> None:
+    def append_pcm(self, pcm16_bytes: bytes) -> AppendOutcome:
+        if self.take_invalid:
+            return AppendOutcome.TAKE_INVALID  # rejected take: refuse until reset()
+        if not pcm16_bytes:
+            return AppendOutcome.ACCEPTED
+        # Raw PCM is a sequence of whole int16 samples: an odd byte count
+        # means a sample was split mid-frame at a transport boundary. The old
+        # code silently dropped the dangling byte, hiding a misaligned client
+        # from itself; reject the frame and invalidate the take instead
+        # (issue #173, mirroring the native OddPcmLength policy).
+        if len(pcm16_bytes) % 2 == 1:
+            log.warning("rejecting odd-length PCM chunk (len=%d)", len(pcm16_bytes))
+            self.take_invalid = True
+            self.invalid_reason = AppendOutcome.ODD_PCM_LENGTH.value
+            return AppendOutcome.ODD_PCM_LENGTH
         s = _pcm16_bytes_to_float32(pcm16_bytes)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
         self._maybe_trim_samples()
+        return AppendOutcome.ACCEPTED
 
-    def append_wav(self, wav_bytes: bytes) -> None:
+    def append_wav(self, wav_bytes: bytes) -> AppendOutcome:
+        if self.take_invalid:
+            return AppendOutcome.TAKE_INVALID  # rejected take: refuse until reset()
         # Only treat as WAV if it has a RIFF/WAVE header; otherwise it's raw PCM16.
         if wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
-            self.append_pcm(wav_bytes)
-            return
+            return self.append_pcm(wav_bytes)
         try:
             s, sr = _wav_bytes_to_float32(wav_bytes)
         except (ValueError, wave.Error):
             # Malformed WAV despite the header -- don't silently reinterpret as
-            # PCM16 (that decodes header bytes as audio samples -> garbage).
-            # Drop just this chunk, but log it so each dropped chunk is recorded
-            # (matches the odd-PCM-byte handling in _pcm16_bytes_to_float32).
-            log.warning("dropping malformed WAV chunk (len=%d)", len(wav_bytes))
-            return
+            # PCM16 (that decodes header bytes as audio samples -> garbage) and
+            # don't just drop the chunk either: the client would never learn
+            # its audio went missing. Invalidate the take so the WS layer can
+            # report it and refuse an incomplete commit (issue #173, mirroring
+            # the native MalformedWav policy).
+            log.warning("rejecting malformed WAV chunk (len=%d)", len(wav_bytes))
+            self.take_invalid = True
+            self.invalid_reason = AppendOutcome.MALFORMED_WAV.value
+            return AppendOutcome.MALFORMED_WAV
+        # Divergence from the native server (which rejects with RateMismatch):
+        # scipy is available here, so non-16 kHz WAVs are resampled to 16 kHz
+        # and accepted. Deliberate, documented feature difference -- see
+        # docs/python-serving.md.
         if sr != SAMPLE_RATE:
             s = _resample_audio(s, sr, SAMPLE_RATE)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
         self._maybe_trim_samples()
+        return AppendOutcome.ACCEPTED
 
     @property
     def buffered_seconds(self) -> float:
@@ -1299,12 +1355,34 @@ class StreamSession:
         self.samples = np.zeros(0, dtype=np.float32)
         self.last_partial_ts = 0.0
         self.trimmed_samples = 0
+        self.take_invalid = False
+        self.invalid_reason = ""
         if self.chunker is not None:
             self.chunker.reset()
 
     def transcribe_current_sync(self) -> TranscribeResult:
         snapshot = self.samples.copy()
         return self.server._run_queued_sync(snapshot, None)
+
+
+def _ws_append_error(outcome: AppendOutcome, session: StreamSession) -> str:
+    """Describe a refused binary audio frame as a WS error-frame message.
+
+    Message-for-message port of ``ws_append_error`` in ``cpp/serve/main.cpp``
+    (minus Overflowed/RateMismatch, which have no Python counterpart -- the
+    Python server has no per-connection buffer cap and resamples non-16 kHz
+    WAVs instead of rejecting them).
+    """
+    if outcome is AppendOutcome.MALFORMED_WAV:
+        return "malformed WAV frame rejected; audio ignored until reset"
+    if outcome is AppendOutcome.ODD_PCM_LENGTH:
+        return "odd-length PCM frame rejected (split sample); audio ignored until reset"
+    if outcome is AppendOutcome.TAKE_INVALID:
+        # Only reached on a frame AFTER the invalidating one (whose own
+        # outcome carried the reason); repeat that reason, not a generic.
+        # invalid_reason is an internal [a-z_] code: safe to embed raw.
+        return f"take invalidated ({session.invalid_reason}); audio ignored until reset"
+    return "audio frame rejected; audio ignored until reset"
 
 
 # ===========================================================================
@@ -1439,6 +1517,10 @@ def create_app(
     async def _stream(ws):  # noqa: ANN001
         await ws.accept()
         sess = StreamSession(server=server)
+        # Sent once when a binary frame is refused (malformed WAV, odd PCM
+        # length); re-armed on reset so a fresh dictation gets a fresh error
+        # if it is refused. Mirrors reject_error_sent in cpp/serve/main.cpp.
+        reject_error_sent = False
         log.info("WS /stream client connected")
         try:
             while True:
@@ -1457,6 +1539,25 @@ def create_app(
                         continue
                     mtype = cmd.get("type")
                     if mtype == "commit":
+                        # An invalidated take (a rejected binary frame) holds
+                        # incomplete audio: committing it as an ordinary
+                        # successful final would silently miss speech, so the
+                        # commit is refused and the client falls back to its
+                        # authoritative local recording after a reset
+                        # (issue #173). The busy-retry path below is untouched:
+                        # it retains VALID audio, while this path refuses
+                        # INVALID audio.
+                        if sess.take_invalid:
+                            await ws.send_json(
+                                {
+                                    "type": "error",
+                                    "message": (
+                                        f"take invalidated ({sess.invalid_reason});"
+                                        " reset and resend"
+                                    ),
+                                }
+                            )
+                            continue
                         if sess.buffered_seconds > 0.0:
                             await asyncio.to_thread(server._ensure_loaded)
                             try:
@@ -1487,12 +1588,16 @@ def create_app(
                             }
                         )
                         sess.reset()
+                        # reset() re-enables audio; re-arm the one-shot error
+                        # frame with it.
+                        reject_error_sent = False
                         continue
                     elif mtype == "ping":
                         await ws.send_json({"type": "pong"})
                         continue
                     elif mtype == "reset":
                         sess.reset()
+                        reject_error_sent = False
                         await ws.send_json({"type": "reset_ack"})
                         continue
                     else:
@@ -1502,8 +1607,18 @@ def create_app(
                 bdata = msg.get("bytes")
                 if not bdata:
                     continue
-                # append_wav itself sniffs RIFF/WAVE vs raw PCM16.
-                sess.append_wav(bdata)
+                # append_wav itself sniffs RIFF/WAVE vs raw PCM16. A refused
+                # frame is reported once as an error frame, and the session
+                # stops accepting audio until it is reset (issue #173,
+                # mirroring the native frame-validity policy).
+                outcome = sess.append_wav(bdata)
+                if outcome is not AppendOutcome.ACCEPTED:
+                    if not reject_error_sent:
+                        reject_error_sent = True
+                        await ws.send_json(
+                            {"type": "error", "message": _ws_append_error(outcome, sess)}
+                        )
+                    continue
 
                 await asyncio.to_thread(server._ensure_loaded)
                 now = time.monotonic()

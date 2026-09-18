@@ -33,11 +33,13 @@ if os.path.isdir(_SRC) and _SRC not in sys.path:
 from starling.server import (  # noqa: E402
     SAMPLE_RATE,
     STREAM_TRIM_MIN_SAMPLES,
+    AppendOutcome,
     ServerConfig,
     StarlingServer,
     StreamSession,
     TranscribeResult,
     _extract_multipart_payload,
+    _pcm16_bytes_to_float32,
     _transcribe_payload_sync,
     _wav_bytes_to_float32,
 )
@@ -450,6 +452,91 @@ def test_stream_session_does_not_trim_when_boundary_equals_buffer() -> None:
 
     assert chunker.boundary == n
     assert len(sess.samples) == n  # full buffer retained
+
+
+# ---------------------------------------------------------------------------
+# D2. invalid binary frames invalidate the take (issue #173)
+# Mirrors test_stream_session_rejects_invalid_audio in
+# cpp/tests/stream_session_test.cpp (the native half of the policy).
+# ---------------------------------------------------------------------------
+def _bare_session() -> StreamSession:
+    """A StreamSession without a chunker (legacy whole-buffer mode)."""
+    return StreamSession(server=StarlingServer(
+        config=ServerConfig(stream_chunk_seconds=0.0)))
+
+
+def test_stream_session_rejects_malformed_wav_and_invalidates_take() -> None:
+    sess = _bare_session()
+    malformed = b"RIFF\x00\x00\x00\x00WAVEjunk"  # RIFF/WAVE magic, no fmt chunk
+
+    assert sess.append_wav(malformed) is AppendOutcome.MALFORMED_WAV
+    assert sess.take_invalid
+    assert sess.invalid_reason == "malformed_wav"
+    assert sess.buffered_seconds == 0.0  # nothing appended
+
+    # Further audio of any kind is refused with TakeInvalid until reset().
+    assert sess.append_pcm(_pcm_chunk(1600)) is AppendOutcome.TAKE_INVALID
+    assert sess.append_wav(malformed) is AppendOutcome.TAKE_INVALID
+    assert sess.buffered_seconds == 0.0
+
+    sess.reset()
+    assert not sess.take_invalid
+    assert sess.invalid_reason == ""
+    assert sess.append_pcm(_pcm_chunk(1600)) is AppendOutcome.ACCEPTED
+    assert sess.buffered_seconds == pytest.approx(0.1)
+
+
+def test_stream_session_rejects_odd_pcm_length() -> None:
+    sess = _bare_session()
+    odd = _pcm_chunk(800) + b"\x7f"  # whole samples plus one dangling byte
+
+    assert sess.append_pcm(odd) is AppendOutcome.ODD_PCM_LENGTH
+    assert sess.take_invalid
+    assert sess.invalid_reason == "odd_pcm_length"
+    assert sess.buffered_seconds == 0.0  # the whole frame is refused
+
+    # Even-length (including empty) frames keep their old acceptance.
+    sess.reset()
+    assert sess.append_pcm(b"") is AppendOutcome.ACCEPTED
+    assert not sess.take_invalid
+    assert sess.append_pcm(_pcm_chunk(1600)) is AppendOutcome.ACCEPTED
+    assert sess.buffered_seconds == pytest.approx(0.1)
+
+
+def test_stream_session_valid_invalid_valid_retains_pre_rejection_audio() -> None:
+    """Audio appended before the rejection is retained; audio after it is
+    refused (the issue's regression sequence)."""
+    sess = _bare_session()
+    assert sess.append_pcm(_pcm_chunk(SAMPLE_RATE // 2)) is AppendOutcome.ACCEPTED
+
+    assert sess.append_wav(b"RIFF\x00\x00\x00\x00WAVEjunk") is AppendOutcome.MALFORMED_WAV
+    assert sess.invalid_reason == "malformed_wav"
+
+    assert sess.append_pcm(_pcm_chunk(SAMPLE_RATE)) is AppendOutcome.TAKE_INVALID
+    assert sess.buffered_seconds == pytest.approx(0.5)  # only pre-rejection audio
+
+    sess.reset()
+    assert sess.append_pcm(_pcm_chunk(SAMPLE_RATE // 2)) is AppendOutcome.ACCEPTED
+    assert sess.buffered_seconds == pytest.approx(0.5)
+
+
+def test_stream_session_resamples_non_16k_wav() -> None:
+    """Deliberate divergence from the native server (which rejects with
+    RateMismatch): scipy is available here, so a non-16 kHz WAV is resampled
+    to 16 kHz and accepted (documented in docs/python-serving.md)."""
+    sess = _bare_session()
+    wav8k = _wav_bytes(np.zeros(4000, dtype=np.float32), framerate=8000)  # 0.5 s @ 8 kHz
+
+    assert sess.append_wav(wav8k) is AppendOutcome.ACCEPTED
+    assert not sess.take_invalid
+    assert sess.buffered_seconds == pytest.approx(0.5, abs=1e-6)
+
+
+def test_pcm16_bytes_to_float32_refuses_odd_byte_count() -> None:
+    """The converter is strict: an odd byte count raises instead of silently
+    dropping the dangling byte (the drop now lives in the refusal policy)."""
+    with pytest.raises(ValueError, match="odd PCM16 byte count"):
+        _pcm16_bytes_to_float32(b"\x00\x00\x00")
 
 
 # ---------------------------------------------------------------------------
