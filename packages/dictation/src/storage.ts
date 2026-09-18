@@ -634,8 +634,9 @@ export interface IndexedDbSessionStoreOptions {
   readonly indexedDB?: IDBFactory | undefined;
   /**
    * Cross-tab ownership signal for streaming captures and transcription
-   * attempts. Defaults to `navigator.locks` when the host provides it;
-   * pass an explicit `undefined` to force the unlocked fallback.
+   * attempts. Defaults to `navigator.locks` when the host provides it.
+   * Passing the property with the value `undefined` (as opposed to omitting
+   * it) forces the unlocked fallback even in a Web-Locks-capable host.
    */
   readonly webLocks?: WebLocksLike | undefined;
 }
@@ -1026,7 +1027,10 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   constructor(options: IndexedDbSessionStoreOptions = {}) {
     this.databaseName = options.databaseName ?? "starling-dictation";
     this.factory = options.indexedDB ?? globalThis.indexedDB;
-    this.locks = options.webLocks ?? navigatorLocks();
+    // Property presence, not nullish coalescing: an explicitly supplied
+    // `webLocks: undefined` means "run unlocked" even where the host has
+    // navigator.locks, while an omitted property takes the host default.
+    this.locks = "webLocks" in options ? options.webLocks : navigatorLocks();
     this.ownerId = sessionId();
   }
 

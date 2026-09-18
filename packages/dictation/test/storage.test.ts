@@ -754,6 +754,66 @@ class MemoryWebLocks implements WebLocksLike {
 }
 
 describe("cross-window capture ownership", () => {
+  it("treats an explicit webLocks: undefined as the forced fallback, not an omitted option", async () => {
+    const factory = new IDBFactory();
+    const requested: string[] = [];
+    const inner = new MemoryWebLocks();
+
+    const hostLocks: WebLocksLike = {
+      request: (name, options, granted) => {
+        requested.push(name);
+
+        return inner.request(name, options, granted);
+      },
+    };
+
+    const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+
+    Object.defineProperty(globalThis, "navigator", {
+      value: { locks: hostLocks },
+      configurable: true,
+    });
+
+    try {
+      // Omitted property: the host's lock manager is used.
+      const defaulted = new IndexedDbSessionStore({
+        databaseName: "host-locks",
+        indexedDB: factory,
+      });
+      const withHost = await defaulted.beginStreamCapture({ id: "host-owned" });
+
+      await withHost.abandon();
+      defaulted.close();
+
+      assert.equal(requested.length > 0, true);
+
+      // Explicitly undefined: the unlocked fallback runs even though the
+      // host provides navigator.locks — the host manager stays untouched.
+      requested.length = 0;
+
+      const forced = new IndexedDbSessionStore({
+        databaseName: "forced-fallback",
+        indexedDB: factory,
+        webLocks: undefined,
+      });
+
+      const unlocked = await forced.beginStreamCapture({ id: "unlocked-owned" });
+
+      await unlocked.abandon();
+      forced.close();
+
+      assert.deepEqual(requested, []);
+    } finally {
+      if (navigatorDescriptor) {
+        Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+      } else {
+        // SAFETY: the descriptor was absent, so this environment had no
+        // navigator to begin with — removing the stub restores that.
+        delete (globalThis as { navigator?: unknown }).navigator;
+      }
+    }
+  });
+
   it("does not consume a journal another window is still recording into", async () => {
     const factory = new IDBFactory();
     const webLocks = new MemoryWebLocks();
