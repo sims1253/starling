@@ -48,10 +48,38 @@ export interface SaveTranscriptOptions {
   readonly streamed?: boolean;
 }
 
+export interface InvalidStoredSession {
+  /** Best-effort id taken from the raw record; "(unknown id)" when absent. */
+  readonly id: string;
+  /** Why the record failed schema validation. */
+  readonly cause: unknown;
+  /**
+   * The raw IndexedDB record, retained untouched in the database. Damaged
+   * entries are quarantined out of the listing — never deleted — so
+   * recoverable audio stays exportable.
+   */
+  readonly record: unknown;
+}
+
+export interface DictationHistory {
+  readonly sessions: readonly DictationSession[];
+  readonly invalid: readonly InvalidStoredSession[];
+}
+
 export interface DictationSessionStore {
   create(input: CreateSessionInput): Promise<DictationSession>;
   get(id: string): Promise<DictationSession | undefined>;
+  /**
+   * Healthy sessions, newest first. Records that fail validation are
+   * skipped — never deleted — and reported via `listReport()`.
+   */
   list(): Promise<readonly DictationSession[]>;
+  /**
+   * `list()` plus per-record diagnostics for entries that failed
+   * validation. The raw records stay in the database, so a single damaged
+   * entry can neither hide healthy history nor block journal recovery.
+   */
+  listReport(): Promise<DictationHistory>;
   markAttempt(id: string): Promise<DictationSession>;
   saveTranscript(
     id: string,
@@ -285,6 +313,22 @@ export function exportDictationSession(session: DictationSession): DictationSess
   return Object.freeze({ manifest: Object.freeze(manifest), wav: session.wav });
 }
 
+const decodeRescuedWavRecord = Schema.decodeUnknownOption(
+  Schema.Struct({ wav: Schema.instanceOf(Blob) }),
+);
+
+/**
+ * Best-effort audio rescue for a quarantined history entry: the raw record
+ * is untouched by `listReport()`, so a damaged entry whose `wav` is still a
+ * non-empty Blob can be downloaded before the user deletes it. Returns
+ * undefined when no usable audio survives.
+ */
+export function invalidSessionWav(entry: InvalidStoredSession): Blob | undefined {
+  const decoded = decodeRescuedWavRecord(entry.record);
+
+  return Option.isSome(decoded) && decoded.value.wav.size > 0 ? decoded.value.wav : undefined;
+}
+
 export interface CreateStreamCaptureInput {
   readonly id?: string | undefined;
   readonly createdAt?: string | undefined;
@@ -429,6 +473,10 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
     );
   }
 
+  async listReport(): Promise<DictationHistory> {
+    return Object.freeze({ sessions: await this.list(), invalid: Object.freeze([]) });
+  }
+
   async markAttempt(id: string): Promise<DictationSession> {
     return this.update(id, (current) =>
       updatedSession(current, {
@@ -518,7 +566,26 @@ interface StreamChunkRecord {
 
 const decodeSession = Schema.decodeUnknownSync(DictationSessionSchema);
 
-const decodeSessions = Schema.decodeUnknownSync(Schema.Array(DictationSessionSchema));
+const decodeSessionId = Schema.decodeUnknownOption(Schema.Struct({ id: Schema.NonEmptyString }));
+
+/**
+ * Validate one stored record without touching the database: damaged entries
+ * are reported with their raw record so recoverable audio stays exportable.
+ */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- A raw IndexedDB row is unknown by definition; this function is the boundary that parses it.
+function isolateStoredSession(record: unknown): DictationSession | InvalidStoredSession {
+  try {
+    return freezeSession(decodeSession(record));
+  } catch (cause) {
+    const decodedId = decodeSessionId(record);
+
+    return Object.freeze({
+      id: Option.isSome(decodedId) ? decodedId.value.id : "(unknown id)",
+      cause: invalidStoredSession(cause),
+      record,
+    });
+  }
+}
 
 function invalidStoredSession<Cause>(cause: Cause): DictationStorageError {
   return new DictationStorageError("stored dictation session is invalid", { cause });
@@ -793,6 +860,15 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   async list(): Promise<readonly DictationSession[]> {
+    return (await this.listReport()).sessions;
+  }
+
+  /**
+   * Decode records one at a time: a single damaged or incompatible entry is
+   * quarantined into `invalid` instead of rejecting the whole listing, so
+   * healthy history stays visible and recoverable audio is never deleted.
+   */
+  async listReport(): Promise<DictationHistory> {
     const database = await this.database();
 
     return new Promise((resolve, reject) => {
@@ -801,13 +877,23 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
 
       request.onsuccess = () => {
         try {
-          const sessions = decodeSessions(request.result)
-            .map(freezeSession)
-            .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+          const sessions: DictationSession[] = [];
+          const invalid: InvalidStoredSession[] = [];
 
-          resolve(Object.freeze(sessions));
+          for (const record of request.result) {
+            const isolated = isolateStoredSession(record);
+
+            if ("record" in isolated) invalid.push(isolated);
+            else sessions.push(isolated);
+          }
+
+          sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+          resolve(
+            Object.freeze({ sessions: Object.freeze(sessions), invalid: Object.freeze(invalid) }),
+          );
         } catch (cause) {
-          reject(invalidStoredSession(cause));
+          reject(new DictationStorageError("failed to list dictation sessions", { cause }));
         }
       };
 

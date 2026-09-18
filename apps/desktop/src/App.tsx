@@ -4,10 +4,12 @@ import {
   analyzeTranscript,
   encodePcm16kMono,
   IndexedDbSessionStore,
+  invalidSessionWav,
   prepareWav16k,
   StarlingClient,
   StarlingStream,
   type DictationSession,
+  type InvalidStoredSession,
   type TranscriptionProtocol,
   type TranscriptionResult,
 } from "@starling/dictation";
@@ -118,6 +120,7 @@ export default function App() {
   const [connection, setConnection] = useState<Connection>("checking");
   const [serverModel, setServerModel] = useState("server");
   const [sessions, setSessions] = useState<DictationSession[]>([]);
+  const [damaged, setDamaged] = useState<readonly InvalidStoredSession[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [activeIds, setActiveIds] = useState<ReadonlySet<string>>(() => new Set());
   const activeUploadsRef = useRef(new Set<string>());
@@ -184,9 +187,11 @@ export default function App() {
   );
 
   const refresh = useCallback(async () => {
-    const next = [...(await store.list())];
+    const report = await store.listReport();
+    const next = [...report.sessions];
     next.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     setSessions(next);
+    setDamaged(report.invalid);
     setSelectedId((current) =>
       current && next.some((item) => item.id === current) ? current : next[0]?.id,
     );
@@ -238,22 +243,35 @@ export default function App() {
 
   useEffect(() => {
     void (async () => {
-      const saved = await store.list();
-      await Promise.all(
-        saved.flatMap((session) =>
-          session.status === "transcribing"
-            ? [
-                store.saveFailure(
-                  session.id,
-                  "Interrupted before the server returned a transcript. Your audio is ready to retry.",
-                ),
-              ]
-            : [],
-        ),
-      );
+      // Only the interrupted-session sweep needs the listing, and a bad
+      // history entry is quarantined by listReport() rather than rejecting —
+      // so journal recovery below runs even when history is unreadable.
+      try {
+        const saved = await store.listReport();
+
+        await Promise.all(
+          saved.sessions.flatMap((session) =>
+            session.status === "transcribing"
+              ? [
+                  store.saveFailure(
+                    session.id,
+                    "Interrupted before the server returned a transcript. Your audio is ready to retry.",
+                  ),
+                ]
+              : [],
+          ),
+        );
+      } catch (caught) {
+        setError(`Could not open saved recordings: ${messageFrom(caught)}`);
+      }
+
       // Streaming captures journal audio as it arrives; anything the app
       // left behind becomes a retryable session instead of orphaned bytes.
-      await store.recoverStreamCaptures();
+      await store
+        .recoverStreamCaptures()
+        .catch((caught) =>
+          setError(`Could not recover streaming captures: ${messageFrom(caught)}`),
+        );
       await refresh();
     })().catch((caught) => setError(`Could not open saved recordings: ${messageFrom(caught)}`));
   }, [refresh]);
@@ -727,6 +745,22 @@ export default function App() {
     }
   }
 
+  // Quarantined history entries stay in the database untouched; this only
+  // rescues audio that survived the damage so it can be downloaded.
+  function exportDamagedAudio(id: string) {
+    const entry = damaged.find((item) => item.id === id);
+    const wav = entry && invalidSessionWav(entry);
+
+    if (wav) {
+      const url = URL.createObjectURL(wav);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `starling-damaged-${id.replace(/[^a-z0-9-]/gi, "").slice(0, 8)}.wav`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    }
+  }
+
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
@@ -914,6 +948,39 @@ export default function App() {
             <Clock3 size={18} />
           </div>
           <div className="history-list">
+            {damaged.length > 0 && (
+              <div className="history-warning" role="status">
+                <CircleAlert size={16} />
+                <div>
+                  <strong>
+                    {damaged.length === 1
+                      ? "1 saved recording could not be read"
+                      : `${damaged.length} saved recordings could not be read`}
+                  </strong>
+                  <small>
+                    Damaged entries are kept untouched; the list below shows every recording that is
+                    still readable.
+                  </small>
+                  {damaged.some((entry) => invalidSessionWav(entry) !== undefined) && (
+                    <div className="recovery-actions">
+                      {damaged.map((entry, index) => {
+                        const wav = invalidSessionWav(entry);
+
+                        return wav ? (
+                          <button
+                            key={`${entry.id}-${index}`}
+                            className="recover-audio"
+                            onClick={() => exportDamagedAudio(entry.id)}
+                          >
+                            Download WAV {index + 1}
+                          </button>
+                        ) : null;
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             {sessions.length === 0 && (
               <div className="history-empty">
                 Your recordings will collect here, ready to retry or export.

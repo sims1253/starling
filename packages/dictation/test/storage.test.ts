@@ -9,6 +9,7 @@ import {
   IndexedDbSessionStore,
   MemorySessionStore,
   exportDictationSession,
+  invalidSessionWav,
 } from "../src/storage.js";
 import { decodePcm16Wav } from "../src/audio.js";
 
@@ -208,6 +209,9 @@ async function wavBytes(wav: Blob): Promise<Uint8Array> {
   return new Uint8Array(await wav.arrayBuffer());
 }
 
+/** Raw stored-record shape for fixtures that damage one field at a time. */
+type DamagedStoredRecord = { wav?: Blob };
+
 describe("streaming capture journal", () => {
   it("assembles journaled PCM16 chunks into a canonical WAV session", async () => {
     const store = new MemorySessionStore();
@@ -402,5 +406,171 @@ describe("streaming capture journal", () => {
     assert.equal(restored?.streamError, undefined);
     assert.equal((await second.list()).length, 1);
     second.close();
+  });
+});
+
+describe("damaged history isolation", () => {
+  it("keeps healthy sessions visible while quarantining damaged records", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "damaged-history";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    await store.create({ id: "healthy-one", wav, durationMs: 10 });
+    await store.create({ id: "healthy-two", wav, durationMs: 20 });
+    const damaged = await store.create({ id: "damaged", wav, durationMs: 30 });
+
+    await overwriteStoredSession(factory, databaseName, {
+      ...damaged,
+      status: "uploading",
+    });
+
+    const report = await store.listReport();
+
+    assert.deepEqual(report.sessions.map((session) => session.id).sort(), [
+      "healthy-one",
+      "healthy-two",
+    ]);
+    assert.equal(report.invalid.length, 1);
+    assert.equal(report.invalid[0]?.id, "damaged");
+
+    const failure = report.invalid[0]?.cause;
+
+    assert.ok(failure instanceof DictationStorageError);
+    assert.ok(failure.cause instanceof Schema.SchemaError);
+
+    // list() keeps resolving with the healthy history instead of rejecting.
+    assert.deepEqual((await store.list()).map((session) => session.id).sort(), [
+      "healthy-one",
+      "healthy-two",
+    ]);
+
+    // Quarantine means neither deletion nor silent acceptance: the raw record
+    // is still there and get() still refuses to decode it.
+    await assert.rejects(
+      store.get("damaged"),
+      (cause) =>
+        cause instanceof DictationStorageError && cause.cause instanceof Schema.SchemaError,
+    );
+
+    // Healthy entries keep their single-record reads working.
+    assert.equal((await store.get("healthy-one"))?.id, "healthy-one");
+    store.close();
+  });
+
+  it("reports damaged records with a missing field and unknown ids", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "missing-wav-history";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+    const session = await store.create({ id: "missing-wav", wav });
+
+    const withoutWav: DamagedStoredRecord = { ...session };
+
+    delete withoutWav.wav;
+
+    await overwriteStoredSession(factory, databaseName, withoutWav);
+    // Empty string is a valid IndexedDB key but not a NonEmptyString id.
+    await overwriteStoredSession(factory, databaseName, { id: "" });
+
+    const report = await store.listReport();
+
+    assert.equal(report.sessions.length, 0);
+    assert.equal(report.invalid.length, 2);
+    assert.deepEqual(report.invalid.map((entry) => entry.id).sort(), [
+      "(unknown id)",
+      "missing-wav",
+    ]);
+
+    // A record without a usable wav offers no audio to rescue.
+    for (const entry of report.invalid) {
+      assert.equal(invalidSessionWav(entry), undefined);
+    }
+
+    store.close();
+  });
+
+  it("keeps the damaged record's audio exportable for rescue", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "rescuable-history";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+    const session = await store.create({ id: "rescuable", wav });
+
+    // Damage a metadata field; the retained wav is untouched and identical.
+    await overwriteStoredSession(factory, databaseName, {
+      ...session,
+      attemptCount: "not-a-number",
+    });
+
+    const [entry] = (await store.listReport()).invalid;
+
+    assert.ok(entry);
+    assert.equal(entry.id, "rescuable");
+
+    // The raw record round-trips through IndexedDB, so rescue compares bytes.
+    const rescued = invalidSessionWav(entry);
+
+    assert.ok(rescued);
+    assert.deepEqual(
+      new Uint8Array(await rescued.arrayBuffer()),
+      new Uint8Array(await wav.arrayBuffer()),
+    );
+
+    // Empty or missing blobs offer no audio worth offering.
+    assert.equal(
+      invalidSessionWav({ id: "x", cause: new Error(), record: { wav: new Blob() } }),
+      undefined,
+    );
+    assert.equal(invalidSessionWav({ id: "y", cause: new Error(), record: {} }), undefined);
+    store.close();
+  });
+
+  it("recovers orphaned journals even when a history record is damaged", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "recovery-vs-damage", indexedDB: factory };
+    const first = new IndexedDbSessionStore(options);
+    const capture = await first.beginStreamCapture({ id: "orphaned" });
+
+    await capture.append(chunkOf(1_000));
+
+    const damaged = await first.create({ id: "damaged", wav });
+
+    await overwriteStoredSession(factory, options.databaseName, {
+      ...damaged,
+      status: "wedged",
+    });
+    first.close();
+
+    const reopened = new IndexedDbSessionStore(options);
+
+    // The damaged entry surfaces through listReport() instead of rejecting,
+    // and the orphan journal still recovers into a retryable session.
+    const report = await reopened.listReport();
+    const recovered = await reopened.recoverStreamCaptures();
+
+    assert.equal(report.invalid.length, 1);
+    assert.equal(report.invalid[0]?.id, "damaged");
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.id, "orphaned");
+    assert.equal(recovered[0]?.status, "failed");
+
+    const restored = await reopened.get("orphaned");
+
+    if (!restored) throw new Error("recovered session missing");
+
+    assert.equal(decodePcm16Wav(await wavBytes(restored.wav)).samples.length, 1_000);
+    reopened.close();
+  });
+
+  it("reports an empty invalid list for healthy memory-backed history", async () => {
+    const store = new MemorySessionStore();
+
+    await store.create({ id: "healthy", wav });
+
+    const report = await store.listReport();
+
+    assert.deepEqual(
+      report.sessions.map((session) => session.id),
+      ["healthy"],
+    );
+    assert.deepEqual(report.invalid, []);
   });
 });

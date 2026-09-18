@@ -486,6 +486,44 @@ kbd {
   padding: 28px 24px;
   max-width: 280px;
 }
+.history-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 12px 14px;
+  padding: 12px;
+  background: rgba(64, 48, 15, 0.55);
+  border: 1px solid rgba(217, 255, 106, 0.25);
+  color: var(--dim);
+  border-radius: 7px;
+  font-size: 11px;
+}
+.history-warning div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+}
+.history-warning strong {
+  color: var(--lime);
+}
+.history-warning small {
+  color: var(--dim);
+  line-height: 1.5;
+}
+.history-warning .recovery-actions {
+  margin-top: 4px;
+}
+.history-warning .recover-audio {
+  flex: 0 0 auto;
+  color: var(--lime);
+  border: 1px solid rgba(217, 255, 106, 0.35);
+  border-radius: 4px;
+  padding: 6px 9px;
+  font-size: 9px;
+  background: 0;
+  cursor: pointer;
+}
 .history-row {
   width: 100%;
   min-height: 78px;
