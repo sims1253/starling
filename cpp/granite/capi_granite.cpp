@@ -204,6 +204,11 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
                     return nullptr;
             }
         }
+        // Whole-request wall time covers the chunk loop AND the final text
+        // join, so join_texts is attributed to bookkeeping, not silently
+        // dropped from the request summary (the output-buffer malloc/copy is
+        // response emission and stays outside).
+        const std::string text = join_texts(texts);
         auto t_end = now();
         if (timing) {
             std::fprintf(stderr, "%s\n",
@@ -213,7 +218,6 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
                     .c_str());
         }
 
-        const std::string text = join_texts(texts);
         char* out = static_cast<char*>(std::malloc(text.size() + 1));
         if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
         std::memcpy(out, text.data(), text.size());

@@ -16,9 +16,12 @@
 //
 // Reconciliation contract: `stages` sums the per-chunk stage durations over
 // ALL chunks, `total` is the whole-request wall time measured around the
-// chunk loop, and `bookkeeping = total - stages` is the unattributed
-// remainder (join/detokenize/loop memcpy). The three agree by construction
-// within the %.1f rendering rounding; the regression test pins that.
+// chunk loop AND the final text join, and `bookkeeping = total - stages` is
+// the unattributed remainder (loop memcpy/padding, per-chunk detokenize, the
+// text join, and the timing prints themselves — the output-buffer malloc and
+// copy are response emission and stay outside the window). The three agree by
+// construction within the %.1f rendering rounding; the regression test pins
+// that.
 #pragma once
 
 #include <cstdio>
@@ -80,7 +83,8 @@ inline std::string format_stage_chunk_line(const StageTiming& s, int64_t chunk_i
 }
 
 // The whole-request summary line. `request_total_ms` is the wall time around
-// the whole chunk loop (the caller's t_start..t_end span).
+// the whole chunk loop plus the final text join (the caller's t_start..t_end
+// span; the output-buffer malloc/copy stay outside it).
 inline std::string format_stage_request_line(const StageTiming& s, double audio_seconds,
                                              double request_total_ms) {
     char buf[320];
