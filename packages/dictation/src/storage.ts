@@ -89,6 +89,12 @@ export interface DictationSessionStore {
   saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession>;
   /** Record why live streaming failed without changing the session status. */
   noteStreamError(id: string, message: string): Promise<DictationSession>;
+  /**
+   * True while a live owner (this window or another) is transcribing the
+   * session right now. Startup sweeps consult this so a second window does
+   * not interrupt another owner's in-flight attempt (#144).
+   */
+  transcriptionInFlight(id: string): Promise<boolean>;
   delete(id: string): Promise<void>;
 }
 
@@ -391,6 +397,33 @@ function assemblePcm16Wav(chunks: readonly Uint8Array[]) {
   };
 }
 
+const RECOVERED_CAPTURE_MESSAGE =
+  "Recovered after the app closed during recording. The audio is intact; retry when ready.";
+
+/**
+ * The retryable session an abandoned journal promotes into: already marked
+ * failed with the recovery note, exactly as a create-then-fail sequence
+ * would have left it — but written in one transaction with the journal
+ * delete, so promotion is atomic.
+ */
+function recoveredSession(
+  captureId: string,
+  assembled: ReturnType<typeof assemblePcm16Wav>,
+): DictationSession {
+  const now = new Date().toISOString();
+
+  return freezeSession({
+    id: captureId,
+    createdAt: now,
+    updatedAt: now,
+    status: "failed",
+    wav: assembled.wav,
+    durationMs: assembled.durationMs,
+    attemptCount: 0,
+    lastError: RECOVERED_CAPTURE_MESSAGE,
+  });
+}
+
 function streamCaptureId(input: CreateStreamCaptureInput): string {
   const id = input.id ?? sessionId();
 
@@ -450,6 +483,7 @@ class MemoryStreamCapture implements DictationStreamCapture {
 
 export class MemorySessionStore implements DictationSessionStore, DictationStreamCaptureStore {
   private readonly sessions = new Map<string, DictationSession>();
+  private readonly transcribing = new Set<string>();
 
   async create(input: CreateSessionInput): Promise<DictationSession> {
     const session = initialSession(input);
@@ -478,13 +512,17 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
   }
 
   async markAttempt(id: string): Promise<DictationSession> {
-    return this.update(id, (current) =>
+    const marked = await this.update(id, (current) =>
       updatedSession(current, {
         status: "transcribing",
         attemptCount: current.attemptCount + 1,
         lastError: undefined,
       }),
     );
+
+    this.transcribing.add(id);
+
+    return marked;
   }
 
   async saveTranscript(
@@ -500,24 +538,37 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
 
     if (options?.streamed === true) update.streamed = true;
 
-    return this.update(id, (current) => updatedSession(current, update));
+    try {
+      return await this.update(id, (current) => updatedSession(current, update));
+    } finally {
+      this.transcribing.delete(id);
+    }
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
-    return this.update(id, (current) =>
-      updatedSession(current, {
-        status: "failed",
-        lastError: errorText(cause),
-      }),
-    );
+    try {
+      return await this.update(id, (current) =>
+        updatedSession(current, {
+          status: "failed",
+          lastError: errorText(cause),
+        }),
+      );
+    } finally {
+      this.transcribing.delete(id);
+    }
   }
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
     return this.update(id, (current) => updatedSession(current, { streamError: message }));
   }
 
+  async transcriptionInFlight(id: string): Promise<boolean> {
+    return this.transcribing.has(id);
+  }
+
   async delete(id: string): Promise<void> {
     this.sessions.delete(id);
+    this.transcribing.delete(id);
   }
 
   async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
@@ -542,9 +593,52 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
   }
 }
 
+/** Structural slice of a granted Web Lock handle. */
+export interface GrantedWebLock {
+  readonly name: string;
+}
+
+/** Acquisition options the store asks its lock manager for. */
+export interface WebLockRequestOptions {
+  readonly mode: "exclusive";
+  readonly ifAvailable: boolean;
+}
+
+/**
+ * The slice of the Web Locks API the store depends on: exclusive,
+ * never-queueing acquisition. `navigator.locks` satisfies this structurally;
+ * tests substitute an in-memory fake to drive both ownership branches.
+ */
+export interface WebLocksLike {
+  request<Result>(
+    name: string,
+    options: WebLockRequestOptions,
+    granted: (lock: GrantedWebLock | null) => Promise<Result> | Result,
+  ): Promise<Result>;
+}
+
+/**
+ * The host's Web Locks manager when it has one. Environments without
+ * navigator.locks (Node, older embedders) run unlocked: capture ownership is
+ * then tracked only within the environment, which two live stores in one
+ * realm honor but two separate windows cannot.
+ */
+function navigatorLocks(): WebLocksLike | undefined {
+  const locks = globalThis.navigator?.locks;
+
+  return locks ?? undefined;
+}
+
 export interface IndexedDbSessionStoreOptions {
   readonly databaseName?: string;
   readonly indexedDB?: IDBFactory | undefined;
+  /**
+   * Cross-tab ownership signal for streaming captures and transcription
+   * attempts. Defaults to `navigator.locks` when the host provides it.
+   * Passing the property with the value `undefined` (as opposed to omitting
+   * it) forces the unlocked fallback even in a Web-Locks-capable host.
+   */
+  readonly webLocks?: WebLocksLike | undefined;
 }
 
 const OBJECT_STORE = "sessions";
@@ -556,6 +650,12 @@ const STREAM_CHUNK_STORE = "stream-chunks";
 interface StreamMetaRecord {
   readonly id: string;
   readonly createdAt: string;
+  /**
+   * Owning store instance, written when the journal is created. Recovery
+   * trusts locks and the environment registry for liveness; this records
+   * which window's capture a journal was for whoever inspects the store.
+   */
+  readonly ownerId?: string | undefined;
 }
 
 interface StreamChunkRecord {
@@ -626,24 +726,118 @@ function runIdbTransaction(
   });
 }
 
+function captureLockName(databaseName: string, captureId: string): string {
+  return `starling:dictation:${databaseName}:capture:${captureId}`;
+}
+
+function attemptLockName(databaseName: string, sessionId: string): string {
+  return `starling:dictation:${databaseName}:transcribe:${sessionId}`;
+}
+
+/**
+ * Capture journals and transcription attempts currently held open by a live
+ * store in this environment. Web Locks own cross-window detection; these
+ * registries are the within-environment signal for hosts without
+ * navigator.locks, and a second line of defense everywhere else.
+ */
+const liveCaptureRegistry = new Set<string>();
+
+const liveAttemptRegistry = new Set<string>();
+
+function captureRegistryKey(databaseName: string, captureId: string): string {
+  return `capture\u0000${databaseName}\u0000${captureId}`;
+}
+
+function attemptRegistryKey(databaseName: string, sessionId: string): string {
+  return `attempt\u0000${databaseName}\u0000${sessionId}`;
+}
+
+/** One lock handshake: the grant signal plus the held lock's release latch. */
+class LockHandshake {
+  private settleGranted: ((granted: boolean) => void) | undefined;
+  private resolveHeld: (() => void) | undefined;
+
+  readonly granted: Promise<boolean> = new Promise((resolve) => {
+    this.settleGranted = resolve;
+  });
+
+  readonly held: Promise<void> = new Promise((resolve) => {
+    this.resolveHeld = resolve;
+  });
+
+  settle(granted: boolean): void {
+    this.settleGranted?.(granted);
+  }
+
+  release(): void {
+    this.resolveHeld?.();
+  }
+}
+
+/**
+ * Take one named lock without queueing: resolves undefined while another
+ * owner holds it, otherwise a function that releases the lock exactly once.
+ */
+async function acquireNamedLock(
+  locks: WebLocksLike,
+  name: string,
+): Promise<(() => void) | undefined> {
+  const handshake = new LockHandshake();
+
+  const request = locks.request(name, { mode: "exclusive", ifAvailable: true }, (lock) => {
+    if (lock === null) {
+      handshake.settle(false);
+
+      return null;
+    }
+
+    handshake.settle(true);
+
+    // The lock is held for exactly as long as this promise stays pending.
+    return handshake.held;
+  });
+
+  void request.catch(() => handshake.settle(false));
+
+  if (!(await handshake.granted)) return undefined;
+
+  return () => handshake.release();
+}
+
 class IndexedDbStreamCapture implements DictationStreamCapture {
   readonly sessionId: string;
   private readonly createSession: (input: CreateSessionInput) => Promise<DictationSession>;
   private readonly openDatabase: () => Promise<IDBDatabase>;
+  private readonly releaseLock: (() => void) | undefined;
+  private readonly retire: () => void;
   private readonly chunks: Uint8Array[] = [];
   private writeChain: Promise<void> = Promise.resolve();
   private nextIndex = 0;
   private closed = false;
   private durable = true;
+  private ownershipReleased = false;
 
   constructor(
     sessionId: string,
     createSession: (input: CreateSessionInput) => Promise<DictationSession>,
     openDatabase: () => Promise<IDBDatabase>,
+    releaseLock: (() => void) | undefined,
+    retire: () => void,
   ) {
     this.sessionId = sessionId;
     this.createSession = createSession;
     this.openDatabase = openDatabase;
+    this.releaseLock = releaseLock;
+    this.retire = retire;
+  }
+
+  /**
+   * Drop every ownership claim without touching the journal: the owning
+   * store is going away, so from another window's point of view the owner
+   * just terminated — the journal stays durable and recoverable.
+   */
+  orphan(): void {
+    this.releaseOwnership();
   }
 
   append(pcm16: Uint8Array): Promise<void> {
@@ -728,10 +922,22 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     }
   }
 
-  private async discard(): Promise<void> {
-    const database = await this.openDatabase();
+  /** The journal is gone or going; the capture's ownership ends with it. */
+  private releaseOwnership(): void {
+    if (this.ownershipReleased) return;
+    this.ownershipReleased = true;
+    this.releaseLock?.();
+    this.retire();
+  }
 
-    await deleteStreamCapture(database, this.sessionId);
+  private async discard(): Promise<void> {
+    try {
+      const database = await this.openDatabase();
+
+      await deleteStreamCapture(database, this.sessionId);
+    } finally {
+      this.releaseOwnership();
+    }
   }
 }
 
@@ -811,11 +1017,21 @@ function deleteStreamCapture(database: IDBDatabase, captureId: string): Promise<
 export class IndexedDbSessionStore implements DictationSessionStore, DictationStreamCaptureStore {
   private readonly databaseName: string;
   private readonly factory: IDBFactory | undefined;
+  private readonly locks: WebLocksLike | undefined;
+  /** Identifies this instance in journal ownership metadata. */
+  private readonly ownerId: string;
+  private readonly openCaptures = new Map<string, IndexedDbStreamCapture>();
+  private readonly attemptLocks = new Map<string, (() => void) | undefined>();
   private databasePromise: Promise<IDBDatabase> | undefined;
 
   constructor(options: IndexedDbSessionStoreOptions = {}) {
     this.databaseName = options.databaseName ?? "starling-dictation";
     this.factory = options.indexedDB ?? globalThis.indexedDB;
+    // Property presence, not nullish coalescing: an explicitly supplied
+    // `webLocks: undefined` means "run unlocked" even where the host has
+    // navigator.locks, while an omitted property takes the host default.
+    this.locks = "webLocks" in options ? options.webLocks : navigatorLocks();
+    this.ownerId = sessionId();
   }
 
   async create(input: CreateSessionInput): Promise<DictationSession> {
@@ -911,13 +1127,21 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   async markAttempt(id: string): Promise<DictationSession> {
-    return this.update(id, (current) =>
-      updatedSession(current, {
-        status: "transcribing",
-        attemptCount: current.attemptCount + 1,
-        lastError: undefined,
-      }),
-    );
+    await this.holdAttemptSignal(id);
+
+    try {
+      return await this.update(id, (current) =>
+        updatedSession(current, {
+          status: "transcribing",
+          attemptCount: current.attemptCount + 1,
+          lastError: undefined,
+        }),
+      );
+    } catch (failure) {
+      this.releaseAttemptSignal(id);
+
+      throw failure;
+    }
   }
 
   async saveTranscript(
@@ -933,20 +1157,47 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
 
     if (options?.streamed === true) update.streamed = true;
 
-    return this.update(id, (current) => updatedSession(current, update));
+    try {
+      return await this.update(id, (current) => updatedSession(current, update));
+    } finally {
+      // The settling write can reject (quota, abort, session deleted from
+      // another window): the attempt signal must not outlive its attempt,
+      // or every other window's liveness probe reports true forever.
+      this.releaseAttemptSignal(id);
+    }
   }
 
   async saveFailure<Cause>(id: string, cause: Cause): Promise<DictationSession> {
-    return this.update(id, (current) =>
-      updatedSession(current, {
-        status: "failed",
-        lastError: errorText(cause),
-      }),
-    );
+    try {
+      return await this.update(id, (current) =>
+        updatedSession(current, {
+          status: "failed",
+          lastError: errorText(cause),
+        }),
+      );
+    } finally {
+      this.releaseAttemptSignal(id);
+    }
   }
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
     return this.update(id, (current) => updatedSession(current, { streamError: message }));
+  }
+
+  async transcriptionInFlight(id: string): Promise<boolean> {
+    if (this.attemptLocks.has(id)) return true;
+
+    if (liveAttemptRegistry.has(attemptRegistryKey(this.databaseName, id))) return true;
+
+    if (!this.locks) return false;
+
+    // A lock nobody holds acquires briefly and releases right away; one
+    // another window still holds never arrives, which is the answer sought.
+    const release = await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id));
+
+    release?.();
+
+    return release === undefined;
   }
 
   async delete(id: string): Promise<void> {
@@ -968,23 +1219,53 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
           }),
         );
     });
+    this.releaseAttemptSignal(id);
   }
 
   async beginStreamCapture(input: CreateStreamCaptureInput = {}): Promise<DictationStreamCapture> {
     const id = streamCaptureId(input);
     const createdAt = input.createdAt ?? new Date().toISOString();
     const database = await this.database();
-    const record: StreamMetaRecord = { id, createdAt };
 
-    await runIdbTransaction(database, [STREAM_META_STORE], "readwrite", (transaction) => {
-      transaction.objectStore(STREAM_META_STORE).add(record);
-    });
+    // The lock is the cross-window ownership claim for this capture id: held
+    // from before the metadata row exists until the capture closes, so a
+    // second window's recovery can never mistake the journal for abandoned.
+    const release = this.locks
+      ? await acquireNamedLock(this.locks, captureLockName(this.databaseName, id))
+      : undefined;
 
-    return new IndexedDbStreamCapture(
+    if (this.locks && !release) {
+      throw new DictationStorageError(`stream capture ${id} is already owned by another window`);
+    }
+
+    const record: StreamMetaRecord = { id, createdAt, ownerId: this.ownerId };
+
+    try {
+      await runIdbTransaction(database, [STREAM_META_STORE], "readwrite", (transaction) => {
+        transaction.objectStore(STREAM_META_STORE).add(record);
+      });
+    } catch (cause) {
+      release?.();
+
+      throw cause;
+    }
+
+    liveCaptureRegistry.add(captureRegistryKey(this.databaseName, id));
+
+    const capture = new IndexedDbStreamCapture(
       id,
       (sessionInput) => this.create(sessionInput),
       () => this.database(),
+      release,
+      () => {
+        liveCaptureRegistry.delete(captureRegistryKey(this.databaseName, id));
+        this.openCaptures.delete(id);
+      },
     );
+
+    this.openCaptures.set(id, capture);
+
+    return capture;
   }
 
   async recoverStreamCaptures(): Promise<readonly DictationSession[]> {
@@ -1003,32 +1284,31 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
         continue;
       }
 
-      try {
-        const chunks = await readStreamChunks(database, meta.id);
+      // A journal is consumed only when its owner is demonstrably gone: a
+      // live store in this environment, this very instance's ownership
+      // marker, or a capture lock another window still holds all mean
+      // somebody is recording into it right now (#144).
+      if (
+        liveCaptureRegistry.has(captureRegistryKey(this.databaseName, meta.id)) ||
+        meta.ownerId === this.ownerId
+      ) {
+        continue;
+      }
 
-        if (chunks.length === 0 || (await this.get(meta.id))) {
-          await deleteStreamCapture(database, meta.id);
+      if (this.locks) {
+        // The lock is held for the whole promotion, so concurrent sweeps
+        // cannot double-consume a journal; `null` means a live owner.
+        await this.locks.request(
+          captureLockName(this.databaseName, meta.id),
+          { mode: "exclusive", ifAvailable: true },
+          async (lock) => {
+            if (lock === null) return;
 
-          continue;
-        }
-
-        const assembled = assemblePcm16Wav(chunks);
-
-        const created = await this.create({
-          id: meta.id,
-          wav: assembled.wav,
-          durationMs: assembled.durationMs,
-        });
-
-        const marked = await this.saveFailure(
-          meta.id,
-          "Recovered after the app closed during recording. The audio is intact; retry when ready.",
+            await this.promoteJournal(database, meta.id, recovered);
+          },
         );
-
-        await deleteStreamCapture(database, meta.id);
-        recovered.push(marked ?? created);
-      } catch {
-        // A journal that cannot be assembled now stays for the next attempt.
+      } else {
+        await this.promoteJournal(database, meta.id, recovered);
       }
     }
 
@@ -1036,6 +1316,22 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   }
 
   close(): void {
+    // From every other window's point of view this owner just terminated:
+    // its claims end here, so abandoned journals become recoverable. Map
+    // iteration tolerates the deletions these releases make.
+    //
+    // Precondition: captures have been finished or abandoned and attempts
+    // have settled (saveTranscript/saveFailure/delete) before close() —
+    // closing with work still in flight strands that work's journal and
+    // leaves its chunks orphaned for every future sweep.
+    for (const capture of this.openCaptures.values()) {
+      capture.orphan();
+    }
+
+    for (const id of this.attemptLocks.keys()) {
+      this.releaseAttemptSignal(id);
+    }
+
     // A failed open already rejected to its caller; closing afterwards must
     // not re-surface that failure as an unhandled rejection.
     void this.databasePromise?.then(
@@ -1043,6 +1339,123 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
       () => undefined,
     );
     this.databasePromise = undefined;
+  }
+
+  /**
+   * Assemble one journal and promote it. The session insert and the journal
+   * (metadata plus chunks) delete share a single transaction, so a crash
+   * mid-promotion rolls back together: a journal can neither strand a
+   * half-promoted session nor be consumed twice. Journals that cannot be
+   * promoted now simply stay for the next attempt.
+   */
+  private async promoteJournal(
+    database: IDBDatabase,
+    captureId: string,
+    recovered: DictationSession[],
+  ): Promise<void> {
+    try {
+      const chunks = await readStreamChunks(database, captureId);
+      const promoted = await this.promoteStreamCapture(database, captureId, chunks);
+
+      if (promoted) recovered.push(promoted);
+    } catch {
+      // A journal that cannot be promoted now stays for the next attempt.
+    }
+  }
+
+  /**
+   * One-transaction promotion: insert the retryable session (unless it
+   * already exists or the journal has no audio) and delete the journal.
+   * Resolves the created session, or undefined when there was nothing to
+   * insert — an empty journal or one whose session already survived.
+   */
+  private promoteStreamCapture(
+    database: IDBDatabase,
+    captureId: string,
+    chunks: readonly Uint8Array[],
+  ): Promise<DictationSession | undefined> {
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction(
+        [OBJECT_STORE, STREAM_META_STORE, STREAM_CHUNK_STORE],
+        "readwrite",
+      );
+
+      const existing = transaction.objectStore(OBJECT_STORE).get(captureId);
+
+      existing.onsuccess = () => {
+        let created: DictationSession | undefined;
+
+        if (existing.result === undefined && chunks.length > 0) {
+          created = recoveredSession(captureId, assemblePcm16Wav(chunks));
+          transaction.objectStore(OBJECT_STORE).add(created);
+        }
+
+        transaction.objectStore(STREAM_META_STORE).delete(captureId);
+
+        const cursorRequest = transaction.objectStore(STREAM_CHUNK_STORE).openCursor();
+
+        cursorRequest.onsuccess = () => {
+          const cursor = cursorRequest.result;
+
+          if (!cursor) return;
+
+          if (isStreamChunkRecord(cursor.value) && cursor.value.captureId === captureId) {
+            cursor.delete();
+          }
+
+          cursor.continue();
+        };
+
+        transaction.oncomplete = () => resolve(created);
+      };
+
+      existing.onerror = () =>
+        reject(
+          new DictationStorageError("failed to read a session before journal promotion", {
+            cause: existing.error,
+          }),
+        );
+      transaction.onerror = () =>
+        reject(
+          new DictationStorageError("failed to promote a streaming capture journal", {
+            cause: transaction.error,
+          }),
+        );
+      transaction.onabort = () =>
+        reject(
+          new DictationStorageError("streaming capture journal promotion was aborted", {
+            cause: transaction.error,
+          }),
+        );
+    });
+  }
+
+  /**
+   * Best-effort in-flight signal for one transcription attempt, so another
+   * window's startup sweep can tell a live attempt from a dead owner's
+   * leftover. The signal is advisory: contention never blocks a retry.
+   */
+  private async holdAttemptSignal(id: string): Promise<void> {
+    if (this.attemptLocks.has(id)) return;
+
+    const release = this.locks
+      ? await acquireNamedLock(this.locks, attemptLockName(this.databaseName, id))
+      : undefined;
+
+    // Contended or lockless, the attempt is still live as far as this
+    // environment is concerned — the registry carries the signal alone then.
+    this.attemptLocks.set(id, release);
+    liveAttemptRegistry.add(attemptRegistryKey(this.databaseName, id));
+  }
+
+  private releaseAttemptSignal(id: string): void {
+    if (!this.attemptLocks.has(id)) return;
+
+    const release = this.attemptLocks.get(id);
+
+    this.attemptLocks.delete(id);
+    liveAttemptRegistry.delete(attemptRegistryKey(this.databaseName, id));
+    release?.();
   }
 
   private database(): Promise<IDBDatabase> {
