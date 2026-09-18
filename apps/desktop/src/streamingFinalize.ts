@@ -43,15 +43,29 @@ function messageFrom(cause: unknown): string {
 }
 
 /**
+ * Remove the provisional row this finalize created — never the state a
+ * Discard settled — and resync the list the row may already appear in.
+ */
+async function dropProvisional(
+  store: StreamingFinalizeStore,
+  deps: StreamingFinalizeDeps,
+  id: string,
+): Promise<void> {
+  await store.delete(id).catch(() => {});
+  await deps.refresh();
+}
+
+/**
  * Finalize the streamed take Stop was issued against, honouring a close-guard
  * Discard that lands while the finalize is in flight (#160).
  *
- * The generation is captured synchronously by the caller and re-validated
- * before and after each durable write; a stale finalize performs no session
- * write — no saveTranscript, no noteStreamError, no batch transcribe —
- * cleans up anything provisional its own finish created, undoes its own
- * streamed save when the Discard lands mid-write, and never falls through
- * to the batch path. The state the Discard settled is left untouched.
+ * The generation is captured by the caller before any await and re-validated
+ * around each durable write; a stale finalize performs no session write —
+ * no saveTranscript, no noteStreamError, no batch transcribe — cleans up
+ * anything provisional its own finish created, undoes its own completed
+ * writes (the streamed save or the batch transcription) when the Discard
+ * lands mid-write, and never falls through to the batch path. The state
+ * the Discard settled is left untouched.
  *
  * Returns batchFallback when the stream was never usable and the caller
  * should save the recorder's own capture via the batch path.
@@ -99,7 +113,7 @@ export async function finishStreamingTake(
     // The Discard landed after the capture layer's own probe: remove only
     // the provisional row this finalize created, never touching the state
     // the Discard settled (#160).
-    await store.delete(result.session.id).catch(() => {});
+    await dropProvisional(store, deps, result.session.id);
 
     return { streamed: false, discarded: true, batchFallback: false };
   }
@@ -110,7 +124,7 @@ export async function finishStreamingTake(
   // the session without the take: skip the write and remove the provisional
   // row this finalize created, instead of transcribing a dropped take.
   if (!isCurrentTake()) {
-    await store.delete(result.session.id).catch(() => {});
+    await dropProvisional(store, deps, result.session.id);
 
     return { streamed: false, discarded: true, batchFallback: false };
   }
@@ -122,7 +136,7 @@ export async function finishStreamingTake(
     // the take: undo this finalize's completed write instead of surfacing
     // the dropped take.
     if (!isCurrentTake()) {
-      await store.delete(result.session.id).catch(() => {});
+      await dropProvisional(store, deps, result.session.id);
 
       return { streamed: false, discarded: true, batchFallback: false };
     }
@@ -136,12 +150,20 @@ export async function finishStreamingTake(
     }
 
     if (!isCurrentTake()) {
-      await store.delete(result.session.id).catch(() => {});
+      await dropProvisional(store, deps, result.session.id);
 
       return { streamed: false, discarded: true, batchFallback: false };
     }
 
     await deps.transcribe(result.session);
+
+    // A Discard that landed while the batch transcription ran settles the
+    // session without the take: undo its completed writes the same way.
+    if (!isCurrentTake()) {
+      await dropProvisional(store, deps, result.session.id);
+
+      return { streamed: false, discarded: true, batchFallback: false };
+    }
   }
 
   return { streamed: result.streamed, session: result.session, batchFallback: false };

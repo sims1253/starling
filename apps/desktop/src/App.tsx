@@ -561,21 +561,28 @@ export default function App() {
   }, [discardStreamingTake]);
 
   /**
-   * Finalize the streamed take this Stop was issued against. Captures its
-   * generation synchronously and re-validates it before each durable write,
-   * so a close-guard Discard racing the finalize wins: the stale take writes
-   * nothing and leaves the Discard's state untouched (#160). Returns false
-   * when the stream was never usable and the caller should save the
-   * recorder's own capture via the batch path.
+   * Finalize the streamed take this Stop was issued against. The caller
+   * captures the take generation before any await — a close-guard Discard
+   * offered while the stop itself is still running already bumped past it —
+   * and the finalize re-validates it around each durable write, so a Discard
+   * racing the finalize wins: the stale take writes nothing and leaves the
+   * Discard's state untouched (#160). Returns false when the stream was
+   * never usable and the caller should save the recorder's own capture via
+   * the batch path.
    */
   const finishStreamingTake = useCallback(
-    async (stream: StreamingDictation, durationMs: number): Promise<boolean> => {
+    async (
+      stream: StreamingDictation,
+      durationMs: number,
+      generation: number,
+    ): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
-      // The take identity Stop settled on; the close-guard Discard bumps
-      // takeSeqRef, which flips this probe and cancels the finalize's writes.
-      const generation = takeSeqRef.current;
+
+      // The take identity this Stop was issued against; the close-guard
+      // Discard bumps takeSeqRef, which flips this probe and cancels the
+      // finalize's writes.
       const isCurrentTake = () => takeSeqRef.current === generation;
 
       if (bailed) {
@@ -630,6 +637,12 @@ export default function App() {
     if (shouldStop) {
       if (!lifecycle.beginStop()) return;
 
+      // The take identity this Stop was issued against, captured before any
+      // await: a close-guard Discard offered while the stop itself is still
+      // running bumps takeSeqRef past it, so the finalize below sees a
+      // stale take from its first probe (#160).
+      const generation = takeSeqRef.current;
+
       // The controller bound to the take being stopped, read before any
       // await: Stop must finalize the take that was recorded (#143).
       const stream = streamRef.current;
@@ -657,7 +670,7 @@ export default function App() {
           throw new Error("Recording was too short to keep.");
         }
 
-        if (stream && (await finishStreamingTake(stream, capture.durationMs))) {
+        if (stream && (await finishStreamingTake(stream, capture.durationMs, generation))) {
           return;
         }
 

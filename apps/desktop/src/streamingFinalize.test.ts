@@ -78,8 +78,18 @@ class FakeStream extends StreamingDictation {
 
   journaled = 0;
 
-  override async finish(): Promise<StreamingDictationResult> {
-    if (this.pending) return this.pending.promise;
+  override async finish(
+    _durationMs?: number,
+    isCancelled?: () => boolean,
+  ): Promise<StreamingDictationResult> {
+    if (this.pending) {
+      const settled = await this.pending.promise;
+
+      // Mirrors StreamingDictation.finish: a take cancelled while the
+      // journal drained skips the commit and hands the provisional row
+      // back for deletion.
+      return isCancelled?.() ? { ...settled, streamed: false } : settled;
+    }
 
     return this.finishResult;
   }
@@ -380,6 +390,33 @@ describe("finishStreamingTake", () => {
     expect(store.noted).toEqual([]);
     expect(store.transcribed).toEqual([]);
     expect(store.deleted).toEqual([]);
+  });
+
+  it("deletes the batch-transcribed session when Discard lands during transcribe", async () => {
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 1;
+    stream.finishResult = Object.freeze({
+      wav,
+      durationMs: 500,
+      session: session(),
+      streamed: false,
+      streamNote: "socket closed",
+    });
+
+    // Current through the pre-transcribe probes (calls 1–3), stale at the
+    // post-transcribe probe (call 4): the transcription completed, but the
+    // row is this finalize's to remove.
+    let probes = 0;
+
+    const result = await finishStreamingTake(
+      handlersFor(stream, store, () => ++probes < 4),
+      store,
+    );
+
+    expect(result.discarded).toBe(true);
+    expect(store.transcribed).toEqual(["take-one"]);
+    expect(store.deleted).toEqual(["take-one"]);
   });
 
   it("notes the stream error and transcribes via batch on the live path", async () => {
