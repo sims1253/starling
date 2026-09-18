@@ -25,7 +25,7 @@ import { defaultExecFile, extractBinary, type ExecFileFn } from "./archive.js";
 import { assertChecksum, parseChecksum, sha256File } from "./checksum.js";
 import { detectVulkanLoader } from "./detect.js";
 import { defaultBackend, resolveArtifact, type Backend } from "./platforms.js";
-import { DEFAULT_REPO, releaseAssetUrl, releaseTag } from "./release.js";
+import { DEFAULT_REPO, normalizeRepo, releaseAssetUrl, releaseTag } from "./release.js";
 
 export class ReleaseAssetError extends Error {
   constructor(
@@ -88,6 +88,8 @@ export interface EnsureResult {
   readonly binaryPath: string;
   readonly backend: Backend;
   readonly tag: string;
+  /** Normalized `owner/name` of the repository the binary was verified from. */
+  readonly repo: string;
   /** True when this call downloaded and verified the binary. */
   readonly downloaded: boolean;
 }
@@ -104,16 +106,19 @@ export async function ensureBinary(options: EnsureOptions): Promise<EnsureResult
     options.backend ?? defaultBackend(os, arch, options.hasVulkanLoader ?? detectVulkanLoader);
 
   const spec = resolveArtifact(os, arch, backend);
-  const repo = options.repo ?? DEFAULT_REPO;
+  // Normalize early: the normalized coordinate is the cache identity, so
+  // case-differing spellings of the same repository share one entry and an
+  // invalid coordinate throws before any download is attempted.
+  const repo = normalizeRepo(options.repo ?? DEFAULT_REPO);
   const tag = releaseTag(options.version, options.releaseTag);
   const root = options.cacheDir ?? resolveCacheDir();
-  const binaryPath = releaseCachePath(root, tag, spec.binary);
+  const binaryPath = releaseCachePath(root, repo, tag, spec.binary);
   const log = options.log ?? (() => {});
 
-  if (await cachedBinaryMatchesMarker(binaryPath)) {
+  if (await cachedBinaryMatchesMarker(binaryPath, repo, tag, spec.binary)) {
     log(`starling-serve ${tag} (${os}-${backend}) found in cache: ${binaryPath}`);
 
-    return { binaryPath, backend, tag, downloaded: false };
+    return { binaryPath, backend, tag, repo, downloaded: false };
   }
 
   log(`Downloading starling-serve ${tag} (${os}-${backend}) from ${repo}...`);
@@ -148,29 +153,84 @@ export async function ensureBinary(options: EnsureOptions): Promise<EnsureResult
     }
 
     await rename(extracted.binaryPath, binaryPath);
-    await writeFile(verifiedMarkerPath(binaryPath), `${innerChecksum}\n`, "utf8");
+    await writeFile(
+      verifiedMarkerPath(binaryPath),
+      `repo ${repo}\ntag ${tag}\nbinary ${spec.binary}\nsha256 ${innerChecksum}\n`,
+      "utf8",
+    );
 
-    return { binaryPath, backend, tag, downloaded: true };
+    return { binaryPath, backend, tag, repo, downloaded: true };
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
 }
 
-/** A cached binary is usable when its marker hash matches a fresh re-hash. */
-async function cachedBinaryMatchesMarker(binaryPath: string): Promise<boolean> {
-  let marker: string | undefined;
+/**
+ * A cached binary is usable when its marker carries the requested artifact
+ * identity (`repo`, `tag`, `binary`) and its checksum matches a fresh
+ * re-hash. A legacy marker (a bare checksum line from before provenance was
+ * recorded) has unknowable origin, so it is treated as a miss: the binary is
+ * re-downloaded and re-verified, replacing the marker with one that carries
+ * the full identity.
+ */
+async function cachedBinaryMatchesMarker(
+  binaryPath: string,
+  repo: string,
+  tag: string,
+  binary: string,
+): Promise<boolean> {
+  let marker: string;
 
   try {
-    marker = (await readFile(verifiedMarkerPath(binaryPath), "utf8")).trim();
+    marker = await readFile(verifiedMarkerPath(binaryPath), "utf8");
   } catch {
     return false;
   }
 
+  const fields = parseMarker(marker);
+
+  if (
+    fields === undefined ||
+    fields.repo !== repo ||
+    fields.tag !== tag ||
+    fields.binary !== binary
+  ) {
+    return false;
+  }
+
   try {
-    return (await sha256File(binaryPath)) === marker;
+    return (await sha256File(binaryPath)) === fields.sha256;
   } catch {
     return false;
   }
+}
+
+/** Parsed verification-marker fields, or `undefined` for a legacy marker. */
+function parseMarker(
+  marker: string,
+): { repo: string; tag: string; binary: string; sha256: string } | undefined {
+  const fields = new Map<string, string>();
+
+  for (const rawLine of marker.split("\n")) {
+    const line = rawLine.trim();
+
+    if (line === "") continue;
+    const space = line.indexOf(" ");
+
+    if (space <= 0) return undefined;
+    fields.set(line.slice(0, space), line.slice(space + 1));
+  }
+
+  const repo = fields.get("repo");
+  const tag = fields.get("tag");
+  const binary = fields.get("binary");
+  const sha256 = fields.get("sha256");
+
+  if (repo === undefined || tag === undefined || binary === undefined || sha256 === undefined) {
+    return undefined;
+  }
+
+  return { repo, tag, binary, sha256 };
 }
 
 async function downloadToFile(
