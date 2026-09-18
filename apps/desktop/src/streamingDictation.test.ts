@@ -83,10 +83,16 @@ class FakeCapture implements StreamingCapture {
     this.appended.push(new Uint8Array(pcm16));
   }
 
-  async finish(durationMs?: number) {
+  async finish(durationMs?: number, isCancelled?: () => boolean) {
     this.finishes += 1;
 
     if (this.finishFailure) throw this.finishFailure;
+
+    if (isCancelled?.()) {
+      const wav = new Blob([new Uint8Array(44)]);
+
+      return Object.freeze({ wav, durationMs: durationMs ?? 0, session: undefined });
+    }
 
     const wav = new Blob([new Uint8Array(44)]);
 
@@ -379,5 +385,62 @@ describe("StreamingDictation", () => {
     await drained();
 
     expect(controller.journaledChunkCount).toBe(2);
+  });
+
+  it("skips the commit when the take is cancelled while the journal drains", async () => {
+    // The #160 shape: the close-guard Discard lands between Stop and the
+    // durable save, so the finalize must neither persist nor transcribe.
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    await drained();
+
+    const result = await controller.finish(500, () => true);
+
+    expect(result.session).toBeUndefined();
+    expect(result.streamed).toBe(false);
+    expect(result.transcript).toBeUndefined();
+    expect(transport.commits).toBe(0);
+    expect(capture.finishes).toBe(1);
+    expect(transport.closeCalls).toBe(1);
+  });
+
+  it("returns the provisional session so a mid-flight Discard can delete it", async () => {
+    // The capture layer's probe fired first (call 1, still live), so its
+    // session row exists; the controller's own probe (call 2) then sees the
+    // Discard: the commit is skipped and the row is the finalize's to remove.
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+    let probes = 0;
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    await drained();
+
+    const result = await controller.finish(500, () => ++probes > 1);
+
+    expect(result.session?.id).toBe("streamed-take");
+    expect(result.streamed).toBe(false);
+    expect(transport.commits).toBe(0);
+  });
+
+  it("still commits when the take stays current through the finalize", async () => {
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    await drained();
+
+    const result = await controller.finish(500, () => false);
+
+    expect(result.streamed).toBe(true);
+    expect(result.session).toBeTruthy();
+    expect(transport.commits).toBe(1);
   });
 });

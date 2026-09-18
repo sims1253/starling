@@ -344,7 +344,7 @@ export interface FinishedStreamCapture {
   readonly wav: Blob;
   readonly durationMs: number;
   /** Present unless durable persistence failed; then `wav` is the only copy. */
-  readonly session?: DictationSession;
+  readonly session?: DictationSession | undefined;
   readonly failure?: unknown;
 }
 
@@ -363,8 +363,13 @@ export interface DictationStreamCapture {
   append(pcm16: Uint8Array): Promise<void>;
   /** Frames journaled so far. */
   appendedFrames(): number;
-  /** Assemble the WAV and persist the session (source-of-truth save). */
-  finish(durationMs?: number): Promise<FinishedStreamCapture>;
+  /**
+   * Assemble the WAV and persist the session (source-of-truth save). The
+   * cancellation probe runs after every await, before each durable write:
+   * when it reports true the session stays unwritten and the provisional
+   * journal is cleaned up, so a discarded take cannot finalize (#160).
+   */
+  finish(durationMs?: number, isCancelled?: () => boolean): Promise<FinishedStreamCapture>;
   /** Drop the journal without creating a session (recording discarded). */
   abandon(): Promise<void>;
 }
@@ -457,10 +462,18 @@ class MemoryStreamCapture implements DictationStreamCapture {
     return this.chunks.reduce((frames, chunk) => frames + chunk.byteLength / 2, 0);
   }
 
-  async finish(durationMs?: number): Promise<FinishedStreamCapture> {
+  async finish(durationMs?: number, isCancelled?: () => boolean): Promise<FinishedStreamCapture> {
     this.closed = true;
     const assembled = assemblePcm16Wav(this.chunks);
     const duration = durationMs ?? assembled.durationMs;
+
+    // The session is the only durable write this path makes; a take
+    // discarded while assembly awaited must not be persisted (#160).
+    if (isCancelled?.()) {
+      this.chunks.length = 0;
+
+      return Object.freeze({ wav: assembled.wav, durationMs: duration, session: undefined });
+    }
 
     try {
       const session = await this.store.create({
@@ -866,11 +879,27 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     return this.chunks.reduce((frames, chunk) => frames + chunk.byteLength / 2, 0);
   }
 
-  async finish(durationMs?: number): Promise<FinishedStreamCapture> {
+  async finish(durationMs?: number, isCancelled?: () => boolean): Promise<FinishedStreamCapture> {
     this.closed = true;
     await this.writeChain.catch(() => {
       /* durability was already reported to the appender */
     });
+
+    // The session insert is the only durable write this path makes; a take
+    // discarded while the journal drained must not be persisted (#160).
+    if (isCancelled?.()) {
+      await this.discard().catch(() => {
+        /* a journal that could not be deleted stays claimed by this window */
+      });
+
+      const assembled = assemblePcm16Wav(this.chunks);
+
+      return Object.freeze({
+        wav: assembled.wav,
+        durationMs: durationMs ?? assembled.durationMs,
+        session: undefined,
+      });
+    }
 
     const assembled = assemblePcm16Wav(this.chunks);
     const duration = durationMs ?? assembled.durationMs;
@@ -883,7 +912,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
       });
 
       await this.discard().catch(() => {
-        /* recovery sweeps journals whose session already exists */
+        /* the post-close sweep consumes a journal that could not be deleted */
       });
 
       return Object.freeze({ wav: assembled.wav, durationMs: duration, session });
@@ -899,7 +928,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     // being durable mid-take still has rows in the store, and a take the
     // user discarded must not resurrect via recovery.
     await this.discard().catch(() => {
-      /* recovery sweeps journals that could not be deleted */
+      /* a journal that could not be deleted stays claimed by this window */
     });
   }
 
@@ -922,7 +951,7 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
     }
   }
 
-  /** The journal is gone or going; the capture's ownership ends with it. */
+  /** The journal is gone; the capture's ownership ends with it. */
   private releaseOwnership(): void {
     if (this.ownershipReleased) return;
     this.ownershipReleased = true;
@@ -931,13 +960,14 @@ class IndexedDbStreamCapture implements DictationStreamCapture {
   }
 
   private async discard(): Promise<void> {
-    try {
-      const database = await this.openDatabase();
+    const database = await this.openDatabase();
 
-      await deleteStreamCapture(database, this.sessionId);
-    } finally {
-      this.releaseOwnership();
-    }
+    await deleteStreamCapture(database, this.sessionId);
+
+    // Ownership ends with the journal, and only then: a delete that failed
+    // keeps the capture claimed, so no sweep can promote a journal its
+    // owner discarded into a resurrected session while this window lives.
+    this.releaseOwnership();
   }
 }
 

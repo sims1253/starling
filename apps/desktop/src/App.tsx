@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
+import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
 import type { PendingAudioState } from "../electron/ipc.js";
 
@@ -560,15 +561,29 @@ export default function App() {
   }, [discardStreamingTake]);
 
   /**
-   * Finalize the streamed take this Stop was issued against. Returns false
-   * when the stream was never usable and the caller should save the
-   * recorder's own capture via the batch path.
+   * Finalize the streamed take this Stop was issued against. The caller
+   * captures the take generation before any await — a close-guard Discard
+   * offered while the stop itself is still running already bumped past it —
+   * and the finalize re-validates it around each durable write, so a Discard
+   * racing the finalize wins: the stale take writes nothing and leaves the
+   * Discard's state untouched (#160). Returns false when the stream was
+   * never usable and the caller should save the recorder's own capture via
+   * the batch path.
    */
   const finishStreamingTake = useCallback(
-    async (stream: StreamingDictation, durationMs: number): Promise<boolean> => {
+    async (
+      stream: StreamingDictation,
+      durationMs: number,
+      generation: number,
+    ): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
+
+      // The take identity this Stop was issued against; the close-guard
+      // Discard bumps takeSeqRef, which flips this probe and cancels the
+      // finalize's writes.
+      const isCurrentTake = () => takeSeqRef.current === generation;
 
       if (bailed) {
         setPartialText(undefined);
@@ -581,47 +596,31 @@ export default function App() {
         return false;
       }
 
-      if (stream.journaledChunkCount === 0) {
-        // The microphone never reached this controller's journal — its
-        // session would be a header-only WAV: drop the empty journal and
-        // keep the recorder's capture through the batch path (#143).
+      setStreamingFinalize(true);
+
+      try {
+        const finalized = await finalizeStreamingTake(
+          {
+            stream,
+            durationMs,
+            isCurrentTake,
+            parkUnsavedWav,
+            refresh,
+            setSelectedId: (id) => setSelectedId(id),
+            setConnectionReady: () => setConnection("ready"),
+            transcribe,
+          },
+          store,
+        );
+
+        if (finalized.discarded) return true;
+
+        return !finalized.batchFallback;
+      } finally {
         setPartialText(undefined);
         setStreamStatus(undefined);
-        await stream.abandon().catch(() => {});
         setStreamingFinalize(false);
-
-        return false;
       }
-
-      const result = await stream.finish(durationMs);
-      setPartialText(undefined);
-      setStreamStatus(undefined);
-
-      if (!result.session) {
-        // The durable save failed; the assembled WAV is the only copy.
-        setStreamingFinalize(false);
-        parkUnsavedWav(result.wav);
-        throw new Error(
-          `Local storage failed: ${messageFrom(result.failure ?? "unknown storage failure")} Keep this window open and download the unsaved WAV to recover it.`,
-        );
-      }
-
-      await refresh();
-
-      if (result.streamed && result.transcript) {
-        await store.saveTranscript(result.session.id, result.transcript, { streamed: true });
-        setSelectedId(result.session.id);
-        setConnection("ready");
-        await refresh();
-      } else {
-        if (result.streamNote) {
-          await store.noteStreamError(result.session.id, result.streamNote).catch(() => {});
-        }
-
-        await transcribe(result.session);
-      }
-
-      return true;
     },
     [parkUnsavedWav, refresh, transcribe],
   );
@@ -637,6 +636,12 @@ export default function App() {
 
     if (shouldStop) {
       if (!lifecycle.beginStop()) return;
+
+      // The take identity this Stop was issued against, captured before any
+      // await: a close-guard Discard offered while the stop itself is still
+      // running bumps takeSeqRef past it, so the finalize below sees a
+      // stale take from its first probe (#160).
+      const generation = takeSeqRef.current;
 
       // The controller bound to the take being stopped, read before any
       // await: Stop must finalize the take that was recorded (#143).
@@ -665,7 +670,7 @@ export default function App() {
           throw new Error("Recording was too short to keep.");
         }
 
-        if (stream && (await finishStreamingTake(stream, capture.durationMs))) {
+        if (stream && (await finishStreamingTake(stream, capture.durationMs, generation))) {
           return;
         }
 
