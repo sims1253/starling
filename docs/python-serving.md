@@ -126,28 +126,30 @@ has been transcribed. If retries remain busy, the server sends
 `{"type":"error","message":"server busy"}` and retains the audio. Retry `commit`
 after a delay; use `reset` only to discard the buffered session.
 
-### Divergence from the native server on invalid stream audio
+### Invalid stream audio (and the remaining divergence from the native server)
 
-The native server rejects invalid `WS /stream` audio loudly: a malformed WAV,
-a non-16 kHz WAV, or an odd-length PCM16 frame produces one error frame and
-invalidates the take until `reset` (see [invalid audio
-frames](native-serving.md#ws-stream)). This server keeps the older, lenient
-behavior instead (issue #156):
+Invalid `WS /stream` audio is refused loudly (issue #173), matching the native
+contract (see [invalid audio frames](native-serving.md#ws-stream)):
 
-- a malformed WAV chunk (RIFF/WAVE magic but undecodable) is dropped with a
-  server-side `log.warning` and no error frame — the session keeps accepting
-  audio (`StreamSession.append_wav` in `src/starling/server.py`);
-- an odd trailing PCM16 byte is discarded with a `log.warning`, keeping the
-  rest of the frame (`_pcm16_bytes_to_float32`);
-- a non-16 kHz WAV is resampled to 16 kHz via scipy and accepted — the native
-  server has no resampler, so this is a genuine feature difference.
+- a malformed WAV chunk (RIFF/WAVE magic but undecodable) is rejected: the
+  server sends one `{"type":"error"}` frame per episode and invalidates the
+  take (`StreamSession.append_wav` in `src/starling/server.py`, reason code
+  `malformed_wav`);
+- raw PCM16 with an odd byte count is rejected the same way (reason code
+  `odd_pcm_length`) — the dangling byte is not silently discarded, because an
+  odd length means a sample was split at a transport boundary;
+- while the take is invalidated, further binary frames are ignored and
+  `{"type":"commit"}` is refused with
+  `{"type":"error","message":"take invalidated (<reason>); reset and resend"}`
+  instead of a successful `final` that silently omits audio;
+- `{"type":"reset"}` clears the invalidation and re-enables audio.
 
-This divergence is intentional: this serving path is deprecated (see above)
-and [slated for retirement after the first native-server
-release](https://github.com/sims1253/starling/issues/19), so the native
-rejection/invalidation contract was deliberately not ported here. Clients
-should code against the [native contract](native-serving.md#ws-stream): do
-not rely on resampling or silent drops surviving in future releases.
+The one remaining divergence is sample rate: a non-16 kHz WAV is resampled to
+16 kHz via scipy and accepted — the native server has no resampler and rejects
+it with `sample_rate_mismatch`, so this is a genuine feature difference.
+Clients should not rely on it surviving: this serving path is deprecated (see
+above) and [slated for retirement after the first native-server
+release](https://github.com/sims1253/starling/issues/19).
 
 Profiles provide supported defaults for the main workloads:
 
