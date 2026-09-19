@@ -792,6 +792,13 @@ kbd {
   min-height: 0;
   overflow-y: auto;
 }
+/* Fixed head zone above the scrolling body: the close button overlaps only
+   this strip, so settings scrolling past never run under the ✕. The right
+   padding reserves the button's column for the title row. */
+.settings-head {
+  flex-shrink: 0;
+  padding-right: 40px;
+}
 .settings-close {
   position: absolute;
   top: 18px;

@@ -91,6 +91,17 @@ function refinedTranscriptSeparator(refined: RefinedTranscript, iso: string) {
   return `--- REFINED TRANSCRIPT — ${refinedTranscriptStamp(refined, iso)} ---`;
 }
 
+/**
+ * The refine action's caption: refining in flight, a stored copy to replace,
+ * or the first run. A named branch instead of a nested ternary at the call
+ * site, so the drawer JSX stays flat.
+ */
+function refineActionLabel(refining: boolean, hasRefined: boolean) {
+  if (refining) return "Refining…";
+
+  return hasRefined ? "Refine again" : "Refine";
+}
+
 /** Stable-enough id for WAVs parked in memory when storage fails. */
 function unsavedWavId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `unsaved-${Date.now()}-${Math.random()}`;
@@ -219,14 +230,18 @@ export default function App() {
 
   // Transcript refinement in flight, keyed by session id like activeIds:
   // each take shows its own spinner, and one take refining never disables or
-  // animates another. The error is keyed the same way: a failure belongs to
-  // the take it came from and never bleeds into another drawer selection.
+  // animates another. The error and the copied flash are keyed the same way:
+  // both belong to the take they came from and never bleed across selections.
   const [refiningIds, setRefiningIds] = useState<ReadonlySet<string>>(() => new Set());
   const refiningIdsRef = useRef(new Set<string>());
   const refineAbortRef = useRef(new Map<string, AbortController>());
   const [refineError, setRefineError] = useState<{ id: string; message: string }>();
-  const [copiedRefined, setCopiedRefined] = useState(false);
+  const [copiedRefinedId, setCopiedRefinedId] = useState<string>();
   const copiedRefinedTimerRef = useRef<number | undefined>(undefined);
+  // True once the user edits the refinement key field this session. The
+  // mount-time decrypt below must never clobber what they typed while it was
+  // in flight, so an edited field is off limits to the async load.
+  const refineApiKeyEditedRef = useRef(false);
 
   // Refinement stays inert until both a base URL and a model are configured.
   const refineConfigured = refineBaseUrl.trim() !== "" && refineModel.trim() !== "";
@@ -248,8 +263,10 @@ export default function App() {
   }, []);
 
   // Refinement key at rest: prefer the safeStorage ciphertext the main
-  // process can decrypt over any plaintext copy. Decryption is best-effort —
-  // when it fails, whatever fallback is already loaded stands.
+  // process can decrypt over any plaintext copy. The loaded key only fills
+  // a field the user has not edited meanwhile (the decrypt is async and can
+  // resolve after they start typing); once it applied, the plaintext copy
+  // that predates the encrypted form is residue and is removed.
   useEffect(() => {
     const bridge = window.starlingDesktop;
     const encrypted = localStorage.getItem("starling:refine:apiKeyEnc");
@@ -259,7 +276,11 @@ export default function App() {
     void bridge
       .loadRefinementKey({ ciphertext: encrypted })
       .then((loaded) => {
-        if (loaded.apiKey) setRefineApiKey(loaded.apiKey);
+        if (!loaded.apiKey) return;
+
+        if (refineApiKeyEditedRef.current) return;
+        setRefineApiKey(loaded.apiKey);
+        localStorage.removeItem("starling:refine:apiKey");
       })
       .catch(() => {
         /* best-effort: the plaintext fallback key (if any) stays in place */
@@ -598,9 +619,9 @@ export default function App() {
 
     try {
       await navigator.clipboard.writeText(selected.refined.text);
-      setCopiedRefined(true);
+      setCopiedRefinedId(selected.id);
       window.clearTimeout(copiedRefinedTimerRef.current);
-      copiedRefinedTimerRef.current = window.setTimeout(() => setCopiedRefined(false), 1400);
+      copiedRefinedTimerRef.current = window.setTimeout(() => setCopiedRefinedId(undefined), 1400);
     } catch (caught) {
       setRefineError({
         id: selected.id,
@@ -1078,12 +1099,26 @@ export default function App() {
    * plaintext copy is removed. Without either (browser preview, or a host
    * with no keychain backend), the key falls back to plaintext localStorage —
    * a documented, deliberate fallback, never a silent one.
+   *
+   * The lifecycle is symmetric on every path: whenever a plaintext key is
+   * written, the ciphertext entry is removed too — otherwise the next mount
+   * would decrypt the stale ciphertext over the newer plaintext. Saving an
+   * empty key clears both entries: there is nothing to encrypt and no
+   * residue to keep.
    */
   async function persistRefinementKey(apiKey: string): Promise<void> {
+    if (apiKey === "") {
+      localStorage.removeItem("starling:refine:apiKey");
+      localStorage.removeItem("starling:refine:apiKeyEnc");
+
+      return;
+    }
+
     const bridge = window.starlingDesktop;
 
     if (!bridge?.storeRefinementKey) {
       localStorage.setItem("starling:refine:apiKey", apiKey);
+      localStorage.removeItem("starling:refine:apiKeyEnc");
 
       return;
     }
@@ -1102,6 +1137,7 @@ export default function App() {
       localStorage.removeItem("starling:refine:apiKey");
     } catch {
       localStorage.setItem("starling:refine:apiKey", apiKey);
+      localStorage.removeItem("starling:refine:apiKeyEnc");
     }
   }
 
@@ -1118,7 +1154,15 @@ export default function App() {
     localStorage.setItem("starling:refine:baseUrl", refineBaseUrl.trim());
     localStorage.setItem("starling:refine:model", refineModel.trim());
     localStorage.setItem("starling:refine:instruction", refineInstruction);
-    await persistRefinementKey(refineApiKey);
+
+    try {
+      await persistRefinementKey(refineApiKey);
+    } catch (caught) {
+      // The fire-and-forget click must not swallow this: persistence can
+      // fail without the bridge too (quota, private mode).
+      setError(`Could not save the refinement API key: ${messageFrom(caught)}`);
+    }
+
     closeSettings();
     void checkHealth(clean);
   }
@@ -1419,19 +1463,22 @@ export default function App() {
                     ) : (
                       <Sparkles size={16} />
                     )}
-                    {refiningIds.has(selected.id)
-                      ? "Refining…"
-                      : selected.refined
-                        ? "Refine again"
-                        : "Refine"}
+                    {refineActionLabel(
+                      refiningIds.has(selected.id),
+                      selected.refined !== undefined,
+                    )}
                   </button>
                   {selected.refined && (
                     <button
                       disabled={refiningIds.has(selected.id)}
                       onClick={() => void copyRefinedText()}
                     >
-                      {copiedRefined ? <Check size={16} /> : <Clipboard size={16} />}
-                      {copiedRefined ? "Copied" : "Copy"}
+                      {copiedRefinedId === selected.id ? (
+                        <Check size={16} />
+                      ) : (
+                        <Clipboard size={16} />
+                      )}
+                      {copiedRefinedId === selected.id ? "Copied" : "Copy"}
                     </button>
                   )}
                 </div>
@@ -1487,11 +1534,15 @@ export default function App() {
             <button className="settings-close" onClick={closeSettings} aria-label="Close settings">
               <X size={18} />
             </button>
-            {/* The body region scrolls while the card stays viewport-bounded,
-                so the footer buttons remain reachable on small screens. */}
-            <div className="settings-body">
+            {/* The head stays fixed above the scrolling body: the close
+                button lives in its zone, so scrolled settings never run
+                under it, and the body region scrolls while the card stays
+                viewport-bounded with the footer always reachable. */}
+            <div className="settings-head">
               <p className="eyebrow">CONNECTION</p>
               <h2 id="settings-title">Transcription server</h2>
+            </div>
+            <div className="settings-body">
               <p>
                 Choose a <code>starling-serve</code> endpoint or an OpenAI-compatible transcription
                 endpoint.
@@ -1588,7 +1639,11 @@ export default function App() {
                     <input
                       type="password"
                       value={refineApiKey}
-                      onChange={(event) => setRefineApiKey(event.target.value)}
+                      onChange={(event) => {
+                        setRefineApiKey(event.target.value);
+                        // Typed input outranks the async decrypt from mount.
+                        refineApiKeyEditedRef.current = true;
+                      }}
                       placeholder="Local servers need none"
                     />
                     <small>
