@@ -54,7 +54,7 @@ From a checkout of the release tag, run:
 
 ```bash
 scripts/release-runtime/check-linux-vulkan.sh \
-  starling-serve-linux-vulkan.tar.gz 0.1.0 6
+  starling-serve-linux-vulkan.tar.gz 0.1.0 8
 ```
 
 Replace the version and ABI with the values expected for that tag. Docker builds
@@ -76,7 +76,7 @@ Same procedure against the CPU image, which installs only `libstdc++6` and
 
 ```bash
 scripts/release-runtime/check-linux-cpu.sh \
-  starling-serve-linux-cpu.tar.gz 0.1.0 6
+  starling-serve-linux-cpu.tar.gz 0.1.0 8
 ```
 
 The check additionally requires `backend: cpu` in the `--version` output so a
