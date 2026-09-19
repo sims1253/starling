@@ -137,7 +137,10 @@ export interface DictationSessionStore {
    * bumps `updatedAt`, and touches nothing else — the raw transcript, its
    * history, any refined copy, and the status all stay exactly as they were.
    * Membership is a label for chaining refinement context, never a mutation
-   * of the take's own records.
+   * of the take's own records. Assignment is permanent for the session's
+   * lifetime: there is deliberately no un-assign, and moving a take between
+   * threads can only arrive as a future explicit feature — a re-assignment
+   * to a different id supersedes the label, but nothing ever clears it.
    */
   assignThread(id: string, threadId: string): Promise<DictationSession>;
   /**
@@ -248,14 +251,23 @@ function errorText<Cause>(cause: Cause): string {
   return serialized ?? String(cause);
 }
 
+/**
+ * The shared id rules: non-empty and single-line. Both the session id and
+ * the refinement-thread id are checked through this one helper so their
+ * contracts (and the error wording callers rely on) cannot drift apart.
+ */
+function assertNonEmptySingleLine(value: string, label: string): void {
+  if (!value || /[\r\n]/.test(value)) {
+    throw new TypeError(`${label} must be non-empty and contain no newlines`);
+  }
+}
+
 function assertCreateInput(input: CreateSessionInput): void {
   if (!(input.wav instanceof Blob) || input.wav.size === 0) {
     throw new TypeError("wav must be a non-empty Blob");
   }
 
-  if (input.id !== undefined && (!input.id || /[\r\n]/.test(input.id))) {
-    throw new TypeError("session id must be non-empty and contain no newlines");
-  }
+  if (input.id !== undefined) assertNonEmptySingleLine(input.id, "session id");
 
   if (
     input.durationMs !== undefined &&
@@ -266,14 +278,12 @@ function assertCreateInput(input: CreateSessionInput): void {
 }
 
 /**
- * Thread ids follow the session-id rules (non-empty, no newlines) so a value
- * the schema's NonEmptyString would quarantine on its next read is rejected
- * at the write boundary in both stores, memory included.
+ * Thread ids share the session-id rules through assertNonEmptySingleLine so
+ * a value the schema's NonEmptyString would quarantine on its next read is
+ * rejected at the write boundary in both stores, memory included.
  */
 function assertThreadId(threadId: string): void {
-  if (!threadId || /[\r\n]/.test(threadId)) {
-    throw new TypeError("thread id must be non-empty and contain no newlines");
-  }
+  assertNonEmptySingleLine(threadId, "thread id");
 }
 
 interface TranscriptDraft {
