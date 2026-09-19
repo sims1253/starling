@@ -517,7 +517,10 @@ def probe_target_assets(t: dict, repo_root: Path = REPO_ROOT) -> AssetProbe:
             # root + "/models/<name>.gguf") — probing any env-provided file
             # would pin a GGUF the binary never reads (pullfrog review).
             path = repo_root / gguf["default_path"]
-            _check_gguf_pin(t, path, gguf.get("sha256", ""), problems)
+            if path.exists():
+                _check_gguf_pin(t, path, gguf.get("sha256", ""), problems)
+            else:
+                missing.append(f"gguf:{gguf['default_path']} (hardcoded binary path)")
         else:
             env, default = gguf.get("env", ""), gguf.get("default_path", "")
             raw = os.environ.get(env, "") if env else ""

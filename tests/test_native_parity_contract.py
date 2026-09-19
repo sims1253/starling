@@ -348,3 +348,33 @@ def test_probe_detects_hash_mismatch_as_problem(tmp_path, monkeypatch) -> None:
     entry["gguf"]["sha256"] = pc.sha256_file(gguf)
     probe = pc.probe_target_assets(entry, repo_root=tmp_path)
     assert probe.present and not probe.problems and not probe.missing
+
+
+def test_probe_handles_absent_hardcoded_gguf(tmp_path, monkeypatch) -> None:
+    """An absent HARDCODED (cpp-test binary) GGUF is MISSING coverage — never
+    a crash and never an env-override lookup. Regression test: CI runners
+    have no models/ at all, and the binary itself ignores the env override
+    (pullfrog review on PR #182)."""
+    entry = {
+        "id": "x.cpptest", "engine": "cpp-test", "model": "x", "needs_lib": False,
+        "gguf": {"hardcoded": True, "default_path": "models/x.gguf",
+                 "sha256": "0" * 64},
+    }
+    # A stray env override must NOT redirect the probe to a different file...
+    monkeypatch.setenv("X_GGUF", str(tmp_path / "decoy.gguf"))
+    (tmp_path / "decoy.gguf").write_bytes(b"decoy")
+    # ...and the absent hardcoded path must report missing, not raise.
+    probe = pc.probe_target_assets(entry, repo_root=tmp_path)
+    assert probe.missing == ["gguf:models/x.gguf (hardcoded binary path)"]
+    assert probe.problems == [] and not probe.present
+
+    # With the file present at the hardcoded path, the pin applies there.
+    (tmp_path / "models").mkdir()
+    real = tmp_path / "models" / "x.gguf"
+    real.write_bytes(b"payload")
+    probe = pc.probe_target_assets(entry, repo_root=tmp_path)
+    assert probe.missing == []
+    assert probe.problems and "sha256" in probe.problems[0]
+    entry["gguf"]["sha256"] = pc.sha256_file(real)
+    probe = pc.probe_target_assets(entry, repo_root=tmp_path)
+    assert probe.present and not probe.problems
