@@ -26,6 +26,24 @@ export const REFINEMENT_DEFAULT_INSTRUCTION = [
   "Reply with the refined transcript only — no preamble, explanation, or quotation marks.",
 ].join(" ");
 
+/**
+ * The built-in instruction for a turn refined inside a thread (#117): the
+ * assistant message holds the thread's current text and the user message is
+ * a new dictated turn — either an edit instruction about that text or
+ * additional dictation. The same wording, meaning, language, and order
+ * discipline as the single-turn default applies, and the reply is the
+ * complete updated text.
+ */
+export const REFINEMENT_THREAD_INSTRUCTION = [
+  "You are a transcription editor working on a running dictation thread.",
+  "The assistant message is the thread's current text.",
+  "The user message is a new dictated turn: either an edit instruction about that text or additional dictation — apply it accordingly.",
+  "Return the complete updated text, and nothing else.",
+  "Preserve the original wording, meaning, language, and order;",
+  "never add, omit, summarize, or translate content.",
+  "Reply without preamble, explanation, or quotation marks.",
+].join(" ");
+
 /** One chat-completions turn as sent on the wire. */
 export interface RefinementMessage {
   /** "assistant" is accepted so a future caller can inject prior-turn context. */
@@ -52,6 +70,13 @@ export interface RefineEffectOptions {
   readonly fetchImpl?: typeof globalThis.fetch | undefined;
   readonly signal?: AbortSignal | undefined;
   readonly timeoutMs?: number | undefined;
+  /**
+   * Multi-turn context (#117): the thread's current text, sent as the
+   * assistant message before the new dictated turn. Whitespace-only is
+   * treated as absent, so a thread whose earlier turns never refined sends
+   * the same system+user pair as a standalone refinement.
+   */
+  readonly contextText?: string | undefined;
 }
 
 interface ChatCompletionRequest {
@@ -150,25 +175,55 @@ export type RefinementError =
   | RefinementTimeoutError
   | RefinementTransportError;
 
+/** Optional multi-turn context accepted by buildRefinementMessages. */
+export interface BuildRefinementOptions {
+  /**
+   * The thread's current text, sent as the assistant message before the new
+   * dictated turn. Whitespace-only is treated as absent, which keeps a
+   * thread head or an unrefined thread on the standalone message pair.
+   */
+  readonly contextText?: string | undefined;
+}
+
 /**
- * Chat-completions messages for one refinement request: the instruction as
- * the system turn, the raw transcript as the user turn. The pair is rebuilt
- * from the raw transcript every call; a future caller can extend the array
- * with prior assistant/user turns for iterative refinement.
+ * Chat-completions messages for one refinement request. Standalone, the pair
+ * is the instruction as the system turn and the raw transcript as the user
+ * turn. With `options.contextText` present, an assistant turn carrying the
+ * thread's current text is inserted between them and the built-in
+ * instruction becomes the multi-turn contract — a custom instruction still
+ * wins verbatim in both modes, exactly like the single-turn path.
  */
 export function buildRefinementMessages(
   rawTranscript: string,
   settings: RefinementSettings,
+  options?: BuildRefinementOptions,
 ): readonly RefinementMessage[] {
   const instruction = settings.instruction?.trim();
+  const contextText = options?.contextText?.trim();
 
-  return Object.freeze([
-    Object.freeze({
-      role: "system",
-      content: instruction || REFINEMENT_DEFAULT_INSTRUCTION,
-    }) satisfies RefinementMessage,
+  const system = instruction
+    ? instruction
+    : contextText
+      ? REFINEMENT_THREAD_INSTRUCTION
+      : REFINEMENT_DEFAULT_INSTRUCTION;
+
+  const messages: RefinementMessage[] = [
+    Object.freeze({ role: "system", content: system }) satisfies RefinementMessage,
+  ];
+
+  // The thread's current text rides as the assistant turn: the model reads
+  // its own prior answer, which is what a running document is to it.
+  if (contextText) {
+    messages.push(
+      Object.freeze({ role: "assistant", content: contextText }) satisfies RefinementMessage,
+    );
+  }
+
+  messages.push(
     Object.freeze({ role: "user", content: rawTranscript }) satisfies RefinementMessage,
-  ]);
+  );
+
+  return Object.freeze(messages);
 }
 
 function describeCause(cause: unknown): string {
@@ -334,7 +389,9 @@ export function refineEffect(
           headers,
           body: JSON.stringify({
             model,
-            messages: buildRefinementMessages(rawTranscript, settings),
+            messages: buildRefinementMessages(rawTranscript, settings, {
+              contextText: options.contextText,
+            }),
             stream: false,
           } satisfies ChatCompletionRequest),
           signal: fiberSignal,
