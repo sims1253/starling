@@ -316,6 +316,115 @@ describe("retry-safe session storage", () => {
     assert.deepEqual((await store.listReport()).invalid, []);
     store.close();
   });
+
+  it("assigns sessions to refinement threads without disturbing their records", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "threaded", wav });
+    await memory.markAttempt("threaded");
+    await memory.saveTranscript("threaded", { text: "raw words", segments: [] });
+    await memory.saveRefinedTranscript("threaded", {
+      text: "Raw words.",
+      model: "llama3.1",
+      createdAt: 1_760_000_000_000,
+    });
+
+    const assigned = await memory.assignThread("threaded", "thread-9f1c");
+
+    // Membership is a label: transcript, history, refinement, status, and
+    // attempt count are exactly what they were before the assignment.
+    assert.equal(assigned.threadId, "thread-9f1c");
+    assert.equal(assigned.transcript?.text, "raw words");
+    assert.equal(assigned.refined?.text, "Raw words.");
+    assert.deepEqual(assigned.transcriptHistory, []);
+    assert.equal(assigned.status, "transcribed");
+    assert.equal(assigned.attemptCount, 1);
+    assert.notEqual(new Date(assigned.updatedAt).getTime(), 0);
+
+    // Re-assignment moves the label in place, like re-refining overwrites.
+    const moved = await memory.assignThread("threaded", "thread-next");
+
+    assert.equal(moved.threadId, "thread-next");
+    assert.equal(moved.transcript?.text, "raw words");
+    assert.equal(exportDictationSession(moved).manifest.threadId, "thread-next");
+
+    // Sessions nobody assigned stay unthreaded.
+    await memory.create({ id: "lonely", wav });
+    assert.equal((await memory.get("lonely"))?.threadId, undefined);
+
+    await assert.rejects(
+      memory.assignThread("missing", "thread-9f1c"),
+      DictationSessionNotFoundError,
+    );
+    await assert.rejects(memory.assignThread("lonely", ""), TypeError);
+    await assert.rejects(memory.assignThread("lonely", "bad\nid"), TypeError);
+  });
+
+  it("keeps thread assignment across an IndexedDB reopen", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "thread-reopen", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "reopened-thread", wav });
+    await store.markAttempt("reopened-thread");
+    await store.saveTranscript("reopened-thread", { text: "raw", segments: [] });
+    await store.saveRefinedTranscript("reopened-thread", {
+      text: "Raw.",
+      model: "llama3.1",
+      createdAt: 2,
+    });
+
+    const assigned = await store.assignThread("reopened-thread", "thread-abc12345");
+
+    assert.equal(assigned.threadId, "thread-abc12345");
+    assert.equal(assigned.transcript?.text, "raw");
+    store.close();
+
+    // The assignment survives the reopen: same label, same records.
+    const reopened = new IndexedDbSessionStore(options);
+    const restored = await reopened.get("reopened-thread");
+
+    assert.ok(restored);
+    assert.equal(restored.threadId, "thread-abc12345");
+    assert.equal(restored.transcript?.text, "raw");
+    assert.equal(restored.refined?.text, "Raw.");
+    assert.equal(exportDictationSession(restored).manifest.threadId, "thread-abc12345");
+    assert.deepEqual((await reopened.listReport()).invalid, []);
+    reopened.close();
+  });
+
+  it("decodes records persisted before thread membership existed", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "pre-thread-history";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    // A record exactly as the pre-thread store wrote it: no threadId field.
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "pre-thread",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "transcribed",
+      wav,
+      durationMs: 25,
+      attemptCount: 1,
+      transcript: { text: "written before threads existed", segments: [] },
+    });
+
+    v1.close();
+
+    const restored = await store.get("pre-thread");
+
+    assert.ok(restored);
+    assert.equal(restored.threadId, undefined);
+    assert.equal(restored.transcript?.text, "written before threads existed");
+
+    // Thread membership still attaches to such a record without migration.
+    const assigned = await store.assignThread("pre-thread", "thread-late");
+
+    assert.equal(assigned.threadId, "thread-late");
+    assert.deepEqual((await store.listReport()).invalid, []);
+    store.close();
+  });
 });
 
 function chunkOf(frames: number, fill = 1): Uint8Array {
