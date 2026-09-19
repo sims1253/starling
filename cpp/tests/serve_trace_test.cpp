@@ -6,9 +6,11 @@
 //   - queue_enter (with admission policy + waiter depth) -> queue_wait ->
 //     engine records (correlated by req) -> request -> queue_exit ->
 //     response, in that order;
-//   - engine-layer records (chunk/stage/graph/cache) carry the request id
-//     through the C boundary (RequestScope);
-//   - a second request of the same shape produces encoder-cache hits;
+//   - engine-layer records (chunk/stage on CPU) carry the request id
+//     through the C boundary (RequestScope) — the captured-graph cache
+//     records are GPU-gated and covered by trace_schema_test;
+//   - early queue departures (server_busy / timed_out / cancelled) emit
+//     their terminal records, keeping the enter/exit ledger balanced;
 //   - the anon-caller path (no RequestContext) synthesizes "#anon-N" ids.
 //
 // Usage: ./serve_trace_test
@@ -17,9 +19,13 @@
 #include "tiny_granite_fixture.hpp"
 #include "trace_test_support.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 int failures = 0;
@@ -187,6 +193,126 @@ static void e2e_checks(starling::serve::StarlingServer& server) {
     check(anon_enter, "e2e: anonymous caller gets a synthesized #anon-N ticket");
     check(anon_policy, "e2e: anonymous caller declares skip_if_busy policy");
 }
+// Early-departure coverage (pullfrog review of #183): every queue_enter
+// must balance against exactly one terminal queue_exit carrying a reason,
+// and abandoned waits must be measured. Contention is deterministic: a long
+// transcription holds the turn (waited on via ctx->running) before each
+// departing probe runs; retries cover a slow machine finishing the
+// occupier early.
+static void contention_checks(starling::serve::StarlingServer& server,
+                              std::vector<std::string>& logs) {
+    const int64_t kSampleRate = 16000;
+    // 120 s -> ~120 one-second chunks on the tiny fixture: comfortably
+    // longer than the 150 ms timeout and the probe delays.
+    std::vector<float> long_pcm((size_t)(120.0 * kSampleRate), 0.0f);
+
+    auto occupy = [&](const char* id)
+        -> std::pair<starling::serve::RequestContext*, std::thread> {
+        auto* occ = server.register_request(id);
+        std::string err;
+        std::thread t([&server, occ, &long_pcm, &err] {
+            auto r = server.transcribe_pcm(long_pcm.data(),
+                                           (int64_t)long_pcm.size(), occ, &err);
+            (void)r;
+        });
+        for (int i = 0; i < 600 && !occ->running.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(occ->running.load(), std::string("contention: ") + id + " reached the turn");
+        return {occ, std::move(t)};
+    };
+
+    // --- skip_if_busy refusal while the turn is held ----------------------
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        auto [occ, t] = occupy("req-occupy-busy");
+        std::string berr;
+        const std::string log = capture_stderr([&] {
+            auto rb = server.transcribe_pcm(long_pcm.data(),
+                                            (int64_t)long_pcm.size(), nullptr, &berr,
+                                            starling::serve::QueuePolicy::SkipIfBusy);
+            (void)rb;
+        });
+        t.join();
+        server.finish_request(occ);
+        if (berr == "server busy") {
+            bool refused = false;
+            for (const auto& r : parse(log)) {
+                if (r.ev == "queue_exit" && r.req.rfind("#anon-", 0) == 0 &&
+                    json_str(r.raw, "reason") == "server_busy")
+                    refused = true;
+            }
+            check(refused,
+                  "contention: skip_if_busy refusal emits queue_exit(reason=server_busy)");
+            logs.push_back(log);
+            break;
+        }
+        check(attempt == 3, "contention: busy scenario hit within the retries");
+    }
+
+    // --- timeout while parked behind the turn (server built with 0.15 s) --
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        auto [occ, t] = occupy("req-occupy-timeout");
+        auto* ctx = server.register_request("req-timeout");
+        std::string terr;
+        const std::string log = capture_stderr([&] {
+            auto rt = server.transcribe_pcm(long_pcm.data(),
+                                            (int64_t)long_pcm.size(), ctx, &terr);
+            (void)rt;
+        });
+        t.join();
+        server.finish_request(occ);
+        server.finish_request(ctx);
+        if (terr == "request timed out") {
+            auto rs = parse(log);
+            bool timed_out = false, waited = false;
+            for (const auto& r : rs) {
+                if (r.ev == "queue_exit" && r.req == "req-timeout" &&
+                    json_str(r.raw, "reason") == "timed_out")
+                    timed_out = true;
+                if (r.ev == "queue_wait" && r.req == "req-timeout" && r.dur_ms > 0.0)
+                    waited = true;
+            }
+            check(timed_out, "contention: timeout emits queue_exit(reason=timed_out)");
+            check(waited, "contention: the abandoned wait is measured (queue_wait > 0)");
+            logs.push_back(log);
+            break;
+        }
+        check(attempt == 3, "contention: timeout scenario hit within the retries");
+    }
+
+    // --- cancellation while parked behind the turn -------------------------
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        auto [occ, t] = occupy("req-occupy-cancel");
+        auto* ctx = server.register_request("req-cancel");
+        std::string cerr_;
+        // The whole victim lifecycle (enter -> wait -> cancelled exit) runs
+        // inside the capture so the ledger sees a balanced pair.
+        const std::string log = capture_stderr([&] {
+            std::thread blk([&server, ctx, &long_pcm, &cerr_] {
+                auto rc = server.transcribe_pcm(long_pcm.data(),
+                                                (int64_t)long_pcm.size(), ctx, &cerr_);
+                (void)rc;
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            server.cancel_request("req-cancel");
+            blk.join();
+        });
+        t.join();
+        server.finish_request(occ);
+        server.finish_request(ctx);
+        if (cerr_ == "cancelled") {
+            bool cancelled = false;
+            for (const auto& r : parse(log)) {
+                if (r.ev == "queue_exit" && r.req == "req-cancel" &&
+                    json_str(r.raw, "reason") == "cancelled")
+                    cancelled = true;
+            }
+            check(cancelled, "contention: cancellation emits queue_exit(reason=cancelled)");
+            logs.push_back(log);
+            break;
+        }
+        check(attempt == 3, "contention: cancel scenario hit within the retries");
+    }
+}
 #endif // !_WIN32
 
 int main() {
@@ -204,6 +330,36 @@ int main() {
         cfg.gguf_path = fixture.path.string();
         starling::serve::StarlingServer server(cfg);
         e2e_checks(server);
+
+        // A second, short-deadline server instance drives the early
+        // departures (busy/timeout/cancel).
+        starling::serve::ServerConfig cfg2 = cfg;
+        cfg2.request_timeout_seconds = 0.15;
+        starling::serve::StarlingServer contention_server(cfg2);
+        std::vector<std::string> contention_logs;
+        contention_checks(contention_server, contention_logs);
+
+        // Ledger invariant across everything captured: every request whose
+        // queue_enter is IN a captured window also has its terminal
+        // queue_exit there (an occupier's records can straddle the capture
+        // window — enter before, exit after — so enter-less tails are
+        // expected and excluded).
+        std::map<std::string, std::pair<int, int>> ledger;
+        for (const auto& log : contention_logs) {
+            for (const auto& r : parse(log)) {
+                if (r.ev == "queue_enter") ledger[r.req].first++;
+                if (r.ev == "queue_exit") ledger[r.req].second++;
+            }
+        }
+        int fully_seen = 0;
+        bool balanced = true;
+        for (const auto& [req, cnt] : ledger) {
+            if (cnt.first == 0) continue;  // straddling occupier tail
+            ++fully_seen;
+            if (cnt.first != cnt.second) balanced = false;
+        }
+        check(fully_seen >= 3 && balanced,
+              "ledger: every queue_enter balances one queue_exit");
     }
 #endif
     std::printf("%s\n", failures ? "SERVE TRACE FAILED" : "SERVE TRACE OK");

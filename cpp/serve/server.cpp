@@ -286,27 +286,41 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                 policy == QueuePolicy::SkipIfBusy ? "skip_if_busy" : "block");
         }
 
+        // Wait for our turn (head of the queue), with a timeout. wait_start
+        // also measures abandoned waits: leave_queue emits it so skip
+        // refusals, timeouts and cancellations carry their host-blocked time.
+        auto wait_start = std::chrono::steady_clock::now();
+
         // Leave the queue (waiter gone, ticket removed). Lock is held.
-        auto leave_queue = [&]() {
+        // `reason` feeds the queue_exit trace record so early departures
+        // (busy/cancel/timeout) stay visible and the record-derived depth
+        // stays balanced — exactly the outcomes the trace exists to
+        // diagnose (pullfrog review of #183).
+        auto leave_queue = [&](const char* reason) {
             n_waiters_--;
             auto it = std::find(request_order_.begin(),
                                 request_order_.end(), req_id);
             if (it != request_order_.end()) request_order_.erase(it);
+            if (trace::on()) {
+                trace::queue_wait_event(
+                    req_id,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - wait_start).count());
+                trace::queue_exit_event(req_id, n_waiters_, reason);
+            }
             queue_cv_.notify_all();
         };
 
-        // Wait for our turn (head of the queue), with a timeout.
-        auto wait_start = std::chrono::steady_clock::now();
         while (request_order_.front() != req_id) {
             if (ctx && ctx->cancelled.load()) {
-                leave_queue();
+                leave_queue("cancelled");
                 if (err) *err = "cancelled";
                 return false;
             }
             if (policy == QueuePolicy::SkipIfBusy) {
                 // Anonymous latency-sensitive caller (WS streaming chunk):
                 // don't park on the queue — report busy and retry later.
-                leave_queue();
+                leave_queue("server_busy");
                 if (err) *err = "server busy";
                 return false;
             }
@@ -315,7 +329,7 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                 auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - wait_start).count();
                 if (elapsed >= timeout) {
-                    leave_queue();
+                    leave_queue("timed_out");
                     if (err) *err = "request timed out";
                     return false;
                 }
@@ -338,6 +352,7 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
         n_waiters_--;
         request_order_.pop_front();
         queue_cv_.notify_all();
+        if (trace::on()) trace::queue_exit_event(req_id, n_waiters_, "cancelled");
         if (err) *err = "cancelled";
         return false;
     }
@@ -376,7 +391,7 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             cancel_won = ctx->cancelled.load();
         }
         queue_cv_.notify_all();
-        if (tr_on) trace::queue_event("queue_exit", req_id, n_waiters_);
+        if (tr_on) trace::queue_exit_event(req_id, n_waiters_, "completed");
     }
 
     if (cancel_won) {

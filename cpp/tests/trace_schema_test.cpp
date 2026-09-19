@@ -147,7 +147,7 @@ int main() {
     {
         const std::string log = capture_stderr([] {
             starling::ggml::trace::queue_event("queue_enter", "req-Q", 2, "block");
-            starling::ggml::trace::queue_event("queue_exit", "req-Q", 1);
+            starling::ggml::trace::queue_exit_event("req-Q", 1, "server_busy");
             starling::ggml::trace::queue_wait_event("req-Q", 0.5);
             starling::ggml::trace::response_event(0.25);
             starling::ggml::trace::chunk_event(2, 12.5);
@@ -163,8 +163,9 @@ int main() {
                       json_str(lines[0], "policy") == "block",
                   "kinds: queue_enter req+depth+policy");
             check(ev_of(lines[1]) == "queue_exit" && json_num(lines[1], "depth") == 1.0 &&
-                      !has_field(lines[1], "policy"),
-                  "kinds: queue_exit has no policy");
+                      !has_field(lines[1], "policy") &&
+                      json_str(lines[1], "reason") == "server_busy",
+                  "kinds: queue_exit carries its departure reason, no policy");
             check(ev_of(lines[2]) == "queue_wait" && json_num(lines[2], "dur_ms") == 0.5,
                   "kinds: queue_wait dur");
             check(ev_of(lines[3]) == "response", "kinds: response");

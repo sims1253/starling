@@ -301,9 +301,9 @@ Record kinds and fields:
 | `ev` | Layer | Fields |
 | --- | --- | --- |
 | `queue_enter` | serving | `req`, `policy` (`block`/`skip_if_busy`), `depth` (waiters after enqueue) |
-| `queue_wait` | serving | `req`, `dur_ms` (host time blocked waiting for the serial-queue turn) |
+| `queue_wait` | serving | `req`, `dur_ms` (host time blocked waiting for the serial-queue turn; emitted on turn acquisition AND on abandoned departures — skip refusal, timeout, cancellation) |
 | `request` | serving | `dur_ms` (engine-call wall time) |
-| `queue_exit` | serving | `req`, `depth` (waiters after release) |
+| `queue_exit` | serving | `req`, `reason` (`completed`/`cancelled`/`server_busy`/`timed_out`), `depth` (waiters after release). Terminal: every `queue_enter` balances exactly one `queue_exit` |
 | `response` | serving | `dur_ms` (result marshalling; the HTTP body build and socket write are outside the trace) |
 | `chunk` | engine | `chunk` (1-based), `dur_ms` |
 | `stage` | engine | `stage` (`mel_enc_proj`, `prompt_embeds`, `generate`), `dur_ms` |
@@ -332,6 +332,11 @@ Reading the numbers correctly (binding rules):
   of a chunk sum to that chunk's engine work; the `chunk` records of a request
   sum to its engine time inside `request`. `graph_replay` + `readback_sync`
   overlap the stage walls (they are leaves, not additional time).
+- **The queue ledger balances.** Every `queue_enter` has exactly one
+  terminal `queue_exit` whose `reason` says how the ticket left
+  (`completed`, `server_busy`, `timed_out`, `cancelled`), and `queue_wait`
+  fires for abandoned waits too — the contention outcomes the trace exists
+  to diagnose are never invisible.
 - **No contents.** Records carry ids, indices, shape dimensions, and cache
   occupancy — never audio, transcripts, prompts, or tensor contents.
 - **Scope.** Chunk/stage spans currently come from the granite engine (the

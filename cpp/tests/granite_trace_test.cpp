@@ -8,8 +8,10 @@
 //     STARLING_GRANITE_TIMING clocks (both gates on coexist);
 //   - graph records: graph_build/graph_replay/readback_sync with uid, node
 //     count, output shape, and device name;
-//   - cache records: granite.encoder misses on the first decode of a shape,
-//     hits on the second;
+//   - cache record KINDS are schema-checked here via a direct CPU
+//     ReplayGraph + a labeled LruCache (the engine's captured-graph caches
+//     are GPU-gated, so engine-decode records cover chunk/stage only on
+//     CPU);
 //   - reconciliation: each chunk's three stage durations sum to at most the
 //     chunk's wall time (stages are clock-nested inside the chunk span —
 //     never double-counted into it).

@@ -106,23 +106,21 @@ long long now_us();
 // Escape a string for JSON (same rules as the server's json_escape).
 std::string json_escape(const std::string& s);
 
-// Emit one record. `fields` is the comma-joined, already-JSON fragment for
-// this record's own fields (e.g. "\"ev\":\"queue_enter\",\"depth\":2"); the
-// common prefix (v/ts/tid/req/chunk) is prepended here. No-op when the gate
-// is off — callers still avoid measuring, so this is the last line of
-// defense, not the only one.
-void emit(const std::string& fields);
-
 // ---- record kinds ------------------------------------------------------------
 // All helpers are no-ops when the gate is off.
 
-// queue_enter / queue_exit: the serving layer's serial-queue arrival and
-// release points, with the waiter depth AFTER the change. `req` is passed
+// queue_enter: arrival at the serial queue, with the admission policy and
+// the waiter depth after enqueue. queue_exit: the ONE terminal record every
+// queue_enter eventually gets, carrying why the ticket left — "completed"
+// after the engine call, or "cancelled" / "server_busy" / "timed_out" for
+// the early-departure paths. queue_wait fires whenever a ticket stops
+// waiting, including abandoned waits (skip refusal, timeout, cancellation)
+// — the duration is the host time blocked up to departure. `req` is passed
 // explicitly: the waiting phase sits outside RequestScope, which only wraps
-// the engine call. queue_enter also carries the admission policy ("block" /
-// "skip_if_busy").
+// the engine call.
 void queue_event(const char* ev, const std::string& req, int depth,
                  const char* policy = nullptr);
+void queue_exit_event(const std::string& req, int depth, const char* reason);
 
 // queue_wait: host time blocked waiting for the serial-queue turn.
 void queue_wait_event(const std::string& req, double dur_ms);
@@ -215,11 +213,6 @@ inline std::string json_escape(const std::string& s) {
     return out;
 }
 
-inline void emit(const std::string& fields) {
-    if (!on()) return;
-    detail::write_record(fields + detail::correlation_fields());
-}
-
 inline void queue_event(const char* ev, const std::string& req, int depth,
                         const char* policy) {
     if (!on()) return;
@@ -238,6 +231,14 @@ inline void queue_wait_event(const std::string& req, double dur_ms) {
                          json_escape(req) + "\",\"dur_ms\":" + buf);
 }
 
+inline void queue_exit_event(const std::string& req, int depth, const char* reason) {
+    if (!on()) return;
+    detail::write_record("\"ev\":\"queue_exit\",\"req\":\"" + json_escape(req) +
+                         "\",\"reason\":\"" + reason +
+                         "\",\"depth\":" + std::to_string(depth));
+}
+
+
 inline void request_event(double dur_ms) {
     if (!on()) return;
     char buf[96];
@@ -245,6 +246,7 @@ inline void request_event(double dur_ms) {
     detail::write_record(std::string("\"ev\":\"request\",\"dur_ms\":") + buf +
                          detail::correlation_fields());
 }
+
 
 inline void response_event(double dur_ms) {
     if (!on()) return;

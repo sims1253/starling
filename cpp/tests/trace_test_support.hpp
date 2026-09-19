@@ -24,12 +24,12 @@
 // stderr capture + GRANITE_STAGE line parsing.
 // --------------------------------------------------------------------------- //
 #ifdef _WIN32
-std::string capture_stderr(const std::function<void()>& fn) {
+inline std::string capture_stderr(const std::function<void()>& fn) {
     fn();  // no capture on Windows; the e2e layer is skipped by the caller
     return "";
 }
 #else
-std::string capture_stderr(const std::function<void()>& fn) {
+inline std::string capture_stderr(const std::function<void()>& fn) {
     const char* tmpl = "/tmp/granite_stage_stderr_XXXXXX";
     std::vector<char> name(tmpl, tmpl + std::strlen(tmpl) + 1);
     const int fd = mkstemp(name.data());
