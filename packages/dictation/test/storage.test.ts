@@ -196,6 +196,152 @@ describe("retry-safe session storage", () => {
     assert.equal(saved.streamError, "live transcription unavailable");
     assert.equal(exportDictationSession(saved).manifest.streamed, true);
   });
+
+  it("stores the refined transcript beside, never in place of, the raw one", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "refined", wav });
+    await memory.markAttempt("refined");
+    await memory.saveTranscript("refined", { text: "raw words", segments: [] });
+
+    const refined = await memory.saveRefinedTranscript("refined", {
+      text: "Raw words.",
+      model: "llama3.1",
+      createdAt: 1_760_000_000_000,
+    });
+
+    // The refinement is a labeled extra: the raw transcript, its history, the
+    // status, and the attempt count are exactly what they were before.
+    assert.equal(refined.transcript?.text, "raw words");
+    assert.deepEqual(refined.transcriptHistory, []);
+    assert.equal(refined.status, "transcribed");
+    assert.equal(refined.attemptCount, 1);
+    assert.equal(refined.refined?.text, "Raw words.");
+    assert.equal(refined.refined?.model, "llama3.1");
+    assert.equal(refined.refined?.createdAt, 1_760_000_000_000);
+    assert.ok(Object.isFrozen(refined.refined));
+    assert.notEqual(new Date(refined.updatedAt).getTime(), 0);
+
+    // A retry that succeeds after a refinement keeps the raw transcript swap
+    // from touching the stored refinement.
+    await memory.markAttempt("refined");
+    const retried = await memory.saveTranscript("refined", { text: "raw words 2", segments: [] });
+
+    assert.equal(retried.refined?.text, "Raw words.");
+    assert.deepEqual(
+      retried.transcriptHistory?.map((entry) => entry.text),
+      ["raw words"],
+    );
+
+    assert.equal(exportDictationSession(retried).manifest.refined?.model, "llama3.1");
+    await assert.rejects(
+      memory.saveRefinedTranscript("missing", { text: "x", model: "m", createdAt: 1 }),
+      DictationSessionNotFoundError,
+    );
+  });
+
+  it("overwrites the refined transcript when a take is refined again", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "refine-again", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "again", wav });
+    await store.markAttempt("again");
+    await store.saveTranscript("again", { text: "raw", segments: [] });
+
+    const first = await store.saveRefinedTranscript("again", {
+      text: "First pass.",
+      model: "llama3.1",
+      createdAt: 1,
+    });
+
+    assert.equal(first.refined?.text, "First pass.");
+
+    const second = await store.saveRefinedTranscript("again", {
+      text: "Second pass.",
+      model: "qwen",
+      createdAt: 2,
+    });
+
+    assert.equal(second.refined?.text, "Second pass.");
+    assert.equal(second.refined?.model, "qwen");
+    assert.equal(second.transcript?.text, "raw");
+    store.close();
+
+    // The overwrite survives a reopen: one refined copy, the latest one.
+    const reopened = new IndexedDbSessionStore(options);
+    const restored = await reopened.get("again");
+
+    assert.ok(restored);
+    assert.equal(restored.refined?.text, "Second pass.");
+    assert.equal(restored.refined?.model, "qwen");
+    assert.equal(restored.transcript?.text, "raw");
+    assert.equal(exportDictationSession(restored).manifest.refined?.text, "Second pass.");
+    reopened.close();
+  });
+
+  it("decodes records persisted before the refined field existed", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "pre-refined-history";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    // A record exactly as v-of-the-day wrote it: no refined field at all.
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "pre-refined",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "transcribed",
+      wav,
+      durationMs: 25,
+      attemptCount: 1,
+      transcript: { text: "written before refinement existed", segments: [] },
+    });
+
+    v1.close();
+
+    const restored = await store.get("pre-refined");
+
+    assert.ok(restored);
+    assert.equal(restored.refined, undefined);
+    assert.equal(restored.transcript?.text, "written before refinement existed");
+
+    // Refinement still attaches to such a record without any migration step.
+    const refined = await store.saveRefinedTranscript("pre-refined", {
+      text: "Written before refinement existed.",
+      model: "llama3.1",
+      createdAt: 3,
+    });
+
+    assert.equal(refined.refined?.text, "Written before refinement existed.");
+    assert.deepEqual((await store.listReport()).invalid, []);
+    store.close();
+  });
+
+  it("treats an empty refined text or model as damage, not data", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "refined-emptied";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    await store.create({ id: "emptied", wav });
+    await store.markAttempt("emptied");
+    await store.saveTranscript("emptied", { text: "raw", segments: [] });
+
+    const refined = await store.saveRefinedTranscript("emptied", {
+      text: "Fine.",
+      model: "llama3.1",
+      createdAt: 1,
+    });
+
+    // Non-empty text and model are part of the contract: an emptied field is
+    // corruption and must quarantine like any other damaged record.
+    await overwriteStoredSession(factory, databaseName, {
+      ...refined,
+      refined: { text: "", model: "llama3.1", createdAt: 1 },
+    });
+
+    await assert.rejects(store.get("emptied"), DictationStorageError);
+    store.close();
+  });
 });
 
 function chunkOf(frames: number, fill = 1): Uint8Array {

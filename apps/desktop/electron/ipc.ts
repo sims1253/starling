@@ -39,9 +39,50 @@ export const TranscribeInputSchema = Schema.Struct({
   timeoutMs: Schema.optionalKey(Schema.Finite),
 });
 
+/**
+ * Plaintext refinement API key inbound to the main process, which returns
+ * safeStorage ciphertext for at-rest storage. The plaintext never persists.
+ * Non-empty by schema: clearing the key is the renderer's job (it removes
+ * both stored entries without an IPC round trip), so an empty save is a
+ * malformed call, not a "store nothing" request.
+ */
+export const RefinementKeySaveInputSchema = Schema.Struct({
+  apiKey: Schema.NonEmptyString,
+});
+
+/**
+ * Ciphertext previously returned by the save channel, inbound for decryption.
+ * Non-empty by schema: an empty payload is rejected at the boundary instead
+ * of relying on decryptString throwing on it.
+ */
+export const RefinementKeyLoadInputSchema = Schema.Struct({
+  ciphertext: Schema.NonEmptyString,
+});
+
 export type HealthInput = typeof HealthInputSchema.Type;
 
 export type TranscribeInput = typeof TranscribeInputSchema.Type;
+
+export type RefinementKeySaveInput = typeof RefinementKeySaveInputSchema.Type;
+
+export type RefinementKeyLoadInput = typeof RefinementKeyLoadInputSchema.Type;
+
+export interface RefinementKeySaveResult {
+  /**
+   * Base64 safeStorage ciphertext for the renderer to persist, or null when
+   * this host cannot encrypt (no OS keychain backend): the caller then keeps
+   * its documented plaintext-localStorage fallback instead.
+   */
+  readonly ciphertext: string | null;
+}
+
+export interface RefinementKeyLoadResult {
+  /**
+   * Decrypted key, or null when the host cannot decrypt this payload
+   * (encryption unavailable, or the ciphertext is corrupt/foreign).
+   */
+  readonly apiKey: string | null;
+}
 
 export const PendingAudioStateSchema = Schema.Struct({
   recording: Schema.Boolean,
@@ -79,6 +120,13 @@ export interface StarlingDesktopBridge {
   ready(): void;
   onToggleRecording(callback: () => void): () => void;
   setPendingAudio(state: PendingAudioState): void;
+  /**
+   * Optional so older preload builds (and the browser preview, which has no
+   * bridge at all) degrade to the renderer's plaintext-localStorage fallback
+   * instead of failing: callers must guard on the method's presence.
+   */
+  storeRefinementKey?(input: RefinementKeySaveInput): Promise<RefinementKeySaveResult>;
+  loadRefinementKey?(input: RefinementKeyLoadInput): Promise<RefinementKeyLoadResult>;
   /**
    * The main process chose an explicit Discard in the close guard; the
    * renderer drops its durable streaming journal, then reports back via
