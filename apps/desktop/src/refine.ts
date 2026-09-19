@@ -292,6 +292,15 @@ function withExternalAbort<A, E>(
   );
 }
 
+/**
+ * Hosts for which plain http stays acceptable even with a Bearer key: the
+ * loopback interfaces never leave the machine, so local servers (Ollama,
+ * llama.cpp, LM Studio) keep working without TLS.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
 const decodeCompletionResponse = Schema.decodeEffect(
   Schema.fromJsonString(ChatCompletionResponseSchema),
 );
@@ -351,6 +360,28 @@ export function refineEffect(
 
     const headers = new Headers({ "Content-Type": "application/json" });
     const apiKey = settings.apiKey?.trim();
+
+    // A Bearer key must never cross the wire in cleartext: with a key set,
+    // plain http is reserved for loopback hosts; every other endpoint needs
+    // https. Without a key, http stays allowed everywhere (the transcript is
+    // not a credential, and the user may genuinely be on an trusted LAN).
+    if (apiKey) {
+      let url: URL;
+
+      try {
+        url = new URL(baseUrl);
+      } catch {
+        return yield* new RefinementInputError(
+          "Enter a valid http(s) base URL for the refinement endpoint, for example https://api.openai.com/v1.",
+        );
+      }
+
+      if (url.protocol !== "https:" && !isLoopbackHost(url.hostname)) {
+        return yield* new RefinementInputError(
+          "The refinement API key would be sent in cleartext. Use an https base URL, or a loopback endpoint such as http://127.0.0.1:11434/v1.",
+        );
+      }
+    }
 
     // Bearer auth is attached only when a key is configured, so purely local
     // endpoints (Ollama, llama.cpp, LM Studio) never receive the header.

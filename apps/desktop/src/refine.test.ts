@@ -159,6 +159,82 @@ describe("refineEffect", () => {
     expect(new Headers(withoutKey.captured[0]?.init.headers).get("authorization")).toBe(null);
   });
 
+  it("refuses a bearer key over non-loopback cleartext http", async () => {
+    // A Bearer key must never cross the wire in cleartext: remote http is
+    // refused before any request is sent, while loopback http keeps working
+    // for local servers and https keeps working everywhere.
+    const unreachable: typeof fetch = async () => {
+      throw new Error("a cleartext remote request must never be sent");
+    };
+
+    const cleartext = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { baseUrl: "http://example.com:8080/v1", model: "m", apiKey: "sk" },
+          {
+            fetchImpl: unreachable,
+          },
+        ),
+      ),
+    );
+
+    expect(cleartext).toBeInstanceOf(RefinementInputError);
+    expect(cleartext.message).toContain("cleartext");
+
+    const invalidUrl = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { baseUrl: "not a url", model: "m", apiKey: "sk" },
+          {
+            fetchImpl: unreachable,
+          },
+        ),
+      ),
+    );
+
+    expect(invalidUrl).toBeInstanceOf(RefinementInputError);
+
+    const loopback = recordingFetch(() => completion("Local."));
+
+    await Effect.runPromise(
+      refineEffect("hello", { ...settings, apiKey: "sk" }, { fetchImpl: loopback.fetchImpl }),
+    );
+
+    expect(loopback.captured.length).toBe(1);
+
+    const https = recordingFetch(() => completion("Remote."));
+
+    await Effect.runPromise(
+      refineEffect(
+        "hello",
+        { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini", apiKey: "sk" },
+        {
+          fetchImpl: https.fetchImpl,
+        },
+      ),
+    );
+
+    expect(https.captured.length).toBe(1);
+
+    // Without a key, plain remote http stays allowed: the transcript is not
+    // a credential and the endpoint may be an intentionally trusted LAN box.
+    const plainHttp = recordingFetch(() => completion("LAN."));
+
+    await Effect.runPromise(
+      refineEffect(
+        "hello",
+        { baseUrl: "http://192.168.1.10:8080/v1", model: "m" },
+        {
+          fetchImpl: plainHttp.fetchImpl,
+        },
+      ),
+    );
+
+    expect(plainHttp.captured.length).toBe(1);
+  });
+
   it("surfaces HTTP status and the server's own error detail", async () => {
     const recorder = recordingFetch(
       () =>
