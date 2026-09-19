@@ -238,7 +238,6 @@ inline void queue_exit_event(const std::string& req, int depth, const char* reas
                          "\",\"depth\":" + std::to_string(depth));
 }
 
-
 inline void request_event(double dur_ms) {
     if (!on()) return;
     char buf[96];
@@ -246,7 +245,6 @@ inline void request_event(double dur_ms) {
     detail::write_record(std::string("\"ev\":\"request\",\"dur_ms\":") + buf +
                          detail::correlation_fields());
 }
-
 
 inline void response_event(double dur_ms) {
     if (!on()) return;
