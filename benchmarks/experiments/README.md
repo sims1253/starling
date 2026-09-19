@@ -6,8 +6,8 @@ tools — SONAR stays the quality harness, `bench_all.py` stays the fixture
 benchmark — and contributes an **experiment record** plus the **comparison
 command** that decides whether a candidate may be called a win.
 
-Stdlib only (the runner speaks HTTP through `urllib`/`requests-free` code):
-production server installations gain no Python dependency from this code.
+Stdlib only (the runner speaks HTTP through `urllib`): production server
+installations gain no Python dependency from this code.
 
 ## The one-command reproduction
 
@@ -23,10 +23,13 @@ python benchmarks/experiments/run_experiment.py demo \
 
 The demo runs the SAME binary as both arms of a sealed spec — fresh
 processes per repeat, interleaved seeded order, cold/warm split — and
-compares them under preregistered rules. Identical arms compare
-**inconclusive**; that is the point. On a noisy box the point estimate can
-look like several percent "improvement", and the comparator still refuses
-it unless the CI clears the preregistered bar. That refusal is the product.
+compares them under preregistered rules. Identical arms never compare
+`pass`: normally the verdict is `inconclusive`; on a noisy box the
+point estimate can look like several percent "improvement", and the
+comparator still refuses it unless the CI clears the preregistered bar.
+(With a zero regression tolerance, noise can also tip the verdict to
+`fail` — an honest "too noisy to call", never a win.) That refusal is the
+product.
 
 ## Real experiments
 
@@ -59,10 +62,14 @@ it unless the CI clears the preregistered bar. That refusal is the product.
 - different workload manifests (the corpus changed between arms),
 - different metric identities — SONAR WER vs quantization-driver WER vs
   raw HTTP wall time are never averaged or compared,
-- different normalizers, model/config claims, or hardware/runtime claims
-  (cross-machine comparisons need an explicit `hardware_claim` in the spec),
-- a spec-seal mismatch, a failed run, zero usable warm samples, missing or
-  malformed records.
+- different normalizers, model/config claims, or runtime identities
+  (hardware AND driver; cross-machine comparisons need an explicit
+  `hardware_claim` in the spec),
+- a spec-seal mismatch, missing or malformed records.
+
+Failed runs and records with zero usable warm samples are not hard errors:
+they produce the structured `unavailable` verdict with the failure
+diagnostics attached (see below).
 
 ## Verdicts
 
@@ -77,16 +84,22 @@ it unless the CI clears the preregistered bar. That refusal is the product.
 
 - Arms never run concurrently; repeats interleave in a seeded order so
   systematic drift hits both arms equally. Fresh server process per
-  (repeat, arm).
+  (repeat, arm). Both arms send the same clip for a given
+  (repeat, request) — the seeded per-request file choice derives from the
+  seed alone, so the paired difference isolates the binary, not the clip.
 - The first request per process is the **cold** sample (model load + graph
   capture): recorded and reported separately, excluded from the gated
   estimate; `warmup_requests` more untimed requests follow before the
   measured window.
-- Timeouts kill the whole process group; failures are recorded with their
-  diagnostics and flip the run to `status=failed`.
+- A timed-out request is recorded as a failure with its diagnostics and
+  the repeat moves on; the server's whole process group is torn down when
+  the repeat ends. More failures than `tolerated_failures` flip the run to
+  `status=failed`, which the comparator turns into an unavailable verdict.
 - GPU work follows the SONAR serialization contract: all `STARLING_*` GPU
   lock variables pass through to the server processes, so externally held
-  locks are honored.
+  locks are honored, and concurrent experiment commands on one machine
+  serialize through an advisory lock (`STARLING_GPU_LOCK_DISABLE=1` opts
+  out).
 
 ## Files
 

@@ -60,8 +60,8 @@ python benchmarks/experiments/run_experiment.py demo \
   --binary build-exp/starling-serve-contract-fixture --out-dir build-exp/experiments/demo
 ```
 
-Identical arms compare **inconclusive** — the no-false-win contract
-demonstrated end to end. See the
+Identical arms never compare `pass` (normally **inconclusive**) — the
+no-false-win contract demonstrated end to end. See the
 [experiments README](../benchmarks/experiments/README.md) for the full
 workflow (pin the workload, seal the spec, run both arms, compare).
 
