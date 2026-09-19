@@ -77,8 +77,10 @@ diagnostics attached (see below).
 - `fail` — the CI sits beyond the regression bound.
 - `inconclusive` — CI spans the boundary or is too wide for the declared
   power requirement. **Cannot be promoted as a win.**
-- `unavailable` — a required run failed or is missing; diagnostics
-  accompany the verdict instead of a number.
+- `unavailable` — a required run failed or is missing, or all usable pairs
+  come from a single fresh-process repeat (a zero-width CI would be
+  manufactured certainty); diagnostics accompany the verdict instead of a
+  number.
 
 ## Protocol guarantees
 

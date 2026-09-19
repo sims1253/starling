@@ -321,6 +321,19 @@ class VerdictTests(unittest.TestCase):
         r = compare_mod.compare(spec, b, c)
         self.assertEqual(r["verdict"], "unavailable")
 
+    def test_single_repeat_is_unavailable_not_a_zero_width_pass(self):
+        # repeats=1 is validation-legal, but one fresh-process cluster means
+        # every bootstrap resample redraws the same data: ci == point
+        # estimate, a manufactured 0%-width "certainty" that must not pass.
+        spec = json.loads(json.dumps(V1_SPEC))
+        spec["protocol"]["repeats"] = 1
+        spec["protocol"]["requests_per_repeat"] = 4  # 3 warm pairs, 1 cluster
+        b = make_record("baseline", repeats=1, requests=4, spec=spec)
+        c = make_record("candidate", cand_ms=50.0, repeats=1, requests=4, spec=spec)
+        r = compare_mod.compare(spec, b, c)
+        self.assertEqual(r["verdict"], "unavailable")
+        self.assertIn("single fresh-process repeat", r["reason"])
+
     def test_verdicts_are_deterministic(self):
         r1 = self._compare(100.0, 90.0)
         r2 = self._compare(100.0, 90.0)
@@ -448,6 +461,17 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(runner_mod.RunnerError) as ctx:
             runner_mod.run_arm(other, "baseline", run_dir, HERE.parent.parent, 0)
         self.assertIn("different spec", str(ctx.exception))
+
+    def test_rerunning_a_completed_repeat_is_refused(self):
+        # The natural move after an early stop is a re-run into the same
+        # directory; appending would duplicate (repeat, request) samples.
+        spec = self._spec()
+        spec["protocol"]["repeats"] = 2
+        run_dir = self.dir / "rerun"
+        runner_mod.run_arm(spec, "baseline", run_dir, HERE.parent.parent, 0)
+        with self.assertRaises(runner_mod.RunnerError) as ctx:
+            runner_mod.run_arm(spec, "baseline", run_dir, HERE.parent.parent, 0)
+        self.assertIn("already contains repeat 0", str(ctx.exception))
 
     def test_arm_order_is_seeded_and_reproducible(self):
         spec = self._spec()

@@ -197,11 +197,17 @@ def _cmd_demo(args: argparse.Namespace) -> int:
                      indent=2, default=str))
     if result["verdict"] == "pass":
         # The demo's arms are the SAME binary: a "pass" here is exactly the
-        # false win this harness exists to catch. Anything else (normally
-        # "inconclusive"; on a noisy box a too-noise-tipped "fail" or
-        # "unavailable") is the honest outcome and stays green.
+        # false win this harness exists to catch.
         print("[demo] ERROR: identical arms produced a 'pass' — the comparator "
               "manufactured a win from noise; see comparison.json", file=sys.stderr)
+        return 1
+    if result["verdict"] == "unavailable":
+        # The demo spec tolerates zero failures, so an unusable run means a
+        # request actually failed — a defect signal, not noise. Green only
+        # on completed-run verdicts (inconclusive, or a noise-tipped fail).
+        print(f"[demo] run unusable: {result.get('reason')} — the demo must "
+              "complete both arms to demonstrate the no-false-win contract",
+              file=sys.stderr)
         return 1
     print(f"[demo] identical arms -> verdict {result['verdict']!r}: no false win; "
           "full details in comparison.json")

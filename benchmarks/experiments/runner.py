@@ -206,13 +206,17 @@ class ArmServer:
                 "--gguf", os.path.expandvars(model) if model else "/dev/null",
                 "--port", str(port),
             ]
-        self.proc = subprocess.Popen(
-            cmd,
-            stdout=self._log,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=self._log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError:
+            self._log.close()  # recorded as a failure downstream; no fd leak
+            raise
         self.base = f"http://127.0.0.1:{port}"
 
     def wait_healthy(self, timeout_s: float) -> float:
@@ -333,6 +337,16 @@ def run_arm(spec: dict, arm_name: str, run_dir: Path, repo_root: Path,
             raise RunnerError(
                 f"{record_path} was produced by a different spec/arm; "
                 "use a fresh run directory for a new experiment"
+            )
+        if any(s.get("repeat") == repeat for s in record.get("samples", [])):
+            # e.g. re-running after _run_interleaved's early stop: appending
+            # would duplicate (repeat, request) keys and only blow up later
+            # in record validation. Refuse here, at run time, with guidance.
+            raise RunnerError(
+                f"{record_path} already contains repeat {repeat}; re-running "
+                "into a partially complete run directory would duplicate "
+                "samples — use a fresh run directory (the partial records "
+                "can still be compared via the compare command)"
             )
     else:
         record = {

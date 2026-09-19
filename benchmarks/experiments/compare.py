@@ -150,6 +150,18 @@ def compare(spec: dict, baseline: dict, candidate: dict) -> dict:
             spec,
             f"only {len(pairs)} paired sample(s); two or more are required",
         )
+    n_clusters = len({repeat for repeat, _request, _b, _c in pairs})
+    if n_clusters < 2:
+        # A single fresh-process repeat means every bootstrap resample
+        # redraws the same cluster: ci_low == ci_high == the point estimate,
+        # a zero-width CI that would pass the halfwidth gate on manufactured
+        # certainty. That is exactly the false win this comparator refuses.
+        return _unavailable(
+            spec,
+            f"all {len(pairs)} paired sample(s) come from a single fresh-process "
+            "repeat, so the interval would be zero-width; two or more repeats "
+            "are required to quantify uncertainty",
+        )
 
     direction = spec["direction"]
     acc = spec["acceptance"]
