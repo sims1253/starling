@@ -42,14 +42,21 @@ export const TranscribeInputSchema = Schema.Struct({
 /**
  * Plaintext refinement API key inbound to the main process, which returns
  * safeStorage ciphertext for at-rest storage. The plaintext never persists.
+ * Non-empty by schema: clearing the key is the renderer's job (it removes
+ * both stored entries without an IPC round trip), so an empty save is a
+ * malformed call, not a "store nothing" request.
  */
 export const RefinementKeySaveInputSchema = Schema.Struct({
-  apiKey: Schema.String,
+  apiKey: Schema.NonEmptyString,
 });
 
-/** Ciphertext previously returned by the save channel, inbound for decryption. */
+/**
+ * Ciphertext previously returned by the save channel, inbound for decryption.
+ * Non-empty by schema: an empty payload is rejected at the boundary instead
+ * of relying on decryptString throwing on it.
+ */
 export const RefinementKeyLoadInputSchema = Schema.Struct({
-  ciphertext: Schema.String,
+  ciphertext: Schema.NonEmptyString,
 });
 
 export type HealthInput = typeof HealthInputSchema.Type;
