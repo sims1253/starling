@@ -12,11 +12,14 @@ spec.loader.exec_module(contract)
 
 
 def inputs():
-    return (ROOT / contract.WORKFLOW).read_text(encoding="utf-8"), {name: (ROOT / name).read_text(encoding="utf-8") for name in contract.DOCS}
+    return ((ROOT / contract.WORKFLOW).read_text(encoding="utf-8"),
+            {name: (ROOT / name).read_text(encoding="utf-8") for name in contract.DOCS},
+            (ROOT / contract.DOCKERFILE).read_text(encoding="utf-8"))
 
 
 def test_current_release_contract():
-    assert contract.check(*inputs()) == []
+    workflow, docs, dockerfile = inputs()
+    assert contract.check(workflow, docs, dockerfile=dockerfile) == []
 
 
 @pytest.mark.parametrize("path, old, new", [
@@ -28,23 +31,29 @@ def test_current_release_contract():
     (contract.DOCS[0], 'CUDA @SERIES@ runtime and cuBLAS libraries', 'CUDA @BAD_SERIES@ runtime and cuBLAS libraries'),
     (contract.DOCS[0], 'CUDA @SERIES@ runtime and cuBLAS DLLs', 'CUDA @BAD_SERIES@ runtime and cuBLAS DLLs'),
     (contract.DOCS[1], 'The workflow builds with CUDA @SERIES@.', 'The workflow builds with CUDA @BAD_SERIES@.'),
+    (contract.DOCKERFILE, 'cuda-cudart-@SERIES_DASHED@ libcublas-@SERIES_DASHED@', 'cuda-cudart-@BAD_DASHED@ libcublas-@BAD_DASHED@'),
 ])
 def test_rejects_independent_version_drift(path, old, new):
-    workflow, docs = inputs()
+    workflow, docs, dockerfile = inputs()
     version = re.search(r"CUDA_VERSION: '([^']+)'", workflow).group(1)
     old = old.replace("@VERSION@", version).replace("@SERIES@", version.rsplit(".", 1)[0])
     bad_series = f"{int(version.split('.')[0]) + 1}.0"
+    dashed = version.rsplit(".", 1)[0].replace(".", "-")
+    old = old.replace("@SERIES_DASHED@", dashed)
     new = (new.replace("@BAD_VERSION@", bad_series + ".0")
               .replace("@BAD_SERIES@", bad_series)
-              .replace("@BAD_PACKAGE@", bad_series.replace(".", "-")))
-    text = workflow if path == contract.WORKFLOW else docs[path]
+              .replace("@BAD_PACKAGE@", bad_series.replace(".", "-"))
+              .replace("@BAD_DASHED@", bad_series.replace(".", "-")))
+    text = {contract.WORKFLOW: workflow, **docs, contract.DOCKERFILE: dockerfile}[path]
     assert old in text
     changed = text.replace(old, new)
     if path == contract.WORKFLOW:
         workflow = changed
+    elif path == contract.DOCKERFILE:
+        dockerfile = changed
     else:
         docs[path] = changed
-    assert contract.check(workflow, docs)
+    assert contract.check(workflow, docs, dockerfile=dockerfile)
 
 
 @pytest.mark.parametrize("path, old, new", [
@@ -55,7 +64,7 @@ def test_rejects_independent_version_drift(path, old, new):
     (contract.DOCS[1], 'The workflow builds with ROCm @ROCM@.', 'The workflow builds with ROCm @BAD_ROCM@.'),
 ])
 def test_rejects_independent_rocm_version_drift(path, old, new):
-    workflow, docs = inputs()
+    workflow, docs, dockerfile = inputs()
     rocm = re.search(r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", workflow).group(1)
     old = old.replace("@ROCM@", rocm)
     parts = [int(p) + (i == 0) for i, p in enumerate(rocm.split("."))]
@@ -68,21 +77,24 @@ def test_rejects_independent_rocm_version_drift(path, old, new):
         workflow = changed
     else:
         docs[path] = changed
-    assert contract.check(workflow, docs)
+    assert contract.check(workflow, docs, dockerfile=dockerfile)
 
 
 def test_coordinated_version_update_passes():
-    workflow, docs = inputs()
+    workflow, docs, dockerfile = inputs()
     version = re.search(r"CUDA_VERSION: '([^']+)'", workflow).group(1)
     series = version.rsplit(".", 1)[0]
-    workflow = workflow.replace(version, '99.1.2').replace(series, '99.1')
-    docs = {name: text.replace(series, '99.1') for name, text in docs.items()}
-    assert contract.check(workflow, docs) == []
+    bad_series = '99.1'
+    workflow = workflow.replace(version, '99.1.2').replace(series, bad_series)
+    docs = {name: text.replace(series, bad_series) for name, text in docs.items()}
+    dockerfile = dockerfile.replace(series.replace(".", "-"),
+                                    bad_series.replace(".", "-"))
+    assert contract.check(workflow, docs, dockerfile=dockerfile) == []
 
 
 @pytest.mark.parametrize("patch_offset", [0, 1])
 def test_release_preflight_checks_executing_workflow_version(monkeypatch, capsys, patch_offset):
-    workflow, _ = inputs()
+    workflow, _, _ = inputs()
     version = re.search(r"CUDA_VERSION: '([^']+)'", workflow).group(1)
     major, minor, patch = version.split(".")
     executing = f"{major}.{minor}.{int(patch) + patch_offset}"

@@ -1,0 +1,16 @@
+# Keep this list in sync with docs/release-runtime.md.
+# libnvidia-compute provides the userspace DRIVER library (libcuda.so.1).
+# RUNTIME.md: the driver library comes from the installed NVIDIA driver — a
+# GPU-less container installs the userspace half so the loader and
+# --version/--abi-version run, but cuInit fails without a kernel driver and
+# the backend auto-selects CPU (the check script treats that as expected).
+# With --gpus all, the container runtime injects the host driver's libraries,
+# which take precedence over this copy.
+FROM ubuntu:22.04
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates gnupg wget \
+    && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libstdc++6 libgomp1 cuda-cudart-13-3 libcublas-13-3 libnvidia-compute-610 \
+    && rm -rf /var/lib/apt/lists/* /cuda-keyring_1.1-1_all.deb

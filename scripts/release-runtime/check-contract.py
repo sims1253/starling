@@ -8,9 +8,11 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/release-starling-serve.yml"
 DOCS = ("docs/release-runtime.md", "docs/native-serving.md")
+DOCKERFILE = "scripts/release-runtime/Dockerfile.cuda"
 
 
-def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None) -> list[str]:
+def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None,
+          dockerfile: str = "") -> list[str]:
     errors = []
     versions = re.findall(r"^  CUDA_VERSION: ['\"]?(\d+\.\d+\.\d+)['\"]?\s*$", workflow, re.M)
     if len(versions) != 1:
@@ -44,6 +46,19 @@ def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | Non
         if found != [series]:
             errors.append(f"{path}: {label} must state CUDA {series} once; found {found}")
 
+    # The runtime-check image installs the CUDA series' runtime packages by
+    # name; a series bump that skips it would keep validating the old
+    # runtime (within a major the sonames still resolve), so the pin is
+    # gated here like the ROCm repository (pullfrog review of #185).
+    if dockerfile != "":
+        series_dashed = series.replace(".", "-")
+        for package in (f"cuda-cudart-{series_dashed}", f"libcublas-{series_dashed}"):
+            if dockerfile.count(package) != 1:
+                errors.append(
+                    f"{DOCKERFILE}: expected exactly one {package} install "
+                    f"matching CUDA {series}"
+                )
+
     # The ROCm release is an exact versioned apt repository, not a series:
     # the install URL is the single source of truth and the docs restate it.
     rocm_pins = re.findall(r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", workflow)
@@ -73,7 +88,8 @@ def main() -> int:
     args = parser.parse_args()
     errors = check((ROOT / WORKFLOW).read_text(encoding="utf-8"),
                    {name: (ROOT / name).read_text(encoding="utf-8") for name in DOCS},
-                   args.executing_cuda_version)
+                   args.executing_cuda_version,
+                   (ROOT / DOCKERFILE).read_text(encoding="utf-8"))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
