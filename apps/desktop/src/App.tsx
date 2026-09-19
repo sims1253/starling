@@ -46,6 +46,16 @@ const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/ap
 
 const SETTINGS_FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled])";
 
+/**
+ * localStorage key for the active-thread hint, the one thread-related value
+ * that lives outside the sessions themselves: a stored id pins the thread
+ * the next "Refine in thread" joins, a stored empty string is the
+ * "start new thread" veto, and an absent key follows the history. Every
+ * read and write goes through this constant so the encoding cannot drift
+ * between call sites.
+ */
+const THREAD_ACTIVE_HINT_KEY = "starling:thread:activeHint";
+
 const store = new IndexedDbSessionStore();
 
 function formatDuration(ms?: number) {
@@ -198,7 +208,7 @@ export default function App() {
   // makes the next press mint a fresh thread; an absent key follows the
   // history — the most recently updated threaded session.
   const [activeThreadHint, setActiveThreadHint] = useState<string | undefined>(() => {
-    const stored = localStorage.getItem("starling:thread:activeHint");
+    const stored = localStorage.getItem(THREAD_ACTIVE_HINT_KEY);
 
     return stored === null ? undefined : stored;
   });
@@ -283,7 +293,22 @@ export default function App() {
   const activeThread = useMemo(() => {
     if (activeThreadHint === "") return undefined;
 
-    if (activeThreadHint !== undefined && sessions.some((s) => s.threadId === activeThreadHint)) {
+    if (activeThreadHint !== undefined) {
+      const pinnedAlive = sessions.some((session) => session.threadId === activeThreadHint);
+
+      // A pin whose thread has no members left is stale residue, not a
+      // fallback candidate: it means "no active thread", and the stored copy
+      // is cleared so a reload follows the history instead of the dead pin
+      // (and so the strip disappears rather than silently jumping to the
+      // derived thread). removeItem is idempotent, so re-renders while the
+      // pin stays stale are free; the state value is left alone because a
+      // render must not setState on itself.
+      if (!pinnedAlive) {
+        localStorage.removeItem(THREAD_ACTIVE_HINT_KEY);
+
+        return undefined;
+      }
+
       return activeThreadHint;
     }
 
@@ -675,10 +700,14 @@ export default function App() {
             // The explicit assignment: this take joins the thread now, and
             // membership stays visible even when the refinement below fails.
             await store.assignThread(session.id, threadId);
-            setActiveThreadHint(threadId);
-            localStorage.setItem("starling:thread:activeHint", threadId);
             await refresh();
           }
+
+          // Both the join and the already-threaded path pin the hint: the
+          // thread this press refined in is the one the next join targets,
+          // so a stale pin on another thread can never silently win.
+          setActiveThreadHint(threadId);
+          localStorage.setItem(THREAD_ACTIVE_HINT_KEY, threadId);
 
           // Context is read from the listing this render captured: the
           // assignment above only labeled THIS take, so the thread's other
@@ -728,7 +757,7 @@ export default function App() {
    */
   function startNewThread() {
     setActiveThreadHint("");
-    localStorage.setItem("starling:thread:activeHint", "");
+    localStorage.setItem(THREAD_ACTIVE_HINT_KEY, "");
   }
 
   async function copyRefinedText() {
