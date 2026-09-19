@@ -19,6 +19,15 @@ These scripts support `--update-readme` to refresh the tables on this page.
   latency/throughput per engine, byte-exact parity vs stock, curated quality
   cases, and the full 16-combination control matrix (styling × structure ×
   context). Splices the `BENCH:S1` block below.
+- **`benchmarks/experiments/`** (issue #168): the shared
+  baseline-versus-candidate experiment record and comparison command.
+  Preregisters the objective, workload pin, protocol, and acceptance rules
+  in a sealed spec; runs both arms interleaved in fresh processes with
+  cold/warm separation; compares under a deterministic paired bootstrap and
+  refuses invalid pairs (changed corpus, mismatched metric identities,
+  models, or hardware). Inconclusive results cannot be promoted as wins.
+  See [experiments/README.md](../benchmarks/experiments/README.md) for the
+  one-command CPU reproduction and the verdict semantics.
 
 ```
 uv run --extra bench python benchmarks/bench_all.py --update-readme
@@ -28,6 +37,33 @@ uv run --extra bench python benchmarks/bench_leaderboard.py --num-samples 0  # f
 
 RTFx = audio_seconds / transcribe_seconds (higher is faster). bf16, model load
 excluded, single RTX 5090.
+
+## Experiment records and comparisons
+
+[`benchmarks/experiments/`](../benchmarks/experiments/) adds the layer the
+tools above lack: a shared **experiment record** for a baseline-versus-
+candidate comparison and the **comparison command** that applies
+preregistered acceptance rules (issue #168). A candidate may only be called
+a win when the paired-improvement CI clears the preregistered bar;
+inconclusive results cannot be promoted, failed runs are refused with
+diagnostics, and records with different corpus hashes, metric identities
+(SONAR WER vs quantization-driver WER vs raw HTTP latency), normalizers,
+model/config, or hardware claims are rejected as incomparable. The
+one-command paired CPU reproduction runs against the contract-fixture
+binary with no models:
+
+```bash
+cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+cmake --build build-exp -j --target starling-serve-contract-fixture
+python benchmarks/experiments/run_experiment.py demo \
+  --binary build-exp/starling-serve-contract-fixture --out-dir build-exp/experiments/demo
+```
+
+Identical arms compare **inconclusive** — the no-false-win contract
+demonstrated end to end. See the
+[experiments README](../benchmarks/experiments/README.md) for the full
+workflow (pin the workload, seal the spec, run both arms, compare).
 
 ### Synthetic fixture latency / RTFx
 
