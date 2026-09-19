@@ -30,17 +30,17 @@ export const REFINEMENT_DEFAULT_INSTRUCTION = [
  * The built-in instruction for a turn refined inside a thread (#117): the
  * assistant message holds the thread's current text and the user message is
  * a new dictated turn — either an edit instruction about that text or
- * additional dictation. The same wording, meaning, language, and order
- * discipline as the single-turn default applies, and the reply is the
+ * additional dictation. The never-omit clause is scoped to the thread's
+ * EXISTING content so a literal-minded model still appends additional
+ * dictation instead of declining to "add content". The reply is the
  * complete updated text.
  */
 export const REFINEMENT_THREAD_INSTRUCTION = [
   "You are a transcription editor working on a running dictation thread.",
   "The assistant message is the thread's current text.",
-  "The user message is a new dictated turn: either an edit instruction about that text or additional dictation — apply it accordingly.",
-  "Return the complete updated text, and nothing else.",
-  "Preserve the original wording, meaning, language, and order;",
-  "never add, omit, summarize, or translate content.",
+  "The user message is a new dictated turn: either an edit instruction about that text or additional dictation — apply it accordingly and return the complete updated text, and nothing else.",
+  "Preserve the thread's language and the meaning and order of its existing content.",
+  "Never omit, summarize, or translate the thread's existing content; apply the user's turn to it.",
   "Reply without preamble, explanation, or quotation marks.",
 ].join(" ");
 
@@ -186,6 +186,24 @@ export interface BuildRefinementOptions {
 }
 
 /**
+ * The system turn for one request. A custom instruction wins verbatim in
+ * both modes, exactly like the single-turn path of #191; otherwise thread
+ * context selects the multi-turn contract and its absence the base
+ * instruction. A named branch instead of a nested ternary, so the selection
+ * reads as the contract it encodes.
+ */
+function resolveSystemInstruction(
+  settings: RefinementSettings,
+  contextText: string | undefined,
+): string {
+  const instruction = settings.instruction?.trim();
+
+  if (instruction) return instruction;
+
+  return contextText ? REFINEMENT_THREAD_INSTRUCTION : REFINEMENT_DEFAULT_INSTRUCTION;
+}
+
+/**
  * Chat-completions messages for one refinement request. Standalone, the pair
  * is the instruction as the system turn and the raw transcript as the user
  * turn. With `options.contextText` present, an assistant turn carrying the
@@ -198,17 +216,13 @@ export function buildRefinementMessages(
   settings: RefinementSettings,
   options?: BuildRefinementOptions,
 ): readonly RefinementMessage[] {
-  const instruction = settings.instruction?.trim();
   const contextText = options?.contextText?.trim();
 
-  const system = instruction
-    ? instruction
-    : contextText
-      ? REFINEMENT_THREAD_INSTRUCTION
-      : REFINEMENT_DEFAULT_INSTRUCTION;
-
   const messages: RefinementMessage[] = [
-    Object.freeze({ role: "system", content: system }) satisfies RefinementMessage,
+    Object.freeze({
+      role: "system",
+      content: resolveSystemInstruction(settings, contextText),
+    }) satisfies RefinementMessage,
   ];
 
   // The thread's current text rides as the assistant turn: the model reads

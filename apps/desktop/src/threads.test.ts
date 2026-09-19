@@ -243,6 +243,42 @@ describe("threadContext", () => {
     expect(threadContext(mixed, "t1", "m4")).toBe("Oldest refined.");
   });
 
+  it("skips whitespace-only refined text instead of treating it as context", () => {
+    // The storage schema quarantines EMPTY refined text as damage, so only
+    // the whitespace-only shape can reach the walk — it carries no thread
+    // state and must be skipped like an unrefined member, not returned (and
+    // not allowed to shadow the previous real text).
+    const blank = [
+      take({
+        id: "w1",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+        refinedText: "Real text.",
+      }),
+      take({
+        id: "w2",
+        createdAt: "2025-09-01T10:01:00.000Z",
+        threadId: "t1",
+        refinedText: "   ",
+      }),
+      take({ id: "w3", createdAt: "2025-09-01T10:02:00.000Z", threadId: "t1" }),
+    ];
+
+    expect(threadContext(blank, "t1", "w3")).toBe("Real text.");
+
+    const onlyBlank = [
+      take({
+        id: "b1",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+        refinedText: "\n\t ",
+      }),
+      take({ id: "b2", createdAt: "2025-09-01T10:01:00.000Z", threadId: "t1" }),
+    ];
+
+    expect(threadContext(onlyBlank, "t1", "b2")).toBeUndefined();
+  });
+
   it("ignores refined takes that are not members of the thread", () => {
     expect(threadContext(sessions, "t1", "turn-3")).not.toBe("A different thread entirely.");
 

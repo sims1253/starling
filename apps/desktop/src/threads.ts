@@ -105,11 +105,16 @@ export function threadContext(
   const earlier = boundary === -1 ? turns : turns.slice(0, boundary);
 
   // Walk backwards: the nearest refined predecessor is the thread's current
-  // text, and members without a refined copy are skipped, not blocking.
+  // text, and members without a usable refined copy are skipped, not
+  // blocking. Whitespace-only text carries no thread state — downstream it
+  // would trim to no context — so it is skipped like an unrefined member and
+  // the walk continues to the previous real text. (Empty text cannot reach
+  // here at all: the storage schema treats it as damage and quarantines the
+  // record out of the listing.)
   for (let index = earlier.length - 1; index >= 0; index -= 1) {
     const refined = earlier[index]?.refined;
 
-    if (refined !== undefined) return refined.text;
+    if (refined !== undefined && refined.text.trim() !== "") return refined.text;
   }
 
   return undefined;
