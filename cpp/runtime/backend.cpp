@@ -666,8 +666,18 @@ bool ReplayGraph::alloc_internal() {
                 std::string(backend_.device_name()) + "' rejected " +
                 std::to_string(unsupported.size()) + " of " +
                 std::to_string(n_nodes) + " captured-graph nodes:\n";
-            for (const auto& u : unsupported)
-                msg += "  " + format_unsupported_graph_node(u, n_nodes) + "\n";
+            // The message crosses the C API into a 2048-byte error buffer
+            // (g_last_error in capi.cpp), so cap the embedded per-node lines
+            // or the actionable tail below would truncate away first. The
+            // STARLING_SCHED_DEBUG echo above always prints every node.
+            constexpr size_t kMaxEmbeddedLines = 16;
+            for (size_t i = 0; i < unsupported.size() && i < kMaxEmbeddedLines; ++i)
+                msg += "  " + format_unsupported_graph_node(unsupported[i], n_nodes) + "\n";
+            if (unsupported.size() > kMaxEmbeddedLines)
+                msg += "  ... and " +
+                       std::to_string(unsupported.size() - kMaxEmbeddedLines) +
+                       " more rejected node(s) - run with STARLING_SCHED_DEBUG=1"
+                       " to print all of them\n";
             msg +=
                 "A captured (replayed) graph cannot fall back to"
                 " ggml_backend_sched: its input uploads run on the primary"
