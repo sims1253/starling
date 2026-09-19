@@ -11,7 +11,8 @@ parity tests assert with:
   files with ``ast`` (no import, no dependencies) so
   ``test_manifest_test_selection_agrees`` can prove every manifest entry maps to
   a real test with the same fixture list, and every parity test is claimed by
-  exactly one manifest entry.
+  at least one manifest entry (a gate may legitimately feed two targets, e.g.
+  the moss_llm_test components + token-stream split).
 * **Rendered documentation** — :func:`render_manifest_markdown`` produces the
   contract table embedded between markers in ``docs/ggml-engine.md``;
   ``test_manifest_docs_agree`` fails when the two drift apart.
@@ -468,6 +469,19 @@ class AssetProbe:
     detail: dict = field(default_factory=dict)
 
 
+def _check_gguf_pin(t: dict, path: Path, pin: str, problems: list[str]) -> None:
+    """A present GGUF whose sha256 differs from the manifest pin is a PROBLEM
+    (fail loudly), never a skip: the validated measurement belongs to the
+    pinned artifact."""
+    if not pin:
+        return
+    got = sha256_file(path)
+    if got != pin:
+        problems.append(
+            f"{t['id']}: GGUF {path} sha256 {got[:12]}... != pinned "
+            f"{pin[:12]}...")
+
+
 def probe_target_assets(t: dict, repo_root: Path = REPO_ROOT) -> AssetProbe:
     """Probe whether a manifest target's assets exist in THIS environment.
 
@@ -497,29 +511,40 @@ def probe_target_assets(t: dict, repo_root: Path = REPO_ROOT) -> AssetProbe:
 
     gguf = t.get("gguf") or {}
     if gguf:
-        env, default = gguf.get("env", ""), gguf.get("default_path", "")
-        raw = os.environ.get(env, "") if env else ""
-        if not (raw or default):
-            # env-only probe with the variable unset: the asset lives outside
-            # the repo (external engines); report it missing rather than
-            # treating the repository root as "the model".
-            missing.append(f"gguf:{env or '(unspecified)'} (env unset)")
+        if gguf.get("hardcoded"):
+            # The consuming binary hardcodes the repo-relative model path and
+            # IGNORES the engine env override (cpp/tests/* load
+            # root + "/models/<name>.gguf") — probing any env-provided file
+            # would pin a GGUF the binary never reads (pullfrog review).
+            path = repo_root / gguf["default_path"]
+            _check_gguf_pin(t, path, gguf.get("sha256", ""), problems)
         else:
+            env, default = gguf.get("env", ""), gguf.get("default_path", "")
+            raw = os.environ.get(env, "") if env else ""
             if raw:
                 path = Path(raw).expanduser()
-            else:
+            elif gguf.get("default_path_env_root"):
+                # External engines resolve their default under a root that is
+                # itself env-configurable (benchmarks/engines.py:
+                # ASR_BENCH_ROOT, default ~/asr-bench) — mirror it so the
+                # probe does not report a runnable engine as unavailable.
+                spec = gguf["default_path_env_root"]
+                root = os.environ.get(spec["root_env"]) or spec["root_default"]
+                path = Path(os.path.expanduser(root)) / spec["relative"]
+            elif default:
                 # A default may be repo-relative or absolute/`~` (external
                 # engines keep models outside the repo, e.g. ~/asr-bench).
                 dpath = Path(os.path.expanduser(default))
                 path = dpath if dpath.is_absolute() else (repo_root / default)
-            if path.exists():
-                pin = gguf.get("sha256", "")
-                if pin:
-                    got = sha256_file(path)
-                    if got != pin:
-                        problems.append(
-                            f"{t['id']}: GGUF {path} sha256 {got[:12]}... != pinned "
-                            f"{pin[:12]}... (env {env or default})")
+            else:
+                path = None
+            if path is None:
+                # env-only probe with the variable unset: the asset lives
+                # outside the repo (external engines); report it missing
+                # rather than treating the repository root as "the model".
+                missing.append(f"gguf:{env or '(unspecified)'} (env unset)")
+            elif path.exists():
+                _check_gguf_pin(t, path, gguf.get("sha256", ""), problems)
             else:
                 missing.append(f"gguf:{env or default}")
 

@@ -30,9 +30,15 @@
       "required": true,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_text_parity"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "unvalidated"
@@ -79,7 +85,11 @@
       "required": true,
       "contract": {
         "class": "component_numerical_tolerance",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "tolerances": [
           {
             "component": "log-mel frontend (128 bins, 16 kHz, n_fft 640, hop 160)",
@@ -91,7 +101,9 @@
           }
         ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_mel_components"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_mel_components"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "unvalidated"
@@ -115,9 +127,10 @@
       "needs_lib": false,
       "binary": "moss_mel_test",
       "gguf": {
-        "env": "STARLING_GGML_MOSS_MODEL",
+        "hardcoded": true,
         "default_path": "models/moss-transcribe-preview-2b-bf16-exact.gguf",
-        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a"
+        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a",
+        "note": "cpp/tests/* load this repo-relative path directly; the STARLING_GGML_MOSS_MODEL env override does not apply to these binaries, so the probe must not honor it either."
       },
       "assets_files": [
         "tests/fixtures/short.wav",
@@ -137,7 +150,11 @@
       "required": true,
       "contract": {
         "class": "component_numerical_tolerance",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "tolerances": [
           {
             "component": "audio encoder last_hidden_state (Qwen3-Omni tower, 32 bf16 attention layers)",
@@ -157,7 +174,9 @@
           }
         ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_encoder_components"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_encoder_components"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "unvalidated"
@@ -181,9 +200,10 @@
       "needs_lib": false,
       "binary": "moss_encoder_test",
       "gguf": {
-        "env": "STARLING_GGML_MOSS_MODEL",
+        "hardcoded": true,
         "default_path": "models/moss-transcribe-preview-2b-bf16-exact.gguf",
-        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a"
+        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a",
+        "note": "cpp/tests/* load this repo-relative path directly; the STARLING_GGML_MOSS_MODEL env override does not apply to these binaries, so the probe must not honor it either."
       },
       "goldens": [
         "raw/moss_short_encoder_hidden.f32",
@@ -201,7 +221,11 @@
       "required": true,
       "contract": {
         "class": "component_numerical_tolerance",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "tolerances": [
           {
             "component": "merged inputs_embeds (token embeds + scattered audio embeds)",
@@ -229,7 +253,9 @@
           }
         ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_llm_components"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_llm_components"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "validated"
@@ -253,9 +279,10 @@
       "needs_lib": false,
       "binary": "moss_llm_test",
       "gguf": {
-        "env": "STARLING_GGML_MOSS_MODEL",
+        "hardcoded": true,
         "default_path": "models/moss-transcribe-preview-2b-bf16-exact.gguf",
-        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a"
+        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a",
+        "note": "cpp/tests/* load this repo-relative path directly; the STARLING_GGML_MOSS_MODEL env override does not apply to these binaries, so the probe must not honor it either."
       },
       "goldens": [
         "raw/moss_short_prompt_ids.i64",
@@ -279,18 +306,30 @@
       "required": true,
       "contract": {
         "class": "exact_token_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
       "enforcement": {
         "cuda": {
-          "fixtures_exact": ["short", "medium", "long"]
+          "fixtures_exact": [
+            "short",
+            "medium",
+            "long"
+          ]
         },
         "cpu": {
-          "fixtures_exact": ["short"],
+          "fixtures_exact": [
+            "short"
+          ],
           "note": "cpp/moss/llm.cpp documents the decoder's byte-exactness contract as CUDA-scoped: 'CPU bf16 GEMMs are not bit-identical to cuBLAS and are a fallback only'. Measured on CPU against the pinned reference: short exact; medium/long diverge at near-tie argmax positions (NOT a K-step artifact — STARLING_MOSS_NOKSTEP=1 reproduces the bit-identical failing numbers). On CPU those fixtures' id/text columns are REPORTED, not gated; end-to-end CPU text exactness is carried by moss.intree.text (measured byte-exact on all three fixtures). Any other backend (Vulkan/Metal/...) gets the full strict gate."
         }
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_llm_components"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_llm_components"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -314,9 +353,10 @@
       "needs_lib": false,
       "binary": "moss_llm_test",
       "gguf": {
-        "env": "STARLING_GGML_MOSS_MODEL",
+        "hardcoded": true,
         "default_path": "models/moss-transcribe-preview-2b-bf16-exact.gguf",
-        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a"
+        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a",
+        "note": "cpp/tests/* load this repo-relative path directly; the STARLING_GGML_MOSS_MODEL env override does not apply to these binaries, so the probe must not honor it either."
       },
       "goldens": [
         "raw/moss_short_ids.i64",
@@ -339,11 +379,17 @@
       "required": true,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "fixture_contracts": {
           "long": {
             "class": "corpus_quality_acceptance",
-            "fixtures": ["long"],
+            "fixtures": [
+              "long"
+            ],
             "tolerance": {
               "metric": "difflib.SequenceMatcher ratio on the raw transcript",
               "aggregation": "per-fixture (long only)",
@@ -354,7 +400,9 @@
           }
         }
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_parakeet_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_parakeet_text_parity"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "validated"
@@ -388,11 +436,17 @@
       "required": true,
       "contract": {
         "class": "exact_token_equality",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "fixture_contracts": {
           "long": {
             "class": "corpus_quality_acceptance",
-            "fixtures": ["long"],
+            "fixtures": [
+              "long"
+            ],
             "tolerance": {
               "metric": "positional content-token match rate, denominator = LONGER stream (a decode that only truncates cannot score 1.0) — tests/parity_contract.token_match_rate",
               "aggregation": "per-fixture (long only)",
@@ -403,7 +457,9 @@
           }
         }
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_parakeet_idstream_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_parakeet_idstream_parity"
+      ],
       "backends": {
         "cpu": "validated",
         "cuda": "validated"
@@ -437,11 +493,17 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "fixture_contracts": {
           "medium": {
             "class": "corpus_quality_acceptance",
-            "fixtures": ["medium"],
+            "fixtures": [
+              "medium"
+            ],
             "tolerance": {
               "metric": "normalized character error rate (tests/parity_contract.character_error_rate)",
               "aggregation": "per-fixture",
@@ -452,7 +514,9 @@
           },
           "long": {
             "class": "corpus_quality_acceptance",
-            "fixtures": ["long"],
+            "fixtures": [
+              "long"
+            ],
             "tolerance": {
               "metric": "normalized character error rate (tests/parity_contract.character_error_rate)",
               "aggregation": "per-fixture",
@@ -485,7 +549,11 @@
       "needs_lib": false,
       "gguf": {
         "env": "GGML_MOSS_MODEL",
-        "default_path": "~/asr-bench/models/moss-transcribe-preview-2b-f16.gguf"
+        "default_path_env_root": {
+          "root_env": "ASR_BENCH_ROOT",
+          "root_default": "~/asr-bench",
+          "relative": "models/moss-transcribe-preview-2b-f16.gguf"
+        }
       },
       "goldens": [
         "moss_short_text.txt",
@@ -500,11 +568,17 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"],
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ],
         "fixture_contracts": {
           "long": {
             "class": "corpus_quality_acceptance",
-            "fixtures": ["long"],
+            "fixtures": [
+              "long"
+            ],
             "tolerance": {
               "metric": "difflib.SequenceMatcher ratio on the raw transcript",
               "aggregation": "per-fixture (long only)",
@@ -515,7 +589,9 @@
           }
         }
       },
-      "tests": ["tests/test_ggml_parity.py::test_ggml_parakeet_external_text_gate"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_ggml_parakeet_external_text_gate"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -534,7 +610,11 @@
       "needs_lib": false,
       "gguf": {
         "env": "GGML_PARAKEET_MODEL",
-        "default_path": "~/asr-bench/models/tdt-0.6b-v3-f16.gguf"
+        "default_path_env_root": {
+          "root_env": "ASR_BENCH_ROOT",
+          "root_default": "~/asr-bench",
+          "relative": "models/tdt-0.6b-v3-f16.gguf"
+        }
       },
       "goldens": [
         "parakeet_tdt_short_text.txt",
@@ -549,10 +629,14 @@
       "required": false,
       "contract": {
         "class": "smoke_non_certifying",
-        "fixtures": ["synthetic_maxcache_boundary"],
+        "fixtures": [
+          "synthetic_maxcache_boundary"
+        ],
         "note": "Regression guard (Wave G), not an accuracy certification: the K-step decode must stay within the KV cache / RoPE tables at the max_cache boundary (K=4 and K=8, n_tokens + max_new_tokens == max_cache). On unpatched code the final block's wasted tail steps index >= max_cache and greedy_generate returns false. A CPU run is a vacuous pass (the K-step path is GPU-only, where the bug lives)."
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_moss_kstep_cache_boundary"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_moss_kstep_cache_boundary"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -571,9 +655,10 @@
       "needs_lib": false,
       "binary": "moss_kstep_oob_test",
       "gguf": {
-        "env": "STARLING_GGML_MOSS_MODEL",
+        "hardcoded": true,
         "default_path": "models/moss-transcribe-preview-2b-bf16-exact.gguf",
-        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a"
+        "sha256": "b96dae2bcadc9e89f61a3ac1e103915e0abb11da521ca6d8db91e3244129e71a",
+        "note": "cpp/tests/* load this repo-relative path directly; the STARLING_GGML_MOSS_MODEL env override does not apply to these binaries, so the probe must not honor it either."
       }
     },
     {
@@ -583,9 +668,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_ark_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_ark_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -605,7 +696,9 @@
         "env": "STARLING_GGML_ARK_MODEL",
         "default_path": "models/ark-asr-3b-bf16-exact.gguf"
       },
-      "goldens": ["ark_reference.json"]
+      "goldens": [
+        "ark_reference.json"
+      ]
     },
     {
       "id": "higgs.intree.text",
@@ -614,9 +707,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_higgs_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_higgs_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -636,7 +735,9 @@
         "env": "STARLING_GGML_HIGGS_MODEL",
         "default_path": "models/higgs-audio-v3-bf16-exact.gguf"
       },
-      "goldens": ["higgs_golden.json"]
+      "goldens": [
+        "higgs_golden.json"
+      ]
     },
     {
       "id": "hojo.intree.text",
@@ -645,9 +746,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_hojo_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_hojo_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -667,7 +774,9 @@
         "env": "STARLING_GGML_HOJO_MODEL",
         "default_path": "models/hojo-asr-v1.gguf"
       },
-      "goldens": ["hojo_reference.json"]
+      "goldens": [
+        "hojo_reference.json"
+      ]
     },
     {
       "id": "granite.intree.text",
@@ -676,9 +785,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_granite_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_granite_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -698,7 +813,9 @@
         "env": "STARLING_GGML_GRANITE_MODEL",
         "default_path": "models/granite-speech-4.1-2b-bf16-exact.gguf"
       },
-      "goldens": ["granite_reference.json"]
+      "goldens": [
+        "granite_reference.json"
+      ]
     },
     {
       "id": "qwen3.intree.text",
@@ -707,9 +824,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_qwen3_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_qwen3_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -729,7 +852,9 @@
         "env": "STARLING_GGML_QWEN3_MODEL",
         "default_path": "models/qwen3-asr-1.7b-bf16-exact.gguf"
       },
-      "goldens": ["qwen3_reference.json"]
+      "goldens": [
+        "qwen3_reference.json"
+      ]
     },
     {
       "id": "audex.intree.text",
@@ -738,9 +863,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_audex_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_audex_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -760,7 +891,9 @@
         "env": "STARLING_GGML_AUDEX_MODEL",
         "default_path": "models/audex-2b-bf16-exact.gguf"
       },
-      "goldens": ["audex_reference.json"]
+      "goldens": [
+        "audex_reference.json"
+      ]
     },
     {
       "id": "s1.intree.text",
@@ -769,9 +902,15 @@
       "required": false,
       "contract": {
         "class": "exact_text_equality",
-        "fixtures": ["short", "medium", "long"]
+        "fixtures": [
+          "short",
+          "medium",
+          "long"
+        ]
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_s1_text_parity"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_s1_text_parity"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -792,7 +931,9 @@
         "env": "STARLING_GGML_S1_MODEL",
         "default_path": "models/s1-mini-bf16-exact.gguf"
       },
-      "assets_files": ["tests/fixtures/s1_transcripts.py"]
+      "assets_files": [
+        "tests/fixtures/s1_transcripts.py"
+      ]
     },
     {
       "id": "s1.intree.control_matrix_smoke",
@@ -801,10 +942,14 @@
       "required": false,
       "contract": {
         "class": "smoke_non_certifying",
-        "fixtures": ["control_matrix_16_cells"],
+        "fixtures": [
+          "control_matrix_16_cells"
+        ],
         "note": "SMOKE check (renamed from test_starling_ggml_s1_control_matrix so it cannot be mistaken for accuracy certification): all 16 trained control combinations produce non-degenerate output and unknown control values are rejected. The accuracy contract for s1 is s1.intree.text above."
       },
-      "tests": ["tests/test_ggml_parity.py::test_starling_ggml_s1_control_matrix_smoke"],
+      "tests": [
+        "tests/test_ggml_parity.py::test_starling_ggml_s1_control_matrix_smoke"
+      ],
       "backends": {
         "cuda": "validated",
         "cpu": "unvalidated"
@@ -824,7 +969,9 @@
         "env": "STARLING_GGML_S1_MODEL",
         "default_path": "models/s1-mini-bf16-exact.gguf"
       },
-      "assets_files": ["tests/fixtures/s1_transcripts.py"]
+      "assets_files": [
+        "tests/fixtures/s1_transcripts.py"
+      ]
     }
   ]
 }
