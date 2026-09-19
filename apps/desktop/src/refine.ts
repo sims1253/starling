@@ -1,4 +1,4 @@
-import { Effect, Option, Predicate, Schema } from "effect";
+import { Duration, Effect, Option, Predicate, Schema } from "effect";
 import { ServerErrorResponseSchema } from "@starling/dictation";
 
 /**
@@ -239,11 +239,16 @@ function withTimeout<A, E>(
   timeoutMs: number,
 ): Effect.Effect<A, E | RefinementTimeoutError> {
   // 0 disables the deadline, matching the dictation client's convention.
+  // Duration.millis is explicit on purpose: a bare number in Duration.Input
+  // also means milliseconds in this Effect version (verified against the
+  // vendored rc.115 — Duration.toMillis(1000) === 1000 — the same reading
+  // client.ts relies on), and naming the unit keeps that from being
+  // re-derived from the call site.
   if (timeoutMs === 0) return effect;
 
   return effect.pipe(
     Effect.timeoutOrElse({
-      duration: timeoutMs,
+      duration: Duration.millis(timeoutMs),
       orElse: () => Effect.fail(new RefinementTimeoutError(timeoutMs)),
     }),
   );
@@ -257,22 +262,34 @@ function withExternalAbort<A, E>(
 
   // The listener race makes an externally cancelled request fail like any
   // other: the losing side is interrupted, which aborts the in-flight fetch
-  // through its fiber signal. A resume after the request already settled is
-  // a no-op, so the once-listener never produces a late failure.
+  // through its fiber signal.
+  let detach: () => void = () => {};
+
   const cancelled = Effect.callback<never, RefinementTransportError>((resume) => {
-    const abort = () =>
+    const onAbort = (): void => {
+      detach();
       resume(Effect.fail(new RefinementTransportError("The refinement request was cancelled.")));
+    };
+
+    detach = () => signal.removeEventListener("abort", onAbort);
 
     if (signal.aborted) {
-      abort();
+      onAbort();
 
       return;
     }
 
-    signal.addEventListener("abort", abort, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 
-  return Effect.raceFirst(effect, cancelled);
+  // The listener is detached the moment the race settles: onExit observes
+  // every exit of the raced request — including the interruption the race
+  // imposes on the loser — so it can never outlive the request it was
+  // registered for.
+  return Effect.raceFirst(
+    Effect.onExit(effect, () => Effect.sync(detach)),
+    cancelled,
+  );
 }
 
 const decodeCompletionResponse = Schema.decodeEffect(
@@ -320,6 +337,18 @@ export function refineEffect(
       );
     }
 
+    // Same rule as the dictation client's constructor (which throws a
+    // TypeError for the same condition): 0 disables the deadline, anything
+    // not a finite non-negative number is refused. Here it surfaces as a
+    // typed failure instead of a throw because this is already an Effect.
+    const timeoutMs = options.timeoutMs ?? DEFAULT_REFINEMENT_TIMEOUT_MS;
+
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      return yield* new RefinementInputError(
+        "timeoutMs must be a finite non-negative number, or 0 to disable the deadline.",
+      );
+    }
+
     const headers = new Headers({ "Content-Type": "application/json" });
     const apiKey = settings.apiKey?.trim();
 
@@ -354,10 +383,7 @@ export function refineEffect(
       catch: (cause) => new RefinementTransportError(describeCause(cause)),
     }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
 
-    const response = yield* withExternalAbort(
-      withTimeout(request, options.timeoutMs ?? DEFAULT_REFINEMENT_TIMEOUT_MS),
-      options.signal,
-    );
+    const response = yield* withExternalAbort(withTimeout(request, timeoutMs), options.signal);
 
     const wire = yield* decodeCompletionResponse(response.body).pipe(
       Effect.mapError(

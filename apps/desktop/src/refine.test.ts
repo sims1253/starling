@@ -274,12 +274,43 @@ describe("refineEffect", () => {
         );
       });
 
+    const startedAt = Date.now();
+
     const failure = await Effect.runPromise(
       Effect.flip(refineEffect("hello", settings, { fetchImpl: never, timeoutMs: 5 })),
     );
 
+    // Units guard, not just outcome: Duration.Input reads bare numbers and
+    // Duration.millis identically in this Effect version, so 5 means 5 ms and
+    // the deadline must land far inside a second — a seconds interpretation
+    // of the same option would take ~5_000 ms.
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(failure).toBeInstanceOf(RefinementTimeoutError);
     expect(requestAborted).toBe(true);
+  });
+
+  it("treats zero as no deadline and rejects invalid deadlines as input errors", async () => {
+    // 0 disables the deadline: a fetch that resolves on a later tick succeeds.
+    const later: typeof fetch = async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+      return completion("Unhurried.");
+    };
+
+    const unhurried = await Effect.runPromise(
+      refineEffect("hello", settings, { fetchImpl: later, timeoutMs: 0 }),
+    );
+
+    expect(unhurried).toBe("Unhurried.");
+
+    for (const timeoutMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const failure = await Effect.runPromise(
+        Effect.flip(refineEffect("hello", settings, { fetchImpl: later, timeoutMs })),
+      );
+
+      expect(failure).toBeInstanceOf(RefinementInputError);
+      expect(failure.message).toContain("timeoutMs");
+    }
   });
 
   it("fails as cancelled when the caller aborts mid-request", async () => {
@@ -312,6 +343,24 @@ describe("refineEffect", () => {
     expect(failure).toBeInstanceOf(RefinementTransportError);
     expect(failure.message).toBe("The refinement request was cancelled.");
     expect(requestSignal.aborted).toBe(true);
+  });
+
+  it("detaches the abort listener once the request settles", async () => {
+    // After a successful refinement, the caller's signal firing must be a
+    // complete no-op: the listener was removed when the race settled, so no
+    // late resume — and no unhandled rejection — can follow teardown.
+    const controller = new AbortController();
+    const recorder = recordingFetch(() => completion("Done."));
+
+    const text = await Effect.runPromise(
+      refineEffect("hello", settings, { fetchImpl: recorder.fetchImpl, signal: controller.signal }),
+    );
+
+    expect(text).toBe("Done.");
+
+    controller.abort();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(recorder.captured.length).toBe(1);
   });
 
   it("fails as cancelled when the signal is already aborted", async () => {
