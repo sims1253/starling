@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import re
 import sys
 from pathlib import Path
 
@@ -122,6 +123,71 @@ def test_manifest_rejects_bad_fixture_overrides() -> None:
         del o["tolerance"]
     with pytest.raises(pc.ManifestError, match="corpus_quality_acceptance"):
         pc.validate_manifest(broken)
+
+
+def test_manifest_rejects_unsanctioned_shared_gate() -> None:
+    """A test claimed by two targets is only legal when every claiming target
+    declares ``shared_gate: true`` — an accidental duplicate must fail."""
+    base = pc.load_manifest()
+    broken = copy.deepcopy(base)
+    donor = next(t for t in broken["targets"]
+                 if t["id"] == "parakeet.intree.ids")
+    victim = next(t for t in broken["targets"] if t["id"] == "ark.intree.text")
+    victim["tests"] = list(victim["tests"]) + list(donor["tests"])
+    with pytest.raises(pc.ManifestError, match="shared_gate"):
+        pc.validate_manifest(broken)
+    # The sanctioned share (moss_llm_test -> components + token_stream) is
+    # exactly the two declaring targets and must keep validating.
+    pc.validate_manifest(base)
+
+
+# --------------------------------------------------------------------------- #
+# Manifest <-> gate-code margin agreement (the only manifest value the gates
+# read at runtime is enforcement.fixtures_exact — every recorded margin that
+# lives as a code literal must be pinned by a test, pullfrog review PR #182)
+# --------------------------------------------------------------------------- #
+def test_code_margins_match_manifest(manifest: dict) -> None:
+    """Every decimal margin recorded in a manifest tolerance block must appear
+    as the SAME literal in the enforcing gate's source (assertion or recorded
+    docstring), so a manifest edit or a gate edit cannot drift silently."""
+    source = PARITY_FILE.read_text()
+    tree = ast.parse(source)
+    fn_sources = {
+        n.name: ast.get_source_segment(source, n)
+        for n in tree.body if isinstance(n, ast.FunctionDef)}
+    decimal = re.compile(r"\d+\.\d+")
+    checked = 0
+    for t in manifest["targets"]:
+        blocks: list[tuple[str | None, dict]] = [(None, t["contract"])]
+        for fname, override in (t["contract"].get("fixture_contracts") or {}).items():
+            blocks.append((fname, override))
+        for fname, contract in blocks:
+            tolerances: list[dict] = []
+            if contract.get("class") == "corpus_quality_acceptance":
+                tolerances = [contract["tolerance"]]
+            elif contract.get("class") == "component_numerical_tolerance":
+                tolerances = contract.get("tolerances", [])
+            for tolerance in tolerances:
+                margins = decimal.findall(tolerance.get("margin", ""))
+                if not margins:
+                    continue
+                where = f"{t['id']}" + (f"/{fname}" if fname else "")
+                srcs = []
+                for node in t["tests"]:
+                    fn = node.split("::")[-1].split("[", 1)[0]
+                    src = fn_sources.get(fn)
+                    assert src, f"{where}: gate {fn} not found in {PARITY_FILE}"
+                    srcs.append(src)
+                for margin in margins:
+                    assert any(margin in s for s in srcs), (
+                        f"{where}: manifest margin {margin!r} is not a literal "
+                        f"in any of {[n.split('::')[-1] for n in t['tests']]} — "
+                        "the gate code and the manifest contract have drifted; "
+                        "update both in one reviewed change")
+                checked += 1
+    # the corpus margins (0.10 x2 crispasr, 0.90 x2 parakeet long, 0.65 ids
+    # long) plus the recorded component bounds (encoder 0.02/0.001, llm 8.0)
+    assert checked >= 8, f"expected the known margin set, checked only {checked}"
 
 
 def test_manifest_changelog_records_this_change(manifest: dict) -> None:
@@ -328,6 +394,26 @@ def test_required_targets_never_silently_pass(manifest: dict, request) -> None:
         assert not hard, (
             "required-target coverage failures (assets present but zero tests "
             f"executed, or asset hash mismatches):\n{hard}")
+
+
+def test_recorded_skip_reasons_surface_in_report(manifest: dict) -> None:
+    """record_unavailable must not be a dead write: the recorded gate-skip
+    reason appears in the coverage report (the probe cannot see, e.g., an
+    absent external server binary while its GGUF/goldens exist)."""
+    pc.record_unavailable("parakeet.external", "server binary absent (test)")
+    try:
+        report, _failures = pc.coverage_lines(manifest)
+        assert any("parakeet.external" in line
+                   and "server binary absent (test)" in line
+                   for line in report), report
+    finally:
+        rec = pc._RECORDS.get("parakeet.external")
+        if rec is not None:
+            rec.unavailable_reasons = [
+                r for r in rec.unavailable_reasons
+                if r != "server binary absent (test)"]
+            if not rec.unavailable_reasons and rec.executed == 0:
+                pc._RECORDS.pop("parakeet.external", None)
 
 
 def test_probe_detects_hash_mismatch_as_problem(tmp_path, monkeypatch) -> None:

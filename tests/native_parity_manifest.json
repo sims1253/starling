@@ -219,6 +219,7 @@
       "model": "MOSS-Transcribe-preview-2B LLM trunk (shared lib/qwen_decode stack)",
       "engine": "cpp-test:moss_llm_test",
       "required": true,
+      "shared_gate": true,
       "contract": {
         "class": "component_numerical_tolerance",
         "fixtures": [
@@ -297,13 +298,15 @@
         "raw/moss_short_prefill_logits.f32",
         "raw/moss_medium_prefill_logits.f32",
         "raw/moss_long_prefill_logits.f32"
-      ]
+      ],
+      "shared_gate_note": "test_starling_ggml_moss_llm_components is ONE binary run feeding TWO targets: the always-enforced component contract and the backend-scoped exact-token contract. Declared explicitly so the validator's duplicate-ownership check can distinguish this sanctioned share from an accidental one."
     },
     {
       "id": "qwen_decode.shared_fixture.token_stream",
       "model": "MOSS-Transcribe-preview-2B LLM trunk (shared lib/qwen_decode stack)",
       "engine": "cpp-test:moss_llm_test",
       "required": true,
+      "shared_gate": true,
       "contract": {
         "class": "exact_token_equality",
         "fixtures": [
@@ -370,7 +373,8 @@
         "moss_short_text.txt": "4b7b1073246846994578dce6910ba0fa85cf07918053dd0df4223ccbaef10ddc",
         "moss_medium_text.txt": "9ed7421e4851d167b5cd53cb283802f0cad41e6a9fc9f8c940a4109bf1dc6b8d",
         "moss_long_text.txt": "3b7c95a515f9ac652f09a0728c18751a858b2b056461703d06583459540c280d"
-      }
+      },
+      "shared_gate_note": "test_starling_ggml_moss_llm_components is ONE binary run feeding TWO targets: the always-enforced component contract and the backend-scoped exact-token contract. Declared explicitly so the validator's duplicate-ownership check can distinguish this sanctioned share from an accidental one."
     },
     {
       "id": "parakeet.intree.text",

@@ -168,3 +168,19 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_compile)
         if not run_slow and item.get_closest_marker("slow") is not None:
             item.add_marker(skip_slow)
+
+    # Issue #167 coverage accounting must observe the parity gates' executed
+    # records AFTER the gates have run. Both modules are imported at
+    # COLLECTION time (so parity_module_loaded() is already true), but with an
+    # explicit file order like
+    #   pytest tests/test_native_parity_contract.py tests/test_ggml_parity.py
+    # the accounting test would run before any gate and see empty records.
+    # Move the accounting tests to the very end of the session.
+    accounting = {
+        "test_parity_coverage_accounting",             # tests/test_ggml_parity.py
+        "test_required_targets_never_silently_pass",   # tests/test_native_parity_contract.py
+    }
+    tail = [it for it in items if it.name.split("[", 1)[0] in accounting]
+    if tail:
+        items[:] = [it for it in items
+                    if it.name.split("[", 1)[0] not in accounting] + tail

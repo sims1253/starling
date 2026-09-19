@@ -198,6 +198,27 @@ def validate_manifest(m: dict) -> None:
                     f"target {tid!r}: policies.{pol} must be recorded explicitly "
                     "(even 'none'/'n/a')")
 
+    # Test ownership: a test claimed by more than one target must be a
+    # SANCTIONED shared gate — every claiming target declares
+    # ``"shared_gate": true`` — so an accidental duplicate cannot hide behind
+    # the at-least-once claim check (greptile review on PR #182).
+    ownership: dict[str, list[str]] = {}
+    for t in targets:
+        for node in t["tests"]:
+            ownership.setdefault(node.split("::")[-1].split("[", 1)[0],
+                                 []).append(t["id"])
+    by_id = {t["id"]: t for t in targets}
+    for name, tids in ownership.items():
+        if len(set(tids)) > 1:
+            unsanctioned = [tid for tid in sorted(set(tids))
+                            if not by_id[tid].get("shared_gate")]
+            if unsanctioned:
+                raise ManifestError(
+                    f"test {name!r} is claimed by {sorted(set(tids))} but "
+                    f"{unsanctioned} do not declare 'shared_gate': true — "
+                    "duplicate gate ownership must be an explicit, reviewed "
+                    "exception")
+
 
 # --------------------------------------------------------------------------- #
 # Test-selection agreement (pure ast — no imports of the test modules)
@@ -645,12 +666,19 @@ def coverage_lines(m: dict, repo_root: Path = REPO_ROOT,
     Unavailable required targets are reported distinctly and only fail in
     strict mode. ``deselection`` (from :func:`pytest_deselection`) suspends the
     zero-executed enforcement for explicitly scoped runs (``-k``/``-m``).
+
+    Gate-recorded skip reasons (:func:`record_unavailable`) are surfaced in
+    the report: the probe can only see files, so a gate that skipped for a
+    reason the probe cannot see (e.g. an external server binary absent while
+    its GGUF/goldens exist) would otherwise vanish silently.
     """
     report: list[str] = []
     failures: list[str] = []
     for t in m["targets"]:
         probe = probe_target_assets(t, repo_root)
         rec = _RECORDS.get(t["id"], CoverageRecord())
+        reasons = "; ".join(dict.fromkeys(rec.unavailable_reasons))
+        suffix = f"; gate skip reasons: {reasons}" if reasons else ""
         if t.get("required"):
             if probe.problems:
                 failures.extend(probe.problems)
@@ -658,20 +686,26 @@ def coverage_lines(m: dict, repo_root: Path = REPO_ROOT,
                     and parity_module_loaded() and not deselection):
                 failures.append(
                     f"{t['id']}: REQUIRED target has all assets present but executed "
-                    f"ZERO tests in this run (silent skip = broken gate)")
+                    f"ZERO tests in this run (silent skip = broken gate){suffix}")
             if probe.missing:
                 line = (f"{t['id']}: required coverage UNAVAILABLE here "
-                        f"(missing: {', '.join(probe.missing)})")
+                        f"(missing: {', '.join(probe.missing)}){suffix}")
                 if strict_mode():
                     failures.append(line + " [STARLING_PARITY_STRICT=1]")
                 else:
                     report.append(line)
         elif probe.missing and not probe.problems:
             report.append(f"{t['id']}: optional target unavailable (missing: "
-                          f"{', '.join(probe.missing)})")
+                          f"{', '.join(probe.missing)}){suffix}")
         elif probe.problems:
             report.append(f"{t['id']}: optional target asset problem: "
                           f"{'; '.join(probe.problems)}")
+        elif (rec.executed == 0 and reasons
+              and parity_module_loaded() and not deselection):
+            # Assets look present to the probe, yet the gates skipped anyway —
+            # surface the gate-recorded reason instead of silence.
+            report.append(f"{t['id']}: optional target not executed "
+                          f"(gate skip reasons: {reasons})")
     return report, failures
 
 
