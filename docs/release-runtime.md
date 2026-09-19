@@ -22,7 +22,7 @@ checked-out tag. For a manual release, select a workflow ref with the same versi
 | --- | --- | --- |
 | `linux-vulkan` | x86_64 Ubuntu 22.04 with `libstdc++6`, `libgomp1`, and `libvulkan1`; a vendor Vulkan driver and supported GPU for inference | Extracted archive, checksum, loader dependencies, version, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
 | `linux-cpu` | x86_64 Ubuntu 22.04 with `libstdc++6` and `libgomp1`; no GPU or driver required | Extracted archive, checksum, loader dependencies, version, backend, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages |
-| `linux-cuda` | x86_64 Linux compatible with the Ubuntu 22.04 build; CUDA 13.3 runtime and cuBLAS libraries, their dependencies, and a compatible NVIDIA driver | Extracted archive, checksum, loader dependencies, version, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages and the userspace driver library (startup only; no GPU) |
+| `linux-cuda` | x86_64 Linux compatible with the Ubuntu 22.04 build; CUDA 13.3 runtime and cuBLAS libraries, their dependencies, and a compatible NVIDIA driver | Extracted archive, checksum, loader dependencies, version, backend, and ABI in a fresh Ubuntu 22.04 container with only these runtime packages and the userspace driver library (startup only; no GPU) |
 | `linux-rocm` | x86_64 Linux compatible with the Ubuntu 22.04 build; ROCm 7.2.4 HIP runtime, rocBLAS, hipBLAS, and their dependencies; a compatible AMD driver and GPU | Version and ABI on the build runner only |
 | `windows-cuda` | x86_64 Windows; CUDA 13.3 runtime and cuBLAS DLLs, their dependencies, and a compatible NVIDIA driver; runtime DLL directories on `PATH` | Version and ABI on the build runner only |
 | `windows-vulkan` | x86_64 Windows; Vulkan loader and vendor Vulkan driver | Version and ABI on the build runner only |
@@ -47,31 +47,6 @@ that separate check. Do not treat their build-runner metadata checks as a
 clean-machine guarantee. The Linux CUDA archive has the same style of
 fresh-container startup check as Linux Vulkan/CPU (see below); like them, it
 does not verify GPU inference.
-
-## Linux CUDA archive check
-
-From a checkout of the release tag, run:
-
-```bash
-scripts/release-runtime/check-linux-cuda.sh \
-  starling-serve-linux-cuda.tar.gz 0.1.0 8
-```
-
-Docker builds an Ubuntu 22.04 image with the documented runtime packages —
-the CUDA 13.3 runtime and cuBLAS from the vendor repository, the base C/C++
-runtime, and the userspace driver library (`libcuda.so.1` comes from the
-installed NVIDIA driver; the container installs the vendor's userspace
-package so the loader path is exercised without a kernel driver). The check
-runs with networking disabled, verifies the checksum, requires every loader
-dependency to resolve, and gates the version, `backend: cuda`, and ABI.
-
-The default mode is GPU-less — exactly what the release runner executes
-after packaging, before upload. Pass `--with-gpu` on a machine whose
-container runtime can inject the NVIDIA driver to rerun the same checks
-under it. Either way this is a startup check: it does not initialize a CUDA
-device or run inference. Representative inference on real hardware is
-recorded on the tracking issue (see #57; the Linux CUDA inference leg
-currently fails — #184).
 
 ## Linux Vulkan archive check
 
@@ -110,33 +85,29 @@ scope as above applies.
 
 ## Linux CUDA archive check
 
-From a checkout of the release tag (or against any locally built archive of
-the same recipe), run:
+From a checkout of the release tag, run:
 
 ```bash
 scripts/release-runtime/check-linux-cuda.sh \
-  starling-serve-linux-cuda.tar.gz 0.1.0 6
+  starling-serve-linux-cuda.tar.gz 0.1.0 8
 ```
 
-Docker builds an Ubuntu 22.04 image with the documented runtime packages —
-the CUDA 13.3 runtime and cuBLAS from the vendor repository, the platform
-C/C++ runtime, and the userspace driver library (`libnvidia-compute-610`,
-chosen from the vendor repository as the loader-resolution half of the
-documented "compatible NVIDIA driver" prerequisite; a real driver provides
-the same soname) — then runs the archive check with networking disabled and
-nothing but the archive mounted. No CUDA SDK, build directory, or host
-library paths are supplied.
+Replace the version and ABI with the values expected for that tag. Docker
+builds an Ubuntu 22.04 image with the documented runtime packages — the CUDA
+13.3 runtime and cuBLAS from the vendor repository, the base C/C++ runtime,
+and the userspace driver library (`libnvidia-compute-610` from the vendor
+repository provides `libcuda.so.1`, the loader-resolution half of the
+documented "compatible NVIDIA driver" prerequisite; an installed driver
+supplies the same soname) — then runs the archive check with networking
+disabled and nothing but the archive mounted. No CUDA SDK, build directory,
+or host library paths are supplied.
 
-The default mode is GPU-less, like the release runner: the binary must load
-(drivers' userspace library included), its checksum must verify, every
-loader dependency must resolve, and the version/backend/ABI metadata must
-match. The `--version` backend line names the compiled backend flavor, not
-a probed device. On a machine whose Docker has the NVIDIA container runtime,
-`--with-gpu` reruns the same checks with the real driver injected.
-
-This is a startup check, not inference evidence: no CUDA device is
-initialized in the default mode and no model is loaded. Representative
-inference on CUDA hardware failed on the first attempted verification
-(parakeet + RTX 5090; see
-[issue #184](https://github.com/sims1253/starling/issues/184)) and remains
-open on [#57](https://github.com/sims1253/starling/issues/57).
+The check verifies the checksum, requires every loader dependency to resolve,
+and gates the version, `backend: cuda`, and ABI. The `--version` backend line
+names the compiled backend flavor, not a probed device. The default mode is
+GPU-less — exactly what the release runner executes after packaging, before
+upload; on a machine whose container runtime can inject the NVIDIA driver,
+`--with-gpu` reruns the same checks under it. Either way this is a startup
+check: it does not initialize a CUDA device or run inference. Representative
+inference on real hardware is recorded on the tracking issue (see #57; the
+Linux CUDA inference leg currently fails — #184).
