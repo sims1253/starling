@@ -228,9 +228,10 @@ jobs:
       # also #184) and stays outside this job.
       - name: Runtime check (fresh container, documented packages only)
         run: |
+          abi=$(awk '/^#define STARLING_GGML_ABI_VERSION / { print $3 }' cpp/include/starling_ggml.h)
+          test -n "$abi"
           scripts/release-runtime/check-linux-cuda.sh \
-            starling-serve-linux-cuda.tar.gz "${RELEASE_TAG#v}" \
-            "$(./starling-serve-linux-cuda --abi-version)"
+            starling-serve-linux-cuda.tar.gz "${RELEASE_TAG#v}" "$abi"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -617,9 +618,10 @@ jobs:
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
             accelerator runtime libraries are not bundled. CUDA requires the 13.3
             runtime and cuBLAS; ROCm requires the 7.2.4 HIP/BLAS runtime.
-            The CPU builds need only the platform C/C++ runtime. Linux Vulkan and
-            Linux CPU are smoke-tested outside their build environment in a clean
-            container. These startup checks do not verify GPU inference.
+            The CPU builds need only the platform C/C++ runtime. Linux CUDA,
+            Linux Vulkan and Linux CPU are smoke-tested outside their build
+            environment in a clean container. These startup checks do not
+            verify GPU inference.
 
             ### Usage
             ```bash
