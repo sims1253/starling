@@ -4,6 +4,7 @@ import {
   dialog,
   globalShortcut,
   ipcMain,
+  safeStorage,
   session,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
@@ -15,10 +16,16 @@ import path from "node:path";
 import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
 import {
   HealthInputSchema,
+  RefinementKeyLoadInputSchema,
+  RefinementKeySaveInputSchema,
   TranscribeInputSchema,
   type DesktopDiagnostics,
   type HealthInput,
   type PendingAudioState,
+  type RefinementKeyLoadInput,
+  type RefinementKeySaveInput,
+  type RefinementKeySaveResult,
+  type RefinementKeyLoadResult,
   type TranscribeInput,
   type TranscriptionResult,
   type ServerHealth,
@@ -381,6 +388,48 @@ function transcribeProgram(input: TranscribeInput) {
   });
 }
 
+/**
+ * Encrypt the refinement API key with the OS keychain-backed safeStorage and
+ * hand back base64 ciphertext; the plaintext never persists anywhere. A host
+ * without an encryption backend resolves ciphertext null, which tells the
+ * renderer to keep its documented plaintext fallback rather than fail.
+ */
+function storeRefinementKeyProgram(
+  input: RefinementKeySaveInput,
+): Effect.Effect<RefinementKeySaveResult, RequestTransportError> {
+  return Effect.try({
+    try: () => ({
+      ciphertext: safeStorage.isEncryptionAvailable()
+        ? safeStorage.encryptString(input.apiKey).toString("base64")
+        : null,
+    }),
+    catch: (cause) =>
+      new RequestTransportError({
+        message: "Could not encrypt the refinement API key.",
+        cause,
+      }),
+  });
+}
+
+/**
+ * Decrypt a previously stored ciphertext. Undecryptable input (corrupt or
+ * produced by another app/origin) resolves apiKey null instead of failing:
+ * losing the key only disables hosted refinement, it must never block use.
+ */
+function loadRefinementKeyProgram(
+  input: RefinementKeyLoadInput,
+): Effect.Effect<RefinementKeyLoadResult, never> {
+  return Effect.sync(() => {
+    if (!safeStorage.isEncryptionAvailable()) return { apiKey: null };
+
+    try {
+      return { apiKey: safeStorage.decryptString(Buffer.from(input.ciphertext, "base64")) };
+    } catch {
+      return { apiKey: null };
+    }
+  });
+}
+
 function trustedRenderer(raw: string): boolean {
   try {
     const url = new URL(raw);
@@ -438,6 +487,27 @@ ipcMain.handle("starling:transcribe", (event, input: TranscribeInput) =>
     event,
     Schema.decodeUnknownEffect(TranscribeInputSchema)(input).pipe(
       Effect.flatMap(transcribeProgram),
+    ),
+  ),
+);
+
+// Same trust rule and decode-at-the-boundary recipe as the channels above:
+// only the trusted renderer may hand keys in for encryption or ciphertexts
+// in for decryption.
+ipcMain.handle("starling:refine-key:save", (event, input: RefinementKeySaveInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(RefinementKeySaveInputSchema)(input).pipe(
+      Effect.flatMap(storeRefinementKeyProgram),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:refine-key:load", (event, input: RefinementKeyLoadInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(RefinementKeyLoadInputSchema)(input).pipe(
+      Effect.flatMap(loadRefinementKeyProgram),
     ),
   ),
 );

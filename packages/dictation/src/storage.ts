@@ -18,12 +18,14 @@ const NonNegativeFinite = Schema.Finite.pipe(Schema.check(Schema.isGreaterThanOr
 
 /**
  * A refined transcript: the output of one explicit, opt-in refinement
- * request, stored beside the raw transcript — never in place of it.
+ * request, stored beside the raw transcript — never in place of it. Text and
+ * model are non-empty by contract (the refinement client refuses empty
+ * content and requires a model), so an empty value here is damage, not data.
  */
 export const RefinedTranscriptSchema = Schema.Struct({
-  text: Schema.String,
+  text: Schema.NonEmptyString,
   /** The chat model that produced this refinement, shown with the text. */
-  model: Schema.String,
+  model: Schema.NonEmptyString,
   createdAt: NonNegativeFinite,
 });
 

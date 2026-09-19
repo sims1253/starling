@@ -227,6 +227,82 @@ describe("refineEffect", () => {
     expect(new Headers(withoutKey.captured[0]?.init.headers).get("authorization")).toBe(null);
   });
 
+  it("refuses a bearer key over non-loopback cleartext http", async () => {
+    // A Bearer key must never cross the wire in cleartext: remote http is
+    // refused before any request is sent, while loopback http keeps working
+    // for local servers and https keeps working everywhere.
+    const unreachable: typeof fetch = async () => {
+      throw new Error("a cleartext remote request must never be sent");
+    };
+
+    const cleartext = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { baseUrl: "http://example.com:8080/v1", model: "m", apiKey: "sk" },
+          {
+            fetchImpl: unreachable,
+          },
+        ),
+      ),
+    );
+
+    expect(cleartext).toBeInstanceOf(RefinementInputError);
+    expect(cleartext.message).toContain("cleartext");
+
+    const invalidUrl = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { baseUrl: "not a url", model: "m", apiKey: "sk" },
+          {
+            fetchImpl: unreachable,
+          },
+        ),
+      ),
+    );
+
+    expect(invalidUrl).toBeInstanceOf(RefinementInputError);
+
+    const loopback = recordingFetch(() => completion("Local."));
+
+    await Effect.runPromise(
+      refineEffect("hello", { ...settings, apiKey: "sk" }, { fetchImpl: loopback.fetchImpl }),
+    );
+
+    expect(loopback.captured.length).toBe(1);
+
+    const https = recordingFetch(() => completion("Remote."));
+
+    await Effect.runPromise(
+      refineEffect(
+        "hello",
+        { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini", apiKey: "sk" },
+        {
+          fetchImpl: https.fetchImpl,
+        },
+      ),
+    );
+
+    expect(https.captured.length).toBe(1);
+
+    // Without a key, plain remote http stays allowed: the transcript is not
+    // a credential and the endpoint may be an intentionally trusted LAN box.
+    const plainHttp = recordingFetch(() => completion("LAN."));
+
+    await Effect.runPromise(
+      refineEffect(
+        "hello",
+        { baseUrl: "http://192.168.1.10:8080/v1", model: "m" },
+        {
+          fetchImpl: plainHttp.fetchImpl,
+        },
+      ),
+    );
+
+    expect(plainHttp.captured.length).toBe(1);
+  });
+
   it("surfaces HTTP status and the server's own error detail", async () => {
     const recorder = recordingFetch(
       () =>
@@ -342,12 +418,43 @@ describe("refineEffect", () => {
         );
       });
 
+    const startedAt = Date.now();
+
     const failure = await Effect.runPromise(
       Effect.flip(refineEffect("hello", settings, { fetchImpl: never, timeoutMs: 5 })),
     );
 
+    // Units guard, not just outcome: Duration.Input reads bare numbers and
+    // Duration.millis identically in this Effect version, so 5 means 5 ms and
+    // the deadline must land far inside a second — a seconds interpretation
+    // of the same option would take ~5_000 ms.
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(failure).toBeInstanceOf(RefinementTimeoutError);
     expect(requestAborted).toBe(true);
+  });
+
+  it("treats zero as no deadline and rejects invalid deadlines as input errors", async () => {
+    // 0 disables the deadline: a fetch that resolves on a later tick succeeds.
+    const later: typeof fetch = async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+      return completion("Unhurried.");
+    };
+
+    const unhurried = await Effect.runPromise(
+      refineEffect("hello", settings, { fetchImpl: later, timeoutMs: 0 }),
+    );
+
+    expect(unhurried).toBe("Unhurried.");
+
+    for (const timeoutMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const failure = await Effect.runPromise(
+        Effect.flip(refineEffect("hello", settings, { fetchImpl: later, timeoutMs })),
+      );
+
+      expect(failure).toBeInstanceOf(RefinementInputError);
+      expect(failure.message).toContain("timeoutMs");
+    }
   });
 
   it("fails as cancelled when the caller aborts mid-request", async () => {
@@ -380,6 +487,24 @@ describe("refineEffect", () => {
     expect(failure).toBeInstanceOf(RefinementTransportError);
     expect(failure.message).toBe("The refinement request was cancelled.");
     expect(requestSignal.aborted).toBe(true);
+  });
+
+  it("detaches the abort listener once the request settles", async () => {
+    // After a successful refinement, the caller's signal firing must be a
+    // complete no-op: the listener was removed when the race settled, so no
+    // late resume — and no unhandled rejection — can follow teardown.
+    const controller = new AbortController();
+    const recorder = recordingFetch(() => completion("Done."));
+
+    const text = await Effect.runPromise(
+      refineEffect("hello", settings, { fetchImpl: recorder.fetchImpl, signal: controller.signal }),
+    );
+
+    expect(text).toBe("Done.");
+
+    controller.abort();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(recorder.captured.length).toBe(1);
   });
 
   it("fails as cancelled when the signal is already aborted", async () => {

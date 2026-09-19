@@ -10,6 +10,7 @@ import {
   StarlingStream,
   type DictationSession,
   type InvalidStoredSession,
+  type RefinedTranscript,
   type TranscriptionProtocol,
   type TranscriptionResult,
 } from "@starling/dictation";
@@ -82,6 +83,38 @@ function historyRowLabel(session: DictationSession) {
 
 function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/** The "model, when" attribution stamped on every refined copy. */
+function refinedTranscriptStamp(refined: RefinedTranscript, when: string) {
+  return `${refined.model}, ${when}`;
+}
+
+/** The separator line that appends a refined copy to a text export. */
+function refinedTranscriptSeparator(refined: RefinedTranscript, iso: string) {
+  return `--- REFINED TRANSCRIPT — ${refinedTranscriptStamp(refined, iso)} ---`;
+}
+
+/**
+ * The refine action's caption: refining in flight, a stored copy to replace,
+ * or the first run. A named branch instead of a nested ternary at the call
+ * site, so the drawer JSX stays flat.
+ */
+function refineActionLabel(refining: boolean, hasRefined: boolean) {
+  if (refining) return "Refining…";
+
+  return hasRefined ? "Refine again" : "Refine";
+}
+
+/**
+ * The threaded refine action's caption: refining in flight, a re-run against
+ * the thread's current text, or the first join. Same shape as
+ * refineActionLabel so the second drawer button stays as flat as the first.
+ */
+function refineThreadActionLabel(refining: boolean, threaded: boolean) {
+  if (refining) return "Refining…";
+
+  return threaded ? "Refine with thread context" : "Refine in thread";
 }
 
 /** Stable-enough id for WAVs parked in memory when storage fails. */
@@ -221,18 +254,25 @@ export default function App() {
   // that raced the sweep would journal into a database still being recovered.
   const startupRecoveryDoneRef = useRef(false);
 
-  // Transcript refinement, like transcription, is single-flight and guarded by
-  // a ref so a re-entry issued mid-request is ignored instead of interleaved.
-  // The error is keyed by session id: a failure belongs to the take it came
-  // from and never bleeds into another drawer selection.
-  const [refining, setRefining] = useState(false);
-  const refiningRef = useRef(false);
-  const refineAbortRef = useRef<AbortController | undefined>(undefined);
+  // Transcript refinement in flight, keyed by session id like activeIds:
+  // each take shows its own spinner, and one take refining never disables or
+  // animates another. The error and the copied flash are keyed the same way:
+  // both belong to the take they came from and never bleed across selections.
+  const [refiningIds, setRefiningIds] = useState<ReadonlySet<string>>(() => new Set());
+  const refiningIdsRef = useRef(new Set<string>());
+  const refineAbortRef = useRef(new Map<string, AbortController>());
   const [refineError, setRefineError] = useState<{ id: string; message: string }>();
-  const [copiedRefined, setCopiedRefined] = useState(false);
-  // Which of the two refine buttons is in flight, so only the pressed one
-  // shows its spinner; the single-flight guard keeps them mutually exclusive.
-  const [refiningInThread, setRefiningInThread] = useState(false);
+  const [copiedRefinedId, setCopiedRefinedId] = useState<string>();
+  const copiedRefinedTimerRef = useRef<number | undefined>(undefined);
+  // True once the user edits the refinement key field this session. The
+  // mount-time decrypt below must never clobber what they typed while it was
+  // in flight, so an edited field is off limits to the async load.
+  const refineApiKeyEditedRef = useRef(false);
+  // Which takes are refining WITH thread context, keyed by session id like
+  // refiningIds: each of the drawer's two refine buttons reflects its own
+  // take and mode, so a standalone refine on one take never animates the
+  // thread button on another.
+  const [refiningThreadIds, setRefiningThreadIds] = useState<ReadonlySet<string>>(() => new Set());
 
   // Refinement stays inert until both a base URL and a model are configured.
   const refineConfigured = refineBaseUrl.trim() !== "" && refineModel.trim() !== "";
@@ -261,12 +301,51 @@ export default function App() {
     return index === -1 ? undefined : { turn: index + 1, total: turns.length };
   }, [selected, sessions]);
 
-  // A refine request still in flight when the app unmounts must settle
-  // without corrupting state: abort it so the promise rejects, and the late
-  // setState calls become no-ops on the unmounted component — the same
-  // guarantee transcribe() relies on through its ref-guarded finally block.
+  // Which of the selected take's two refine actions is running: the busy id
+  // set drives both buttons' disabled state, the thread-mode set decides
+  // which one spins and says "Refining…".
+  const selectedRefining = selected !== undefined && refiningIds.has(selected.id);
+  const selectedRefiningThread = selected !== undefined && refiningThreadIds.has(selected.id);
+
+  // Refinements still in flight when the app unmounts must settle without
+  // corrupting state: abort each one so its promise rejects and late setState
+  // calls become no-ops on the unmounted component — the same guarantee
+  // transcribe() relies on through its ref-guarded finally blocks. The copy
+  // timer is cleared for the same reason. The ref containers (not their
+  // current values) are captured so the cleanup reads the latest entries.
   useEffect(() => {
-    return () => refineAbortRef.current?.abort();
+    const controllers = refineAbortRef;
+    const timer = copiedRefinedTimerRef;
+
+    return () => {
+      for (const controller of controllers.current.values()) controller.abort();
+      window.clearTimeout(timer.current);
+    };
+  }, []);
+
+  // Refinement key at rest: prefer the safeStorage ciphertext the main
+  // process can decrypt over any plaintext copy. The loaded key only fills
+  // a field the user has not edited meanwhile (the decrypt is async and can
+  // resolve after they start typing); once it applied, the plaintext copy
+  // that predates the encrypted form is residue and is removed.
+  useEffect(() => {
+    const bridge = window.starlingDesktop;
+    const encrypted = localStorage.getItem("starling:refine:apiKeyEnc");
+
+    if (!bridge?.loadRefinementKey || !encrypted) return;
+
+    void bridge
+      .loadRefinementKey({ ciphertext: encrypted })
+      .then((loaded) => {
+        if (!loaded.apiKey) return;
+
+        if (refineApiKeyEditedRef.current) return;
+        setRefineApiKey(loaded.apiKey);
+        localStorage.removeItem("starling:refine:apiKey");
+      })
+      .catch(() => {
+        /* best-effort: the plaintext fallback key (if any) stays in place */
+      });
   }, []);
 
   const busy = activeIds.size > 0;
@@ -549,7 +628,9 @@ export default function App() {
    * endpoint. Explicit and opt-in per press: the result is saved to the
    * session's separate `refined` field, and the raw transcript — the copy the
    * drawer leads with — is never touched, whether refinement succeeds, fails,
-   * or is cancelled.
+   * or is cancelled. Guarded per session id like transcribe(): a second press
+   * on the same take while its refinement runs is ignored, while other takes
+   * stay free to refine concurrently.
    *
    * With `options.inThread` the press also carries the multi-turn context
    * (#117): an unthreaded take is first assigned — by this explicit action
@@ -563,16 +644,19 @@ export default function App() {
     async (session: DictationSession, options?: { inThread?: boolean }) => {
       const transcript = session.transcript;
 
-      if (!transcript || refiningRef.current) return;
+      if (!transcript || refiningIdsRef.current.has(session.id)) return;
 
-      refiningRef.current = true;
-      setRefining(true);
-      setRefiningInThread(options?.inThread === true);
-      setRefineError(undefined);
+      refiningIdsRef.current.add(session.id);
+      setRefiningIds(new Set(refiningIdsRef.current));
+      setRefineError((current) => (current?.id === session.id ? undefined : current));
+
+      if (options?.inThread === true) {
+        setRefiningThreadIds((current) => new Set([...current, session.id]));
+      }
 
       const controller = new AbortController();
 
-      refineAbortRef.current = controller;
+      refineAbortRef.current.set(session.id, controller);
 
       const settings: RefinementSettings = {
         baseUrl: refineBaseUrl,
@@ -619,10 +703,19 @@ export default function App() {
       } catch (caught) {
         setRefineError({ id: session.id, message: messageFrom(caught) });
       } finally {
-        refiningRef.current = false;
-        refineAbortRef.current = undefined;
-        setRefining(false);
-        setRefiningInThread(false);
+        refiningIdsRef.current.delete(session.id);
+        setRefiningIds(new Set(refiningIdsRef.current));
+        refineAbortRef.current.delete(session.id);
+
+        if (options?.inThread === true) {
+          setRefiningThreadIds((current) => {
+            const next = new Set(current);
+
+            next.delete(session.id);
+
+            return next;
+          });
+        }
       }
     },
     [activeThread, refresh, refineApiKey, refineBaseUrl, refineInstruction, refineModel, sessions],
@@ -643,8 +736,9 @@ export default function App() {
 
     try {
       await navigator.clipboard.writeText(selected.refined.text);
-      setCopiedRefined(true);
-      window.setTimeout(() => setCopiedRefined(false), 1400);
+      setCopiedRefinedId(selected.id);
+      window.clearTimeout(copiedRefinedTimerRef.current);
+      copiedRefinedTimerRef.current = window.setTimeout(() => setCopiedRefinedId(undefined), 1400);
     } catch (caught) {
       setRefineError({
         id: selected.id,
@@ -1001,7 +1095,7 @@ export default function App() {
     const refined = selected.refined;
 
     const text = refined
-      ? `${selected.transcript.text}\n\n--- REFINED TRANSCRIPT — ${refined.model}, ${new Date(refined.createdAt).toISOString()} ---\n\n${refined.text}\n`
+      ? `${selected.transcript.text}\n\n${refinedTranscriptSeparator(refined, new Date(refined.createdAt).toISOString())}\n\n${refined.text}\n`
       : selected.transcript.text;
 
     const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
@@ -1116,7 +1210,55 @@ export default function App() {
     }
   }
 
-  function saveSettings() {
+  /**
+   * Persist the refinement API key. With the desktop bridge and OS-backed
+   * encryption available, only safeStorage ciphertext is written and any
+   * plaintext copy is removed. Without either (browser preview, or a host
+   * with no keychain backend), the key falls back to plaintext localStorage —
+   * a documented, deliberate fallback, never a silent one.
+   *
+   * The lifecycle is symmetric on every path: whenever a plaintext key is
+   * written, the ciphertext entry is removed too — otherwise the next mount
+   * would decrypt the stale ciphertext over the newer plaintext. Saving an
+   * empty key clears both entries: there is nothing to encrypt and no
+   * residue to keep.
+   */
+  async function persistRefinementKey(apiKey: string): Promise<void> {
+    if (apiKey === "") {
+      localStorage.removeItem("starling:refine:apiKey");
+      localStorage.removeItem("starling:refine:apiKeyEnc");
+
+      return;
+    }
+
+    const bridge = window.starlingDesktop;
+
+    if (!bridge?.storeRefinementKey) {
+      localStorage.setItem("starling:refine:apiKey", apiKey);
+      localStorage.removeItem("starling:refine:apiKeyEnc");
+
+      return;
+    }
+
+    try {
+      const stored = await bridge.storeRefinementKey({ apiKey });
+
+      if (stored.ciphertext === null) {
+        localStorage.setItem("starling:refine:apiKey", apiKey);
+        localStorage.removeItem("starling:refine:apiKeyEnc");
+
+        return;
+      }
+
+      localStorage.setItem("starling:refine:apiKeyEnc", stored.ciphertext);
+      localStorage.removeItem("starling:refine:apiKey");
+    } catch {
+      localStorage.setItem("starling:refine:apiKey", apiKey);
+      localStorage.removeItem("starling:refine:apiKeyEnc");
+    }
+  }
+
+  async function saveSettings() {
     const clean = draftEndpoint.trim().replace(/\/$/, "");
 
     if (!clean) return;
@@ -1128,8 +1270,16 @@ export default function App() {
     localStorage.setItem("starling:terms", expectedTerms);
     localStorage.setItem("starling:refine:baseUrl", refineBaseUrl.trim());
     localStorage.setItem("starling:refine:model", refineModel.trim());
-    localStorage.setItem("starling:refine:apiKey", refineApiKey);
     localStorage.setItem("starling:refine:instruction", refineInstruction);
+
+    try {
+      await persistRefinementKey(refineApiKey);
+    } catch (caught) {
+      // The fire-and-forget click must not swallow this: persistence can
+      // fail without the bridge too (quota, private mode).
+      setError(`Could not save the refinement API key: ${messageFrom(caught)}`);
+    }
+
     closeSettings();
     void checkHealth(clean);
   }
@@ -1425,45 +1575,50 @@ export default function App() {
                   <p className="eyebrow">REFINED TRANSCRIPT</p>
                   <span>
                     {selected.refined
-                      ? `${selected.refined.model}, ${formatWhen(new Date(selected.refined.createdAt).toISOString())} — kept beside the raw transcript above`
+                      ? `${refinedTranscriptStamp(selected.refined, formatWhen(new Date(selected.refined.createdAt).toISOString()))} — kept beside the raw transcript above`
                       : "Optional LLM cleanup, run on demand. The raw transcript above never changes."}
                   </span>
                 </div>
                 <div className="transcript-actions">
                   <button
                     onClick={() => void refineTranscript(selected)}
-                    disabled={refining || !refineConfigured}
+                    disabled={selectedRefining || !refineConfigured}
                   >
-                    {refining && !refiningInThread ? (
+                    {selectedRefining && !selectedRefiningThread ? (
                       <LoaderCircle className="spinning" size={16} />
                     ) : (
                       <Sparkles size={16} />
                     )}
-                    {refining && !refiningInThread
-                      ? "Refining…"
-                      : selected.refined
-                        ? "Refine again"
-                        : "Refine"}
+                    {refineActionLabel(
+                      selectedRefining && !selectedRefiningThread,
+                      selected.refined !== undefined,
+                    )}
                   </button>
                   <button
                     onClick={() => void refineTranscript(selected, { inThread: true })}
-                    disabled={refining || !refineConfigured}
+                    disabled={selectedRefining || !refineConfigured}
                   >
-                    {refining && refiningInThread ? (
+                    {selectedRefiningThread ? (
                       <LoaderCircle className="spinning" size={16} />
                     ) : (
                       <MessagesSquare size={16} />
                     )}
-                    {refining && refiningInThread
-                      ? "Refining…"
-                      : selected.threadId
-                        ? "Refine with thread context"
-                        : "Refine in thread"}
+                    {refineThreadActionLabel(
+                      selectedRefiningThread,
+                      selected.threadId !== undefined,
+                    )}
                   </button>
                   {selected.refined && (
-                    <button disabled={refining} onClick={() => void copyRefinedText()}>
-                      {copiedRefined ? <Check size={16} /> : <Clipboard size={16} />}
-                      {copiedRefined ? "Copied" : "Copy"}
+                    <button
+                      disabled={refiningIds.has(selected.id)}
+                      onClick={() => void copyRefinedText()}
+                    >
+                      {copiedRefinedId === selected.id ? (
+                        <Check size={16} />
+                      ) : (
+                        <Clipboard size={16} />
+                      )}
+                      {copiedRefinedId === selected.id ? "Copied" : "Copy"}
                     </button>
                   )}
                 </div>
@@ -1484,10 +1639,10 @@ export default function App() {
                   Add a refinement base URL and model in settings to enable this.
                 </p>
               )}
-              {refining && !selected.refined && (
+              {selectedRefining && !selected.refined && (
                 <p className="refined-status">
                   <LoaderCircle className="spinning" size={15} />{" "}
-                  {refiningInThread
+                  {selectedRefiningThread
                     ? "Sending the thread's current text and this new turn to the refinement model…"
                     : "Sending the raw transcript to the refinement model…"}
                 </p>
@@ -1527,130 +1682,146 @@ export default function App() {
             <button className="settings-close" onClick={closeSettings} aria-label="Close settings">
               <X size={18} />
             </button>
-            <p className="eyebrow">CONNECTION</p>
-            <h2 id="settings-title">Transcription server</h2>
-            <p>
-              Choose a <code>starling-serve</code> endpoint or an OpenAI-compatible transcription
-              endpoint.
-            </p>
-            <label>
-              Server endpoint
-              <input
-                ref={endpointInputRef}
-                value={draftEndpoint}
-                onChange={(event) => setDraftEndpoint(event.target.value)}
-                placeholder="http://127.0.0.1:8181"
-              />
-            </label>
-            <div className="settings-grid">
-              <label>
-                API format
-                <select
-                  value={protocol}
-                  onChange={(event) =>
-                    setProtocol(event.target.value === "openai" ? "openai" : "starling")
-                  }
-                >
-                  <option value="starling">Starling native</option>
-                  <option value="openai">OpenAI compatible</option>
-                </select>
-              </label>
-              <label>
-                Model
-                <input
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                  placeholder="parakeet"
-                />
-              </label>
+            {/* The head stays fixed above the scrolling body: the close
+                button lives in its zone, so scrolled settings never run
+                under it, and the body region scrolls while the card stays
+                viewport-bounded with the footer always reachable. */}
+            <div className="settings-head">
+              <p className="eyebrow">CONNECTION</p>
+              <h2 id="settings-title">Transcription server</h2>
             </div>
-            <label className="settings-check">
-              <input
-                type="checkbox"
-                checked={streamLive}
-                disabled={protocol === "openai"}
-                onChange={(event) => setStreamLive(event.target.checked)}
-              />
-              <span>
-                Live streaming transcript
-                <small>
-                  Streams audio to a Starling native server while you speak. Requires the Starling
-                  API format; recordings always save locally first and fall back to a full upload if
-                  the stream fails.
-                </small>
-              </span>
-            </label>
-            <label>
-              Words to watch
-              <input
-                value={expectedTerms}
-                onChange={(event) => setExpectedTerms(event.target.value)}
-                placeholder="auth, Starling, GGUF"
-              />
-              <small>
-                Comma-separated terms are checked after transcription. They are never inserted or
-                substituted.
-              </small>
-            </label>
-            <div className="settings-section">
-              <p className="eyebrow">TRANSCRIPT REFINEMENT</p>
-              <p className="settings-section-lede">
-                Optional: press Refine on a finished take to send its raw transcript to an
-                OpenAI-compatible chat endpoint. The refined copy is stored and labeled separately;
-                the raw transcript is never rewritten.
+            <div className="settings-body">
+              <p>
+                Choose a <code>starling-serve</code> endpoint or an OpenAI-compatible transcription
+                endpoint.
               </p>
               <label>
-                Base URL
+                Server endpoint
                 <input
-                  value={refineBaseUrl}
-                  onChange={(event) => setRefineBaseUrl(event.target.value)}
-                  placeholder="http://127.0.0.1:11434/v1"
+                  ref={endpointInputRef}
+                  value={draftEndpoint}
+                  onChange={(event) => setDraftEndpoint(event.target.value)}
+                  placeholder="http://127.0.0.1:8181"
                 />
-                <small>
-                  Include the version path the server needs, for example /v1 for Ollama or
-                  https://api.openai.com/v1.
-                </small>
               </label>
               <div className="settings-grid">
                 <label>
-                  Model
-                  <input
-                    value={refineModel}
-                    onChange={(event) => setRefineModel(event.target.value)}
-                    placeholder="llama3.1"
-                  />
+                  API format
+                  <select
+                    value={protocol}
+                    onChange={(event) =>
+                      setProtocol(event.target.value === "openai" ? "openai" : "starling")
+                    }
+                  >
+                    <option value="starling">Starling native</option>
+                    <option value="openai">OpenAI compatible</option>
+                  </select>
                 </label>
                 <label>
-                  API key (optional)
+                  Model
                   <input
-                    type="password"
-                    value={refineApiKey}
-                    onChange={(event) => setRefineApiKey(event.target.value)}
-                    placeholder="Local servers need none"
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                    placeholder="parakeet"
                   />
                 </label>
               </div>
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={streamLive}
+                  disabled={protocol === "openai"}
+                  onChange={(event) => setStreamLive(event.target.checked)}
+                />
+                <span>
+                  Live streaming transcript
+                  <small>
+                    Streams audio to a Starling native server while you speak. Requires the Starling
+                    API format; recordings always save locally first and fall back to a full upload
+                    if the stream fails.
+                  </small>
+                </span>
+              </label>
               <label>
-                Instruction
-                <textarea
-                  rows={4}
-                  value={refineInstruction}
-                  onChange={(event) => setRefineInstruction(event.target.value)}
-                  placeholder={REFINEMENT_DEFAULT_INSTRUCTION}
+                Words to watch
+                <input
+                  value={expectedTerms}
+                  onChange={(event) => setExpectedTerms(event.target.value)}
+                  placeholder="auth, Starling, GGUF"
                 />
                 <small>
-                  Leave empty to use the default shown here: light cleanup that keeps the wording,
-                  meaning, language, and order.
+                  Comma-separated terms are checked after transcription. They are never inserted or
+                  substituted.
                 </small>
               </label>
-            </div>
-            <div className="settings-callout">
-              <span className={`status-dot ${connection}`} />
-              <div>
-                <strong>
-                  {connection === "ready" ? "Server connected" : "Server needs attention"}
-                </strong>
-                <span>{endpoint}</span>
+              <div className="settings-section">
+                <p className="eyebrow">TRANSCRIPT REFINEMENT</p>
+                <p className="settings-section-lede">
+                  Optional: press Refine on a finished take to send its raw transcript to an
+                  OpenAI-compatible chat endpoint. The refined copy is stored and labeled
+                  separately; the raw transcript is never rewritten.
+                </p>
+                <label>
+                  Base URL
+                  <input
+                    value={refineBaseUrl}
+                    onChange={(event) => setRefineBaseUrl(event.target.value)}
+                    placeholder="http://127.0.0.1:11434/v1"
+                  />
+                  <small>
+                    Include the version path the server needs, for example /v1 for Ollama or
+                    https://api.openai.com/v1.
+                  </small>
+                </label>
+                <div className="settings-grid">
+                  <label>
+                    Refinement model
+                    <input
+                      value={refineModel}
+                      onChange={(event) => setRefineModel(event.target.value)}
+                      placeholder="llama3.1"
+                    />
+                  </label>
+                  <label>
+                    API key (optional)
+                    <input
+                      type="password"
+                      value={refineApiKey}
+                      onChange={(event) => {
+                        setRefineApiKey(event.target.value);
+                        // Typed input outranks the async decrypt from mount.
+                        refineApiKeyEditedRef.current = true;
+                      }}
+                      placeholder="Local servers need none"
+                    />
+                    <small>
+                      Stored encrypted via your OS keychain in the desktop app when available; the
+                      browser preview keeps it in local storage as plaintext.
+                    </small>
+                  </label>
+                </div>
+                <label>
+                  Instruction
+                  <textarea
+                    rows={4}
+                    value={refineInstruction}
+                    onChange={(event) => setRefineInstruction(event.target.value)}
+                    placeholder={REFINEMENT_DEFAULT_INSTRUCTION}
+                  />
+                  <small>
+                    Leave empty to use the default shown here: light cleanup that keeps the wording,
+                    meaning, language, and order.
+                  </small>
+                </label>
+              </div>
+              <div className="settings-callout">
+                <span className={`status-dot ${connection}`} />
+                <div>
+                  <strong>
+                    {connection === "ready" ? "Server connected" : "Server needs attention"}
+                  </strong>
+                  <span>{endpoint}</span>
+                </div>
               </div>
             </div>
             <div className="settings-footer">
@@ -1661,7 +1832,7 @@ export default function App() {
               >
                 {testingConnection ? "Testing…" : "Test connection"}
               </button>
-              <button className="primary" onClick={saveSettings}>
+              <button className="primary" onClick={() => void saveSettings()}>
                 Save settings
               </button>
             </div>

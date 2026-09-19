@@ -812,17 +812,39 @@ kbd {
   background: rgba(6, 7, 5, 0.72);
   backdrop-filter: blur(9px);
   display: grid;
+  /* A definite row track is what lets the card's max-height percentage
+     resolve; an auto track sizes to the content and the cap vanishes. */
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
   padding: 20px;
   animation: fade 0.2s;
 }
 .settings-card {
   width: min(510px, 100%);
+  /* Viewport-bounded card with a scrollable body and a footer that stays
+     reachable: the card never grows past the modal layer's padded area, so
+     Save settings is always in view on small screens while the settings
+     themselves scroll. */
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
   background: #efebe0;
   color: #25261f;
   padding: 33px;
   position: relative;
   box-shadow: 0 30px 100px rgba(0, 0, 0, 0.6);
+}
+.settings-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* Fixed head zone above the scrolling body: the close button overlaps only
+   this strip, so settings scrolling past never run under the ✕. The right
+   padding reserves the button's column for the title row. */
+.settings-head {
+  flex-shrink: 0;
+  padding-right: 40px;
 }
 .settings-close {
   position: absolute;
@@ -840,7 +862,7 @@ kbd {
   font: 500 33px/1 var(--serif);
   margin: 0 0 13px;
 }
-.settings-card > p:not(.eyebrow) {
+.settings-body > p:not(.eyebrow) {
   font-size: 11px;
   line-height: 1.65;
   color: #68695e;
@@ -939,6 +961,7 @@ kbd {
   justify-content: flex-end;
   gap: 9px;
   margin-top: 25px;
+  flex-shrink: 0;
 }
 .settings-footer button {
   border: 1px solid #a9a79d;
