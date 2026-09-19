@@ -130,7 +130,7 @@ int main() {
         const auto lines = trace_lines(log);
         check(lines.size() == 5, "scope: five records", std::to_string(lines.size()));
         if (lines.size() == 5) {
-            check(json_str(lines[0], "req").empty() && !has_field(lines[0], "chunk"),
+            check(!has_field(lines[0], "req") && !has_field(lines[0], "chunk"),
                   "scope: bare record has no req/chunk");
             check(json_str(lines[1], "req") == "req-A" && !has_field(lines[1], "chunk"),
                   "scope: RequestScope sets req only");
@@ -138,7 +138,7 @@ int main() {
                   "scope: ChunkScope adds chunk");
             check(json_str(lines[3], "req") == "req-A" && !has_field(lines[3], "chunk"),
                   "scope: ChunkScope restores");
-            check(json_str(lines[4], "req").empty(),
+            check(!has_field(lines[4], "req"),
                   "scope: RequestScope restores");
         }
     }

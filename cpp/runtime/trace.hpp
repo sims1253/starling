@@ -12,12 +12,14 @@
 //   runtime layer (ReplayGraph in cpp/runtime/backend.cpp, LruCache)
 //     graph_build / graph_replay / readback_sync / cache
 //
-// Correlation fields on every record: "req" (serving-layer request id, set
-// via RequestScope around the engine call; "#anon-N" for anonymous callers),
-// "chunk" (engine chunk index, set via ChunkScope; omitted when absent), and
-// "stage" (model stage name, present on stage records). Graph and cache
-// records inherit whatever req/chunk is active on the emitting thread, so a
-// replay graph fired inside chunk 3 of request R carries both.
+// Correlation fields, present only when active: "req" (serving-layer request
+// id, set via RequestScope around the engine call; "#anon-N" for anonymous
+// callers — omitted when no request is active, so field presence distinguishes
+// an uncorrelated record from an empty id), "chunk" (engine chunk index, set
+// via ChunkScope; omitted when absent), and "stage" (model stage name, present
+// on stage records). Graph and cache records inherit whatever req/chunk is
+// active on the emitting thread, so a replay graph fired inside chunk 3 of
+// request R carries both.
 //
 // Labeling rules (binding, from #170 — do not relax):
 //   - Host enqueue, host blocked time, and device measurements are separate
@@ -170,10 +172,13 @@ inline void write_record(const std::string& fields) {
                  fields.c_str());
 }
 
-// Common correlation suffix: req + chunk when active. Kept LAST in each
-// record so readers can strip it uniformly.
+// Common correlation suffix: req + chunk when active, each omitted when not
+// (an empty req is not serialized — absence marks the uncorrelated case).
+// Kept LAST in each record so readers can strip it uniformly.
 inline std::string correlation_fields() {
-    std::string f = ",\"req\":\"" + json_escape(t_correlation.req) + "\"";
+    std::string f;
+    if (!t_correlation.req.empty())
+        f += ",\"req\":\"" + json_escape(t_correlation.req) + "\"";
     if (t_correlation.chunk >= 0)
         f += ",\"chunk\":" + std::to_string(t_correlation.chunk);
     return f;
