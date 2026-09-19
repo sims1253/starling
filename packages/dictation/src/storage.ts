@@ -16,6 +16,19 @@ export type DictationSessionStatus = "captured" | "transcribing" | "transcribed"
 
 const NonNegativeFinite = Schema.Finite.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0)));
 
+/**
+ * A refined transcript: the output of one explicit, opt-in refinement
+ * request, stored beside the raw transcript — never in place of it.
+ */
+export const RefinedTranscriptSchema = Schema.Struct({
+  text: Schema.String,
+  /** The chat model that produced this refinement, shown with the text. */
+  model: Schema.String,
+  createdAt: NonNegativeFinite,
+});
+
+export type RefinedTranscript = (typeof RefinedTranscriptSchema)["Type"];
+
 export const DictationSessionSchema = Schema.Struct({
   id: Schema.NonEmptyString,
   createdAt: Schema.NonEmptyString,
@@ -33,6 +46,13 @@ export const DictationSessionSchema = Schema.Struct({
   streamed: Schema.optional(Schema.Boolean),
   /** Why live streaming failed here; kept for review even after a batch retry succeeds. */
   streamError: Schema.optional(Schema.String),
+  /**
+   * Optional LLM-refined copy of `transcript.text`, written only by an
+   * explicit user action. Additive and optional like `streamed`, so records
+   * persisted before this field existed decode unchanged — no session schema
+   * or database version bump — and re-refining overwrites it in place.
+   */
+  refined: Schema.optional(RefinedTranscriptSchema),
 });
 
 export type DictationSession = (typeof DictationSessionSchema)["Type"];
@@ -95,6 +115,13 @@ export interface DictationSessionStore {
     options?: SaveTranscriptOptions,
   ): Promise<DictationSession>;
   /**
+   * Attach (or overwrite) the refined transcript produced by one explicit
+   * refinement request. Never touches `transcript`, `transcriptHistory`, or
+   * `status`: the raw transcript stays the primary record and refinement is
+   * a separate, labeled artifact on the same session.
+   */
+  saveRefinedTranscript(id: string, refined: RefinedTranscript): Promise<DictationSession>;
+  /**
    * Downgrade an in-flight session (`transcribing`/`captured`) to `failed`.
    * A session a live owner already settled keeps its state, so a sweep
    * racing a settling write cannot overwrite it (#162).
@@ -135,6 +162,7 @@ export interface DictationSessionManifest {
   readonly lastError?: string;
   readonly streamed?: boolean;
   readonly streamError?: string;
+  readonly refined?: RefinedTranscript;
 }
 
 export interface DictationSessionExport {
@@ -156,6 +184,7 @@ interface ManifestDraft {
   lastError?: string;
   streamed?: boolean;
   streamError?: string;
+  refined?: RefinedTranscript;
 }
 
 export class DictationStorageError extends Data.TaggedError("DictationStorageError")<{
@@ -250,6 +279,11 @@ interface SessionDraft {
   lastError?: string | undefined;
   streamed?: boolean | undefined;
   streamError?: string | undefined;
+  refined?: RefinedTranscript | undefined;
+}
+
+function freezeRefined(value: RefinedTranscript): RefinedTranscript {
+  return Object.freeze({ text: value.text, model: value.model, createdAt: value.createdAt });
 }
 
 function freezeSession(value: DictationSession): DictationSession {
@@ -272,6 +306,8 @@ function freezeSession(value: DictationSession): DictationSession {
   if (value.streamed !== undefined) session.streamed = value.streamed;
 
   if (value.streamError !== undefined) session.streamError = value.streamError;
+
+  if (value.refined !== undefined) session.refined = freezeRefined(value.refined);
 
   return Object.freeze(session);
 }
@@ -303,6 +339,7 @@ type SessionUpdate = Partial<{
   lastError: string | undefined;
   streamed: boolean;
   streamError: string;
+  refined: RefinedTranscript;
 }>;
 
 function updatedSession(current: DictationSession, update: SessionUpdate): DictationSession {
@@ -338,6 +375,8 @@ export function exportDictationSession(session: DictationSession): DictationSess
   if (session.streamed !== undefined) manifest.streamed = session.streamed;
 
   if (session.streamError !== undefined) manifest.streamError = session.streamError;
+
+  if (session.refined !== undefined) manifest.refined = freezeRefined(session.refined);
 
   return Object.freeze({ manifest: Object.freeze(manifest), wav: session.wav });
 }
@@ -598,6 +637,12 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
     return this.update(id, (current) => updatedSession(current, { streamError: message }));
+  }
+
+  async saveRefinedTranscript(id: string, refined: RefinedTranscript): Promise<DictationSession> {
+    return this.update(id, (current) =>
+      updatedSession(current, { refined: freezeRefined(refined) }),
+    );
   }
 
   async transcriptionInFlight(id: string): Promise<boolean> {
@@ -1393,6 +1438,12 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
 
   async noteStreamError(id: string, message: string): Promise<DictationSession> {
     return this.update(id, (current) => updatedSession(current, { streamError: message }));
+  }
+
+  async saveRefinedTranscript(id: string, refined: RefinedTranscript): Promise<DictationSession> {
+    return this.update(id, (current) =>
+      updatedSession(current, { refined: freezeRefined(refined) }),
+    );
   }
 
   /**
