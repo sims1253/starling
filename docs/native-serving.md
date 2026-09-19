@@ -333,9 +333,11 @@ libraries. These are not fully static binaries.
 | Vulkan | Vulkan loader and a compatible GPU driver. |
 | Metal | Apple Silicon macOS with the system Metal frameworks. |
 
-The workflow runs startup checks on its build machines, where the development
-toolkits are already installed. Those checks do not establish that the archives
-run on a clean machine. Missing-runtime packaging is tracked in
+The Linux CUDA, Vulkan, and CPU archives are smoke-tested outside their
+build environment in a fresh Ubuntu 22.04 container with only the documented
+runtime packages (see the [runtime guide](release-runtime.md)); the Windows
+and macOS archives are checked on their build machines only. None of these
+startup checks verify GPU inference — hardware validation is tracked in
 [issue #57](https://github.com/sims1253/starling/issues/57).
 
 Choose the executable for your operating system, CPU architecture, and GPU:
