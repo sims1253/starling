@@ -100,6 +100,27 @@ class SpecValidationTests(unittest.TestCase):
         bad["arms"] = {"baseline": {"binary": "/bin/true"}}
         self.assertTrue(any("arms" in p for p in record_mod.validate_spec(bad)))
 
+    def test_workload_pin_is_mandatory(self):
+        bad = json.loads(json.dumps(V1_SPEC))
+        del bad["workload"]["sha256"]
+        self.assertTrue(any("sha256" in p for p in record_mod.validate_spec(bad)))
+
+
+class RecordValidationTests(unittest.TestCase):
+    def test_malformed_samples_are_rejected(self):
+        rec = make_record("baseline")
+        rec["samples"][1]["wall_ms"] = float("nan")
+        self.assertTrue(any("wall_ms" in p for p in record_mod.validate_record(rec)))
+        rec = make_record("baseline")
+        rec["samples"][2]["arm"] = "candidate"  # disagrees with role
+        self.assertTrue(any("role" in p for p in record_mod.validate_record(rec)))
+        rec = make_record("baseline")
+        rec["samples"].append(dict(rec["samples"][2]))  # duplicate (repeat, request)
+        self.assertTrue(any("duplicates" in p for p in record_mod.validate_record(rec)))
+        rec = make_record("baseline")
+        rec["samples"][0]["repeat"] = -1
+        self.assertTrue(any("repeat" in p for p in record_mod.validate_record(rec)))
+
 
 class ManifestTests(unittest.TestCase):
     def setUp(self):
@@ -141,10 +162,10 @@ class StatsTests(unittest.TestCase):
                  "wall_ms": 50.0}]
         pairs = stats_mod.paired_samples(base, cand)
         self.assertEqual(len(pairs), 1)
-        self.assertEqual(pairs[0][1], 100.0)
+        self.assertEqual(pairs[0][2], 100.0)
 
     def test_bootstrap_is_deterministic(self):
-        pairs = [(f"{i}.0", 100.0, 90.0) for i in range(10)]
+        pairs = [(i, 0, 100.0, 90.0) for i in range(10)]
         e1 = stats_mod.effect_estimate(pairs, "lower", seed=7)
         e2 = stats_mod.effect_estimate(pairs, "lower", seed=7)
         e3 = stats_mod.effect_estimate(pairs, "lower", seed=8)
@@ -152,10 +173,33 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(e1["ci_high_pct"], e2["ci_high_pct"])
         self.assertNotEqual(e1["bootstrap_seed"], e3["bootstrap_seed"])
 
+    def test_bootstrap_resamples_whole_repeats_not_requests(self):
+        # Two repeat clusters with very different levels: a request-level
+        # bootstrap would narrow the CI by treating the 2x4 correlated
+        # observations as independent evidence; the cluster bootstrap keeps
+        # the repeat-level spread in the interval.
+        pairs = [(r, q, 100.0, 100.0 if r == 0 else 50.0)
+                 for r in (0, 1) for q in range(4)]
+        e = stats_mod.effect_estimate(pairs, "lower", seed=3)
+        self.assertEqual(e["n_pairs"], 8)
+        self.assertEqual(e["n_repeat_clusters"], 2)
+        self.assertLess(e["ci_low_pct"], 20.0)   # repeat 0: 0% improvement
+        self.assertGreater(e["ci_high_pct"], 20.0)  # repeat 1: 50% improvement
+
     def test_effect_orientation_positive_is_better(self):
-        pairs = [(f"{i}.0", 100.0, 50.0) for i in range(6)]
+        pairs = [(i, 0, 100.0, 50.0) for i in range(6)]
         e = stats_mod.effect_estimate(pairs, "lower", seed=1)
         self.assertGreater(e["improvement_pct"], 40.0)
+
+    def test_higher_is_better_direction_is_not_inverted(self):
+        pairs = [(i, 0, 100.0, 150.0) for i in range(6)]
+        e = stats_mod.effect_estimate(pairs, "higher", seed=1)
+        self.assertGreater(e["improvement_pct"], 40.0)
+
+    def test_unknown_direction_is_refused(self):
+        pairs = [(i, 0, 100.0, 50.0) for i in range(6)]
+        with self.assertRaises(ValueError):
+            stats_mod.effect_estimate(pairs, "sideways", seed=1)
 
 
 class ComparatorNegativeTests(unittest.TestCase):
@@ -207,15 +251,21 @@ class ComparatorNegativeTests(unittest.TestCase):
         c = make_record("candidate", cand_ms=50.0, hardware="cpu-only-host")
         self._rejects(b, c, needle="hardware")
 
-    def test_failed_run_rejected(self):
+    def test_failed_run_is_unavailable_not_a_crash(self):
         b = make_record("baseline", status="failed")
+        b["failures"] = [{"repeat": 0, "error": "server did not become healthy"}]
         c = make_record("candidate", cand_ms=50.0)
-        self._rejects(b, c, needle="failed")
+        r = compare_mod.compare(V1_SPEC, b, c)
+        self.assertEqual(r["verdict"], "unavailable")
+        self.assertIn("failed", r["reason"])
+        self.assertTrue(r["failures"]["baseline"])  # diagnostics accompany it
 
-    def test_zero_case_rejected(self):
+    def test_zero_case_is_unavailable(self):
         c = make_record("candidate", cand_ms=50.0)
         c["samples"] = [s for s in c["samples"] if s["cold"]]  # only cold left
-        self._rejects(make_record("baseline"), c, needle="zero")
+        r = compare_mod.compare(V1_SPEC, make_record("baseline"), c)
+        self.assertEqual(r["verdict"], "unavailable")
+        self.assertIn("zero usable", r["reason"])
 
     def test_missing_record_file_rejected(self):
         with tempfile.TemporaryDirectory() as d:
@@ -258,8 +308,9 @@ class VerdictTests(unittest.TestCase):
     def test_failed_run_is_unavailable(self):
         b = make_record("baseline", status="failed")
         c = make_record("candidate", cand_ms=50.0)
-        with self.assertRaises(record_mod.RecordError):
-            compare_mod.compare(V1_SPEC, b, c)
+        r = compare_mod.compare(V1_SPEC, b, c)
+        self.assertEqual(r["verdict"], "unavailable")
+        self.assertIn("failed", r["reason"])
 
     def test_too_few_pairs_is_unavailable(self):
         spec = json.loads(json.dumps(V1_SPEC))
@@ -306,41 +357,97 @@ class RunnerTests(unittest.TestCase):
         spec.update(overrides)
         return spec
 
+    def _run_interleaved(self, spec, run_dir):
+        """The CLI's calling convention: repeat-by-repeat, both arms per
+        repeat, in the seeded order (run_experiment._run_interleaved)."""
+        records = {}
+        for repeat in range(spec["protocol"]["repeats"]):
+            for arm in runner_mod.arm_order(spec, repeat):
+                records[arm] = runner_mod.run_arm(spec, arm, run_dir,
+                                                  HERE.parent.parent, repeat)
+        return records["baseline"], records["candidate"]
+
     def test_runner_produces_comparable_passing_pair(self):
         spec = self._spec()
         run_dir = self.dir / "run"
-        rb = runner_mod.run_arm(spec, "baseline", run_dir, HERE.parent.parent)
-        rc = runner_mod.run_arm(spec, "candidate", run_dir, HERE.parent.parent)
+        rb, rc = self._run_interleaved(spec, run_dir)
         self.assertEqual(rb["status"], "ok")
         self.assertEqual(rc["status"], "ok")
-        # cold sample recorded and much slower than warm for the slow arm
+        # one cold sample per fresh-process repeat; 1 cold + 1 warmup + 3
+        # timed requests per repeat, accumulated across the repeat calls
         cold = [s for s in rb["samples"] if s["cold"]]
-        warm = [s for s in rb["samples"] if not s["cold"]]
-        self.assertEqual(len(cold), 2)  # one per fresh-process repeat
-        self.assertGreater(len(warm), 0)
-        (run_dir / "baseline").mkdir(parents=True, exist_ok=True)
-        (run_dir / "candidate").mkdir(parents=True, exist_ok=True)
-        (run_dir / "baseline" / "record.json").write_text(json.dumps(rb))
-        (run_dir / "candidate" / "record.json").write_text(json.dumps(rc))
-        result = compare_mod.compare_directories.__wrapped__ if False else None
+        self.assertEqual(len(cold), 2)
+        self.assertEqual(len(rb["samples"]), 2 * (1 + 1 + 3))
+        # the on-disk record is the merged one the comparator reads back
+        on_disk = json.loads((run_dir / "baseline" / "record.json").read_text())
+        self.assertEqual(on_disk["samples"], rb["samples"])
         verdict = compare_mod.compare(spec, rb, rc)
         self.assertEqual(verdict["verdict"], "pass")
+
+    def test_cold_then_warmup_then_timed_split(self):
+        spec = self._spec()
+        spec["protocol"]["repeats"] = 1
+        rb = runner_mod.run_arm(spec, "baseline", self.dir / "split",
+                                HERE.parent.parent, 0)
+        r0 = sorted(rb["samples"], key=lambda s: s["request"])
+        self.assertEqual([s["request"] for s in r0], list(range(5)))
+        self.assertTrue(r0[0]["cold"])
+        self.assertFalse(r0[0]["warmup"])           # cold is its own category
+        self.assertFalse(r0[1]["cold"])
+        self.assertTrue(r0[1]["warmup"])            # warmup_requests=1 MORE
+        self.assertFalse(any(s["cold"] or s["warmup"] for s in r0[2:]))  # then timed
+
+    def test_paired_requests_measure_the_same_clip(self):
+        second = self.dir / "b.wav"
+        second.write_bytes(b"RIFF-other-fake-wav" * 6)
+        spec = self._spec()
+        manifest = record_mod.workload_manifest([self.audio, second])
+        spec["workload"] = {"audio": str(self.dir),
+                            "files": [self.audio.name, second.name],
+                            "sha256": manifest["sha256"]}
+        rb, rc = self._run_interleaved(spec, self.dir / "paired")
+        base_clip = {(s["repeat"], s["request"]): s["audio"] for s in rb["samples"]}
+        self.assertEqual(len(base_clip), len(rb["samples"]))  # keys unique
+        for s in rc["samples"]:
+            self.assertEqual(base_clip[(s["repeat"], s["request"])], s["audio"],
+                             "paired (repeat, request) must send the same clip")
 
     def test_runner_refutes_changed_workload(self):
         spec = self._spec()
         spec["workload"]["audio"] = str(self.dir)
         spec["workload"]["sha256"] = "f" * 64  # not what's on disk
         with self.assertRaises(runner_mod.RunnerError) as ctx:
-            runner_mod.run_arm(spec, "baseline", self.dir / "x", HERE.parent.parent)
+            runner_mod.run_arm(spec, "baseline", self.dir / "x",
+                               HERE.parent.parent, 0)
         self.assertIn("manifest", str(ctx.exception))
 
     def test_runner_records_startup_failure(self):
         spec = self._spec()
         spec["arms"]["baseline"]["stub_args"] = [str(HERE / "no_such_module.py")]
         rec = runner_mod.run_arm(spec, "baseline", self.dir / "y",
-                                 HERE.parent.parent)
+                                 HERE.parent.parent, 0)
         self.assertEqual(rec["status"], "failed")
         self.assertTrue(rec["failures"])
+
+    def test_missing_binary_is_a_recorded_failure_not_a_traceback(self):
+        spec = self._spec()
+        spec["arms"]["baseline"].pop("stub_args")
+        spec["arms"]["baseline"]["binary"] = str(self.dir / "no-such-binary")
+        rec = runner_mod.run_arm(spec, "baseline", self.dir / "z",
+                                 HERE.parent.parent, 0)
+        self.assertEqual(rec["status"], "failed")
+        self.assertIn("cannot start server", rec["failures"][0]["error"])
+
+    def test_stale_record_in_run_dir_is_refused(self):
+        spec = self._spec()
+        spec["protocol"]["repeats"] = 1
+        run_dir = self.dir / "stale"
+        runner_mod.run_arm(spec, "baseline", run_dir, HERE.parent.parent, 0)
+        other = json.loads(json.dumps(spec))
+        other["objective"] = "a different preregistered hypothesis"
+        with self.assertRaises(runner_mod.RunnerError) as ctx:
+            runner_mod.run_arm(other, "baseline", run_dir, HERE.parent.parent, 0)
+        self.assertIn("different spec", str(ctx.exception))
 
     def test_arm_order_is_seeded_and_reproducible(self):
         spec = self._spec()

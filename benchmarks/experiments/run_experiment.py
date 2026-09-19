@@ -11,14 +11,15 @@ HTTP serving stack via the contract fixture binary — build it first):
         --binary build-exp/starling-serve-contract-fixture
 
 The demo runs the SAME binary as both arms, so its honest verdict is
-"inconclusive" — a live demonstration that the comparator refuses to
-manufacture a win from noise (issue #168's core requirement).
+never "pass" (normally "inconclusive") — a live demonstration that the
+comparator refuses to manufacture a win from noise (issue #168's core
+requirement).
 
 Real experiments: pin a workload, write a spec, run both arms, compare:
 
     python benchmarks/experiments/run_experiment.py pin-workload --audio clips/
     # -> paste the printed block into the spec's "workload"
-    python benchmarks/experiments/run_experiment.py run --spec spec.json --out-dir runs/exp1
+    python benchmarks/experiments/run_experiment.py run --spec spec.json --run-dir runs/exp1
     python benchmarks/experiments/run_experiment.py compare --spec spec.json --run-dir runs/exp1
 
 Stdlib only; production server installations gain no Python dependency.
@@ -46,15 +47,24 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _cmd_pin_workload(args: argparse.Namespace) -> int:
-    files = sorted(p for p in args.audio.iterdir() if p.is_file()) if args.audio.is_dir() \
-        else sorted(args.audio)
+    audio = args.audio
+    if audio.is_dir():
+        files = sorted(p for p in audio.iterdir() if p.is_file())
+        audio_dir = audio
+    elif audio.is_file():
+        # A single clip pins the same way a directory does.
+        files = [audio]
+        audio_dir = audio.parent
+    else:
+        print(f"no such file or directory: {audio}", file=sys.stderr)
+        return 2
     if not files:
-        print(f"no files under {args.audio}", file=sys.stderr)
+        print(f"no files under {audio}", file=sys.stderr)
         return 2
     manifest = workload_manifest(files)
     block = {
         "workload": {
-            "audio": str(args.audio),
+            "audio": str(audio_dir),
             "files": [f.name for f in files],
             "sha256": manifest["sha256"],
         }
@@ -63,23 +73,36 @@ def _cmd_pin_workload(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    spec = load_spec(args.spec)
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Seal the spec before any arm runs: the records embed this hash and the
-    # comparator refuses pairs whose seals disagree with the compared spec.
-    sealed = out_dir / "spec.sealed.json"
-    sealed.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    (out_dir / "spec.sha256").write_text(spec_sha256(spec) + "\n", encoding="utf-8")
+def _run_interleaved(spec: dict, out_dir: Path) -> None:
+    """Drive the interleaved protocol: repeat-by-repeat, both arms, seeded order.
 
-    # Interleaved repeats: both arms execute repeat-by-repeat in the seeded
-    # order (runner.arm_order), each in fresh processes.
+    run_arm executes exactly one (repeat, arm) slot in a fresh process; this
+    loop is what makes baseline and candidate repeats interleave (issue
+    #168) instead of each arm running its repeats back-to-back.
+    """
     protocol = spec["protocol"]
     for repeat in range(protocol["repeats"]):
+        records = {}
         for arm in runner_mod.arm_order(spec, repeat):
-            runner_mod.run_arm(spec, arm, out_dir, REPO_ROOT)
-    print(f"records written under {out_dir}/{{baseline,candidate}}/record.json")
+            records[arm] = runner_mod.run_arm(spec, arm, out_dir, REPO_ROOT, repeat)
+        if any(r["status"] == "failed" for r in records.values()):
+            print("a run exceeded its tolerated failures; the comparison will be "
+                  "unavailable — stopping early", file=sys.stderr)
+            return
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    spec = load_spec(args.spec)
+    run_dir = args.run_dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # Seal the spec before any arm runs: the records embed this hash and the
+    # comparator refuses pairs whose seals disagree with the compared spec.
+    sealed = run_dir / "spec.sealed.json"
+    sealed.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (run_dir / "spec.sha256").write_text(spec_sha256(spec) + "\n", encoding="utf-8")
+
+    _run_interleaved(spec, run_dir)
+    print(f"records written under {run_dir}/{{baseline,candidate}}/record.json")
     return 0
 
 
@@ -93,8 +116,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     except RecordError as e:
         print(f"comparison rejected: {e}")
         return 2
-    print(compare_mod.render_summary(result) if hasattr(compare_mod, "render_summary")
-          else json.dumps(result, indent=2))
+    print(compare_mod.render_summary(result))
     return 0 if result["verdict"] in ("pass", "fail", "inconclusive") else 3
 
 
@@ -161,18 +183,29 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     spec_path = out_dir / "demo-spec.json"
     spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
     print(f"[demo] spec sealed at {spec_path} ({spec_sha256(spec)[:12]}…)")
-    for repeat in range(spec["protocol"]["repeats"]):
-        for arm in runner_mod.arm_order(spec, repeat):
-            runner_mod.run_arm(spec, arm, out_dir, REPO_ROOT)
-    result = compare_mod.compare_directories(
-        spec_path, out_dir / "baseline", out_dir / "candidate",
-        out_path=out_dir / "comparison.json",
-    )
+    _run_interleaved(spec, out_dir)
+    try:
+        result = compare_mod.compare_directories(
+            spec_path, out_dir / "baseline", out_dir / "candidate",
+            out_path=out_dir / "comparison.json",
+        )
+    except RecordError as e:
+        # e.g. an arm record is missing entirely after an early stop.
+        print(f"[demo] comparison rejected: {e}", file=sys.stderr)
+        return 1
     print(json.dumps({k: result[k] for k in ("verdict", "effect") if k in result},
                      indent=2, default=str))
-    print("[demo] identical arms: an honest 'inconclusive' here demonstrates the "
-          "no-false-win contract; full details in comparison.json")
-    return 0 if result["verdict"] == "inconclusive" else 1
+    if result["verdict"] == "pass":
+        # The demo's arms are the SAME binary: a "pass" here is exactly the
+        # false win this harness exists to catch. Anything else (normally
+        # "inconclusive"; on a noisy box a too-noise-tipped "fail" or
+        # "unavailable") is the honest outcome and stays green.
+        print("[demo] ERROR: identical arms produced a 'pass' — the comparator "
+              "manufactured a win from noise; see comparison.json", file=sys.stderr)
+        return 1
+    print(f"[demo] identical arms -> verdict {result['verdict']!r}: no false win; "
+          "full details in comparison.json")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -188,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("run", help="execute both arms of a sealed spec")
     p.add_argument("--spec", required=True, type=Path)
-    p.add_argument("--out-dir", required=True, type=Path)
+    p.add_argument("--run-dir", required=True, type=Path,
+                   help="directory the records are written to and compare reads back")
     p.set_defaults(fn=_cmd_run)
 
     p = sub.add_parser("compare", help="apply the preregistered rules to two run records")

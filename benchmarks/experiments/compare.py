@@ -20,7 +20,6 @@ annoying (issue #168 acceptance).
 from __future__ import annotations
 
 import json
-import statistics
 from pathlib import Path
 
 from record import RECORD_SCHEMA, RecordError, load_record, load_spec, spec_sha256
@@ -38,7 +37,18 @@ def _require(condition: bool, message: str) -> None:
         raise IncompatibleRecords(message)
 
 
+def _usable_samples(rec: dict) -> list[dict]:
+    return [s for s in rec.get("samples", [])
+            if not s.get("cold") and not s.get("error") and not s.get("warmup")]
+
+
 def check_compatibility(spec: dict, baseline: dict, candidate: dict) -> None:
+    """Identity gates: a mismatch means the comparison is INVALID, not unusable.
+
+    Run status and sample usability are deliberately NOT checked here — a
+    failed or empty run yields the structured `unavailable` verdict from
+    compare() with its diagnostics; an identity mismatch is a hard refusal.
+    """
     # Same sealed spec: preregistered rules cannot be swapped post hoc.
     digest = spec_sha256(spec)
     _require(
@@ -55,14 +65,6 @@ def check_compatibility(spec: dict, baseline: dict, candidate: dict) -> None:
             rec.get("schema") == RECORD_SCHEMA,
             f"{name} record schema is {rec.get('schema')!r}",
         )
-        _require(
-            rec.get("status") == "ok",
-            f"{name} run status is {rec.get('status')!r} "
-            f"({len(rec.get('failures', []))} failure(s) recorded) — verdict unavailable",
-        )
-        warm = [s for s in rec.get("samples", [])
-                if not s.get("cold") and not s.get("error") and not s.get("warmup")]
-        _require(len(warm) > 0, f"{name} record has zero usable (warm, non-failed) samples")
 
     pb, pc = baseline["provenance"], candidate["provenance"]
     _require(
@@ -89,32 +91,65 @@ def check_compatibility(spec: dict, baseline: dict, candidate: dict) -> None:
     )
     hw = spec.get("hardware_claim")
     if hw is not None:
+        # A declared claim deliberately authorizes cross-machine records;
+        # each arm must match the claim (hardware model at least).
         _require(
             pb["runtime"].get("hardware") == hw and pc["runtime"].get("hardware") == hw,
             "runtime does not match the declared hardware claim "
             f"({pb['runtime'].get('hardware')!r} / {pc['runtime'].get('hardware')!r} vs {hw!r})",
         )
     else:
+        # No claim: both arms must come from the SAME runtime identity —
+        # hardware AND driver, so the same GPU model under different driver
+        # versions is still refused as a confound.
         _require(
-            pb["runtime"].get("hardware") == pc["runtime"].get("hardware"),
-            "hardware claims differ "
-            f"({pb['runtime'].get('hardware')!r} vs {pc['runtime'].get('hardware')!r}); "
+            pb["runtime"] == pc["runtime"],
+            "runtime identities differ "
+            f"({pb['runtime']!r} vs {pc['runtime']!r}); "
             "declare a hardware_claim in the spec to compare cross-machine runs "
             "deliberately",
         )
+
+
+def _unavailable(spec: dict, reason: str, **extra) -> dict:
+    result = {
+        "verdict": "unavailable",
+        "reason": reason,
+        "experiment_id": spec.get("experiment_id"),
+    }
+    result.update(extra)
+    return result
 
 
 def compare(spec: dict, baseline: dict, candidate: dict) -> dict:
     """Apply the preregistered acceptance rules to two validated records."""
     check_compatibility(spec, baseline, candidate)
 
+    # Failed or empty runs are unavailable (diagnostics, no verdict guessed),
+    # not hard refusals: they say the experiment could not run, not that the
+    # comparison logic is invalid.
+    for name, rec in (("baseline", baseline), ("candidate", candidate)):
+        if rec.get("status") != "ok":
+            return _unavailable(
+                spec,
+                f"{name} run status is {rec.get('status')!r} "
+                f"({len(rec.get('failures', []))} failure(s) recorded)",
+                failures={
+                    "baseline": baseline.get("failures", []),
+                    "candidate": candidate.get("failures", []),
+                },
+            )
+        if not _usable_samples(rec):
+            return _unavailable(
+                spec, f"{name} record has zero usable (warm, non-failed) samples"
+            )
+
     pairs = paired_samples(baseline["samples"], candidate["samples"])
     if len(pairs) < 2:
-        return {
-            "verdict": "unavailable",
-            "reason": f"only {len(pairs)} paired sample(s); two or more are required",
-            "experiment_id": spec.get("experiment_id"),
-        }
+        return _unavailable(
+            spec,
+            f"only {len(pairs)} paired sample(s); two or more are required",
+        )
 
     direction = spec["direction"]
     acc = spec["acceptance"]
@@ -179,10 +214,13 @@ def render_summary(comparison: dict) -> str:
     ]
     est = comparison.get("effect")
     if est:
+        clusters = est.get("n_repeat_clusters")
+        cluster_note = f" in {clusters} repeat clusters" if clusters else ""
         lines.append(
             f"effect:     median improvement {est['improvement_pct']:+.2f}% "
             f"(95% CI {est['ci_low_pct']:+.2f}% .. {est['ci_high_pct']:+.2f}%, "
-            f"n={est['n_pairs']} pairs, bootstrap seed {est['bootstrap_seed']})"
+            f"n={est['n_pairs']} pairs{cluster_note}, "
+            f"bootstrap seed {est['bootstrap_seed']})"
         )
         lines.append(
             f"            median wall {est['median_baseline_ms']:.1f} ms -> "
@@ -192,29 +230,6 @@ def render_summary(comparison: dict) -> str:
             lines.append(f"note:        {reason}")
     if comparison.get("verdict") == "unavailable":
         lines.append(f"note:        {comparison.get('reason', 'run unavailable')}")
-    return "\n".join(lines)
-
-
-def render_summary(comparison: dict) -> str:
-    lines = [
-        f"experiment: {comparison.get('experiment_id')}",
-        f"verdict:    {comparison['verdict']}",
-    ]
-    est = comparison.get("effect")
-    if est:
-        lines.append(
-            f"effect:     median improvement {est['improvement_pct']:+.2f}% "
-            f"(95% CI {est['ci_low_pct']:+.2f}% .. {est['ci_high_pct']:+.2f}%, "
-            f"n={est['n_pairs']} pairs, seed {est['bootstrap_seed']})"
-        )
-        lines.append(
-            f"            median wall {est['median_baseline_ms']:.1f}ms -> "
-            f"{est['median_candidate_ms']:.1f}ms"
-        )
-    for r in est.get("inconclusive_because", []) if est else []:
-        lines.append(f"note:        {r}")
-    if comparison.get("verdict") == "unavailable":
-        lines.append(f"note:        {comparison.get('reason', 'runs unusable')}")
     return "\n".join(lines)
 
 

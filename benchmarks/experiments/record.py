@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -144,9 +145,14 @@ def validate_spec(spec: dict) -> list[str]:
             problems.append("workload.files must be a non-empty list")
         if not isinstance(workload.get("audio"), str):
             problems.append("workload.audio must be the directory path string")
+        # The pin is MANDATORY: without it the corpus could change after
+        # preregistration and both arms would silently measure the new files.
         pin = workload.get("sha256")
-        if pin is not None and (not isinstance(pin, str) or len(pin) != 64):
-            problems.append("workload.sha256 pin must be a 64-char digest")
+        if not isinstance(pin, str) or len(pin) != 64:
+            problems.append(
+                "workload.sha256 pin is mandatory (64-char digest from "
+                "run_experiment.py pin-workload)"
+            )
     return problems
 
 
@@ -195,9 +201,32 @@ def validate_record(record: dict) -> list[str]:
     if not isinstance(samples, list):
         problems.append("samples must be a list")
     else:
+        seen_keys = set()
         for i, s in enumerate(samples):
             if not isinstance(s, dict) or not {"arm", "repeat", "request", "cold", "wall_ms"} <= set(s):
                 problems.append(f"samples[{i}] missing required fields")
+                continue
+            if s["arm"] != record.get("role"):
+                problems.append(
+                    f"samples[{i}].arm {s['arm']!r} disagrees with the record role "
+                    f"{record.get('role')!r}"
+                )
+            key_ok = True
+            for key in ("repeat", "request"):
+                v = s[key]
+                if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                    problems.append(f"samples[{i}].{key} must be a non-negative integer")
+                    key_ok = False
+            if key_ok:
+                pair_key = (s["repeat"], s["request"])
+                if pair_key in seen_keys:
+                    problems.append(f"samples[{i}] duplicates (repeat, request) {pair_key}")
+                seen_keys.add(pair_key)
+            w = s["wall_ms"]
+            if isinstance(w, bool) or not isinstance(w, (int, float)):
+                problems.append(f"samples[{i}].wall_ms must be a number")
+            elif not math.isfinite(w) or w < 0:
+                problems.append(f"samples[{i}].wall_ms must be finite and >= 0")
     if record.get("status") not in ("ok", "failed"):
         problems.append("status must be 'ok' or 'failed'")
     return problems
