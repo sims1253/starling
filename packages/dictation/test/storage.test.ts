@@ -316,6 +316,32 @@ describe("retry-safe session storage", () => {
     assert.deepEqual((await store.listReport()).invalid, []);
     store.close();
   });
+
+  it("treats an empty refined text or model as damage, not data", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "refined-emptied";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    await store.create({ id: "emptied", wav });
+    await store.markAttempt("emptied");
+    await store.saveTranscript("emptied", { text: "raw", segments: [] });
+
+    const refined = await store.saveRefinedTranscript("emptied", {
+      text: "Fine.",
+      model: "llama3.1",
+      createdAt: 1,
+    });
+
+    // Non-empty text and model are part of the contract: an emptied field is
+    // corruption and must quarantine like any other damaged record.
+    await overwriteStoredSession(factory, databaseName, {
+      ...refined,
+      refined: { text: "", model: "llama3.1", createdAt: 1 },
+    });
+
+    await assert.rejects(store.get("emptied"), DictationStorageError);
+    store.close();
+  });
 });
 
 function chunkOf(frames: number, fill = 1): Uint8Array {
