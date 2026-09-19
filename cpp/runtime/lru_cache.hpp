@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "trace.hpp"
+
 namespace starling::ggml {
 
 // Maximum retained shapes per model cache; configurable below.
@@ -37,12 +39,17 @@ inline size_t replay_cache_size() {
 // A bounded LRU map. `Value` is typically an entry struct holding a
 // GraphInputPool + unique_ptr<ReplayGraph>; it must be default-constructible
 // (get_or_init places a default value first, then fills it in place).
+//
+// `label` (optional) names the cache in the STARLING_TRACE records ("cache"
+// events: hit/miss/evict + occupancy). Null (the default) = unlabeled: the
+// cache stays silent, so only the caches the trace scopes over need changes.
 template <typename Key, typename Value,
           typename Hash = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>>
 class LruCache {
 public:
-    explicit LruCache(size_t capacity) : capacity_(capacity == 0 ? 1 : capacity) {}
+    explicit LruCache(size_t capacity, const char* label = nullptr)
+        : capacity_(capacity == 0 ? 1 : capacity), label_(label) {}
 
     size_t size() const { return map_.size(); }
 
@@ -51,8 +58,9 @@ public:
     // caller may then call get_or_init).
     Value* get(const Key& key) {
         auto it = map_.find(key);
-        if (it == map_.end()) return nullptr;
+        if (it == map_.end()) return nullptr;  // the get_or_init that follows reports the miss
         touch(it);
+        trace_hit();
         return &it->second.second;
     }
 
@@ -66,9 +74,10 @@ public:
         auto it = map_.find(key);
         if (it != map_.end()) {
             touch(it);
+            trace_hit();
             return &it->second.second;
         }
-        trim();
+        const size_t evicted = trim();
         lru_.push_front(key);
         auto inserted = map_.end();
         try {
@@ -77,6 +86,7 @@ public:
                 std::forward_as_tuple(key),
                 std::forward_as_tuple(lru_.begin(), Value())).first;
             init(inserted->second.second);
+            trace_miss(evicted);
             return &inserted->second.second;
         } catch (...) {
             if (inserted != map_.end()) map_.erase(inserted);
@@ -101,16 +111,31 @@ private:
     }
 
     // Evict LRU entries while size >= capacity, so a following insert lands at
-    // <= capacity. No-op below capacity.
-    void trim() {
+    // <= capacity. No-op below capacity. Returns the number of victims — the
+    // trace miss record reports them.
+    size_t trim() {
+        size_t evicted = 0;
         while (map_.size() >= capacity_ && !lru_.empty()) {
             Key victim = lru_.back();
             lru_.pop_back();
             map_.erase(victim);  // destroys the value (and its ReplayGraph)
+            ++evicted;
         }
+        return evicted;
+    }
+
+    // The cache layer cannot see the device, so mem_free stays "unavailable"
+    // (trace.hpp rule: never fabricate). Occupancy (size/cap) is the available
+    // allocation counter this layer actually owns.
+    void trace_hit() {
+        if (label_) trace::cache_event(label_, "hit", 0, map_.size(), capacity_, -1);
+    }
+    void trace_miss(size_t evicted) {
+        if (label_) trace::cache_event(label_, "miss", evicted, map_.size(), capacity_, -1);
     }
 
     size_t capacity_;
+    const char* label_ = nullptr;
     std::list<Key> lru_;
     Map map_;
 };

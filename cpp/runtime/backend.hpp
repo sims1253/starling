@@ -40,6 +40,9 @@ struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend;
 typedef struct ggml_backend* ggml_backend_t;
+// Same tag spelling as ggml-backend.h (which declares it non-opaquely).
+struct ggml_backend_device;
+typedef struct ggml_backend_device* ggml_backend_dev_t;
 struct ggml_gallocr;
 typedef struct ggml_gallocr* ggml_gallocr_t;
 
@@ -69,6 +72,11 @@ public:
     // GPU, where launch overhead dominates; callers gate on this).
     bool is_gpu() const;
 
+    // Device free memory in bytes, re-queried from the device on each call;
+    // -1 when the selected device cannot report it (never fabricated). Used
+    // by the STARLING_TRACE cache records; not a hot path.
+    long long device_memory_free() const;
+
     // The underlying ggml backend handle. Exposed so the loader can place
     // weight tensors in a buffer on the SAME backend graphs run on.
     ggml_backend_t handle() const;
@@ -91,6 +99,9 @@ private:
     std::unique_ptr<Impl> impl_;
     int   n_threads_ = 1;
     std::string device_name_ = "cpu";
+    // The selected registry device (null when only the CPU fallback engaged);
+    // retained for the trace-only memory queries.
+    ggml_backend_dev_t dev_ = nullptr;
 
     friend class ReplayGraph;
 };
