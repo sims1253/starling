@@ -705,6 +705,58 @@ kbd {
   line-height: 1.45;
   color: #705a2b;
 }
+.refined-block {
+  border-top: 1px solid rgba(36, 37, 30, 0.1);
+  padding: 10px 27px 12px;
+}
+.refined-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.refined-head .eyebrow {
+  color: #5c5d51;
+  margin: 0 0 3px;
+}
+.refined-head > div > span {
+  color: #626358;
+  font-size: 10px;
+}
+.refined-block .transcript-actions {
+  flex-shrink: 0;
+}
+.refined-text {
+  margin: 9px 0 0;
+  white-space: pre-wrap;
+  font: 500 15px/1.5 var(--serif);
+  letter-spacing: -0.005em;
+  color: #2e2f27;
+  max-height: 104px;
+  overflow-y: auto;
+}
+.refined-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #93483b;
+}
+.refined-hint,
+.refined-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #68695e;
+}
+.spinning {
+  animation: spin 1s linear infinite;
+}
 
 .modal-layer {
   position: fixed;
@@ -760,7 +812,8 @@ kbd {
   font-weight: 600;
 }
 .settings-card input,
-.settings-card select {
+.settings-card select,
+.settings-card textarea {
   background: rgba(255, 255, 255, 0.48);
   color: #25261f;
   border: 1px solid #c4c1b8;
@@ -770,12 +823,14 @@ kbd {
   font: 11px var(--mono);
 }
 .settings-card input:focus,
-.settings-card select:focus {
+.settings-card select:focus,
+.settings-card textarea:focus {
   border-color: #747e3d;
   box-shadow: 0 0 0 2px rgba(116, 126, 61, 0.1);
 }
 .settings-card input:focus-visible,
-.settings-card select:focus-visible {
+.settings-card select:focus-visible,
+.settings-card textarea:focus-visible {
   outline: 2px solid #747e3d;
   outline-offset: 1px;
   box-shadow: 0 0 0 4px rgba(116, 126, 61, 0.22);
@@ -784,6 +839,26 @@ kbd {
   color: #65665b;
   font-weight: 400;
   line-height: 1.5;
+}
+.settings-card textarea {
+  resize: vertical;
+  min-height: 58px;
+  line-height: 1.5;
+}
+.settings-section {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(36, 37, 30, 0.14);
+}
+.settings-section .eyebrow {
+  color: #77796c;
+  margin-bottom: 5px;
+}
+.settings-section-lede {
+  font-size: 11px;
+  line-height: 1.65;
+  color: #68695e;
+  margin: 0 0 9px;
 }
 .settings-grid {
   display: grid;
