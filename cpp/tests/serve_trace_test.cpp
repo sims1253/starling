@@ -209,10 +209,13 @@ static void contention_checks(starling::serve::StarlingServer& server,
     auto occupy = [&](const char* id)
         -> std::pair<starling::serve::RequestContext*, std::thread> {
         auto* occ = server.register_request(id);
-        std::string err;
-        std::thread t([&server, occ, &long_pcm, &err] {
+        // The occupier thread outlives occupy()'s frame (occupy returns once
+        // running latches, with the transcription still in flight), so it must
+        // not capture a local for the error out-param — nullptr (every *err
+        // write in the server is guarded) instead of a dangling reference.
+        std::thread t([&server, occ, &long_pcm] {
             auto r = server.transcribe_pcm(long_pcm.data(),
-                                           (int64_t)long_pcm.size(), occ, &err);
+                                           (int64_t)long_pcm.size(), occ, nullptr);
             (void)r;
         });
         for (int i = 0; i < 600 && !occ->running.load(); ++i)
@@ -245,7 +248,10 @@ static void contention_checks(starling::serve::StarlingServer& server,
             logs.push_back(log);
             break;
         }
-        check(attempt == 3, "contention: busy scenario hit within the retries");
+        // Fail only after the LAST retry missed: check() latches a failure
+        // immediately, so a mid-loop check would sink a miss-then-hit run.
+        if (attempt == 3)
+            check(false, "contention: busy scenario hit within the retries");
     }
 
     // --- timeout while parked behind the turn (server built with 0.15 s) --
@@ -276,7 +282,8 @@ static void contention_checks(starling::serve::StarlingServer& server,
             logs.push_back(log);
             break;
         }
-        check(attempt == 3, "contention: timeout scenario hit within the retries");
+        if (attempt == 3)
+            check(false, "contention: timeout scenario hit within the retries");
     }
 
     // --- cancellation while parked behind the turn -------------------------
@@ -310,7 +317,8 @@ static void contention_checks(starling::serve::StarlingServer& server,
             logs.push_back(log);
             break;
         }
-        check(attempt == 3, "contention: cancel scenario hit within the retries");
+        if (attempt == 3)
+            check(false, "contention: cancel scenario hit within the retries");
     }
 }
 #endif // !_WIN32
