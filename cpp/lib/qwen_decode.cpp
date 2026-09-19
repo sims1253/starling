@@ -552,7 +552,7 @@ struct PrefillReplayEntry {
 
 struct PrefillCache {
     LruCache<int64_t, PrefillReplayEntry> by_S;
-    explicit PrefillCache(size_t cap) : by_S(cap) {}
+    explicit PrefillCache(size_t cap) : by_S(cap, "qwen.prefill") {}
     void clear() { by_S.clear(); }
 };
 

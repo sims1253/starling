@@ -449,7 +449,9 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 
     // GPU: captured per-T graph; the mel is the only varying input.
     auto& encoder_cache = model.loader.cache<EncoderCache>();
-    if (!encoder_cache) encoder_cache = std::make_unique<EncoderCache>(replay_cache_size());
+    if (!encoder_cache)
+        encoder_cache = std::make_unique<EncoderCache>(replay_cache_size(),
+                                                                "granite.encoder");
 
     ShapeKey key{T};
     EncoderReplayEntry& e = *encoder_cache->get_or_init(key,
