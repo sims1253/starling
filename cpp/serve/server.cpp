@@ -7,6 +7,7 @@
 #include "server.hpp"
 
 #include "lib/model_registry.hpp"
+#include "runtime/trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,8 @@
 #include <sstream>
 
 namespace starling::serve {
+
+namespace trace = starling::ggml::trace;
 
 // ---- JSON helpers ---------------------------------------------------------
 namespace {
@@ -232,21 +235,35 @@ TranscribeResult StarlingServer::do_transcribe(
     const float* samples, int64_t n, RequestContext* ctx, std::string* err,
     QueuePolicy policy) {
     std::string text;
+    std::string req_id;
     if (!run_with_turn(ctx, policy, [&] {
             return starling_ggml_transcribe_pcm(model_, samples, n, kSampleRate);
-        }, &text, err))
+        }, &text, err, &req_id))
         return {};
 
+    // Response emission (result marshalling — the transport-level body build
+    // and socket write stay outside the trace; see docs/native-serving.md).
+    // RequestScope re-established with the ticket's id so the response record
+    // correlates with the queue/request records above.
+    trace::RequestScope trace_resp(req_id);
+    const bool tr_on = trace::on();
+    const auto t_resp0 = std::chrono::steady_clock::now();
     TranscribeResult result;
     result.text = std::move(text);
     result.duration_s = static_cast<double>(n) / kSampleRate;
     result.segments.push_back({result.text, 0.0, result.duration_s});
+    if (tr_on) {
+        trace::response_event(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_resp0).count());
+    }
     return result;
 }
 
 bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                                    const std::function<char*()>& engine_call,
-                                   std::string* out_text, std::string* err) {
+                                   std::string* out_text, std::string* err,
+                                   std::string* effective_req_id) {
     // Acquire the serial queue position. Every caller gets a ticket —
     // anonymous ones (warmup, WS streaming) get a synthesized id so they
     // queue like everyone else instead of racing the engine.
@@ -258,8 +275,16 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             return false;
         }
         if (req_id.empty()) req_id = "#anon-" + std::to_string(next_anon_id_++);
+        if (effective_req_id) *effective_req_id = req_id;
         request_order_.push_back(req_id);
         n_waiters_++;
+        if (trace::on()) {
+            // Arrival point + admission policy + waiter depth after enqueue
+            // (issue #180: queue entry/start/end with host-wait attribution).
+            trace::queue_event(
+                "queue_enter", req_id, n_waiters_,
+                policy == QueuePolicy::SkipIfBusy ? "skip_if_busy" : "block");
+        }
 
         // Leave the queue (waiter gone, ticket removed). Lock is held.
         auto leave_queue = [&]() {
@@ -297,6 +322,14 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             }
             queue_cv_.wait_for(lk, std::chrono::milliseconds(100));
         }
+        if (trace::on()) {
+            // Host time blocked waiting for the turn (0 when immediately
+            // front-of-queue).
+            trace::queue_wait_event(
+                req_id,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wait_start).count());
+        }
     }
 
     if (ctx && ctx->cancelled.load()) {
@@ -312,8 +345,19 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
     phase_.store(Phase::Busy);
     if (ctx) ctx->running.store(true);
 
-    // Run the engine call (the C engine is synchronous).
+    // Run the engine call (the C engine is synchronous). RequestScope
+    // correlates every engine-layer trace record (chunks, stages, graph
+    // replays, cache events) with this request id — the engine runs on this
+    // thread, so the thread-local context carries through the C boundary.
+    trace::RequestScope trace_req(req_id);
+    const bool tr_on = trace::on();
+    const auto t_engine0 = std::chrono::steady_clock::now();
     char* result_text = engine_call();
+    if (tr_on) {
+        trace::request_event(
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_engine0).count());
+    }
 
     if (ctx) ctx->running.store(false);
     phase_.store(Phase::Ready);
@@ -332,6 +376,7 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             cancel_won = ctx->cancelled.load();
         }
         queue_cv_.notify_all();
+        if (tr_on) trace::queue_event("queue_exit", req_id, n_waiters_);
     }
 
     if (cancel_won) {
