@@ -48,6 +48,15 @@ jobs:
           tests/test_server_routing.py tests/test_server_robustness.py
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
+          tests/test_native_parity_contract.py
+
+      # tests/test_native_parity_contract.py (issue #167): the executable
+      # numerical-correctness contract — manifest schema, test-selection
+      # agreement, docs/manifest agreement, and the comparator negative tests
+      # (seeded truncation / wrong token / wrong EOS boundary are rejected).
+      # Stdlib + pytest only, no models, no downloads; the required-target
+      # accounting reports gitignored-asset coverage as UNAVAILABLE (distinct,
+      # non-failing) so the contract is executable on every CPU runner.
 
       - name: Test native Python bindings with CPU-only PyTorch
         run: >-
