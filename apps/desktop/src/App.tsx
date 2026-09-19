@@ -23,6 +23,7 @@ import {
   Download,
   FileAudio,
   LoaderCircle,
+  MessagesSquare,
   Mic,
   Radio,
   RefreshCw,
@@ -36,6 +37,7 @@ import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings }
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
+import { activeThreadId, newThreadId, threadContext, threadTurns } from "./threads";
 import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
@@ -43,6 +45,24 @@ type Connection = "checking" | "ready" | "busy" | "offline";
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 
 const SETTINGS_FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled])";
+
+/**
+ * localStorage key for the active-thread hint, the one thread-related value
+ * that lives outside the sessions themselves: a stored id pins the thread
+ * the next "Refine in thread" joins, a stored empty string is the
+ * "start new thread" veto, and an absent key follows the history. Every
+ * read and write goes through this constant so the encoding cannot drift
+ * between call sites.
+ */
+const THREAD_ACTIVE_HINT_KEY = "starling:thread:activeHint";
+
+/**
+ * Shown when a threaded refine is refused because another turn in the same
+ * thread is already refining: the second walk would use the same context and
+ * its later save would clobber the thread's text with stale-thread output.
+ */
+const THREAD_REFINE_BUSY_MESSAGE =
+  "Another turn in this thread is already refining. Wait for it to finish, then refine this turn again.";
 
 const store = new IndexedDbSessionStore();
 
@@ -74,7 +94,9 @@ function historyRowLabel(session: DictationSession) {
   const codePoints = Array.from(title);
   const brief = codePoints.length > 60 ? `${codePoints.slice(0, 60).join("")}…` : title;
 
-  return `${brief}, ${formatWhen(session.createdAt)}`;
+  return `${brief}, ${formatWhen(session.createdAt)}${
+    session.threadId ? `, thread ${session.threadId.slice(0, 8)}` : ""
+  }`;
 }
 
 function messageFrom(cause: unknown) {
@@ -100,6 +122,17 @@ function refineActionLabel(refining: boolean, hasRefined: boolean) {
   if (refining) return "Refining…";
 
   return hasRefined ? "Refine again" : "Refine";
+}
+
+/**
+ * The threaded refine action's caption: refining in flight, a re-run against
+ * the thread's current text, or the first join. Same shape as
+ * refineActionLabel so the second drawer button stays as flat as the first.
+ */
+function refineThreadActionLabel(refining: boolean, threaded: boolean) {
+  if (refining) return "Refining…";
+
+  return threaded ? "Refine with thread context" : "Refine in thread";
 }
 
 /** Stable-enough id for WAVs parked in memory when storage fails. */
@@ -177,6 +210,17 @@ export default function App() {
     () => localStorage.getItem("starling:refine:instruction") ?? "",
   );
 
+  // Multi-turn threads (#117): the active-thread hint is pure UI state, never
+  // a session mutation. A stored id pins the thread the next "Refine in
+  // thread" joins; a stored empty string is the "start new thread" veto that
+  // makes the next press mint a fresh thread; an absent key follows the
+  // history — the most recently updated threaded session.
+  const [activeThreadHint, setActiveThreadHint] = useState<string | undefined>(() => {
+    const stored = localStorage.getItem(THREAD_ACTIVE_HINT_KEY);
+
+    return stored === null ? undefined : stored;
+  });
+
   const fileRef = useRef<HTMLInputElement>(null);
   const settingsGearRef = useRef<HTMLButtonElement>(null);
   const settingsDialogRef = useRef<HTMLElement>(null);
@@ -242,9 +286,64 @@ export default function App() {
   // mount-time decrypt below must never clobber what they typed while it was
   // in flight, so an edited field is off limits to the async load.
   const refineApiKeyEditedRef = useRef(false);
+  // Which takes are refining WITH thread context, keyed by session id like
+  // refiningIds: each of the drawer's two refine buttons reflects its own
+  // take and mode, so a standalone refine on one take never animates the
+  // thread button on another.
+  const [refiningThreadIds, setRefiningThreadIds] = useState<ReadonlySet<string>>(() => new Set());
+
+  // Threads with a threaded refine in flight. Per-session concurrency is
+  // master's design and standalone refinement keeps it; a thread, though,
+  // is one running document — two takes refining into it simultaneously
+  // would both walk the same context and the later save would clobber the
+  // thread's text. The claim set is a ref so a press arriving mid-flight
+  // reads the truth without waiting for a re-render.
+  const refiningThreadsRef = useRef(new Set<string>());
 
   // Refinement stays inert until both a base URL and a model are configured.
   const refineConfigured = refineBaseUrl.trim() !== "" && refineModel.trim() !== "";
+
+  // A pin whose thread has no members left is stale residue, not a fallback
+  // candidate: it means "no active thread" instead of silently jumping to
+  // the derived thread. Only the derived answer lives here; the stored copy
+  // is cleaned up by the effect below, because a render-phase removeItem
+  // would be a side effect — StrictMode's double render could fire it, and
+  // a discarded concurrent render could delete a pin that is valid against
+  // fresher data than the render saw.
+  const pinnedThreadDangling =
+    activeThreadHint !== undefined &&
+    activeThreadHint !== "" &&
+    !sessions.some((session) => session.threadId === activeThreadHint);
+
+  // The thread the next "Refine in thread" press joins: the pinned hint when
+  // its thread still has members, else the most recently updated thread in
+  // history. The "start new thread" veto ("") selects neither.
+  const activeThread = useMemo(() => {
+    if (activeThreadHint === "") return undefined;
+
+    if (pinnedThreadDangling) return undefined;
+
+    if (activeThreadHint !== undefined) return activeThreadHint;
+
+    return activeThreadId(sessions);
+  }, [activeThreadHint, pinnedThreadDangling, sessions]);
+
+  // The selected take's position inside its thread, for the drawer's context
+  // line. Undefined when the take is unthreaded or not (yet) listed.
+  const threadPosition = useMemo(() => {
+    if (!selected?.threadId) return undefined;
+
+    const turns = threadTurns(sessions, selected.threadId);
+    const index = turns.findIndex((turn) => turn.id === selected.id);
+
+    return index === -1 ? undefined : { turn: index + 1, total: turns.length };
+  }, [selected, sessions]);
+
+  // Which of the selected take's two refine actions is running: the busy id
+  // set drives both buttons' disabled state, the thread-mode set decides
+  // which one spins and says "Refining…".
+  const selectedRefining = selected !== undefined && refiningIds.has(selected.id);
+  const selectedRefiningThread = selected !== undefined && refiningThreadIds.has(selected.id);
 
   // Refinements still in flight when the app unmounts must settle without
   // corrupting state: abort each one so its promise rejects and late setState
@@ -261,6 +360,16 @@ export default function App() {
       window.clearTimeout(timer.current);
     };
   }, []);
+
+  // The residue cleanup for a dangling pin, committed after render: the
+  // stored value is removed so a reload follows the history instead of the
+  // dead pin, while the memo above already reports "no active thread" so
+  // the strip disappears immediately. removeItem is idempotent, so re-runs
+  // while the pin stays stale are free; the state value is left alone
+  // because nothing react-owned needs to change for the cleanup to hold.
+  useEffect(() => {
+    if (pinnedThreadDangling) localStorage.removeItem(THREAD_ACTIVE_HINT_KEY);
+  }, [pinnedThreadDangling]);
 
   // Refinement key at rest: prefer the safeStorage ciphertext the main
   // process can decrypt over any plaintext copy. The loaded key only fills
@@ -563,6 +672,17 @@ export default function App() {
   );
 
   /**
+   * Apply the active-thread hint everywhere it lives at once: component
+   * state for this render, localStorage for the next launch. A thread id is
+   * the pin, "" the start-new-thread veto; every writer goes through here so
+   * the two stores can never disagree.
+   */
+  const applyThreadHint = useCallback((value: string) => {
+    setActiveThreadHint(value);
+    localStorage.setItem(THREAD_ACTIVE_HINT_KEY, value);
+  }, []);
+
+  /**
    * Refine one take's raw transcript through the configured OpenAI-compatible
    * endpoint. Explicit and opt-in per press: the result is saved to the
    * session's separate `refined` field, and the raw transcript — the copy the
@@ -570,20 +690,55 @@ export default function App() {
    * or is cancelled. Guarded per session id like transcribe(): a second press
    * on the same take while its refinement runs is ignored, while other takes
    * stay free to refine concurrently.
+   *
+   * With `options.inThread` the press also carries the multi-turn context
+   * (#117): thread state is read fresh from the store, an unthreaded take is
+   * then assigned — by this explicit action only — to the active thread (or
+   * a freshly minted one) and refined against the thread's current text; a
+   * take already in a thread skips the assignment and uses the same context.
+   * A thread with no refined predecessor sends the standalone pair, so the
+   * thread head behaves like a normal refinement while still opening the
+   * thread. One threaded refine per thread at a time: a second press on the
+   * same thread exits with a message instead of racing the first save.
    */
   const refineTranscript = useCallback(
-    async (session: DictationSession) => {
+    async (session: DictationSession, options?: { inThread?: boolean }) => {
       const transcript = session.transcript;
+      const inThread = options?.inThread === true;
 
       if (!transcript || refiningIdsRef.current.has(session.id)) return;
+
+      // Fast exit for the common conflict: the render-time target thread
+      // already has a threaded refine in flight. The authoritative claim is
+      // made after the fresh listing read below; standalone refinement never
+      // touches the claim set and stays fully concurrent.
+      if (inThread) {
+        const target = session.threadId ?? activeThread;
+
+        if (target !== undefined && refiningThreadsRef.current.has(target)) {
+          setRefineError({ id: session.id, message: THREAD_REFINE_BUSY_MESSAGE });
+
+          return;
+        }
+      }
 
       refiningIdsRef.current.add(session.id);
       setRefiningIds(new Set(refiningIdsRef.current));
       setRefineError((current) => (current?.id === session.id ? undefined : current));
 
+      if (inThread) {
+        setRefiningThreadIds((current) => new Set([...current, session.id]));
+      }
+
       const controller = new AbortController();
 
       refineAbortRef.current.set(session.id, controller);
+
+      // The thread this press claimed, released in the finally below.
+      let claimedThread: string | undefined;
+      // Set when THIS press assigned the take to its thread, so a refine
+      // failure afterwards can say the join itself succeeded.
+      let joinedThread: string | undefined;
 
       const settings: RefinementSettings = {
         baseUrl: refineBaseUrl,
@@ -593,8 +748,66 @@ export default function App() {
       };
 
       try {
+        let contextText: string | undefined;
+
+        if (inThread) {
+          // Thread state is read fresh from the store — the same read
+          // refresh() uses — never from the render-time closure, which
+          // predates every await in this function: cross-window updates and
+          // just-written assignments are visible here. The read happens
+          // BEFORE this take's own assignment, so a joining take still
+          // counts every current member as earlier, whatever its age — the
+          // join semantics the context walk documents.
+          const fresh = await store.listReport();
+          const stored = fresh.sessions.find((candidate) => candidate.id === session.id);
+          const threadId = stored?.threadId ?? activeThread ?? newThreadId();
+
+          if (refiningThreadsRef.current.has(threadId)) {
+            setRefineError({ id: session.id, message: THREAD_REFINE_BUSY_MESSAGE });
+
+            return;
+          }
+
+          refiningThreadsRef.current.add(threadId);
+          claimedThread = threadId;
+
+          if (stored?.threadId === undefined) {
+            // The explicit assignment: this take joins the thread now, and
+            // membership stays visible even when the refinement below fails.
+            // Its failure is its own sentence — never a generic refinement
+            // error — and nothing else has been touched yet.
+            try {
+              await store.assignThread(session.id, threadId);
+            } catch (caught) {
+              setRefineError({
+                id: session.id,
+                message: `Could not add this take to thread ${threadId.slice(0, 8)}: ${messageFrom(caught)}`,
+              });
+
+              return;
+            }
+
+            joinedThread = threadId;
+            await refresh();
+          }
+
+          // Both the join and the already-threaded path pin the hint: the
+          // thread this press refined in is the one the next join targets,
+          // so a stale pin on another thread can never silently win.
+          applyThreadHint(threadId);
+
+          // The context itself comes from the same fresh snapshot: the
+          // assignment only labeled THIS take, so the thread's other members
+          // — the earlier turns this walks — are exactly what the store
+          // holds right now.
+          contextText = threadContext(fresh.sessions, threadId, session.id);
+        }
+
         const text = await Effect.runPromise(
-          refineEffect(transcript.text, settings, { signal: controller.signal }),
+          refineEffect(transcript.text, settings, {
+            signal: controller.signal,
+            contextText,
+          }),
         );
 
         await store.saveRefinedTranscript(session.id, {
@@ -604,15 +817,55 @@ export default function App() {
         });
         await refresh();
       } catch (caught) {
-        setRefineError({ id: session.id, message: messageFrom(caught) });
+        // A refine failure after a fresh join must not read as though the
+        // join failed: the take IS threaded now, and only the refinement
+        // needs repeating.
+        setRefineError({
+          id: session.id,
+          message:
+            joinedThread !== undefined
+              ? `This take joined thread ${joinedThread.slice(0, 8)}, but its refinement failed: ${messageFrom(caught)}`
+              : messageFrom(caught),
+        });
       } finally {
         refiningIdsRef.current.delete(session.id);
         setRefiningIds(new Set(refiningIdsRef.current));
         refineAbortRef.current.delete(session.id);
+
+        if (claimedThread !== undefined) {
+          refiningThreadsRef.current.delete(claimedThread);
+        }
+
+        if (inThread) {
+          setRefiningThreadIds((current) => {
+            const next = new Set(current);
+
+            next.delete(session.id);
+
+            return next;
+          });
+        }
       }
     },
-    [refresh, refineApiKey, refineBaseUrl, refineInstruction, refineModel],
+    [
+      activeThread,
+      applyThreadHint,
+      refresh,
+      refineApiKey,
+      refineBaseUrl,
+      refineInstruction,
+      refineModel,
+    ],
   );
+
+  /**
+   * Clear the active-thread hint so the next "Refine in thread" starts a
+   * fresh thread. Pure UI state: no session is deleted, mutated, or
+   * reassigned — existing threads and their takes stay exactly as they are.
+   */
+  function startNewThread() {
+    applyThreadHint("");
+  }
 
   async function copyRefinedText() {
     if (!selected?.refined) return;
@@ -1314,6 +1567,12 @@ export default function App() {
             </div>
             <Clock3 size={18} />
           </div>
+          {activeThread && (
+            <div className="thread-strip">
+              <span>Active thread: {activeThread.slice(0, 8)}</span>
+              <button onClick={startNewThread}>start new thread</button>
+            </div>
+          )}
           <div className="history-list">
             {damaged.length > 0 && (
               <div className="history-warning" role="status">
@@ -1379,6 +1638,9 @@ export default function App() {
                     {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
                     {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
                   </small>
+                  {session.threadId && (
+                    <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
+                  )}
                 </span>
                 <ChevronRight size={16} />
               </button>
@@ -1456,16 +1718,30 @@ export default function App() {
                 <div className="transcript-actions">
                   <button
                     onClick={() => void refineTranscript(selected)}
-                    disabled={refiningIds.has(selected.id) || !refineConfigured}
+                    disabled={selectedRefining || !refineConfigured}
                   >
-                    {refiningIds.has(selected.id) ? (
+                    {selectedRefining && !selectedRefiningThread ? (
                       <LoaderCircle className="spinning" size={16} />
                     ) : (
                       <Sparkles size={16} />
                     )}
                     {refineActionLabel(
-                      refiningIds.has(selected.id),
+                      selectedRefining && !selectedRefiningThread,
                       selected.refined !== undefined,
+                    )}
+                  </button>
+                  <button
+                    onClick={() => void refineTranscript(selected, { inThread: true })}
+                    disabled={selectedRefining || !refineConfigured}
+                  >
+                    {selectedRefiningThread ? (
+                      <LoaderCircle className="spinning" size={16} />
+                    ) : (
+                      <MessagesSquare size={16} />
+                    )}
+                    {refineThreadActionLabel(
+                      selectedRefiningThread,
+                      selected.threadId !== undefined,
                     )}
                   </button>
                   {selected.refined && (
@@ -1483,6 +1759,12 @@ export default function App() {
                   )}
                 </div>
               </div>
+              {selected.threadId && threadPosition && (
+                <p className="thread-line">
+                  Thread {selected.threadId.slice(0, 8)} — turn {threadPosition.turn} of{" "}
+                  {threadPosition.total}. Each turn keeps its own raw transcript.
+                </p>
+              )}
               {refineError?.id === selected.id && (
                 <p className="refined-error" role="alert">
                   <CircleAlert size={15} /> {refineError.message}
@@ -1493,10 +1775,12 @@ export default function App() {
                   Add a refinement base URL and model in settings to enable this.
                 </p>
               )}
-              {refiningIds.has(selected.id) && !selected.refined && (
+              {selectedRefining && !selected.refined && (
                 <p className="refined-status">
-                  <LoaderCircle className="spinning" size={15} /> Sending the raw transcript to the
-                  refinement model…
+                  <LoaderCircle className="spinning" size={15} />{" "}
+                  {selectedRefiningThread
+                    ? "Sending the thread's current text and this new turn to the refinement model…"
+                    : "Sending the raw transcript to the refinement model…"}
                 </p>
               )}
               {selected.refined && <p className="refined-text">{selected.refined.text}</p>}

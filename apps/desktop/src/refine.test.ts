@@ -3,6 +3,7 @@ import { Effect, Schema } from "effect";
 
 import {
   REFINEMENT_DEFAULT_INSTRUCTION,
+  REFINEMENT_THREAD_INSTRUCTION,
   RefinementHttpError,
   RefinementInputError,
   RefinementProtocolError,
@@ -91,6 +92,52 @@ describe("buildRefinementMessages", () => {
     for (const message of messages) expect(Object.isFrozen(message)).toBe(true);
     expect(messages.map((message) => message.role)).toEqual(["system", "user"]);
   });
+
+  it("inserts thread context as an assistant turn under the multi-turn instruction", () => {
+    expect(
+      buildRefinementMessages("make that more formal", settings, {
+        contextText: "so i says to her",
+      }),
+    ).toEqual([
+      { role: "system", content: REFINEMENT_THREAD_INSTRUCTION },
+      { role: "assistant", content: "so i says to her" },
+      { role: "user", content: "make that more formal" },
+    ]);
+  });
+
+  it("keeps a custom instruction verbatim even with thread context", () => {
+    expect(
+      buildRefinementMessages(
+        "next turn",
+        { ...settings, instruction: "Tighten it." },
+        {
+          contextText: "current text",
+        },
+      ),
+    ).toEqual([
+      { role: "system", content: "Tighten it." },
+      { role: "assistant", content: "current text" },
+      { role: "user", content: "next turn" },
+    ]);
+  });
+
+  it("treats absent or whitespace-only context as standalone", () => {
+    for (const contextText of [undefined, "", "   \n\t  "]) {
+      expect(buildRefinementMessages("raw", settings, { contextText })).toEqual([
+        { role: "system", content: REFINEMENT_DEFAULT_INSTRUCTION },
+        { role: "user", content: "raw" },
+      ]);
+    }
+  });
+
+  it("returns a frozen system+assistant+user triple with context", () => {
+    const messages = buildRefinementMessages("raw words", settings, { contextText: "current" });
+
+    expect(Object.isFrozen(messages)).toBe(true);
+
+    for (const message of messages) expect(Object.isFrozen(message)).toBe(true);
+    expect(messages.map((message) => message.role)).toEqual(["system", "assistant", "user"]);
+  });
 });
 
 describe("refineEffect", () => {
@@ -140,6 +187,27 @@ describe("refineEffect", () => {
     );
 
     expect(recorder.captured[0]?.url).toBe("http://127.0.0.1:11434/v1/chat/completions");
+  });
+
+  it("sends the thread context through to the wire as an assistant turn", async () => {
+    const recorder = recordingFetch(() => completion("Updated."));
+
+    const text = await Effect.runPromise(
+      refineEffect("make that more formal", settings, {
+        fetchImpl: recorder.fetchImpl,
+        contextText: "so i says to her",
+      }),
+    );
+
+    expect(text).toBe("Updated.");
+
+    const body = wireBody(recorder.captured[0]?.init ?? {});
+
+    expect(body.messages).toEqual([
+      { role: "system", content: REFINEMENT_THREAD_INSTRUCTION },
+      { role: "assistant", content: "so i says to her" },
+      { role: "user", content: "make that more formal" },
+    ]);
   });
 
   it("attaches bearer auth only when an API key is set", async () => {

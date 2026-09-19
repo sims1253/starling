@@ -55,6 +55,14 @@ export const DictationSessionSchema = Schema.Struct({
    * or database version bump — and re-refining overwrites it in place.
    */
   refined: Schema.optional(RefinedTranscriptSchema),
+  /**
+   * Thread this take was explicitly assigned to for multi-turn refinement
+   * (#117). Additive and optional like `refined`, so records persisted before
+   * threads existed decode unchanged — no session schema or database version
+   * bump. Purely a label for chaining refinement context: it never changes
+   * which transcript is primary, and a take keeps its own raw transcript.
+   */
+  threadId: Schema.optional(Schema.NonEmptyString),
 });
 
 export type DictationSession = (typeof DictationSessionSchema)["Type"];
@@ -124,6 +132,18 @@ export interface DictationSessionStore {
    */
   saveRefinedTranscript(id: string, refined: RefinedTranscript): Promise<DictationSession>;
   /**
+   * Assign the session to a refinement thread (#117). Like
+   * `saveRefinedTranscript` this is written only by an explicit user action,
+   * bumps `updatedAt`, and touches nothing else — the raw transcript, its
+   * history, any refined copy, and the status all stay exactly as they were.
+   * Membership is a label for chaining refinement context, never a mutation
+   * of the take's own records. Assignment is permanent for the session's
+   * lifetime: there is deliberately no un-assign, and moving a take between
+   * threads can only arrive as a future explicit feature — a re-assignment
+   * to a different id supersedes the label, but nothing ever clears it.
+   */
+  assignThread(id: string, threadId: string): Promise<DictationSession>;
+  /**
    * Downgrade an in-flight session (`transcribing`/`captured`) to `failed`.
    * A session a live owner already settled keeps its state, so a sweep
    * racing a settling write cannot overwrite it (#162).
@@ -165,6 +185,7 @@ export interface DictationSessionManifest {
   readonly streamed?: boolean;
   readonly streamError?: string;
   readonly refined?: RefinedTranscript;
+  readonly threadId?: string;
 }
 
 export interface DictationSessionExport {
@@ -187,6 +208,7 @@ interface ManifestDraft {
   streamed?: boolean;
   streamError?: string;
   refined?: RefinedTranscript;
+  threadId?: string;
 }
 
 export class DictationStorageError extends Data.TaggedError("DictationStorageError")<{
@@ -229,14 +251,23 @@ function errorText<Cause>(cause: Cause): string {
   return serialized ?? String(cause);
 }
 
+/**
+ * The shared id rules: non-empty and single-line. Both the session id and
+ * the refinement-thread id are checked through this one helper so their
+ * contracts (and the error wording callers rely on) cannot drift apart.
+ */
+function assertNonEmptySingleLine(value: string, label: string): void {
+  if (!value || /[\r\n]/.test(value)) {
+    throw new TypeError(`${label} must be non-empty and contain no newlines`);
+  }
+}
+
 function assertCreateInput(input: CreateSessionInput): void {
   if (!(input.wav instanceof Blob) || input.wav.size === 0) {
     throw new TypeError("wav must be a non-empty Blob");
   }
 
-  if (input.id !== undefined && (!input.id || /[\r\n]/.test(input.id))) {
-    throw new TypeError("session id must be non-empty and contain no newlines");
-  }
+  if (input.id !== undefined) assertNonEmptySingleLine(input.id, "session id");
 
   if (
     input.durationMs !== undefined &&
@@ -244,6 +275,15 @@ function assertCreateInput(input: CreateSessionInput): void {
   ) {
     throw new TypeError("durationMs must be a non-negative finite number");
   }
+}
+
+/**
+ * Thread ids share the session-id rules through assertNonEmptySingleLine so
+ * a value the schema's NonEmptyString would quarantine on its next read is
+ * rejected at the write boundary in both stores, memory included.
+ */
+function assertThreadId(threadId: string): void {
+  assertNonEmptySingleLine(threadId, "thread id");
 }
 
 interface TranscriptDraft {
@@ -282,6 +322,7 @@ interface SessionDraft {
   streamed?: boolean | undefined;
   streamError?: string | undefined;
   refined?: RefinedTranscript | undefined;
+  threadId?: string | undefined;
 }
 
 function freezeRefined(value: RefinedTranscript): RefinedTranscript {
@@ -310,6 +351,8 @@ function freezeSession(value: DictationSession): DictationSession {
   if (value.streamError !== undefined) session.streamError = value.streamError;
 
   if (value.refined !== undefined) session.refined = freezeRefined(value.refined);
+
+  if (value.threadId !== undefined) session.threadId = value.threadId;
 
   return Object.freeze(session);
 }
@@ -342,6 +385,7 @@ type SessionUpdate = Partial<{
   streamed: boolean;
   streamError: string;
   refined: RefinedTranscript;
+  threadId: string;
 }>;
 
 function updatedSession(current: DictationSession, update: SessionUpdate): DictationSession {
@@ -379,6 +423,8 @@ export function exportDictationSession(session: DictationSession): DictationSess
   if (session.streamError !== undefined) manifest.streamError = session.streamError;
 
   if (session.refined !== undefined) manifest.refined = freezeRefined(session.refined);
+
+  if (session.threadId !== undefined) manifest.threadId = session.threadId;
 
   return Object.freeze({ manifest: Object.freeze(manifest), wav: session.wav });
 }
@@ -645,6 +691,12 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
     return this.update(id, (current) =>
       updatedSession(current, { refined: freezeRefined(refined) }),
     );
+  }
+
+  async assignThread(id: string, threadId: string): Promise<DictationSession> {
+    assertThreadId(threadId);
+
+    return this.update(id, (current) => updatedSession(current, { threadId }));
   }
 
   async transcriptionInFlight(id: string): Promise<boolean> {
@@ -1446,6 +1498,12 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
     return this.update(id, (current) =>
       updatedSession(current, { refined: freezeRefined(refined) }),
     );
+  }
+
+  async assignThread(id: string, threadId: string): Promise<DictationSession> {
+    assertThreadId(threadId);
+
+    return this.update(id, (current) => updatedSession(current, { threadId }));
   }
 
   /**
