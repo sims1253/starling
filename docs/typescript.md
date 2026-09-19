@@ -22,7 +22,10 @@ network requests, and release resources when an operation ends. Promise methods
 remain available at React, Electron, and browser API boundaries. Pure audio and
 text transformations can stay ordinary TypeScript functions.
 
-The renderer displays the returned text without cleanup. Changing the compiler,
+The renderer displays the returned text without cleanup. The optional transcript
+refinement layer keeps that stance: it runs only on an explicit per-take action,
+stores its result in a separate labeled `refined` field beside the raw transcript,
+and never rewrites the raw transcript or its history. Changing the compiler,
 error handling, or schemas must not change transcripts or discard saved audio.
 
 ## Checks
