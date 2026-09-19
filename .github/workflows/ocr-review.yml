@@ -85,6 +85,18 @@ jobs:
   code-review:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The ocr launcher spawns a detached self-updater on every invocation
+    # (18-minute cooldown, state under ~/.opencodereview) unless
+    # OCR_NO_UPDATE is set. On an ephemeral runner the check fires on the
+    # action's first `ocr` call: the background updater re-runs a global
+    # npm install of the latest version, which swaps the package under the
+    # /usr/local/bin/ocr symlink — the next `ocr review` then dies with
+    # "Cannot find module '/usr/local/bin/ocr'" (run 35463956250). Killing
+    # the updater also keeps ocr_version honest: the CLI stays at the
+    # version pinned below instead of whatever registry npmjs.org served
+    # at run time.
+    env:
+      OCR_NO_UPDATE: '1'
     # Run on PR events from trusted authors, or on human-authored comments
     # starting with trigger keywords. Bot comments are excluded as a safety
     # net: GITHUB_TOKEN already suppresses events from bot-posted comments,
