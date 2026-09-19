@@ -220,6 +220,18 @@ jobs:
           grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
           ./starling-serve-linux-cuda --abi-version
 
+      # Clean-machine startup check (issue #57): fresh Ubuntu 22.04 container
+      # with only the documented runtime packages — no SDK, no build dir, no
+      # host libraries. GPU-less by design (release runners have no GPU):
+      # checksum, complete loader resolution, and version/ABI metadata.
+      # Representative inference on real hardware is tracked on #57 (see
+      # also #184) and stays outside this job.
+      - name: Runtime check (fresh container, documented packages only)
+        run: |
+          scripts/release-runtime/check-linux-cuda.sh \
+            starling-serve-linux-cuda.tar.gz "${RELEASE_TAG#v}" \
+            "$(./starling-serve-linux-cuda --abi-version)"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: starling-serve-linux-cuda
