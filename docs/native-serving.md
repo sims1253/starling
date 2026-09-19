@@ -276,6 +276,79 @@ incomplete commits preserve the remaining audio for a later retry. Transcript
 stitching uses matching words rather than timestamps, so disagreements between
 neighboring windows can still omit or duplicate words.
 
+## Timing trace
+
+`STARLING_TRACE=1 starling-serve …` turns on an opt-in structured timing trace
+(issue #180): one JSON record per line on stderr, prefixed `[trace] `, that
+correlates one transcription request's timing across the layers it touches.
+With the variable unset (the default) nothing is measured, formatted, or
+printed, and the replay fast path is untouched.
+
+```text
+[trace] {"v":1,"ts":1840,"tid":91255231,"ev":"queue_enter","req":"req-42","policy":"block","depth":1}
+[trace] {"v":1,"ts":1841,"tid":91255231,"ev":"queue_wait","req":"req-42","dur_ms":0.612}
+[trace] {"v":1,"ts":1842,"tid":91255231,"ev":"chunk","chunk":1,"dur_ms":410.2,"req":"req-42"}
+[trace] {"v":1,"ts":2600,"tid":91255231,"ev":"stage","stage":"mel_enc_proj","dur_ms":180.4,"req":"req-42","chunk":1}
+[trace] {"v":1,"ts":2610,"tid":91255231,"ev":"graph_replay","dur_ms":0.31,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
+[trace] {"v":1,"ts":2790,"tid":91255231,"ev":"readback_sync","dur_ms":178.9,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
+[trace] {"v":1,"ts":3410,"tid":91255231,"ev":"request","dur_ms":1568.3,"req":"req-42"}
+[trace] {"v":1,"ts":3412,"tid":91255231,"ev":"queue_exit","req":"req-42","depth":0}
+[trace] {"v":1,"ts":3413,"tid":91255231,"ev":"response","dur_ms":0.02,"req":"req-42"}
+```
+
+Record kinds and fields:
+
+| `ev` | Layer | Fields |
+| --- | --- | --- |
+| `queue_enter` | serving | `req`, `policy` (`block`/`skip_if_busy`), `depth` (waiters after enqueue) |
+| `queue_wait` | serving | `req`, `dur_ms` (host time blocked waiting for the serial-queue turn; emitted on turn acquisition AND on abandoned departures — skip refusal, timeout, cancellation) |
+| `request` | serving | `dur_ms` (engine-call wall time) |
+| `queue_exit` | serving | `req`, `reason` (`completed`/`cancelled`/`server_busy`/`timed_out`), `depth` (waiters after release). Terminal: every `queue_enter` balances exactly one `queue_exit` |
+| `response` | serving | `dur_ms` (result marshalling; the HTTP body build and socket write are outside the trace) |
+| `chunk` | engine | `chunk` (1-based), `dur_ms` |
+| `stage` | engine | `stage` (`mel_enc_proj`, `prompt_embeds`, `generate`), `dur_ms` |
+| `graph_build` | runtime | `dur_ms` (construction + allocation of one captured shape), `uid`, `nodes`, `out_ne`, `device`, `mem_free` (device free bytes after admission, or `unavailable`) |
+| `graph_replay` | runtime | `dur_ms` (the async launch — **host enqueue**), `uid`, `nodes`, `out_ne`, `device` |
+| `readback_sync` | runtime | `dur_ms` (the single trailing sync — **host blocked**), `uid`, `nodes`, `out_ne`, `device` |
+| `cache` | runtime | `cache` (e.g. `granite.encoder`, `qwen.prefill`, `parakeet.encoder`), `op` (`hit`/`miss`), `evicted`, `size`, `cap`, `mem_free` |
+
+Every record carries `v` (schema version), `ts` (µs since the first record),
+`tid`, and — when active — `req` (the HTTP request id, or the synthesized
+`#anon-N` ticket of an anonymous caller) and `chunk`. Engine-layer records
+inherit both through the request scope, so a replay graph fired inside chunk 3
+of request `req-42` carries `req` and `chunk:3`.
+
+Reading the numbers correctly (binding rules):
+
+- **Host enqueue vs. host blocked vs. device time are different things.**
+  `graph_replay` measures the async launch (returns almost immediately on
+  CUDA). `readback_sync` measures the single trailing sync and *includes
+  waiting for prior GPU work* — it is **not** transfer time alone. True
+  per-graph device time is not measured and never fabricated. On the CPU
+  backend the launch is itself synchronous, so `graph_replay` approximates
+  the full compute — check `device` before interpreting.
+- **Wall times are clock-nested; never add a child into its parent.**
+  Aggregate by summing sibling records of ONE kind: the three `stage` records
+  of a chunk sum to that chunk's engine work; the `chunk` records of a request
+  sum to its engine time inside `request`. `graph_replay` + `readback_sync`
+  overlap the stage walls (they are leaves, not additional time).
+- **The queue ledger balances.** Every `queue_enter` has exactly one
+  terminal `queue_exit` whose `reason` says how the ticket left
+  (`completed`, `server_busy`, `timed_out`, `cancelled`), and `queue_wait`
+  fires for abandoned waits too — the contention outcomes the trace exists
+  to diagnose are never invisible.
+- **No contents.** Records carry ids, indices, shape dimensions, and cache
+  occupancy — never audio, transcripts, prompts, or tensor contents.
+- **Scope.** Chunk/stage spans currently come from the granite engine (the
+  multi-chunk reference); other engines emit the serving and runtime records
+  without chunk attribution. One-shot (non-captured) computes are not traced.
+  The trace is a diagnostic tool, not telemetry: nothing is sent anywhere.
+
+The older gates remain independent: `STARLING_GRANITE_TIMING` (granite stage
+summaries) and `STARLING_REPLAY_TIMING` (per-replay split). The stage records
+share `STARLING_GRANITE_TIMING`'s clocks, so the two renderings cannot
+disagree.
+
 ## Pre-converted GGUF files
 
 Download Parakeet weights from

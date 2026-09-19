@@ -200,9 +200,13 @@ private:
     // engine_call (returning a malloc'd string owned by the caller policy
     // below), release the turn, and map failures to *err. Returns the
     // engine's string via out_text. Shared by the audio and text paths.
+    // effective_req_id (optional) receives the request id actually used for
+    // the queue ticket (the caller's ctx id, or the synthesized "#anon-N" —
+    // the trace correlates follow-up records like response emission with it).
     bool run_with_turn(RequestContext* ctx, QueuePolicy policy,
                        const std::function<char*()>& engine_call,
-                       std::string* out_text, std::string* err);
+                       std::string* out_text, std::string* err,
+                       std::string* effective_req_id = nullptr);
 };
 
 } // namespace starling::serve

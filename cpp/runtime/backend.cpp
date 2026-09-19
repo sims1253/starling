@@ -15,6 +15,7 @@
 #include "imatrix.hpp"
 #include "lru_cache.hpp"
 #include "model_loader.hpp"
+#include "trace.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -216,6 +217,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     }
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
+        dev_ = chosen;
         impl_->backend = ggml_backend_dev_init(chosen, nullptr);
         // Record the replay-cache default for this device class before any
         // model can construct its per-shape caches.
@@ -267,6 +269,16 @@ void Backend::set_n_threads(int n_threads) {
 
 bool Backend::is_gpu() const { return impl_ && impl_->use_sched; }
 ggml_backend_t Backend::handle() const { return impl_ ? impl_->backend : nullptr; }
+
+long long Backend::device_memory_free() const {
+    // Trace-only query (STARLING_TRACE cache records). -1 = the device cannot
+    // report it; the trace renders that as "unavailable" rather than
+    // fabricating a number. The CPU device reports zeros — treated the same.
+    if (!dev_) return -1;
+    struct ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev_, &props);
+    return props.memory_free > 0 ? (long long)props.memory_free : -1;
+}
 
 void Backend::register_input(ggml_tensor* t, const void* host, size_t nbytes) {
     if (t_pending_inputs) t_pending_inputs->push_back({t, host, nbytes});
@@ -491,6 +503,11 @@ void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<flo
 ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
+    // graph_build spans construction + allocation of one captured shape (the
+    // one-time cost a replay-cache miss pays). Includes the build lambda and
+    // alloc_internal(); the gated F1 histogram below is inside the window.
+    const bool tr_on = trace::on();
+    const auto t_build0 = std::chrono::steady_clock::now();
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize
                          + ggml_graph_overhead_custom(kGraphSize, false),
@@ -533,6 +550,14 @@ ReplayGraph::ReplayGraph(Backend& backend,
                 captures_.emplace_back(c.t, c.dst);
             }
             if (!alloc_internal()) throw std::runtime_error("ReplayGraph allocation failed");
+            if (tr_on) {
+                long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+                trace::graph_build_event(
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_build0).count(),
+                    (unsigned)gf_->uid, gf_->n_nodes, ne, backend_.device_name(),
+                    backend_.device_memory_free());
+            }
             // F1: one-time op histogram for this graph (gated). Counts nodes by op
             // name and, for MUL_MAT, the source (weight) dtype so we can confirm the
             // f16 tensor-core cuBLAS path vs an f32 fallback. Printed once per ctor.
@@ -673,9 +698,13 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     Backend::Impl* impl = backend_.impl_.get();
     // Fast path: graph_compute_async (skip the sync-wrapping graph_compute so the
     // readbacks can pipeline behind the graph on the same stream), then async
-    // readback + single sync.
+    // readback + single sync. The trace timestamps ride the same clocks as the
+    // STARLING_REPLAY_TIMING split; with both gates off the only added work is
+    // the gate load.
     const bool t_on = replay_timing_on();
-    const int64_t t_gc0 = t_on ? ggml_time_us() : 0;
+    const bool tr_on = trace::on();
+    const bool any_gate = t_on || tr_on;
+    const int64_t t_gc0 = any_gate ? ggml_time_us() : 0;
     bool ok;
     if (!need_sched_) {
         ok = (ggml_backend_graph_compute_async(impl->backend, gf_) == GGML_STATUS_SUCCESS);
@@ -713,11 +742,27 @@ bool ReplayGraph::compute(std::vector<float>& out) {
                 ggml_type_name(a->type));
         }
     }
-    const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
+    const int64_t t_gc1 = any_gate ? ggml_time_us() : 0;
+    if (tr_on) {
+        long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+        trace::graph_event("graph_replay",
+                           (double)(t_gc1 - t_gc0) / 1000.0,
+                           gf_ ? (unsigned)gf_->uid : 0u, gf_ ? gf_->n_nodes : -1,
+                           ne, backend_.device_name());
+    }
     out.resize((size_t)ggml_nelements(out_));
     readback_async_then_sync(impl, out_, out);
+    const int64_t t_rb1 = any_gate ? ggml_time_us() : 0;
+    if (tr_on) {
+        long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+        // Host blocked on the single trailing sync — includes waiting for
+        // prior GPU work, so it is NOT transfer time alone (see trace.hpp).
+        trace::graph_event("readback_sync",
+                           (double)(t_rb1 - t_gc1) / 1000.0,
+                           gf_ ? (unsigned)gf_->uid : 0u, gf_ ? gf_->n_nodes : -1,
+                           ne, backend_.device_name());
+    }
     if (t_on) {
-        const int64_t t_rb1 = ggml_time_us();
         std::fprintf(stderr,
             "[enc-timing]   graph_compute=%lldus readback=%lldus n_nodes=%d uid=%u\n",
             (long long)(t_gc1 - t_gc0), (long long)(t_rb1 - t_gc1),

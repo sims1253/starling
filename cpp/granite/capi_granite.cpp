@@ -21,6 +21,7 @@
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/backend.hpp"
+#include "runtime/trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -84,6 +85,17 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
         stage_ms[0] = ms(t0, t1);  // mel + encode + project
         stage_ms[1] = ms(t1, t2);  // prompt + embeds
         stage_ms[2] = ms(t2, t3);  // generate
+    }
+    if (starling::ggml::trace::on()) {
+        // Same clocks as stage_ms (single source: the trace and the
+        // STARLING_GRANITE_TIMING lines cannot disagree). Chunk index comes
+        // from the enclosing ChunkScope's thread-local correlation.
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        starling::ggml::trace::stage_event("mel_enc_proj", ms(t0, t1));
+        starling::ggml::trace::stage_event("prompt_embeds", ms(t1, t2));
+        starling::ggml::trace::stage_event("generate", ms(t2, t3));
     }
     return true;
 }
@@ -160,11 +172,26 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
         StageTiming stages;  // accumulates every chunk's stage durations
         // One piece through the pipeline + timing bookkeeping. Fills `text`,
         // accumulates the piece's stages, and emits the per-chunk summary
-        // line under the timing gate.
+        // line under the timing gate. ChunkScope numbers the runtime-layer
+        // trace records (graph replays, cache events) with this chunk's
+        // 1-based index; the chunk record itself closes the scope so its
+        // wall time covers exactly what the scope covered.
         auto run_piece = [&](const float* pcm_piece, int64_t piece_n, int32_t budget) {
             double piece_ms[kStageCount] = {0, 0, 0};
             std::string text;
-            if (!transcribe_piece(*c, pcm_piece, piece_n, budget, text, piece_ms)) {
+            const bool tr_on = starling::ggml::trace::on();
+            const auto t_piece0 = std::chrono::steady_clock::now();
+            bool ok;
+            {
+                starling::ggml::trace::ChunkScope chunk_scope(stages.chunks + 1);
+                ok = transcribe_piece(*c, pcm_piece, piece_n, budget, text, piece_ms);
+            }
+            if (tr_on && ok) {
+                starling::ggml::trace::chunk_event(stages.chunks + 1,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_piece0).count());
+            }
+            if (!ok) {
                 report(err_out, c->err);
                 return false;
             }

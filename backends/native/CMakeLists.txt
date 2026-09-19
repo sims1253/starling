@@ -175,6 +175,18 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve)
     endif()
 
+    # The serve_trace_test drives StarlingServer directly (server.cpp only —
+    # no WS transport) with the tiny synthesized granite GGUF (issue #180).
+    if(test_name STREQUAL "serve_trace_test")
+      target_sources(${test_name} PRIVATE
+          ${STARLING_REPO_ROOT}/cpp/serve/server.cpp)
+      target_include_directories(${test_name} PRIVATE
+          ${STARLING_REPO_ROOT}/cpp/include
+          ${STARLING_REPO_ROOT}/cpp/serve)
+      find_package(Threads REQUIRED)
+      target_link_libraries(${test_name} PRIVATE Threads::Threads)
+    endif()
+
     set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   endforeach()
 endif()
