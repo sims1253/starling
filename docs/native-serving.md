@@ -292,7 +292,7 @@ printed, and the replay fast path is untouched.
 [trace] {"v":1,"ts":2610,"tid":91255231,"ev":"graph_replay","dur_ms":0.31,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
 [trace] {"v":1,"ts":2790,"tid":91255231,"ev":"readback_sync","dur_ms":178.9,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
 [trace] {"v":1,"ts":3410,"tid":91255231,"ev":"request","dur_ms":1568.3,"req":"req-42"}
-[trace] {"v":1,"ts":3412,"tid":91255231,"ev":"queue_exit","req":"req-42","depth":0}
+[trace] {"v":1,"ts":3412,"tid":91255231,"ev":"queue_exit","req":"req-42","reason":"completed","depth":0}
 [trace] {"v":1,"ts":3413,"tid":91255231,"ev":"response","dur_ms":0.02,"req":"req-42"}
 ```
 
