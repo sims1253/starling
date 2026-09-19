@@ -30,6 +30,34 @@ jobs:
       - name: Harness regressions
         run: uv run --project benchmarks/sonar python -m unittest discover -s benchmarks/sonar -p 'test_*.py'
 
+  # benchmarks/experiments (issue #168): the shared experiment record +
+  # comparison command. Stdlib-only unit/comparator tests over the stub
+  # double, plus the one-command paired CPU reproduction against the real
+  # contract-fixture binary (deterministic engine double, no models).
+  experiments-harness:
+    name: Experiments harness (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Unit and comparator tests (stub double, no models)
+        run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
+      - name: Paired CPU reproduction (contract fixture binary)
+        run: >
+          cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON
+          -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF &&
+          cmake --build build-exp -j --target starling-serve-contract-fixture &&
+          uv run --no-project --python 3.12 python
+          benchmarks/experiments/run_experiment.py demo
+          --binary build-exp/starling-serve-contract-fixture
+          --out-dir build-exp/experiments/demo
+
+
   engine-guards:
     name: Native engine and server guards (CPU)
     runs-on: ubuntu-latest
