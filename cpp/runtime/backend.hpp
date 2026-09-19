@@ -158,6 +158,31 @@ void ensure_weights_realized(const ModelLoader& ml);
 void weight_to_host_f32(const ModelLoader& ml, const char* name,
                         std::vector<float>& out);
 
+// One captured-graph node an accelerator backend rejected (issue #184), with
+// the details the STARLING_SCHED_DEBUG report prints — kept as data so the
+// enumeration can be unit-tested without a GPU backend.
+struct UnsupportedGraphNode {
+    int         node_index;  // index into the cgraph's node list
+    std::string op;          // ggml_op_name of the node (e.g. "UNARY")
+    std::string dst_type;    // ggml_type_name of the node's own type
+    std::string srcs;        // "src0=f32(VIEW,STRIDED) src1=f32(MUL_MAT,cont)"
+};
+
+// Enumerate EVERY cgraph node for which `supports` returns false. Used by
+// ReplayGraph::alloc_internal with ggml_backend_supports_op; tests inject a
+// fake predicate. Never stops at the first rejection: the parakeet CUDA graph
+// of issue #184 had one rejected node per conformer layer, and naming only
+// the first hid the pattern. Null node slots are skipped. (The pinned ggml's
+// graph accessors are non-const, so the parameter is too.)
+std::vector<UnsupportedGraphNode> enumerate_unsupported_graph_nodes(
+    ggml_cgraph* gf,
+    const std::function<bool(const ggml_tensor*)>& supports);
+
+// One sched-dbg report line for an entry, e.g.
+//   "node 96/1845: op=UNARY dst=f32 src0=f32(VIEW,STRIDED)"
+std::string format_unsupported_graph_node(const UnsupportedGraphNode& node,
+                                          int n_nodes);
+
 // A graph built once and replayed many times, keeping the same ggml context +
 // cgraph alive so ggml-cuda can capture + replay it. Callers feed fresh input
 // data each call via set_input.

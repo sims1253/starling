@@ -66,10 +66,16 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     if (pw1b) y = ggml_add(ctx, y, pw1b);
 
     // -- GLU over channel dim (NeMo F.glu(x, dim=1)). The two views share y's
-    // row stride; SIGMOID/MUL consume strided rows directly, so no cont()
-    // materialization is needed (2 fewer dispatches per layer).
+    // row stride; MUL consumes the strided `a` rows directly (ggml-cuda
+    // supports strided binary ops), but ggml-cuda's UNARY kernels require a
+    // FULLY contiguous src0 (supports_op returns ggml_is_contiguous(src0)) —
+    // the strided `b` view routed the whole captured encoder graph onto the
+    // sched path, which aborts at the first input upload (#184). Materialize
+    // b with a contiguous copy (pure layout change: identical numerics on
+    // every backend). Same pattern as the tdt_multistep LSTM gates.
     ggml_tensor* a = ggml_view_2d(ctx, y, D, T, y->nb[1], 0);
-    ggml_tensor* b = ggml_view_2d(ctx, y, D, T, y->nb[1], (size_t)D * y->nb[0]);
+    ggml_tensor* b = ggml_cont(ctx,
+        ggml_view_2d(ctx, y, D, T, y->nb[1], (size_t)D * y->nb[0]));
     ggml_tensor* glu = ggml_mul(ctx, a, ggml_sigmoid(ctx, b));  // [d, T]
 
     // -- pad_mask: zero padded time positions before depthwise conv.
