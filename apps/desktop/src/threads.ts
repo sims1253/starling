@@ -35,9 +35,13 @@ function compareTakeOrder(left: DictationSession, right: DictationSession): numb
 }
 
 /**
- * Freshness order for picking the active thread: updatedAt descending, then
- * createdAt and id descending as tiebreaks. updatedAt leads because pressing
- * "Refine in thread" bumps it — the thread acted on most recently is the one
+ * Freshness order for picking the active thread, written ASCENDING like
+ * every other comparator here: a negative number means `left` is older than
+ * `right`, a positive number that `left` is newer (updatedAt first, then
+ * createdAt, then id as tiebreaks). The caller — activeThreadId — selects
+ * the newest by keeping the session for which this reports greater than
+ * zero against the current winner. updatedAt leads because pressing
+ * "Refine in thread" bumps it: the thread acted on most recently is the one
  * the next unthreaded take should join.
  */
 function compareFreshness(left: DictationSession, right: DictationSession): number {
