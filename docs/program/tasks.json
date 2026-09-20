@@ -629,7 +629,7 @@
    "evidence": [
     "I1 PHASE 1 complete: coordinator rerun 106/106 + 17/17 on gpui/fixes-wave-a4 8be559c, pushed to PR #194; RT callback = atomics only (R01 structurally fixed), SPSC ring + 25ms writer thread, gap spans surfaced, quiesce-stop handshake with typed QuiesceTimeout carrying intact samples (R09)"
    ],
-   "notes": "PHASE 2 open: journal/fsync/durable boundary ack, sampleDurationMs vs wallClockMs split, Interrupted transitions; accumulation Vec still unbounded until journal lands"
+   "notes": "I1 phase 2 dispatched: journal+fsync+durable boundary ack+interrupted recovery; completes G01/E01 capture half"
   },
   {
    "id": "G02",
@@ -1372,13 +1372,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-21",
    "branch": "gpui/fixes-wave-a6",
    "evidence": [
-    "PR #194 OCR run 35503993636, 2026-09-20 10:10Z (15 findings; 3 resolved by unpushed R13 commits)"
+    "coordinator rerun: 116/116 + 22/22; quiesce timeout now Arc-defers teardown (no callback race, design-conform), drain watermark single-sourced via take_pending, channels==0 typed rejection, writer panic surfaced w/ samples still returned, example modernized, fsync split by recoverability, export notice own slot; pushed 911f305"
    ],
-   "notes": "workflow timeout-minutes landed (51ec75e); recorder edges + example + export/notice with impl-agent-21"
+   "notes": "follow-up folded into I1-phase2: upload.rs should consume QuiesceTimeout salvaged audio"
   },
   {
    "id": "R18",
@@ -1455,6 +1455,14 @@
    "agent": "impl-agent-22",
    "branch": "program/wave-a",
    "scope": "apps/desktop + electron main (light)"
+  },
+  {
+   "ids": [
+    "G01-p2"
+   ],
+   "agent": "impl-agent-23",
+   "branch": "gpui/fixes-wave-a7",
+   "scope": "gpui worktree Rust (light-mid cargo)"
   }
  ],
  "prs": {
