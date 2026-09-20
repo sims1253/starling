@@ -1464,6 +1464,22 @@
     "coordinator rerun: 139/139 + 35/35 (84073a7, pushed); rename-to-quarantine tombstone before row removal; crash matrix covered incl. reappeared-file case; unsafe manifest linkages read as None (no traversal, deletion never bricked)"
    ],
    "notes": "fix in gpui worktree: confirmed delete removes or quarantines the journal linked via journal_id; recovery skips deliberately-deleted ids (needs a tombstone list or rename convention); dispatch next gpui slot"
+  },
+  {
+   "id": "R22",
+   "title": "Address PR #198 re-review: sched-path zero-byte accounting degenerates budget; rollback byte leak",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35510136933 (post-R20 push): 2 medium + 2 low"
+   ],
+   "notes": "P1: the zero-byte case silently voids S02s entire guarantee. Fix directions: nonzero accounting for sched-path graphs (sched memory estimate or declared minimum) OR separate entry-count bound for zero-byte entries + one-time diagnostic; NEVER silently unbounded. Rollback: restore bytes_ in catch. Queue AFTER S11 completes (same worktree)."
   }
  ],
  "active_assignments": [

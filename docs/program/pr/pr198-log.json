@@ -10,13 +10,18 @@
   4056810574,
   4056810577,
   4056810584,
-  4056822688
+  4056822688,
+  4056919733,
+  4056919736,
+  4056919739,
+  4056919742
  ],
  "known_issue_comment_ids": [
   5749428749,
-  5749451634
+  5749451634,
+  5749747674
  ],
- "last_review_comment_at": "2026-09-20T11:22:57Z",
+ "last_review_comment_at": "2026-09-20T12:20:00Z",
  "findings": [
   {
    "id": 4056810545,
@@ -72,6 +77,26 @@
    "id": 4056822688,
    "severity": "other-low",
    "summary": "trace() maps bytes_/budget_ into cache_event size/capacity - rename when reporting work lands"
+  },
+  {
+   "id": 4056919733,
+   "severity": "bug-medium",
+   "summary": "sched-path graphs account 0 bytes (galloc_ null) -> byte budget silently degenerates to unbounded entry cache"
+  },
+  {
+   "id": 4056919739,
+   "severity": "bug-medium",
+   "summary": "exception rollback leaks accounted bytes (bytes_+= before trim; vector push_back in trim can throw) -> permanent over-eviction"
+  },
+  {
+   "id": 4056919742,
+   "severity": "bug-low",
+   "summary": "rollback pop_front assumes half-built entry at front; add structural assert"
+  },
+  {
+   "id": 4056919736,
+   "severity": "doc-low",
+   "summary": "comment overclaims WHOLE-list behavior"
   }
  ]
 }
