@@ -990,6 +990,17 @@ kbd {
   font-size: 9px;
   color: #5a5b50;
 }
+.settings-issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  background: #f0ded7;
+  color: #93483b;
+  font-size: 11px;
+  line-height: 1.55;
+}
 .settings-footer {
   display: flex;
   justify-content: flex-end;
