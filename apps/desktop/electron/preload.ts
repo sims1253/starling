@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 import type {
   DesktopDiagnostics,
   HealthInput,
@@ -61,7 +61,9 @@ const bridge: StarlingDesktopBridge = Object.freeze({
     invoke<StreamCommandResult>("starling:stream:command", input),
   streamClose: (input: StreamCloseInput) => ipcRenderer.send("starling:stream:close", input),
   onStreamEvent: (callback: (message: StreamEventMessage) => void) => {
-    const listener = (_event: unknown, message: StreamEventMessage): void => callback(message);
+    const listener = (_event: IpcRendererEvent, message: StreamEventMessage): void =>
+      callback(message);
+
     ipcRenderer.on("starling:stream:event", listener);
 
     return () => ipcRenderer.removeListener("starling:stream:event", listener);

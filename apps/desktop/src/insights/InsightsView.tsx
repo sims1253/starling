@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { CalendarDays, CircleAlert, Download, RotateCcw, X } from "lucide-react";
-import type { InsightEvent } from "./insightEvents";
+import { TRANSFORMATION_KINDS, type InsightEvent } from "./insightEvents";
 import {
   aggregate,
   activityByDay,
@@ -97,7 +97,8 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
   const quality = useMemo(() => compute(() => selectionStats(events)), [events]);
 
   const week = useMemo(() => {
-    const sinceMs = Date.now() - WEEK_MS;
+    const sinceMs = new Date().getTime() - WEEK_MS;
+
     const within = events.filter((event) => parseInsightTimestamp(event.occurred_at) >= sinceMs);
 
     return compute(() => aggregate(within, baseline));
@@ -114,6 +115,7 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
     const url = URL.createObjectURL(
       new Blob([JSON.stringify(usage.value, null, 2)], { type: "application/json" }),
     );
+
     const anchor = document.createElement("a");
 
     anchor.href = url;
@@ -382,21 +384,16 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
                   </tr>
                 </thead>
                 <tbody>
-                  {(
-                    [
-                      "model_authoring",
-                      "snippet_expansion",
-                      "user_edit",
-                      "dictionary_substitution",
-                    ] as const
-                  )
-                    .filter((kind) => usage.value.transformation_counts[kind] > 0)
-                    .map((kind) => (
-                      <tr key={kind}>
-                        <th scope="row">{kind.replace(/_/g, " ")}</th>
-                        <td>{usage.value.transformation_counts[kind]}</td>
-                      </tr>
-                    ))}
+                  {TRANSFORMATION_KINDS.flatMap((kind) =>
+                    usage.value.transformation_counts[kind] > 0
+                      ? [
+                          <tr key={kind}>
+                            <th scope="row">{kind.replace(/_/g, " ")}</th>
+                            <td>{usage.value.transformation_counts[kind]}</td>
+                          </tr>,
+                        ]
+                      : [],
+                  )}
                 </tbody>
               </table>
               <p className="changes-summary">
@@ -480,6 +477,7 @@ function calendarWeeks(
               : "cal-3",
     };
   });
+
   const weeks: CalendarCell[][] = [];
 
   for (let index = 0; index < cells.length; index += 7) {
@@ -501,6 +499,7 @@ function recapText(week: Computed<InsightAggregate>): string {
   const generated =
     week.value.generated_words_by_status.confirmed +
     week.value.generated_words_by_status.submitted_unconfirmed;
+
   const parts = [
     `${plural(week.value.recognized_words, "word")} recognized from speech`,
     `${plural(week.value.unique_takes, "take")}`,

@@ -373,6 +373,7 @@ export function aggregate(
 
   const comparable = tokenizers.size === 1;
   const wpm = eligibleSeconds > 0 && comparable ? (words * 60) / eligibleSeconds : null;
+
   const proxy =
     typingWpm !== undefined && typingWpm !== null && waitsKnown && selectedCount > 0 && comparable
       ? (words * 60) / typingWpm - eligibleSeconds - waitSeconds

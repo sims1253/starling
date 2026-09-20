@@ -289,15 +289,13 @@ function canonicalJson(
   value: unknown, // oxlint-disable-line anti-slop/no-unknown-parameters -- see above
 ): string {
   if (value === null) return "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (Predicate.isObject(value)) {
-    // SAFETY: Predicate.isObject has excluded arrays and nulls; the remaining
-    // shape is a string-keyed record.
-    const record = value as Record<string, unknown>;
 
-    return `{${Object.keys(record)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+
+  if (Predicate.isObject(value)) {
+    return `{${Object.keys(value)
       .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
       .join(",")}}`;
   }
 
@@ -420,6 +418,7 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
 
   async load(): Promise<InsightEventLog> {
     const database = await this.database();
+
     const records = await runIdbRequest(
       database
         .transaction(EVENTS_OBJECT_STORE, "readonly")
@@ -511,6 +510,7 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
       request.onupgradeneeded = () => {
         request.result.createObjectStore(EVENTS_OBJECT_STORE, { keyPath: "event_id" });
       };
+
       request.onsuccess = () => resolve(request.result);
       request.onerror = () =>
         reject(

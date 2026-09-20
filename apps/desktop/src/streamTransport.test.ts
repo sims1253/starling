@@ -225,9 +225,12 @@ describe("BridgeStreamTransport", () => {
 });
 
 describe("createStreamingTransport", () => {
+  // SAFETY: this suite may run outside a DOM, where `window` is absent from
+  // globalThis; the cast only reads the pristine value once, for restore.
   const originalWindow = (globalThis as { window?: unknown }).window;
 
-  function stubWindow(bridge: unknown): void {
+  /** The bridge shapes the probe exercises: any channel may be missing. */
+  function stubWindow(bridge: Partial<DesktopStreamBridge> | undefined): void {
     Object.defineProperty(globalThis, "window", {
       value: { starlingDesktop: bridge },
       configurable: true,
@@ -275,7 +278,7 @@ describe("createStreamingTransport", () => {
   });
 
   it("falls back to the renderer socket for a bridge missing any channel", () => {
-    const channels = boundBridge(new FakeBridge()) as Partial<DesktopStreamBridge>;
+    const channels: Partial<DesktopStreamBridge> = boundBridge(new FakeBridge());
 
     delete channels.onStreamEvent;
     stubWindow(channels);

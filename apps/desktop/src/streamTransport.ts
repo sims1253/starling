@@ -125,7 +125,9 @@ export class BridgeStreamTransport implements StreamingTransport {
   private deliver(event: StarlingStreamEvent): void {
     if (event.type === "closed") this.opened = false;
 
-    for (const listener of [...this.listeners]) listener(event);
+    // Snapshot: a listener may unsubscribe — itself or another — while the
+    // event is still dispatching, and the copy keeps the dispatch stable.
+    for (const listener of Array.from(this.listeners)) listener(event);
   }
 
   private requireOpen(action: string): number {

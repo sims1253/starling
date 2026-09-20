@@ -15,7 +15,6 @@ import {
   type TranscriptionResult,
 } from "@starling/dictation";
 import {
-  BarChart3,
   Check,
   ChevronRight,
   CircleAlert,
@@ -71,7 +70,6 @@ import {
   type SettingsSnapshot,
 } from "./settingsTransaction";
 import type { PendingAudioState } from "../electron/ipc.js";
-import { InsightsView } from "./insights/InsightsView";
 import { InsightRecorder, wavCaptureStats } from "./insights/insightEmitter";
 import { IndexedDbInsightEventStore, type InsightEvent } from "./insights/insightEvents";
 
@@ -239,15 +237,13 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  // The Insights surface (E29): a view toggle over the same app — no router,
-  // the events the surface aggregates, and the one storage/recording notice
-  // it can show. Events refresh after each emit, so opening the view later
-  // always reads the current population.
-  const [view, setView] = useState<"capture" | "insights">("capture");
+  // The insight event log state (E29): the population the Insights surface
+  // aggregates plus the one storage/recording notice it can show. Events
+  // refresh after each emit, so opening the view later always reads the
+  // current population.
+  const [, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
 
-  const [insightEvents, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
-
-  const [insightsIssue, setInsightsIssue] = useState<string>();
+  const [, setInsightsIssue] = useState<string>();
 
   // Post-Stop timestamps for takes whose first transcript has not settled
   // yet, keyed by session id and consumed by that first recognition: the
@@ -631,16 +627,6 @@ export default function App() {
     },
     [recordInsight],
   );
-
-  /** Reset the insight event log; the surface starts over empty. */
-  const resetInsights = useCallback(() => {
-    void insights
-      .reset()
-      .then(() => setInsightEvents(insights.snapshot()))
-      .catch((caught) =>
-        setInsightsIssue(`Insights could not reset the event log: ${messageFrom(caught)}`),
-      );
-  }, []);
 
   // The dialog's status line (B06): the probe's own outcome while one is
   // running or has settled, else the committed endpoint's live status.

@@ -22,10 +22,7 @@ import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
 
 const T0 = Date.parse("2026-09-20T12:00:00Z");
 
-function recorder(): {
-  readonly recorder: InsightRecorder;
-  readonly store: MemoryInsightEventStore;
-} {
+function recorder() {
   const store = new MemoryInsightEventStore();
   let tick = 0;
   let serial = 0;
@@ -308,6 +305,7 @@ describe("InsightRecorder", () => {
 
   it("replays an identical capture finalization as a no-op", async () => {
     const store = new MemoryInsightEventStore();
+
     const fixed = new InsightRecorder(store, {
       now: () => new Date(T0),
       uuid: () => "uuid",

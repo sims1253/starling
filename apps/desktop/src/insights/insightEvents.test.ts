@@ -1,4 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
+import { Schema } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 
 import basicSession from "../../../../packages/contracts/insight-events/fixtures/basic-session.json";
@@ -9,6 +10,7 @@ import syncReplay from "../../../../packages/contracts/insight-events/fixtures/s
 import timezoneShift from "../../../../packages/contracts/insight-events/fixtures/timezone-shift.json";
 import {
   IndexedDbInsightEventStore,
+  InsightEventSchema,
   MemoryInsightEventStore,
   insightEventProblems,
   isCaptureFinalized,
@@ -29,11 +31,10 @@ import {
  * quarantine.
  */
 
-function events(value: unknown): readonly InsightEvent[] {
-  // SAFETY: fixture JSON from the frozen contract, validated by the tests
-  // below before anything else reads it.
-  return value as readonly InsightEvent[];
-}
+/** Parse a fixture at the boundary: the frozen schema, excess properties rejected. */
+const events = Schema.decodeUnknownSync(Schema.Array(InsightEventSchema), {
+  onExcessProperty: "error",
+});
 
 const BASIC = events(basicSession);
 
@@ -147,6 +148,7 @@ describe("schema conformance", () => {
   it("treats payloads with reordered keys as the same payload", () => {
     const first = basicCaptureFinalized();
     const second = basicRecognitionSelected();
+
     const reordered: CaptureFinalizedEvent = {
       occurred_at: first.occurred_at,
       reporting_timezone: first.reporting_timezone,
@@ -203,10 +205,12 @@ describe("MemoryInsightEventStore", () => {
 describe("IndexedDbInsightEventStore", () => {
   it("persists events across store instances and dedupes replays", async () => {
     const factory = new IDBFactory();
+
     const first = new IndexedDbInsightEventStore({
       databaseName: "insights-a",
       indexedDB: factory,
     });
+
     const event = basicCaptureFinalized();
 
     await first.append(event);
@@ -216,6 +220,7 @@ describe("IndexedDbInsightEventStore", () => {
       databaseName: "insights-a",
       indexedDB: factory,
     });
+
     const log = await second.load();
 
     expect(log.events).toHaveLength(1);
@@ -225,10 +230,12 @@ describe("IndexedDbInsightEventStore", () => {
 
   it("conflicts on a differing payload under a known event id", async () => {
     const factory = new IDBFactory();
+
     const store = new IndexedDbInsightEventStore({
       databaseName: "insights-b",
       indexedDB: factory,
     });
+
     const event = basicRecognitionSelected();
 
     await store.append(event);
@@ -267,6 +274,7 @@ describe("IndexedDbInsightEventStore", () => {
 
   it("clears the log for a reset", async () => {
     const factory = new IDBFactory();
+
     const store = new IndexedDbInsightEventStore({
       databaseName: "insights-d",
       indexedDB: factory,
@@ -309,6 +317,7 @@ function writeRawCaptureRecord(
         request.result.createObjectStore("events", { keyPath: "event_id" });
       }
     };
+
     request.onsuccess = () => {
       const database = request.result;
       const transaction = database.transaction("events", "readwrite");
@@ -318,9 +327,11 @@ function writeRawCaptureRecord(
         database.close();
         resolve();
       };
+
       transaction.onerror = () => reject(transaction.error ?? new Error("raw write failed"));
       transaction.onabort = () => reject(transaction.error ?? new Error("raw write aborted"));
     };
+
     request.onerror = () => reject(request.error ?? new Error("raw open failed"));
   });
 }

@@ -87,6 +87,12 @@ function lexicalTokens(text: string): readonly string[] {
   return tokens;
 }
 
+/** Word-level multiset difference between two texts, under the declared tokenizer. */
+export interface WordMultisetDelta {
+  readonly additions: number;
+  readonly removals: number;
+}
+
 /**
  * Word-level multiset difference between two texts. `additions` are words
  * present in the revised text but not the original (multiset semantics — two
@@ -96,7 +102,7 @@ function lexicalTokens(text: string): readonly string[] {
 export function wordMultisetDifference(
   originalText: string,
   revisedText: string,
-): { readonly additions: number; readonly removals: number } {
+): WordMultisetDelta {
   const counts = new Map<string, number>();
 
   for (const token of lexicalTokens(originalText)) {
@@ -125,6 +131,12 @@ export function wordMultisetDifference(
   return { additions, removals };
 }
 
+/** One authored revision's declared change counts and generated-word attribution. */
+export interface TransformationDiff {
+  readonly change_counts: ChangeCounts;
+  readonly generated_words: number;
+}
+
 /**
  * Change counts for one authored revision, from the word-level diff. The
  * mapping is declared, not observed fact: paired word swaps (min of
@@ -133,10 +145,7 @@ export function wordMultisetDifference(
  * transformation exists in this app yet. Changes are never labeled corrected
  * errors — without a reference transcript, accuracy is unknown.
  */
-export function transformationChanges(
-  rawText: string,
-  revisedText: string,
-): { readonly change_counts: ChangeCounts; readonly generated_words: number } {
+export function transformationChanges(rawText: string, revisedText: string): TransformationDiff {
   const { additions, removals } = wordMultisetDifference(rawText, revisedText);
   const replacements = Math.min(additions, removals);
 
@@ -287,7 +296,9 @@ export class InsightRecorder {
     const seq = this.nextSequence(input.captureId, "recognition_selected", (event) =>
       isRecognitionSelected(event) ? event.selection_seq : undefined,
     );
+
     const { lexical, raw } = segmentWordCounts(input.transcriptText);
+
     const event: RecognitionSelectedEvent = {
       schema_version: 1,
       event_id: `rs-${input.captureId}-${seq}`,
@@ -315,7 +326,9 @@ export class InsightRecorder {
     const passCount = this.snapshot().filter(
       (event) => isTransformationCompleted(event) && event.capture_id === input.captureId,
     ).length;
+
     const { change_counts } = transformationChanges(input.rawText, input.revisedText);
+
     const event: TransformationCompletedEvent = {
       schema_version: 1,
       event_id: `tc-${input.captureId}-${passCount + 1}`,
@@ -340,11 +353,14 @@ export class InsightRecorder {
    */
   async deliveryRecorded(input: DeliveryRecordedInput): Promise<void> {
     const outputWords = segmentWordCounts(input.outputText).lexical;
+
     const generatedWords =
       input.revisedText !== undefined && input.baselineText !== undefined
         ? wordMultisetDifference(input.baselineText, input.revisedText).additions
         : 0;
+
     const id = this.uuid();
+
     const event: DeliveryRecordedEvent = {
       schema_version: 1,
       event_id: `dl-${id}`,

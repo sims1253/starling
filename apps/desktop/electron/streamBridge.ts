@@ -1,5 +1,6 @@
 import {
   StarlingStream,
+  type StarlingSocketEvent,
   type StarlingStreamSocket,
   type StarlingStreamSocketFactory,
 } from "@starling/dictation";
@@ -24,9 +25,19 @@ export interface NodeWebSocket {
   removeEventListener(type: string, listener: EventListener): void;
 }
 
+/**
+ * The listener shapes `StarlingStream` registers: open/error listeners take no
+ * argument; message/close listeners take the stream event's structural shape.
+ */
+type StreamSocketListener = (() => void) | ((event: StarlingSocketEvent) => void);
+
 /** Adapt a Node WebSocket to the socket shape `StarlingStream` consumes. */
 export function adaptNodeSocket(socket: NodeWebSocket): StarlingStreamSocket {
-  const forward = (listener: unknown): EventListener => listener as EventListener;
+  const forward = (listener: StreamSocketListener): EventListener =>
+    // SAFETY: undici dispatches MessageEvent/CloseEvent instances whose
+    // data/code/reason fields are exactly the StarlingSocketEvent shape, and
+    // open/error listeners ignore the argument entirely.
+    listener as EventListener;
 
   return {
     get readyState() {
@@ -139,7 +150,10 @@ export class StreamBridge {
 
   /** Close every open stream, for teardown of the whole bridge. */
   closeAll(): void {
-    for (const streamId of [...this.streams.keys()]) this.dispose(streamId);
+    // Snapshot: dispose removes the current entry while the loop runs, and a
+    // snapshot keeps every stream present at teardown reachable even if a
+    // close ever cascades into disposing another stream.
+    for (const streamId of Array.from(this.streams.keys())) this.dispose(streamId);
   }
 
   private live(streamId: number): StarlingStream {

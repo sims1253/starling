@@ -32,7 +32,10 @@ import {
   type RefinementKeySaveInput,
   type RefinementKeySaveResult,
   type RefinementKeyLoadResult,
+  type StreamCloseInput,
+  type StreamCommandInput,
   type StreamOpenInput,
+  type StreamSendInput,
   type TranscribeInput,
   type TranscriptionResult,
   type ServerHealth,
@@ -573,7 +576,7 @@ ipcMain.handle("starling:stream:open", (event, input: StreamOpenInput) =>
   ),
 );
 
-ipcMain.handle("starling:stream:send", (event, input: unknown) =>
+ipcMain.handle("starling:stream:send", (event, input: StreamSendInput) =>
   runForSender(
     event,
     Schema.decodeUnknownEffect(StreamSendInputSchema)(input).pipe(
@@ -587,7 +590,7 @@ ipcMain.handle("starling:stream:send", (event, input: unknown) =>
   ),
 );
 
-ipcMain.handle("starling:stream:command", (event, input: unknown) =>
+ipcMain.handle("starling:stream:command", (event, input: StreamCommandInput) =>
   runForSender(
     event,
     Schema.decodeUnknownEffect(StreamCommandInputSchema)(input).pipe(
@@ -603,7 +606,7 @@ ipcMain.handle("starling:stream:command", (event, input: unknown) =>
 
 // Fire-and-forget teardown from the renderer's close(): no reply is needed,
 // and a dropped packet only strands a socket the destroyed cleanup reaps.
-ipcMain.on("starling:stream:close", (event, input: unknown) => {
+ipcMain.on("starling:stream:close", (event, input: StreamCloseInput) => {
   if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
 
   const decoded = Schema.decodeUnknownOption(StreamCloseInputSchema)(input);

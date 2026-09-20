@@ -147,8 +147,11 @@ export const StreamCloseInputSchema = Schema.Struct({
 });
 
 export type StreamOpenInput = typeof StreamOpenInputSchema.Type;
+
 export type StreamSendInput = typeof StreamSendInputSchema.Type;
+
 export type StreamCommandInput = typeof StreamCommandInputSchema.Type;
+
 export type StreamCloseInput = typeof StreamCloseInputSchema.Type;
 
 /** The awaited reply of `commit`; reset and ping resolve it without one. */

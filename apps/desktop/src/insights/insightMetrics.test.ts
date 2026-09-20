@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { Schema } from "effect";
 
 import basicSession from "../../../../packages/contracts/insight-events/fixtures/basic-session.json";
 import deletionPropagation from "../../../../packages/contracts/insight-events/fixtures/deletion-propagation.json";
@@ -6,7 +7,11 @@ import generatedOutput from "../../../../packages/contracts/insight-events/fixtu
 import negativeProxy from "../../../../packages/contracts/insight-events/fixtures/negative-proxy.json";
 import syncReplay from "../../../../packages/contracts/insight-events/fixtures/sync-replay.json";
 import timezoneShift from "../../../../packages/contracts/insight-events/fixtures/timezone-shift.json";
-import type { InsightEvent, RecognitionSelectedEvent } from "./insightEvents";
+import {
+  InsightEventSchema,
+  type InsightEvent,
+  type RecognitionSelectedEvent,
+} from "./insightEvents";
 import { activityByDay, aggregate, localWallTime } from "./insightMetrics";
 
 /**
@@ -16,11 +21,10 @@ import { activityByDay, aggregate, localWallTime } from "./insightMetrics";
  * TypeScript port.
  */
 
-function events(value: unknown): readonly InsightEvent[] {
-  // SAFETY: fixture JSON from the frozen contract; the aggregate below
-  // re-validates every numeric field it reads.
-  return value as readonly InsightEvent[];
-}
+/** Parse a fixture at the boundary: the frozen schema, excess properties rejected. */
+const events = Schema.decodeUnknownSync(Schema.Array(InsightEventSchema), {
+  onExcessProperty: "error",
+});
 
 const BASIC = events(basicSession);
 
@@ -91,6 +95,7 @@ describe("aggregate: frozen metric semantics", () => {
       },
       ...BASIC,
     ];
+
     const result = aggregate(tombstoneFirst);
 
     expect(result.unique_takes).toBe(1);
@@ -189,6 +194,7 @@ describe("aggregate: frozen metric semantics", () => {
     const mixed = BASIC.map((event) =>
       event.event_id === "a3" ? { ...event, tokenizer: "uax29-de-v1" } : event,
     );
+
     const result = aggregate(mixed);
 
     expect(result.recognized_words_per_captured_minute).toBeNull();
@@ -263,6 +269,7 @@ describe("aggregate: frozen metric semantics", () => {
       tokenizer: "uax29-en-v1",
       post_stop_ready_ms: 10,
     };
+
     const result = aggregate([orphan]);
 
     expect(result.unique_takes).toBe(0);

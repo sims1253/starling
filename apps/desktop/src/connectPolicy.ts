@@ -32,13 +32,26 @@ export const STATIC_CONNECT_SRC =
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
 /** Default ports per URL scheme, used to compare ports that were omitted. */
-const DEFAULT_PORTS: Readonly<Record<string, string>> = {
+const DEFAULT_PORTS = {
   ftp: "21",
   http: "80",
   https: "443",
   ws: "80",
   wss: "443",
-};
+} as const;
+
+type SchemeWithDefaultPort = keyof typeof DEFAULT_PORTS;
+
+const SCHEMES_WITH_DEFAULT_PORT = new Set<string>(Object.keys(DEFAULT_PORTS));
+
+function isSchemeWithDefaultPort(scheme: string): scheme is SchemeWithDefaultPort {
+  return SCHEMES_WITH_DEFAULT_PORT.has(scheme);
+}
+
+/** The default port for one scheme, or "" when the scheme has none to assume. */
+function defaultPortFor(scheme: string): string {
+  return isSchemeWithDefaultPort(scheme) ? DEFAULT_PORTS[scheme] : "";
+}
 
 /** The shipped policy as a token list, the form the matcher consumes. */
 export function staticConnectSrcTokens(): string[] {
@@ -102,7 +115,7 @@ function unwrapIpv6(host: string): string {
 function effectivePort(url: URL): string {
   if (url.port) return url.port;
 
-  return DEFAULT_PORTS[url.protocol.slice(0, -1)] ?? "";
+  return defaultPortFor(url.protocol.slice(0, -1));
 }
 
 /**
@@ -136,7 +149,7 @@ function selfAllows(pageOrigin: string, url: URL): boolean {
 
 const schemeSourcePattern = /^([a-z][a-z0-9+.-]*):$/i;
 
-const hostSourcePattern = /^([a-z][a-z0-9+.-]*):\/\/(\[[^\]]+\]|[^\[\/:]+)(?::(\*|\d+))?$/i;
+const hostSourcePattern = /^([a-z][a-z0-9+.-]*):\/\/(\[[^\]]+\]|[^[/:]+)(?::(\*|\d+))?$/i;
 
 /**
  * Evaluate a `connect-src` token list against one URL the way the browser
@@ -184,7 +197,7 @@ export function connectSrcAllows(
     if (host !== targetHost) continue;
 
     if (tokenPort === undefined) {
-      if (effectivePort(target) === (DEFAULT_PORTS[tokenScheme.toLowerCase()] ?? "")) return true;
+      if (effectivePort(target) === defaultPortFor(tokenScheme.toLowerCase())) return true;
 
       continue;
     }
