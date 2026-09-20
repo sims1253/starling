@@ -322,8 +322,28 @@ fn render_import_button(cx: &mut Context<StarlingApp>) -> impl IntoElement {
 
 fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<impl IntoElement> {
     if app.error.is_none() && app.unsaved.is_empty() {
-        let message = app.capture_warning.clone()?;
-        return Some(quality_banner(message, cx));
+        // Two independent ephemeral notices share this slot; the capture
+        // warning outranks a one-off export rename (banner_notice in
+        // `app.rs` is the tested form of that priority).
+        if let Some(message) = app.capture_warning.clone() {
+            return Some(quality_banner(
+                "Recording clipped",
+                message,
+                "The take was still saved and sent; heavily clipped audio transcribes poorly.",
+                |app: &mut StarlingApp| app.capture_warning = None,
+                cx,
+            ));
+        }
+        if let Some(message) = app.export_notice.clone() {
+            return Some(quality_banner(
+                "Export renamed",
+                message,
+                "Nothing was overwritten; both files are in your downloads directory.",
+                |app: &mut StarlingApp| app.export_notice = None,
+                cx,
+            ));
+        }
+        return None;
     }
     let error = app.error.clone();
     let unsaved_count = app.unsaved.len();
@@ -430,9 +450,17 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
     Some(banner)
 }
 
-/// A non-fatal notice (shown instead of the error banner when nothing failed):
-/// e.g. a take that was saved and sent but arrived heavily clipped.
-fn quality_banner(message: String, cx: &mut Context<StarlingApp>) -> Stateful<Div> {
+/// A non-fatal notice (shown instead of the error banner when nothing
+/// failed): e.g. a take that was saved and sent but arrived heavily
+/// clipped, or an export that had to land on a `-N` name. `clear` dismisses
+/// whichever app field the notice came from.
+fn quality_banner(
+    title: &'static str,
+    message: String,
+    footer: &'static str,
+    clear: fn(&mut StarlingApp),
+    cx: &mut Context<StarlingApp>,
+) -> Stateful<Div> {
     div()
         .id("quality-banner")
         .absolute()
@@ -457,22 +485,16 @@ fn quality_banner(message: String, cx: &mut Context<StarlingApp>) -> Stateful<Di
                 .flex_col()
                 .gap(px(3.))
                 .flex_1()
-                .child(
-                    div()
-                        .text_color(theme::ERROR_TITLE)
-                        .child("Recording clipped"),
-                )
+                .child(div().text_color(theme::ERROR_TITLE).child(title))
                 .child(message)
-                .child(div().text_color(theme::ERROR_SUBTLE).child(
-                    "The take was still saved and sent; heavily clipped audio transcribes poorly.",
-                )),
+                .child(div().text_color(theme::ERROR_SUBTLE).child(footer)),
         )
         .child(
             div()
                 .id("dismiss-quality")
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.capture_warning = None;
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    clear(this);
                     cx.notify();
                 }))
                 .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),

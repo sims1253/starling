@@ -67,6 +67,12 @@ pub struct StarlingApp {
     pub active_ids: HashSet<String>,
     pub error: Option<String>,
     pub capture_warning: Option<String>,
+    /// Ephemeral one-off export notice (G05: a renamed export is surfaced,
+    /// never silently written next to the file it dodged). Owns its own
+    /// slot so a later capture warning cannot overwrite it mid-read, and
+    /// vice versa; auto-clears on the same timer pattern as the other
+    /// transient flags.
+    pub export_notice: Option<String>,
     pub unsaved: Vec<UnsavedWav>,
     pub confirm_discard: bool,
     pub copied: bool,
@@ -164,6 +170,18 @@ pub(crate) fn user_set_model_after_save(
     previous || model_before != model_saved
 }
 
+/// Which ephemeral notice the quality banner shows (G05): the capture
+/// warning outranks the export notice — a take's clipping evidence stays
+/// relevant for the session it describes, while a rename notice is a
+/// one-off that clears itself. The two live in separate fields precisely
+/// so neither can overwrite the other's content.
+pub(crate) fn banner_notice<'a>(
+    capture_warning: Option<&'a str>,
+    export_notice: Option<&'a str>,
+) -> Option<&'a str> {
+    capture_warning.or(export_notice)
+}
+
 /// Highest `-N` suffix attempted when dodging an existing download name.
 const MAX_DOWNLOAD_NAME_ATTEMPTS: u32 = 1_000;
 
@@ -192,7 +210,17 @@ fn download_name_candidate(name: &str, attempt: u32) -> String {
 /// permission error never leaves a truncated export behind. Exclusive
 /// creation is what makes this collision-safe: there is deliberately no
 /// overwrite path to race with.
-fn write_download_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+///
+/// `sync` fsyncs the landed file. It is kept for WAV exports — an unsaved
+/// take's export can be the only copy of the recording, and WAV durability
+/// is not weakened here — while transcript `.txt` exports skip it: a text
+/// file lost to a crash is byte-for-byte re-exportable from history.
+fn write_download_exclusive(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    sync: bool,
+) -> std::io::Result<PathBuf> {
     for attempt in 1..=MAX_DOWNLOAD_NAME_ATTEMPTS {
         let candidate = download_name_candidate(name, attempt);
         let path = dir.join(&candidate);
@@ -203,7 +231,14 @@ fn write_download_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Re
             .open(&path)
         {
             Ok(mut file) => {
-                if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                let written = file.write_all(bytes).and_then(|()| {
+                    if sync {
+                        file.sync_all()
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(err) = written {
                     // Never leave a truncated export behind on disk.
                     let _ = std::fs::remove_file(&path);
                     return Err(err);
@@ -243,6 +278,7 @@ impl StarlingApp {
         Self {
             error: store_error.clone(),
             capture_warning: None,
+            export_notice: None,
             store,
             store_error,
             player,
@@ -521,7 +557,8 @@ impl StarlingApp {
             "starling-{}.txt",
             session.created_at.replace([':', '.'], "-")
         );
-        self.write_download(name, Arc::new(transcript.text.into_bytes()), false, cx);
+        // Re-exportable from history, so no fsync (see write_download_exclusive).
+        self.write_download(name, Arc::new(transcript.text.into_bytes()), false, false, cx);
     }
 
     pub fn export_audio(&mut self, cx: &mut Context<Self>) {
@@ -533,7 +570,7 @@ impl StarlingApp {
             session.created_at.replace([':', '.'], "-")
         );
         let wav = session.wav.clone();
-        self.write_download(name, wav, true, cx);
+        self.write_download(name, wav, true, true, cx);
     }
 
     pub fn export_unsaved_audio(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -546,7 +583,8 @@ impl StarlingApp {
             &capture.id[capture.id.len().saturating_sub(8)..]
         );
         let wav = capture.wav.clone();
-        self.write_download(name, wav, false, cx);
+        // The only copy of the recording: fsync it.
+        self.write_download(name, wav, false, true, cx);
     }
 
     pub fn discard_unsaved(&mut self, cx: &mut Context<Self>) {
@@ -565,6 +603,7 @@ impl StarlingApp {
         name: String,
         bytes: Arc<Vec<u8>>,
         mark_saved: bool,
+        sync: bool,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
@@ -572,7 +611,7 @@ impl StarlingApp {
             let result = cx
                 .background_spawn(async move {
                     let dir = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
-                    write_download_exclusive(&dir, &requested, bytes.as_slice())
+                    write_download_exclusive(&dir, &requested, bytes.as_slice(), sync)
                         .map(|path| (dir, path))
                 })
                 .await;
@@ -580,16 +619,19 @@ impl StarlingApp {
                 Ok((dir, path)) => {
                     // G05: an export that had to change names is surfaced,
                     // never silently written next to the file it dodged.
+                    // Its own notice slot, so a capture warning (or another
+                    // export notice) can no longer overwrite it mid-read.
                     if path.file_name().and_then(|file| file.to_str()) != Some(name.as_str()) {
                         let landed = path
                             .file_name()
                             .and_then(|file| file.to_str())
                             .unwrap_or_default();
-                        app.capture_warning = Some(format!(
+                        app.export_notice = Some(format!(
                             "Exported as {landed} — {name} already existed in {} and was left \
                              untouched.",
                             dir.display()
                         ));
+                        app.schedule_export_notice_reset(cx);
                     }
                     if mark_saved {
                         app.wav_saved = true;
@@ -601,6 +643,22 @@ impl StarlingApp {
                     app.error = Some(format!("Could not save the file: {err}"));
                     cx.notify();
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Clears the export notice after a read-through window, on the same
+    /// ephemeral-flag pattern as `copied`/`wav_saved`. Longer than those
+    /// flips because the notice names two files the user may need to tell
+    /// apart.
+    fn schedule_export_notice_reset(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(6_000)).await;
+            this.update(cx, |app, cx| {
+                app.export_notice = None;
+                cx.notify();
             })
             .ok();
         })
@@ -901,6 +959,26 @@ mod tests {
     }
 
     #[test]
+    fn the_quality_banner_prefers_the_capture_warning_over_an_export_notice() {
+        // G05: the two notices live in separate fields, so neither can
+        // overwrite the other — but the banner shows at most one, and a
+        // take's clipping evidence outranks a one-off rename notice.
+        assert_eq!(
+            banner_notice(Some("heavily clipped"), Some("exported as -2")),
+            Some("heavily clipped")
+        );
+        assert_eq!(
+            banner_notice(None, Some("exported as -2")),
+            Some("exported as -2")
+        );
+        assert_eq!(
+            banner_notice(Some("heavily clipped"), None),
+            Some("heavily clipped")
+        );
+        assert_eq!(banner_notice(None, None), None);
+    }
+
+    #[test]
     fn exclusive_write_errors_without_overwriting_when_all_names_are_taken() {
         let dir = scratch_dir("exhausted");
         // Seed every candidate the policy would try: the name plus -2..-1000.
@@ -910,7 +988,7 @@ mod tests {
                 .expect("seed candidate");
         }
 
-        let result = write_download_exclusive(&dir, "starling-t.txt", b"NEW");
+        let result = write_download_exclusive(&dir, "starling-t.txt", b"NEW", false);
         assert!(result.is_err(), "exhausted candidates error out");
 
         // The very first file is still the original seed, byte for byte.
@@ -924,7 +1002,7 @@ mod tests {
     #[test]
     fn exclusive_write_lands_on_a_free_name() {
         let dir = scratch_dir("free");
-        let path = write_download_exclusive(&dir, "starling-t.wav", b"NEW")
+        let path = write_download_exclusive(&dir, "starling-t.wav", b"NEW", true)
             .expect("write succeeds");
         assert_eq!(path, dir.join("starling-t.wav"));
         assert_eq!(std::fs::read(&path).expect("read back"), b"NEW");
@@ -937,7 +1015,7 @@ mod tests {
         std::fs::write(dir.join("starling-t.txt"), b"OLD TRANSCRIPT")
             .expect("seed the existing export");
 
-        let path = write_download_exclusive(&dir, "starling-t.txt", b"NEW TRANSCRIPT")
+        let path = write_download_exclusive(&dir, "starling-t.txt", b"NEW TRANSCRIPT", false)
             .expect("dodges instead of failing");
 
         // The user's existing file is byte-for-byte untouched.
@@ -959,7 +1037,7 @@ mod tests {
         std::fs::write(dir.join("starling-t.txt"), b"1").expect("seed");
         std::fs::write(dir.join("starling-t-2.txt"), b"2").expect("seed");
 
-        let path = write_download_exclusive(&dir, "starling-t.txt", b"3").expect("third name");
+        let path = write_download_exclusive(&dir, "starling-t.txt", b"3", true).expect("third name");
         assert_eq!(path, dir.join("starling-t-3.txt"));
         assert_eq!(std::fs::read(dir.join("starling-t.txt")).expect("original"), b"1");
         assert_eq!(std::fs::read(dir.join("starling-t-2.txt")).expect("second"), b"2");
@@ -971,7 +1049,7 @@ mod tests {
         let missing = std::env::temp_dir().join("starling-g05-no-such-dir");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(
-            write_download_exclusive(&missing, "starling-t.txt", b"x").is_err(),
+            write_download_exclusive(&missing, "starling-t.txt", b"x", false).is_err(),
             "a missing directory must surface an error, not create files elsewhere"
         );
     }
@@ -985,7 +1063,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join("starling-t.txt")).expect("plant symlink");
 
         let path =
-            write_download_exclusive(&dir, "starling-t.txt", b"EXPORT").expect("dodges symlink");
+            write_download_exclusive(&dir, "starling-t.txt", b"EXPORT", true).expect("dodges symlink");
 
         // The symlink and its target are untouched; the export landed beside it.
         assert_eq!(std::fs::read(&target).expect("target content"), b"PRECIOUS");
