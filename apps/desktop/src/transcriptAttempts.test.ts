@@ -97,9 +97,7 @@ describe("sessionTitle", () => {
   });
 
   it("keeps the legacy fallbacks for takes without a transcript", () => {
-    expect(sessionTitle(take({ status: "failed", text: null }))).toBe(
-      "Saved. Retry available",
-    );
+    expect(sessionTitle(take({ status: "failed", text: null }))).toBe("Saved. Retry available");
   });
 });
 
@@ -107,7 +105,13 @@ describe("attemptProvenanceLabel", () => {
   it("joins model, protocol, and time provenance", () => {
     expect(
       attemptProvenanceLabel(
-        { text: "a", segments: [], model: "parakeet", protocol: "starling", savedAt: "2026-09-20T10:00:00.000Z" },
+        {
+          text: "a",
+          segments: [],
+          model: "parakeet",
+          protocol: "starling",
+          savedAt: "2026-09-20T10:00:00.000Z",
+        },
         when,
       ),
     ).toBe("parakeet · starling · @2026-09-20T10:00:00.000Z");
@@ -126,8 +130,20 @@ describe("transcriptExportText", () => {
   it("appends every earlier attempt under its own provenance separator, oldest first (B04)", () => {
     const session = take({
       history: [
-        { text: "first pass", segments: [], model: "parakeet", protocol: "starling", savedAt: "2026-09-20T10:00:00.000Z" },
-        { text: "", segments: [], model: "other", protocol: "openai", savedAt: "2026-09-20T11:00:00.000Z" },
+        {
+          text: "first pass",
+          segments: [],
+          model: "parakeet",
+          protocol: "starling",
+          savedAt: "2026-09-20T10:00:00.000Z",
+        },
+        {
+          text: "",
+          segments: [],
+          model: "other",
+          protocol: "openai",
+          savedAt: "2026-09-20T11:00:00.000Z",
+        },
       ],
     });
 
@@ -160,8 +176,11 @@ describe("transcriptExportText", () => {
   });
 
   it("stamps a refined copy as model, when", () => {
-    expect(refinedTranscriptStamp({ text: "x", model: "llama3.1", createdAt: 5 }, "2026-01-01T00:00:00.000Z")).toBe(
-      "llama3.1, 2026-01-01T00:00:00.000Z",
-    );
+    expect(
+      refinedTranscriptStamp(
+        { text: "x", model: "llama3.1", createdAt: 5 },
+        "2026-01-01T00:00:00.000Z",
+      ),
+    ).toBe("llama3.1, 2026-01-01T00:00:00.000Z");
   });
 });

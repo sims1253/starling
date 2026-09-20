@@ -470,7 +470,11 @@ describe("StreamingDictation", () => {
     await drained();
 
     const durable: string[] = [];
-    const finishing = controller.finish(500, () => false, (session) => durable.push(session.id));
+    const finishing = controller.finish(
+      500,
+      () => false,
+      (session) => durable.push(session.id),
+    );
 
     await drained();
 
@@ -508,7 +512,11 @@ describe("StreamingDictation", () => {
 
     const durable: string[] = [];
 
-    const result = await controller.finish(500, () => true, (session) => durable.push(session.id));
+    const result = await controller.finish(
+      500,
+      () => true,
+      (session) => durable.push(session.id),
+    );
 
     expect(durable).toEqual([]);
     expect(result.session).toBeUndefined();

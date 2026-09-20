@@ -1,12 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import type { DictationSession } from "@starling/dictation";
-import {
-  activeThreadId,
-  newThreadId,
-  threadContextBase,
-  threadTurns,
-} from "./threads";
+import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./threads";
 
 interface Fixture {
   readonly id: string;
@@ -480,9 +475,7 @@ describe("threadContextBase", () => {
     const next = take({ id: "c", createdAt: "2025-09-01T11:00:00.000Z" });
 
     expect(threadContextBase([head, appended, next], "t1", "c")?.id).toBe("a");
-    expect(threadContextBase([head, appended, next], "t1", "c")?.refined?.text).toBe(
-      "A, refined.",
-    );
+    expect(threadContextBase([head, appended, next], "t1", "c")?.refined?.text).toBe("A, refined.");
 
     // Deletion of the appended member falls back to the previous refined
     // member instead of inventing a base.
