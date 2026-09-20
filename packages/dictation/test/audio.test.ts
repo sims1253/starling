@@ -59,20 +59,53 @@ describe("PCM16 rounding contract (shared fixture)", () => {
       "../../../apps/desktop-gpui/test-fixtures/pcm-rounding.json",
       import.meta.url,
     );
-    const fixture = JSON.parse(readFileSync(fixtureUrl, "utf8")) as {
-      cases: Array<{ input: number | string; expected: number }>;
-    };
 
-    assert.ok(fixture.cases.length >= 15, "fixture must keep its coverage");
+    const fixture = parsePcmRoundingFixture(readFileSync(fixtureUrl, "utf8"));
 
-    const samples = Float32Array.from(
-      fixture.cases.map(({ input }) => (typeof input === "string" ? Number(input) : input)),
-    );
+    assert.ok(fixture.length >= 15, "fixture must keep its coverage");
+
+    const samples = Float32Array.from(fixture.map((row) => row.input));
+
     const bytes = encodeWav16k({ samples, sampleRate: 16_000 });
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
-    fixture.cases.forEach(({ input, expected }, index) => {
+    fixture.forEach(({ input, expected }, index) => {
       assert.equal(view.getInt16(44 + index * 2, true), expected, `case ${index}: ${input}`);
     });
   });
 });
+
+// Parse the fixture at its I/O boundary: accept numeric inputs as-is and
+// numeric strings (the JSON encoding of NaN / Infinity), reject anything
+// else loudly instead of narrowing by representation at the use site.
+function parsePcmRoundingFixture(raw: string): Array<{ input: number; expected: number }> {
+  const parsed: unknown = JSON.parse(raw);
+
+  if (typeof parsed !== "object" || parsed === null || !("cases" in parsed)) {
+    throw new Error("pcm-rounding fixture: expected an object with a cases array");
+  }
+
+  const { cases } = parsed;
+
+  if (!Array.isArray(cases)) {
+    throw new Error("pcm-rounding fixture: cases must be an array");
+  }
+
+  return cases.map((entry) => {
+    if (typeof entry !== "object" || entry === null || !("input" in entry) || !("expected" in entry)) {
+      throw new Error("pcm-rounding fixture: each case needs input and expected");
+    }
+
+    const { input, expected } = entry;
+
+    if (typeof input !== "number" && typeof input !== "string") {
+      throw new Error("pcm-rounding fixture: input must be a number or numeric string");
+    }
+
+    if (typeof expected !== "number") {
+      throw new Error("pcm-rounding fixture: expected must be a number");
+    }
+
+    return { input: Number(input), expected };
+  });
+}

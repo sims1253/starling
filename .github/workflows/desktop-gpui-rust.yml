@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Install ALSA headers for cpal
+        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
       - name: Install stable toolchain
         if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         run: |
