@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
+import { stoppedTakeVerdict } from "./recorderSession";
 import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings } from "./refine";
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
@@ -1108,15 +1109,19 @@ export default function App() {
       try {
         const capture = await stop();
 
-        // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
-        if (!capture || capture.audio.samples.length === 0) {
+        // Any capture with samples is a real take, however short (B02): a
+        // one-letter answer stays reviewable and retryable, and only an
+        // empty capture — no samples at all — is an accidental activation.
+        const verdict = stoppedTakeVerdict(
+          capture && {
+            sampleCount: capture.audio.samples.length,
+            durationMs: capture.durationMs,
+          },
+        );
+
+        if (!capture || !verdict.keep) {
           await discardStreamingTake();
           throw new Error("No microphone audio was captured.");
-        }
-
-        if (capture.durationMs < 250) {
-          await discardStreamingTake();
-          throw new Error("Recording was too short to keep.");
         }
 
         if (stream && (await finishStreamingTake(stream, capture.durationMs, generation))) {

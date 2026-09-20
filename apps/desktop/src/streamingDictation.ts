@@ -193,7 +193,7 @@ export class StreamingDictation {
     });
   }
 
-  /** Drop the journal without transcribing (take too short, user discard). */
+  /** Drop the journal without transcribing (user discard, unusable stream). */
   async abandon(): Promise<void> {
     await this.pipeline.catch(() => {});
     this.close();
