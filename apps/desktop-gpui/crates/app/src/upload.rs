@@ -11,7 +11,44 @@ use starling_dictation::{
     storage::{self, FileSessionStore},
 };
 
-use crate::app::{Connection, StarlingApp, UnsavedWav, client_protocol};
+use crate::app::{StarlingApp, UnsavedWav, client_protocol};
+
+/// What a finished transcription job may apply to global app state (R03).
+///
+/// There is deliberately no connection variant: a job outcome conflates
+/// transport failures with local storage failures (`mark_attempt`,
+/// `save_transcript`, `save_failure` — think a full disk), so it cannot
+/// decide `Connection::Offline` or `Connection::Ready`. `check_health` is
+/// the single writer of connection state; a failed job surfaces as the
+/// per-session error instead.
+pub(crate) enum FinishedJob {
+    /// Transcript saved: no global-state effects.
+    Saved,
+    /// The job failed: surface `message` as the app error.
+    Failed { message: String },
+}
+
+/// Classify a finished transcription job (R03).
+///
+/// `job_failure` is the error that failed the job, if any;
+/// `history_update_failure` is the error from the follow-up attempt to
+/// record that failure in local history, if that write also failed.
+pub(crate) fn finished_job(
+    job_failure: Option<&str>,
+    history_update_failure: Option<&str>,
+) -> FinishedJob {
+    match job_failure {
+        None => FinishedJob::Saved,
+        Some(failure) => FinishedJob::Failed {
+            message: match history_update_failure {
+                Some(storage_err) => {
+                    format!("{failure} Local history update also failed: {storage_err}")
+                }
+                None => failure.to_string(),
+            },
+        },
+    }
+}
 
 impl StarlingApp {
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
@@ -194,34 +231,44 @@ impl StarlingApp {
                 }
             }
 
-            if let Outcome::Failure(message) = outcome {
-                let store = store_for_job.clone();
-                let id_for_failure = id.clone();
-                let failure_message = message.clone();
-                let stored = cx
-                    .background_spawn(async move {
+            let job_failure = match outcome {
+                Outcome::Success => None,
+                Outcome::Failure(message) => Some(message),
+            };
+
+            // Record a failure in local history; keep that write's own
+            // error, if any, to append to the surfaced message.
+            let history_failure = match job_failure.as_ref() {
+                Some(failure) => {
+                    let store = store_for_job.clone();
+                    let id_for_failure = id.clone();
+                    let failure_message = failure.clone();
+                    cx.background_spawn(async move {
                         if store.get(&id_for_failure)?.is_some() {
                             store.save_failure(&id_for_failure, failure_message)?;
                         }
                         Ok::<(), storage::StorageError>(())
                     })
-                    .await;
-                let mut full = message;
-                if let Err(storage_err) = stored {
-                    full = format!("{full} Local history update also failed: {storage_err}");
+                    .await
+                    .err()
+                    .map(|err| err.to_string())
                 }
-                this.update(cx, |app, cx| {
-                    app.connection = Connection::Offline;
-                    app.error = Some(full);
-                    cx.notify();
-                })
-                .ok();
-            } else {
-                this.update(cx, |app, cx| {
-                    app.connection = Connection::Ready;
-                    cx.notify();
-                })
-                .ok();
+                None => None,
+            };
+
+            match finished_job(job_failure.as_deref(), history_failure.as_deref()) {
+                FinishedJob::Failed { message } => {
+                    this.update(cx, |app, cx| {
+                        app.error = Some(message);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                // R03: a finished job applies no connection state. A success
+                // says nothing about readiness or busyness, and a failure may
+                // be a local storage error rather than a dead server; only
+                // health probes (`check_health`) write connection state.
+                FinishedJob::Saved => {}
             }
 
             this.update(cx, |app, cx| {
@@ -308,5 +355,49 @@ pub(crate) async fn refresh_sessions(
             })
             .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_local_storage_failure_surfaces_as_an_error_not_a_connection_change() {
+        // R03: a full disk in `save_transcript` fails the job with a local
+        // storage error. The job's only global effect is the error banner —
+        // `FinishedJob` carries no connection state at all, so the app can
+        // no longer flip to `Connection::Offline` (or `Ready`) from a job
+        // outcome; only a health probe may.
+        let job = finished_job(
+            Some("Local storage failed: No space left on device (os error 28)"),
+            None,
+        );
+        match job {
+            FinishedJob::Failed { message } => assert_eq!(
+                message,
+                "Local storage failed: No space left on device (os error 28)"
+            ),
+            FinishedJob::Saved => panic!("a failed job must surface its error"),
+        }
+    }
+
+    #[test]
+    fn a_failed_history_update_is_appended_to_the_surfaced_error() {
+        let job = finished_job(Some("request failed"), Some("history is read-only"));
+        match job {
+            FinishedJob::Failed { message } => assert_eq!(
+                message,
+                "request failed Local history update also failed: history is read-only"
+            ),
+            FinishedJob::Saved => panic!("a failed job must surface its error"),
+        }
+    }
+
+    #[test]
+    fn a_successful_job_has_no_global_state_effects() {
+        // Success says nothing about server readiness or busyness, so it
+        // cannot set `Connection::Ready` from its outcome either.
+        assert!(matches!(finished_job(None, None), FinishedJob::Saved));
     }
 }
