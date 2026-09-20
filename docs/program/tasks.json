@@ -48,9 +48,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-11",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -62,9 +62,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-11",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -604,11 +604,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-10",
+   "branch": "gpui/fixes-wave-a4",
    "evidence": [],
-   "notes": "blocked-by-design only; solution specified in design note \u00a73 (I1); structural RT-ring + writer-journal + quiesce handshake"
+   "notes": "I1 phase 1: RT SPSC ring + atomics + bounded handoff + quiesce stop per design \u00a73; journal/fsync = phase 2"
   },
   {
    "id": "G02",
@@ -800,13 +800,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "implemented",
+   "status": "integrated",
    "owner": null,
    "branch": "program/s01-moss-kv-clear",
    "evidence": [
-    "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending"
+    "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending",
+    "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196"
    ],
-   "notes": "await agent handoff + coordinator verification of build/test evidence"
+   "notes": "CPU-verified; CUDA/Vulkan source-read only; no GPU timing or real-model A/B (validation gaps)"
   },
   {
    "id": "S02",
@@ -830,11 +831,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-12",
+   "branch": "program/s03-eos-contract",
    "evidence": [],
-   "notes": ""
+   "notes": "engine worktree starling-s01, branched from master; sole heavy-build slot"
   },
   {
    "id": "S04",
@@ -1109,13 +1110,14 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-8",
    "branch": "gpui/fixes-wave-a3",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 96/96 dictation, 17/17 app on gpui/fixes-wave-a3 021d7e0; persisted userSetModel flag replaces file sniffing; migration=conservative false"
    ],
-   "notes": "impl-agent-8"
+   "notes": "pushed to PR #194"
   },
   {
    "id": "R03",
@@ -1125,13 +1127,14 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-8",
    "branch": "gpui/fixes-wave-a3",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun 17/17 incl. storage-failure-does-not-touch-connection test; check_health is sole connection writer (bf50e61)"
    ],
-   "notes": "impl-agent-8"
+   "notes": "pushed to PR #194; note: same latent bug exists in Electron App.tsx - fold into B-fix wave"
   },
   {
    "id": "R04",
@@ -1305,14 +1308,6 @@
   },
   {
    "ids": [
-    "S01"
-   ],
-   "agent": "impl-agent-5",
-   "branch": "program/s01-moss-kv-clear",
-   "scope": "starling-s01 worktree; sole heavy-build slot (-j3)"
-  },
-  {
-   "ids": [
     "E17-I0"
    ],
    "agent": "impl-agent-7",
@@ -1321,12 +1316,28 @@
   },
   {
    "ids": [
-    "R02",
-    "R03"
+    "G01"
    ],
-   "agent": "impl-agent-8",
-   "branch": "gpui/fixes-wave-a3",
-   "scope": "gpui worktree Rust (light)"
+   "agent": "impl-agent-10",
+   "branch": "gpui/fixes-wave-a4",
+   "scope": "recorder.rs RT ring (light cargo)"
+  },
+  {
+   "ids": [
+    "B02",
+    "B03"
+   ],
+   "agent": "impl-agent-11",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop TS (light)"
+  },
+  {
+   "ids": [
+    "S03"
+   ],
+   "agent": "impl-agent-12",
+   "branch": "program/s03-eos-contract",
+   "scope": "engine worktree (heavy slot, -j3)"
   }
  ],
  "prs": {
