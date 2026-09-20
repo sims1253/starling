@@ -731,6 +731,45 @@ static void test_tail_reuse_engine_identity_change_forces_recompute() {
     CHECK(fx.session.tail_cache_hits() == 1);
 }
 
+static void test_tail_reuse_mid_step_engine_identity_never_rekeys_in_flight_calls() {
+    // PR #199 batch-4 (medium): engine_id had the same construction-vs-
+    // invocation gap the generation had — a set_engine_identity() issued
+    // from inside an earlier window's callback would re-key the in-flight
+    // wrapper's tail retention under the NEW identity. The fix snapshots
+    // engine_id with the callback and generation at construction.
+    TailFixture fx;
+    fx.hook = [&](int64_t n) -> std::optional<std::string> {
+        if (n == 16000) {
+            fx.hook = nullptr;
+            // Mid-step identity change (a re-configured engine answering
+            // differently): the in-flight wrapper must stay keyed under the
+            // identity it was built with, and the retained entry must not
+            // survive the change for the NEW wrappers either.
+            fx.session.set_engine_identity(fx.session.engine_identity() + "|q8");
+
+            return "full window old-id";
+        }
+        return "tail from old-id";
+    };
+    fx.text = "tail from old-id";
+    fx.session.append_pcm(pcm_for_range(0, 24000));
+    CHECK(fx.session.stream_step(1.0)
+          == std::optional<std::string>("full window old-id tail from old-id"));
+    CHECK(fx.engine_calls == 2);
+    CHECK(fx.session.tail_cache_hits() == 0);
+
+    // Under the new identity the same tail must recompute (no stale match),
+    // and the new result is retained for the unchanged-audio commit.
+    CHECK(fx.session.stream_step(2.0)
+          == std::optional<std::string>("full window old-id tail from old-id"));
+    CHECK(fx.engine_calls == 3);
+    CHECK(fx.session.tail_cache_hits() == 0);
+    CHECK(fx.session.stream_flush()
+          == std::optional<std::string>("full window old-id tail from old-id"));
+    CHECK(fx.engine_calls == 3);  // commit reuses the retained entry
+    CHECK(fx.session.tail_cache_hits() == 1);
+}
+
 static void test_tail_reuse_callback_swap_forces_recompute() {
     // PR #199 (medium): set_transcribe_fn() used to swap custom_tx_ without
     // invalidating the retained exact-tail entry, so byte-identical audio
@@ -1246,6 +1285,7 @@ int main() {
     test_tail_reuse_engine_identity_change_forces_recompute();
     test_tail_reuse_callback_swap_forces_recompute();
     test_tail_reuse_mid_step_swap_never_rekeys_in_flight_calls();
+    test_tail_reuse_mid_step_engine_identity_never_rekeys_in_flight_calls();
     test_tail_reuse_empty_text_is_a_valid_result();
     test_tail_reuse_busy_preview_recomputes_at_commit();
     test_tail_reuse_cancel_after_success_not_reused();
