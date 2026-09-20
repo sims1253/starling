@@ -226,6 +226,19 @@ impl<S: JournalSink> JournalWriter<S> {
         self.sample_rate
     }
 
+    /// Cumulative sample count appended so far (storage v2, I2: the
+    /// `captures.frame_count` source).
+    pub fn total_samples(&self) -> u64 {
+        self.total_samples
+    }
+
+    /// The running content hash over everything appended so far (storage
+    /// v2, I2: the `captures.journal_hash` source — after `finalize` this
+    /// is exactly the value sealed into the trailer).
+    pub(crate) fn content_hash(&self) -> u64 {
+        self.hash
+    }
+
     /// Appends `samples` as one frame record, updating the running content
     /// hash. This is a plain write: the samples become acknowledged only
     /// when a later boundary record is fsynced.
@@ -305,6 +318,20 @@ impl JournalWriter<FileSink> {
     /// Creates a fresh journal for a new take under `dir`.
     pub fn create(dir: &Path, sample_rate: u32) -> io::Result<Self> {
         let id = format!("j_{}", uuid::Uuid::new_v4().simple());
+        Self::create_named(dir, id, sample_rate)
+    }
+
+    /// [`Self::create`] with a caller-chosen id (storage v2, I2): the v2
+    /// crash protocol stages a journal named after its capture id under
+    /// `staging/` and renames it into `audio/`, so the file stem is the
+    /// capture id rather than a generated `j_<uuid>`. Crate-visible: the id
+    /// becomes a path component, so callers must pass a safe one (the v2
+    /// store only ever passes its generated `c_<uuid>` ids).
+    pub(crate) fn create_named(
+        dir: &Path,
+        id: String,
+        sample_rate: u32,
+    ) -> io::Result<Self> {
         let (sink, path) = FileSink::create(dir, &id)?;
         Self::over_sink(sink, id, path, sample_rate)
     }
@@ -446,6 +473,54 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
     })
 }
 
+/// The content hash a writer would hold after appending exactly `samples`
+/// (FNV-1a over the little-endian f32 payload bytes, in order). Recovery
+/// sealing (storage v2, I2) uses this to write a checksum-valid trailer for
+/// a verified prefix without re-reading frame records.
+pub(crate) fn samples_hash(samples: &[f32]) -> u64 {
+    let mut hash = FNV_OFFSET;
+    for &sample in samples {
+        hash = fnv1a(hash, &sample.to_bits().to_le_bytes());
+    }
+    hash
+}
+
+/// Seal a recovered journal (storage v2, I2): physically truncate the file
+/// to the end of its last checksum-valid verification point (boundary or
+/// trailer), append a trailer covering the verified samples, and fsync —
+/// leaving a finalized journal whose every byte is covered by the trailer's
+/// length + hash. The v1 recovery path never modifies journal files (they
+/// are source evidence for the v1 store); v2 calls this only on its own
+/// staging journals during reconciliation, where §4 specifies "truncate +
+/// gap flag" and the discarded tail is reported to the caller so the gap can
+/// be flagged on the resulting captures row. Idempotent: sealing an already
+/// sealed journal truncates nothing and rewrites an equivalent trailer.
+pub(crate) fn seal_recovered_journal(path: &Path, parsed: &ParsedJournal) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let file_len = std::fs::metadata(path)?.len();
+    let verified_end = file_len - parsed.torn_tail_bytes;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(verified_end)?;
+    file.seek(SeekFrom::Start(verified_end))?;
+
+    let mut trailer = Vec::with_capacity(17);
+    trailer.push(TAG_TRAILER);
+    trailer.extend_from_slice(&(parsed.samples.len() as u64).to_le_bytes());
+    trailer.extend_from_slice(&samples_hash(&parsed.samples).to_le_bytes());
+    file.write_all(&trailer)?;
+    file.sync_all()
+}
+
+/// Whether `header` (at least [`HEADER_LEN`] bytes) is a journal this
+/// build understands: the v1 magic + format version. Storage v2 uses this
+/// for its bounded per-record audio check (I2).
+pub(crate) fn is_journal_header(header: &[u8]) -> bool {
+    header.len() >= HEADER_LEN
+        && &header[..MAGIC.len()] == MAGIC
+        && header[MAGIC.len()] == FORMAT_VERSION
+}
+
 /// The journals root: `<data-root>/starling-gpui/journals/`, a sibling of
 /// the session store's `sessions/` directory.
 pub fn default_journals_root() -> PathBuf {
@@ -471,8 +546,9 @@ fn validate_journal_id(id: &str) -> Result<(), StorageError> {
 
 /// fsync a directory's own entry (POSIX; best-effort no-op elsewhere) so a
 /// rename inside it survives a crash. Same contract as
-/// [`JournalSink::sync_parent_dir`], standalone for the quarantine path.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+/// [`JournalSink::sync_parent_dir`], standalone for the quarantine path and
+/// the storage-v2 staging→audio promotion (I2).
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(dir)?.sync_all()?;
