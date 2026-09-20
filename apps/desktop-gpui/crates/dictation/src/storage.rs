@@ -324,6 +324,31 @@ impl FileSessionStore {
         Ok(linked)
     }
 
+    /// Metadata-only lookup of one session's journal linkage (R21): reads
+    /// the manifest, never the audio, so the confirmed-delete flow can find
+    /// the journal to quarantine without loading the WAV. A missing session
+    /// (already deleted) or an unparseable manifest has no known linkage
+    /// (`None`) — deletion then proceeds without a tombstone, matching
+    /// [`Self::journal_ids`]' tolerance for damaged records (quarantining
+    /// those is I2's job). A linkage that is not a safe path component is
+    /// likewise dropped: it can never equal a scanned journal stem (file
+    /// stems contain no separators), so dropping it cannot resurrect
+    /// anything, while honoring it would brick the deletion.
+    pub fn journal_id_of(&self, id: &str) -> Result<Option<String>, StorageError> {
+        validate_session_id(id)?;
+
+        let bytes = match std::fs::read(self.session_dir(id).join(MANIFEST_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(serde_json::from_slice::<SessionManifest>(&bytes)
+            .ok()
+            .and_then(|manifest| manifest.journal_id)
+            .filter(|journal_id| is_safe_path_component(journal_id)))
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), StorageError> {
         validate_session_id(id)?;
 
@@ -549,15 +574,21 @@ pub fn now_iso() -> String {
         .expect("current time formats as RFC3339 with milliseconds")
 }
 
+/// Whether `id` is safe to join onto a filesystem path as one component:
+/// non-empty, no separators or newlines, not `.` or `..`. Shared by session
+/// ids and manifest-provided journal ids (R21).
+pub(crate) fn is_safe_path_component(id: &str) -> bool {
+    !id.is_empty()
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains('\r')
+        && !id.contains('\n')
+        && id != "."
+        && id != ".."
+}
+
 fn validate_session_id(id: &str) -> Result<(), StorageError> {
-    if id.is_empty()
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains('\r')
-        || id.contains('\n')
-        || id == "."
-        || id == ".."
-    {
+    if !is_safe_path_component(id) {
         return Err(StorageError::Invalid(format!(
             "session id {id:?} must be non-empty and contain no path separators"
         )));

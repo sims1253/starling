@@ -36,11 +36,18 @@
 //!   The journal file itself is never modified or deleted: it stays in place
 //!   as source evidence.
 //!
-//! RETENTION POLICY (frozen for I1 phase 2): journal files are never deleted
-//! — not after the session is saved, not after recovery. Storage v2 (I2) owns
-//! garbage collection; until then every journal is kept as evidence. Journals
-//! already linked to a saved session (manifest `journal_id`) are skipped by
-//! recovery so a take can never be recovered twice.
+//! RETENTION POLICY (frozen for I1 phase 2, revised by R21): journal files
+//! are never deleted by the crash-recovery path — not after the session is
+//! saved, not after recovery; that never-delete rule is the *crash* policy.
+//! The one exception is an explicit user deletion: a session deleted through
+//! the confirmed-delete flow (B05's "permanently removes the audio" warning)
+//! takes its linked journal with it — [`delete_session_and_journal`] renames
+//! the journal into `journals/deleted/` *before* removing the session row,
+//! so the rename is the tombstone commit point and startup recovery can
+//! never resurrect a recording the user watched being deleted. Quarantined
+//! files stay on disk awaiting the I2 retention sweep (no eager unlink).
+//! Journals already linked to a saved session (manifest `journal_id`) are
+//! skipped by recovery so a take can never be recovered twice.
 //!
 //! Deferred to I2/I3 (known gaps, by design of this increment): gap records
 //! inside the journal (ring-overflow gaps are flagged live via
@@ -48,6 +55,7 @@
 //! journal), the `staging/` → `audio/` rename protocol, the SQLite metadata
 //! transaction, bounded/streaming journal reads, and journal GC.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,6 +65,13 @@ use crate::storage::{DictationSession, FileSessionStore, StorageError};
 
 /// Extension of journal files under the journals root.
 const JOURNAL_EXT: &str = "sj";
+
+/// Subdirectory of the journals root that holds deliberately-deleted
+/// journals (R21): a confirmed session deletion renames its linked journal
+/// into here instead of unlinking it. The rename is the tombstone — a journal
+/// id with a file under `deleted/` is dead forever as far as recovery is
+/// concerned; the bytes themselves await the I2 retention sweep.
+const DELETED_DIR: &str = "deleted";
 
 /// Format magic at the start of every journal file.
 const MAGIC: &[u8; 8] = b"STRLNGSJ";
@@ -440,6 +455,128 @@ pub fn default_journals_root() -> PathBuf {
         .join("journals")
 }
 
+/// A manifest-provided journal id must obey the same path-safety rules as a
+/// session id before it becomes a filesystem path component. Generated ids
+/// (`j_<uuid>`) always pass; [`FileSessionStore::journal_id_of`] already
+/// drops unsafe linkages, so this is defense in depth for direct callers.
+fn validate_journal_id(id: &str) -> Result<(), StorageError> {
+    if !crate::storage::is_safe_path_component(id) {
+        return Err(StorageError::Invalid(format!(
+            "journal id {id:?} must be non-empty and contain no path separators"
+        )));
+    }
+
+    Ok(())
+}
+
+/// fsync a directory's own entry (POSIX; best-effort no-op elsewhere) so a
+/// rename inside it survives a crash. Same contract as
+/// [`JournalSink::sync_parent_dir`], standalone for the quarantine path.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Quarantine (tombstone) one journal (R21): rename
+/// `<journals_root>/<id>.sj` into `<journals_root>/deleted/<id>.sj`, fsyncing
+/// both directories. Returns whether a live journal was quarantined — a
+/// missing source file is not an error (nothing live to tombstone, e.g. the
+/// journal never existed or an earlier delete already took it).
+///
+/// Why rename rather than unlink: one `rename(2)` atomically removes the
+/// journal from the recovery scan *and* records the tombstone, so there is no
+/// crash window with a removed journal and no tombstone (the resurrection
+/// bug), and no window with a tombstone but a still-live journal. The bytes
+/// survive for the I2 retention sweep, matching the storage-v2 direction
+/// (`quarantine/` + `tombstones`), and an unlink-before-ack failure mode can
+/// never silently break the crash-recovery never-delete rule.
+///
+/// Any other failure is returned: callers must treat it as "deletion did not
+/// happen" and abort before removing the session row.
+pub fn quarantine_journal(
+    journals_root: &Path,
+    journal_id: &str,
+) -> Result<bool, StorageError> {
+    validate_journal_id(journal_id)?;
+    let source = journals_root.join(format!("{journal_id}.{JOURNAL_EXT}"));
+    if !source.exists() {
+        return Ok(false);
+    }
+
+    let quarantine_dir = journals_root.join(DELETED_DIR);
+    std::fs::create_dir_all(&quarantine_dir)?;
+    let destination = quarantine_dir.join(format!("{journal_id}.{JOURNAL_EXT}"));
+    // A stale tombstone under the same id (the journal reappeared live — a
+    // restored backup) is replaced: on Windows `rename` refuses to overwrite.
+    // A crash in that window leaves the journal live and its session row in
+    // place, i.e. deletion simply did not happen — never a resurrection.
+    let _ = std::fs::remove_file(&destination);
+    std::fs::rename(&source, &destination)?;
+    sync_dir(journals_root)?;
+    sync_dir(&quarantine_dir)?;
+    Ok(true)
+}
+
+/// Journal ids tombstoned under `journals/deleted/` (R21): deliberately
+/// deleted through a confirmed session deletion, awaiting the I2 retention
+/// sweep. An unreadable or missing `deleted/` directory simply holds no
+/// tombstones.
+fn tombstoned_journal_ids(journals_root: &Path) -> HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(journals_root.join(DELETED_DIR)) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(JOURNAL_EXT))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Confirmed session deletion (R21, the B05 contract: "This permanently
+/// removes the audio … no undo"): remove the session row and its retained
+/// audio, and take the manifest-linked journal along with it.
+///
+/// Ordering — tombstone strictly before row removal:
+/// 1. Read the session's `journal_id` (metadata-only; never loads the WAV).
+/// 2. If the manifest carries a linkage, [`quarantine_journal`] renames the
+///    journal into `journals/deleted/` and fsyncs. This is the commit point.
+/// 3. Only then does [`FileSessionStore::delete`] remove the row + audio.
+///
+/// Crash matrix: a crash before step 2 leaves everything in place (the
+/// journal stays linked — no resurrection); a crash between 2 and 3 leaves a
+/// live row whose journal is quarantined (recovery sees a linked id with no
+/// journal file — nothing to recover; the retry delete tolerates the missing
+/// source); a crash after 3 is complete. A failure in step 2 aborts before
+/// the row removal, so the deletion surfaces as an error with the session
+/// intact rather than leaving a live journal that recovery would resurrect.
+///
+/// Deleting a session without a journal linkage is exactly the old
+/// [`FileSessionStore::delete`] behavior — nothing under the journals root is
+/// touched.
+pub fn delete_session_and_journal(
+    store: &FileSessionStore,
+    journals_root: &Path,
+    session_id: &str,
+) -> Result<(), StorageError> {
+    if let Some(journal_id) = store.journal_id_of(session_id)? {
+        quarantine_journal(journals_root, &journal_id)?;
+    }
+    store.delete(session_id)
+}
+
 /// What the startup scan found and did.
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
@@ -505,10 +642,16 @@ fn recovery_note(parsed: &ParsedJournal) -> String {
 
 /// Startup scan (§4 recovery, journal-only): every `*.sj` under
 /// `journals_dir` that is not already linked to a saved session (manifest
-/// `journal_id`) is recovered — its verified samples become a new session
-/// with status `interrupted`, duration computed from the verified sample
-/// count at the device rate, and the journal linkage recorded. Journal
-/// files are never modified or deleted; they remain as source evidence.
+/// `journal_id`) and not tombstoned under `journals/deleted/` is recovered —
+/// its verified samples become a new session with status `interrupted`,
+/// duration computed from the verified sample count at the device rate, and
+/// the journal linkage recorded. Journal files are never modified or deleted
+/// by recovery; they remain as source evidence.
+///
+/// A tombstoned id is skipped permanently (R21): the user confirmed its
+/// deletion once, so even a journal file that later reappears live under
+/// `journals/` (a restored backup, a copied disk) must not resurrect into an
+/// interrupted take that contradicts the deletion the user watched.
 ///
 /// A storage failure while saving a recovery aborts the scan with the error
 /// (the remaining journals simply stay unlinked and are retried on the next
@@ -533,6 +676,9 @@ pub fn recover_interrupted_takes(
     // Metadata-only linkage scan: reads manifests, never loads audio (the
     // G02 direction; `list()` would eagerly load every WAV).
     let linked = store.journal_ids()?;
+    // Deliberately-deleted ids outrank everything: check the tombstones
+    // before deciding a journal is an interrupted take.
+    let tombstoned = tombstoned_journal_ids(journals_dir);
 
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
@@ -546,6 +692,11 @@ pub fn recover_interrupted_takes(
             continue;
         };
         let id = id.to_string();
+        if tombstoned.contains(&id) {
+            // Deliberately deleted (R21): the tombstone outlives the journal
+            // file itself. Never resurrect a confirmed deletion.
+            continue;
+        }
         if linked.contains(&id) {
             // Already saved once — never recover a take twice.
             continue;
@@ -1139,5 +1290,309 @@ mod tests {
         let report =
             recover_interrupted_takes(&store, journals_dir.path()).expect("empty dir");
         assert!(!report.has_findings());
+    }
+
+    // ---- R21: confirmed deletion vs journal recovery ----
+
+    /// A saved session with a live linked journal, the state the B05 dialog
+    /// deletes. Returns (session id, journal id).
+    fn linked_session_with_journal(
+        store: &FileSessionStore,
+        journals_dir: &TempDir,
+        samples: usize,
+    ) -> (String, String) {
+        let mut writer = writer_in(journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&ramp(samples, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        drop(writer);
+
+        let wav = encode_wav_16k(&PcmAudio {
+            samples: ramp(samples, 0),
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        let session = store
+            .create_with_journal(wav, Some(50.0), Some(&journal_id))
+            .expect("create linked session");
+        assert!(
+            journals_dir.path().join(format!("{journal_id}.sj")).exists(),
+            "the journal starts live"
+        );
+        (session.id, journal_id)
+    }
+
+    /// R21: a confirmed session deletion takes the linked journal with it —
+    /// renamed into `deleted/` (never an eager unlink) — and removes the row
+    /// + audio; startup recovery then finds nothing to resurrect, exactly as
+    /// the B05 warning promised ("permanently removes the audio").
+    #[test]
+    fn confirmed_deletion_quarantines_the_linked_journal_and_removes_the_row() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+        let (session_id, journal_id) =
+            linked_session_with_journal(&store, &journals_dir, 1_200);
+
+        delete_session_and_journal(&store, journals_dir.path(), &session_id)
+            .expect("confirmed delete");
+
+        // The row and its audio are gone (the old behavior, kept).
+        assert!(store.get(&session_id).expect("get").is_none());
+        // The journal is no longer live — renamed, not unlinked: the bytes
+        // await the I2 retention sweep.
+        assert!(
+            !journals_dir.path().join(format!("{journal_id}.sj")).exists(),
+            "the live journal is gone from the scan path"
+        );
+        let tombstone = journals_dir
+            .path()
+            .join(DELETED_DIR)
+            .join(format!("{journal_id}.sj"));
+        assert!(
+            tombstone.exists(),
+            "the journal is quarantined as the tombstone"
+        );
+
+        // Nothing left to resurrect on the next startup.
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(
+            !report.has_findings(),
+            "the deleted take must stay deleted: {}",
+            report.summary()
+        );
+    }
+
+    /// R21 crash-safety of the ordering. (a) A crash after the tombstone
+    /// rename but before the row removal leaves nothing recoverable, and the
+    /// retried delete completes. (b) The tombstone is permanent: even a
+    /// journal reappearing live under `journals/` with a tombstoned id (a
+    /// restored backup, a copied disk) is never resurrected, while an
+    /// untombstoned orphan beside it still is.
+    #[test]
+    fn recovery_skips_tombstoned_ids_forever() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+        let (session_id, deleted_id) =
+            linked_session_with_journal(&store, &journals_dir, 1_200);
+
+        // The control: an untombstoned orphan that must still recover.
+        let mut orphan = writer_in(&journals_dir, 24_000);
+        let orphan_id = orphan.id().to_string();
+        orphan.append_frames(&ramp(2_400, 0)).expect("append");
+        orphan.write_boundary().expect("boundary");
+        drop(orphan);
+
+        // (a) Crash between the tombstone rename and the row removal: the
+        // quarantine is committed, the delete never finished.
+        let quarantined =
+            quarantine_journal(journals_dir.path(), &deleted_id).expect("tombstone commit");
+        assert!(quarantined, "a live journal was quarantined");
+        assert!(store.get(&session_id).expect("get").is_some(), "row still present");
+
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        let recovered_ids: HashSet<String> = report
+            .recovered
+            .iter()
+            .map(|session| session.journal_id.clone().expect("linked"))
+            .collect();
+        assert_eq!(
+            recovered_ids,
+            HashSet::from([orphan_id]),
+            "only the orphan recovers; the tombstoned take does not"
+        );
+
+        // The delete retries after the restart and completes.
+        delete_session_and_journal(&store, journals_dir.path(), &session_id)
+            .expect("delete completes after the crash");
+        assert!(store.get(&session_id).expect("get").is_none());
+
+        // (b) The journal file reappears live (a restored backup) while its
+        // tombstone still sits in deleted/: the id stays dead forever. A
+        // fresh orphan beside it is the control that still recovers (the
+        // first orphan is linked by pass (a) above).
+        let mut second_orphan = writer_in(&journals_dir, 24_000);
+        let second_orphan_id = second_orphan.id().to_string();
+        second_orphan.append_frames(&ramp(2_400, 5_000)).expect("append");
+        second_orphan.write_boundary().expect("boundary");
+        drop(second_orphan);
+
+        let quarantined = journals_dir
+            .path()
+            .join(DELETED_DIR)
+            .join(format!("{deleted_id}.sj"));
+        std::fs::copy(&quarantined, journals_dir.path().join(format!("{deleted_id}.sj")))
+            .expect("restore the file");
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        let recovered_ids: HashSet<String> = report
+            .recovered
+            .iter()
+            .map(|session| session.journal_id.clone().expect("linked"))
+            .collect();
+        assert_eq!(
+            recovered_ids,
+            HashSet::from([second_orphan_id]),
+            "the reappeared journal must not resurrect — the id is tombstoned"
+        );
+        assert!(
+            !report.empty_journals.iter().any(|id| id == &deleted_id)
+                && !report.unreadable.iter().any(|(id, _)| id == &deleted_id),
+            "a tombstoned id is skipped silently, not reported anywhere"
+        );
+    }
+
+    /// R21: deleting a session without a journal linkage is exactly the old
+    /// behavior — the row goes, nothing under the journals root is touched.
+    #[test]
+    fn deleting_a_session_without_a_journal_touches_nothing_under_journals() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        // An unrelated live journal that must not be swept up.
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let unrelated_id = writer.id().to_string();
+        writer.append_frames(&ramp(100, 0)).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        let session = store
+            .create(
+                encode_wav_16k(&PcmAudio {
+                    samples: ramp(100, 0),
+                    sample_rate: 24_000,
+                    channels: 1,
+                })
+                .expect("encode"),
+                Some(10.0),
+            )
+            .expect("create unlinked session");
+
+        delete_session_and_journal(&store, journals_dir.path(), &session.id)
+            .expect("delete");
+
+        assert!(store.get(&session.id).expect("get").is_none());
+        assert!(
+            journals_dir.path().join(format!("{unrelated_id}.sj")).exists(),
+            "unrelated journals are untouched"
+        );
+        assert!(
+            !journals_dir.path().join(DELETED_DIR).exists(),
+            "no quarantine dir is created for a journal-less deletion"
+        );
+    }
+
+    /// R21: only the confirmed-delete entry point may tombstone. The
+    /// interrupted-take persistence paths — exactly the store calls the
+    /// app's `save_interrupted_take` (R17 salvage) and journal recovery
+    /// itself make — must leave the journal live, and the R05 stash path is
+    /// in-memory only (it performs no store or journal call at all).
+    #[test]
+    fn persisting_an_interrupted_take_does_not_tombstone_its_journal() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+        let (session_id, journal_id) =
+            linked_session_with_journal(&store, &journals_dir, 1_200);
+
+        // The salvage/recovery shape: persist + mark interrupted. No
+        // confirmed deletion happened anywhere.
+        store
+            .mark_interrupted(&session_id, "quiesce timeout salvage")
+            .expect("mark interrupted");
+
+        assert!(
+            journals_dir.path().join(format!("{journal_id}.sj")).exists(),
+            "the journal stays live without a confirmed deletion"
+        );
+        assert!(
+            !journals_dir.path().join(DELETED_DIR).exists(),
+            "no tombstone was written"
+        );
+
+        // The linkage still guards idempotence: nothing new is recovered.
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(report.recovered.is_empty(), "linked stays linked");
+    }
+
+    /// R21: when the quarantine cannot be committed (here: a regular file
+    /// squatting on the `deleted/` dir name), the deletion aborts *before*
+    /// the row removal — a half-delete that leaves a live journal behind is
+    /// exactly the resurrection bug, and surfacing the error with the
+    /// session intact is the honest outcome.
+    #[test]
+    fn a_failed_tombstone_aborts_deletion_before_the_row_removal() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+        let (session_id, journal_id) =
+            linked_session_with_journal(&store, &journals_dir, 1_200);
+
+        // Sabotage: `deleted` exists as a regular file, so the quarantine
+        // dir cannot be created.
+        std::fs::write(journals_dir.path().join(DELETED_DIR), b"not a directory")
+            .expect("sabotage");
+
+        assert!(
+            delete_session_and_journal(&store, journals_dir.path(), &session_id).is_err(),
+            "the quarantine failure must surface, not pass silently"
+        );
+        // The session row and audio survive: the delete did not half-happen.
+        assert!(
+            store.get(&session_id).expect("get").is_some(),
+            "the row must survive a failed tombstone"
+        );
+        // The journal is still live — and still linked, so even a startup
+        // scan in this state recovers nothing.
+        assert!(journals_dir.path().join(format!("{journal_id}.sj")).exists());
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(report.recovered.is_empty());
+    }
+
+    /// R21: a hand-corrupted manifest linkage that is not a safe path
+    /// component is treated as no linkage: the deletion proceeds (a weird
+    /// manifest must never brick deleting the session) and no path outside
+    /// the journals root is ever touched.
+    #[test]
+    fn an_unsafe_manifest_linkage_is_ignored_rather_than_followed() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let session = store
+            .create(
+                encode_wav_16k(&PcmAudio {
+                    samples: ramp(100, 0),
+                    sample_rate: 24_000,
+                    channels: 1,
+                })
+                .expect("encode"),
+                Some(10.0),
+            )
+            .expect("create session");
+
+        // Rewrite the manifest with a traversal linkage.
+        let manifest_path = store_dir.path().join(&session.id).join("manifest.json");
+        let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
+        let mut manifest: serde_json::Value = serde_json::from_str(&raw).expect("parse manifest");
+        manifest
+            .as_object_mut()
+            .expect("object")
+            .insert("journalId".into(), serde_json::json!("../../escape.sj"));
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
+            .expect("rewrite manifest");
+
+        // The unsafe linkage reads back as "no known linkage"…
+        assert_eq!(store.journal_id_of(&session.id).expect("lookup"), None);
+        // …so the delete proceeds without touching anything outside.
+        delete_session_and_journal(&store, journals_dir.path(), &session.id)
+            .expect("delete");
+        assert!(store.get(&session.id).expect("get").is_none());
+        assert!(
+            !journals_dir.path().join(DELETED_DIR).exists(),
+            "nothing under the journals root was touched"
+        );
     }
 }

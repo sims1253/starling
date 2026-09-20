@@ -185,8 +185,9 @@ impl CaptureGap {
 pub struct JournalReport {
     /// Journal id — the stem of `journals/<id>.sj`.
     pub id: String,
-    /// Path of the journal file (left in place in every outcome; deletion
-    /// is storage v2's job).
+    /// Path of the journal file (left in place by every capture outcome;
+    /// only a confirmed session deletion quarantines it — R21 — and the
+    /// I2 retention sweep owns actual removal).
     pub path: PathBuf,
     /// Device sample rate recorded in the journal header.
     pub sample_rate: u32,

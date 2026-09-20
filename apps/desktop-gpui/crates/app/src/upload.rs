@@ -603,9 +603,11 @@ impl StarlingApp {
                 // R05: the transcript had nowhere to land because its
                 // session was deleted mid-flight. Keep the job's audio
                 // recoverable in the unsaved list and surface what
-                // happened — never drop it silently. The capture journal
-                // (which `remove_session` never deletes) also stays on
-                // disk as source evidence.
+                // happened — never drop it silently. This stash path
+                // deliberately performs no journal operation (R21): the
+                // confirmed delete that won the race already quarantined
+                // the capture journal via `remove_session`, and the stashed
+                // in-memory WAV is the kept copy the user can download.
                 let message = session_deleted_message();
                 this.update(cx, |app, cx| {
                     app.stash_unsaved(wav, &message);

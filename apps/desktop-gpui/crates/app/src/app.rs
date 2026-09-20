@@ -555,7 +555,22 @@ impl StarlingApp {
             let deleted = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.delete(&id) }).await
+                cx.background_spawn(async move {
+                    // R21: the confirmed delete (B05's "permanently removes
+                    // the audio" warning) must take the linked capture
+                    // journal with it — quarantined into journals/deleted/
+                    // before the row removal, so startup recovery can never
+                    // resurrect the take as interrupted. The R05 stash path
+                    // never comes through here: only this entry point
+                    // tombstones.
+                    let journals_root = starling_dictation::journal::default_journals_root();
+                    starling_dictation::journal::delete_session_and_journal(
+                        store.as_ref(),
+                        &journals_root,
+                        &id,
+                    )
+                })
+                .await
             };
             match deleted {
                 Ok(()) => refresh_sessions(&this, &store, cx).await,
