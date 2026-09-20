@@ -34,11 +34,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-25 (retry after rate-limit failure)",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": "first agent died on API rate limit mid-flight; partial work present uncommitted in apps/desktop (bridge approach: streamBridge/connectPolicy/streamTransport + 5 modified files); continuation agent dispatched with take-over instructions"
+   "evidence": [
+    "coordinator-completed after 2 agent rate-limit deaths: static CSP loopback-only ws/wss synced w/ connectPolicy.ts (asserted); native stream bridge for non-loopback; 38 new tests; 229/229, lint 0/0, tsc both, fmt clean (b694047)"
+   ],
+   "notes": "packaged Electron run not executed (headless); Playwright CSP repro skipped (no browsers cached)"
   },
   {
    "id": "B02",
@@ -1175,9 +1177,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
@@ -1191,9 +1193,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
@@ -1223,9 +1225,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
@@ -1239,9 +1241,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
