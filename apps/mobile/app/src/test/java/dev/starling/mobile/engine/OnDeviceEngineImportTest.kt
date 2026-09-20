@@ -305,11 +305,22 @@ class OnDeviceEngineImportTest {
                 ),
             )
 
-            val threads = listOf(first, second).map { source ->
-                Thread { engine.importModel(source.inputStream()) }
+            val results = arrayOfNulls<OnDeviceEngine.ImportResult>(2)
+            val threads = listOf(first, second).mapIndexed { index, source ->
+                Thread { results[index] = engine.importModel(source.inputStream()) }
             }
             threads.forEach { it.start() }
             threads.forEach { it.join(30_000) }
+
+            // Both imports must have fully succeeded — this only holds when
+            // the import lock actually serializes them; if they raced, one
+            // could fail (its staging file swept mid-copy by the other).
+            for ((index, result) in results.withIndex()) {
+                assertTrue(
+                    "import ${if (index == 0) "first" else "second"} must succeed: $result",
+                    result is OnDeviceEngine.ImportResult.Imported,
+                )
+            }
 
             val model = File(directory, "parakeet.gguf")
             assertTrue("exactly one model must be published", model.isFile)
@@ -322,6 +333,100 @@ class OnDeviceEngineImportTest {
             )
             assertEquals(
                 "no staging files may survive concurrent imports",
+                emptyList<File>(),
+                directory.listFiles { f -> f.name.endsWith(".importing") }!!.toList(),
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    // ---- promotion mechanics (Files.move ATOMIC_MOVE + fallback) ---------
+
+    @Test
+    fun atomicPromotionReplacesAnExistingModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val target = File(directory, "parakeet.gguf").apply { writeBytes(ByteArray(64) { 1 }) }
+            val staged = File(directory, "parakeet.gguf.seed.importing").apply { writeBytes(ByteArray(64) { 2 }) }
+
+            val promoted = engine.promoteByMove(staged, target)
+
+            assertTrue("Files.move ATOMIC_MOVE must replace the existing target", promoted)
+            assertTrue("the target now holds the staged bytes", target.readBytes().all { it == 2.toByte() })
+            assertFalse("the staged file is gone after an atomic rename", staged.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun asideFallbackMovesTheStagedFileInAndDropsTheAside() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val target = File(directory, "parakeet.gguf").apply { writeBytes(ByteArray(64) { 1 }) }
+            val staged = File(directory, "parakeet.gguf.seed.importing").apply { writeBytes(ByteArray(64) { 2 }) }
+
+            val promoted = engine.moveAsideFirst(staged, target)
+
+            assertTrue(promoted)
+            assertTrue("the target now holds the staged bytes", target.readBytes().all { it == 2.toByte() })
+            assertFalse("the aside backup must not linger", File(directory, "parakeet.gguf.previous").exists())
+            assertFalse(staged.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun asideFallbackRestoresThePreviousModelWhenTheMoveInFails() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val target = File(directory, "parakeet.gguf").apply { writeBytes(ByteArray(64) { 1 }) }
+            // A staged file that vanished underneath the import fails the
+            // move-in step after the aside step already succeeded.
+            val staged = File(directory, "parakeet.gguf.seed.importing")
+
+            val promoted = engine.moveAsideFirst(staged, target)
+
+            assertFalse(promoted)
+            assertTrue(
+                "the previous model must be restored byte-identical",
+                target.readBytes().all { it == 1.toByte() },
+            )
+            assertFalse("no aside backup may linger after the restore", File(directory, "parakeet.gguf.previous").exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun unexpectedFailureAfterCopySweepsTheStagedFileAndKeepsTheModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val parakeet = sparseModelFile(directory, "parakeet.gguf.source", parakeetPayload())
+            engine.importModel(parakeet.inputStream())
+            val before = prefix(File(directory, "parakeet.gguf"), 256)
+            val replacement = sparseModelFile(
+                directory,
+                "replacement.gguf.source",
+                ggufBytes("general.architecture" to "parakeet", "parakeet.vocab_size" to "8193"),
+            )
+
+            val thrown = runCatching {
+                engine.importModel(replacement.inputStream()) { _, _ -> error("injected promote failure") }
+            }.exceptionOrNull()
+
+            assertTrue("the unexpected failure must propagate", thrown is IllegalStateException)
+            val model = File(directory, "parakeet.gguf")
+            assertTrue("the previous model must survive", model.isFile)
+            assertTrue("the previous model must be byte-identical", before.contentEquals(prefix(model, before.size)))
+            assertEquals(
+                "an unexpected failure must still leave no staging file",
                 emptyList<File>(),
                 directory.listFiles { f -> f.name.endsWith(".importing") }!!.toList(),
             )

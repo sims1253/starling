@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -220,7 +221,11 @@ class MainActivity : Activity() {
                     is OnDeviceEngine.ImportResult.Imported -> {
                         recordingMessage.setText(R.string.on_device_imported)
                     }
-                    is OnDeviceEngine.ImportResult.Rejected -> recordingMessage.text = result.reason
+                    is OnDeviceEngine.ImportResult.Rejected -> {
+                        // The stage is diagnostics (logcat); the user copy stays the reason alone.
+                        Log.w(TAG, "model import rejected at ${result.stage}: ${result.reason}")
+                        recordingMessage.text = result.reason
+                    }
                 }
                 refreshOnDeviceStatus()
             }
@@ -516,6 +521,7 @@ class MainActivity : Activity() {
     }
 
     companion object {
+        private const val TAG = "MainActivity"
         private const val REQUEST_RECORD_AUDIO = 4001
         private const val REQUEST_IMPORT_MODEL = 4002
     }
