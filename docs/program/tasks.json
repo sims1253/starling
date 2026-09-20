@@ -235,7 +235,7 @@
     "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
     "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
    ],
-   "notes": "phase 1 complete; remaining: leases, retention sweep, bounded reads, runtime-side store integration"
+   "notes": "phase 1 landed; D14 requires a v2-only simplification pass (drop migration flow, dual-store facade, flag) before merge"
   },
   {
    "id": "E03",
@@ -1664,7 +1664,7 @@
    "evidence": [
     "PR #201 OCR first review (13 findings)"
    ],
-   "notes": "quiesce-salvage finding is the sharpest: finalized journal must still land as interrupted row on v2; fetch full bodies first"
+   "notes": "RESHAPED by D14 (no backwards compatibility): the persisted-choice/env-flag/migration-flow findings become moot with v2-only simplification; REAL findings to keep: quiesce-salvage interrupted-state on v2, store facade perf x2, last_error, updated_at"
   }
  ],
  "active_assignments": [
