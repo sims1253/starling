@@ -48,11 +48,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-11",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: full desktop suite 103/103, tsc -b clean on 4ae4021; stoppedTakeVerdict: samples-present keeps any duration; only empty discards"
+   ],
+   "notes": "cross-client acceptance retained for GPUI port (verdict logic documented)"
   },
   {
    "id": "B03",
@@ -62,11 +64,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-11",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: 103/103 + tsc clean on 7b3dfda; onDurableSave fires before transport.commit; per-generation invalidation stops older finalize deleting its row; out-of-order responses attach per-session"
+   ],
+   "notes": "no React component harness - App wiring verified at unit level; no explicit upload queue cap (pre-existing single-flight retained)"
   },
   {
    "id": "B04",
@@ -1298,13 +1302,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
+   "status": "in_progress",
+   "owner": "impl-agent-15",
    "branch": "program/wave-a",
    "evidence": [
     "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
    ],
-   "notes": "queue behind impl-11; verify durationMs against B03 outcome first"
+   "notes": "dispatched after B02/B03 verified; durationMs finding resolved against stoppedTakeVerdict design"
   },
   {
    "id": "R15",
@@ -1374,15 +1378,6 @@
   },
   {
    "ids": [
-    "B02",
-    "B03"
-   ],
-   "agent": "impl-agent-11",
-   "branch": "program/wave-a",
-   "scope": "apps/desktop TS (light)"
-  },
-  {
-   "ids": [
     "S03"
    ],
    "agent": "impl-agent-12",
@@ -1398,6 +1393,14 @@
    "agent": "impl-agent-13",
    "branch": "program/wave-a",
    "scope": "packages/contracts/mode-routing + tests (light)"
+  },
+  {
+   "ids": [
+    "R14"
+   ],
+   "agent": "impl-agent-15",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop + packages/dictation (light)"
   }
  ],
  "prs": {
