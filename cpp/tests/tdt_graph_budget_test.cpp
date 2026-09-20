@@ -29,6 +29,18 @@
 //   (7) no-growth steady state at fixed shapes: repeating the same shape set
 //       builds each graph exactly once and holds bytes constant.
 //
+// Part A (pure logic, no model, no backend — tiny fake shapes), R20 review
+// additions:
+//   (12) env override parsing (env_budget_bytes, the
+//       STARLING_TDT_GRAPH_BUDGET_MB path): whole-value validation — garbage,
+//       trailing junk, empty, zero, and negative are rejected LOUDLY (stderr
+//       diagnostic + the default budget); a value whose << 20 would wrap
+//       clamps loudly to the largest representable budget;
+//   (13) a zero byte budget is rejected at construction
+//       (std::invalid_argument), not silently clamped to 1;
+//   (14) mass eviction picks the LRU-ordered UNPINNED prefix in one pass,
+//       skipping interleaved pins (regression net for the single-pass trim).
+//
 // Part B (real ReplayGraph entries on the CPU backend — the
 // device_cache_clear_test pattern; the TDT decode path itself is GPU-gated,
 // but the graph/accounting primitives it uses are backend-agnostic):
@@ -52,6 +64,7 @@
 
 #include "runtime/backend.hpp"
 #include "runtime/lru_cache.hpp"
+#include "trace_test_support.hpp"   // SETENV/UNSETENV + capture_stderr
 
 #include "ggml.h"
 
@@ -214,6 +227,132 @@ void test_logic_build_failure() {
     for (int i = 3; i < 6; ++i) acquire_and_release(cache, i, 100, i);
     check(cache.size() == 5 && cache.bytes_in_use() == 500,
           "A6: LRU/list consistent after a failed insert");
+}
+
+// (12) The env-override path behind tdt_graph_byte_budget()
+// (STARLING_TDT_GRAPH_BUDGET_MB): strict whole-value validation with LOUD
+// failure (stderr diagnostic — captured here) and a loud clamp on overflow.
+// The old atol parse truncated ("64x" -> 64) and wrapped silently.
+void test_env_budget_parsing() {
+    std::printf("[A] env override parsing (env_budget_bytes)\n");
+    const char* var = "STARLING_TEST_GRAPH_BUDGET_MB";
+    const size_t dflt = size_t(128) << 20;
+
+    struct Case { const char* value; size_t expect; bool loud; };
+    const Case cases[] = {
+        { "64",  size_t(64) << 20, false },  // valid override
+        { " 32", size_t(32) << 20, false },  // leading whitespace: strtoll skips it
+        { "1",   size_t(1) << 20,  false },  // minimum accepted value
+        { "",    dflt,             true  },  // set-but-empty
+        { "foo", dflt,             true  },  // pure garbage
+        { "64x", dflt,             true  },  // trailing garbage (atol read 64)
+        { "0",   dflt,             true  },  // zero: loud reject (was: silent default)
+        { "-5",  dflt,             true  },  // negative: loud reject
+    };
+    for (const Case& c : cases) {
+        SETENV(var, c.value);
+        size_t got = 0;
+        const std::string err = capture_stderr(
+            [&] { got = env_budget_bytes(var, dflt); });
+        check(got == c.expect,
+              "ENV: '" + std::string(c.value) + "' -> " +
+                  std::to_string(c.expect) + " bytes (got " +
+                  std::to_string(got) + ")");
+        const bool loud = err.find("starling:") != std::string::npos;
+        check(loud == c.loud,
+              "ENV: '" + std::string(c.value) + "' diagnostic " +
+                  (c.loud ? "emitted" : "silent") + " (stderr: '" + err + "')");
+    }
+    UNSETENV(var);
+    size_t got = 0;
+    const std::string err = capture_stderr(
+        [&] { got = env_budget_bytes(var, dflt); });
+    check(got == dflt && err.empty(), "ENV: unset -> default, silently");
+
+    // Overflow: exactly the largest representable MiB (SIZE_MAX >> 20) is
+    // accepted as-is; one more — and an out-of-long-long value — clamp
+    // loudly to the same budget instead of wrapping the shift.
+    const size_t max_mib = SIZE_MAX >> 20;
+    const size_t max_budget = max_mib << 20;
+    SETENV(var, std::to_string(max_mib).c_str());
+    got = 0;
+    capture_stderr([&] { got = env_budget_bytes(var, dflt); });
+    check(got == max_budget, "ENV: boundary max_mib accepted unclamped");
+    for (const char* v : { std::to_string(max_mib + 1).c_str(),
+                           "99999999999999999999" }) {
+        SETENV(var, v);
+        got = 0;
+        const std::string clamp_err = capture_stderr(
+            [&] { got = env_budget_bytes(var, dflt); });
+        check(got == max_budget &&
+                  clamp_err.find("clamping") != std::string::npos,
+              "ENV: overflow '" + std::string(v) + "' clamps loudly to max");
+    }
+    UNSETENV(var);
+}
+
+// (13) A zero byte budget is a construction error, not a silent 1-byte clamp.
+void test_zero_budget_rejected() {
+    std::printf("[A] zero byte budget rejected at construction\n");
+    bool threw = false;
+    try {
+        ByteBudgetLruCache<int, FakeEntry> zero(0);
+        (void)zero;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "CTOR: ByteBudgetLruCache(0) throws std::invalid_argument");
+}
+
+// (14) Mass eviction: one insert that must evict MANY entries at once, with
+// pinned (leased) entries older than every victim. The single-pass trim must
+// produce exactly the same victim set as the per-victim rescan did: the
+// LRU-ordered unpinned prefix whose bytes bring the total within budget,
+// pins skipped in place.
+void test_logic_mass_eviction_skips_pins() {
+    std::printf("[A] mass eviction: victim set with interleaved pins\n");
+    ByteBudgetLruCache<int, FakeEntry> cache(1000);
+
+    // Two OLD entries leased for the whole test: they sit at the LRU end and
+    // must be skipped by every eviction pass.
+    FakeEntry* p1 = cache.get_or_init_pinned(1, [](FakeEntry& v) {
+        v.bytes = 100; v.payload = 9001; return (size_t)100;
+    });
+    FakeEntry* p2 = cache.get_or_init_pinned(2, [](FakeEntry& v) {
+        v.bytes = 100; v.payload = 9002; return (size_t)100;
+    });
+    // Six unpinned fillers between the pins and the incoming entry.
+    for (int i = 3; i <= 8; ++i) acquire_and_release(cache, i, 100, i);
+    check(cache.size() == 8 && cache.bytes_in_use() == 800,
+          "MASS: pre-churn state (8 entries, 800 bytes)");
+
+    // A 700-byte insert (1500 total vs a 1000 budget) must mass-evict the
+    // unpinned LRU prefix 3..7 (500 bytes) to land exactly at budget, leaving
+    // the pins and the newest filler alone.
+    FakeEntry* big = cache.get_or_init_pinned(9, [](FakeEntry& v) {
+        v.bytes = 700; v.payload = 9009; return (size_t)700;
+    });
+    check(big != nullptr && cache.pinned_size() == 3,
+          "MASS: oversized insert admitted while pinned (3 leases live)");
+    cache.release(9);
+    check(cache.pinned_size() == 2, "MASS: insert lease released");
+
+    for (int k = 3; k <= 7; ++k)
+        check(cache.get(k) == nullptr,
+              "MASS: unpinned LRU prefix evicted (" + std::to_string(k) + ")");
+    check(cache.size() == 4 && cache.bytes_in_use() == 1000,
+          "MASS: lands at exactly the budget with pins + newest filler + insert");
+    check(cache.get(8) != nullptr && cache.get(9) != nullptr,
+          "MASS: newest filler and the inserted entry stay resident");
+    check(cache.get(1) == p1 && p1->payload == 9001,
+          "MASS: oldest pin survived with contents intact");
+    check(cache.get(2) == p2 && p2->payload == 9002,
+          "MASS: second pin survived with contents intact");
+    cache.release(1);
+    cache.release(2);
+    check(cache.pinned_size() == 0 &&
+              cache.bytes_in_use() <= cache.byte_budget(),
+          "MASS: pins released; budget holds at rest");
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +525,9 @@ int main() {
     test_logic_budget_lru_accounting();
     test_logic_pin_stability_and_oversize();
     test_logic_build_failure();
+    test_env_budget_parsing();
+    test_zero_budget_rejected();
+    test_logic_mass_eviction_skips_pins();
     test_real_graphs();
 
     if (g_failures) {

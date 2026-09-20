@@ -3,12 +3,16 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <list>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "trace.hpp"
 
@@ -34,6 +38,42 @@ inline size_t replay_cache_size() {
         if (v >= 1) return (size_t)v;
     }
     return device_replay_cache_default();
+}
+
+// Parse an environment variable as a mebibyte count into a byte budget (the
+// STARLING_*_BUDGET_MB pattern). Strict: the WHOLE value must be a decimal
+// integer of MiB in [1, SIZE_MAX >> 20]. Anything else — unset-adjacent
+// garbage like "foo", trailing junk like "64x", an empty value, zero, or a
+// negative — is REJECTED with a one-line diagnostic on stderr and
+// `default_bytes` is used (a malformed knob must not silently disable or
+// shrink the bound; atol's silent truncation is exactly what this replaces).
+// A parseable value too large to represent (ERANGE, or > SIZE_MAX >> 20 —
+// whose << 20 would wrap) is loudly CLAMPED to the largest representable
+// budget, (SIZE_MAX >> 20) MiB, rather than rejected: the operator asked for
+// "a lot", so they get the most the type can express, with a diagnostic.
+inline size_t env_budget_bytes(const char* var, size_t default_bytes) {
+    const char* e = std::getenv(var);
+    if (!e) return default_bytes;
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(e, &end, 10);
+    const size_t max_mib = SIZE_MAX >> 20;
+    if (end == e || *end != '\0' || v <= 0) {
+        std::fprintf(stderr,
+                     "starling: %s='%s' is invalid (expected an integer "
+                     "number of MiB >= 1); using the default budget "
+                     "(%zu bytes)\n",
+                     var, e, default_bytes);
+        return default_bytes;
+    }
+    if (errno == ERANGE || (unsigned long long)v > max_mib) {
+        std::fprintf(stderr,
+                     "starling: %s='%s' MiB exceeds the largest "
+                     "representable budget; clamping to %zu MiB\n",
+                     var, e, max_mib);
+        return max_mib << 20;
+    }
+    return (size_t)v << 20;
 }
 
 // A bounded LRU map. `Value` is typically an entry struct holding a
@@ -165,6 +205,11 @@ private:
 //     retained) and the exception propagates — a failed build never poisons
 //     the cache. (Callers that can leave a VALID-but-unusable entry must
 //     poison the value itself, like the encoder's pos-projection failure.)
+//   * A ZERO byte budget is rejected at construction (std::invalid_argument)
+//     rather than silently clamped: the env parser above already guarantees a
+//     validated budget on the production path, so zero can only be a
+//     direct-construction bug — fail loudly instead of running a cache that
+//     must evict everything.
 //
 // As above: callers serialize cache access; `label` names the cache in the
 // STARLING_TRACE "cache" records (size/capacity are BYTES here, evicted is an
@@ -175,7 +220,12 @@ template <typename Key, typename Value,
 class ByteBudgetLruCache {
 public:
     explicit ByteBudgetLruCache(size_t byte_budget, const char* label = nullptr)
-        : budget_(byte_budget == 0 ? 1 : byte_budget), label_(label) {}
+        : label_(label) {
+        if (byte_budget == 0)
+            throw std::invalid_argument(
+                "ByteBudgetLruCache: byte budget must be at least 1 byte");
+        budget_ = byte_budget;
+    }
 
     size_t size() const { return map_.size(); }
     size_t byte_budget() const { return budget_; }
@@ -283,27 +333,36 @@ private:
         if (!entry(it).pinned) { entry(it).pinned = true; ++pinned_; }
     }
 
-    // Evict unpinned LRU entries while over budget. Stops when only pinned
-    // entries remain (the at-rest invariant's escape hatch for oversized
-    // live leases). Returns the number of victims.
+    // Evict unpinned LRU entries while over budget. SINGLE back-to-front
+    // pass: walk LRU->MRU once, collecting unpinned victims (oldest first)
+    // until the projected remaining bytes fit the budget, then erase them in
+    // one sweep — one rescan per victim made mass eviction quadratic in the
+    // entry count. Pinned entries are skipped in place (a lease is never a
+    // victim); if the walk exhausts the list while still over budget,
+    // everything left is pinned (the at-rest invariant's escape hatch for
+    // oversized live leases). No-op when already within budget. Returns the
+    // number of victims. Invariants kept: bytes_in_use() <= budget at rest
+    // (except live leases), pinned entries never evicted, LRU victim order.
     size_t trim_over_budget() {
-        size_t evicted = 0;
-        while (bytes_ > budget_) {
-            bool evicted_one = false;
-            // LRU-back-to-front scan for the first unpinned entry.
-            for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
-                auto mit = map_.find(*lit);
-                if (mit == map_.end() || entry(mit).pinned) continue;
-                bytes_ -= entry(mit).bytes;
-                lru_.erase(std::next(lit).base());
-                map_.erase(mit);
-                ++evicted;
-                evicted_one = true;
-                break;                       // rescan from the new LRU back
-            }
-            if (!evicted_one) break;         // everything left is pinned
+        std::vector<typename Map::iterator> victims;
+        size_t victim_bytes = 0;
+        for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
+            if (bytes_ - victim_bytes <= budget_) break;   // budget met
+            auto mit = map_.find(*lit);
+            if (mit == map_.end() || entry(mit).pinned) continue;
+            victim_bytes += entry(mit).bytes;
+            victims.push_back(mit);
         }
-        return evicted;
+        // The sweep is safe: erasing an unordered_map node invalidates only
+        // its own iterator, and list erase does not invalidate other list
+        // iterators, so each victim's MapVal (holding its ListIt) stays
+        // readable until its own erasure.
+        for (auto mit : victims) {
+            bytes_ -= entry(mit).bytes;
+            lru_.erase(mit->second.first);
+            map_.erase(mit);
+        }
+        return victims.size();
     }
 
     void trace(const char* op, size_t evicted) const {
