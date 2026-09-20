@@ -626,11 +626,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92"
   },
   {
    "id": "G04",
@@ -654,11 +654,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92"
   },
   {
    "id": "G06",
@@ -668,11 +668,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92; TS behavioral reference = packages/dictation resample (issue #122 acceptance)"
   },
   {
    "id": "G07",
@@ -1064,6 +1064,17 @@
    "branch": null,
    "evidence": [],
    "notes": ""
+  }
+ ],
+ "active_assignments": [
+  {
+   "ids": [
+    "G03",
+    "G05",
+    "G06"
+   ],
+   "agent": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a"
   }
  ]
 }
