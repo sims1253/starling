@@ -154,9 +154,13 @@ void graph_build_event(double dur_ms, unsigned uid, int nodes,
 
 // cache: replay-cache admission. op is "hit" or "miss"; evicted counts LRU
 // victims of the inserting miss; mem_free < 0 renders as "unavailable"
-// (never fabricated).
+// (never fabricated). `pins` (byte-budget lease caches only) marks an event
+// from a pin/lease path — rendered as an extra "pin":1 field so a leased hit
+// is distinguishable from a plain-LRU hit of the same kind; the field is
+// omitted otherwise (additive, so the schema version stays v=1).
 void cache_event(const char* cache, const char* op, size_t evicted,
-                 size_t size, size_t capacity, long long mem_free);
+                 size_t size, size_t capacity, long long mem_free,
+                 bool pins = false);
 
 // ---- inline implementation ---------------------------------------------------
 
@@ -307,13 +311,15 @@ inline void graph_build_event(double dur_ms, unsigned uid, int nodes,
 }
 
 inline void cache_event(const char* cache, const char* op, size_t evicted,
-                        size_t size, size_t capacity, long long mem_free) {
+                        size_t size, size_t capacity, long long mem_free,
+                        bool pins) {
     if (!on()) return;
     std::string f = std::string("\"ev\":\"cache\",\"cache\":\"") + cache +
                     "\",\"op\":\"" + op +
                     "\",\"evicted\":" + std::to_string(evicted) +
                     ",\"size\":" + std::to_string(size) +
-                    ",\"cap\":" + std::to_string(capacity) + ",\"mem_free\":";
+                    ",\"cap\":" + std::to_string(capacity) +
+                    (pins ? ",\"pin\":1" : "") + ",\"mem_free\":";
     if (mem_free < 0)
         f += "\"unavailable\"";
     else
