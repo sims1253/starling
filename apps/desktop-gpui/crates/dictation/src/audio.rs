@@ -6,6 +6,19 @@
 /// Server-side capture format every upload is normalized to.
 pub const STARLING_SAMPLE_RATE: u32 = 16_000;
 
+/// Highest input sample rate the sinc resampler accepts (R15).
+///
+/// Professional audio hardware tops out at 384 kHz and every real capture
+/// device sits below it; past that only the kernel pays. Its half-width is
+/// `ceil(4 / cutoff) ≈ 8.9 × sample_rate / 16_000`, so a mislabeled or
+/// hostile import claiming a GHz-scale rate would make the resampler spend
+/// pathological taps — and time — per output sample. Rates above the
+/// ceiling are rejected outright, as a device would refuse them, never
+/// clamped: silently resampling a mislabeled file would fabricate audio at
+/// the wrong speed. With this ceiling the kernel half-width is bounded at
+/// 214 taps.
+pub const MAX_RESAMPLE_INPUT_RATE: u32 = 384_000;
+
 /// Interleaved floating-point PCM in the range -1..=1.
 #[derive(Clone, Debug)]
 pub struct PcmAudio {
@@ -97,8 +110,9 @@ pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
 /// linear interpolation did (a 12 kHz tone at 48 kHz became a 4 kHz tone
 /// at unchanged level). Deterministic output, mono mixdown, and duration
 /// are preserved; edges are handled by replicating the first/last input
-/// sample. Native recording APIs should still request 16 kHz directly
-/// when possible.
+/// sample. Input rates above [`MAX_RESAMPLE_INPUT_RATE`] are rejected
+/// rather than resampled (R15). Native recording APIs should still request
+/// 16 kHz directly when possible.
 ///
 /// Whole-recording batch contract: this runs once over the finished buffer
 /// (capture drains at Stop, imports arrive whole), so there is deliberately
@@ -109,6 +123,14 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
 
     if audio.sample_rate == STARLING_SAMPLE_RATE {
         return Ok(mono);
+    }
+
+    // R15: reject rates no real device produces instead of letting the
+    // kernel width grow with them (~8.9 taps per 16 kHz of input rate).
+    if audio.sample_rate > MAX_RESAMPLE_INPUT_RATE {
+        return Err(error(&format!(
+            "sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz"
+        )));
     }
 
     let output_length = ((mono.len() as f64 * f64::from(STARLING_SAMPLE_RATE))
@@ -122,11 +144,11 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     // window yields ~-74 dB stopband sidelobes and keeps aliases past the
     // transition band >= 40 dB down (>= 85 dB for 48 kHz and 44.1 kHz
     // inputs); tapCount covers upsampling too (ratio < 1 keeps the full
-    // input band).
+    // input band). With [`MAX_RESAMPLE_INPUT_RATE`] enforced above,
+    // `half_taps` is bounded at 214.
     let ratio = f64::from(audio.sample_rate) / f64::from(STARLING_SAMPLE_RATE);
     let cutoff = 0.45 * f64::min(1.0, 1.0 / ratio);
     let half_taps = (4.0 / cutoff).ceil() as i64;
-    let last_input = mono.len() as i64 - 1;
 
     let mut output = Vec::with_capacity(output_length);
 
@@ -134,36 +156,56 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
         let position = index as f64 * ratio;
         let center = position.floor() as i64;
         let fraction = position - center as f64;
-
-        // Weighted sinc interpolation centered at `position` (in input
-        // samples). Normalizing by the weight sum pins the DC gain to
-        // exactly 1.
-        let mut sum = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for tap in -half_taps..=half_taps {
-            let offset = tap as f64 - fraction;
-            let cosine = (std::f64::consts::PI * offset / half_taps as f64).cos();
-            let window = 0.42 + 0.5 * cosine + 0.08 * (2.0 * cosine * cosine - 1.0);
-            let angle = 2.0 * std::f64::consts::PI * cutoff * offset;
-            let sinc = if angle == 0.0 { 1.0 } else { angle.sin() / angle };
-            let coefficient = window * sinc;
-
-            let sample_index = center + tap;
-            let sample = f64::from(mono[sample_index.clamp(0, last_input) as usize]);
-
-            sum += sample * coefficient;
-            weight_sum += coefficient;
-        }
-
-        output.push(if weight_sum > 0.0 {
-            (sum / weight_sum) as f32
-        } else {
-            0.0
-        });
+        output.push(sinc_sample(&mono, center, fraction, half_taps, cutoff));
     }
 
     Ok(output)
+}
+
+/// One windowed-sinc output sample at fractional input position
+/// `center + fraction` (R16). Pure: the kernel parameters and the input
+/// determine the output. Taps that fall outside the input replicate the
+/// nearest edge, as the batch contract documents.
+///
+/// A kernel whose weight sum is not positive resolves to nearest-edge
+/// replication of the input at `center` — never a fabricated `0.0`, which
+/// would quietly punch silence into the take and erase whatever the real
+/// neighbors say. For every cutoff the legal rate range can produce
+/// (`0 < cutoff <= 0.45`) the kernel's DC gain stays above 1.1, so the
+/// branch is defensive; it exists so that a degenerate kernel cannot fail
+/// silently *and invisibly*.
+fn sinc_sample(mono: &[f32], center: i64, fraction: f64, half_taps: i64, cutoff: f64) -> f32 {
+    let last_input = mono.len() as i64 - 1;
+
+    // Weighted sinc interpolation centered at `position` (in input
+    // samples). Normalizing by the weight sum pins the DC gain to
+    // exactly 1.
+    let mut sum = 0.0f64;
+    let mut weight_sum = 0.0f64;
+
+    for tap in -half_taps..=half_taps {
+        let offset = tap as f64 - fraction;
+        let cosine = (std::f64::consts::PI * offset / half_taps as f64).cos();
+        let window = 0.42 + 0.5 * cosine + 0.08 * (2.0 * cosine * cosine - 1.0);
+        let angle = 2.0 * std::f64::consts::PI * cutoff * offset;
+        let sinc = if angle == 0.0 { 1.0 } else { angle.sin() / angle };
+        let coefficient = window * sinc;
+
+        let sample_index = center + tap;
+        let sample = f64::from(mono[sample_index.clamp(0, last_input) as usize]);
+
+        sum += sample * coefficient;
+        weight_sum += coefficient;
+    }
+
+    if weight_sum > 0.0 {
+        (sum / weight_sum) as f32
+    } else {
+        // R16: replicate the actual input nearest the output position —
+        // edge value when clamping pinned every tap to one end — instead
+        // of fabricating silence.
+        f64::from(mono[center.clamp(0, last_input) as usize]) as f32
+    }
 }
 
 /// ECMAScript `Math.round` for finite `x`: the closest integer, with ties
@@ -560,6 +602,75 @@ mod tests {
             resample_to_16k(&native).expect("resample succeeds"),
             vec![0.25, -0.75]
         );
+    }
+
+    #[test]
+    fn rejects_input_rates_beyond_the_resampling_ceiling() {
+        // R15: a mislabeled or hostile rate field must be rejected, not
+        // resampled — the kernel half-width grows as ~8.9 × rate/16000,
+        // so a u32::max rate would demand ~2.4M taps per output sample.
+        assert_eq!(
+            message_of(resample_to_16k(&mono(&[0.5], u32::MAX))),
+            "sampleRate must not exceed 384000 Hz"
+        );
+        assert_eq!(
+            message_of(resample_to_16k(&mono(&[0.5], MAX_RESAMPLE_INPUT_RATE + 1))),
+            format!("sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz")
+        );
+
+        // The ceiling itself still resamples (output length clamps to >= 1).
+        assert_eq!(
+            resample_to_16k(&mono(&[0.5], MAX_RESAMPLE_INPUT_RATE))
+                .expect("384 kHz is the documented ceiling")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_mislabeled_import_rate_is_rejected_at_prepare_time() {
+        // End to end: the WAV decoder accepts any nonzero rate, so the
+        // ceiling is what stops a mislabeled import from reaching the
+        // sinc path.
+        let fmt = chunk(b"fmt ", &fmt_body(1, 1_000_000, 16, 1));
+        let data = chunk(b"data", &[0, 0, 0, 0]);
+        let bytes = wav_from_chunks(&[fmt, data]);
+        assert_eq!(
+            message_of(prepare_wav_16k(&bytes)),
+            format!("sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz")
+        );
+    }
+
+    #[test]
+    fn a_degenerate_kernel_replicates_the_edge_instead_of_fabricating_silence() {
+        // R16: when a kernel's weight sum is not positive, the output must
+        // be the replicated input sample nearest the position — 0.0 would
+        // quietly punch silence into the take.
+        //
+        // These parameters cannot come from a legal rate (production cutoff
+        // is capped at 0.45); cutoff just past Nyquist drives the windowed
+        // sinc's DC sum negative at the half-sample position, exercising the
+        // defensive branch deterministically.
+        let input = [0.1, 0.2, 0.3, 0.4, 0.75, 0.6, 0.5, 0.4, 0.3];
+        let center = 4i64;
+        let value = sinc_sample(&input, center, 0.5, 4, 1.001);
+        assert_eq!(value, input[center as usize]);
+        assert_ne!(value, 0.0, "degenerate kernels must not emit silence");
+
+        // Outside the input, the fallback clamps to the nearest edge.
+        assert_eq!(sinc_sample(&input, -50, 0.5, 4, 1.001), input[0]);
+        assert_eq!(sinc_sample(&input, 500, 0.5, 4, 1.001), input[input.len() - 1]);
+    }
+
+    #[test]
+    fn the_sinc_kernel_holds_dc_at_exact_unity_gain() {
+        // Every tap of a constant input contributes the same sample, so
+        // sum / weight_sum must return it bit-exactly — the normalized
+        // kernel's DC gain is pinned to 1 (the property the degenerate
+        // fallback protects when the weights themselves go wrong).
+        let input = [0.25f32; 64];
+        assert_eq!(sinc_sample(&input, 32, 0.0, 9, 0.45), 0.25);
+        assert_eq!(sinc_sample(&input, 32, 0.37, 9, 0.45), 0.25);
     }
 
     /// Amplitude of `frequency_hz` in `samples` at `sample_rate`, by complex

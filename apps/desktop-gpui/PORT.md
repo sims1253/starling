@@ -89,7 +89,12 @@ fractional input position, with the cutoff at 90% of the lower Nyquist
 frequency, so content above the output band is attenuated instead of folding
 into it: a 12 kHz tone in 48 kHz input no longer aliases to 4 kHz at unchanged
 level, and the suite pins that leak at >= 40 dB down (the linear kernel this
-replaced fails that fixture at essentially full amplitude). The kernel is a
+replaced fails that fixture at essentially full amplitude). Input rates above
+`audio::MAX_RESAMPLE_INPUT_RATE` (384 kHz) are rejected outright (R15) — the
+kernel half-width grows as ~8.9 × rate/16 000, so a mislabeled or hostile
+rate field would otherwise cost pathological taps per output sample — and a
+kernel whose weight sum is not positive falls back to nearest-edge
+replication instead of emitting a fabricated 0.0 (R16). The kernel is a
 deliberate Rust-side divergence from `resampleTo16k` in
 `packages/dictation/src/audio.ts`, which still linearly interpolates; the TS
 implementation remains the semantic source for the rest of the audio contract
