@@ -92,7 +92,7 @@ jobs:
       # run them only where their binaries were built (see Build (CPU)).
       - name: Engine contract tests (KV clearing, termination semantics)
         run: |
-          for t in device_cache_clear_test greedy_termination_test; do
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
             if [ -x "build/$t" ]; then "./build/$t"; fi
           done
 
