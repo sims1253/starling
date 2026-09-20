@@ -1,0 +1,31 @@
+{
+  "machine": "jobs",
+  "description": "Corpus-level ordering violation: jobs.submit references route \"route-never-frozen\", which no prior mode.routeFrozen event ever froze. Audio (a capture handed to recognition) may only leave the runtime on a route that was frozen while the context machine was in ModeDecided; the machine-level replay alone is green, the route-freeze rule is what rejects this trace.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "route_not_frozen",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_930",
+      "ts": "2026-09-20T10:09:30Z",
+      "corr": "job-10",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": {
+        "captureRef": "take_78",
+        "route": "route-never-frozen",
+        "budget": "standard"
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_930",
+      "ts": "2026-09-20T10:09:30Z",
+      "corr": "job-10",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    }
+  ]
+}

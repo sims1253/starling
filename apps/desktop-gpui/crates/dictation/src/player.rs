@@ -5,7 +5,9 @@
 //! One rodio output stream is kept alive for the [`Player`]'s lifetime;
 //! `play` decodes the WAV into a fresh [`rodio::Sink`], replacing any current
 //! playback (like assigning a new `src` to the audio element). `is_playing`
-//! is an `AtomicBool` that a watcher thread clears once the sink drains.
+//! is an `AtomicBool` that a single long-lived watcher thread clears once
+//! the current sink drains (R10: one thread for the player's lifetime, not
+//! one per playback).
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,7 +15,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// How often the watcher checks whether playback has drained.
+/// How often the watcher checks whether playback has drained. It only polls
+/// while a sink is actually live; idle, it blocks on the wake channel.
 const WATCHER_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +54,9 @@ impl PlaybackState {
 struct Inner {
     handle: rodio::OutputStreamHandle,
     state: Arc<PlaybackState>,
+    /// Wakes the playback watcher when a new sink is published. The sender
+    /// disconnects when the player drops, telling the watcher to exit.
+    watcher_wake: mpsc::SyncSender<()>,
     /// Disconnects when the player drops, telling the owner thread to exit
     /// (which ends playback and releases the device).
     _shutdown: mpsc::Sender<()>,
@@ -92,14 +98,26 @@ impl Player {
             })?
             .map_err(|err| PlayerError(err.0))?;
 
+        // R10: the one and only playback watcher, alive for the player's
+        // lifetime. It sleeps on the wake channel until a playback starts,
+        // then polls at WATCHER_POLL until that sink drains.
+        let state = Arc::new(PlaybackState {
+            current: Mutex::new(None),
+            epoch: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+        });
+        let (watcher_wake, watcher_rx) = mpsc::sync_channel::<()>(1);
+        let watcher_state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("starling-playback".into())
+            .spawn(move || watch_playback(watcher_state, watcher_rx))
+            .map_err(|err| PlayerError(format!("Could not start the playback watcher: {err}")))?;
+
         Ok(Self {
             inner: Arc::new(Inner {
                 handle,
-                state: Arc::new(PlaybackState {
-                    current: Mutex::new(None),
-                    epoch: AtomicU64::new(0),
-                    playing: AtomicBool::new(false),
-                }),
+                state,
+                watcher_wake,
                 _shutdown: shutdown_tx,
             }),
         })
@@ -133,19 +151,10 @@ impl Player {
         *current = Some((epoch, sink));
         drop(current);
 
-        // Watcher thread: clears `playing` once this generation's sink drains.
-        let state = Arc::clone(&self.inner.state);
-        if let Err(err) = std::thread::Builder::new()
-            .name("starling-playback".into())
-            .spawn(move || watch_until_drained(state, epoch))
-        {
-            // No watcher means `is_playing` would never settle — stop rather
-            // than leave a stuck flag behind.
-            self.stop();
-            return Err(PlayerError(format!(
-                "Could not start playback thread: {err}"
-            )));
-        }
+        // Wake the watcher so it starts polling this sink for drain. A
+        // token queued while it is already polling only costs one extra
+        // idle check, so a lost/ignored token is harmless.
+        let _ = self.inner.watcher_wake.try_send(());
         Ok(())
     }
 
@@ -165,28 +174,42 @@ impl Player {
     }
 }
 
-/// Body of the per-playback watcher thread. Exits as soon as `epoch` is no
-/// longer the active generation (replaced or stopped); otherwise clears the
-/// playing flag and drops the drained sink.
-fn watch_until_drained(state: Arc<PlaybackState>, epoch: u64) {
-    loop {
-        std::thread::sleep(WATCHER_POLL);
-        let current = state.lock_current();
-        match current.as_ref() {
-            Some((active, sink)) if *active == epoch => {
-                // rodio 0.20: `Sink::empty()` (len() == 0), no `is_empty`.
-                if sink.empty() {
-                    drop(current);
-                    state.playing.store(false, Ordering::Relaxed);
-                    let mut current = state.lock_current();
-                    if matches!(current.as_ref(), Some((active, _)) if *active == epoch) {
-                        *current = None;
-                    }
-                    return;
+/// Body of the player's single long-lived watcher thread (R10).
+///
+/// Idle, it blocks on `wake` — no polling, no wakeups. A published playback
+/// wakes it; it then polls at `WATCHER_POLL` until the current sink drains
+/// (clearing `playing` and dropping the sink, double-checked against the
+/// epoch in case a newer playback replaced it mid-check), or until there is
+/// nothing current (stopped/replaced), at which point it goes back to
+/// sleep. The channel disconnecting (player dropped) ends the thread.
+fn watch_playback(state: Arc<PlaybackState>, wake: mpsc::Receiver<()>) {
+    while wake.recv().is_ok() {
+        loop {
+            std::thread::sleep(WATCHER_POLL);
+            let drained_epoch = {
+                let current = state.lock_current();
+                match current.as_ref() {
+                    // rodio 0.20: `Sink::empty()` (len() == 0), no `is_empty`.
+                    Some((epoch, sink)) if sink.empty() => Some(*epoch),
+                    // Still audible: poll again.
+                    Some(_) => None,
+                    // Stopped or replaced: back to sleep until the next wake.
+                    None => break,
                 }
+            };
+
+            let Some(epoch) = drained_epoch else {
+                continue;
+            };
+
+            state.playing.store(false, Ordering::Relaxed);
+            let mut current = state.lock_current();
+            // A playback may have been published between the check and this
+            // lock; only the generation we saw drain may be removed.
+            if matches!(current.as_ref(), Some((active, _)) if *active == epoch) {
+                *current = None;
             }
-            // Replaced by a newer playback, stopped, or not ours anymore.
-            _ => return,
+            break;
         }
     }
 }
@@ -263,7 +286,14 @@ mod tests {
 
     #[test]
     fn play_silence_reports_playing_then_finishes() {
-        let player = Player::new().expect("player with output device");
+        // Headless CI has no output device: skip rather than panic (the
+        // device-dependent behaviors are covered wherever audio exists).
+        let Ok(player) = Player::new() else {
+            eprintln!("skipping: no audio output device");
+
+            return;
+        };
+
         assert!(!player.is_playing());
 
         player.play(&silence_wav_16k(0.5)).expect("play silence");
@@ -278,7 +308,14 @@ mod tests {
 
     #[test]
     fn play_replaces_current_playback() {
-        let player = Player::new().expect("player with output device");
+        // Headless CI has no output device: skip rather than panic (the
+        // device-dependent behaviors are covered wherever audio exists).
+        let Ok(player) = Player::new() else {
+            eprintln!("skipping: no audio output device");
+
+            return;
+        };
+
         player.play(&silence_wav_16k(30.0)).expect("play long clip");
         player
             .play(&silence_wav_16k(0.25))
@@ -292,7 +329,14 @@ mod tests {
 
     #[test]
     fn stop_stops_playback_immediately() {
-        let player = Player::new().expect("player with output device");
+        // Headless CI has no output device: skip rather than panic (the
+        // device-dependent behaviors are covered wherever audio exists).
+        let Ok(player) = Player::new() else {
+            eprintln!("skipping: no audio output device");
+
+            return;
+        };
+
         player.play(&silence_wav_16k(30.0)).expect("play long clip");
         player.stop();
         assert!(!player.is_playing());
@@ -300,7 +344,14 @@ mod tests {
 
     #[test]
     fn play_rejects_bytes_that_are_not_wav() {
-        let player = Player::new().expect("player with output device");
+        // Headless CI has no output device: skip rather than panic (the
+        // device-dependent behaviors are covered wherever audio exists).
+        let Ok(player) = Player::new() else {
+            eprintln!("skipping: no audio output device");
+
+            return;
+        };
+
         assert!(player.play(&[0u8; 16]).is_err());
         assert!(!player.is_playing());
     }

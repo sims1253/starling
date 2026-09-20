@@ -6,6 +6,19 @@
 /// Server-side capture format every upload is normalized to.
 pub const STARLING_SAMPLE_RATE: u32 = 16_000;
 
+/// Highest input sample rate the sinc resampler accepts (R15).
+///
+/// Professional audio hardware tops out at 384 kHz and every real capture
+/// device sits below it; past that only the kernel pays. Its half-width is
+/// `ceil(4 / cutoff) ≈ 8.9 × sample_rate / 16_000`, so a mislabeled or
+/// hostile import claiming a GHz-scale rate would make the resampler spend
+/// pathological taps — and time — per output sample. Rates above the
+/// ceiling are rejected outright, as a device would refuse them, never
+/// clamped: silently resampling a mislabeled file would fabricate audio at
+/// the wrong speed. With this ceiling the kernel half-width is bounded at
+/// 214 taps.
+pub const MAX_RESAMPLE_INPUT_RATE: u32 = 384_000;
+
 /// Interleaved floating-point PCM in the range -1..=1.
 #[derive(Clone, Debug)]
 pub struct PcmAudio {
@@ -87,8 +100,24 @@ pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
 
 /// Resample interleaved floating-point PCM to mono 16 kHz.
 ///
-/// Linear interpolation is intentionally dependency-free and deterministic.
-/// Native recording APIs should still request 16 kHz directly when possible.
+/// Anti-aliased and still dependency-free (issue #122), a port of
+/// `resampleTo16k` in `packages/dictation/src/audio.ts`: each output sample
+/// is a Blackman-windowed sinc kernel evaluated at its exact fractional
+/// input position — a windowed-sinc low-pass whose cutoff tracks the lower
+/// of the two Nyquist frequencies, so content above the output band is
+/// attenuated (>= 40 dB past the transition band; ~85 dB for 48/44.1 kHz
+/// inputs) instead of folding into it at full amplitude the way plain
+/// linear interpolation did (a 12 kHz tone at 48 kHz became a 4 kHz tone
+/// at unchanged level). Deterministic output, mono mixdown, and duration
+/// are preserved; edges are handled by replicating the first/last input
+/// sample. Input rates above [`MAX_RESAMPLE_INPUT_RATE`] are rejected
+/// rather than resampled (R15). Native recording APIs should still request
+/// 16 kHz directly when possible.
+///
+/// Whole-recording batch contract: this runs once over the finished buffer
+/// (capture drains at Stop, imports arrive whole), so there is deliberately
+/// no inter-chunk filter state to carry; streaming/stateful resampling
+/// belongs to a capture-pipeline redesign, not to this function.
 pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     let mono = mix_to_mono(audio)?;
 
@@ -96,39 +125,125 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
         return Ok(mono);
     }
 
+    // R15: reject rates no real device produces instead of letting the
+    // kernel width grow with them (~8.9 taps per 16 kHz of input rate).
+    if audio.sample_rate > MAX_RESAMPLE_INPUT_RATE {
+        return Err(error(&format!(
+            "sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz"
+        )));
+    }
+
     let output_length = ((mono.len() as f64 * f64::from(STARLING_SAMPLE_RATE))
         / f64::from(audio.sample_rate))
     .round()
     .max(1.0) as usize;
 
-    let mut output = Vec::with_capacity(output_length);
+    // Kernel design: cutoff at 90% of the lower Nyquist (7.2 kHz passband
+    // edge for 16 kHz output) with a half-width of four sinc main-lobe zero
+    // crossings on each side of every output position. The 3-term Blackman
+    // window yields ~-74 dB stopband sidelobes and keeps aliases past the
+    // transition band >= 40 dB down (>= 85 dB for 48 kHz and 44.1 kHz
+    // inputs); tapCount covers upsampling too (ratio < 1 keeps the full
+    // input band). With [`MAX_RESAMPLE_INPUT_RATE`] enforced above,
+    // `half_taps` is bounded at 214.
     let ratio = f64::from(audio.sample_rate) / f64::from(STARLING_SAMPLE_RATE);
-    let last = mono.len() - 1;
+    let cutoff = 0.45 * f64::min(1.0, 1.0 / ratio);
+    let half_taps = (4.0 / cutoff).ceil() as i64;
+
+    let mut output = Vec::with_capacity(output_length);
 
     for index in 0..output_length {
         let position = index as f64 * ratio;
-        let left = (position.floor() as usize).min(last);
-        let right = (left + 1).min(last);
-        let fraction = position - left as f64;
-        let left_sample = f64::from(mono[left]);
-        output.push((left_sample + (f64::from(mono[right]) - left_sample) * fraction) as f32);
+        let center = position.floor() as i64;
+        let fraction = position - center as f64;
+        output.push(sinc_sample(&mono, center, fraction, half_taps, cutoff));
     }
 
     Ok(output)
 }
 
+/// One windowed-sinc output sample at fractional input position
+/// `center + fraction` (R16). Pure: the kernel parameters and the input
+/// determine the output. Taps that fall outside the input replicate the
+/// nearest edge, as the batch contract documents.
+///
+/// A kernel whose weight sum is not positive resolves to nearest-edge
+/// replication of the input at `center` — never a fabricated `0.0`, which
+/// would quietly punch silence into the take and erase whatever the real
+/// neighbors say. For every cutoff the legal rate range can produce
+/// (`0 < cutoff <= 0.45`) the kernel's DC gain stays above 1.1, so the
+/// branch is defensive; it exists so that a degenerate kernel cannot fail
+/// silently *and invisibly*.
+fn sinc_sample(mono: &[f32], center: i64, fraction: f64, half_taps: i64, cutoff: f64) -> f32 {
+    let last_input = mono.len() as i64 - 1;
+
+    // Weighted sinc interpolation centered at `position` (in input
+    // samples). Normalizing by the weight sum pins the DC gain to
+    // exactly 1.
+    let mut sum = 0.0f64;
+    let mut weight_sum = 0.0f64;
+
+    for tap in -half_taps..=half_taps {
+        let offset = tap as f64 - fraction;
+        let cosine = (std::f64::consts::PI * offset / half_taps as f64).cos();
+        let window = 0.42 + 0.5 * cosine + 0.08 * (2.0 * cosine * cosine - 1.0);
+        let angle = 2.0 * std::f64::consts::PI * cutoff * offset;
+        let sinc = if angle == 0.0 { 1.0 } else { angle.sin() / angle };
+        let coefficient = window * sinc;
+
+        let sample_index = center + tap;
+        let sample = f64::from(mono[sample_index.clamp(0, last_input) as usize]);
+
+        sum += sample * coefficient;
+        weight_sum += coefficient;
+    }
+
+    if weight_sum > 0.0 {
+        (sum / weight_sum) as f32
+    } else {
+        // R16: replicate the actual input nearest the output position —
+        // edge value when clamping pinned every tap to one end — instead
+        // of fabricating silence.
+        f64::from(mono[center.clamp(0, last_input) as usize]) as f32
+    }
+}
+
+/// ECMAScript `Math.round` for finite `x`: the closest integer, with ties
+/// going toward positive infinity (`Math.round(-1.5)` is `-1`). Rust's
+/// `f64::round` instead rounds ties away from zero — exactly the
+/// divergence G07 pinned down.
+///
+/// One deliberate, documented divergence from the letter of ECMAScript:
+/// for `-0.5 <= x < 0` JS produces negative zero (`Math.round(-0.5)` and
+/// `Math.round(-0.2)` are both `-0`), while the `floor + 1.0` form here
+/// returns `+0.0`. Harmless for the only caller, [`pcm16`]: `-0.0` and
+/// `+0.0` both cast to the i16 sample `0`, so the encoded WAV is
+/// byte-identical either way.
+fn js_round(x: f64) -> f64 {
+    let floor = x.floor();
+    let fraction = x - floor;
+    if fraction < 0.5 {
+        floor
+    } else {
+        floor + 1.0
+    }
+}
+
 /// Mirrors `pcm16` in audio.ts: non-finite becomes 0, clamps to -1..=1, then
-/// rounds half away from zero with the asymmetric scales JS applies
-/// (`0x8000` for negatives, `0x7fff` for non-negatives). The multiply happens
-/// in f64 because JS numbers are f64 even for Float32Array elements.
+/// rounds with JS `Math.round` semantics — ties toward positive infinity,
+/// not the half-away-from-zero of `f64::round` (G07: `-2^-16` scales to
+/// exactly -0.5, which `Math.round` maps to 0, where `f64::round` gave -1)
+/// — with the asymmetric scales JS applies (`0x8000` for negatives,
+/// `0x7fff` for non-negatives). The multiply happens in f64 because JS
+/// numbers are f64 even for Float32Array elements.
 fn pcm16(sample: f32) -> i16 {
     let finite = if sample.is_finite() { sample } else { 0.0 };
     let clamped = finite.max(-1.0).min(1.0);
 
     if clamped < 0.0 {
-        (f64::from(clamped) * f64::from(0x8000)).round() as i16
+        js_round(f64::from(clamped) * f64::from(0x8000)) as i16
     } else {
-        (f64::from(clamped) * f64::from(0x7fff)).round() as i16
+        js_round(f64::from(clamped) * f64::from(0x7fff)) as i16
     }
 }
 
@@ -396,6 +511,41 @@ mod tests {
     }
 
     #[test]
+    fn pcm16_matches_the_shared_rounding_contract_fixture() {
+        // Shared with the TypeScript encoder (G07): packages/dictation's
+        // vitest suite consumes the same file, and audio.ts is the semantic
+        // source of the contract. The negative half-tie cases fail under a
+        // deliberate switch back to round-half-away-from-zero.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/pcm-rounding.json"
+        );
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read shared fixture {path}: {err}"));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&raw).expect("fixture is valid JSON");
+        let cases = fixture["cases"].as_array().expect("fixture cases array");
+        assert!(cases.len() >= 15, "fixture must keep its coverage");
+
+        for case in cases {
+            let input = match &case["input"] {
+                serde_json::Value::Number(number) => {
+                    number.as_f64().expect("finite fixture input") as f32
+                }
+                serde_json::Value::String(literal) => match literal.as_str() {
+                    "NaN" => f32::NAN,
+                    "Infinity" => f32::INFINITY,
+                    "-Infinity" => f32::NEG_INFINITY,
+                    other => panic!("unsupported non-finite literal {other}"),
+                },
+                other => panic!("unsupported fixture input {other}"),
+            };
+            let expected = case["expected"].as_i64().expect("expected i16") as i16;
+            assert_eq!(pcm16(input), expected, "fixture case {case}");
+        }
+    }
+
+    #[test]
     fn rejects_truncated_wav_chunks_instead_of_treating_them_as_pcm() {
         let audio = mono(&[0.0, 0.0], 16_000);
         let mut bytes = encode_wav_16k(&audio).expect("encode succeeds");
@@ -436,13 +586,14 @@ mod tests {
     }
 
     #[test]
-    fn resample_matches_lengths_and_interpolates_linearly() {
-        // Downsampling 8 kHz → 16 kHz: 3 frames become 6, interpolated.
+    fn resample_preserves_lengths_and_passes_native_through() {
+        // Downsampling 8 kHz → 16 kHz: 3 frames become 6, all finite.
+        // (Exact sample values are no longer pinned to linear interpolation;
+        // the anti-aliasing suite below owns spectral behavior.)
         let audio = mono(&[0.0, 1.0, 0.0], 8_000);
-        assert_eq!(
-            resample_to_16k(&audio).expect("resample succeeds"),
-            vec![0.0, 0.5, 1.0, 0.5, 0.0, 0.0]
-        );
+        let output = resample_to_16k(&audio).expect("resample succeeds");
+        assert_eq!(output.len(), 6);
+        assert!(output.iter().all(|sample| sample.is_finite()));
 
         // The output length never collapses to zero: round(1 * 16000/96000)
         // is 0, clamped to 1.
@@ -457,6 +608,246 @@ mod tests {
         assert_eq!(
             resample_to_16k(&native).expect("resample succeeds"),
             vec![0.25, -0.75]
+        );
+    }
+
+    #[test]
+    fn rejects_input_rates_beyond_the_resampling_ceiling() {
+        // R15: a mislabeled or hostile rate field must be rejected, not
+        // resampled — the kernel half-width grows as ~8.9 × rate/16000,
+        // so a u32::max rate would demand ~2.4M taps per output sample.
+        assert_eq!(
+            message_of(resample_to_16k(&mono(&[0.5], u32::MAX))),
+            "sampleRate must not exceed 384000 Hz"
+        );
+        assert_eq!(
+            message_of(resample_to_16k(&mono(&[0.5], MAX_RESAMPLE_INPUT_RATE + 1))),
+            format!("sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz")
+        );
+
+        // The ceiling itself still resamples (output length clamps to >= 1).
+        assert_eq!(
+            resample_to_16k(&mono(&[0.5], MAX_RESAMPLE_INPUT_RATE))
+                .expect("384 kHz is the documented ceiling")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_mislabeled_import_rate_is_rejected_at_prepare_time() {
+        // End to end: the WAV decoder accepts any nonzero rate, so the
+        // ceiling is what stops a mislabeled import from reaching the
+        // sinc path.
+        let fmt = chunk(b"fmt ", &fmt_body(1, 1_000_000, 16, 1));
+        let data = chunk(b"data", &[0, 0, 0, 0]);
+        let bytes = wav_from_chunks(&[fmt, data]);
+        assert_eq!(
+            message_of(prepare_wav_16k(&bytes)),
+            format!("sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz")
+        );
+    }
+
+    #[test]
+    fn a_degenerate_kernel_replicates_the_edge_instead_of_fabricating_silence() {
+        // R16: when a kernel's weight sum is not positive, the output must
+        // be the replicated input sample nearest the position — 0.0 would
+        // quietly punch silence into the take.
+        //
+        // These parameters cannot come from a legal rate (production cutoff
+        // is capped at 0.45); cutoff just past Nyquist drives the windowed
+        // sinc's DC sum negative at the half-sample position, exercising the
+        // defensive branch deterministically.
+        let input = [0.1, 0.2, 0.3, 0.4, 0.75, 0.6, 0.5, 0.4, 0.3];
+        let center = 4i64;
+        let value = sinc_sample(&input, center, 0.5, 4, 1.001);
+        assert_eq!(value, input[center as usize]);
+        assert_ne!(value, 0.0, "degenerate kernels must not emit silence");
+
+        // Outside the input, the fallback clamps to the nearest edge.
+        assert_eq!(sinc_sample(&input, -50, 0.5, 4, 1.001), input[0]);
+        assert_eq!(sinc_sample(&input, 500, 0.5, 4, 1.001), input[input.len() - 1]);
+    }
+
+    #[test]
+    fn the_sinc_kernel_holds_dc_at_exact_unity_gain() {
+        // Every tap of a constant input contributes the same sample, so
+        // sum / weight_sum must return it bit-exactly — the normalized
+        // kernel's DC gain is pinned to 1 (the property the degenerate
+        // fallback protects when the weights themselves go wrong).
+        let input = [0.25f32; 64];
+        assert_eq!(sinc_sample(&input, 32, 0.0, 9, 0.45), 0.25);
+        assert_eq!(sinc_sample(&input, 32, 0.37, 9, 0.45), 0.25);
+    }
+
+    #[test]
+    fn js_round_ties_go_toward_positive_infinity_as_positive_zero() {
+        // Documented divergence (R17): ECMAScript yields -0 for
+        // -0.5 <= x < 0; the floor+1 form yields +0. Both encode to the
+        // same pcm16 sample, and the tie direction itself still matches
+        // JS for every nonzero result.
+        assert_eq!(js_round(-1.5), -1.0);
+        assert_eq!(js_round(-0.5), 0.0);
+        assert!(js_round(-0.5).is_sign_positive());
+        assert_eq!(js_round(-0.2), 0.0);
+        assert!(js_round(-0.2).is_sign_positive());
+        assert_eq!(js_round(0.5), 1.0);
+        assert_eq!(js_round(1.5), 2.0);
+    }
+
+    /// Amplitude of `frequency_hz` in `samples` at `sample_rate`, by complex
+    /// correlation over a whole number of cycles (leakage-free for pure
+    /// tones whose cycle count is an integer).
+    fn tone_amplitude(samples: &[f32], sample_rate: u32, frequency_hz: f64) -> f64 {
+        let cycles = ((samples.len() as f64 * frequency_hz) / f64::from(sample_rate)).floor();
+        let window = ((cycles * f64::from(sample_rate)) / frequency_hz).round() as usize;
+        let mut real = 0.0f64;
+        let mut imaginary = 0.0f64;
+
+        for (index, &sample) in samples.iter().take(window).enumerate() {
+            let phase = 2.0 * std::f64::consts::PI * frequency_hz * index as f64
+                / f64::from(sample_rate);
+            real += f64::from(sample) * phase.cos();
+            imaginary -= f64::from(sample) * phase.sin();
+        }
+
+        if window == 0 {
+            return 0.0;
+        }
+        2.0 * (real * real + imaginary * imaginary).sqrt() / window as f64
+    }
+
+    /// The seeded linear interpolation this port originally shipped with
+    /// (issue #122 regression control): reads every `ratio`-th input sample.
+    fn linear_resample(mono_samples: &[f32], sample_rate: u32) -> Vec<f32> {
+        let output_length = ((mono_samples.len() as f64 * f64::from(STARLING_SAMPLE_RATE))
+            / f64::from(sample_rate))
+        .round()
+        .max(1.0) as usize;
+        let ratio = f64::from(sample_rate) / f64::from(STARLING_SAMPLE_RATE);
+        let last = mono_samples.len() - 1;
+        let mut output = Vec::with_capacity(output_length);
+
+        for index in 0..output_length {
+            let position = index as f64 * ratio;
+            let left = (position.floor() as usize).min(last);
+            let right = (left + 1).min(last);
+            let fraction = position - left as f64;
+            let left_sample = f64::from(mono_samples[left]);
+            output
+                .push((left_sample + (f64::from(mono_samples[right]) - left_sample) * fraction)
+                    as f32);
+        }
+
+        output
+    }
+
+    #[test]
+    fn suppresses_the_12khz_alias_from_48khz_input() {
+        // Issue #122: a 12 kHz tone at 48 kHz decimated 3:1 aliases to 4 kHz
+        // at unchanged level (the linear kernel reads positions 0, 3, 6, …
+        // of sin(pi/2 * n) → 0, -0.8, 0, 0.8 …).
+        let amplitude = 0.8f64;
+        let samples: Vec<f32> = (0..48_000)
+            .map(|index| {
+                (amplitude * (std::f64::consts::PI * index as f64 / 2.0).sin()) as f32
+            })
+            .collect();
+        let audio = mono(&samples, 48_000);
+
+        let output = resample_to_16k(&audio).expect("resample succeeds");
+        assert_eq!(output.len(), 16_000);
+
+        let leaked = tone_amplitude(&output, STARLING_SAMPLE_RATE, 4_000.0);
+        assert!(
+            leaked <= amplitude * 10.0f64.powf(-40.0 / 20.0),
+            "12 kHz must not fold to 4 kHz above -40 dB: leaked {leaked}"
+        );
+
+        // The fixture has teeth: the seeded linear implementation passes the
+        // alias at (essentially) full amplitude.
+        let linear = linear_resample(&samples, 48_000);
+        let linear_leak = tone_amplitude(&linear, STARLING_SAMPLE_RATE, 4_000.0);
+        assert!(
+            linear_leak > amplitude * 0.5,
+            "linear control must fail this fixture: leaked {linear_leak}"
+        );
+    }
+
+    #[test]
+    fn passes_a_1khz_tone_within_one_db_at_common_rates() {
+        for rate in [48_000u32, 44_100] {
+            let amplitude = 0.7f64;
+            let samples: Vec<f32> = (0..rate)
+                .map(|index| {
+                    (amplitude
+                        * (2.0 * std::f64::consts::PI * 1_000.0 * index as f64
+                            / f64::from(rate))
+                        .sin()) as f32
+                })
+                .collect();
+            let audio = mono(&samples, rate);
+
+            let output = resample_to_16k(&audio).expect("resample succeeds");
+            assert_eq!(output.len(), 16_000, "1 s at {rate} Hz → 16_000 frames");
+
+            // 1000 whole cycles at 16 kHz: exact correlation bin.
+            let passed = tone_amplitude(&output, STARLING_SAMPLE_RATE, 1_000.0);
+            let ratio = passed / amplitude;
+            assert!(
+                (10.0f64.powf(-1.0 / 20.0)..=10.0f64.powf(1.0 / 20.0)).contains(&ratio),
+                "{rate} Hz in-band 1 kHz tone must stay within 1 dB: {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn resample_passes_dc_with_unity_gain() {
+        let samples = vec![0.25f32; 1_000];
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 333); // round(1000 * 16000/48000)
+        for sample in &output {
+            assert!(
+                (sample - 0.25).abs() <= 1e-9,
+                "DC must pass at unity gain, got {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn resample_spreads_an_impulse_without_inventing_energy() {
+        let mut samples = vec![0.0f32; 4_800];
+        samples[2_400] = 1.0;
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 1_600);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let peak = output.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        assert!(peak <= 1.3, "windowed-sinc overshoot stays bounded: {peak}");
+
+        let energy: f64 = output.iter().map(|sample| f64::from(*sample).powi(2)).sum();
+        // Band-limiting keeps roughly the in-band share (~7.2/24 kHz = 0.3);
+        // no energy may be invented, none silently nulled.
+        assert!(
+            (0.05..=1.5).contains(&energy),
+            "impulse energy out of bounds: {energy}"
+        );
+    }
+
+    #[test]
+    fn resample_replicates_a_trailing_edge_without_smearing_it_away() {
+        // 10 ms of silence, then a full-scale step for the last 10 samples:
+        // boundary replication must represent the edge (duration kept, no
+        // blow-up, final output close to the step level).
+        let mut samples = vec![0.0f32; 470];
+        samples.resize(480, 1.0);
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 160);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.3));
+        assert!(
+            output.last().copied().unwrap_or(0.0) >= 0.5,
+            "edge step must survive into the final output"
         );
     }
 

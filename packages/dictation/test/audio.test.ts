@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "vite-plus/test";
+import { Schema } from "effect";
 
 import {
   AudioFormatError,
@@ -47,3 +49,47 @@ describe("canonical WAV preparation", () => {
     assert.throws(() => decodePcm16Wav(bytes), AudioFormatError);
   });
 });
+
+describe("PCM16 rounding contract (shared fixture)", () => {
+  it("matches the fixture also consumed by the Rust port", () => {
+    // G07: this package is the semantic source of the quantization contract;
+    // apps/desktop-gpui/crates/dictation runs the identical fixture. The
+    // negative half-tie cases (e.g. -2^-16 scaling to exactly -0.5 -> 0)
+    // fail under an implementation that rounds ties away from zero.
+    const fixtureUrl = new URL(
+      "../../../apps/desktop-gpui/test-fixtures/pcm-rounding.json",
+      import.meta.url,
+    );
+
+    const fixture = parsePcmRoundingFixture(readFileSync(fixtureUrl, "utf8"));
+
+    assert.ok(fixture.length >= 15, "fixture must keep its coverage");
+
+    const samples = Float32Array.from(fixture.map((row) => row.input));
+
+    const bytes = encodeWav16k({ samples, sampleRate: 16_000 });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    fixture.forEach(({ input, expected }, index) => {
+      assert.equal(view.getInt16(44 + index * 2, true), expected, `case ${index}: ${input}`);
+    });
+  });
+});
+
+// Parse the fixture at its I/O boundary with the repo's schema idiom
+// (decodeUnknownSync, like refine.test.ts): the schema does the shape
+// checking, numeric strings (the JSON encoding of NaN / Infinity) are
+// converted once here, and anything malformed throws a ParseError instead
+// of narrowing by representation at the use site.
+const PcmFixtureRow = Schema.Struct({
+  input: Schema.Union([Schema.Number, Schema.String]),
+  expected: Schema.Number,
+});
+
+const PcmFixture = Schema.Struct({ cases: Schema.Array(PcmFixtureRow) });
+
+function parsePcmRoundingFixture(raw: string): Array<{ input: number; expected: number }> {
+  const fixture = Schema.decodeUnknownSync(PcmFixture)(JSON.parse(raw));
+
+  return fixture.cases.map(({ input, expected }) => ({ input: Number(input), expected }));
+}

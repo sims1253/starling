@@ -1,0 +1,39 @@
+{
+  "machine": "docs",
+  "description": "Command illegal in the current state: docs.appendTurn while a head update is still Validating. The document's head must be resolved (Steady/Committed, or explicitly Conflicted for reads) before turns are appended; turn order is the explicit turnSeq, never a race with an in-flight CAS.",
+  "initial": "Steady",
+  "schema_valid": true,
+  "replay": "illegal_command",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_950",
+      "ts": "2026-09-20T10:09:50Z",
+      "corr": "up-9",
+      "seq": 1,
+      "type": "docs.updateHead",
+      "payload": {
+        "docId": "notes",
+        "expectedBase": 8,
+        "newRevision": {
+          "revId": "rev-50",
+          "baseRevision": 8,
+          "sourceAttemptIds": ["att-2"],
+          "instructionTemplateId": "tpl-none",
+          "text": "Append.",
+          "status": "candidate",
+          "provenance": "recognition"
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_951",
+      "ts": "2026-09-20T10:09:51Z",
+      "corr": "turn-9",
+      "seq": 1,
+      "type": "docs.appendTurn",
+      "payload": { "docId": "notes", "takeRef": "take_77" }
+    }
+  ]
+}

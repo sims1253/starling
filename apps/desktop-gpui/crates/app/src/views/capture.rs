@@ -320,13 +320,70 @@ fn render_import_button(cx: &mut Context<StarlingApp>) -> impl IntoElement {
         )
 }
 
+/// What the pinned error/recovery banner shows (R08): the footer line and
+/// whether the X that clears `app.error` is offered. Pure so the policy is
+/// testable without building elements.
+pub(crate) struct ErrorBannerSurface {
+    /// The unsaved-count line under the message. `None` when there are no
+    /// unsaved recordings — an error-only banner shows no footer at all,
+    /// never the success-ish "Starling keeps audio in history…" line that
+    /// used to ride it.
+    pub footer: Option<String>,
+    /// Whether the dismiss X is rendered. True whenever there is an error
+    /// to clear — including alongside unsaved recordings, which used to
+    /// leave an error with no dismiss affordance at all. False for an
+    /// unsaved-only banner, whose exits are download and discard, not
+    /// dismiss.
+    pub dismissible: bool,
+}
+
+/// Decide the error/recovery banner's surface (R08).
+pub(crate) fn error_banner_surface(has_error: bool, unsaved_count: usize) -> ErrorBannerSurface {
+    ErrorBannerSurface {
+        footer: (unsaved_count > 0).then(|| unsaved_footer_line(unsaved_count)),
+        dismissible: has_error,
+    }
+}
+
+fn unsaved_footer_line(count: usize) -> String {
+    format!(
+        "{count} recording{} could not be saved. Download {} before you close Starling.",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "it" } else { "them" },
+    )
+}
+
 fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<impl IntoElement> {
     if app.error.is_none() && app.unsaved.is_empty() {
-        let message = app.capture_warning.clone()?;
-        return Some(quality_banner(message, cx));
+        // Two independent ephemeral notices share this slot; the capture
+        // warning outranks a one-off export rename (banner_notice in
+        // `app.rs` is the tested form of that priority).
+        if let Some(message) = app.capture_warning.clone() {
+            return Some(quality_banner(
+                "Recording clipped",
+                message,
+                "The take was still saved and sent; heavily clipped audio transcribes poorly.",
+                |app: &mut StarlingApp| app.capture_warning = None,
+                cx,
+            ));
+        }
+        if let Some(message) = app.export_notice.clone() {
+            return Some(quality_banner(
+                "Export renamed",
+                message,
+                "Nothing was overwritten; both files are in your downloads directory.",
+                |app: &mut StarlingApp| app.export_notice = None,
+                cx,
+            ));
+        }
+        return None;
     }
     let error = app.error.clone();
     let unsaved_count = app.unsaved.len();
+    // R08: the footer and dismiss affordance come from one tested decision
+    // — an error state never shows the reassurance footer, and there is
+    // always a dismiss path for the error itself.
+    let surface = error_banner_surface(error.is_some(), unsaved_count);
 
     let mut banner = div()
         .id("error-banner")
@@ -360,15 +417,11 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                     }),
                 )
                 .children(error.clone().map(|message| div().child(message)))
-                .child(div().text_color(theme::ERROR_SUBTLE).child(if unsaved_count > 0 {
-                    format!(
-                        "{unsaved_count} recording{} could not be saved. Download {} before you close Starling.",
-                        if unsaved_count == 1 { "" } else { "s" },
-                        if unsaved_count == 1 { "it" } else { "them" },
-                    )
-                } else {
-                    "Starling keeps audio in history after a successful local save.".to_string()
-                })),
+                .children(
+                    surface
+                        .footer
+                        .map(|line| div().text_color(theme::ERROR_SUBTLE).child(line)),
+                ),
         );
 
     if unsaved_count > 0 {
@@ -414,7 +467,11 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 }),
         );
         banner = banner.child(actions);
-    } else {
+    }
+    if surface.dismissible {
+        // R08: an error alongside unsaved recordings used to have no
+        // dismiss at all; the X now always clears the error, while the
+        // unsaved list keeps its own download/discard exits.
         banner = banner.child(
             div()
                 .id("dismiss-error")
@@ -430,9 +487,17 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
     Some(banner)
 }
 
-/// A non-fatal notice (shown instead of the error banner when nothing failed):
-/// e.g. a take that was saved and sent but arrived heavily clipped.
-fn quality_banner(message: String, cx: &mut Context<StarlingApp>) -> Stateful<Div> {
+/// A non-fatal notice (shown instead of the error banner when nothing
+/// failed): e.g. a take that was saved and sent but arrived heavily
+/// clipped, or an export that had to land on a `-N` name. `clear` dismisses
+/// whichever app field the notice came from.
+fn quality_banner(
+    title: &'static str,
+    message: String,
+    footer: &'static str,
+    clear: fn(&mut StarlingApp),
+    cx: &mut Context<StarlingApp>,
+) -> Stateful<Div> {
     div()
         .id("quality-banner")
         .absolute()
@@ -457,24 +522,72 @@ fn quality_banner(message: String, cx: &mut Context<StarlingApp>) -> Stateful<Di
                 .flex_col()
                 .gap(px(3.))
                 .flex_1()
-                .child(
-                    div()
-                        .text_color(theme::ERROR_TITLE)
-                        .child("Recording clipped"),
-                )
+                .child(div().text_color(theme::ERROR_TITLE).child(title))
                 .child(message)
-                .child(div().text_color(theme::ERROR_SUBTLE).child(
-                    "The take was still saved and sent; heavily clipped audio transcribes poorly.",
-                )),
+                .child(div().text_color(theme::ERROR_SUBTLE).child(footer)),
         )
         .child(
             div()
                 .id("dismiss-quality")
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.capture_warning = None;
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    clear(this);
                     cx.notify();
                 }))
                 .child(icon("icons/x.svg", 16., theme::ERROR_TEXT)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_error_only_banner_shows_no_footer_and_is_dismissible() {
+        // R08: with errors and no unsaved recordings, the banner used to
+        // show the success-ish "Starling keeps audio in history…" line —
+        // reassurance copy has no business under "Action failed".
+        let surface = error_banner_surface(true, 0);
+        assert_eq!(surface.footer, None);
+        assert!(surface.dismissible);
+    }
+
+    #[test]
+    fn an_error_with_unsaved_recordings_keeps_the_count_line_and_gains_a_dismiss() {
+        // R08: this combination used to have no dismiss affordance at all.
+        let surface = error_banner_surface(true, 2);
+        assert_eq!(
+            surface.footer.as_deref(),
+            Some("2 recordings could not be saved. Download them before you close Starling.")
+        );
+        assert!(surface.dismissible, "there must always be a dismiss path");
+    }
+
+    #[test]
+    fn an_unsaved_only_banner_is_not_dismissable_by_x() {
+        // No error to clear: the exits are download and discard, so an X
+        // that silently dropped the recovery affordance would be wrong.
+        let surface = error_banner_surface(false, 1);
+        assert_eq!(
+            surface.footer.as_deref(),
+            Some("1 recording could not be saved. Download it before you close Starling.")
+        );
+        assert!(!surface.dismissible);
+    }
+
+    #[test]
+    fn the_reassurance_line_is_gone_from_every_surface() {
+        // Belt and braces: no error/unsaved combination may surface the
+        // old footer again.
+        for has_error in [false, true] {
+            for count in [0usize, 1, 3] {
+                if let Some(footer) = error_banner_surface(has_error, count).footer {
+                    assert!(
+                        !footer.contains("keeps audio in history"),
+                        "reassurance footer resurfaced: {footer}"
+                    );
+                }
+            }
+        }
+    }
 }

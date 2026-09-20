@@ -1,0 +1,26 @@
+{
+  "contract": "Shared PCM16 quantization contract for f32 samples: packages/dictation/src/audio.ts is the semantic source, apps/desktop-gpui/crates/dictation/src/audio.rs must match it byte for byte (issue G07). Rule: non-finite becomes 0, clamp to -1..=1, negatives scale by 0x8000 and non-negatives by 0x7fff (multiply in f64), then round with ECMAScript Math.round semantics - ties toward positive infinity, NOT f64::round's ties away from zero. All finite inputs are exactly f32-representable; non-finite inputs are spelled as strings because JSON cannot carry them. 'expected' is the i16 the encoder writes. The negative half-tie cases (e.g. -2^-16 scaling to exactly -0.5 -> 0) fail under a round-half-away-from-zero implementation, so this fixture rejects that divergence.",
+  "cases": [
+    { "input": 0, "expected": 0 },
+    { "input": -0.0, "expected": 0, "note": "signed zero: -0 < 0 is false, so the *0x7fff branch; Math.round(-0) is -0 -> 0" },
+    { "input": 1, "expected": 32767, "note": "positive full scale scales by 0x7fff" },
+    { "input": -1, "expected": -32768, "note": "negative full scale scales by 0x8000" },
+    { "input": 2, "expected": 32767, "note": "clipping boundary above +1 clamps to 1" },
+    { "input": -2, "expected": -32768, "note": "clipping boundary below -1 clamps to -1" },
+    { "input": "NaN", "expected": 0 },
+    { "input": "Infinity", "expected": 0, "note": "Number.isFinite replaces any non-finite input with 0 before clamping" },
+    { "input": "-Infinity", "expected": 0, "note": "same: non-finite becomes 0, never the clamp boundary" },
+    { "input": 0.5, "expected": 16384, "note": "positive half tie: 0.5 * 0x7fff = 16383.5 -> toward +infinity" },
+    { "input": -0.5, "expected": -16384, "note": "-0.5 * 0x8000 = -16384 exactly; no tie" },
+    { "input": 1.52587890625e-5, "expected": 0, "note": "2^-16 * 0x7fff = 0.4999847412109375 -> 0; an exact +0.5 product is unreachable for the 0x7fff scale from f32 inputs" },
+    { "input": -1.52587890625e-5, "expected": 0, "note": "the G07 case: -2^-16 * 0x8000 = -0.5 exactly; Math.round -> 0, f64::round gave -1" },
+    { "input": 4.57763671875e-5, "expected": 1, "note": "3*2^-16 * 0x7fff = 1.499908447265625 -> 1" },
+    { "input": -4.57763671875e-5, "expected": -1, "note": "negative half tie: -1.5 -> -1 (toward +infinity; half-away-from-zero gave -2)" },
+    { "input": -7.62939453125e-5, "expected": -2, "note": "negative half tie: -2.5 -> -2 (half-away-from-zero gave -3)" },
+    { "input": -3.0517578125e-5, "expected": -1, "note": "-2^-15 * 0x8000 = -1 exactly" },
+    { "input": 0.999969482421875, "expected": 32766, "note": "1 - 2^-15: * 0x7fff = 32766.000030517578125 -> 32766" },
+    { "input": -0.999969482421875, "expected": -32767, "note": "1 - 2^-15: * 0x8000 = -32767 exactly" },
+    { "input": 0.9999847412109375, "expected": 32767, "note": "1 - 2^-16: * 0x7fff = 32766.5000152587890625 -> 32767" },
+    { "input": -0.9999847412109375, "expected": -32767, "note": "negative half tie at the clip boundary: (1 - 2^-16) * 0x8000 = -32767.5 -> -32767 (half-away-from-zero gave -32768)" }
+  ]
+}

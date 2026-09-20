@@ -186,19 +186,21 @@ pub fn render_drawer(
                     .child("The model returned an empty transcript."),
             );
         } else {
-            let lines: Vec<String> = transcript.text.split('\n').map(str::to_string).collect();
-            for line in lines {
-                body = body.child(
-                    div()
-                        .font(theme::serif_font())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_size(transcript_scale)
-                        .line_height(transcript_scale * 1.4)
-                        .text_color(theme::PAPER_INK)
-                        .min_h(transcript_scale * 1.4)
-                        .child(line),
-                );
-            }
+            // R10: one text element for the whole transcript. gpui shapes
+            // '\n' into lines internally, so the previous one-div-per-line
+            // build (an unbounded element count on every render) bought
+            // nothing. `line_height` keeps the rhythm, `min_h` the empty-
+            // line height, exactly as the per-line divs did.
+            body = body.child(
+                div()
+                    .font(theme::serif_font())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(transcript_scale)
+                    .line_height(transcript_scale * 1.4)
+                    .text_color(theme::PAPER_INK)
+                    .min_h(transcript_scale * 1.4)
+                    .child(transcript.text),
+            );
         }
     }
 

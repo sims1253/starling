@@ -71,12 +71,35 @@ trimmed. Timeouts: default 180s, allowed 1ms..=600s. Redirects are blocked
 ### Audio (mirror audio.ts exactly: dependency-free, deterministic)
 
 `PcmAudio { samples: Vec<f32>, sample_rate: u32, channels: u16 }` (interleaved
--1..=1). `mix_to_mono`, `resample_to_16k` (linear interpolation, same rounding),
+-1..=1). `mix_to_mono`, `resample_to_16k` (windowed-sinc low-pass, see below),
 `encode_wav_16k` (canonical 44-byte header, PCM16, 16 kHz mono, asymmetric clamp:
-negatives `*0x8000`, positives `*0x7fff`, round-half-away like JS `Math.round`),
+negatives `*0x8000`, positives `*0x7fff`, then `Math.round` semantics — ties
+toward +∞, e.g. `-2^-16` scales to exactly -0.5 and encodes as 0; shared
+contract fixture: `test-fixtures/pcm-rounding.json`, G07),
 `decode_pcm16_wav` (PCM-only, 16-bit, RIFF chunks walked with padding, same
 error messages), `prepare_wav_16k(bytes) -> PreparedWav { wav: Vec<u8>,
 duration_ms, duration_seconds }`.
+
+Resampling policy (G06, issue #122): `resample_to_16k` runs once over the
+whole finished recording — capture drains at Stop and imports arrive whole, so
+there is deliberately no inter-chunk filter state; streaming/stateful
+resampling belongs to a capture-pipeline redesign, not to this function. Each
+output sample is a Blackman-windowed sinc kernel evaluated at its exact
+fractional input position, with the cutoff at 90% of the lower Nyquist
+frequency, so content above the output band is attenuated instead of folding
+into it: a 12 kHz tone in 48 kHz input no longer aliases to 4 kHz at unchanged
+level, and the suite pins that leak at >= 40 dB down (the linear kernel this
+replaced fails that fixture at essentially full amplitude). Input rates above
+`audio::MAX_RESAMPLE_INPUT_RATE` (384 kHz) are rejected outright (R15) — the
+kernel half-width grows as ~8.9 × rate/16 000, so a mislabeled or hostile
+rate field would otherwise cost pathological taps per output sample — and a
+kernel whose weight sum is not positive falls back to nearest-edge
+replication instead of emitting a fabricated 0.0 (R16). The kernel is a
+deliberate Rust-side divergence from `resampleTo16k` in
+`packages/dictation/src/audio.ts`, which still linearly interpolates; the TS
+implementation remains the semantic source for the rest of the audio contract
+(mono mixdown precision, output length, determinism, duration), so change this
+function only to mirror a TS change or to extend the alias rejection.
 
 ### Storage (file-backed IndexedDB equivalent)
 

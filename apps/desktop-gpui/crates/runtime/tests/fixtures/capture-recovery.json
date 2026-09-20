@@ -1,0 +1,43 @@
+{
+  "machine": "capture",
+  "description": "Journal replay after restart: the machine re-enters as Recovering (initial state of this trace; entered from Interrupted by the runtime-internal recovery path, no wire message). Replay surfaces the tail-truncation gap, then capture.stopped publishes the recovered boundary: Recovering -> Persisted. Continues the take_5 stream from capture-interrupted.json.",
+  "initial": "Recovering",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "evt_020",
+      "ts": "2026-09-20T10:02:30Z",
+      "corr": "take_5",
+      "seq": 104,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 64000, "clipRatio": 0.0, "level": 0.0 }
+    },
+    {
+      "v": 1,
+      "id": "evt_021",
+      "ts": "2026-09-20T10:02:31Z",
+      "corr": "take_5",
+      "seq": 105,
+      "type": "capture.gap",
+      "payload": { "startSample": 64000, "endSample": 65280 }
+    },
+    {
+      "v": 1,
+      "id": "evt_022",
+      "ts": "2026-09-20T10:02:32Z",
+      "corr": "take_5",
+      "seq": 106,
+      "type": "capture.stopped",
+      "payload": {
+        "finalSampleIndex": 65280,
+        "acknowledgedSamples": 64000,
+        "gaps": [{ "startSample": 64000, "endSample": 65280 }],
+        "journalId": "j_02a1",
+        "sampleDurationMs": 4000.0,
+        "wallClockMs": 0.0
+      }
+    }
+  ]
+}

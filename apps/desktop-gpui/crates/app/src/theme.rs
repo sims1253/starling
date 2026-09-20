@@ -1,7 +1,7 @@
 //! Design tokens and small formatting helpers, mirroring
 //! `apps/desktop/src/styles.css`.
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Pixels, Rgba, px};
 
 const fn rgb(hex: u32) -> Rgba {
@@ -143,6 +143,18 @@ pub fn fmt_duration(ms: Option<f64>) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
+/// `h:mm AM/PM` with explicit padding (R11): chrono's `%-I`/`%-d` are
+/// glibc-isms that format as literal text on other platforms; build the
+/// string from components instead.
+fn twelve_hour(local: &DateTime<Local>) -> String {
+    let (is_pm, hour) = local.hour12();
+    format!(
+        "{hour}:{:02} {}",
+        local.minute(),
+        if is_pm { "PM" } else { "AM" }
+    )
+}
+
 /// `formatWhen` from App.tsx: local `h:mm AM/PM` today, otherwise `Mon D`.
 pub fn fmt_when(iso: &str) -> String {
     let Ok(parsed) = DateTime::parse_from_rfc3339(iso) else {
@@ -151,8 +163,49 @@ pub fn fmt_when(iso: &str) -> String {
     let local = parsed.with_timezone(&Local);
     let now = Local::now();
     if local.date_naive() == now.date_naive() {
-        local.format("%-I:%M %p").to_string()
+        twelve_hour(&local)
     } else {
-        local.format("%b %-d").to_string()
+        // `%b` is locale-independent in chrono; the day comes from `day()`
+        // (no leading zero) rather than a platform-dependent `%-d`.
+        format!("{} {}", local.format("%b"), local.day())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn twelve_hour_clock_has_no_leading_zeroes() {
+        // R11: `%-I` was replaced with component formatting — same output,
+        // no platform-dependent format specifiers.
+        let at = |hour, minute| Local.with_ymd_and_hms(2026, 1, 2, hour, minute, 0).unwrap();
+        assert_eq!(twelve_hour(&at(15, 5)), "3:05 PM");
+        assert_eq!(twelve_hour(&at(9, 5)), "9:05 AM");
+        // Midnight and noon are 12, not 0.
+        assert_eq!(twelve_hour(&at(0, 5)), "12:05 AM");
+        assert_eq!(twelve_hour(&at(12, 5)), "12:05 PM");
+    }
+
+    #[test]
+    fn non_today_dates_render_as_abbreviated_month_and_unpadded_day() {
+        // A date far enough in the past is never "today", so the `Mon D`
+        // branch runs regardless of when the test executes. The local
+        // timezone may shift it to Jan 1 or Jan 2, but never pads the day.
+        let formatted = fmt_when("2020-01-02T03:04:05.000Z");
+        let mut parts = formatted.split(' ');
+        let month = parts.next().expect("month");
+        let day = parts.next().expect("day");
+        assert_eq!(month, "Jan");
+        assert!(
+            day == "1" || day == "2",
+            "day is unpadded, got {day:?} in {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn non_timestamp_strings_pass_through_unchanged() {
+        assert_eq!(fmt_when("not a date"), "not a date");
     }
 }

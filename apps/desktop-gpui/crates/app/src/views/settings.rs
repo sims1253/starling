@@ -11,7 +11,9 @@ use starling_dictation::settings;
 
 use crate::app::{Connection, StarlingApp};
 use crate::theme;
-use crate::views::{icon, status_dot};
+use crate::views::{
+    SETTINGS_CALLOUT_DOT_ID, icon, protocol_option_id, status_dot,
+};
 
 pub fn render_settings_modal(
     app: &mut StarlingApp,
@@ -130,7 +132,7 @@ pub fn render_settings_modal(
                 .bg(theme::SETTINGS_CALLOUT)
                 .p(px(12.))
                 .mt(px(21.))
-                .child(status_dot(connection, false))
+                .child(status_dot(SETTINGS_CALLOUT_DOT_ID, connection, false))
                 .child(
                     div()
                         .flex()
@@ -238,7 +240,7 @@ fn field_label(label: &str) -> Div {
 fn protocol_toggle(selected: settings::Protocol, cx: &mut Context<StarlingApp>) -> Div {
     let options = [
         (settings::Protocol::Starling, "Starling native"),
-        (settings::Protocol::OpenAI, "OpenAI compatible"),
+        (settings::Protocol::OpenAi, "OpenAI compatible"),
     ];
     let mut toggle = div()
         .flex()
@@ -252,11 +254,10 @@ fn protocol_toggle(selected: settings::Protocol, cx: &mut Context<StarlingApp>) 
         let is_selected = selected == protocol;
         toggle = toggle.child(
             div()
-                .id(if is_selected {
-                    "protocol-selected"
-                } else {
-                    "protocol-option"
-                })
+                // R04: the id names the option and nothing else — the old
+                // "protocol-selected"/"protocol-option" pair flipped both
+                // options' identities on every click.
+                .id(protocol_option_id(protocol))
                 .flex()
                 .flex_1()
                 .items_center()

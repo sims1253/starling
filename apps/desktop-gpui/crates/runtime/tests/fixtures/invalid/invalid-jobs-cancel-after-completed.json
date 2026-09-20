@@ -1,0 +1,54 @@
+{
+  "machine": "jobs",
+  "description": "Command illegal in the current state: jobs.cancel after the job already reached Completed. Terminal job states (Completed, Failed, Cancelled, Rejected) accept no further commands.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "illegal_command",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_920",
+      "ts": "2026-09-20T10:09:20Z",
+      "corr": "job-9",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_77", "route": "local-default", "budget": "standard" }
+    },
+    {
+      "v": 1,
+      "id": "evt_920",
+      "ts": "2026-09-20T10:09:20Z",
+      "corr": "job-9",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    { "$advance": "Dispatched" },
+    { "$advance": "Loading" },
+    { "$advance": "Recognizing" },
+    {
+      "v": 1,
+      "id": "evt_921",
+      "ts": "2026-09-20T10:09:22Z",
+      "corr": "job-9",
+      "seq": 3,
+      "type": "jobs.completed",
+      "payload": {
+        "attemptId": "att-9",
+        "text": "Done.",
+        "backend": "local-parakeet-tdt",
+        "timing": 100.0,
+        "completionEvidence": "final_decode"
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_921",
+      "ts": "2026-09-20T10:09:23Z",
+      "corr": "job-9",
+      "seq": 4,
+      "type": "jobs.cancel",
+      "payload": { "jobId": "job-9" }
+    }
+  ]
+}

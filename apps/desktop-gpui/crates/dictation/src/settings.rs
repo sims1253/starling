@@ -6,12 +6,17 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    Starling,
-    OpenAI,
-}
+/// The transcription backend wire protocol. One enum for the whole crate
+/// (R11): the client routes requests by it, the settings file persists it
+/// (`"starling"` / `"openai"`, lowercase, unchanged on disk).
+pub use crate::client::Protocol;
+
+/// The platform config directory could not be resolved (on Linux,
+/// `$XDG_CONFIG_HOME` and `$HOME` are both unset). Returned instead of
+/// silently reading/writing settings in an arbitrary working directory.
+#[derive(Debug, thiserror::Error)]
+#[error("could not resolve the user config directory; set XDG_CONFIG_HOME or HOME")]
+pub struct ConfigDirUnavailable;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +25,12 @@ pub struct Settings {
     pub protocol: Protocol,
     pub model: String,
     pub expected_terms: Vec<String>,
+    /// Whether the user explicitly chose the model (R02). While false, the
+    /// app may sync `model` from the server's health response. Files written
+    /// before this field existed deserialize it as `false` (`serde(default)`),
+    /// which re-enables that sync instead of guessing from the file's text.
+    #[serde(default)]
+    pub user_set_model: bool,
 }
 
 impl Settings {
@@ -31,20 +42,27 @@ impl Settings {
             protocol: Protocol::Starling,
             model: "parakeet".to_string(),
             expected_terms: vec!["auth".to_string()],
+            user_set_model: false,
         }
     }
 
-    /// `dirs::config_dir()/starling-gpui/settings.json`.
-    pub fn default_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+    /// `dirs::config_dir()/starling-gpui/settings.json`. A `None` from
+    /// `dirs` is a typed error (R11): settings must never silently land in
+    /// whatever directory the app happened to start in.
+    pub fn default_path() -> Result<PathBuf, ConfigDirUnavailable> {
+        Ok(dirs::config_dir()
+            .ok_or(ConfigDirUnavailable)?
             .join("starling-gpui")
-            .join("settings.json")
+            .join("settings.json"))
     }
 
-    /// Missing or corrupt file always falls back to the defaults.
+    /// Missing or corrupt file always falls back to the defaults; so does an
+    /// unresolvable config directory (there is nothing to load from it).
     pub fn load_or_default() -> Self {
-        Self::load(&Self::default_path())
+        match Self::default_path() {
+            Ok(path) => Self::load(&path),
+            Err(_) => Self::default_settings(),
+        }
     }
 
     /// Missing or corrupt file always falls back to the defaults; never panics.
@@ -117,6 +135,7 @@ mod tests {
         assert_eq!(settings.model, "parakeet");
         assert_eq!(settings.expected_terms, vec!["auth".to_string()]);
         assert_eq!(settings.expected_terms_input(), "auth");
+        assert!(!settings.user_set_model);
     }
 
     #[test]
@@ -126,14 +145,14 @@ mod tests {
             "\"starling\""
         );
         assert_eq!(
-            serde_json::to_string(&Protocol::OpenAI).unwrap(),
+            serde_json::to_string(&Protocol::OpenAi).unwrap(),
             "\"openai\""
         );
 
         let starling: Protocol = serde_json::from_str("\"starling\"").unwrap();
         let openai: Protocol = serde_json::from_str("\"openai\"").unwrap();
         assert_eq!(starling, Protocol::Starling);
-        assert_eq!(openai, Protocol::OpenAI);
+        assert_eq!(openai, Protocol::OpenAi);
     }
 
     #[test]
@@ -143,9 +162,10 @@ mod tests {
 
         let settings = Settings {
             endpoint: "http://127.0.0.1:9999/".to_string(),
-            protocol: Protocol::OpenAI,
+            protocol: Protocol::OpenAi,
             model: "whisper-large-v3".to_string(),
             expected_terms: vec!["auth".to_string(), "Starling".to_string()],
+            user_set_model: true,
         };
 
         settings.save(&path).expect("save");
@@ -161,6 +181,27 @@ mod tests {
             value["expectedTerms"],
             serde_json::json!(["auth", "Starling"])
         );
+        assert_eq!(value["userSetModel"], true);
+    }
+
+    #[test]
+    fn legacy_files_without_the_flag_load_as_not_user_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+
+        // A file written before `userSetModel` existed: every legacy save
+        // contains a `model` key, but that never meant the user chose it, so
+        // the missing flag must not be sniffed out of the text.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","protocol":"openai","model":"whisper-large-v3","expectedTerms":["auth"]}"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.model, "whisper-large-v3");
+        assert!(!settings.user_set_model, "no recorded choice: auto-sync stays enabled");
     }
 
     #[test]

@@ -2,6 +2,9 @@
 name = "starling-gpui"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sims1253/starling"
 description = "Starling desktop dictation app built with gpui (gpui port of the Electron shell)"
 
 [dependencies]

@@ -4,7 +4,7 @@ use gpui::{Context, Div, Window, div, prelude::*, px};
 
 use crate::app::StarlingApp;
 use crate::theme;
-use crate::views::{connection_label, icon, status_dot};
+use crate::views::{TOPBAR_STATUS_DOT_ID, connection_label, icon, status_dot};
 
 pub fn render_topbar(
     app: &mut StarlingApp,
@@ -55,7 +55,7 @@ pub fn render_topbar(
                     .font(theme::mono_font())
                     .text_size(px(10.))
                     .text_color(theme::MUTED)
-                    .child(status_dot(app.connection, true))
+                    .child(status_dot(TOPBAR_STATUS_DOT_ID, app.connection, true))
                     .child(connection_label(app)),
             ),
         )

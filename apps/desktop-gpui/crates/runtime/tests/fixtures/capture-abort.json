@@ -1,0 +1,134 @@
+{
+  "machine": "capture",
+  "description": "capture.abort from every state that accepts it (Recording, Draining mid-drain, Acquiring) plus a fatal open failure from Acquiring. abort returns the machine to Idle without a capture.* event (v1 defines none; the UI projection updates via snapshot). take_9's fatal error shows Acquiring -> Interrupted.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_030",
+      "ts": "2026-09-20T10:03:00Z",
+      "corr": "take_6",
+      "seq": 100,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_030",
+      "ts": "2026-09-20T10:03:00Z",
+      "corr": "take_6",
+      "seq": 101,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_031",
+      "ts": "2026-09-20T10:03:01Z",
+      "corr": "take_6",
+      "seq": 102,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 24000, "clipRatio": 0.0, "level": 0.05 }
+    },
+    {
+      "v": 1,
+      "id": "cmd_031",
+      "ts": "2026-09-20T10:03:02Z",
+      "corr": "take_6",
+      "seq": 103,
+      "type": "capture.abort",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "cmd_032",
+      "ts": "2026-09-20T10:03:04Z",
+      "corr": "take_7",
+      "seq": 110,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_032",
+      "ts": "2026-09-20T10:03:04Z",
+      "corr": "take_7",
+      "seq": 111,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_033",
+      "ts": "2026-09-20T10:03:05Z",
+      "corr": "take_7",
+      "seq": 112,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    },
+    {
+      "v": 1,
+      "id": "evt_034",
+      "ts": "2026-09-20T10:03:05Z",
+      "corr": "take_7",
+      "seq": 113,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 60000, "clipRatio": 0.0, "level": 0.0 }
+    },
+    {
+      "v": 1,
+      "id": "cmd_037",
+      "ts": "2026-09-20T10:03:06Z",
+      "corr": "take_7",
+      "seq": 114,
+      "type": "capture.abort",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "cmd_034",
+      "ts": "2026-09-20T10:03:08Z",
+      "corr": "take_8",
+      "seq": 120,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_035",
+      "ts": "2026-09-20T10:03:08Z",
+      "corr": "take_8",
+      "seq": 121,
+      "type": "capture.abort",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "cmd_036",
+      "ts": "2026-09-20T10:03:10Z",
+      "corr": "take_9",
+      "seq": 130,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_033",
+      "ts": "2026-09-20T10:03:10Z",
+      "corr": "take_9",
+      "seq": 131,
+      "type": "capture.error",
+      "payload": { "code": "device_open_failed", "fatal": true }
+    }
+  ]
+}

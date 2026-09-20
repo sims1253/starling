@@ -34,23 +34,27 @@ actions!(
     ]
 );
 
-/// Bind the editing keys these fields consume. Bindings are global (context
-/// `None`); the handlers only live on the focused field's element.
+/// Bind the editing keys these fields consume. Bindings are scoped to the
+/// `"TextField"` key context (R07) — the context the field's own root div
+/// registers — so they only match while one of these fields is focused and
+/// can never shadow app-global keys (or future ones) elsewhere in the
+/// window. The handlers themselves live on the focused field's element.
 pub fn bind_keys(cx: &mut App) {
+    let field = Some("TextField");
     cx.bind_keys([
-        gpui::KeyBinding::new("backspace", Backspace, None),
-        gpui::KeyBinding::new("delete", Delete, None),
-        gpui::KeyBinding::new("left", Left, None),
-        gpui::KeyBinding::new("right", Right, None),
-        gpui::KeyBinding::new("shift-left", SelectLeft, None),
-        gpui::KeyBinding::new("shift-right", SelectRight, None),
-        gpui::KeyBinding::new("secondary-a", SelectAll, None),
-        gpui::KeyBinding::new("secondary-v", Paste, None),
-        gpui::KeyBinding::new("secondary-c", Copy, None),
-        gpui::KeyBinding::new("secondary-x", Cut, None),
-        gpui::KeyBinding::new("home", Home, None),
-        gpui::KeyBinding::new("end", End, None),
-        gpui::KeyBinding::new("escape", InputEscape, None),
+        gpui::KeyBinding::new("backspace", Backspace, field),
+        gpui::KeyBinding::new("delete", Delete, field),
+        gpui::KeyBinding::new("left", Left, field),
+        gpui::KeyBinding::new("right", Right, field),
+        gpui::KeyBinding::new("shift-left", SelectLeft, field),
+        gpui::KeyBinding::new("shift-right", SelectRight, field),
+        gpui::KeyBinding::new("secondary-a", SelectAll, field),
+        gpui::KeyBinding::new("secondary-v", Paste, field),
+        gpui::KeyBinding::new("secondary-c", Copy, field),
+        gpui::KeyBinding::new("secondary-x", Cut, field),
+        gpui::KeyBinding::new("home", Home, field),
+        gpui::KeyBinding::new("end", End, field),
+        gpui::KeyBinding::new("escape", InputEscape, field),
     ]);
 }
 
