@@ -77,7 +77,7 @@
         "value": { "type": "number", "minimum": 0 },
         "cli_flag": {
           "type": "string",
-          "description": "CLI flag that overrides the default; '(fixed)' when the value is compile-time."
+          "description": "CLI flag that overrides this default. Compile-time values are not modelled as numberSettings at all; they are plain typed fields with compile-time noted in their own descriptions."
         },
         "zero_means": { "type": "string" }
       }

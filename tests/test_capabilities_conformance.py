@@ -159,9 +159,27 @@ def test_one_model_server_is_not_oversubscribed():
 
 
 def test_fixture_files_validate_against_envelope():
+    """fixtures.schema.json must be exercised, not merely present: every file
+    under fixtures/ validates against it under BOTH validators — jsonschema
+    when installed, and the minischema fallback always, so the envelope has
+    teeth even in environments without the third-party package (where the
+    fallback path would otherwise never run). No fixture intentionally
+    bypasses the envelope schema."""
     assert FIXTURES, "no conformance fixtures found"
     for path in FIXTURES:
-        assert_valid(json.loads(path.read_text()), FIXTURE_SCHEMA)
+        doc = json.loads(path.read_text())
+        assert_valid(doc, FIXTURE_SCHEMA)
+        assert not minischema.errors(doc, FIXTURE_SCHEMA), path.name
+    # The envelope has teeth: fabricated fixture shapes must be rejected, so
+    # the loop above cannot be a vacuous green.
+    bad = json.loads(FIXTURES[0].read_text())
+    bad["cases"][0]["wire_format"] = "invented"  # not in the envelope
+    assert_invalid(bad, FIXTURE_SCHEMA)
+    assert minischema.errors(bad, FIXTURE_SCHEMA)
+    bad = json.loads(FIXTURES[0].read_text())
+    del bad["cases"][0]["request"]  # required by the envelope
+    assert_invalid(bad, FIXTURE_SCHEMA)
+    assert minischema.errors(bad, FIXTURE_SCHEMA)
 
 
 def test_openai_error_bodies_match_openapi_error_schema():
@@ -349,6 +367,7 @@ def test_descriptor_defaults_match_the_cpp_server():
 ELECTRON_TS_PATHS = [
     REPO / "packages" / "dictation" / "src",
     REPO / "apps" / "desktop" / "electron",
+    REPO / "apps" / "desktop" / "src",  # renderer; .tsx files live here
 ]
 
 
@@ -357,14 +376,16 @@ def _ts_sources() -> list[Path]:
     for root in ELECTRON_TS_PATHS:
         if root.is_dir():
             sources.extend(root.rglob("*.ts"))
+            sources.extend(root.rglob("*.tsx"))
     return sources
 
 
 def test_no_client_consumes_the_capability_route_yet():
     """Today-state check behind the README adoption map: nothing in the
-    Electron TS clients fetches /v1/starling/capabilities. When a client is
-    wired to the descriptor (README follow-ups), update the adoption map and
-    this assertion together."""
+    Electron TS/TSX clients (dictation package, main process, renderer —
+    .tsx included, e.g. apps/desktop/src/App.tsx) fetches
+    /v1/starling/capabilities. When a client is wired to the descriptor
+    (README follow-ups), update the adoption map and this assertion together."""
     offenders = [
         str(path.relative_to(REPO))
         for path in _ts_sources()
