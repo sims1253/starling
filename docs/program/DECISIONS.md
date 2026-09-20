@@ -58,3 +58,11 @@ new dependencies. Decision: extend that kernel to a streaming/stateful form
 rather than adopting rubato or another crate; revisit only with measured
 spectral/latency evidence showing it inadequate. **Rejected:** new resampler
 dependency without evidence; keeping linear interpolation anywhere on the path.
+
+## D8 — 2026-09-20 — Upstream pushes and PRs authorized by user
+The user explicitly authorized pushing program branches and opening PRs on
+sims1253/starling so automated reviews run on them ("Let them push to PRs").
+This supersedes D1's default for this session's program branches. Still
+forbidden: merging, force-pushing shared branches, pushing to master, and
+claiming publication without a successful command result. Coordinator pushes
+verified branches; agents never push directly.
