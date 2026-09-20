@@ -567,7 +567,12 @@ TranscribeFn StreamSession::active_tx() {
     // together, every invocation of this wrapper is keyed as the
     // (callback, generation) pair that existed at construction.
     const uint64_t tx_gen = tx_gen_;
-    return [this, inner = std::move(inner), tx_gen](const float* p, int64_t n)
+    // engine_id joins the snapshot for the same reason (batch-4): reading it
+    // inside the lambda would key a mid-step set_engine_identity() under the
+    // new identity for a wrapper built against the old one.
+    std::string engine_id = engine_id_;
+    return [this, inner = std::move(inner), tx_gen,
+            engine_id = std::move(engine_id)](const float* p, int64_t n)
                -> std::optional<std::string> {
         StreamTailKey key;
         // p always points into samples_ (the chunker passes
@@ -577,7 +582,7 @@ TranscribeFn StreamSession::active_tx() {
                         + static_cast<int64_t>(p - samples_.data());
         key.length = n;
         key.audio_rev = audio_rev_;
-        key.engine_id = engine_id_;
+        key.engine_id = engine_id;
         key.tx_gen = tx_gen;
         if (tail_valid_ && tail_key_ == key) {
             ++tail_cache_hits_;
