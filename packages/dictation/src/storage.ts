@@ -357,7 +357,14 @@ interface SessionDraft {
   threadJoinedAt?: number | undefined;
 }
 
-interface RefinedDraft {
+/**
+ * Mutable draft for one refined copy: the SessionDraft pattern, so the
+ * optional captured-base identity (B11) is added only when the refinement
+ * actually had prior context, never as a present-but-undefined field. The
+ * one shared shape for callers drafting a refined transcript — the app's
+ * refine path included — so it cannot drift from what freezeRefined writes.
+ */
+export interface RefinedDraft {
   text: string;
   model: string;
   createdAt: number;

@@ -151,16 +151,3 @@ export function threadContextBase(
 
   return undefined;
 }
-
-/**
- * The refinement context text for a take about to be refined inside its
- * thread: `threadContextBase`'s member's refined text, or undefined when
- * there is no base.
- */
-export function threadContext(
-  sessions: readonly DictationSession[],
-  threadId: string,
-  beforeTakeId: string,
-): string | undefined {
-  return threadContextBase(sessions, threadId, beforeTakeId)?.refined?.text;
-}

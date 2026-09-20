@@ -10,6 +10,7 @@ import {
   StarlingStream,
   type DictationSession,
   type InvalidStoredSession,
+  type RefinedDraft,
   type RefinedTranscript,
   type TranscriptionProtocol,
   type TranscriptionResult,
@@ -42,19 +43,6 @@ import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./t
 import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
-
-/**
- * Mutable draft for one refined copy — the SessionDraft pattern from
- * storage.ts — so the captured base identity (B11) is added only when the
- * refinement actually had prior context, never as a present-but-undefined
- * field.
- */
-interface RefinedDraft {
-  text: string;
-  model: string;
-  createdAt: number;
-  contextSourceId?: string;
-}
 
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 

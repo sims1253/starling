@@ -4,7 +4,6 @@ import type { DictationSession } from "@starling/dictation";
 import {
   activeThreadId,
   newThreadId,
-  threadContext,
   threadContextBase,
   threadTurns,
 } from "./threads";
@@ -327,7 +326,7 @@ describe("threadTurns", () => {
   });
 });
 
-describe("threadContext", () => {
+describe("threadContextBase", () => {
   const sessions = [
     take({
       id: "turn-1",
@@ -351,23 +350,23 @@ describe("threadContext", () => {
     }),
   ];
 
-  it("returns the nearest earlier refined text in the thread", () => {
-    expect(threadContext(sessions, "t1", "turn-4")).toBe("Turn three, refined.");
-    expect(threadContext(sessions, "t1", "turn-3")).toBe("Turn one, refined.");
-    expect(threadContext(sessions, "t1", "turn-2")).toBe("Turn one, refined.");
+  it("returns the nearest earlier refined member, whose text is the context", () => {
+    expect(threadContextBase(sessions, "t1", "turn-4")?.refined?.text).toBe("Turn three, refined.");
+    expect(threadContextBase(sessions, "t1", "turn-3")?.refined?.text).toBe("Turn one, refined.");
+    expect(threadContextBase(sessions, "t1", "turn-2")?.refined?.text).toBe("Turn one, refined.");
   });
 
   it("is undefined for the thread head or when nobody refined yet", () => {
-    expect(threadContext(sessions, "t1", "turn-1")).toBeUndefined();
+    expect(threadContextBase(sessions, "t1", "turn-1")).toBeUndefined();
 
     const unrefined = [
       take({ id: "u1", createdAt: "2025-09-01T10:00:00.000Z", threadId: "t1" }),
       take({ id: "u2", createdAt: "2025-09-01T10:01:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(unrefined, "t1", "u2")).toBeUndefined();
-    expect(threadContext([], "t1", "u2")).toBeUndefined();
-    expect(threadContext(sessions, "missing", "turn-4")).toBeUndefined();
+    expect(threadContextBase(unrefined, "t1", "u2")).toBeUndefined();
+    expect(threadContextBase([], "t1", "u2")).toBeUndefined();
+    expect(threadContextBase(sessions, "missing", "turn-4")).toBeUndefined();
   });
 
   it("skips unrefined members instead of stopping at them", () => {
@@ -384,7 +383,7 @@ describe("threadContext", () => {
     ];
 
     // m3 never refined; the context for m4 reaches back to m1.
-    expect(threadContext(mixed, "t1", "m4")).toBe("Oldest refined.");
+    expect(threadContextBase(mixed, "t1", "m4")?.refined?.text).toBe("Oldest refined.");
   });
 
   it("skips whitespace-only refined text instead of treating it as context", () => {
@@ -408,7 +407,7 @@ describe("threadContext", () => {
       take({ id: "w3", createdAt: "2025-09-01T10:02:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(blank, "t1", "w3")).toBe("Real text.");
+    expect(threadContextBase(blank, "t1", "w3")?.refined?.text).toBe("Real text.");
 
     const onlyBlank = [
       take({
@@ -420,20 +419,24 @@ describe("threadContext", () => {
       take({ id: "b2", createdAt: "2025-09-01T10:01:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(onlyBlank, "t1", "b2")).toBeUndefined();
+    expect(threadContextBase(onlyBlank, "t1", "b2")).toBeUndefined();
   });
 
   it("ignores refined takes that are not members of the thread", () => {
-    expect(threadContext(sessions, "t1", "turn-3")).not.toBe("A different thread entirely.");
+    expect(threadContextBase(sessions, "t1", "turn-3")?.refined?.text).not.toBe(
+      "A different thread entirely.",
+    );
 
     // A take outside the thread must never supply or block context.
-    expect(threadContext(sessions, "t2", "other-thread")).toBeUndefined();
+    expect(threadContextBase(sessions, "t2", "other-thread")).toBeUndefined();
   });
 
   it("treats every member as earlier when the boundary take is not yet a member", () => {
     // The join case: context is computed for an unthreaded take right before
     // its assignment lands, so its id is absent from the member list.
-    expect(threadContext(sessions, "t1", "about-to-join")).toBe("Turn three, refined.");
+    expect(threadContextBase(sessions, "t1", "about-to-join")?.refined?.text).toBe(
+      "Turn three, refined.",
+    );
   });
 
   it("keeps an appended older take's base stable from join through retry (B11)", () => {
@@ -451,7 +454,8 @@ describe("threadContext", () => {
 
     // First press: the context is computed before the assignment lands, so
     // the joining take counts every member as earlier and picks B.
-    expect(threadContext([head, older], "t1", "a")).toBe("B, refined.");
+    expect(threadContextBase([head, older], "t1", "a")?.id).toBe("b");
+    expect(threadContextBase([head, older], "t1", "a")?.refined?.text).toBe("B, refined.");
 
     // The assignment stamps the append sequence (A appended at 200). A retry
     // — after a failure, a cancel, or a reload — computes the same base: A is
@@ -463,7 +467,8 @@ describe("threadContext", () => {
       threadJoinedAt: 200,
     });
 
-    expect(threadContext([head, joined], "t1", "a")).toBe("B, refined.");
+    expect(threadContextBase([head, joined], "t1", "a")?.id).toBe("b");
+    expect(threadContextBase([head, joined], "t1", "a")?.refined?.text).toBe("B, refined.");
 
     // A's completed edit is now the thread's current document: the next turn
     // appended after it (C, at 300) includes that edit, not the stale head.
@@ -474,17 +479,19 @@ describe("threadContext", () => {
 
     const next = take({ id: "c", createdAt: "2025-09-01T11:00:00.000Z" });
 
-    expect(threadContext([head, appended, next], "t1", "c")).toBe("A, refined.");
+    expect(threadContextBase([head, appended, next], "t1", "c")?.id).toBe("a");
+    expect(threadContextBase([head, appended, next], "t1", "c")?.refined?.text).toBe(
+      "A, refined.",
+    );
 
     // Deletion of the appended member falls back to the previous refined
     // member instead of inventing a base.
-    expect(threadContext([head, next], "t1", "c")).toBe("B, refined.");
+    expect(threadContextBase([head, next], "t1", "c")?.id).toBe("b");
+    expect(threadContextBase([head, next], "t1", "c")?.refined?.text).toBe("B, refined.");
   });
-});
 
-describe("threadContextBase", () => {
   it("returns the member whose refined text is the base, so the base identity is capturable", () => {
-    const sessions = [
+    const identity = [
       take({
         id: "head",
         createdAt: "2025-09-01T10:00:00.000Z",
@@ -503,12 +510,12 @@ describe("threadContextBase", () => {
 
     // The appended take — recorded earlier, joined later — refines against
     // the head; the next member refines against the appended take.
-    expect(threadContextBase(sessions, "t1", "appended")?.id).toBe("head");
-    expect(threadContextBase(sessions, "t1", "appended")?.refined?.text).toBe("Head, refined.");
-    expect(threadContextBase(sessions, "t1", "unjoined")?.id).toBe("appended");
+    expect(threadContextBase(identity, "t1", "appended")?.id).toBe("head");
+    expect(threadContextBase(identity, "t1", "appended")?.refined?.text).toBe("Head, refined.");
+    expect(threadContextBase(identity, "t1", "unjoined")?.id).toBe("appended");
 
     // No refined predecessor, or no thread: no base to capture.
-    expect(threadContextBase(sessions, "t1", "head")).toBeUndefined();
+    expect(threadContextBase(identity, "t1", "head")).toBeUndefined();
     expect(threadContextBase([], "t1", "head")).toBeUndefined();
   });
 });
