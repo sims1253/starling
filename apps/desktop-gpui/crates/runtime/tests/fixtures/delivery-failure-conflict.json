@@ -1,0 +1,108 @@
+{
+  "machine": "delivery",
+  "description": "Failure branches: apply whose revalidation finds the target changed (delivery.conflict -> Conflict, then the user picks the clipboard fallback), and a submission that fails with fallbackSuggested -> Failed -> copyFallback. copyFallback closes nothing in v1 (no event is defined for it); the delivery stays Conflict/Failed and the user's choice is explicit.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_410",
+      "ts": "2026-09-20T10:08:00Z",
+      "corr": "dlv-3",
+      "seq": 1,
+      "type": "delivery.prepare",
+      "payload": { "revisionId": "rev-42", "targetRef": "vscode" }
+    },
+    {
+      "v": 1,
+      "id": "evt_410",
+      "ts": "2026-09-20T10:08:00Z",
+      "corr": "dlv-3",
+      "seq": 2,
+      "type": "delivery.prepared",
+      "payload": { "deliveryId": "dlv-3a", "compareToken": "tok-ghi789" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_411",
+      "ts": "2026-09-20T10:08:02Z",
+      "corr": "dlv-3",
+      "seq": 3,
+      "type": "delivery.apply",
+      "payload": { "deliveryId": "dlv-3a" }
+    },
+    {
+      "v": 1,
+      "id": "evt_411",
+      "ts": "2026-09-20T10:08:02Z",
+      "corr": "dlv-3",
+      "seq": 4,
+      "type": "delivery.conflict",
+      "payload": { "expectedTarget": "vscode", "actualTarget": "vscode-insiders" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_412",
+      "ts": "2026-09-20T10:08:04Z",
+      "corr": "dlv-3",
+      "seq": 5,
+      "type": "delivery.copyFallback",
+      "payload": { "deliveryId": "dlv-3a" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_413",
+      "ts": "2026-09-20T10:08:08Z",
+      "corr": "dlv-4",
+      "seq": 1,
+      "type": "delivery.prepare",
+      "payload": { "revisionId": "rev-42", "targetRef": "notes" }
+    },
+    {
+      "v": 1,
+      "id": "evt_412",
+      "ts": "2026-09-20T10:08:08Z",
+      "corr": "dlv-4",
+      "seq": 2,
+      "type": "delivery.prepared",
+      "payload": { "deliveryId": "dlv-4a", "compareToken": "tok-jkl012" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_414",
+      "ts": "2026-09-20T10:08:09Z",
+      "corr": "dlv-4",
+      "seq": 3,
+      "type": "delivery.apply",
+      "payload": { "deliveryId": "dlv-4a" }
+    },
+    {
+      "v": 1,
+      "id": "evt_413",
+      "ts": "2026-09-20T10:08:09Z",
+      "corr": "dlv-4",
+      "seq": 4,
+      "type": "delivery.submittedUnconfirmed",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "evt_414",
+      "ts": "2026-09-20T10:08:10Z",
+      "corr": "dlv-4",
+      "seq": 5,
+      "type": "delivery.failed",
+      "payload": { "reason": "target_unreachable", "fallbackSuggested": true }
+    },
+    {
+      "v": 1,
+      "id": "cmd_415",
+      "ts": "2026-09-20T10:08:12Z",
+      "corr": "dlv-4",
+      "seq": 6,
+      "type": "delivery.copyFallback",
+      "payload": { "deliveryId": "dlv-4a" }
+    }
+  ]
+}

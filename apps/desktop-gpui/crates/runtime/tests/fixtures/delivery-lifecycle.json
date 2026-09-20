@@ -1,0 +1,81 @@
+{
+  "machine": "delivery",
+  "description": "Happy path and cancel: prepare -> prepared -> apply (target revalidated: Prepared -> Revalidating) -> submittedUnconfirmed -> confirmed with an explicit evidence level; then a second delivery cancelled while Prepared.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_400",
+      "ts": "2026-09-20T10:07:00Z",
+      "corr": "dlv-1",
+      "seq": 1,
+      "type": "delivery.prepare",
+      "payload": { "revisionId": "rev-42", "targetRef": "vscode" }
+    },
+    {
+      "v": 1,
+      "id": "evt_400",
+      "ts": "2026-09-20T10:07:00Z",
+      "corr": "dlv-1",
+      "seq": 2,
+      "type": "delivery.prepared",
+      "payload": { "deliveryId": "dlv-1a", "compareToken": "tok-abc123" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_401",
+      "ts": "2026-09-20T10:07:02Z",
+      "corr": "dlv-1",
+      "seq": 3,
+      "type": "delivery.apply",
+      "payload": { "deliveryId": "dlv-1a" }
+    },
+    {
+      "v": 1,
+      "id": "evt_401",
+      "ts": "2026-09-20T10:07:02Z",
+      "corr": "dlv-1",
+      "seq": 4,
+      "type": "delivery.submittedUnconfirmed",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "evt_402",
+      "ts": "2026-09-20T10:07:03Z",
+      "corr": "dlv-1",
+      "seq": 5,
+      "type": "delivery.confirmed",
+      "payload": { "evidenceLevel": "target_ack" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_402",
+      "ts": "2026-09-20T10:07:06Z",
+      "corr": "dlv-2",
+      "seq": 1,
+      "type": "delivery.prepare",
+      "payload": { "revisionId": "rev-42", "targetRef": "notes" }
+    },
+    {
+      "v": 1,
+      "id": "evt_403",
+      "ts": "2026-09-20T10:07:06Z",
+      "corr": "dlv-2",
+      "seq": 2,
+      "type": "delivery.prepared",
+      "payload": { "deliveryId": "dlv-2a", "compareToken": "tok-def456" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_403",
+      "ts": "2026-09-20T10:07:07Z",
+      "corr": "dlv-2",
+      "seq": 3,
+      "type": "delivery.cancel",
+      "payload": { "deliveryId": "dlv-2a" }
+    }
+  ]
+}

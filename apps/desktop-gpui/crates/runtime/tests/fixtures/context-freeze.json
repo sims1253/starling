@@ -1,0 +1,164 @@
+{
+  "machine": "context",
+  "description": "Three cycles. Cycle A: snapshot -> mode decision -> route frozen (mode.routeFrozen is emitted when the audio route freezes at capture start; its corr names the take whose frames will leave the runtime, here take_77 continued by capture-happy.json) -> explicit expire. Cycle B: a snapshot that expires by itself ($advance over the runtime-internal expiry edge). Cycle C: freeze followed by the take completing ($advance Released) and the next cycle's Observing.",
+  "initial": "Observing",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_200",
+      "ts": "2026-09-20T10:00:00Z",
+      "corr": "ctx-1",
+      "seq": 1,
+      "type": "context.snapshot",
+      "payload": { "source": "vscode" }
+    },
+    {
+      "v": 1,
+      "id": "evt_200",
+      "ts": "2026-09-20T10:00:01Z",
+      "corr": "ctx-1",
+      "seq": 2,
+      "type": "context.targetSnapshot",
+      "payload": {
+        "descriptor": "vscode:active-editor",
+        "digest": "d41d8cd9",
+        "capabilities": ["text-insert", "selection-read"],
+        "selectionRange": { "startOffset": 120, "endOffset": 148 },
+        "offsetEncoding": "utf-16",
+        "expiry": "2026-09-20T10:00:40Z"
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_201",
+      "ts": "2026-09-20T10:00:02Z",
+      "corr": "ctx-1",
+      "seq": 3,
+      "type": "mode.set",
+      "payload": { "mode": "code-guidance", "source": "manual" }
+    },
+    {
+      "v": 1,
+      "id": "evt_201",
+      "ts": "2026-09-20T10:00:03Z",
+      "corr": "ctx-1",
+      "seq": 4,
+      "type": "mode.decision",
+      "payload": {
+        "modeId": "code-guidance",
+        "source": "manual",
+        "matchedPrefixSpan": null,
+        "explanation": "Manual mode selected from the tray menu.",
+        "payloadView": "instructions-only"
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_202",
+      "ts": "2026-09-20T10:00:04Z",
+      "corr": "take_77",
+      "seq": 409,
+      "type": "mode.routeFrozen",
+      "payload": { "route": "local-default", "decidedAt": "2026-09-20T10:00:03Z" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_202",
+      "ts": "2026-09-20T10:00:05Z",
+      "corr": "ctx-1",
+      "seq": 5,
+      "type": "context.expire",
+      "payload": {}
+    },
+    { "$advance": "Observing" },
+    {
+      "v": 1,
+      "id": "cmd_203",
+      "ts": "2026-09-20T10:00:10Z",
+      "corr": "ctx-2",
+      "seq": 1,
+      "type": "context.snapshot",
+      "payload": { "source": "notes" }
+    },
+    {
+      "v": 1,
+      "id": "evt_203",
+      "ts": "2026-09-20T10:00:11Z",
+      "corr": "ctx-2",
+      "seq": 2,
+      "type": "context.targetSnapshot",
+      "payload": {
+        "descriptor": "notes:front-document",
+        "digest": "0f2a7b31",
+        "capabilities": ["text-insert"],
+        "selectionRange": { "startOffset": 0, "endOffset": 0 },
+        "offsetEncoding": "utf-8",
+        "expiry": "2026-09-20T10:00:30Z"
+      }
+    },
+    { "$advance": "Expired" },
+    { "$advance": "Observing" },
+    {
+      "v": 1,
+      "id": "cmd_204",
+      "ts": "2026-09-20T10:00:15Z",
+      "corr": "ctx-3",
+      "seq": 1,
+      "type": "context.snapshot",
+      "payload": { "source": "vscode" }
+    },
+    {
+      "v": 1,
+      "id": "evt_204",
+      "ts": "2026-09-20T10:00:16Z",
+      "corr": "ctx-3",
+      "seq": 2,
+      "type": "context.targetSnapshot",
+      "payload": {
+        "descriptor": "vscode:active-editor",
+        "digest": "9c1e04aa",
+        "capabilities": ["text-insert", "selection-read", "atomic-edit"],
+        "selectionRange": { "startOffset": 44, "endOffset": 90 },
+        "offsetEncoding": "utf-16",
+        "expiry": "2026-09-20T10:00:55Z"
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_205",
+      "ts": "2026-09-20T10:00:17Z",
+      "corr": "ctx-3",
+      "seq": 3,
+      "type": "mode.set",
+      "payload": { "mode": "verbatim", "source": "manual" }
+    },
+    {
+      "v": 1,
+      "id": "evt_205",
+      "ts": "2026-09-20T10:00:18Z",
+      "corr": "ctx-3",
+      "seq": 4,
+      "type": "mode.decision",
+      "payload": {
+        "modeId": "verbatim",
+        "source": "manual",
+        "matchedPrefixSpan": null,
+        "explanation": "Verbatim mode selected manually; prefix interpretation disabled.",
+        "payloadView": "raw-text-only"
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_206",
+      "ts": "2026-09-20T10:00:19Z",
+      "corr": "take_90",
+      "seq": 1,
+      "type": "mode.routeFrozen",
+      "payload": { "route": "local-authoring-default", "decidedAt": "2026-09-20T10:00:18Z" }
+    },
+    { "$advance": "Released" },
+    { "$advance": "Observing" }
+  ]
+}

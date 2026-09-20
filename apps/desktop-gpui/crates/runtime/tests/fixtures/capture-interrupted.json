@@ -1,0 +1,49 @@
+{
+  "machine": "capture",
+  "description": "Device error mid-take: a fatal capture.error moves Recording -> Interrupted with acknowledged samples intact. The take stays Interrupted in this process; the Interrupted -> Recovering edge is runtime-internal (journal replay after restart) and is exercised by capture-recovery.json, which continues the take_5 stream.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_010",
+      "ts": "2026-09-20T10:02:00Z",
+      "corr": "take_5",
+      "seq": 100,
+      "type": "capture.start",
+      "payload": { "policy": "dictation" }
+    },
+    {
+      "v": 1,
+      "id": "evt_010",
+      "ts": "2026-09-20T10:02:00Z",
+      "corr": "take_5",
+      "seq": 101,
+      "type": "capture.started",
+      "payload": {
+        "device": "USB PnP Sound Device",
+        "actualRate": 16000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_011",
+      "ts": "2026-09-20T10:02:03Z",
+      "corr": "take_5",
+      "seq": 102,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 64000, "clipRatio": 0.0, "level": 0.12 }
+    },
+    {
+      "v": 1,
+      "id": "evt_012",
+      "ts": "2026-09-20T10:02:04Z",
+      "corr": "take_5",
+      "seq": 103,
+      "type": "capture.error",
+      "payload": { "code": "device_stream_lost", "fatal": true }
+    }
+  ]
+}

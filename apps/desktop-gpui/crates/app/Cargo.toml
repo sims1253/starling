@@ -1,0 +1,16 @@
+[package]
+name = "starling-gpui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sims1253/starling"
+description = "Starling desktop dictation app built with gpui (gpui port of the Electron shell)"
+
+[dependencies]
+gpui = "0.2.2"
+global-hotkey = "0.7"
+starling-dictation = { path = "../dictation" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dirs = "6"
+unicode-segmentation = "1"

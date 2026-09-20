@@ -1,0 +1,18 @@
+{
+  "machine": "capture",
+  "description": "Command illegal in the current state: capture.stop in Idle. Nothing is recording; stop is only legal from Recording.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "illegal_command",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_910",
+      "ts": "2026-09-20T10:09:10Z",
+      "corr": "take_9a",
+      "seq": 1,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    }
+  ]
+}
