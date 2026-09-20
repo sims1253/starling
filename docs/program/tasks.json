@@ -1410,11 +1410,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "coordinator",
    "branch": "gpui/fixes-wave-a7",
    "evidence": [
-    "PR #194 checks 2026-09-20: alsa-sys build script fails (no ALSA headers on runner); Desktop matrix red on packages/dictation/test/audio.test.ts 4 lint errors (type assertion without SAFETY, typeof narrowing, 2 blank-line)"
+    "boundary parser replaces type assertion (lint+fmt verified via main-checkout toolchain, 0/0); libasound2-dev install step added; pushed 80aa4a1 -> PR #194 re-runs checks"
    ],
    "notes": "audio.test.ts authored in gpui worktree which lacks node_modules - JS gates never ran there; fixing + verifying via main-checkout lint. code-review bot workflow itself failed on #196/#197 at open time (bot-side exit 1; later runs on other PRs succeeded) - no action possible from agents; re-triggers on next push."
   }
