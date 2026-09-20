@@ -1,0 +1,223 @@
+{
+  "name": "Native streaming dictation over WebSocket",
+  "route": "/stream",
+  "protocol": "starling-streaming",
+  "sources": [
+    "cpp/serve/main.cpp:942-1091 (WS handler: controls, audio frames, error frames, heartbeat)",
+    "cpp/serve/stream_session.hpp:69-82 (AppendOutcome), 133-203 (StreamSession contract)",
+    "tests/test_native_serve.py:test_websocket_control_frames, test_websocket_stream_cap, test_websocket_stream_audio_rejection, test_real_websocket_flow",
+    "docs/native-serving.md#ws-stream"
+  ],
+  "cases": [
+    {
+      "name": "ping heartbeat",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [{ "kind": "text", "message_json": { "type": "ping" } }]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [{ "type": "pong" }]
+      }
+    },
+    {
+      "name": "reset discards buffered audio",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [{ "kind": "text", "message_json": { "type": "reset" } }]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [{ "type": "reset_ack" }]
+      },
+      "note": "reset also re-enables audio acceptance after a buffer-cap error or an invalid-audio rejection."
+    },
+    {
+      "name": "commit with an empty buffer yields an empty final",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [{ "kind": "text", "message_json": { "type": "commit" } }]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          {
+            "type": "final",
+            "text": "",
+            "segments": [{ "text": "", "start_s": 0.0, "end_s": 0.0 }],
+            "duration_s": 0.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "audio then commit yields partials and a final",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 6.0 } },
+          { "kind": "text", "message_json": { "type": "commit" } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          {
+            "type": "partial",
+            "text": "<growing partial transcript>",
+            "segments": [{ "text": "<growing partial transcript>", "start_s": 0.0, "end_s": 6.0 }],
+            "start_s": 0.0,
+            "end_s": 6.0
+          },
+          {
+            "type": "final",
+            "text": "<final transcript>",
+            "segments": [{ "text": "<final transcript>", "start_s": 0.0, "end_s": 6.0 }],
+            "duration_s": 6.0
+          }
+        ]
+      },
+      "note": "First partial needs at least 5 s of audio (--min-chunk-seconds) and partials are at least 3 s apart (--partial-interval-seconds). WAV frames are equally accepted; a partial may or may not precede the commit depending on timing."
+    },
+    {
+      "name": "busy commit retains the audio",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.5 } },
+          { "kind": "text", "message_json": { "type": "commit" } },
+          { "kind": "text", "message_json": { "type": "commit" } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "server busy" },
+          { "type": "error", "message": "server busy" }
+        ]
+      },
+      "note": "Bounded busy retries on flush; the audio is retained, so a repeated commit retries it rather than emitting an empty final. Observed on the placeholder-model test server; a loaded model returns the final instead."
+    },
+    {
+      "name": "live buffer cap rejects a frame once",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 61.0, "note": "would push the live buffer past the 60 s default cap" } },
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 1.0, "note": "ignored: no second error frame" } },
+          { "kind": "text", "message_json": { "type": "ping" } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "stream buffer limit reached (60 s live buffer); audio ignored until reset" },
+          { "type": "pong" }
+        ]
+      },
+      "note": "The number in the message is the configured cap (--max-stream-seconds; 60 s default, 0 = unlimited). The cap bounds the live un-finalized buffer only; finalized windows are trimmed. Control frames keep working; reset re-enables audio."
+    },
+    {
+      "name": "malformed WAV frame invalidates the take",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "bytes_hex": "5249464600000000574156456a756e6b", "note": "RIFF/WAVE magic truncated before the fmt chunk" }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "malformed WAV frame rejected; audio ignored until reset" }
+        ]
+      }
+    },
+    {
+      "name": "non-16kHz WAV frame invalidates the take",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "wav", "sample_rate_hz": 8000, "channels": 1, "duration_s": 0.5 } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "WAV sample rate mismatch: expected 16000; audio ignored until reset" }
+        ]
+      }
+    },
+    {
+      "name": "odd-length PCM frame invalidates the take",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.5, "note": "with one extra trailing byte (split sample)" } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "odd-length PCM frame rejected (split sample); audio ignored until reset" }
+        ]
+      },
+      "note": "Frames are sequences of whole int16 samples; re-send on whole-sample boundaries."
+    },
+    {
+      "name": "commit on an invalidated take is refused",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "wav", "sample_rate_hz": 8000, "channels": 1, "duration_s": 0.5 } },
+          { "kind": "text", "message_json": { "type": "commit" } }
+        ]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [
+          { "type": "error", "message": "WAV sample rate mismatch: expected 16000; audio ignored until reset" },
+          { "type": "error", "message": "take invalidated (sample_rate_mismatch); reset and resend" }
+        ]
+      },
+      "note": "Never a successful final over an incomplete capture; the client falls back to its authoritative local recording. Reason codes: malformed_wav, sample_rate_mismatch, odd_pcm_length."
+    },
+    {
+      "name": "unknown control type",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [{ "kind": "text", "message_json": { "type": "transcribe" } }]
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [{ "type": "error", "message": "unknown type 'transcribe'" }]
+      }
+    },
+    {
+      "name": "client disconnect mid-session",
+      "request": {
+        "method": "WS",
+        "path": "/stream",
+        "ws_frames": [
+          { "kind": "binary", "audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.5 } }
+        ],
+        "then_disconnect": true
+      },
+      "response": {
+        "status": 101,
+        "ws_messages": [],
+        "after_disconnect": "The server tears the session down without sending frames (a stderr log line only); buffered audio is discarded. Server-side heartbeat pings every 30 s and closes after 3 missed pongs detect dead connections."
+      }
+    }
+  ]
+}

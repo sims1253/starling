@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "product": "starling-serve",
+  "endpoints": {
+    "batch_transcription": [
+      {
+        "method": "POST",
+        "path": "/transcribe",
+        "protocol": "starling-legacy",
+        "purpose": "Raw WAV bytes, raw PCM16, or multipart upload; Starling response shape."
+      },
+      {
+        "method": "POST",
+        "path": "/inference",
+        "protocol": "starling-legacy",
+        "purpose": "Alias for /transcribe."
+      },
+      {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "protocol": "openai-subset",
+        "purpose": "OpenAI-compatible subset: multipart file+model, json/text response."
+      }
+    ],
+    "text_normalization": [
+      {
+        "method": "POST",
+        "path": "/normalize",
+        "protocol": "starling-legacy",
+        "requires": "resident text model (s1)",
+        "purpose": "JSON {transcript, styling?, structure?, context?} to {text, request_id}."
+      }
+    ],
+    "live_transcription": [
+      {
+        "method": "GET",
+        "path": "/stream",
+        "protocol": "starling-streaming",
+        "upgrade": "websocket",
+        "purpose": "Real-time streaming dictation over binary audio frames and JSON control frames."
+      }
+    ],
+    "control": [
+      {
+        "method": "GET",
+        "path": "/health",
+        "protocol": "starling-legacy",
+        "purpose": "{status, model, loaded, busy, phase, queue_depth}."
+      },
+      {
+        "method": "GET",
+        "path": "/",
+        "protocol": "starling-legacy",
+        "alias_of": "/health",
+        "purpose": "Health alias for legacy probes."
+      },
+      {
+        "method": "POST",
+        "path": "/warmup",
+        "protocol": "starling-legacy",
+        "purpose": "Idempotent async warmup; 202 with {status, phase}."
+      },
+      {
+        "method": "DELETE",
+        "path": "/inference/{request_id}",
+        "protocol": "starling-legacy",
+        "purpose": "Cancel a queued or in-flight request; cancelled request answers 499."
+      }
+    ],
+    "discovery": [
+      {
+        "method": "GET",
+        "path": "/v1/models",
+        "protocol": "openai-subset",
+        "purpose": "Lists the one configured model; created is 0."
+      },
+      {
+        "method": "GET",
+        "path": "/v1/starling/capabilities",
+        "protocol": "starling-extension",
+        "purpose": "Partial capability shape (schema_version 1); subset of this descriptor, see README mapping."
+      }
+    ]
+  },
+  "audio": {
+    "sample_rates_hz": [16000],
+    "resampling": false,
+    "channel_handling": {
+      "wav_max_channels": 64,
+      "wav_mixdown": "average_to_mono",
+      "pcm16_channels": 1
+    },
+    "max_upload_mb": 256,
+    "batch": {
+      "starling_legacy": {
+        "containers": ["wav", "pcm16le"],
+        "wav_magic": ["RIFF", "RF64", "RIFX"]
+      },
+      "openai_subset": {
+        "containers": ["wav"],
+        "wav_magic": ["RIFF", "RF64"],
+        "multipart_file_part_name": "file",
+        "multipart_model_field_required": true
+      }
+    },
+    "live": {
+      "containers": ["wav", "pcm16le"],
+      "whole_sample_frames_required": true
+    }
+  },
+  "models": {
+    "listing_endpoint": "/v1/models",
+    "resident_limit": 1,
+    "served": [
+      {
+        "id": "parakeet",
+        "object": "model",
+        "created": 0,
+        "owned_by": "starling"
+      }
+    ],
+    "selection_semantics": "single-configured-model",
+    "created_semantics": "not-tracked"
+  },
+  "responses": {
+    "openai_subset_formats": ["json", "text"],
+    "openai_subset_plain_text_content_type": "text/plain; charset=utf-8",
+    "starling_legacy_shape": "{text, segments: [{text, start_s, end_s}], duration_s, request_id}",
+    "streaming_final_shape": "{type: final, text, segments: [{text, start_s, end_s}], duration_s}"
+  },
+  "streaming": {
+    "transport": "websocket",
+    "path": "/stream",
+    "protocol": "starling-streaming",
+    "openai_realtime_compatible": false,
+    "audio_frames": "binary WAV or raw little-endian PCM16 mono at the declared sample rate",
+    "server_messages": ["partial", "final", "error", "pong", "reset_ack"],
+    "client_controls": ["commit", "reset", "ping"],
+    "chunking": {
+      "window_seconds": {
+        "value": 12.0,
+        "cli_flag": "--stream-chunk-seconds"
+      },
+      "overlap_seconds": {
+        "value": 3.0,
+        "cli_flag": "--stream-overlap-seconds"
+      },
+      "min_seconds_before_first_partial": {
+        "value": 5.0,
+        "cli_flag": "--min-chunk-seconds"
+      },
+      "min_seconds_between_partials": {
+        "value": 3.0,
+        "cli_flag": "--partial-interval-seconds"
+      },
+      "overlap_dedup": "word-match-at-boundary"
+    },
+    "finalization": {
+      "commit": "commit finalizes all buffered audio and answers one final message",
+      "busy": "busy commit answers error 'server busy' and retains the audio for retry",
+      "invalidated_take": "commit on an invalidated take is refused with an error instead of a final",
+      "reset": "reset discards buffered audio, answers reset_ack, and re-enables audio acceptance"
+    },
+    "live_buffer_cap": {
+      "default_seconds": {
+        "value": 60.0,
+        "cli_flag": "--max-stream-seconds",
+        "zero_means": "unlimited"
+      },
+      "behavior": "one error frame per rejection, further audio ignored until reset; bounds the live (un-finalized) buffer only"
+    },
+    "take_invalidation": {
+      "reasons": ["malformed_wav", "sample_rate_mismatch", "odd_pcm_length"],
+      "recovery": "client resets and falls back to its authoritative local recording"
+    },
+    "heartbeat": {
+      "ping_interval_seconds": 30,
+      "max_missed_pongs": 3
+    }
+  },
+  "limits": {
+    "max_queue_waiters": 8,
+    "request_timeout_seconds": {
+      "value": 600.0,
+      "cli_flag": "--request-timeout-seconds",
+      "zero_means": "never"
+    },
+    "idle_shutdown_seconds": {
+      "value": 0.0,
+      "cli_flag": "--idle-timeout",
+      "zero_means": "never"
+    },
+    "serial_inference": true
+  },
+  "request_ids": {
+    "header": "X-Request-Id",
+    "fallback_header": "X-Correlation-Id",
+    "generated_when_absent": true,
+    "reserved_prefix": "#",
+    "echo_legacy": "request_id field in the JSON body",
+    "echo_openai_subset": "X-Request-Id response header",
+    "cancellation": "DELETE /inference/{request_id}"
+  },
+  "error_contract": {
+    "bodies": {
+      "openai_subset": "{error: {message, type, param, code}}",
+      "starling_legacy": "{error: string, text: \"\", request_id?}"
+    },
+    "non_json_bodies_possible": true,
+    "clients_must_check_status_first": true,
+    "status_codes": [
+      { "code": 400, "when": "invalid or unsupported request option; malformed audio; sample-rate mismatch; invalid request id" },
+      { "code": 404, "when": "requested model is not served by this process; unknown request id on cancel" },
+      { "code": 409, "when": "duplicate active request id" },
+      { "code": 413, "when": "request body too large (HTTP parser may answer non-JSON)" },
+      { "code": 499, "when": "cancelled" },
+      { "code": 500, "when": "engine error" },
+      { "code": 503, "when": "server busy or model not loaded" },
+      { "code": 504, "when": "queued request outlived the request timeout" }
+    ]
+  },
+  "features": {
+    "audio_transcription": true,
+    "text_normalization": false,
+    "prompt": false,
+    "language_selection": false,
+    "word_timestamps": false,
+    "segment_timestamps": true,
+    "verbose_json": false,
+    "subtitle_formats": false,
+    "diarization": false,
+    "sampling_controls": false,
+    "server_sent_transcription_events": false,
+    "openai_realtime": false,
+    "resampling": false,
+    "authentication": false
+  }
+}
