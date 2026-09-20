@@ -310,10 +310,14 @@ impl StarlingApp {
                 })
                 .await;
             match created {
-                Ok(id) => {
+                Ok(saved) => {
                     refresh_sessions(&this, &store, cx).await;
                     this.update(cx, |app, cx| {
-                        app.transcribe(id, wav, cx);
+                        // `saved.wav` is the audio to transcribe: the
+                        // stored evidence itself when the journal was
+                        // adopted (the same bytes a retry loads), the
+                        // caller's WAV otherwise.
+                        app.transcribe(saved.id, saved.wav, cx);
                     })
                     .ok();
                 }

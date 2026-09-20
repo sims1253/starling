@@ -572,6 +572,22 @@ impl StoreV2 {
         self.begin_take_with_id(id, 16_000, meta)
     }
 
+    /// [`Self::begin_take`] recording at an explicit sample rate — the
+    /// WAV-import shape, whose decoded bytes carry whatever rate the file
+    /// had. The id is minted the same way. The returned [`V2Take`] owns its
+    /// staging journal: appending, sealing, and finalizing are pure journal
+    /// work with no store access, so a caller sharing one store behind a
+    /// lock may release the lock for the write phase and retake it for
+    /// [`FinalizedTake::commit_marked`].
+    pub fn begin_take_at_rate(
+        &self,
+        sample_rate: u32,
+        meta: TakeMeta,
+    ) -> Result<V2Take, StoreV2Error> {
+        let id = format!("c_{}", uuid::Uuid::new_v4().simple());
+        self.begin_take_with_id(id, sample_rate, meta)
+    }
+
     /// [`Self::begin_take`] with a caller-chosen id and journal sample
     /// rate (the WAV-save path, which mints its own id).
     fn begin_take_with_id(
@@ -942,10 +958,13 @@ impl StoreV2 {
         }
     }
 
-    /// Lazily loads one take's audio (the G02 "load on demand" contract):
-    /// reads and verifies `audio/<id>.sj`. The verified prefix excludes any
-    /// torn tail; `torn_tail_bytes` reports it.
-    pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
+    /// Metadata-only half of [`Self::load_audio`]: the on-disk path of a
+    /// capture's audio journal. [`StoreV2Error::NotFound`] when the id has
+    /// no row; [`StoreV2Error::Invalid`] when the row exists but its journal
+    /// file is gone. Deliberately split out so a caller sharing the store
+    /// behind a lock can resolve the path under the guard and do the heavy
+    /// read + verify + WAV encode (via [`read_audio_journal`]) without it.
+    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {
         validate_capture_id(id)?;
         if self.get_capture(id)?.is_none() {
             return Err(StoreV2Error::NotFound(id.to_string()));
@@ -956,14 +975,15 @@ impl StoreV2 {
                 "capture {id} has no audio journal on disk"
             )));
         }
-        let parsed =
-            read_journal(&path).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        Ok(JournalAudio {
-            sample_rate: parsed.sample_rate,
-            samples: parsed.samples,
-            finalized: parsed.finalized,
-            torn_tail_bytes: parsed.torn_tail_bytes,
-        })
+        Ok(path)
+    }
+
+    /// Lazily loads one take's audio (the G02 "load on demand" contract):
+    /// reads and verifies `audio/<id>.sj`. The verified prefix excludes any
+    /// torn tail; `torn_tail_bytes` reports it.
+    pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
+        let path = self.audio_journal_path(id)?;
+        read_audio_journal(&path)
     }
 
     // ------------------------------------------------------------------
@@ -1391,7 +1411,17 @@ impl StoreV2 {
     /// import-audio and quiesce-salvage paths arrive as canonical 16 kHz
     /// WAVs rather than live journals; this writes them through the same
     /// durable steps a take gets. The audio is verified by re-reading the
-    /// journal before the row commits.
+    /// journal before the row commits. Note this decodes the entire WAV
+    /// into an in-memory [`crate::audio::PcmAudio`] while the caller still
+    /// holds the encoded bytes — roughly doubling peak memory for long
+    /// imports; acceptable at desktop scale, worth knowing for future
+    /// bulk-import callers.
+    ///
+    /// Everything runs under the caller's `&mut self`; a caller that shares
+    /// the store behind a lock and wants the journal writes off it drives
+    /// the same steps itself ([`Self::begin_take_at_rate`] +
+    /// [`V2Take::append_and_seal`] + [`V2Take::finalize`] +
+    /// [`FinalizedTake::commit_marked`]).
     pub fn save_wav_capture(
         &mut self,
         wav: &[u8],
@@ -1403,19 +1433,9 @@ impl StoreV2 {
                 "wav has no samples; nothing to store".to_string(),
             ));
         }
-        let id = format!("c_{}", uuid::Uuid::new_v4().simple());
-        let mut take = self.begin_take_with_id(id, pcm.sample_rate, meta)?;
-        for chunk in pcm.samples.chunks(4096) {
-            take.append_frames(chunk)?;
-        }
-        let acked = take.write_boundary()?;
-        if acked != pcm.samples.len() as u64 {
-            return Err(StoreV2Error::Invalid(format!(
-                "journal acknowledged {acked} samples for {} written",
-                pcm.samples.len()
-            )));
-        }
-        take.finish(self)
+        let mut take = self.begin_take_at_rate(pcm.sample_rate, meta)?;
+        take.append_and_seal(&pcm.samples)?;
+        take.finalize()?.commit_marked(self, CommitMark::Complete)
     }
 
     /// Marks the start of one recognition attempt on a capture: a
@@ -1560,6 +1580,17 @@ pub enum RecognitionOutcome<'a> {
     Failed { message: &'a str },
 }
 
+/// How a finalized take's `captures` row is written at commit time
+/// ([`FinalizedTake::commit_marked`]). `Interrupted` writes the status and
+/// its recovery note inside the commit transaction itself — there is no
+/// second update that a crash could skip (R34: a salvaged take must never
+/// rest as a complete take without its note).
+#[derive(Debug, Clone)]
+pub enum CommitMark {
+    Complete,
+    Interrupted { note: String },
+}
+
 impl V2Take {
     /// The capture id (also the journal file stem).
     pub fn id(&self) -> &str {
@@ -1576,6 +1607,25 @@ impl V2Take {
     /// count (§3: acknowledged = boundary fsynced).
     pub fn write_boundary(&mut self) -> Result<u64, StoreV2Error> {
         Ok(self.writer.write_boundary()?)
+    }
+
+    /// Appends `samples` in §3-sized chunks and writes the closing
+    /// boundary, verifying the acknowledged count covers everything
+    /// written (the write half of the WAV-import protocol). Pure journal
+    /// work through the take's own writer — no store access, so it needs
+    /// no store lock.
+    pub fn append_and_seal(&mut self, samples: &[f32]) -> Result<(), StoreV2Error> {
+        for chunk in samples.chunks(4096) {
+            self.append_frames(chunk)?;
+        }
+        let acked = self.write_boundary()?;
+        if acked != samples.len() as u64 {
+            return Err(StoreV2Error::Invalid(format!(
+                "journal acknowledged {acked} samples for {} written",
+                samples.len()
+            )));
+        }
+        Ok(())
     }
 
     /// §4 step 2 (first half): trailer with length + content hash, fsync
@@ -1598,21 +1648,42 @@ impl V2Take {
     /// [`CommittedTake`] is the durable ack — it exists only after the
     /// SQLite commit.
     pub fn finish(self, store: &mut StoreV2) -> Result<CommittedTake, StoreV2Error> {
-        let finalized = self.finalize()?;
-        store.promote_from_staging(&finalized.id)?;
+        self.finalize()?.commit_marked(store, CommitMark::Complete)
+    }
+}
+
+impl FinalizedTake {
+    /// §4 steps 2 (second half) – 4: promote out of staging, commit the
+    /// `captures` row (one transaction), sweep staging. The commit is
+    /// where the row first exists — with [`CommitMark::Interrupted`] the
+    /// status and recovery note land in that same transaction, so no crash
+    /// window can leave a salvaged take looking complete (R34).
+    pub fn commit_marked(
+        self,
+        store: &mut StoreV2,
+        mark: CommitMark,
+    ) -> Result<CommittedTake, StoreV2Error> {
+        store.promote_from_staging(&self.id)?;
+        let (status, extra_json) = match mark {
+            CommitMark::Complete => (CaptureStatus::Complete, self.meta.extra_json),
+            CommitMark::Interrupted { note } => (
+                CaptureStatus::Interrupted,
+                Some(merge_extra_note(self.meta.extra_json.as_deref(), &note)),
+            ),
+        };
         let record = CaptureRecord {
-            id: finalized.id.clone(),
-            created_utc: finalized.created_utc.clone(),
-            tz: finalized.meta.tz.clone(),
-            device: finalized.meta.device.clone(),
-            actual_rate: finalized.sample_rate,
-            policy: finalized.meta.policy.clone(),
-            frame_count: finalized.total_samples,
-            ack_sample_index: finalized.total_samples,
-            journal_hash: finalized.content_hash,
-            status: CaptureStatus::Complete,
-            retention_class: finalized.meta.retention_class,
-            extra_json: finalized.meta.extra_json,
+            id: self.id.clone(),
+            created_utc: self.created_utc.clone(),
+            tz: self.meta.tz.clone(),
+            device: self.meta.device.clone(),
+            actual_rate: self.sample_rate,
+            policy: self.meta.policy.clone(),
+            frame_count: self.total_samples,
+            ack_sample_index: self.total_samples,
+            journal_hash: self.content_hash,
+            status,
+            retention_class: self.meta.retention_class.clone(),
+            extra_json,
         };
         store.commit_capture(&record)?;
         store.gc_staging()?;
@@ -1811,6 +1882,21 @@ fn merge_extra_note(current: Option<&str>, note: &str) -> String {
     map.insert("recovery".to_string(), serde_json::Value::String(note.to_string()));
     serde_json::to_string(&serde_json::Value::Object(map))
         .expect("a JSON object serializes")
+}
+
+/// Read and verify one audio journal from disk (the lock-free half of
+/// [`StoreV2::load_audio`]). No store state is touched — only the file at
+/// `path` — so a caller sharing the store behind a lock resolves the path
+/// via [`StoreV2::audio_journal_path`] under the guard and does this work
+/// without it.
+pub fn read_audio_journal(path: &Path) -> Result<JournalAudio, StoreV2Error> {
+    let parsed = read_journal(path).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+    Ok(JournalAudio {
+        sample_rate: parsed.sample_rate,
+        samples: parsed.samples,
+        finalized: parsed.finalized,
+        torn_tail_bytes: parsed.torn_tail_bytes,
+    })
 }
 
 /// Sorted `.sj` stems under `dir` (missing dir = empty).
@@ -2698,6 +2784,94 @@ mod tests {
                 .save_wav_capture(&wav_bytes(&[]), TakeMeta::for_device("x"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_staged_protocol_walks_the_same_steps_without_holding_the_store() {
+        // The step-wise protocol a lock-sharing caller drives: begin under
+        // the guard, write + finalize with only the take's own journal,
+        // commit back under the guard. The end state must be exactly
+        // `save_wav_capture`'s (same row shape, same audio, staging swept).
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let samples = ramp(120, 0);
+
+        // `&self` borrows only — the point of the split: nothing here
+        // needs `&mut StoreV2` until the commit.
+        let mut take = store
+            .begin_take_at_rate(16_000, TakeMeta::for_device("staged"))
+            .expect("begin");
+        let staged_id = take.id().to_string();
+        take.append_and_seal(&samples).expect("append + seal");
+        let finalized = take.finalize().expect("finalize");
+        let committed = finalized
+            .commit_marked(&mut store, CommitMark::Complete)
+            .expect("commit");
+
+        assert_eq!(committed.record.id, staged_id);
+        assert_eq!(committed.record.status, CaptureStatus::Complete);
+        assert_eq!(committed.record.frame_count, 120);
+        let audio = store.load_audio(&staged_id).expect("audio");
+        assert_eq!(audio.samples, samples);
+        assert!(journal_ids_in(&store.root.join(STAGING_DIR)).is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_commit_writes_status_and_note_in_one_transaction() {
+        // R34: a salvaged take committed through the WAV path must land as
+        // interrupted with its note in the row's own INSERT — there is no
+        // follow-up status update a crash between the two could skip.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let samples = ramp(90, 0);
+
+        let mut take = store
+            .begin_take_at_rate(16_000, TakeMeta::for_device("salvage"))
+            .expect("begin");
+        take.append_and_seal(&samples).expect("append");
+        let committed = take
+            .finalize()
+            .expect("finalize")
+            .commit_marked(
+                &mut store,
+                CommitMark::Interrupted {
+                    note: "salvaged and kept as this interrupted recording".to_string(),
+                },
+            )
+            .expect("commit");
+
+        let id = committed.record.id.clone();
+        assert_eq!(committed.record.status, CaptureStatus::Interrupted);
+        let record = store.get_capture(&id).expect("get").expect("row");
+        assert_eq!(record.status, CaptureStatus::Interrupted);
+        let note = record.recovery_note().expect("the note landed with the row");
+        assert!(note.contains("salvaged and kept"), "{note}");
+        let audio = store.load_audio(&id).expect("audio");
+        assert_eq!(audio.samples, samples);
+    }
+
+    #[test]
+    fn read_audio_journal_agrees_with_load_audio() {
+        // The lock-free read half of `load_audio`: given only the path (as
+        // `audio_journal_path` resolves it under a caller's guard), it
+        // yields exactly what the store-owned read yields.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(70, 0));
+        let id = take.record.id.clone();
+
+        let path = store.audio_journal_path(&id).expect("path");
+        let free_read = read_audio_journal(&path).expect("free read");
+        let store_read = store.load_audio(&id).expect("store read");
+        assert_eq!(free_read.samples, store_read.samples);
+        assert_eq!(free_read.sample_rate, store_read.sample_rate);
+        assert_eq!(free_read.finalized, store_read.finalized);
+
+        // The metadata-only half keeps load_audio's typed failures.
+        match store.audio_journal_path("c_missing_row") {
+            Err(StoreV2Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

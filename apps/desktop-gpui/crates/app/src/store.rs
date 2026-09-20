@@ -70,23 +70,29 @@ impl Store {
 
     /// One recording's WAV, loaded on demand (G02). `Ok(None)` when the id
     /// is unknown — the delete race is indistinguishable from a missing
-    /// record and is not an error.
+    /// record and is not an error. The guard covers only the metadata
+    /// lookup; the journal read + verify and the WAV encode — the heavy
+    /// half, seconds for a long take — run without the shared handle, so
+    /// listing, playback, deletes, and the transcription job's
+    /// exists-checks are never pinned behind one load.
     pub(crate) fn audio_wav(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, storage::StorageError> {
-        let store = lock_v2(&self.0);
-        match store.load_audio(id) {
-            Ok(journal) => {
-                let pcm = audio::PcmAudio {
-                    samples: journal.samples,
-                    sample_rate: journal.sample_rate,
-                    channels: 1,
-                };
-                let wav = audio::encode_wav_16k(&pcm)
-                    .map_err(|err| storage::StorageError::Invalid(err.to_string()))?;
-                Ok(Some(Arc::new(wav)))
+        let path = {
+            let store = lock_v2(&self.0);
+            match store.audio_journal_path(id) {
+                Ok(path) => path,
+                Err(StoreV2Error::NotFound(_)) => return Ok(None),
+                Err(err) => return Err(v2_err(err)),
             }
-            Err(StoreV2Error::NotFound(_)) => Ok(None),
-            Err(err) => Err(v2_err(err)),
-        }
+        };
+        let journal = store_v2::read_audio_journal(&path).map_err(v2_err)?;
+        let pcm = audio::PcmAudio {
+            samples: journal.samples,
+            sample_rate: journal.sample_rate,
+            channels: 1,
+        };
+        let wav = audio::encode_wav_16k(&pcm)
+            .map_err(|err| storage::StorageError::Invalid(err.to_string()))?;
+        Ok(Some(Arc::new(wav)))
     }
 
     /// Persists a finished take: the recorder's journal is adopted as the
@@ -94,54 +100,80 @@ impl Store {
     /// re-encoded); otherwise the take is written from its encoded WAV
     /// through the full §4 protocol. The stored duration is derived from
     /// the samples themselves, never the caller's wall clock. Returns the
-    /// record id.
+    /// record id and the WAV any transcription must run on: when the
+    /// journal was adopted that is the *stored* audio (the evidence every
+    /// retry loads), so the first transcript and its retries can never
+    /// disagree — a faulted journal holds fewer samples than the
+    /// in-memory take.
     pub(crate) fn save_capture(
         &self,
         wav: Arc<Vec<u8>>,
         journal: Option<&recorder::JournalReport>,
-    ) -> Result<String, storage::StorageError> {
-        let mut store = lock_v2(&self.0);
-        if let Some(record) = adopt_or_none(&mut store, journal, None)? {
-            return Ok(record);
+    ) -> Result<SavedTake, storage::StorageError> {
+        let adopted = {
+            let mut store = lock_v2(&self.0);
+            try_adopt(&mut store, journal, None)
+        };
+        if let Ok(Some(id)) = adopted {
+            // A failure to load what was just committed would be odd, but
+            // the take is saved either way — fall back to the caller's WAV
+            // rather than failing the save over the transcript source.
+            let wav = self.audio_wav(&id).ok().flatten().unwrap_or(wav);
+            return Ok(SavedTake { id, wav });
         }
-        let take = store
-            .save_wav_capture(wav.as_slice(), store_v2::TakeMeta::for_device(""))
-            .map_err(v2_err)?;
-        Ok(take.record.id)
+        // No journal evidence — or a journal-level failure (the store
+        // itself is typically healthy): the fully encoded WAV is in hand,
+        // so the take is stored from it; a journal problem never costs the
+        // audio.
+        let pcm = decode_wav(&wav)?;
+        let id = self
+            .save_pcm_take(pcm, store_v2::CommitMark::Complete)
+            .map_err(|err| join_adopt_failure(adopted, err))?;
+        Ok(SavedTake { id, wav })
     }
 
     /// Persists a salvaged take as interrupted-but-usable with `note`
-    /// stating exactly what survived (I1 phase 2).
+    /// stating exactly what survived (I1 phase 2). The interruption is
+    /// written *with* the take: on the journal path adoption carries the
+    /// note and the status is forced under the same guard; on the WAV path
+    /// the row is committed already-interrupted in one transaction — there
+    /// is no separate status update a crash could skip (R34).
     pub(crate) fn save_interrupted_capture(
         &self,
         wav: Arc<Vec<u8>>,
         journal: Option<&recorder::JournalReport>,
         note: &str,
     ) -> Result<String, storage::StorageError> {
-        let mut store = lock_v2(&self.0);
-        if let Some(id) = adopt_or_none(&mut store, journal, Some(note))? {
-            // A salvaged take is interrupted no matter what its journal
-            // looked like (R34): the QuiesceTimeout path carries an
-            // already-finalized journal — the writer's exit path closed
-            // it — which adoption alone marks Complete. Interrupted-ness
-            // derives from the salvage, not the journal's finalized-ness.
-            // The note itself is already stored by the adoption (merged
-            // with any torn-tail wording under `extra_json.recovery`), so
-            // this only forces the status — passing no note keeps that
-            // combined wording intact.
-            store
-                .update_capture_status(&id, CaptureStatus::Interrupted, None)
-                .map_err(v2_err)?;
-            return Ok(id);
-        }
-        let take = store
-            .save_wav_capture(wav.as_slice(), store_v2::TakeMeta::for_device(""))
-            .map_err(v2_err)?;
-        let id = take.record.id.clone();
-        store
-            .update_capture_status(&id, CaptureStatus::Interrupted, Some(note))
-            .map_err(v2_err)?;
-        Ok(id)
+        let adopted = {
+            let mut store = lock_v2(&self.0);
+            let adopted = try_adopt(&mut store, journal, Some(note));
+            if let Ok(Some(id)) = &adopted {
+                // A salvaged take is interrupted no matter what its journal
+                // looked like (R34): the QuiesceTimeout path carries an
+                // already-finalized journal — the writer's exit path closed
+                // it — which adoption alone marks Complete. Interrupted-ness
+                // derives from the salvage, not the journal's finalized-ness.
+                // The note itself is already stored by the adoption (merged
+                // with any torn-tail wording under `extra_json.recovery`), so
+                // this only forces the status — passing no note keeps that
+                // combined wording intact.
+                store
+                    .update_capture_status(id, CaptureStatus::Interrupted, None)
+                    .map_err(v2_err)?;
+                return Ok(id.clone());
+            }
+            adopted
+        };
+        // Fall-through WAV path (no journal, or an unusable one — see
+        // [`try_adopt`]).
+        let pcm = decode_wav(&wav)?;
+        self.save_pcm_take(
+            pcm,
+            store_v2::CommitMark::Interrupted {
+                note: note.to_string(),
+            },
+        )
+        .map_err(|err| join_adopt_failure(adopted, err))
     }
 
     /// Marks a transcription attempt as started on the record. `backend`
@@ -203,27 +235,93 @@ impl Store {
             .map_err(v2_err)?;
         Ok(summary)
     }
+
+    /// Write a take from decoded PCM through the §4 protocol with the
+    /// guard held only for the cheap steps — minting the staging journal
+    /// and the metadata commit. The bulk journal writes and fsyncs run
+    /// through the take's own writer, off the shared handle, so one long
+    /// take's save cannot pin every other store call behind it.
+    fn save_pcm_take(
+        &self,
+        pcm: audio::PcmAudio,
+        mark: store_v2::CommitMark,
+    ) -> Result<String, storage::StorageError> {
+        let rate = pcm.sample_rate;
+        let mut take = {
+            let store = lock_v2(&self.0);
+            store.begin_take_at_rate(rate, store_v2::TakeMeta::for_device(""))
+        }
+        .map_err(v2_err)?;
+        take.append_and_seal(&pcm.samples).map_err(v2_err)?;
+        let finalized = take.finalize().map_err(v2_err)?;
+        let mut store = lock_v2(&self.0);
+        let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
+        Ok(committed.record.id)
+    }
 }
 
-/// Adopt the recorder's journal into v2 when it holds verified samples.
-/// `Ok(Some(id))` — adopted, with `note` (the salvage note) riding along
-/// when given. `Ok(None)` — no journal, or one without verified samples
-/// ([`StoreV2Error::NoVerifiedSamples`]: the writer faulted before its
-/// first boundary): not an error, the caller stores the take from its
-/// encoded WAV instead. Any other failure propagates.
-fn adopt_or_none(
+/// What a persisted take hands back to the pipeline: the record id, and
+/// the WAV any transcription of it must run on. When the recorder's
+/// journal was adopted, that is the stored audio — the evidence every
+/// retry loads — so the first transcript and later retries transcribe the
+/// same bytes ([`Store::save_capture`]).
+pub(crate) struct SavedTake {
+    pub(crate) id: String,
+    pub(crate) wav: Arc<Vec<u8>>,
+}
+
+/// Try to adopt the recorder's journal into v2. `Ok(Some(id))` — adopted,
+/// with `note` (the salvage note) riding along when given. `Ok(None)` — no
+/// journal to adopt. `Err(reason)` — adoption failed (an unreadable
+/// source, a destination conflict, I/O or database trouble), and that is
+/// **never fatal to the save**: the caller still holds the fully encoded
+/// WAV and stores the take from it instead, so a journal-level problem
+/// cannot cost the audio. `reason` resurfaces only if the WAV write also
+/// fails (see [`join_adopt_failure`]). This includes
+/// [`StoreV2Error::NoVerifiedSamples`] — a header-only journal from a
+/// writer that faulted before its first boundary — which is the common
+/// no-evidence case, not a fault.
+fn try_adopt(
     store: &mut StoreV2,
     journal: Option<&recorder::JournalReport>,
     note: Option<&str>,
-) -> Result<Option<String>, storage::StorageError> {
+) -> Result<Option<String>, String> {
     let Some(report) = journal else {
         return Ok(None);
     };
     match store.adopt_journal(&report.path, note) {
         Ok(record) => Ok(Some(record.id)),
-        Err(StoreV2Error::NoVerifiedSamples { .. }) => Ok(None),
-        Err(err) => Err(v2_err(err)),
+        Err(err) => Err(err.to_string()),
     }
+}
+
+/// Fold a journal-adoption failure into a later WAV-path failure: the take
+/// was stored from neither, and the surfaced error must say both — the WAV
+/// error alone would hide the adoption trouble that forced the fall-back.
+fn join_adopt_failure(
+    adopted: Result<Option<String>, String>,
+    wav_err: storage::StorageError,
+) -> storage::StorageError {
+    match adopted {
+        Ok(_) => wav_err,
+        Err(reason) => storage::StorageError::Invalid(format!(
+            "journal adoption failed ({reason}); storing the take from its encoded WAV \
+             failed too: {wav_err}"
+        )),
+    }
+}
+
+/// Decode the caller's canonical WAV — pure CPU work done *outside* the
+/// store lock; the shared handle must not sit behind it.
+fn decode_wav(wav: &[u8]) -> Result<audio::PcmAudio, storage::StorageError> {
+    let pcm = audio::decode_pcm16_wav(wav)
+        .map_err(|err| storage::StorageError::Invalid(err.to_string()))?;
+    if pcm.samples.is_empty() {
+        return Err(storage::StorageError::Invalid(
+            "wav has no samples; nothing to store".to_string(),
+        ));
+    }
+    Ok(pcm)
 }
 
 /// Page through the v2 listing with bounded reads (page size fixed;
@@ -575,8 +673,12 @@ mod tests {
         let wav = tiny_wav(300);
 
         // Save (no journal: the WAV path through the §4 protocol).
-        let id = store.save_capture(wav.clone(), None).expect("save");
+        let saved = store.save_capture(wav.clone(), None).expect("save");
+        let id = saved.id;
         assert!(store.exists(&id).expect("exists"));
+        // The WAV path hands the caller's own bytes back as the transcript
+        // source — the store wrote exactly those samples.
+        assert!(Arc::ptr_eq(&saved.wav, &wav));
 
         // List: metadata-only, mapped onto the v1 shape.
         let listed = store.list().expect("list");
@@ -700,7 +802,8 @@ mod tests {
 
         let id = store
             .save_capture(tiny_wav(90), Some(&report))
-            .expect("clean save");
+            .expect("clean save")
+            .id;
 
         let summary = summary_of(&store, &id);
         assert_eq!(summary.status, SessionStatus::Captured);
@@ -712,7 +815,8 @@ mod tests {
         let store = v2_store("degrade");
         let id = store
             .save_capture(tiny_wav(50), None)
-            .expect("save");
+            .expect("save")
+            .id;
 
         // The journal vanishes under the store (disk trouble).
         {
@@ -736,7 +840,8 @@ mod tests {
         let store = v2_store("recovery");
         let id = store
             .save_capture(tiny_wav(80), None)
-            .expect("save");
+            .expect("save")
+            .id;
         // A recognition attempt left "started" by a previous run.
         store.mark_attempt(&id, "starling:parakeet").expect("begin");
 
