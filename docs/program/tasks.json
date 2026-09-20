@@ -80,9 +80,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-17",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -94,9 +94,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-17",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -1302,11 +1302,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-15",
    "branch": "program/wave-a",
    "evidence": [
-    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+    "coordinator rerun: desktop 105/105, storage 54/54, tsc clean (451859c..e1df3d8); finding 1 resolved as do-NOT-stamp-legacy with justified semantics; finding 2 proven unreachable -> regression locks only; durationMs removed as dead weight"
    ],
    "notes": "dispatched after B02/B03 verified; durationMs finding resolved against stoppedTakeVerdict design"
   },
@@ -1398,19 +1398,20 @@
   },
   {
    "ids": [
-    "R14"
-   ],
-   "agent": "impl-agent-15",
-   "branch": "program/wave-a",
-   "scope": "apps/desktop + packages/dictation (light)"
-  },
-  {
-   "ids": [
     "E24"
    ],
    "agent": "impl-agent-16",
    "branch": "program/wave-a",
    "scope": "packages/contracts/multilingual + tests (light)"
+  },
+  {
+   "ids": [
+    "B04",
+    "B05"
+   ],
+   "agent": "impl-agent-17",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop + packages/dictation (light)"
   }
  ],
  "prs": {
