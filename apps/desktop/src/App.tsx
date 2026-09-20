@@ -7,7 +7,6 @@ import {
   invalidSessionWav,
   prepareWav16k,
   StarlingClient,
-  StarlingStream,
   type DictationSession,
   type InvalidStoredSession,
   type RefinedDraft,
@@ -36,7 +35,8 @@ import {
 import { useRecorder } from "./useRecorder";
 import { stoppedTakeVerdict } from "./recorderSession";
 import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings } from "./refine";
-import { StreamingDictation, type StreamingState } from "./streamingDictation";
+import { StreamingDictation, type StreamingState, type StreamingTransport } from "./streamingDictation";
+import { createStreamingTransport } from "./streamTransport";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
 import { SessionDeleteDialog, deletionWarning } from "./sessionDeletion";
@@ -1113,10 +1113,13 @@ export default function App() {
       setStreamStatus({ state: "connecting" });
       streamBailedRef.current = false;
 
-      let transport: StarlingStream;
+      let transport: StreamingTransport;
 
       try {
-        transport = new StarlingStream({ baseUrl: endpoint });
+        // The packaged app streams over the main process's native bridge;
+        // the browser preview opens the renderer socket its CSP permits
+        // (loopback or the page-origin ws proxy) — same interface (B01).
+        transport = createStreamingTransport(endpoint);
       } catch {
         setStreamStatus(undefined);
 

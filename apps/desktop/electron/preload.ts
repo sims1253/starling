@@ -9,6 +9,12 @@ import type {
   RefinementKeySaveResult,
   ServerHealth,
   StarlingDesktopBridge,
+  StreamCloseInput,
+  StreamCommandInput,
+  StreamCommandResult,
+  StreamEventMessage,
+  StreamOpenInput,
+  StreamSendInput,
   TranscribeInput,
   TranscriptionResult,
 } from "./ipc.js";
@@ -45,6 +51,20 @@ const bridge: StarlingDesktopBridge = Object.freeze({
     return () => ipcRenderer.removeListener("starling:discard-pending", listener);
   },
   discardCleanedUp: () => ipcRenderer.send("starling:discard-cleaned"),
+  // Live-streaming transport over the main process (B01): the renderer never
+  // opens a non-loopback WebSocket itself, so the static CSP stays loopback-
+  // only. Events flow back on starling:stream:event, tagged with streamId.
+  streamOpen: (input: StreamOpenInput) => invoke<{ streamId: number }>("starling:stream:open", input),
+  streamSend: (input: StreamSendInput) => invoke<void>("starling:stream:send", input),
+  streamCommand: (input: StreamCommandInput) =>
+    invoke<StreamCommandResult>("starling:stream:command", input),
+  streamClose: (input: StreamCloseInput) => ipcRenderer.send("starling:stream:close", input),
+  onStreamEvent: (callback: (message: StreamEventMessage) => void) => {
+    const listener = (_event: unknown, message: StreamEventMessage): void => callback(message);
+    ipcRenderer.on("starling:stream:event", listener);
+
+    return () => ipcRenderer.removeListener("starling:stream:event", listener);
+  },
 });
 
 contextBridge.exposeInMainWorld("starlingDesktop", bridge);
