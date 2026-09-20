@@ -58,11 +58,11 @@ bool greedy_generate(const HiggsModel& m, const InputsEmbeds& inputs,
     lib::GenerateResult lo;
     if (!lib::greedy_generate(decode_ctx(m), li, p, lo, err)) return false;
     // Leading-EOS (near-silence input): the shared stack stops on a
-    // prefill-argmax stop token for eos2 engines (qwen_decode.cpp's
-    // prefill_stop gate) — the deleted port's behavior, at its old cost
-    // (no wasted max_new_tokens decode).
+    // prefill-argmax stop token for every engine (the S03 termination
+    // contract) — higgs keeps its dual stop (eos + im_end) via eos2_token_id,
+    // so its behavior here is unchanged.
     out.ids = std::move(lo.ids);
-    out.hit_eos = lo.hit_eos;
+    out.hit_eos = lo.stop_reason == lib::GenStopReason::kEos;
     out.prefill_logits = std::move(lo.prefill_logits);
     return true;
 }

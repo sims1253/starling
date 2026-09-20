@@ -27,6 +27,19 @@ using starling::ggml::lib::report;
 
 } // namespace
 
+// S03 termination contract — completion status of the last successful
+// starling_ggml_moss_decode on a handle, queryable independently of the
+// returned text so a budget-truncated transcript is never mistaken for a
+// complete one. Internal entry following the parakeet _pub precedent (not in
+// the public starling_ggml.h; direct consumers declare it themselves). The
+// text is still returned on budget exhaustion — a partial transcript is
+// information; the status entry is what makes it truthful.
+enum {
+    STARLING_MOSS_COMPLETION_NONE   = 0,  // no successful decode yet on this handle
+    STARLING_MOSS_COMPLETION_EOS    = 1,  // stopped on EOS: complete transcript
+    STARLING_MOSS_COMPLETION_BUDGET = 2,  // max_new_tokens exhausted first: truncated
+};
+
 extern "C" {
 
 void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out) {
@@ -51,6 +64,8 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
     }
     try {
         using namespace starling::ggml::moss;
+        // A new decode attempt invalidates any previous completion claim.
+        c->last_completion = STARLING_MOSS_COMPLETION_NONE;
         const bool timing = std::getenv("STARLING_MOSS_TIMING") != nullptr;
         auto now = [&]() { return std::chrono::steady_clock::now(); };
         auto ms = [&](auto t0, auto t1) {
@@ -89,6 +104,13 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
         if (!greedy_generate(*c->model, inputs, options, generated, c->err)) {
             report(err_out, c->err); return nullptr;
         }
+        // S03 termination contract: record WHY generation stopped — EOS is a
+        // truthful completion; budget exhaustion means the transcript is a
+        // truncation (still returned, but never a complete success).
+        c->last_completion =
+            generated.stop_reason == starling::ggml::lib::GenStopReason::kEos
+                ? STARLING_MOSS_COMPLETION_EOS
+                : STARLING_MOSS_COMPLETION_BUDGET;
         auto a4 = now();
         if (timing) {
             std::fprintf(stderr, "MOSS_STAGE frames=%lld mel=%.1fms enc+adapt=%.1fms prompt+embeds=%.1fms gen=%.1fms audio_tokens=%lld prompt_tokens=%lld gen_tokens=%zu\n",
@@ -112,6 +134,14 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
         report(err_out, "unknown exception transcribing MOSS audio");
     }
     return nullptr;
+}
+
+// Completion status of the last successful starling_ggml_moss_decode on
+// `handle` (see the enum above). Safe on a null handle (returns NONE). The
+// value is per-context, so concurrent handles cannot cross-contaminate.
+int starling_ggml_moss_last_completion(void * handle) {
+    auto * c = static_cast<MossCtx *>(handle);
+    return c ? c->last_completion : STARLING_MOSS_COMPLETION_NONE;
 }
 
 } // extern "C"

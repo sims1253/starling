@@ -122,9 +122,18 @@ struct LlmState { std::vector<LayerKvCache> layers; int64_t length = 0; };
 // inputs_embeds, [hidden, n_tokens] f32 token-major (column per token).
 struct InputsEmbeds { std::vector<float> data; int64_t n_tokens = 0, width = 0; };
 struct PrefillResult { std::vector<float> logits; int32_t first_token = -1; LlmState state; };
+// Why greedy generation stopped (the S03 termination contract). kEos: a stop
+// token (primary EOS, or the configured secondary) was generated — a truthful
+// completion. kBudgetExhausted: the max_new_tokens budget ran out with no stop
+// token — the ids are a truncation, NOT a completed decode, and callers must
+// not report such output as complete success.
+enum class GenStopReason {
+    kEos,
+    kBudgetExhausted,
+};
 struct GenerateResult {
     std::vector<int32_t> ids;
-    bool hit_eos = false;
+    GenStopReason stop_reason = GenStopReason::kBudgetExhausted;
     std::vector<float> prefill_logits;
 };
 // greedy_generate controls. Model bundles keep their own GenerateOptions
@@ -139,6 +148,18 @@ struct GenerateParams {
     // the moss/ark/granite/qwen3 stop behavior byte-identical.
     int32_t eos2_token_id = -1;
 };
+
+// The ONE stop-token predicate behind every termination decision in
+// greedy_generate — the prefill first token, per-step decode, K-step blocks
+// and the debug/probe path all consult it, so the debug and release paths
+// cannot diverge on termination. The primary EOS always stops; the secondary
+// only when configured (eos2_token_id != -1, a sentinel no argmax in
+// [0, vocab) can ever equal). Pure and inline so the contract is
+// unit-testable without a model.
+inline bool generation_stops_on(int32_t token, const GenerateParams& op) {
+    return token == op.eos_token_id ||
+           (op.eos2_token_id != -1 && token == op.eos2_token_id);
+}
 
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t max_cache_len,
                  PrefillResult& o, std::string& e);
