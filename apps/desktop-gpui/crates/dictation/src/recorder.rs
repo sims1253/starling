@@ -22,11 +22,14 @@
 //! - `stop` is an explicit handshake (R09): declare
 //!   `finalSampleIndex = written_seq`, drop the CPAL stream, wait (bounded)
 //!   for `callback_alive == false`, join the writer, then drain what is
-//!   left. A quiesce timeout degrades to a typed
-//!   [`RecorderError::QuiesceTimeout`] carrying the captured audio. A
-//!   silent empty take is structurally impossible: the capture path holds
-//!   no mutex that could poison, and the consumer state is always
-//!   recovered from a poisoned lock rather than treated as empty.
+//!   left. A quiesce timeout defers teardown instead of racing a callback
+//!   that may still be executing: the salvaged accumulation is returned in
+//!   a typed [`RecorderError::QuiesceTimeout`], and the `Shared`
+//!   allocation is left to the callback's own `Arc` — it keeps writing
+//!   harmlessly into a ring nothing reads, and its last access frees the
+//!   memory. A silent empty take is structurally impossible: the capture
+//!   path holds no mutex that could poison, and the consumer state is
+//!   always recovered from a poisoned lock rather than treated as empty.
 //!
 //! The stream is requested as f32 / 1 channel / 16 kHz when the device
 //! supports it; otherwise the device default config is used and any format
@@ -176,16 +179,21 @@ pub enum RecorderError {
     /// The stop handshake timed out waiting for the audio callback to
     /// quiesce after the stream was dropped (R09). The acknowledged samples
     /// are preserved in `audio` — a wedged callback must never turn into a
-    /// silent empty take.
+    /// silent empty take. Teardown is deferred: the callback keeps its own
+    /// `Arc` to the orphaned ring and its last access frees the memory, so
+    /// `stop` never races a callback that may still be executing.
     #[error(
         "The microphone did not stop cleanly within the quiesce timeout; {acknowledged_samples} \
          captured samples are preserved in this error and were not lost."
     )]
     QuiesceTimeout {
         /// Total samples this capture acknowledged (acknowledged-sample
-        /// groundwork for §3's `capture.progress{ackSamples}`).
+        /// groundwork for §3's `capture.progress{ackSamples}`), including
+        /// any already handed out via [`RecorderHandle::drain_chunks`].
         acknowledged_samples: u64,
-        /// Everything captured and drained, ready to encode.
+        /// Everything captured and drained but not yet handed out, ready to
+        /// encode; `acknowledged_samples` minus this length is what the
+        /// caller already owns.
         audio: crate::audio::PcmAudio,
     },
 }
@@ -249,11 +257,32 @@ struct ConsumerState {
     /// Spans the producer overwrote before this consumer read them.
     gaps: Vec<CaptureGap>,
     /// Count of leading samples already handed out via
-    /// [`RecorderHandle::drain_chunks`]; `stop` returns only what is still
-    /// pending after that watermark.
+    /// [`RecorderHandle::drain_chunks`] — the single handout watermark.
+    /// Only [`ConsumerState::take_pending`] advances it, so incremental
+    /// drainers and `stop` agree on the delivered/pending boundary by
+    /// construction instead of each keeping a tally that can double-count
+    /// or lose a span.
     delivered: usize,
     /// First device-side error posted by the CPAL error callback (E01/G01).
     stream_error: Option<String>,
+}
+
+impl ConsumerState {
+    /// The accumulated samples not yet handed out.
+    fn pending(&self) -> &[f32] {
+        &self.samples[self.delivered..]
+    }
+
+    /// Hands out every accumulated sample not yet delivered, advancing the
+    /// watermark in the one place it is tracked. Both
+    /// [`RecorderHandle::drain_chunks`] and [`RecorderHandle::stop`] take
+    /// their pending span through here, so an interleaved caller's drained
+    /// chunks and `stop`'s final return always reassemble the take exactly.
+    fn take_pending(&mut self) -> Vec<f32> {
+        let pending = self.pending().to_vec();
+        self.delivered = self.samples.len();
+        pending
+    }
 }
 
 /// State shared between the cpal audio callback (producer) and the writer
@@ -442,6 +471,18 @@ fn wait_callback_quiesce(shared: &Shared, timeout: Duration) -> bool {
     true
 }
 
+/// The payload of a failed thread join, as text. Boxed panic payloads print
+/// as `Any { .. }` through Debug, which would say nothing.
+fn panic_message(join_err: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = join_err.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = join_err.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "its panic payload could not be displayed".to_string()
+    }
+}
+
 /// The dedicated consumer (§3 G01's "writer task"; phase 1 accumulates in
 /// memory where phase 2 will own the journal). Drains the ring every poll
 /// interval so a stalled UI — occluded window, paused animation frames —
@@ -513,8 +554,10 @@ where
 
 /// Convert and average interleaved frames down to mono, appending to `out`.
 /// Frames shorter than `channels` (a trailing partial frame) are dropped;
-/// `channels <= 1` passes through. `out` is cleared first; its capacity is
-/// retained so repeated calls do not allocate.
+/// `channels <= 1` passes through (a zero-channel config is rejected at
+/// stream-open, so that arm is only defensive totality for direct calls).
+/// `out` is cleared first; its capacity is retained so repeated calls do
+/// not allocate.
 fn downmix_into<T>(data: &[T], channels: usize, out: &mut Vec<f32>)
 where
     T: cpal::Sample,
@@ -601,16 +644,18 @@ impl RecorderHandle {
     /// The simplest UI wiring is to never call this while recording and take
     /// the whole recording from `stop` (exactly like `useRecorder.ts`, which
     /// only reads `chunksRef` at stop). If you do drain per frame, you own
-    /// the drained samples: `stop` returns only what is still pending.
+    /// the drained samples: `stop` returns only what is still pending — an
+    /// empty `Ok`, never [`RecorderError::Empty`], because the take was
+    /// captured; it is just already in your hands.
     pub fn drain_chunks(&self) -> Vec<Vec<f32>> {
         let mut guard = self.shared.lock_consumer();
         self.shared.drain_ring(&mut guard);
-        if guard.delivered >= guard.samples.len() {
-            return Vec::new();
+        let chunk = guard.take_pending();
+        if chunk.is_empty() {
+            Vec::new()
+        } else {
+            vec![chunk]
         }
-        let chunk = guard.samples[guard.delivered..].to_vec();
-        guard.delivered = guard.samples.len();
-        vec![chunk]
     }
 
     /// Last `n` captured samples (fewer until the take fills), for live
@@ -637,8 +682,12 @@ impl RecorderHandle {
     ///
     /// A quiesce timeout returns [`RecorderError::QuiesceTimeout`] with the
     /// acknowledged samples preserved inside the error — never a silent
-    /// empty result. [`RecorderError::Empty`] means the device produced
-    /// nothing at all.
+    /// empty result — and defers teardown: the wedged callback keeps its
+    /// own `Arc` to the ring, so `stop` neither races nor frees memory
+    /// under a callback that may still be executing.
+    /// [`RecorderError::Empty`] means the device produced nothing at all;
+    /// samples already handed out via [`Self::drain_chunks`] belong to the
+    /// caller and do not make the take "empty".
     pub fn stop(mut self) -> Result<crate::audio::PcmAudio, RecorderError> {
         self.shared.stopping.store(true, Ordering::Release);
         let final_sample_index = self.shared.written_seq.load(Ordering::Acquire);
@@ -656,18 +705,53 @@ impl RecorderHandle {
 
         // Wake the writer under the lock so a thread entering wait_timeout
         // cannot miss the notification; it then drains once more and exits.
+        // The join happens on both outcomes below: the writer never waits
+        // on the audio callback, so even a wedged callback cannot stall it.
         {
             let _guard = self.shared.lock_consumer();
             self.shared.wake.notify_all();
         }
         if let Some(writer) = self.writer.take() {
-            // Exits within one WRITER_POLL_INTERVAL of `stopping`.
-            let _ = writer.join();
+            // A panic inside the writer loop must be neither swallowed nor
+            // allowed to fail the take: it is surfaced through the same
+            // first-error-wins slot the device error callback uses, while
+            // the drain below still returns every sample that made it into
+            // the ring.
+            if let Err(join_err) = writer.join() {
+                self.shared.record_stream_error(format!(
+                    "The capture writer task failed: {}",
+                    panic_message(join_err)
+                ));
+            }
         }
 
-        // Final drain: the producer has quiesced (or is wedged — everything
-        // below the published frontier is stable either way). This also
-        // recovers ring contents even if the writer died unexpectedly.
+        if !quiesced {
+            // Deferred teardown (§3 R09): `callback_alive` never cleared, so
+            // a callback invocation may STILL be executing. Do not race it
+            // for the ring — no final drain here — and salvage only what
+            // the writer already accumulated. The handle's `Arc` is not the
+            // last reference: the callback's captured clone keeps `Shared`
+            // alive, its further writes land harmlessly in a ring nothing
+            // reads anymore, and the callback's last access frees the
+            // memory. The typed error carries the acknowledged count and
+            // the pending audio so nothing acknowledged is lost.
+            let mut guard = self.shared.lock_consumer();
+            let acknowledged_samples = guard.samples.len() as u64;
+            let pending = guard.take_pending();
+            drop(guard);
+            return Err(RecorderError::QuiesceTimeout {
+                acknowledged_samples,
+                audio: crate::audio::PcmAudio {
+                    samples: pending,
+                    sample_rate: self.sample_rate,
+                    channels: 1,
+                },
+            });
+        }
+
+        // Final drain: the producer has quiesced, so everything below the
+        // published frontier is stable. This also recovers ring contents
+        // even if the writer died unexpectedly.
         {
             let mut guard = self.shared.lock_consumer();
             self.shared.drain_ring(&mut guard);
@@ -675,27 +759,24 @@ impl RecorderHandle {
         let captured = self.shared.written_seq.load(Ordering::Acquire);
         debug_assert!(captured >= final_sample_index);
 
-        let guard = self.shared.lock_consumer();
-        let acknowledged_samples = guard.samples.len() as u64;
-        let pending = guard.samples[guard.delivered..].to_vec();
+        // Single-sourced tally: `delivered` advanced only in
+        // `take_pending`, so the pending span returned here is exactly the
+        // complement of whatever `drain_chunks` already handed out. `Empty`
+        // is decided by whether anything was ever captured, not by whether
+        // the pending span happens to be empty.
+        let mut guard = self.shared.lock_consumer();
+        let nothing_captured = guard.samples.is_empty();
+        let pending = guard.take_pending();
         drop(guard);
 
-        let audio = crate::audio::PcmAudio {
+        if nothing_captured {
+            return Err(RecorderError::Empty);
+        }
+        Ok(crate::audio::PcmAudio {
             samples: pending,
             sample_rate: self.sample_rate,
             channels: 1,
-        };
-
-        if !quiesced {
-            return Err(RecorderError::QuiesceTimeout {
-                acknowledged_samples,
-                audio,
-            });
-        }
-        if audio.samples.is_empty() {
-            return Err(RecorderError::Empty);
-        }
-        Ok(audio)
+        })
     }
 }
 
@@ -778,6 +859,22 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
     })
 }
 
+/// A capture stream needs at least one channel. A zero-channel device
+/// config must be rejected loudly at stream-open: letting it through would
+/// silently fall into the downmixer's mono passthrough and treat
+/// interleaved nothing-at-all as if it were mono samples.
+fn reject_zero_channels(channels: u16) -> Result<(), RecorderError> {
+    if channels == 0 {
+        Err(RecorderError::Device(
+            "The microphone reported a zero-channel configuration and cannot be captured \
+             from."
+                .to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Build the input stream for whichever sample format the config settled on.
 fn open_stream(
     device: &cpal::Device,
@@ -785,6 +882,7 @@ fn open_stream(
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
 ) -> Result<cpal::Stream, RecorderError> {
+    reject_zero_channels(config.channels)?;
     let attempted = match sample_format {
         cpal::SampleFormat::I8 => Some(build_stream::<i8>(device, config, shared)),
         cpal::SampleFormat::I16 => Some(build_stream::<i16>(device, config, shared)),
@@ -1311,6 +1409,158 @@ mod tests {
                 assert!(message.contains("not lost"), "{message}");
             }
             other => panic!("expected QuiesceTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quiesce_timeout_defers_teardown_and_orphans_the_ring() {
+        // §3 quiesce-timeout contract: stop must not race a callback that
+        // may still be executing. It returns the salvaged accumulation
+        // immediately, and the `Shared` allocation survives behind the
+        // producer's own `Arc` — the wedged callback keeps writing
+        // harmlessly into the orphaned ring with nothing reading it.
+        let shared = test_shared(8_192);
+        let mut callback = CallbackState::new(1);
+        let expected: Vec<f32> = (0..600u32).map(|i| i as f32 * 0.0001).collect();
+        for block in expected.chunks(128) {
+            callback.process(block, &shared);
+        }
+        let writer = spawn_writer(Arc::clone(&shared));
+        // Give the writer a tick, then wedge the quiesce flag. Even without
+        // the tick, the writer's exit drain inside stop() salvages the ring
+        // before the timeout branch reads the accumulation.
+        std::thread::sleep(Duration::from_millis(60));
+        shared.callback_alive.store(true, Ordering::Release);
+
+        let handle = RecorderHandle {
+            // The test keeps the producer's view of the allocation — in a
+            // real capture the callback closure holds this clone.
+            shared: Arc::clone(&shared),
+            stream: None,
+            writer: Some(writer),
+            sample_rate: 16_000,
+            started_at: Instant::now(),
+            quiesce_timeout: Duration::from_millis(30),
+        };
+
+        let salvaged = match handle.stop() {
+            Err(RecorderError::QuiesceTimeout {
+                acknowledged_samples,
+                audio,
+            }) => {
+                assert_eq!(acknowledged_samples, 600);
+                audio
+            }
+            other => panic!("expected QuiesceTimeout, got {other:?}"),
+        };
+        assert_eq!(salvaged.sample_rate, 16_000);
+        assert_eq!(salvaged.channels, 1);
+        assert_eq!(salvaged.samples, expected, "the salvaged take is intact");
+
+        // The orphaned ring still accepts the wedged callback's writes; the
+        // recorder is gone, nothing observes them, and the salvaged take is
+        // unaffected. Completing this without panicking is the no-UB shape:
+        // every access goes through the surviving Arc.
+        let after: Vec<f32> = (600..900u32).map(|i| i as f32 * 0.0001).collect();
+        for block in after.chunks(128) {
+            callback.process(block, &shared);
+        }
+        assert_eq!(shared.written_seq.load(Ordering::Acquire), 900);
+        assert_eq!(salvaged.samples, expected);
+    }
+
+    #[test]
+    fn interleaved_drain_chunks_and_stop_tally_exactly() {
+        // Partial-drain accounting: the delivered/pending watermark is
+        // single-sourced, so interleaved drain_chunks callers get an exact
+        // final tally — no double-counted span, no lost span, and no gap
+        // fabricated at a handout boundary.
+        let shared = test_shared(4_096);
+        let mut callback = CallbackState::new(1);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let data: Vec<f32> = (0..1_000u32).map(|i| i as f32 * 0.0001).collect();
+
+        let mut collected = Vec::new();
+        for (round, block) in data.chunks(125).enumerate() {
+            callback.process(block, &shared);
+            if round % 2 == 0 {
+                for chunk in handle.drain_chunks() {
+                    collected.extend(chunk);
+                }
+            }
+        }
+        assert!(handle.gaps().is_empty(), "no overflow: no gaps fabricated");
+        let audio = handle.stop().expect("stop after incremental drains");
+        collected.extend_from_slice(&audio.samples);
+        assert_eq!(collected.len(), 1_000, "exact sample count");
+        assert_eq!(collected, data, "drained + pending reassemble the take");
+    }
+
+    #[test]
+    fn fully_drained_take_is_not_reported_empty() {
+        // A caller that took the whole take via drain_chunks owns those
+        // samples; stop must not fabricate RecorderError::Empty ("the device
+        // produced nothing") for audio it already handed out.
+        let shared = test_shared(4_096);
+        let mut callback = CallbackState::new(1);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let data: Vec<f32> = (0..250u32).map(|i| i as f32 * 0.0001).collect();
+        for block in data.chunks(125) {
+            callback.process(block, &shared);
+        }
+        assert_eq!(handle.drain_chunks().concat(), data);
+        let audio = handle.stop().expect("a fully drained take stops cleanly");
+        assert!(audio.samples.is_empty(), "nothing pending remains");
+    }
+
+    #[test]
+    fn writer_panic_is_surfaced_and_samples_still_returned() {
+        // The writer dying must not be swallowed: the join failure lands in
+        // the first-error-wins capture-error slot while the take that made
+        // it into the ring is still returned (stop's final drain recovers
+        // what the dead writer left behind).
+        let shared = test_shared(4_096);
+        let mut callback = CallbackState::new(1);
+        let expected: Vec<f32> = (0..500u32).map(|i| i as f32 * 0.0001).collect();
+        for block in expected.chunks(125) {
+            callback.process(block, &shared);
+        }
+
+        let writer = std::thread::Builder::new()
+            .name("test-panicking-writer".to_string())
+            .spawn(|| panic!("writer exploded"))
+            .expect("spawn panicking writer");
+        let handle = RecorderHandle {
+            shared: Arc::clone(&shared),
+            stream: None,
+            writer: Some(writer),
+            sample_rate: 16_000,
+            started_at: Instant::now(),
+            quiesce_timeout: Duration::from_millis(200),
+        };
+
+        let audio = handle.stop().expect("samples that made it are returned");
+        assert_eq!(audio.samples, expected, "ring contents recovered");
+
+        let slot = shared.lock_consumer().stream_error.clone();
+        assert!(
+            slot.as_deref()
+                .is_some_and(|message| message.contains("writer exploded")),
+            "the writer failure must be surfaced, got {slot:?}"
+        );
+    }
+
+    #[test]
+    fn zero_channel_configs_are_rejected_not_treated_as_mono() {
+        // A device config with no channels must fail stream-open loudly…
+        let err = reject_zero_channels(0).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("zero-channel"),
+            "{err}"
+        );
+        // …while every real channel count opens as before.
+        for channels in 1..=8u16 {
+            assert!(reject_zero_channels(channels).is_ok());
         }
     }
 
