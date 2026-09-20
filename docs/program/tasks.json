@@ -1572,6 +1572,38 @@
     "PR #198 OCR run 35518206319 (2 findings)"
    ],
    "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch"
+  },
+  {
+   "id": "R28",
+   "title": "Cherry-pick conditional engine-test CI wiring onto all four engine branches",
+   "priority": "P2",
+   "kind": "ci",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": "coordinator",
+   "branch": null,
+   "evidence": [
+    "PR #197 rerun finding 4057347666: R18 wiring exists only on program/wave-a; engine branches build explicit target lists without device_cache_clear/greedy_termination/tdt_graph_budget tests"
+   ],
+   "notes": "cherry-pick 6f64d8f (conditional version) onto s01/s02/s03/s11 branches + push"
+  },
+  {
+   "id": "R29",
+   "title": "PR #199 batch-3 lows (active_tx cost, step perf note, TailFixture style, fake-engine key)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #199 OCR rerun 35518232105-2"
+   ],
+   "notes": "verify-then-fix; fold into next engine touch with R27"
   }
  ],
  "active_assignments": [

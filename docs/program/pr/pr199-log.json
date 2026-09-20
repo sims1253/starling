@@ -15,11 +15,16 @@
   4057070017,
   4057070027,
   4057070032,
-  4057070040
+  4057070040,
+  4057346919,
+  4057346925,
+  4057346927,
+  4057346930
  ],
  "known_issue_comment_ids": [
   5749833414,
-  5749851339
+  5749851339,
+  5750861551
  ],
  "findings": [
   {
@@ -101,6 +106,26 @@
    "id": 4057070040,
    "severity": "maint-low",
    "summary": "stream note"
+  },
+  {
+   "id": 4057346919,
+   "severity": "perf-low",
+   "summary": "active_tx per-call cost (rerun finding)"
+  },
+  {
+   "id": 4057346925,
+   "severity": "perf-low",
+   "summary": "Eac[h-step...] perf note"
+  },
+  {
+   "id": 4057346927,
+   "severity": "style-low",
+   "summary": "TailFixture style"
+  },
+  {
+   "id": 4057346930,
+   "severity": "test-low",
+   "summary": "fake engine key note"
   }
  ]
 }
