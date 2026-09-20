@@ -19,6 +19,23 @@ pub use crate::client::Protocol;
 pub struct ConfigDirUnavailable;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// The v1 file session store (`sessions/` + `journals/`). Default.
+    V1,
+    /// Storage v2 (SQLite `starling.db` + `audio/` sample journals). Set
+    /// only through the reviewed migration flow (dry-run → verified
+    /// import → cutover) or the `STARLING_STORAGE_V2` testing flag.
+    V2,
+}
+
+impl Default for StorageBackend {
+    fn default() -> Self {
+        StorageBackend::V1
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub endpoint: String,
@@ -31,6 +48,12 @@ pub struct Settings {
     /// which re-enables that sync instead of guessing from the file's text.
     #[serde(default)]
     pub user_set_model: bool,
+    /// Which storage backend the next start uses (E02 cutover). Additive:
+    /// files written before the cutover deserialize it as `V1`, so the
+    /// store of record never changes behind an old config's back. The
+    /// `STARLING_STORAGE_V2` environment flag still wins over it while set.
+    #[serde(default)]
+    pub storage_backend: StorageBackend,
 }
 
 impl Settings {
@@ -43,6 +66,7 @@ impl Settings {
             model: "parakeet".to_string(),
             expected_terms: vec!["auth".to_string()],
             user_set_model: false,
+            storage_backend: StorageBackend::V1,
         }
     }
 
@@ -136,6 +160,7 @@ mod tests {
         assert_eq!(settings.expected_terms, vec!["auth".to_string()]);
         assert_eq!(settings.expected_terms_input(), "auth");
         assert!(!settings.user_set_model);
+        assert_eq!(settings.storage_backend, StorageBackend::V1);
     }
 
     #[test]
@@ -166,6 +191,7 @@ mod tests {
             model: "whisper-large-v3".to_string(),
             expected_terms: vec!["auth".to_string(), "Starling".to_string()],
             user_set_model: true,
+            storage_backend: StorageBackend::V2,
         };
 
         settings.save(&path).expect("save");
@@ -182,6 +208,43 @@ mod tests {
             serde_json::json!(["auth", "Starling"])
         );
         assert_eq!(value["userSetModel"], true);
+        assert_eq!(value["storageBackend"], "v2");
+    }
+
+    #[test]
+    fn the_storage_backend_choice_round_trips_and_legacy_files_stay_v1() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+
+        // A file written before the cutover: no storageBackend key, and the
+        // store of record must stay v1 rather than being guessed from text.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","protocol":"starling","model":"parakeet","expectedTerms":["auth"]}"#,
+        )
+        .expect("write legacy settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.storage_backend, StorageBackend::V1);
+
+        // An explicit cutover persists and reloads.
+        let mut settings = settings;
+        settings.storage_backend = StorageBackend::V2;
+        settings.save(&path).expect("save");
+        assert_eq!(Settings::load(&path).storage_backend, StorageBackend::V2);
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("\"storageBackend\": \"v2\""), "{raw}");
+
+        // A corrupt value falls back to defaults, never to v2.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","protocol":"starling","model":"parakeet","expectedTerms":["auth"],"storageBackend":"v3"}"#,
+        )
+        .expect("write unknown backend");
+        assert_eq!(
+            Settings::load(&path).storage_backend,
+            StorageBackend::V1,
+            "an unknown value is a corrupt file: defaults, not a guess"
+        );
     }
 
     #[test]
