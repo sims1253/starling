@@ -6,48 +6,96 @@ use std::sync::Arc;
 use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
-    client::StarlingClient,
+    client::{ClientError, StarlingClient},
     recorder,
     storage::{self, FileSessionStore},
 };
 
 use crate::app::{StarlingApp, UnsavedWav, client_protocol};
 
-/// What a finished transcription job may apply to global app state (R03).
+/// What a failed job says about server reachability (R13).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FailureClass {
+    /// A transport-level failure — connection refused, timeout, network
+    /// unreachable. The server may be down, so the connection badge needs
+    /// a fresh health probe.
+    Transport,
+    /// Everything else: local storage failures (full disk), input
+    /// validation, blocked redirects, HTTP error statuses, and
+    /// protocol/parse errors. None of them says the server is
+    /// unreachable, so none of them may prompt a probe.
+    Local,
+}
+
+/// Classify a transcription-client failure by what it says about server
+/// reachability (R13). Only [`ClientError::Transport`] (connection
+/// refused, network unreachable, DNS and socket failures) and
+/// [`ClientError::Timeout`] qualify: an HTTP error status or a blocked
+/// redirect proves something answered on the endpoint, and
+/// `Input`/`Protocol` failures never left this machine.
+pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
+    match err {
+        ClientError::Transport(_) | ClientError::Timeout(_) => FailureClass::Transport,
+        ClientError::Input(_)
+        | ClientError::Redirect(_)
+        | ClientError::Http { .. }
+        | ClientError::Protocol(_) => FailureClass::Local,
+    }
+}
+
+/// What a finished transcription job may apply to global app state (R03,
+/// revised by R13).
 ///
-/// There is deliberately no connection variant: a job outcome conflates
-/// transport failures with local storage failures (`mark_attempt`,
-/// `save_transcript`, `save_failure` — think a full disk), so it cannot
-/// decide `Connection::Offline` or `Connection::Ready`. `check_health` is
-/// the single writer of connection state; a failed job surfaces as the
-/// per-session error instead.
+/// There is still deliberately no connection variant: a job outcome
+/// conflates transport failures with local storage failures
+/// (`mark_attempt`, `save_transcript`, `save_failure` — think a full
+/// disk), so it cannot decide `Connection::Offline` or
+/// `Connection::Ready` itself; `check_health` remains the single writer
+/// of connection state. What R13 adds: a failure classified
+/// [`FailureClass::Transport`] prompts a health probe, whose *result* —
+/// not the job — updates the badge, so a server that dies mid-session no
+/// longer shows a stale `Ready` until the next probe.
 pub(crate) enum FinishedJob {
     /// Transcript saved: no global-state effects.
     Saved,
-    /// The job failed: surface `message` as the app error.
-    Failed { message: String },
+    /// The job failed: surface `message` as the app error, and prompt a
+    /// connection re-probe only when `class` is
+    /// [`FailureClass::Transport`].
+    Failed {
+        message: String,
+        class: FailureClass,
+    },
 }
 
-/// Classify a finished transcription job (R03).
+/// Classify a finished transcription job (R03, revised by R13).
 ///
-/// `job_failure` is the error that failed the job, if any;
-/// `history_update_failure` is the error from the follow-up attempt to
-/// record that failure in local history, if that write also failed.
+/// `job_failure` is the error that failed the job (with its
+/// [`FailureClass`]), if any; `history_update_failure` is the error from
+/// the follow-up attempt to record that failure in local history, if
+/// that write also failed.
 pub(crate) fn finished_job(
-    job_failure: Option<&str>,
+    job_failure: Option<(&str, FailureClass)>,
     history_update_failure: Option<&str>,
 ) -> FinishedJob {
     match job_failure {
         None => FinishedJob::Saved,
-        Some(failure) => FinishedJob::Failed {
+        Some((failure, class)) => FinishedJob::Failed {
             message: match history_update_failure {
-                Some(storage_err) => {
-                    format!("{failure} Local history update also failed: {storage_err}")
-                }
+                Some(storage_err) => joined_failure(failure, storage_err),
                 None => failure.to_string(),
             },
+            class,
         },
     }
+}
+
+/// Join a job failure with a follow-up history-write failure (R14): one
+/// sentence boundary between the two messages — never a bare space, and
+/// never a doubled period when the failure already ends with one (the
+/// client's `Timeout` and `Protocol` messages do).
+fn joined_failure(failure: &str, history_err: &str) -> String {
+    let trimmed = failure.trim_end_matches('.');
+    format!("{trimmed}. Local history update also failed: {history_err}")
 }
 
 impl StarlingApp {
@@ -185,7 +233,7 @@ impl StarlingApp {
         cx.spawn(async move |this, cx| {
             enum Outcome {
                 Success,
-                Failure(String),
+                Failure { message: String, class: FailureClass },
             }
             let mut outcome = Outcome::Success;
 
@@ -218,28 +266,42 @@ impl StarlingApp {
                                 .await
                             };
                             if let Err(err) = saved {
-                                outcome = Outcome::Failure(err.to_string());
+                                // A local storage failure says nothing
+                                // about reachability (R13).
+                                outcome = Outcome::Failure {
+                                    message: err.to_string(),
+                                    class: FailureClass::Local,
+                                };
                             }
                         }
                         Err(err) => {
-                            outcome = Outcome::Failure(err.to_string());
+                            // R13: the client error is classified while it
+                            // is still typed — string matching later would
+                            // be fragile.
+                            outcome = Outcome::Failure {
+                                message: err.to_string(),
+                                class: failure_class(&err),
+                            };
                         }
                     }
                 }
                 Err(err) => {
-                    outcome = Outcome::Failure(err.to_string());
+                    outcome = Outcome::Failure {
+                        message: err.to_string(),
+                        class: FailureClass::Local,
+                    };
                 }
             }
 
             let job_failure = match outcome {
                 Outcome::Success => None,
-                Outcome::Failure(message) => Some(message),
+                Outcome::Failure { message, class } => Some((message, class)),
             };
 
             // Record a failure in local history; keep that write's own
             // error, if any, to append to the surfaced message.
             let history_failure = match job_failure.as_ref() {
-                Some(failure) => {
+                Some((failure, _class)) => {
                     let store = store_for_job.clone();
                     let id_for_failure = id.clone();
                     let failure_message = failure.clone();
@@ -256,10 +318,23 @@ impl StarlingApp {
                 None => None,
             };
 
-            match finished_job(job_failure.as_deref(), history_failure.as_deref()) {
-                FinishedJob::Failed { message } => {
+            match finished_job(
+                job_failure.as_ref().map(|(message, class)| (message.as_str(), *class)),
+                history_failure.as_deref(),
+            ) {
+                FinishedJob::Failed { message, class } => {
                     this.update(cx, |app, cx| {
                         app.error = Some(message);
+                        // R13: a transport-classified failure is the one
+                        // job outcome allowed to ask for a connection
+                        // re-check — and even it only triggers the probe.
+                        // `check_health` stays the single writer of
+                        // connection state, so a local failure still
+                        // cannot flip the badge, and a transport failure
+                        // whose probe succeeds shows the server recovered.
+                        if class == FailureClass::Transport {
+                            app.check_health(app.endpoint.clone(), cx);
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -368,27 +443,37 @@ mod tests {
         // storage error. The job's only global effect is the error banner —
         // `FinishedJob` carries no connection state at all, so the app can
         // no longer flip to `Connection::Offline` (or `Ready`) from a job
-        // outcome; only a health probe may.
+        // outcome; only a health probe may. R13 adds that this class also
+        // never prompts a probe: a full disk says nothing about the server.
         let job = finished_job(
-            Some("Local storage failed: No space left on device (os error 28)"),
+            Some((
+                "Local storage failed: No space left on device (os error 28)",
+                FailureClass::Local,
+            )),
             None,
         );
         match job {
-            FinishedJob::Failed { message } => assert_eq!(
-                message,
-                "Local storage failed: No space left on device (os error 28)"
-            ),
+            FinishedJob::Failed { message, class } => {
+                assert_eq!(
+                    message,
+                    "Local storage failed: No space left on device (os error 28)"
+                );
+                assert_eq!(class, FailureClass::Local);
+            }
             FinishedJob::Saved => panic!("a failed job must surface its error"),
         }
     }
 
     #[test]
     fn a_failed_history_update_is_appended_to_the_surfaced_error() {
-        let job = finished_job(Some("request failed"), Some("history is read-only"));
+        let job = finished_job(
+            Some(("request failed", FailureClass::Local)),
+            Some("history is read-only"),
+        );
         match job {
-            FinishedJob::Failed { message } => assert_eq!(
+            FinishedJob::Failed { message, .. } => assert_eq!(
                 message,
-                "request failed Local history update also failed: history is read-only"
+                "request failed. Local history update also failed: history is read-only"
             ),
             FinishedJob::Saved => panic!("a failed job must surface its error"),
         }
@@ -399,5 +484,82 @@ mod tests {
         // Success says nothing about server readiness or busyness, so it
         // cannot set `Connection::Ready` from its outcome either.
         assert!(matches!(finished_job(None, None), FinishedJob::Saved));
+    }
+
+    #[test]
+    fn transport_level_client_failures_classify_as_transport() {
+        // R13: only failures that mean "could not reach the server" may
+        // prompt a probe — connection refused, timeouts, unreachable
+        // networks all arrive as these two variants.
+        assert_eq!(
+            failure_class(&ClientError::Transport(
+                "error sending request for url (http://127.0.0.1:8181/transcribe): Connection \
+                 refused (os error 111)"
+                    .to_string()
+            )),
+            FailureClass::Transport
+        );
+        assert_eq!(
+            failure_class(&ClientError::Timeout(180_000)),
+            FailureClass::Transport
+        );
+    }
+
+    #[test]
+    fn answered_or_purely_local_failures_do_not_prompt_a_probe() {
+        // An HTTP error status or a blocked redirect proves something
+        // answered on the endpoint; Input/Protocol failures never left
+        // this machine.
+        assert_eq!(
+            failure_class(&ClientError::Input("Invalid server endpoint.".to_string())),
+            FailureClass::Local
+        );
+        assert_eq!(failure_class(&ClientError::Redirect(302)), FailureClass::Local);
+        assert_eq!(
+            failure_class(&ClientError::Http {
+                status: 500,
+                message: "model is loading".to_string()
+            }),
+            FailureClass::Local
+        );
+        assert_eq!(
+            failure_class(&ClientError::Protocol("transcription")),
+            FailureClass::Local
+        );
+    }
+
+    #[test]
+    fn a_transport_classified_job_failure_asks_for_a_probe_without_deciding_state() {
+        // R13: the class tells the caller to probe; the job outcome itself
+        // still carries no connection state — the probe's result is what
+        // writes `Connection::Offline`/`Ready`/`Busy`.
+        let job = finished_job(
+            Some((
+                "error sending request: connection refused",
+                FailureClass::Transport,
+            )),
+            None,
+        );
+        match job {
+            FinishedJob::Failed { message, class } => {
+                assert_eq!(message, "error sending request: connection refused");
+                assert_eq!(class, FailureClass::Transport);
+            }
+            FinishedJob::Saved => panic!("a failed job must surface its error"),
+        }
+    }
+
+    #[test]
+    fn a_history_failure_is_joined_with_a_sentence_boundary() {
+        // R14: no bare-space run-on.
+        assert_eq!(
+            joined_failure("request failed", "history is read-only"),
+            "request failed. Local history update also failed: history is read-only"
+        );
+        // Client messages that already end in a period must not double it.
+        assert_eq!(
+            joined_failure("Request timed out after 180000 ms.", "disk full"),
+            "Request timed out after 180000 ms. Local history update also failed: disk full"
+        );
     }
 }
