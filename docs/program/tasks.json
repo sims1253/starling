@@ -445,11 +445,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-18",
+   "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "reproducibility audit: lockfiles, action pins, frozen installs; motivated partly by socket-security dependency warnings on PRs"
   },
   {
    "id": "E17",
@@ -577,11 +577,13 @@
     "E10"
    ],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-16",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": "contract-level: multilingual/code-switching fixtures + locale contracts building on E06 corpus + E10 capabilities"
+   "evidence": [
+    "coordinator rerun: 58 multilingual + 66 fidelity tests green (65af808); Turkic SpecialCasing, fa-IR digits, fr NBSP quotes frozen; astral codepoint-offset mutant test"
+   ],
+   "notes": "contract-level complete; runtime gaps declared: language-selection UI (capability false today), IME/bidi editing tests, per-language quality reporting (model-gated)"
   },
   {
    "id": "E25",
@@ -1398,20 +1400,20 @@
   },
   {
    "ids": [
-    "E24"
-   ],
-   "agent": "impl-agent-16",
-   "branch": "program/wave-a",
-   "scope": "packages/contracts/multilingual + tests (light)"
-  },
-  {
-   "ids": [
     "B04",
     "B05"
    ],
    "agent": "impl-agent-17",
    "branch": "program/wave-a",
    "scope": "apps/desktop + packages/dictation (light)"
+  },
+  {
+   "ids": [
+    "E16"
+   ],
+   "agent": "impl-agent-18",
+   "branch": "program/wave-a",
+   "scope": "root build files + docs + workflows (light)"
   }
  ],
  "prs": {
