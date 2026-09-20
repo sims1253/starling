@@ -223,7 +223,7 @@ function handlersFor(
 }
 
 /** Keeps a promise pending until open(), like a slow transcription backend. */
-function gate(): { readonly promise: Promise<void>; open(): void } {
+function gate() {
   let open: () => void = () => {};
 
   const promise = new Promise<void>((resolve) => {
@@ -532,6 +532,7 @@ describe("finishStreamingTake", () => {
 
     const gateKeeper = stream.blockFinish();
     const released: number[] = [];
+
     const finalizing = finishStreamingTake(
       {
         ...handlersFor(stream, store, () => false),
@@ -576,6 +577,7 @@ describe("finishStreamingTake", () => {
       },
       store,
     );
+
     const finalizeTwo = finishStreamingTake(
       {
         ...handlersFor(streamTwo, store, () => true),

@@ -1813,6 +1813,7 @@ describe("retranscription attempts (B04)", () => {
 
     await memory.create({ id: "again", wav });
     await memory.markAttempt("again");
+
     const first = await memory.saveTranscript(
       "again",
       { text: "good words", segments: [] },
@@ -1820,6 +1821,7 @@ describe("retranscription attempts (B04)", () => {
     );
 
     await memory.markAttempt("again");
+
     const second = await memory.saveTranscript(
       "again",
       { text: "better words", segments: [] },

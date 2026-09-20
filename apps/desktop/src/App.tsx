@@ -1322,6 +1322,7 @@ export default function App() {
     start,
     stop,
     streamLive,
+    transcribe,
   ]);
 
   useEffect(() => {
