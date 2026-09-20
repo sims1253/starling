@@ -1556,6 +1556,22 @@
     "coordinator rerun after branch rebuild: stream_session_test 373/373 (8d416f8 pushed); generation snapshotted beside the callback (mid-step swap test); reset() bumps audio_rev_ (enforced, not comment-only)"
    ],
    "notes": "MEDIUM: capture inner AND tx_gen_ together atomically (the R24 keying has a creation/invocation gap); verify+enforce the reset safety argument in code not just comments"
+  },
+  {
+   "id": "R27",
+   "title": "PR #198 batch-5: RAII guard for trim_fault_hook reset (low); env-budget-tests claim rebutted",
+   "priority": "P3",
+   "kind": "test",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35518206319 (2 findings)"
+   ],
+   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch"
   }
  ],
  "active_assignments": [

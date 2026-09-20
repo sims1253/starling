@@ -27,12 +27,15 @@
   4057070021,
   4057070028,
   4057075326,
-  4057075406
+  4057075406,
+  4057250314,
+  4057250316
  ],
  "known_issue_comment_ids": [
   5749428749,
   5749451634,
-  5749747674
+  5749747674,
+  5750624137
  ],
  "last_review_comment_at": "2026-09-20T12:20:00Z",
  "findings": [
@@ -175,6 +178,16 @@
    "id": 4057075406,
    "severity": "resolved",
    "summary": "bot confirmed floored-rollback test addressed in 5d63153"
+  },
+  {
+   "id": 4057250314,
+   "severity": "test-medium",
+   "summary": "CLAIM: env_budget_bytes untested - REBUTTED: test_env_budget_parsing at tdt_graph_budget_test.cpp:264 pins grammar, per-case diagnostics, both-sign ERANGE clamp (8-case matrix + negative-overflow case added in R20/R25); verified against pushed branch head"
+  },
+  {
+   "id": 4057250316,
+   "severity": "maint-low",
+   "summary": "trim_fault_hook null-reset is manual - early-abort leaves hook set; RAII scope guard in the test"
   }
  ]
 }
