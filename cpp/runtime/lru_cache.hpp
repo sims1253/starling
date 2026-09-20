@@ -41,12 +41,15 @@ inline size_t replay_cache_size() {
 }
 
 // Parse an environment variable as a mebibyte count into a byte budget (the
-// STARLING_*_BUDGET_MB pattern). Strict: the WHOLE value must be a decimal
-// integer of MiB in [1, SIZE_MAX >> 20]. Anything else — unset-adjacent
-// garbage like "foo", trailing junk like "64x", an empty value, zero, or a
-// negative — is REJECTED with a one-line diagnostic on stderr and
-// `default_bytes` is used (a malformed knob must not silently disable or
-// shrink the bound; atol's silent truncation is exactly what this replaces).
+// STARLING_*_BUDGET_MB pattern). Strict-ish, strtoll grammar: optional leading
+// whitespace and +/- sign, then decimal digits to the END of the value
+// (leading whitespace is accepted and " 32" == "32" is deliberate — pinned by
+// the test suite; a sign alone is not digits and is rejected), and the number
+// must land in [1, SIZE_MAX >> 20] MiB. Anything else — garbage like "foo",
+// trailing junk like "64x", an empty value, zero, or a negative — is REJECTED
+// with a one-line diagnostic on stderr and `default_bytes` is used (a
+// malformed knob must not silently disable or shrink the bound; atol's silent
+// truncation is exactly what this replaces).
 // A parseable value too large to represent (ERANGE, or > SIZE_MAX >> 20 —
 // whose << 20 would wrap) is loudly CLAMPED to the largest representable
 // budget, (SIZE_MAX >> 20) MiB, rather than rejected: the operator asked for
@@ -201,28 +204,80 @@ private:
 //     entry is evicted first and the overshoot is trimmed at release. The
 //     invariant is bytes_in_use() <= max(byte_budget(), pinned bytes) — i.e.
 //     the budget always holds AT REST, and is exceeded only by live leases.
-//   * Failure: if `init` throws, the half-built entry is erased (no bytes
-//     retained) and the exception propagates — a failed build never poisons
-//     the cache. (Callers that can leave a VALID-but-unusable entry must
-//     poison the value itself, like the encoder's pos-projection failure.)
+//   * Failure: a throwing build never poisons the cache — the rollback bullet
+//     above erases the half-built entry and the exception propagates. (Callers
+//     that can leave a VALID-but-unusable entry must poison the value itself,
+//     like the encoder's pos-projection failure.)
 //   * A ZERO byte budget is rejected at construction (std::invalid_argument)
 //     rather than silently clamped: the env parser above already guarantees a
 //     validated budget on the production path, so zero can only be a
 //     direct-construction bug — fail loudly instead of running a cache that
 //     must evict everything.
+//   * Zero-byte floor (R22): an entry whose `init` reports ZERO tracked bytes
+//     has, by this cache's contract, an UNKNOWN device cost, not a free one —
+//     on the TDT path zero means the ReplayGraph took the ggml_backend_sched
+//     fallback (no private gallocr buffer to measure; see tdt_multistep.cpp's
+//     accounting note). Tracking it as 0 would silently degenerate the byte
+//     budget into an unbounded entry cache. Such entries are therefore charged
+//     a conservative floor (`zero_byte_floor`, default
+//     kZeroByteEntryFloorBytes) AND hard-capped in COUNT (`floored_cap`,
+//     default kFlooredEntryCap) so an all-sched workload stays bounded no
+//     matter how large the byte budget is. The first floored insert emits a
+//     one-time stderr diagnostic naming the accounting that applies. Passing
+//     0 for either knob opts out of that guard (documented; the defaults keep
+//     every cache bounded).
+//   * Rollback: if `init` throws, OR anything between the accounting commit
+//     and the return throws (trim_over_budget's victim-vector allocation,
+//     the trace call), the half-built entry is erased with its accounted
+//     bytes, pin, floored count, and LRU node all restored — bytes_in_use()
+//     is never left inflated by a failed insert. The LRU node is erased via
+//     the entry's STORED list iterator, not pop_front(), so even a reentrant
+//     touch from `init` (which would splice the node away from the front)
+//     rolls back the right node.
 //
 // As above: callers serialize cache access; `label` names the cache in the
 // STARLING_TRACE "cache" records (size/capacity are BYTES here, evicted is an
 // entry count). get() and the lease paths trace the same hit/miss event
 // kinds; lease-path events carry an extra "pin":1 marker so a leased hit is
 // distinguishable from a plain-LRU hit in the records.
+
+// Conservative charge for an entry whose `init` reports ZERO tracked bytes
+// (R22; see the zero-byte floor bullet in the class comment). 8 MiB sits at
+// the top of the observed per-(T,K) TDT graph range (roughly 1.5-3 MiB
+// short/medium, ~4-8 MiB long), so it never UNDER-counts a sched-path graph
+// — over-charging only evicts earlier, the safe direction. Compile-time
+// nonzero so the default cache is bounded by construction: budget/floor is
+// an upper bound on all-floored entry count.
+constexpr size_t kZeroByteEntryFloorBytes = size_t(8) << 20;
+// Hard COUNT cap on floored entries (R22): with an operator-sized byte budget
+// (STARLING_TDT_GRAPH_BUDGET_MB clamps up to SIZE_MAX>>20 MiB) budget/floor
+// alone can still admit a pathological number of zero-byte entries; 16
+// matches the encoder entry-LRU's default order (kDefaultReplayCacheSize).
+constexpr size_t kFlooredEntryCap = 16;
+static_assert(kZeroByteEntryFloorBytes > 0, "zero-byte floor must be nonzero");
+static_assert(kFlooredEntryCap >= 1, "floored entry cap must be >= 1");
+
+namespace detail {
+// Fault-injection seam for tests (R22): when non-null, invoked at the top of
+// every ByteBudgetLruCache::trim_over_budget call. A hook that throws
+// simulates the std::vector victim-buffer allocation failure the insert
+// rollback must survive (bytes_/floored_ already committed at that point).
+// MUST remain null in production.
+inline void (*trim_fault_hook)() = nullptr;
+}  // namespace detail
+
 template <typename Key, typename Value,
           typename Hash = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>>
 class ByteBudgetLruCache {
 public:
-    explicit ByteBudgetLruCache(size_t byte_budget, const char* label = nullptr)
-        : label_(label) {
+    // `zero_byte_floor` / `floored_cap` configure the R22 zero-byte guard
+    // (see the class comment); the defaults bound every cache. Pass 0 to opt
+    // out of a guard — only for callers whose init provably never reports 0.
+    explicit ByteBudgetLruCache(size_t byte_budget, const char* label = nullptr,
+                                size_t zero_byte_floor = kZeroByteEntryFloorBytes,
+                                size_t floored_cap = kFlooredEntryCap)
+        : label_(label), floor_(zero_byte_floor), floored_cap_(floored_cap) {
         if (byte_budget == 0)
             throw std::invalid_argument(
                 "ByteBudgetLruCache: byte budget must be at least 1 byte");
@@ -233,6 +288,9 @@ public:
     size_t byte_budget() const { return budget_; }
     size_t bytes_in_use() const { return bytes_; }
     size_t pinned_size() const { return pinned_; }
+    // Entries currently charged the zero-byte floor (R22 observability; the
+    // floored_cap bounds this count).
+    size_t floored_size() const { return floored_; }
 
     // Plain LRU lookup (touch, no pin). Stable until a non-const operation
     // evicts THIS key. Nullptr on miss (the get_or_init that follows reports
@@ -262,9 +320,12 @@ public:
     // Lease fetch-or-build. On miss: insert a default value at a stable
     // address, PIN it (so the trim below can never drop the entry being
     // built), call `init(value)` — which fills the value and returns its
-    // tracked bytes — account the bytes, then evict unpinned LRU entries
-    // until back under budget. If `init` throws, the entry is erased and the
-    // exception rethrown (no bytes retained).
+    // tracked bytes — account the bytes (a ZERO return is charged the
+    // zero-byte floor; see the class comment), then evict unpinned LRU
+    // entries until back under budget (and, for a floored insert, down to
+    // the floored-entry cap). Any throw from here onward — init, the
+    // accounting-adjacent trim, the trace — rolls the entry back completely
+    // (bytes, pin, floored count, LRU node) and propagates.
     template <typename Init>
     Value* get_or_init_pinned(const Key& key, Init&& init) {
         auto it = map_.find(key);
@@ -283,17 +344,43 @@ public:
             inserted = map_.try_emplace(key).first;
             inserted->second.first = lru_.begin();
             pin(inserted);
-            entry(inserted).bytes = init(entry(inserted).value);
-            bytes_ += entry(inserted).bytes;
-            const size_t evicted = trim_over_budget();
+            Entry& e = entry(inserted);
+            const size_t reported = init(e.value);
+            e.floored = (reported == 0 && floor_ > 0);
+            e.bytes = e.floored ? floor_ : reported;
+            if (e.floored) {
+                ++floored_;
+                warn_floor_once();
+            }
+            bytes_ += e.bytes;
+            const size_t evicted = trim_over_budget(/*enforce_floored_cap=*/e.floored);
             trace("miss", evicted, /*pins=*/true);
-            return &entry(inserted).value;
+            return &e.value;
         } catch (...) {
             if (inserted != map_.end()) {
-                if (entry(inserted).pinned) --pinned_;
+                // Rollback in reverse order of the commits above. bytes_ -=
+                // undoes the accounting even when the throw happened AFTER
+                // bytes_ += (e.g. trim_over_budget's victim-vector
+                // allocation): without it a failed insert would permanently
+                // inflate bytes_in_use() and the cache would chronically
+                // over-evict (R22 review finding).
+                Entry& e = entry(inserted);
+                if (e.pinned) --pinned_;
+                bytes_ -= e.bytes;
+                if (e.floored) --floored_;
+                // Erase the LRU node by its STORED iterator: today init never
+                // calls back into the cache so the node is still at the
+                // front, but a reentrant touch() would splice it away and a
+                // pop_front() would then drop the WRONG key and leave this
+                // node's ListIt dangling (R22 review finding). The stored
+                // iterator is authoritative in both cases.
+                lru_.erase(inserted->second.first);
                 map_.erase(inserted);  // destroys the half-built value
+            } else {
+                // try_emplace itself threw: the node pushed above is still
+                // the front by construction (nothing ran that could move it).
+                lru_.pop_front();
             }
-            lru_.pop_front();
             throw;
         }
     }
@@ -315,13 +402,15 @@ public:
         lru_.clear();
         bytes_ = 0;
         pinned_ = 0;
+        floored_ = 0;
     }
 
 private:
     struct Entry {
         Value value;
-        size_t bytes = 0;   // tracked bytes (init's return value)
+        size_t bytes = 0;   // tracked bytes (init's return, or the floor)
         bool pinned = false;
+        bool floored = false;  // bytes is the zero-byte floor, not a measurement
     };
     using ListIt = typename std::list<Key>::iterator;
     using MapVal = std::pair<ListIt, Entry>;
@@ -349,14 +438,27 @@ private:
     // oversized live leases). No-op when already within budget. Returns the
     // number of victims. Invariants kept: bytes_in_use() <= budget at rest
     // (except live leases), pinned entries never evicted, LRU victim order.
-    size_t trim_over_budget() {
+    //
+    // With enforce_floored_cap (set by the insert path when the just-inserted
+    // entry was floored), the pass additionally evicts until the floored
+    // ENTRY count is within floored_cap_ — the hard count bound that keeps an
+    // all-zero-byte (sched-path) workload bounded even when the byte budget
+    // itself is huge (R22).
+    size_t trim_over_budget(bool enforce_floored_cap = false) {
+        // Test-only fault seam (see detail::trim_fault_hook): a throwing hook
+        // lands in the caller's rollback path with the accounting committed.
+        if (detail::trim_fault_hook) detail::trim_fault_hook();
         std::vector<typename Map::iterator> victims;
         size_t victim_bytes = 0;
+        size_t victim_floored = 0;
         for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
-            if (bytes_ - victim_bytes <= budget_) break;   // budget met
+            if (bytes_ - victim_bytes <= budget_ &&
+                (!enforce_floored_cap || floored_ - victim_floored <= floored_cap_))
+                break;   // budget (and floored cap, if enforced) met
             auto mit = map_.find(*lit);
             if (mit == map_.end() || entry(mit).pinned) continue;
             victim_bytes += entry(mit).bytes;
+            if (entry(mit).floored) ++victim_floored;
             victims.push_back(mit);
         }
         // The sweep is safe: erasing an unordered_map node invalidates only
@@ -365,10 +467,28 @@ private:
         // readable until its own erasure.
         for (auto mit : victims) {
             bytes_ -= entry(mit).bytes;
+            if (entry(mit).floored) --floored_;
             lru_.erase(mit->second.first);
             map_.erase(mit);
         }
         return victims.size();
+    }
+
+    // One-time-per-cache diagnostic when the zero-byte floor is first applied
+    // (R22): zero tracked bytes means the device cost is UNKNOWN (sched-path
+    // graph), not free — say so, and say which accounting now applies.
+    void warn_floor_once() {
+        if (floor_warned_) return;
+        floor_warned_ = true;
+        std::fprintf(stderr,
+                     "starling: %s: entry reports 0 tracked device bytes "
+                     "(device accounting unavailable - typically a "
+                     "ggml_backend_sched-allocated graph with no private "
+                     "buffer to measure); charging a conservative %zu-byte "
+                     "floor per such entry and hard-capping floored entries "
+                     "at %zu, so the byte budget stays bounded\n",
+                     label_ ? label_ : "byte-budget cache", floor_,
+                     floored_cap_);
     }
 
     // Field mapping into the shared cache_event schema: size=bytes_ and
@@ -385,6 +505,13 @@ private:
     const char* label_ = nullptr;
     size_t bytes_ = 0;
     size_t pinned_ = 0;
+    // Zero-byte accounting guard (R22): floor charged per zero-reporting
+    // entry, hard count cap on floored entries, current floored count, and
+    // the one-time diagnostic latch.
+    size_t floor_;
+    size_t floored_cap_;
+    size_t floored_ = 0;
+    bool floor_warned_ = false;
     std::list<Key> lru_;
     Map map_;
 };

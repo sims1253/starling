@@ -561,6 +561,93 @@ void test_real_graphs() {
 
 }  // namespace
 
+
+
+// Insert-then-release helper for the non-leased assertions below: the
+// pinned acquire keeps the entry alive across the statement, then the
+// release restores the at-rest (post-trim) state those tests assert on.
+static void release_after(ByteBudgetLruCache<int, FakeEntry>& cache,
+                          FakeEntry* entry, int key) {
+    (void)entry;
+    cache.release(key);
+}
+
+// (15) Zero-byte accounting guard (R22): an init that reports ZERO tracked
+// bytes is an UNKNOWN device cost, not a free one — the cache charges the
+// conservative floor, counts it, warns once on stderr, and stays bounded.
+void test_zero_byte_floor() {
+    std::printf("[A] zero-byte entries are floored, warned once, bounded\n");
+    ByteBudgetLruCache<int, FakeEntry> cache(2 * kZeroByteEntryFloorBytes,
+                                             "floor-test");
+    const std::string err = capture_stderr([&] {
+        release_after(cache, cache.get_or_init_pinned(1, [](FakeEntry& v) { v.payload = 1; return size_t(0); }), 1);
+    });
+    check(err.find("conservative") != std::string::npos &&
+              err.find("floor-test") != std::string::npos,
+          "FLOOR: first zero-byte insert warns once on stderr");
+    const std::string quiet = capture_stderr([&] {
+        release_after(cache, cache.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(0); }), 2);
+    });
+    check(quiet.empty(), "FLOOR: the diagnostic fires exactly once");
+    check(cache.floored_size() == 2, "FLOOR: floored entries are counted");
+    check(cache.bytes_in_use() == 2 * kZeroByteEntryFloorBytes,
+          "FLOOR: zero-byte entries are charged the floor, not 0");
+
+    release_after(cache, cache.get_or_init_pinned(3, [](FakeEntry& v) { v.payload = 3; return size_t(0); }), 3);
+    check(cache.bytes_in_use() <= 2 * kZeroByteEntryFloorBytes &&
+              !cache.get(1),
+          "FLOOR: budget holds under all-zero accounting (LRU eviction)");
+}
+
+// (16) The floored COUNT cap bounds an all-sched workload even when the
+// operator raises the byte budget far above floor*cap.
+void test_floored_count_cap() {
+    std::printf("[A] floored entry count is hard-capped\n");
+    ByteBudgetLruCache<int, FakeEntry> cache(SIZE_MAX / 2, "cap-test",
+                                             kZeroByteEntryFloorBytes, 2);
+    capture_stderr([&] {
+        for (int k = 1; k <= 8; ++k) {
+            FakeEntry* v = cache.get_or_init_pinned(k, [k](FakeEntry& e) { e.payload = k; return size_t(0); });
+            cache.release(k);
+            (void)v;
+        }
+    });
+    check(cache.floored_size() <= 2,
+          "CAP: floored entries stay <= cap despite a huge byte budget");
+    check(cache.size() <= 2, "CAP: total entries bounded by the floored cap");
+}
+
+// (17) Rollback restores accounting (R22): a throw between the accounting
+// commit and the return (trim's victim-vector allocation, modeled by the
+// fault hook) must leave bytes_in_use(), floored_size(), and the entry count
+// exactly as before the failed insert.
+void test_rollback_restores_accounting() {
+    std::printf("[A] throwing trim rolls back all accounting\n");
+    ByteBudgetLruCache<int, FakeEntry> cache(1000, "rollback-test");
+    release_after(cache, cache.get_or_init_pinned(1, [](FakeEntry& v) { v.payload = 1; return size_t(400); }), 1);
+    const size_t bytes_before = cache.bytes_in_use();
+    const size_t size_before = cache.size();
+
+    starling::ggml::detail::trim_fault_hook = [] { throw std::bad_alloc(); };
+    bool threw = false;
+    try {
+        cache.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(400); });
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    starling::ggml::detail::trim_fault_hook = nullptr;
+
+    check(threw, "ROLLBACK: the fault propagates");
+    check(cache.bytes_in_use() == bytes_before,
+          "ROLLBACK: bytes_in_use() restored (no leak)");
+    check(cache.size() == size_before && !cache.get(2),
+          "ROLLBACK: the half-built entry is gone");
+    check(cache.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(400); })
+              ->payload == 2,
+          "ROLLBACK: the key is re-insertable after rollback");
+    cache.release(2);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("tdt_graph_budget_test: start\n");
@@ -571,6 +658,9 @@ int main() {
     test_env_budget_parsing();
     test_zero_budget_rejected();
     test_logic_mass_eviction_skips_pins();
+    test_zero_byte_floor();
+    test_floored_count_cap();
+    test_rollback_restores_accounting();
     test_real_graphs();
 
     if (g_failures) {
