@@ -158,11 +158,14 @@ export interface DictationSessionStore {
    * bumps `updatedAt`, and touches nothing else — the raw transcript, its
    * history, any refined copy, and the status all stay exactly as they were.
    * Membership is a label for chaining refinement context, never a mutation
-   * of the take's own records, and the assignment also stamps
-   * `threadJoinedAt` (B11): the append sequence that orders the thread's
-   * turns, so an older recording joining an existing thread appends as the
-   * latest turn instead of rewinding the reading order before the head.
-   * Assignment is permanent for the session's lifetime: there is
+   * of the take's own records, and a join also stamps `threadJoinedAt`
+   * (B11): the append sequence that orders the thread's turns, so an older
+   * recording joining an existing thread appends as the latest turn instead
+   * of rewinding the reading order before the head. Stamping happens
+   * exactly once per join: an idempotent repeat on the thread the take
+   * already belongs to keeps the stamp it has — absent for members that
+   * joined before the sequence existed, which stay sorted as the oldest
+   * appends. Assignment is permanent for the session's lifetime: there is
    * deliberately no un-assign, and moving a take between threads can only
    * arrive as a future explicit feature — a re-assignment to a different id
    * supersedes the label and re-stamps the append, but nothing ever clears
@@ -440,18 +443,17 @@ type SessionUpdate = Partial<{
  * sequence stamp (B11). Appending to a thread stamps now — even when the
  * recording itself is older than the thread's head — so the reading order
  * follows the conversation, not the recording clock. Re-assigning to the
- * thread the take already belongs to keeps its original stamp: an idempotent
- * repeat must not silently move the take to the end of the thread, while a
- * move to a different thread is a fresh append there and stamps again.
+ * thread the take already belongs to writes nothing but the label: the join
+ * already happened, so an idempotent repeat keeps the stamp exactly as it
+ * is — a real stamp unchanged, and a member that joined before the sequence
+ * existed stays unstamped instead of being silently moved to the thread's
+ * end. Only a move to a different thread is a fresh append there and stamps
+ * again.
  */
 function threadAssignment(current: DictationSession, threadId: string): SessionUpdate {
-  return {
-    threadId,
-    threadJoinedAt:
-      current.threadId === threadId && current.threadJoinedAt !== undefined
-        ? current.threadJoinedAt
-        : Date.now(),
-  };
+  if (current.threadId === threadId) return { threadId };
+
+  return { threadId, threadJoinedAt: Date.now() };
 }
 
 function updatedSession(current: DictationSession, update: SessionUpdate): DictationSession {

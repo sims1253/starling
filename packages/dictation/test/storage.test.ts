@@ -481,6 +481,51 @@ describe("retry-safe session storage", () => {
     store.close();
   });
 
+  it("stamps a legacy thread member's join exactly once", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "legacy-thread-stamp";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    // A record exactly as the pre-stamp store wrote it: assigned to a thread
+    // between #117 and B11, so it carries the label but no threadJoinedAt.
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "legacy-member",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "transcribed",
+      wav,
+      durationMs: 25,
+      attemptCount: 1,
+      transcript: { text: "assigned before the append sequence existed", segments: [] },
+      threadId: "thread-legacy",
+    });
+
+    v1.close();
+
+    const restored = await store.get("legacy-member");
+
+    assert.ok(restored);
+    assert.equal(restored.threadId, "thread-legacy");
+    assert.equal(restored.threadJoinedAt, undefined);
+
+    // The join already happened — before the sequence existed — so an
+    // idempotent same-thread repeat must not stamp it now: a fresh stamp
+    // would silently move the take from its legacy position to the end of
+    // the thread. The absence is preserved exactly like a real stamp is.
+    const repeated = await store.assignThread("legacy-member", "thread-legacy");
+
+    assert.equal(repeated.threadId, "thread-legacy");
+    assert.equal(repeated.threadJoinedAt, undefined);
+
+    // Only a move to a different thread is a fresh append, and that stamps.
+    const moved = await store.assignThread("legacy-member", "thread-fresh");
+
+    assert.equal(moved.threadId, "thread-fresh");
+    assert.ok(moved.threadJoinedAt !== undefined);
+    assert.deepEqual((await store.listReport()).invalid, []);
+    store.close();
+  });
+
   it("treats an empty refined text or model as damage, not data", async () => {
     const factory = new IDBFactory();
     const databaseName = "refined-emptied";
@@ -536,6 +581,8 @@ type VersionOneSession = {
   durationMs?: number;
   attemptCount: number;
   transcript?: { text: string; segments: [] };
+  /** As written between #117 and B11: a thread label with no append stamp. */
+  threadId?: string;
 };
 
 /**
