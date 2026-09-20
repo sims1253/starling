@@ -35,10 +35,10 @@
    "deps": [],
    "existing_issue": null,
    "status": "in_progress",
-   "owner": "impl-agent-24",
+   "owner": "impl-agent-25 (retry after rate-limit failure)",
    "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "first agent died on API rate limit mid-flight; partial work present uncommitted in apps/desktop (bridge approach: streamBridge/connectPolicy/streamTransport + 5 modified files); continuation agent dispatched with take-over instructions"
   },
   {
    "id": "B02",
@@ -629,11 +629,12 @@
    "existing_issue": null,
    "status": "integrated",
    "owner": "impl-agent-10",
-   "branch": "gpui/fixes-wave-a4",
+   "branch": "gpui/fixes-wave-a7",
    "evidence": [
-    "I1 PHASE 1 complete: coordinator rerun 106/106 + 17/17 on gpui/fixes-wave-a4 8be559c, pushed to PR #194; RT callback = atomics only (R01 structurally fixed), SPSC ring + 25ms writer thread, gap spans surfaced, quiesce-stop handshake with typed QuiesceTimeout carrying intact samples (R09)"
+    "I1 PHASE 1 complete: coordinator rerun 106/106 + 17/17 on gpui/fixes-wave-a4 8be559c, pushed to PR #194; RT callback = atomics only (R01 structurally fixed), SPSC ring + 25ms writer thread, gap spans surfaced, quiesce-stop handshake with typed QuiesceTimeout carrying intact samples (R09)",
+    "PHASE 2 complete: coordinator rerun 133/133 + 23/23 (9343bb1, pushed to #194); journals with 250ms/64KiB fsync boundaries; ack == last fsynced boundary (atomic durable_ack); torn-tail recovery to checksum-valid boundary; interrupted sessions with journal linkage; quiesce salvage wired; fault injection via FaultSink"
    ],
-   "notes": "I1 phase 2 dispatched: journal+fsync+durable boundary ack+interrupted recovery; completes G01/E01 capture half"
+   "notes": "I1 COMPLETE (ring + journal). Deferred to I2: SQLite metadata, staging->audio rename, gap records in journal, bounded reads, GC/retention (never-delete policy until then)"
   },
   {
    "id": "G02",
