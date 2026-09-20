@@ -1,7 +1,10 @@
 {
  "known_review_comment_ids": [
   4056704921,
-  4057347666
+  4057347666,
+  4057415996,
+  4057416102,
+  4057418159
  ],
  "known_issue_comment_ids": [
   5749119974,
@@ -19,6 +22,21 @@
    "id": 4057347666,
    "severity": "other-medium",
    "summary": "REPEAT of CI-wiring finding - CORRECT for this branch: R18 wiring landed on program/wave-a only; engine branches still build explicit target lists without the new tests"
+  },
+  {
+   "id": 4057415996,
+   "severity": "harvested",
+   "summary": "2 confirmations of 0c44626 + tdt built-but-not-run gap"
+  },
+  {
+   "id": 4057416102,
+   "severity": "harvested",
+   "summary": "2 confirmations of 0c44626 + tdt built-but-not-run gap"
+  },
+  {
+   "id": 4057418159,
+   "severity": "harvested",
+   "summary": "2 confirmations of 0c44626 + tdt built-but-not-run gap"
   }
  ],
  "notes": "same code-review failure at open"

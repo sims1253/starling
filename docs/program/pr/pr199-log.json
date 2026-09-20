@@ -19,7 +19,12 @@
   4057346919,
   4057346925,
   4057346927,
-  4057346930
+  4057346930,
+  4057415761,
+  4057415774,
+  4057415778,
+  4057415784,
+  4057415792
  ],
  "known_issue_comment_ids": [
   5749833414,
@@ -126,6 +131,31 @@
    "id": 4057346930,
    "severity": "test-low",
    "summary": "fake engine key note"
+  },
+  {
+   "id": 4057415761,
+   "severity": "harvested",
+   "summary": "2x run-loop mediums + engine_id invocation-time medium + 2 lows"
+  },
+  {
+   "id": 4057415774,
+   "severity": "harvested",
+   "summary": "2x run-loop mediums + engine_id invocation-time medium + 2 lows"
+  },
+  {
+   "id": 4057415778,
+   "severity": "harvested",
+   "summary": "2x run-loop mediums + engine_id invocation-time medium + 2 lows"
+  },
+  {
+   "id": 4057415784,
+   "severity": "harvested",
+   "summary": "2x run-loop mediums + engine_id invocation-time medium + 2 lows"
+  },
+  {
+   "id": 4057415792,
+   "severity": "harvested",
+   "summary": "2x run-loop mediums + engine_id invocation-time medium + 2 lows"
   }
  ]
 }

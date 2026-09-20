@@ -1,5 +1,7 @@
 {
- "known_review_comment_ids": [],
+ "known_review_comment_ids": [
+  4057406593
+ ],
  "known_issue_comment_ids": [
   5748731189,
   5748731312
@@ -7,5 +9,12 @@
  "notes": "pullfrog + coderabbit skip only; OCR pending | ocr code-review job failed at open (bot-side exit 1); re-triggers on next push",
  "harvested_at": "2026-09-20T08:46:28+00:00",
  "last_review_comment_at": null,
- "last_issue_comment_at": null
+ "last_issue_comment_at": null,
+ "findings": [
+  {
+   "id": 4057406593,
+   "severity": "harvested",
+   "summary": "maint-medium on workflow (run-loop family)"
+  }
+ ]
 }

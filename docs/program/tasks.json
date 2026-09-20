@@ -1604,6 +1604,38 @@
     "PR #199 OCR rerun 35518232105-2"
    ],
    "notes": "verify-then-fix; fold into next engine touch with R27"
+  },
+  {
+   "id": "R30",
+   "title": "Run every conditionally built engine-contract test in CI (tdt_graph_budget_test was built but never run)",
+   "priority": "P2",
+   "kind": "ci",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "coordinator",
+   "branch": "all four engine branches",
+   "evidence": [
+    "PR #196/#197/#199 rerun findings; fixed on 4623e4c/22e7d1b/adb0893/27d6539 (run loop now includes tdt_graph_budget_test)"
+   ],
+   "notes": "master self-heals when the first engine PR merges"
+  },
+  {
+   "id": "R31",
+   "title": "engine_id snapshotted with callback+generation in active_tx (same mid-step gap as R26)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "coordinator",
+   "branch": "program/s11-tail-reuse",
+   "evidence": [
+    "PR #199 batch-4 medium 4057415784; fixed 7340eb6; new mid-step identity-swap test; stream_session_test 382/382 (was 373)"
+   ],
+   "notes": "gpu-validation refreshed to 52f393d"
   }
  ],
  "active_assignments": [
