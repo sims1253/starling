@@ -5,7 +5,21 @@
   4056549491,
   4056549495,
   4056556592,
-  4056556596
+  4056556596,
+  4056696765,
+  4056696767,
+  4056696768,
+  4056696770,
+  4056696772,
+  4056696776,
+  4056696782,
+  4056696786,
+  4056696788,
+  4056696790,
+  4056696792,
+  4056696793,
+  4056696797,
+  4056696803
  ],
  "known_issue_comment_ids": [
   5748729418,
@@ -13,6 +27,78 @@
  ],
  "notes": "pullfrog checkout + coderabbit skip-review only; OCR bot had not run as of first harvest",
  "harvested_at": "2026-09-20T08:46:28+00:00",
- "last_review_comment_at": null,
- "last_issue_comment_at": null
+ "last_review_comment_at": "2026-09-20T10:10:20Z",
+ "last_issue_comment_at": null,
+ "findings": [
+  {
+   "id": 4056696776,
+   "severity": "style-low",
+   "summary": "failure-message join \u2014 RESOLVED by b5925a3 (pending push)"
+  },
+  {
+   "id": 4056696782,
+   "severity": "doc-low",
+   "summary": "resampler port doc \u2014 RESOLVED by f21e860 (pending push)"
+  },
+  {
+   "id": 4056696786,
+   "severity": "bug-medium",
+   "summary": "weight_sum silent zero \u2014 RESOLVED by ff48055 edge replication (pending push)"
+  },
+  {
+   "id": 4056696797,
+   "severity": "bug-medium",
+   "summary": "quiesce-timeout: callback may still execute while stop() drains Shared"
+  },
+  {
+   "id": 4056696803,
+   "severity": "bug-medium",
+   "summary": "partial drain_chunks during session corrupts stop accounting"
+  },
+  {
+   "id": 4056696788,
+   "severity": "bug-low",
+   "summary": "channels==0 falls into mono passthrough"
+  },
+  {
+   "id": 4056696790,
+   "severity": "maint-medium",
+   "summary": "G03 library-only: capture_probe example not updated for new recorder API surface"
+  },
+  {
+   "id": 4056696792,
+   "severity": "other-low",
+   "summary": "writer thread JoinError swallowed"
+  },
+  {
+   "id": 4056696793,
+   "severity": "bug-low",
+   "summary": "acknowledged_samples = accumulated len, not a durable boundary (phase-2 semantics)"
+  },
+  {
+   "id": 4056696765,
+   "severity": "other-medium",
+   "summary": "rust workflow lacks timeout-minutes"
+  },
+  {
+   "id": 4056696767,
+   "severity": "security-low",
+   "summary": "unpinned rustup curl|sh"
+  },
+  {
+   "id": 4056696768,
+   "severity": "perf-medium",
+   "summary": "no cargo cache in rust workflow"
+  },
+  {
+   "id": 4056696770,
+   "severity": "perf-low",
+   "summary": "sync_all on every export"
+  },
+  {
+   "id": 4056696772,
+   "severity": "maint-low",
+   "summary": "renamed-export notice shares the single banner slot"
+  }
+ ]
 }

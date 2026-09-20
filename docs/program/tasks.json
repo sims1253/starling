@@ -1361,6 +1361,38 @@
     "coordinator rerun: 146/146 across capabilities+fidelity+insight+runtime-protocol suites (4f1bdd2, 4eb5286); NaN finding premise stale (already guarded by isfinite), pinned with new test"
    ],
    "notes": "dispatching now; resolved-by-R12: bool/enum equality, empty combiner, overlap clamp (bots reviewed pre-R12 state)"
+  },
+  {
+   "id": "R17",
+   "title": "Address PR #194 second review batch (recorder edge cases + rust CI workflow)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #194 OCR run 35503993636, 2026-09-20 10:10Z (15 findings; 3 resolved by unpushed R13 commits)"
+   ],
+   "notes": "mediums: quiesce-timeout concurrent drain, partial-drain accounting; plus channels==0, JoinError surfacing, capture_probe example, export sync_all, banner slot, workflow timeout/cache/rustup-pin"
+  },
+  {
+   "id": "R18",
+   "title": "Wire greedy_termination_test and device_cache_clear_test into ci-starling-serve.yml",
+   "priority": "P2",
+   "kind": "ci",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #197 OCR finding 4056704921"
+   ],
+   "notes": "explicit --target list + run list in ci-starling-serve.yml; device_cache_clear_test likely same gap - verify"
   }
  ],
  "active_assignments": [
