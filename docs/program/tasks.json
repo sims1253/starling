@@ -1064,6 +1064,182 @@
    "branch": null,
    "evidence": [],
    "notes": ""
+  },
+  {
+   "id": "R01",
+   "title": "Recorder: mutex locking on the real-time audio thread (attenuator + ring)",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "feeds G01/E01 capture rework; OCR bug-high"
+  },
+  {
+   "id": "R02",
+   "title": "user_set_model force-set on every save + raw-file string sniffing",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "kills model auto-sync; app.rs"
+  },
+  {
+   "id": "R03",
+   "title": "Connection state derived from transcription job outcome, not a health probe",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "upload.rs; storage errors flip to Offline"
+  },
+  {
+   "id": "R04",
+   "title": "Duplicate GPUI element IDs: history-spinner, dot-blink, protocol toggle",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "shared per-element state corruption"
+  },
+  {
+   "id": "R05",
+   "title": "Transcript saved without re-checking session existence after in-flight delete",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "upload.rs"
+  },
+  {
+   "id": "R06",
+   "title": "Client copies full WAV into request and buffers unbounded response body",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "client.rs; 256MB recording doubles peak memory"
+  },
+  {
+   "id": "R07",
+   "title": "Editing keybindings registered with None context (global shadowing risk)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "input.rs"
+  },
+  {
+   "id": "R08",
+   "title": "Capture banner: error/success text conflation; no dismiss when unsaved recordings remain",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "capture.rs"
+  },
+  {
+   "id": "R09",
+   "title": "Recorder: poisoned mutex silently drains empty; stop() lacks callback quiesce handshake",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "folds into G01 capture lifecycle rework"
+  },
+  {
+   "id": "R10",
+   "title": "Render/perf hygiene: per-line divs, double history allocation, per-playback threads, mono.clone()",
+   "priority": "P3",
+   "kind": "perf",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "batch; low severity"
+  },
+  {
+   "id": "R11",
+   "title": "Metadata/hygiene: Cargo license/rust-version, dual Protocol enums, config_dir cwd fallback, chrono %-I, probe int-division percent",
+   "priority": "P3",
+   "kind": "maintainability",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "batch; E16-adjacent"
   }
  ],
  "active_assignments": [
