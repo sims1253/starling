@@ -844,11 +844,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": 177,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction"
+   ],
+   "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
   },
   {
    "id": "S03",
