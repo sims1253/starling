@@ -80,11 +80,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-17",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: desktop 127/127 (10 files incl. new transcriptAttempts/sessionDeletion suites), dictation package green, tsc + lint 0/0 after style fix; attempts carry model/protocol/savedAt provenance, history never erased; retry offered for every settled take incl. success + empty"
+   ],
+   "notes": "live-server/model paths unit-tested only; rendered-DOM a11y untested (no component harness)"
   },
   {
    "id": "B05",
@@ -94,11 +96,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-17",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: 127/127; explicit confirm dialog is sole delete path, focus starts on Cancel, Escape/backdrop cancel, failed deletes keep the recording"
+   ],
+   "notes": "undo variant not implemented (spec allows either); GPUI remove_session parity is separate"
   },
   {
    "id": "B06",
@@ -445,11 +449,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-18",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": "reproducibility audit: lockfiles, action pins, frozen installs; motivated partly by socket-security dependency warnings on PRs"
+   "evidence": [
+    "coordinator rerun: lint gate 0/0; policy doc + CI frozen-lockfile/uv-lock drift steps with negative probes proving gates fail on drift; bun.lock determined stale one-off (kept, documented)"
+   ],
+   "notes": "Android gradle locking + CI-resolved tool pins reported as follow-ups; cargo surface lands with PR #193 merge"
   },
   {
    "id": "E17",
