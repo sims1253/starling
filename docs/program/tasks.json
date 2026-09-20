@@ -1,0 +1,1069 @@
+{
+ "program": "Starling integrated implementation program",
+ "generated": "2026-09-20T02:16:00",
+ "baseline": {
+  "master": "12b6548c96ecfa1c989abb7afd39e90080cfb92f",
+  "pr193_head": "4569e67268adeb65119aad9f5b83fbab134e0833",
+  "ggml": "e91ded11bdcd78c42f9c8d3978ff6686eb4c1226 (+ local Starling patch series, uncommitted in submodule)",
+  "app_package": "starling-final-package v3.0 (2026-09-20)",
+  "serving_package": "starling-serving-optimization (2026-09-20)"
+ },
+ "counts": {
+  "app": 48,
+  "serving": 19
+ },
+ "status_vocab": [
+  "pending",
+  "in_progress",
+  "implemented",
+  "integrated",
+  "verified_on_target",
+  "review_ready",
+  "blocked",
+  "no_go",
+  "inconclusive",
+  "obsolete_duplicate",
+  "done"
+ ],
+ "items": [
+  {
+   "id": "B01",
+   "title": "Desktop CSP blocks the default ws:// live-transcription connection",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B02",
+   "title": "Do not discard captured short answers solely because a take is under 250 ms",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B03",
+   "title": "Release the recording lifecycle after durable save, not after network transcription",
+   "priority": "P1",
+   "kind": "bug / workflow defect",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B04",
+   "title": "Allow retranscription of successful and empty transcripts without losing previous attempts",
+   "priority": "P1",
+   "kind": "bug / missing recovery action",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B05",
+   "title": "Protect saved-recording deletion with undo or explicit confirmation",
+   "priority": "P2",
+   "kind": "bug / destructive UX",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B06",
+   "title": "Make desktop settings transactional and isolate connection-test results",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B07",
+   "title": "Port the empty-token stitch guard to Android to prevent dropped words and negations",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B08",
+   "title": "Make Android model replacement transactional and preserve the last usable model",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B09",
+   "title": "Do not accept truncated chat completions as complete transcript refinements",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B10",
+   "title": "Avoid automatic plaintext API-key fallback and detect unprotected safeStorage backends",
+   "priority": "P1",
+   "kind": "security hardening / unsafe fallback",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B11",
+   "title": "Preserve appended-turn context when an older recording joins a thread",
+   "priority": "P1",
+   "kind": "correctness regression following #192",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E01",
+   "title": "Move authoritative desktop recording into a native capture service with drained Stop",
+   "priority": "P1",
+   "kind": "capture architecture replacement",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E02",
+   "title": "Journal every desktop take in native durable storage and make history recoverable at scale",
+   "priority": "P1",
+   "kind": "product gap / storage architecture",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E03",
+   "title": "Implement focus-safe system-wide desktop dictation and target insertion",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E01",
+    "E02",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E04",
+   "title": "Add tray/overlay dictation controls, configurable hold/toggle shortcuts, and permission onboarding",
+   "priority": "P1",
+   "kind": "core product gap / UX",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E05",
+   "title": "Deliver terminal-free local setup with a verified model manager and supervised native server",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E16"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E06",
+   "title": "Create an audio-backed fidelity gate for the six original dictation failure modes",
+   "priority": "P1",
+   "kind": "core product gap / evaluation",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E07",
+   "title": "Turn Words to watch into capability-aware vocabulary and explicit contextual corrections",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E06"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E08",
+   "title": "Make transformations reversible and policy-driven, with meaningful diffs and revision provenance",
+   "priority": "P1",
+   "kind": "authoring and trust model",
+   "area": "app",
+   "deps": [
+    "E21",
+    "B09"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E09",
+   "title": "Provide a coherent authenticated remote-endpoint and phone-pairing flow",
+   "priority": "P1",
+   "kind": "product gap / privacy hardening",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E10",
+   "title": "Consume the existing capability endpoint and share cross-client protocol conformance fixtures",
+   "priority": "P2",
+   "kind": "integration gap / maintainability",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E11",
+   "title": "Define and measure an interactive dictation latency profile end to end",
+   "priority": "P1",
+   "kind": "product performance gap",
+   "area": "app",
+   "deps": [
+    "E01",
+    "E17",
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E12",
+   "title": "Gate app releases on packaged workflows, signing, updates, and real device evidence",
+   "priority": "P1",
+   "kind": "distribution / validation gap",
+   "area": "app",
+   "deps": [
+    "E15",
+    "E03",
+    "E05",
+    "E16"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E13",
+   "title": "Graduate Android on-device inference with explicit model lifetime and resource budgets",
+   "priority": "P2",
+   "kind": "product gap / mobile reliability",
+   "area": "app",
+   "deps": [
+    "E06",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E14",
+   "title": "Build an iOS keyboard\u2013host-app dictation flow and system quick-capture integrations",
+   "priority": "P1",
+   "kind": "mobile product and platform integration",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E15",
+   "title": "Graduate the existing GPUI port through parity, accessibility, packaging and fair renderer comparison",
+   "priority": "P1",
+   "kind": "architecture",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E16",
+   "title": "Make dependency and build-tool adoption reproducible, scoped, and reviewable",
+   "priority": "P2",
+   "kind": "maintainability / supply-chain hardening",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E17",
+   "title": "Extract the existing Rust dictation foundation into a renderer-independent native runtime",
+   "priority": "P1",
+   "kind": "architecture",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E18",
+   "title": "Offer distinct Dictate, Edit and Capture workflows with policy-level consent",
+   "priority": "P1",
+   "kind": "product interaction model",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E19",
+   "title": "Add permission-scoped app, site and project context with inspectable output profiles",
+   "priority": "P1",
+   "kind": "context-aware authoring",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E20",
+   "title": "Add scoped voice snippets, literal spelling and precise technical-text controls",
+   "priority": "P2",
+   "kind": "voice productivity feature set",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E08"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E21",
+   "title": "Replace thread labels and mutable refined text with named documents and immutable revisions",
+   "priority": "P1",
+   "kind": "document data-model rebuild",
+   "area": "app",
+   "deps": [
+    "E02",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E22",
+   "title": "Support the Android RECOGNIZE_SPEECH popup alongside the existing IME and recognizer service",
+   "priority": "P1",
+   "kind": "missing standard integration",
+   "area": "app",
+   "deps": [
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E23",
+   "title": "Expose explicitly shared notes and revisions through CLI and MCP adapters",
+   "priority": "P2",
+   "kind": "agent and external-tool interoperability",
+   "area": "app",
+   "deps": [
+    "E21",
+    "E09"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E24",
+   "title": "Make multilingual dictation, code-switching and locale-aware text a tested product contract",
+   "priority": "P1",
+   "kind": "language and accessibility product gap",
+   "area": "app",
+   "deps": [
+    "E06",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E25",
+   "title": "Separate optional cross-device sync and handoff from remote inference",
+   "priority": "P2",
+   "kind": "cross-device product architecture",
+   "area": "app",
+   "deps": [
+    "E21",
+    "E09",
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G01",
+   "title": "GPUI: checkpoint active audio and surface capture/close failures",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G02",
+   "title": "GPUI: isolate damaged history and recover WAV-only orphan sessions",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G03",
+   "title": "GPUI: detect source clipping before attenuation and report correct percentages",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G04",
+   "title": "GPUI: cancel playback watchers when Stop or selection change ends playback",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G05",
+   "title": "GPUI: do not silently overwrite exports in the Downloads directory",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G06",
+   "title": "GPUI port: restore anti-aliased resampling before promoting native capture",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G07",
+   "title": "GPUI: resolve negative-half PCM rounding divergence and test cross-language contracts",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E26",
+   "title": "Route explicit leading voice phrases to versioned modes without losing literal speech",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E19",
+    "E18"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E27",
+   "title": "Use selected text as scoped context or a conflict-checked edit target",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E03",
+    "E19",
+    "E21"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E28",
+   "title": "Define local Insight events and truthful, deletion-aware metric calculations",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E29",
+   "title": "Build delightful personal Insights: usage, voice patterns and actionable quality",
+   "priority": "P2",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E30",
+   "title": "Ship a Mode Studio with contextual rules, prompt previews and safe editor/browser adapters",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E19",
+    "E08",
+    "E26",
+    "E27"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S01",
+   "title": "Clear MOSS KV tensors on-device instead of uploading full host-zero arrays",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S02",
+   "title": "Bound Parakeet TDT graph retention and account for every replay-cache owner",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": 177,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S03",
+   "title": "Honor prefill EOS for single-stop decoders under an explicit termination contract",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S04",
+   "title": "Keep intermediate audio/model tensors on-device across native pipeline stages",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S05",
+   "title": "Fuse MOSS window attention without materializing full scores and probabilities",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S06",
+   "title": "Eliminate repeated V-prefix transposition in the shared MOSS decoder",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S01"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S07",
+   "title": "Fuse Parakeet query-dependent relative bias into tiled attention",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S08",
+   "title": "Reduce cold-shape setup by sharing immutable projections and preparing real workload shapes",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S09",
+   "title": "Optimize CPU GEMV/repacking and selective execution-plan reuse for MOSS and Parakeet",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S10",
+   "title": "Reduce TDT recurrent/control work with explicit stateful kernels and real blank reuse",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S11",
+   "title": "Reuse an exact successful streaming-tail result at commit and coalesce stale preview work",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S12",
+   "title": "Propagate cancellation into safe engine boundaries and extend contention scheduling",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": [
+    178,
+    174
+   ],
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S13",
+   "title": "Select per-device quant recipes using task quality, latency and resident memory together",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S14",
+   "title": "Make MOSS calibration reproducible and repair quality-evaluation provenance",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S15",
+   "title": "Fuse projections and elementwise epilogues where traced shapes justify register reuse",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S16",
+   "title": "Use the existing experiment harness to gate native workload-level optimizations",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": [
+    171,
+    176,
+    168
+   ],
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S17",
+   "title": "Reuse stable frontend work across growing audio windows without stale model state",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S11"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S18",
+   "title": "Evaluate native batching and local-attention modes as explicit workload experiments",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S12"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S19",
+   "title": "Use file-backed weight ownership and avoid retaining an unnecessary full host heap copy on GPU",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  }
+ ]
+}
