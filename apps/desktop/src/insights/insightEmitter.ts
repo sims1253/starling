@@ -238,7 +238,9 @@ export class InsightRecorder {
     this.now = options.now ?? (() => new Date());
     this.uuid =
       options.uuid ??
-      (() => globalThis.crypto?.randomUUID?.() ?? `id-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      (() =>
+        globalThis.crypto?.randomUUID?.() ??
+        `id-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   }
 
   /**

@@ -36,7 +36,11 @@ import {
 import { useRecorder } from "./useRecorder";
 import { stoppedTakeVerdict } from "./recorderSession";
 import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings } from "./refine";
-import { StreamingDictation, type StreamingState, type StreamingTransport } from "./streamingDictation";
+import {
+  StreamingDictation,
+  type StreamingState,
+  type StreamingTransport,
+} from "./streamingDictation";
 import { createStreamingTransport } from "./streamTransport";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
@@ -562,9 +566,7 @@ export default function App() {
       .load()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
-        setInsightsIssue(
-          `Insights could not open the local event log: ${messageFrom(caught)}`,
-        ),
+        setInsightsIssue(`Insights could not open the local event log: ${messageFrom(caught)}`),
       );
   }, []);
 

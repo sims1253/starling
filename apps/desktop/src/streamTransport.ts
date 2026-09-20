@@ -94,7 +94,10 @@ export class BridgeStreamTransport implements StreamingTransport {
   async sendPcm(bytes: Uint8Array): Promise<void> {
     // A fresh copy, so IPC's structured clone never sees a view into a pooled
     // or shared buffer the recorder still writes to.
-    await this.bridge.streamSend({ streamId: this.requireOpen("send audio"), audio: bytes.slice().buffer });
+    await this.bridge.streamSend({
+      streamId: this.requireOpen("send audio"),
+      audio: bytes.slice().buffer,
+    });
   }
 
   async commit(): Promise<TranscriptionResult> {

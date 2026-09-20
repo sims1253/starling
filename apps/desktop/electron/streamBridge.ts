@@ -113,7 +113,10 @@ export class StreamBridge {
   }
 
   /** Await a commit/reset/ping reply; only commit carries a transcript. */
-  async command(input: { streamId: number; command: "commit" | "reset" | "ping" }): Promise<StreamCommandResult> {
+  async command(input: {
+    streamId: number;
+    command: "commit" | "reset" | "ping";
+  }): Promise<StreamCommandResult> {
     const live = this.live(input.streamId);
 
     if (input.command === "commit") return { transcript: await live.commit() };

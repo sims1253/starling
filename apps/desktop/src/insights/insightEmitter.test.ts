@@ -22,7 +22,10 @@ import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
 
 const T0 = Date.parse("2026-09-20T12:00:00Z");
 
-function recorder(): { readonly recorder: InsightRecorder; readonly store: MemoryInsightEventStore } {
+function recorder(): {
+  readonly recorder: InsightRecorder;
+  readonly store: MemoryInsightEventStore;
+} {
   const store = new MemoryInsightEventStore();
   let tick = 0;
   let serial = 0;
@@ -79,7 +82,10 @@ describe("declared tokenizer", () => {
     const bytes = new Uint8Array(encodeWav16k({ samples, sampleRate: 16_000, channels: 1 }));
     const wav = new Blob([bytes]);
 
-    await expect(wavCaptureStats(wav)).resolves.toEqual({ sampleCount: 16_000, sampleRate: 16_000 });
+    await expect(wavCaptureStats(wav)).resolves.toEqual({
+      sampleCount: 16_000,
+      sampleRate: 16_000,
+    });
   });
 });
 

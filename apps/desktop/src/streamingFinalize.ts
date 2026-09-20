@@ -49,10 +49,7 @@ export interface StreamingFinalizeDeps {
    * settled session and the streamed transcript. Optional and additive, like
    * onDurableSave; never invoked for a discarded take.
    */
-  readonly onStreamedSettled?: (
-    session: DictationSession,
-    transcript: TranscriptionResult,
-  ) => void;
+  readonly onStreamedSettled?: (session: DictationSession, transcript: TranscriptionResult) => void;
 }
 
 function messageFrom(cause: unknown): string {

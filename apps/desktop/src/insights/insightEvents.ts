@@ -49,9 +49,7 @@ const TIMESTAMP_PATTERN =
   /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$/;
 
 /** #/$defs/eventId — also the shape of `capture_id` references. */
-const EventIdSchema = Schema.String.pipe(
-  Schema.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/)),
-);
+const EventIdSchema = Schema.String.pipe(Schema.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/)));
 
 /** #/$defs/safeToken — constrained tokens (mode ids, tokenizer ids). */
 const SafeTokenSchema = Schema.String.pipe(
@@ -59,14 +57,10 @@ const SafeTokenSchema = Schema.String.pipe(
 );
 
 /** #/$defs/tzName — IANA-style timezone names. */
-const TzNameSchema = Schema.String.pipe(
-  Schema.check(Schema.isPattern(/^[A-Za-z0-9_+/-]{1,64}$/)),
-);
+const TzNameSchema = Schema.String.pipe(Schema.check(Schema.isPattern(/^[A-Za-z0-9_+/-]{1,64}$/)));
 
 /** #/$defs/timestamp — an instant with an explicit UTC offset. */
-const TimestampSchema = Schema.String.pipe(
-  Schema.check(Schema.isPattern(TIMESTAMP_PATTERN)),
-);
+const TimestampSchema = Schema.String.pipe(Schema.check(Schema.isPattern(TIMESTAMP_PATTERN)));
 
 const NonNegativeIntSchema = Schema.Number.pipe(
   Schema.check(Schema.isInt()),
@@ -79,9 +73,7 @@ const PositiveIntSchema = Schema.Number.pipe(
 );
 
 /** `["number","null"]` with `minimum: 0` — decimals allowed, unknown waits are null. */
-const NonNegativeNumberSchema = Schema.Number.pipe(
-  Schema.check(Schema.isGreaterThanOrEqualTo(0)),
-);
+const NonNegativeNumberSchema = Schema.Number.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0)));
 
 export interface ChangeCounts {
   readonly structural: number;
@@ -429,7 +421,10 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
   async load(): Promise<InsightEventLog> {
     const database = await this.database();
     const records = await runIdbRequest(
-      database.transaction(EVENTS_OBJECT_STORE, "readonly").objectStore(EVENTS_OBJECT_STORE).getAll(),
+      database
+        .transaction(EVENTS_OBJECT_STORE, "readonly")
+        .objectStore(EVENTS_OBJECT_STORE)
+        .getAll(),
     );
 
     const events: InsightEvent[] = [];
@@ -482,12 +477,9 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
       transaction.oncomplete = () => resolve();
       transaction.onerror = () =>
         reject(
-          new Error(
-            `an insight event store append failed: ${transaction.error?.message ?? ""}`,
-          ),
+          new Error(`an insight event store append failed: ${transaction.error?.message ?? ""}`),
         );
-      transaction.onabort = () =>
-        reject(new Error(`an insight event store append was aborted`));
+      transaction.onabort = () => reject(new Error(`an insight event store append was aborted`));
     });
   }
 
@@ -502,8 +494,7 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
         reject(
           new Error(`an insight event store clear failed: ${transaction.error?.message ?? ""}`),
         );
-      transaction.onabort = () =>
-        reject(new Error(`an insight event store clear was aborted`));
+      transaction.onabort = () => reject(new Error(`an insight event store clear was aborted`));
     });
   }
 
@@ -522,7 +513,9 @@ export class IndexedDbInsightEventStore implements InsightEventStore {
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () =>
-        reject(new Error(`could not open the insight event store: ${request.error?.message ?? ""}`));
+        reject(
+          new Error(`could not open the insight event store: ${request.error?.message ?? ""}`),
+        );
     });
 
     return this.databasePromise;

@@ -243,10 +243,10 @@ describe("aggregate: frozen metric semantics", () => {
 
     expect(result.delivery_counts.confirmed).toBe(1);
     expect(result.delivery_counts.submitted_unconfirmed).toBe(1);
-    expect([result.output_words_by_status.confirmed, result.output_words_by_status.submitted_unconfirmed]).toEqual([
-      120,
-      200,
-    ]);
+    expect([
+      result.output_words_by_status.confirmed,
+      result.output_words_by_status.submitted_unconfirmed,
+    ]).toEqual([120, 200]);
   });
 
   it("treats orphan events as non-takes", () => {

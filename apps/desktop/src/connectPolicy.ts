@@ -85,7 +85,10 @@ export function loopbackStreamTokens(endpoints: ReadonlyArray<string>): string[]
  * host-sources with an optional `*` port. Unknown tokens do not match.
  */
 export function parseConnectSrcTokens(policy: string): string[] {
-  return policy.trim().split(/\s+/).filter((token) => token !== "");
+  return policy
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token !== "");
 }
 
 function wrapIpv6(hostname: string): string {

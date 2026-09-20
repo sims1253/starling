@@ -42,7 +42,9 @@ function messageFrom(cause: unknown) {
 }
 
 /** A computed panel: either its value, or the reason it could not compute. */
-type Computed<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly reason: string };
+type Computed<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly reason: string };
 
 function compute<T>(work: () => T): Computed<T> {
   try {
@@ -81,10 +83,7 @@ function NotEnoughData({ note }: { readonly note: string }) {
 }
 
 export function InsightsView({ events, issue, onDismissIssue, onReset }: InsightsViewProps) {
-  const timezone = useMemo(
-    () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-    [],
-  );
+  const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
 
   const [baselineDraft, setBaselineDraft] = useState(
     () => localStorage.getItem(TYPING_BASELINE_KEY) ?? "",
@@ -141,7 +140,10 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
       const ms = today.getTime() - offset * 24 * 60 * 60 * 1000;
       const key = localDayKey(ms, timezone);
 
-      list.push({ key, label: new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" }) });
+      list.push({
+        key,
+        label: new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" }),
+      });
     }
 
     return list;
@@ -187,8 +189,8 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
             <strong>Insights could not aggregate the local event log.</strong>
             <span>
               {usage.reason} The recordings themselves are untouched. Reset Insights to start a
-              fresh event log, or keep dictating — a conflicting event is a bug worth reporting,
-              not a number to hide.
+              fresh event log, or keep dictating — a conflicting event is a bug worth reporting, not
+              a number to hide.
             </span>
           </div>
         </div>
@@ -200,8 +202,7 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
           <h3>Your first numbers appear after your first take</h3>
           <p>
             Record a short test dictation from the main screen — a sentence is enough. Insights
-            count only what the app can observe, on this machine, with networking off if you
-            prefer.
+            count only what the app can observe, on this machine, with networking off if you prefer.
           </p>
           <div className="insights-example-card" aria-label="Example card, not your data">
             <small>EXAMPLE — NOT YOUR DATA</small>
@@ -231,12 +232,19 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
             </div>
             <div className="insight-tile">
               <strong>{plural(usage.value.selected_recognitions, "completed take")}</strong>
-              <span>takes with a final transcript of {plural(usage.value.unique_takes, "take")} recorded</span>
+              <span>
+                takes with a final transcript of {plural(usage.value.unique_takes, "take")} recorded
+              </span>
             </div>
             {usage.value.recognized_words_per_captured_minute !== null ? (
               <div className="insight-tile">
-                <strong>{Math.round(usage.value.recognized_words_per_captured_minute)} words/min</strong>
-                <span>recognized words per captured minute — a weighted total, not a speaking-speed truth</span>
+                <strong>
+                  {Math.round(usage.value.recognized_words_per_captured_minute)} words/min
+                </strong>
+                <span>
+                  recognized words per captured minute — a weighted total, not a speaking-speed
+                  truth
+                </span>
               </div>
             ) : usage.value.tokenizers.length > 1 ? (
               <NotEnoughData note="words were counted under more than one tokenizer; a shared rate would mislead" />
@@ -300,15 +308,18 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
                 />
               </label>
             </div>
-            <p className="proxy-value" aria-live="polite">{proxyText(usage.value, baseline, baselineDraft)}</p>
+            <p className="proxy-value" aria-live="polite">
+              {proxyText(usage.value, baseline, baselineDraft)}
+            </p>
             <ul id="proxy-assumptions" className="proxy-assumptions">
               <li>{usage.value.time_comparison_caveat}</li>
               <li>
                 estimate = recognized speech words × 60 / your WPM − captured seconds − measured
-                post-Stop wait; unknown waits or an unset baseline mean "not enough data", not
-                zero
+                post-Stop wait; unknown waits or an unset baseline mean "not enough data", not zero
               </li>
-              <li>negative results are shown as-is: if the waits outweighed the benefit, it says so</li>
+              <li>
+                negative results are shown as-is: if the waits outweighed the benefit, it says so
+              </li>
             </ul>
           </div>
         </section>
@@ -326,11 +337,15 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
           <div className="insight-tiles">
             <div className="insight-tile">
               <strong>{plural(quality.value.supersededSelections, "retry")}</strong>
-              <span>recognitions a newer attempt replaced — a retry revises, it never adds a take</span>
+              <span>
+                recognitions a newer attempt replaced — a retry revises, it never adds a take
+              </span>
             </div>
             <div className="insight-tile">
               <strong>{plural(quality.value.emptySelections, "empty result")}</strong>
-              <span>takes whose final transcript had no words — distinct from a failed attempt</span>
+              <span>
+                takes whose final transcript had no words — distinct from a failed attempt
+              </span>
             </div>
             <div className="insight-tile">
               <strong>{plural(usage.value.incomplete_captures, "incomplete capture")}</strong>
@@ -341,7 +356,9 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
                 {usage.value.delivery_counts.confirmed} confirmed /{" "}
                 {usage.value.delivery_counts.submitted_unconfirmed} submitted
               </strong>
-              <span>deliveries — only an observed copy counts as confirmed; an export is unconfirmed</span>
+              <span>
+                deliveries — only an observed copy counts as confirmed; an export is unconfirmed
+              </span>
             </div>
             <NotEnoughData note="no event kind carries interrupted-stream recoveries yet" />
             <NotEnoughData note="no event kind carries local-vs-remote processing provenance yet" />
@@ -385,15 +402,14 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
               <p className="changes-summary">
                 Word changes across all passes: {usage.value.change_counts.style} style (paired
                 swaps), {usage.value.change_counts.structural} structural (net size),{" "}
-                {usage.value.change_counts.user} user,{" "}
-                {usage.value.change_counts.dictionary} dictionary,{" "}
-                {usage.value.change_counts.snippet} snippet.
+                {usage.value.change_counts.user} user, {usage.value.change_counts.dictionary}{" "}
+                dictionary, {usage.value.change_counts.snippet} snippet.
               </p>
               <small>
                 A "style" change is a paired word swap between the raw and refined text; a
                 "structural" change is a net size difference. Without a reference transcript,
-                accuracy is unknown — fewer changes never mean more accuracy, and deleting words
-                is never rewarded.
+                accuracy is unknown — fewer changes never mean more accuracy, and deleting words is
+                never rewarded.
               </small>
             </div>
           )}
@@ -402,14 +418,14 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
             <summary>How these numbers are defined</summary>
             <ul>
               <li>
-                Recognized words: the word-like segment count (UAX#29 via the host ICU, tokenizer
-                id uax29-intl-v1) of each take's final selected transcript. A retry replaces the
-                count; it never adds another take's worth.
+                Recognized words: the word-like segment count (UAX#29 via the host ICU, tokenizer id
+                uax29-intl-v1) of each take's final selected transcript. A retry replaces the count;
+                it never adds another take's worth.
               </li>
               <li>
-                Captured minutes: retained audio frames divided by the actual sample rate —
-                silence included. A VAD-normalized speech rate is a distinct metric this version
-                does not show, and is never silently substituted.
+                Captured minutes: retained audio frames divided by the actual sample rate — silence
+                included. A VAD-normalized speech rate is a distinct metric this version does not
+                show, and is never silently substituted.
               </li>
               <li>
                 Completed takes: captures with a selected final transcript. An empty recognition
@@ -417,12 +433,12 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
               </li>
               <li>
                 Delivery: a clipboard copy that resolved is confirmed; a file export is
-                submitted-unconfirmed because its completion is not observable; failures are
-                counted as failures.
+                submitted-unconfirmed because its completion is not observable; failures are counted
+                as failures.
               </li>
               <li>
-                Deleting a recording removes its contribution from every number here — the
-                tombstone dominates stale replays, so deleted takes cannot reappear.
+                Deleting a recording removes its contribution from every number here — the tombstone
+                dominates stale replays, so deleted takes cannot reappear.
               </li>
               <li>
                 Deliberately absent: accuracy, personality, health and productivity scores. The
@@ -455,7 +471,13 @@ function calendarWeeks(
       label,
       activity: day,
       intensityClass:
-        day === undefined ? "cal-0" : day.takes === 1 ? "cal-1" : day.takes <= 3 ? "cal-2" : "cal-3",
+        day === undefined
+          ? "cal-0"
+          : day.takes === 1
+            ? "cal-1"
+            : day.takes <= 3
+              ? "cal-2"
+              : "cal-3",
     };
   });
   const weeks: CalendarCell[][] = [];

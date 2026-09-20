@@ -54,7 +54,8 @@ const bridge: StarlingDesktopBridge = Object.freeze({
   // Live-streaming transport over the main process (B01): the renderer never
   // opens a non-loopback WebSocket itself, so the static CSP stays loopback-
   // only. Events flow back on starling:stream:event, tagged with streamId.
-  streamOpen: (input: StreamOpenInput) => invoke<{ streamId: number }>("starling:stream:open", input),
+  streamOpen: (input: StreamOpenInput) =>
+    invoke<{ streamId: number }>("starling:stream:open", input),
   streamSend: (input: StreamSendInput) => invoke<void>("starling:stream:send", input),
   streamCommand: (input: StreamCommandInput) =>
     invoke<StreamCommandResult>("starling:stream:command", input),

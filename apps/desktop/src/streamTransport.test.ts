@@ -9,7 +9,10 @@ import {
 
 import type { StreamCommandResult } from "../electron/ipc.js";
 
-const TRANSCRIPT: NonNullable<StreamCommandResult["transcript"]> = { text: "bridge final", segments: [] };
+const TRANSCRIPT: NonNullable<StreamCommandResult["transcript"]> = {
+  text: "bridge final",
+  segments: [],
+};
 
 class FakeBridge implements DesktopStreamBridge {
   opens: Array<{ endpoint: string }> = [];
@@ -19,7 +22,9 @@ class FakeBridge implements DesktopStreamBridge {
   openFailure: Error | undefined;
   commandResult: StreamCommandResult | Error | undefined;
   private nextId = 41;
-  private listeners = new Set<(message: { streamId: number; event: StarlingStreamEvent }) => void>();
+  private listeners = new Set<
+    (message: { streamId: number; event: StarlingStreamEvent }) => void
+  >();
 
   streamOpen(input: { endpoint: string }): Promise<{ streamId: number }> {
     this.opens.push({ endpoint: input.endpoint });
@@ -35,7 +40,10 @@ class FakeBridge implements DesktopStreamBridge {
     return Promise.resolve();
   }
 
-  streamCommand(input: { streamId: number; command: "commit" | "reset" | "ping" }): Promise<StreamCommandResult> {
+  streamCommand(input: {
+    streamId: number;
+    command: "commit" | "reset" | "ping";
+  }): Promise<StreamCommandResult> {
     this.commands.push({ streamId: input.streamId, command: input.command });
 
     if (this.commandResult instanceof Error) return Promise.reject(this.commandResult);
@@ -220,7 +228,10 @@ describe("createStreamingTransport", () => {
   const originalWindow = (globalThis as { window?: unknown }).window;
 
   function stubWindow(bridge: unknown): void {
-    Object.defineProperty(globalThis, "window", { value: { starlingDesktop: bridge }, configurable: true });
+    Object.defineProperty(globalThis, "window", {
+      value: { starlingDesktop: bridge },
+      configurable: true,
+    });
   }
 
   function restoreWindow(): void {

@@ -106,7 +106,9 @@ describe("schema conformance", () => {
   it("rejects an unknown delivery status", () => {
     const delivery = eventOfKind("delivery_recorded", BASIC);
 
-    expect(insightEventProblems({ ...delivery, status: "probably_inserted" }).length).toBeGreaterThan(0);
+    expect(
+      insightEventProblems({ ...delivery, status: "probably_inserted" }).length,
+    ).toBeGreaterThan(0);
   });
 
   const FORBIDDEN_FIELDS = [
@@ -201,13 +203,19 @@ describe("MemoryInsightEventStore", () => {
 describe("IndexedDbInsightEventStore", () => {
   it("persists events across store instances and dedupes replays", async () => {
     const factory = new IDBFactory();
-    const first = new IndexedDbInsightEventStore({ databaseName: "insights-a", indexedDB: factory });
+    const first = new IndexedDbInsightEventStore({
+      databaseName: "insights-a",
+      indexedDB: factory,
+    });
     const event = basicCaptureFinalized();
 
     await first.append(event);
     await first.append(event);
 
-    const second = new IndexedDbInsightEventStore({ databaseName: "insights-a", indexedDB: factory });
+    const second = new IndexedDbInsightEventStore({
+      databaseName: "insights-a",
+      indexedDB: factory,
+    });
     const log = await second.load();
 
     expect(log.events).toHaveLength(1);
@@ -217,7 +225,10 @@ describe("IndexedDbInsightEventStore", () => {
 
   it("conflicts on a differing payload under a known event id", async () => {
     const factory = new IDBFactory();
-    const store = new IndexedDbInsightEventStore({ databaseName: "insights-b", indexedDB: factory });
+    const store = new IndexedDbInsightEventStore({
+      databaseName: "insights-b",
+      indexedDB: factory,
+    });
     const event = basicRecognitionSelected();
 
     await store.append(event);
@@ -256,7 +267,10 @@ describe("IndexedDbInsightEventStore", () => {
 
   it("clears the log for a reset", async () => {
     const factory = new IDBFactory();
-    const store = new IndexedDbInsightEventStore({ databaseName: "insights-d", indexedDB: factory });
+    const store = new IndexedDbInsightEventStore({
+      databaseName: "insights-d",
+      indexedDB: factory,
+    });
 
     await store.append(basicCaptureFinalized());
     await store.clear();

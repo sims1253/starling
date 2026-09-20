@@ -24,7 +24,8 @@ function directiveValue(policy: string, name: string): string {
   for (const directive of policy.split(";")) {
     const trimmed = directive.trim();
 
-    if (trimmed.startsWith(`${name} `) || trimmed === name) return trimmed.slice(name.length).trim();
+    if (trimmed.startsWith(`${name} `) || trimmed === name)
+      return trimmed.slice(name.length).trim();
   }
 
   throw new Error(`the policy has no ${name} directive`);
@@ -82,9 +83,9 @@ describe("the default live-transcription connection", () => {
   });
 
   it("was blocked by the pre-fix policy — http:/https: never cover ws://", () => {
-    expect(connectSrcAllows(["'self'", "http:", "https:"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(
-      false,
-    );
+    expect(
+      connectSrcAllows(["'self'", "http:", "https:"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN),
+    ).toBe(false);
   });
 
   it("permits every loopback host spelling over ws and wss on any port", () => {
@@ -115,7 +116,9 @@ describe("the browser preview under the same static policy", () => {
       Object.defineProperty(globalThis, "location", { value: original, configurable: true });
     }
 
-    expect(connectSrcAllows(["'self'"], "ws://127.0.0.1:1420/api/stream", PREVIEW_ORIGIN)).toBe(true);
+    expect(connectSrcAllows(["'self'"], "ws://127.0.0.1:1420/api/stream", PREVIEW_ORIGIN)).toBe(
+      true,
+    );
     expect(allows("ws://127.0.0.1:1420/api/stream")).toBe(true);
   });
 
@@ -142,11 +145,15 @@ describe("what the static policy must refuse", () => {
 
   it("keeps the http↔ws scheme pairing separate in both directions", () => {
     expect(connectSrcAllows(["http:"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(false);
-    expect(connectSrcAllows(["ws:"] as const, "http://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(false);
+    expect(connectSrcAllows(["ws:"] as const, "http://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(
+      false,
+    );
   });
 
   it("never downgrades: an https token does not permit http", () => {
-    expect(connectSrcAllows(["https:"], "http://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(false);
+    expect(connectSrcAllows(["https:"], "http://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(
+      false,
+    );
     expect(connectSrcAllows(["http:"], "https://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(true);
   });
 });
@@ -159,7 +166,11 @@ describe("loopbackStreamTokens", () => {
 
   it("deduplicates host spellings and sorts, keeping the scheme split", () => {
     expect(
-      loopbackStreamTokens(["http://localhost:1234", "http://localhost:4567", "https://localhost:9000"]),
+      loopbackStreamTokens([
+        "http://localhost:1234",
+        "http://localhost:4567",
+        "https://localhost:9000",
+      ]),
     ).toEqual(["ws://localhost:*", "wss://localhost:*"]);
   });
 
@@ -168,7 +179,9 @@ describe("loopbackStreamTokens", () => {
   });
 
   it("yields no token for non-loopback endpoints — those belong to the native bridge", () => {
-    expect(loopbackStreamTokens(["http://192.168.1.10:8181", "https://streams.example.com"])).toEqual([]);
+    expect(
+      loopbackStreamTokens(["http://192.168.1.10:8181", "https://streams.example.com"]),
+    ).toEqual([]);
   });
 
   it("derives tokens that actually permit the URLs they stand for", () => {
@@ -180,7 +193,9 @@ describe("loopbackStreamTokens", () => {
     }
 
     expect(connectSrcAllows(derived, "ws://127.0.0.1:8182/stream", PREVIEW_ORIGIN)).toBe(true);
-    expect(connectSrcAllows(derived, "http://127.0.0.1:8181/inference", PREVIEW_ORIGIN)).toBe(false);
+    expect(connectSrcAllows(derived, "http://127.0.0.1:8181/inference", PREVIEW_ORIGIN)).toBe(
+      false,
+    );
   });
 
   it("reports null for URLs a static token cannot cover", () => {
@@ -192,17 +207,29 @@ describe("loopbackStreamTokens", () => {
 
 describe("host-source port matching", () => {
   it("matches any port only for the * wildcard", () => {
-    expect(connectSrcAllows(["ws://127.0.0.1:*"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(true);
-    expect(connectSrcAllows(["ws://127.0.0.1:8181"], "ws://127.0.0.1:8182/stream", PREVIEW_ORIGIN)).toBe(false);
+    expect(
+      connectSrcAllows(["ws://127.0.0.1:*"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN),
+    ).toBe(true);
+    expect(
+      connectSrcAllows(["ws://127.0.0.1:8181"], "ws://127.0.0.1:8182/stream", PREVIEW_ORIGIN),
+    ).toBe(false);
   });
 
   it("treats a token without a port as the scheme's default port only", () => {
-    expect(connectSrcAllows(["ws://127.0.0.1"], "ws://127.0.0.1/stream", PREVIEW_ORIGIN)).toBe(true);
-    expect(connectSrcAllows(["ws://127.0.0.1"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(false);
-    expect(connectSrcAllows(["wss://localhost"], "wss://localhost/stream", PREVIEW_ORIGIN)).toBe(true);
+    expect(connectSrcAllows(["ws://127.0.0.1"], "ws://127.0.0.1/stream", PREVIEW_ORIGIN)).toBe(
+      true,
+    );
+    expect(connectSrcAllows(["ws://127.0.0.1"], "ws://127.0.0.1:8181/stream", PREVIEW_ORIGIN)).toBe(
+      false,
+    );
+    expect(connectSrcAllows(["wss://localhost"], "wss://localhost/stream", PREVIEW_ORIGIN)).toBe(
+      true,
+    );
   });
 
   it("requires the host to match exactly, not as a suffix", () => {
-    expect(connectSrcAllows(["ws://localhost:*"], "ws://notlocalhost:8181/stream", PREVIEW_ORIGIN)).toBe(false);
+    expect(
+      connectSrcAllows(["ws://localhost:*"], "ws://notlocalhost:8181/stream", PREVIEW_ORIGIN),
+    ).toBe(false);
   });
 });
