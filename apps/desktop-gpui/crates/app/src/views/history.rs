@@ -5,7 +5,7 @@ use starling_dictation::storage::{DictationSession, SessionStatus};
 
 use crate::app::StarlingApp;
 use crate::theme;
-use crate::views::{icon, spinner};
+use crate::views::{history_spinner_id, icon, spinner};
 
 pub fn render_history(
     app: &mut StarlingApp,
@@ -144,7 +144,9 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
         .flex_none()
         .child(match data.status {
             SessionStatus::Transcribing => {
-                spinner("history-spinner", 14., theme::DIM).into_any_element()
+                // R04: one id per transcribing row, not a shared
+                // "history-spinner" shared by all of them.
+                spinner(history_spinner_id(&data.id), 14., theme::DIM).into_any_element()
             }
             SessionStatus::Transcribed => div()
                 .size(px(6.))
