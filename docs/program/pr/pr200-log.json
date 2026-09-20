@@ -14,7 +14,18 @@
   4057858368,
   4057858374,
   4057858377,
-  4057858381
+  4057858381,
+  4057944286,
+  4057944292,
+  4057944296,
+  4057944301,
+  4057944303,
+  4057944306,
+  4057944310,
+  4057944313,
+  4057944317,
+  4057944319,
+  4057945039
  ],
  "findings": [
   {
@@ -36,6 +47,26 @@
    "id": 4057856985,
    "severity": "test-low",
    "summary": "concurrent-import test discards results; assertions hold if race lost"
+  },
+  {
+   "id": 4057944292,
+   "severity": "perf-medium",
+   "summary": "GgufMetadata parse perf (2nd pass)"
+  },
+  {
+   "id": 4057944306,
+   "severity": "bug-medium",
+   "summary": "relies on File.renameTo semantics (atomicity/error surface) in import"
+  },
+  {
+   "id": 4057944313,
+   "severity": "other-medium",
+   "summary": "staged file handling concern"
+  },
+  {
+   "id": 4057945039,
+   "severity": "meta",
+   "summary": "bot read our tasks.json and disputed R33 prioritization (arch-length cap is a rejection-path string bound only) - fold into re-prioritization"
   }
  ]
 }

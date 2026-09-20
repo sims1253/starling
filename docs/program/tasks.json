@@ -1646,9 +1646,9 @@
    "owner": null,
    "branch": "program/wave-b",
    "evidence": [
-    "PR #200 OCR first review (15 findings)"
+    "PR #200 OCR first review (15) + second pass (11) = 26 findings"
    ],
-   "notes": "fetch full bodies before fixing; the arch-length amplification is the priority"
+   "notes": "re-prioritized per bot meta-feedback: File.renameTo atomicity + staged-file handling + parse perf FIRST; arch-length cap is rejection-path only (lower); then the lows"
   },
   {
    "id": "R34",
