@@ -53,10 +53,12 @@ inline size_t replay_cache_size() {
 // parseable-but-nonpositive value like "0" or "-5" each get their own
 // diagnostic, so an operator typing a number sees "out of range", not
 // "not a number".
-// A parseable value too large to represent (ERANGE, or > SIZE_MAX >> 20 —
-// whose << 20 would wrap) is loudly CLAMPED to the largest representable
-// budget, (SIZE_MAX >> 20) MiB, rather than rejected: the operator asked for
-// "a lot", so they get the most the type can express, with a diagnostic.
+// A parseable value too large to represent (ERANGE — EITHER sign: a
+// negatively-overflowing "-99999999999999999999" is a magnitude overflow
+// first and a sign question second — or a positive > SIZE_MAX >> 20 whose
+// << 20 would wrap) is loudly CLAMPED to the largest representable
+// budget, (SIZE_MAX >> 20) MiB, rather than rejected: the operator asked
+// for "a lot", so they get the most the type can express, with a diagnostic.
 inline size_t env_budget_bytes(const char* var, size_t default_bytes) {
     const char* e = std::getenv(var);
     if (!e) return default_bytes;
@@ -71,6 +73,19 @@ inline size_t env_budget_bytes(const char* var, size_t default_bytes) {
                      var, e, default_bytes);
         return default_bytes;
     }
+    // ERANGE (either sign) is checked BEFORE the positivity branch (R25): a
+    // negatively-overflowing value makes strtoll return LLONG_MIN with
+    // ERANGE, and the old order caught it with `v <= 0` first — reporting
+    // "out of range (>= 1)" when the loud-clamp diagnostic is the accurate
+    // one for a magnitude overflow. The `v > 0` guard keeps plain negatives
+    // ("-5") out of the unsigned max_mib comparison below.
+    if (errno == ERANGE || (v > 0 && (unsigned long long)v > max_mib)) {
+        std::fprintf(stderr,
+                     "starling: %s='%s' MiB exceeds the largest "
+                     "representable budget; clamping to %zu MiB\n",
+                     var, e, max_mib);
+        return max_mib << 20;
+    }
     if (v <= 0) {
         std::fprintf(stderr,
                      "starling: %s='%s' MiB is out of range (the budget must "
@@ -78,13 +93,6 @@ inline size_t env_budget_bytes(const char* var, size_t default_bytes) {
                      "budget (%zu bytes)\n",
                      var, e, default_bytes);
         return default_bytes;
-    }
-    if (errno == ERANGE || (unsigned long long)v > max_mib) {
-        std::fprintf(stderr,
-                     "starling: %s='%s' MiB exceeds the largest "
-                     "representable budget; clamping to %zu MiB\n",
-                     var, e, max_mib);
-        return max_mib << 20;
     }
     return (size_t)v << 20;
 }
@@ -284,7 +292,10 @@ namespace detail {
 // every ByteBudgetLruCache::trim_over_budget call. A hook that throws
 // simulates the std::vector victim-buffer allocation failure the insert
 // rollback must survive (bytes_/floored_ already committed at that point).
-// MUST remain null in production.
+// Process-global and unfiltered: it fires for EVERY cache instance, not just
+// the one under test, and there is deliberately no locking (callers
+// serialize cache access) — a test must restore it to nullptr before
+// returning. MUST remain null in production.
 inline void (*trim_fault_hook)() = nullptr;
 }  // namespace detail
 

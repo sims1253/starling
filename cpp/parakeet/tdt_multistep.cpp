@@ -282,8 +282,9 @@ struct KKeyHash { size_t operator()(const KKey& k) const noexcept {
 // STARLING_TDT_GRAPH_BUDGET_MB (a whole number of MiB >= 1); read lazily at
 // first cache construction so tests can set the env first (replay_cache_size
 // pattern). The override is STRICTLY validated by env_budget_bytes
-// (runtime/lru_cache.hpp): garbage, trailing junk, zero, or negative values
-// are rejected with a stderr diagnostic (default applies), and a value whose
+// (runtime/lru_cache.hpp): garbage, trailing junk, zero, or plain negative
+// values are rejected with a stderr diagnostic (default applies), and a
+// value whose magnitude overflows the parser (ERANGE, either sign) or whose
 // << 20 would wrap is loudly clamped — never silently truncated (the old
 // atol parse) and never wrapped.
 constexpr size_t kDefaultTdtGraphBudgetBytes = size_t(128) << 20;

@@ -33,9 +33,11 @@
 // additions:
 //   (12) env override parsing (env_budget_bytes, the
 //       STARLING_TDT_GRAPH_BUDGET_MB path): whole-value validation — garbage,
-//       trailing junk, empty, zero, and negative are rejected LOUDLY (stderr
-//       diagnostic + the default budget); a value whose << 20 would wrap
-//       clamps loudly to the largest representable budget;
+//       trailing junk, empty, zero, and plain negative are rejected LOUDLY
+//       (stderr diagnostic + the default budget); a value whose << 20 would
+//       wrap, or whose magnitude overflows the parser (ERANGE, EITHER sign —
+//       "-99999999999999999999" clamps, it must not read as a plain
+//       negative), clamps loudly to the largest representable budget;
 //   (13) a zero byte budget is rejected at construction
 //       (std::invalid_argument), not silently clamped to 1;
 //   (14) mass eviction picks the LRU-ordered UNPINNED prefix in one pass,
@@ -302,23 +304,32 @@ void test_env_budget_parsing() {
     check(got == dflt && err.empty(), "ENV: unset -> default, silently");
 
     // Overflow: exactly the largest representable MiB (SIZE_MAX >> 20) is
-    // accepted as-is; one more — and an out-of-long-long value — clamp
-    // loudly to the same budget instead of wrapping the shift.
+    // accepted as-is; one more — and an out-of-long-long value of EITHER
+    // sign — clamp loudly to the same budget instead of wrapping the shift.
+    // (R25: the negative-overflow case pins the ERANGE-before-positivity
+    // check order — a magnitude overflow is a clamp, not "out of range
+    // (>= 1)"; and the inputs live in std::strings because a
+    // std::to_string(...).c_str() temporary in a braced-init list dangles
+    // before the loop body runs.)
     const size_t max_mib = SIZE_MAX >> 20;
     const size_t max_budget = max_mib << 20;
     SETENV(var, std::to_string(max_mib).c_str());
     got = 0;
     capture_stderr([&] { got = env_budget_bytes(var, dflt); });
     check(got == max_budget, "ENV: boundary max_mib accepted unclamped");
-    for (const char* v : { std::to_string(max_mib + 1).c_str(),
-                           "99999999999999999999" }) {
-        SETENV(var, v);
+    const std::string overflow_inputs[] = {
+        std::to_string(max_mib + 1),   // one past the largest representable MiB
+        "99999999999999999999",        // beyond long long (positive ERANGE)
+        "-99999999999999999999",       // beyond long long, NEGATIVE (R25)
+    };
+    for (const std::string& v : overflow_inputs) {
+        SETENV(var, v.c_str());
         got = 0;
         const std::string clamp_err = capture_stderr(
             [&] { got = env_budget_bytes(var, dflt); });
         check(got == max_budget &&
                   clamp_err.find("clamping") != std::string::npos,
-              "ENV: overflow '" + std::string(v) + "' clamps loudly to max");
+              "ENV: overflow '" + v + "' clamps loudly to max");
     }
     UNSETENV(var);
 }
@@ -572,9 +583,12 @@ void test_real_graphs() {
 // Insert-then-release helper for the non-leased assertions below: the
 // pinned acquire keeps the entry alive across the statement, then the
 // release restores the at-rest (post-trim) state those tests assert on.
+// The entry parameter is the acquire's result and is CHECKED, not discarded:
+// a silently-failed insert must surface here instead of slipping through as
+// a release no-op.
 static void release_after(ByteBudgetLruCache<int, FakeEntry>& cache,
                           FakeEntry* entry, int key) {
-    (void)entry;
+    check(entry != nullptr, "release_after: the acquire returned an entry");
     cache.release(key);
 }
 
