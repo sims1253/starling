@@ -1304,11 +1304,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-19",
    "branch": "gpui/fixes-wave-a5",
    "evidence": [
-    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+    "coordinator rerun: 111/111 dictation + 21/21 app tests; transport/local failure classifier + probe-on-transport-only keeps check_health sole connection writer; resampler 384kHz ceiling + edge replication; recorder finding verified ABSORBED by ring rewrite; pushed to PR #194 (51ec75e incl. workflow timeout fix)"
    ],
    "notes": "dispatched after I1-phase1; recorder finding absorbed by ring rewrite - verify"
   },
@@ -1370,13 +1370,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-21",
+   "branch": "gpui/fixes-wave-a6",
    "evidence": [
     "PR #194 OCR run 35503993636, 2026-09-20 10:10Z (15 findings; 3 resolved by unpushed R13 commits)"
    ],
-   "notes": "mediums: quiesce-timeout concurrent drain, partial-drain accounting; plus channels==0, JoinError surfacing, capture_probe example, export sync_all, banner slot, workflow timeout/cache/rustup-pin"
+   "notes": "workflow timeout-minutes landed (51ec75e); recorder edges + example + export/notice with impl-agent-21"
   },
   {
    "id": "R18",
@@ -1386,11 +1386,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
+   "branch": "program/wave-a",
    "evidence": [
-    "PR #197 OCR finding 4056704921"
+    "both engine test targets added to ci-starling-serve.yml build+run lists with comment; yaml validated"
    ],
    "notes": "explicit --target list + run list in ci-starling-serve.yml; device_cache_clear_test likely same gap - verify"
   }
