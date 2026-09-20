@@ -235,7 +235,7 @@
     "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
     "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
    ],
-   "notes": "phase 1 landed; D14 requires a v2-only simplification pass (drop migration flow, dual-store facade, flag) before merge"
+   "notes": "v2-ONLY per D14: migration flow + dual store + flag deleted (net -1987 lines); remaining: leases, retention sweep, bounded reads, runtime-side store integration; v1 FileSessionStore kept only because crates/runtime references it (delete on I3 integration)"
   },
   {
    "id": "E03",
@@ -1658,11 +1658,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
    "branch": "program/e02-cutover",
    "evidence": [
-    "PR #201 OCR first review (13 findings)"
+    "coordinator rerun: 269/269 workspace (fe510da pushed to #201); interrupted-state derives from salvage path (2 regression tests); typed NoVerifiedSamples; grouped attempts query (no N+1); last_error joins recovery note; real created_utc w/ guarded in-place upgrade; obsolete findings grep-verified gone"
    ],
    "notes": "RESHAPED by D14 (no backwards compatibility): the persisted-choice/env-flag/migration-flow findings become moot with v2-only simplification; REAL findings to keep: quiesce-salvage interrupted-state on v2, store facade perf x2, last_error, updated_at"
   }
