@@ -1272,11 +1272,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
+   "branch": "program/wave-a",
    "evidence": [
-    "PR #195 OpenCodeReview run 35500294649-1, 2026-09-20 08:45Z"
+    "all 4 code fixes + 3 regression tests; 98+0 passed (test_fidelity_corpus+insight_events), server_routing 21 unregressed"
    ],
    "notes": "trailing newline (pr193-log.json, already fixed in harvest); LE-safe WAV bytes (fidelity_audio.py); overlap clamp (fidelity_scorers.py L203); bool/int type-aware const/enum equality + empty-combiner guard (minischema.py L78/L121). Execute in coordinator session; tests/ is agent-shared."
   }
