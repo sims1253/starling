@@ -1,9 +1,10 @@
 package dev.starling.mobile.engine
 
 import dev.starling.mobile.network.InferenceResult
-import java.io.DataInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
+import java.util.UUID
 
 /**
  * Owns the on-device Parakeet engine: the imported GGUF, the native model
@@ -12,9 +13,12 @@ import java.io.InputStream
  * serialized; the engine additionally mutexes inside the C API.
  */
 class OnDeviceEngine(modelDir: File) {
+    /** Where in [importModel] a rejection happened; import failures report their stage. */
+    enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
+
     sealed interface ImportResult {
         data class Imported(val sizeBytes: Long) : ImportResult
-        data class Rejected(val reason: String) : ImportResult
+        data class Rejected(val reason: String, val stage: ImportStage = ImportStage.COPY) : ImportResult
     }
 
     private val modelFile = File(modelDir, MODEL_FILE_NAME)
@@ -30,54 +34,88 @@ class OnDeviceEngine(modelDir: File) {
     fun lastLoadError(): String? = loadError
 
     /**
-     * Imports [input] as the on-device model: validated, written to a
-     * temporary file, then atomically promoted. Any previously loaded model
-     * is unloaded so the next transcription reloads from the new file.
-     * Blocking; call from a background thread. [input] is always closed.
+     * Imports [input] as the on-device model (B08, transactional):
+     *
+     * 1. the whole import runs under the engine lock, so concurrent imports
+     *    queue instead of racing and a concurrent transcription can never
+     *    observe a half-published model;
+     * 2. the payload is copied into a unique staging file (a failed or
+     *    interrupted import can never corrupt another import's staging) and
+     *    fsynced, so a later promotion can never publish a half-written file;
+     * 3. the staged file is validated (magic, size, bounded GGUF metadata
+     *    parse, Parakeet model family) BEFORE the active model is touched;
+     * 4. promotion is a single atomic rename over the target — the previous
+     *    model is never deleted first, so any failure at any earlier stage
+     *    (or the rename itself) leaves the last usable model in place.
+     *
+     * Staging files from interrupted imports are swept at the start of the
+     * next import (the lock guarantees none is in use), bounding storage to
+     * one staging file at a time. Blocking; call from a background thread.
+     * [input] is always closed.
      */
-    fun importModel(input: InputStream): ImportResult {
-        input.use { stream ->
-            val temporary = File(modelFile.parentFile, "$MODEL_FILE_NAME.importing")
-            runCatching {
-                modelFile.parentFile?.mkdirs()
-                temporary.outputStream().use { output ->
-                    stream.copyTo(output, BUFFER_SIZE)
-                }
-            }.onFailure {
-                temporary.delete()
-                return ImportResult.Rejected("The model could not be copied to private storage.")
-            }
+    fun importModel(input: InputStream): ImportResult =
+        importModel(input) { staged, target -> staged.renameTo(target) }
 
-            val size = temporary.length()
-            val header = ByteArray(ModelFiles.GGUF_MAGIC_SIZE)
-            runCatching {
-                temporary.inputStream().use { headerStream ->
-                    // A single read may legally return short.
-                    DataInputStream(headerStream).readFully(header)
+    /**
+     * Testable core of [importModel]; [promote] is the promotion seam
+     * (default: an atomic rename). Returning false from it simulates a
+     * failed promotion (device full, permissions, I/O error) and must leave
+     * the previous model usable.
+     */
+    internal fun importModel(input: InputStream, promote: (staged: File, target: File) -> Boolean): ImportResult =
+        synchronized(lock) {
+            input.use { stream ->
+                sweepStaleStaging()
+                val staged = File(modelFile.parentFile, "$MODEL_FILE_NAME.${UUID.randomUUID()}.importing")
+                val copied = runCatching {
+                    modelFile.parentFile?.mkdirs()
+                    FileOutputStream(staged).use { output ->
+                        stream.copyTo(output, BUFFER_SIZE)
+                        // Durability before promotion: the rename below must
+                        // never publish a file whose blocks are not yet on
+                        // disk. A sync failure is a copy-stage failure.
+                        output.fd.sync()
+                    }
                 }
-            }.onFailure {
-                temporary.delete()
-                return ImportResult.Rejected("The model file could not be read.")
-            }
-            val rejection = ModelFiles.validate(size, header)
-            if (rejection != null) {
-                temporary.delete()
-                return ImportResult.Rejected(rejection)
-            }
+                if (copied.isFailure) {
+                    staged.delete()
+                    return ImportResult.Rejected("The model could not be copied to private storage.", ImportStage.COPY)
+                }
+                val size = staged.length()
 
-            synchronized(lock) {
-                unload()
-                if (modelFile.exists() && !modelFile.delete()) {
-                    temporary.delete()
-                    return ImportResult.Rejected("The previous model could not be replaced.")
+                val rejection = ModelFiles.validateStaged(staged)
+                if (rejection != null) {
+                    staged.delete()
+                    return ImportResult.Rejected(rejection, ImportStage.VALIDATE)
                 }
-                if (!temporary.renameTo(modelFile)) {
-                    temporary.delete()
-                    return ImportResult.Rejected("The model could not be moved into place.")
+
+                // Single atomic step: rename(2) over the target replaces it
+                // or fails — the previous model is never deleted first, so a
+                // failed promotion keeps the last usable model recoverable.
+                if (!promote(staged, modelFile)) {
+                    staged.delete()
+                    return ImportResult.Rejected(
+                        "The model could not be moved into place; the previous model was kept.",
+                        ImportStage.PROMOTE,
+                    )
                 }
+                unload() // the next transcription reloads from the new file
+                ImportResult.Imported(size)
             }
-            return ImportResult.Imported(size)
         }
+
+    /**
+     * Removes leftover staging files (the unique ones from interrupted
+     * imports and the fixed-name ones written by earlier app versions).
+     * Only ever called with [lock] held, so no staging file can be in use.
+     */
+    private fun sweepStaleStaging() {
+        val directory = modelFile.parentFile ?: return
+        val stale = directory.listFiles { file ->
+            file.isFile && (file.name == LEGACY_STAGING_NAME ||
+                (file.name.startsWith("$MODEL_FILE_NAME.") && file.name.endsWith(".importing")))
+        } ?: return
+        for (file in stale) file.delete()
     }
 
     /** Blocking transcription of a finalized WAV recording. */
@@ -150,6 +188,9 @@ class OnDeviceEngine(modelDir: File) {
 
     companion object {
         private const val MODEL_FILE_NAME = "parakeet.gguf"
+
+        /** Fixed staging name written by app versions before B08; still swept. */
+        private const val LEGACY_STAGING_NAME = "$MODEL_FILE_NAME.importing"
         private const val BUFFER_SIZE = 64 * 1024
 
         // Silence for warmup; matches serve's dummy-clip warmup purpose.

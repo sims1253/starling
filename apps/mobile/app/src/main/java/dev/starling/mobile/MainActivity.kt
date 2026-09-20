@@ -208,7 +208,10 @@ class MainActivity : Activity() {
         thread {
             val input = runCatching { resolver.openInputStream(uri) }.getOrNull()
             val result = if (input == null) {
-                OnDeviceEngine.ImportResult.Rejected("The selected file could not be opened.")
+                OnDeviceEngine.ImportResult.Rejected(
+                    "The selected file could not be opened.",
+                    OnDeviceEngine.ImportStage.OPEN,
+                )
             } else {
                 application.onDeviceEngine.importModel(input)
             }
