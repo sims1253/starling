@@ -5,7 +5,17 @@
   4056955045,
   4056955047,
   4056955050,
-  4056955052
+  4056955052,
+  4057069991,
+  4057069994,
+  4057069997,
+  4057069998,
+  4057070004,
+  4057070013,
+  4057070017,
+  4057070027,
+  4057070032,
+  4057070040
  ],
  "known_issue_comment_ids": [
   5749833414,
@@ -41,6 +51,56 @@
    "id": 4056955052,
    "severity": "style-low",
    "summary": "double blank line"
+  },
+  {
+   "id": 4057069998,
+   "severity": "bug-medium",
+   "summary": "active_tx() captures inner at creation but reads tx_gen_ at invocation - swap between the two breaks the keying invariant; snapshot BOTH at creation"
+  },
+  {
+   "id": 4057069997,
+   "severity": "maint-medium",
+   "summary": "reset-collision safety comment not actually enforced (indices restart; verify rev/key behavior across reset)"
+  },
+  {
+   "id": 4057070004,
+   "severity": "maint-medium",
+   "summary": "header safety-argument note"
+  },
+  {
+   "id": 4057069991,
+   "severity": "doc-low",
+   "summary": "comment"
+  },
+  {
+   "id": 4057069994,
+   "severity": "perf-low",
+   "summary": "active_tx() rebuilds per call"
+  },
+  {
+   "id": 4057070013,
+   "severity": "test-low",
+   "summary": "CHECK_NEAR fixed abs epsilon"
+  },
+  {
+   "id": 4057070017,
+   "severity": "maint-low",
+   "summary": "TailFixture note"
+  },
+  {
+   "id": 4057070027,
+   "severity": "test-low",
+   "summary": "empty-result comment claim"
+  },
+  {
+   "id": 4057070032,
+   "severity": "test-low",
+   "summary": "prologue step result"
+  },
+  {
+   "id": 4057070040,
+   "severity": "maint-low",
+   "summary": "stream note"
   }
  ]
 }

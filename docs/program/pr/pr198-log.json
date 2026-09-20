@@ -20,7 +20,14 @@
   4056994672,
   4056994674,
   4056998637,
-  4056998640
+  4056998640,
+  4057070006,
+  4057070012,
+  4057070016,
+  4057070021,
+  4057070028,
+  4057075326,
+  4057075406
  ],
  "known_issue_comment_ids": [
   5749428749,
@@ -133,6 +140,41 @@
    "id": 4056994674,
    "severity": "perf-low",
    "summary": "enforce_floored_cap rescans when avoidable"
+  },
+  {
+   "id": 4057070012,
+   "severity": "bug-medium",
+   "summary": "negative-overflow input gets out-of-range message instead of ERANGE-clamp message (order: v<=0 checked before ERANGE)"
+  },
+  {
+   "id": 4057070006,
+   "severity": "maint-low",
+   "summary": "tdt_multistep comment"
+  },
+  {
+   "id": 4057070016,
+   "severity": "maint-low",
+   "summary": "detail:: hook note"
+  },
+  {
+   "id": 4057070021,
+   "severity": "doc-low",
+   "summary": "test header doc"
+  },
+  {
+   "id": 4057070028,
+   "severity": "style-low",
+   "summary": "entry param style"
+  },
+  {
+   "id": 4057075326,
+   "severity": "resolved",
+   "summary": "bot confirmed floor-comment fix addressed in 5d63153"
+  },
+  {
+   "id": 4057075406,
+   "severity": "resolved",
+   "summary": "bot confirmed floored-rollback test addressed in 5d63153"
   }
  ]
 }

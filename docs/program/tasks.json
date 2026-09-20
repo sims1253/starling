@@ -1522,6 +1522,38 @@
     "coordinator rerun after branch-correct rebuild: stream_session_test 363/363 (1aa3a08, pushed to #199); tx_gen_ joins StreamTailKey (in-flight-write immune by construction); callback-swap recompute test; TailFixture dedupe; CHECK_NEAR"
    ],
    "notes": "MEDIUM: set_transcribe_fn swaps custom_tx_ w/o clearing retained entry -> stale replay; callback identity joins the key or swap clears; add test; queue engine slot behind R23"
+  },
+  {
+   "id": "R25",
+   "title": "PR #198 batch-4: ERANGE message ordering + 5 lows",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35513994099 (post-R23; bot also CONFIRMED R23 fixes addressed)"
+   ],
+   "notes": "check ERANGE before the <=0 branch so huge-magnitude negatives get the clamp message; rest are message/doc/test nits"
+  },
+  {
+   "id": "R26",
+   "title": "PR #199 batch-2: snapshot tx_gen_ with the callback at active_tx() creation; reset-collision enforcement; 8 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #199 OCR run 35513991972 (post-R24)"
+   ],
+   "notes": "MEDIUM: capture inner AND tx_gen_ together atomically (the R24 keying has a creation/invocation gap); verify+enforce the reset safety argument in code not just comments"
   }
  ],
  "active_assignments": [
