@@ -224,11 +224,11 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-33",
+   "branch": "gpui/fixes-wave-a11",
    "evidence": [],
-   "notes": ""
+   "notes": "I2 storage v2 core dispatched (D11: rusqlite bundled)"
   },
   {
    "id": "E03",
@@ -646,11 +646,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-30",
    "branch": "gpui/fixes-wave-a10",
-   "evidence": [],
-   "notes": "solution specified in design note \u00a74 (I2): per-record quarantine, orphan recovery, lease ownership"
+   "evidence": [
+    "coordinator rerun: 144/144 + 42/42 (cf70f35, pushed); list_records metadata-only w/ 1MiB manifest cap + WAV magic check; 8-record mixed store surfaces damaged with reasons; WAV-only orphans recover as interrupted takes w/ torn-write duration clamp; heal-on-first-write; paging API"
+   ],
+   "notes": "crash-injection/fsync documentation + multi-process leases remain E02 storage-v2 scope per the issues own migration framing"
   },
   {
    "id": "G03",
@@ -797,11 +799,11 @@
     "E28"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-34",
+   "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "phase 1: Electron Insights surface against frozen E28 fixtures"
   },
   {
    "id": "E30",
@@ -1281,11 +1283,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-30",
    "branch": "gpui/fixes-wave-a10",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun 42/42; single long-lived watcher thread (zero idle wakeups); transcript one text element; history single pass; mono.clone verified absorbed by ring rewrite"
    ],
    "notes": "batch; low severity"
   },
@@ -1297,11 +1300,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-30",
    "branch": "gpui/fixes-wave-a10",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun; single Protocol enum w/ stable serde strings; typed ConfigDir/DataDir errors replace cwd fallbacks; component date formatting; rust-version 1.85 + MIT + repository metadata"
    ],
    "notes": "batch; E16-adjacent"
   },

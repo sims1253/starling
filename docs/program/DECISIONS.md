@@ -66,3 +66,16 @@ This supersedes D1's default for this session's program branches. Still
 forbidden: merging, force-pushing shared branches, pushing to master, and
 claiming publication without a successful command result. Coordinator pushes
 verified branches; agents never push directly.
+
+## D11 — 2026-09-20 — Storage v2 uses rusqlite with the bundled SQLite
+I2 needs a transactional metadata store; the design (§4) specifies SQLite
+in WAL mode. Decision: `rusqlite` with the `bundled` feature — no system
+sqlite dev dependency on user machines, one cargo cache, version pinned by
+the lockfile. **Rejected:** system sqlite (packaging/ABI variance per OS);
+a hand-rolled journal-only metadata format (re-invents transactions badly).
+WAL checkpoint policy stays tunable per the design's slow-disk caveat.
+
+## D12 — 2026-09-20 — All G-items and R-items from the port review are closed
+as of gpui/fixes-wave-a10 (8153a35): G01 (I1 ring+journal), G02 (per-record
+isolation + orphan recovery), G03-G07, R01-R21. Remaining GPUI-port work is
+product scope (E15 parity items, streaming transport parity), not review debt.
