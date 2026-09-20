@@ -22,9 +22,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install ALSA headers for cpal
+      - name: Install system libs for cpal and gpui's X11/Wayland link
         if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
       - name: Install stable toolchain
         if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         run: |

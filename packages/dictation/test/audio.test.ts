@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "vite-plus/test";
+import { Schema } from "effect";
 
 import {
   AudioFormatError,
@@ -75,37 +76,20 @@ describe("PCM16 rounding contract (shared fixture)", () => {
   });
 });
 
-// Parse the fixture at its I/O boundary: accept numeric inputs as-is and
-// numeric strings (the JSON encoding of NaN / Infinity), reject anything
-// else loudly instead of narrowing by representation at the use site.
+// Parse the fixture at its I/O boundary with the repo's schema idiom
+// (decodeUnknownSync, like refine.test.ts): the schema does the shape
+// checking, numeric strings (the JSON encoding of NaN / Infinity) are
+// converted once here, and anything malformed throws a ParseError instead
+// of narrowing by representation at the use site.
+const PcmFixtureRow = Schema.Struct({
+  input: Schema.Union([Schema.Number, Schema.String]),
+  expected: Schema.Number,
+});
+
+const PcmFixture = Schema.Struct({ cases: Schema.Array(PcmFixtureRow) });
+
 function parsePcmRoundingFixture(raw: string): Array<{ input: number; expected: number }> {
-  const parsed: unknown = JSON.parse(raw);
+  const fixture = Schema.decodeUnknownSync(PcmFixture)(JSON.parse(raw));
 
-  if (typeof parsed !== "object" || parsed === null || !("cases" in parsed)) {
-    throw new Error("pcm-rounding fixture: expected an object with a cases array");
-  }
-
-  const { cases } = parsed;
-
-  if (!Array.isArray(cases)) {
-    throw new Error("pcm-rounding fixture: cases must be an array");
-  }
-
-  return cases.map((entry) => {
-    if (typeof entry !== "object" || entry === null || !("input" in entry) || !("expected" in entry)) {
-      throw new Error("pcm-rounding fixture: each case needs input and expected");
-    }
-
-    const { input, expected } = entry;
-
-    if (typeof input !== "number" && typeof input !== "string") {
-      throw new Error("pcm-rounding fixture: input must be a number or numeric string");
-    }
-
-    if (typeof expected !== "number") {
-      throw new Error("pcm-rounding fixture: expected must be a number");
-    }
-
-    return { input: Number(input), expected };
-  });
+  return fixture.cases.map(({ input, expected }) => ({ input: Number(input), expected }));
 }
