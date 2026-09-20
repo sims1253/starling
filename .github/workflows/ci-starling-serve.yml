@@ -62,7 +62,8 @@ jobs:
             parakeet_compact_engine_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
-            replay_graph_support_test
+            replay_graph_support_test \
+            device_cache_clear_test greedy_termination_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -76,6 +77,14 @@ jobs:
           ./build/stream_session_test
           ./build/audio_parser_test
           ./build/replay_graph_support_test
+
+      # Engine contracts from the optimization program: on-device KV cache
+      # clearing (S01) and EOS/budget termination semantics (S03). Both are
+      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed).
+      - name: Engine contract tests (KV clearing, termination semantics)
+        run: |
+          ./build/device_cache_clear_test
+          ./build/greedy_termination_test
 
       # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
       # higgs_dtype_guard_test, audex_loader_guard_test and
