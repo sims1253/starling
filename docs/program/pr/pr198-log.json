@@ -1,0 +1,77 @@
+{
+ "known_review_comment_ids": [
+  4056810545,
+  4056810551,
+  4056810558,
+  4056810560,
+  4056810564,
+  4056810568,
+  4056810571,
+  4056810574,
+  4056810577,
+  4056810584,
+  4056822688
+ ],
+ "known_issue_comment_ids": [
+  5749428749,
+  5749451634
+ ],
+ "last_review_comment_at": "2026-09-20T11:22:57Z",
+ "findings": [
+  {
+   "id": 4056810545,
+   "severity": "bug-medium",
+   "summary": "budget env parse: atol truncation + unbounded MB<<20 overflow -> wrapped budgets, silent"
+  },
+  {
+   "id": 4056810574,
+   "severity": "perf-medium",
+   "summary": "trim_over_budget O(n^2) mass eviction (rescan + map lookup per entry) on inference thread"
+  },
+  {
+   "id": 4056810551,
+   "severity": "maint-low",
+   "summary": "cache constructed without [injectable clock/hooks?]"
+  },
+  {
+   "id": 4056810558,
+   "severity": "maint-low",
+   "summary": "catch only std::exception"
+  },
+  {
+   "id": 4056810560,
+   "severity": "maint-low",
+   "summary": "dead branch in acquire_kstep"
+  },
+  {
+   "id": 4056810564,
+   "severity": "style-low",
+   "summary": "zero budget clamped to 1 masks misconfiguration"
+  },
+  {
+   "id": 4056810568,
+   "severity": "style-low",
+   "summary": "trace asymmetry get vs pinned"
+  },
+  {
+   "id": 4056810571,
+   "severity": "maint-low",
+   "summary": "plain get() silent while pinned logs"
+  },
+  {
+   "id": 4056810577,
+   "severity": "test-low",
+   "summary": "test helper returns raw pointer to evictable entry"
+  },
+  {
+   "id": 4056810584,
+   "severity": "test-low",
+   "summary": "steady-state assumption unguarded in test init"
+  },
+  {
+   "id": 4056822688,
+   "severity": "other-low",
+   "summary": "trace() maps bytes_/budget_ into cache_event size/capacity - rename when reporting work lands"
+  }
+ ]
+}

@@ -1426,6 +1426,22 @@
     "boundary parser replaces type assertion (lint+fmt verified via main-checkout toolchain, 0/0); libasound2-dev install step added; pushed 80aa4a1 -> PR #194 re-runs checks"
    ],
    "notes": "audio.test.ts authored in gpui worktree which lacks node_modules - JS gates never ran there; fixing + verifying via main-checkout lint. code-review bot workflow itself failed on #196/#197 at open time (bot-side exit 1; later runs on other PRs succeeded) - no action possible from agents; re-triggers on next push."
+  },
+  {
+   "id": "R20",
+   "title": "Address PR #198 OCR review on S02 (2 medium: env-parse overflow, O(n^2) trim; 10 low)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35507119114, 2026-09-20 11:15Z (12 findings)"
+   ],
+   "notes": "dispatch into starling-s01 worktree when coordinator next fills the engine slot; budget parse = strtoll+clamp; trim = single-pass back-iteration"
   }
  ],
  "active_assignments": [
