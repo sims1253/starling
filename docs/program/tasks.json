@@ -837,14 +837,16 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": null,
    "branch": "program/s01-moss-kv-clear",
    "evidence": [
     "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending",
     "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196",
     "LOCAL DEVICE EVIDENCE: device_cache_clear_test backend=Vulkan0 all checks passed on AMD Cezanne/RADV (program/gpu-validation build-vk) - Vulkan fillBuffer path now executed-device-verified; CUDA still source-read only pending 5090 run",
-    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)",
+    "5090 VERIFIED_ON_TARGET: 0 KV-clear host bytes/request (LD_PRELOAD byte counter; master carried ~224MiB/request as 56x4MiB H2D memcpys; branch does 56 device-side cudaMemsetAsync, host upload only once at startup); 18/18 byte-identical transcripts; latency not-worse (cold -84..-139ms, warm short/medium -26/-28ms, long +2.9% median within master +/-7% noise, lower mean); VRAM identical 8906MiB",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "CPU-verified; CUDA/Vulkan source-read only; no GPU timing or real-model A/B (validation gaps)"
   },
@@ -856,14 +858,16 @@
    "area": "serving",
    "deps": [],
    "existing_issue": 177,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": null,
    "branch": "program/s02-tdt-budget",
    "evidence": [
     "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction",
     "LOCAL DEVICE EVIDENCE: tdt_graph_budget_test PASS with real ReplayGraphs on Vulkan device (entry_bytes=3080 vs 3136 CPU - device-adaptive accounting); pointer stability under eviction verified on-device",
     "REAL-MODEL iGPU run: parakeet q8_0 720M loaded 1.5s, request 0.77s, {\"text\":\"\"} for tone input (correct no-speech behavior); MOSS tone produced a hallucination (expected for non-speech input) - pipeline-level evidence only, not quality",
-    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)"
+    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)",
+    "5090 VERIFIED: budget/LRU/pin/rollback/pointer-stability on real CUDA graphs (entry_bytes=3328, CUDA graph warmup+replay); CPU E2E transcripts identical across 12 lengths x 3 budgets; CUDA E2E BLOCKED by pre-existing master-identical ggml CONV_2D_DW F32-only vs parakeet F16 layout - NOT an S02 regression",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
   },
@@ -875,13 +879,15 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": "impl-agent-12",
    "branch": "program/s03-eos-contract",
    "evidence": [
     "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction",
     "LOCAL DEVICE EVIDENCE: greedy_termination_test PASS under Vulkan backend; stream_session_test 235/235 on Vulkan",
-    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)",
+    "5090 VERIFIED_ON_TARGET: 66 real-MOSS transcript pairs (18 Gate-B + 48 real-corpus), 0 diffs, 0 instabilities; no over-generation after early EOS; predicate engine cases green on CUDA0",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "model-gated gaps: real MOSS GGUF E2E, GPU K-step branch, real-audio acceptance evals; serve/Python wiring of completion status deferred"
   },
@@ -1001,11 +1007,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": "impl-agent-31",
    "branch": "program/s11-tail-reuse",
    "evidence": [
-    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open"
+    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open",
+    "5090 VERIFIED_ON_TARGET: serve-level reuse contract by engine-call signature: unchanged-audio commit = 1 call, one-appended-sample = 2, duplicate preview coalesce = 1; stream_session_test 382/382 on CUDA",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "no real-model/GPU timing claims; reuse count reported separately from latency; serving first-wave (S01/S02/S03/S11) now ALL implemented+CPU/Vulkan-verified",
    "branch_note": "engine worktree"
@@ -1604,6 +1612,22 @@
     "PR #199 OCR rerun 35518232105-2"
    ],
    "notes": "verify-then-fix; fold into next engine touch with R27"
+  },
+  {
+   "id": "R32",
+   "title": "Parakeet CUDA encoder capture blocked: ggml CONV_2D_DW accepts only F32 src0 vs Starling F16 depthwise-conv layout contract",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": 184,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "5090 report Gate C: ReplayGraph rejects 24/1869 nodes (all CONV_2D_DW, src0=f16) on CUDA; plain master 12b6548 fails identically; ggml-cuda.cu:5533 returns src0->type==F32; convert_parakeet_gguf.py deliberately stores F16"
+   ],
+   "notes": "fix directions: extend pinned-ggml CUDA CONV_2D_DW to accept F16 src0 (patch series) or add a capture-time cast; blocks parakeet CUDA E2E + S02 VRAM-plateau evidence; coordinator to draft as GitHub issue for user review"
   }
  ],
  "active_assignments": [

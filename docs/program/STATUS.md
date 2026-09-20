@@ -173,3 +173,14 @@ builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
   tracked test was nearly lost to a staging copy - restored, gates re-run).
 - I3 runtime crate integrated (161+42+50). Lint-cleanup agent final state:
   0 warnings 0 errors.
+
+## Update 2026-09-20 (night II) — 5090 CUDA validation complete; ALL PRs merged
+
+The user's 5090 agent independently validated and merged #196-#199 (evidence:
+docs/program/evidence/gpu-validation-5090-2026-09-20.md on program/gpu-validation).
+S01/S03/S11 fully verified on target (0 host bytes/request KV clearing,
+66/66 identical transcripts, 1/2/1 reuse signature). S02 verified at CUDA
+graph level; CUDA E2E blocked by pre-existing ggml CONV_2D_DW F32-only
+limitation (master-identical) -> R32. Agent spot-checked control-plane
+claims and reproduced them. D13 freeze lifted. All nine program PRs merged.
+Wave B continues (B07/B08 Android, E02 cutover in flight).
