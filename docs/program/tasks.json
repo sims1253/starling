@@ -232,9 +232,10 @@
    "owner": "impl-agent-33",
    "branch": "gpui/fixes-wave-a11",
    "evidence": [
-    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal"
+    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
+    "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
    ],
-   "notes": "cutover remains: app wiring behind STARLING_STORAGE_V2, user-reviewed dry-run->apply->accept UI, leases, retention sweep, bounded reads, E02 crash-injection docs"
+   "notes": "phase 1 complete; remaining: leases, retention sweep, bounded reads, runtime-side store integration"
   },
   {
    "id": "E03",
