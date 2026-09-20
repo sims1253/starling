@@ -197,8 +197,14 @@ def speech_region_coverage(
     covered = 0.0
     uncovered: list[list[float]] = []
     for start, end in speech_regions:
-        region_covered = sum(
-            _overlap(start, end, seg_start, seg_end) for seg_start, seg_end in captured_segments
+        # Clamp per-region coverage: overlapping captured segments must not
+        # double-count, or coverage can exceed 1.0 and mask uncovered regions.
+        region_covered = min(
+            end - start,
+            sum(
+                _overlap(start, end, seg_start, seg_end)
+                for seg_start, seg_end in captured_segments
+            ),
         )
         covered += region_covered
         if region_covered < (end - start) * min_region_coverage:

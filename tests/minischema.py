@@ -72,9 +72,16 @@ def errors(
         if not any(_type_ok(instance, n) for n in names):
             return [f"{path}: expected type {'/'.join(names)}, got {type(instance).__name__}"]
 
-    if "const" in schema and instance != schema["const"]:
+    # JSON Schema equality is type-aware: true != 1 even though bool is an int
+    # subclass in Python.
+    def _json_equal(a: Any, b: Any) -> bool:
+        if isinstance(a, bool) != isinstance(b, bool):
+            return False
+        return a == b
+
+    if "const" in schema and not _json_equal(instance, schema["const"]):
         found.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
-    if "enum" in schema and instance not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(instance, v) for v in schema["enum"]):
         found.append(f"{path}: {instance!r} not in enum {schema['enum']!r}")
 
     if isinstance(instance, str):
@@ -112,13 +119,14 @@ def errors(
             continue
         branch_errors = [errors(instance, branch, root, path) for branch in schema[combiner]]
         valid = sum(1 for errs in branch_errors if not errs)
+        first_errors = branch_errors[0][:3] if branch_errors else "(no branches)"
         if combiner == "oneOf" and valid != 1:
             found.append(
                 f"{path}: expected exactly 1 matching branch, matched {valid}; "
-                f"first branch errors: {branch_errors[0][:3]}"
+                f"first branch errors: {first_errors}"
             )
         if combiner == "anyOf" and valid < 1:
-            found.append(f"{path}: no matching branch; first errors: {branch_errors[0][:3]}")
+            found.append(f"{path}: no matching branch; first errors: {first_errors}")
 
     return found
 

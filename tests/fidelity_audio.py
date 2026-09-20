@@ -13,6 +13,7 @@ from __future__ import annotations
 import array
 import io
 import math
+import sys
 import wave
 from typing import Any
 
@@ -45,6 +46,9 @@ def write_wav(
 ) -> int:
     """Write the synthesized audio as a 16-bit mono WAV; returns frame count."""
     samples = synthesize_samples(segments, sample_rate)
+    if sys.byteorder == "big":  # wave writes little-endian; array("h") is native
+        samples = array.array("h", samples)
+        samples.byteswap()
     writer = wave.open(fileobj, "wb")
     try:
         writer.setnchannels(1)
@@ -66,7 +70,10 @@ def read_wav(fileobj: io.BytesIO) -> tuple[int, array.array]:
         assert rate == SAMPLE_RATE
     finally:
         reader.close()
-    return len(raw) // 2, array.array("h", raw)
+    samples = array.array("h", raw)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    return len(raw) // 2, samples
 
 
 def speech_frame_bounds(

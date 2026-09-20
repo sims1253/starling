@@ -305,3 +305,43 @@ def test_mutation_of_fixture_data_never_touches_shared_state() -> None:
     before = copy.deepcopy(fixture)
     apply_mutant(fixture, mutant)
     assert fixture == before
+
+
+# --------------------------------------------------------------------------- #
+# OCR review fixes (PR #195): type-aware const/enum equality, empty combiners,
+# overlap clamp in region coverage
+# --------------------------------------------------------------------------- #
+def test_minischema_bool_is_not_integer_in_const_and_enum() -> None:
+    assert minischema.errors(1, {"const": True}) == [
+        "$: expected const True, got 1"
+    ]
+    assert minischema.errors(True, {"const": 1}) == [
+        "$: expected const 1, got True"
+    ]
+    assert minischema.errors(True, {"enum": [1, 2]}) == [
+        "$: True not in enum [1, 2]"
+    ]
+    assert minischema.errors(1, {"enum": [True]}) == [
+        "$: 1 not in enum [True]"
+    ]
+    assert minischema.errors(True, {"const": True}) == []
+    assert minischema.errors(1, {"enum": [1, True]}) == []
+
+
+def test_minischema_empty_combiner_is_a_validation_error_not_a_crash() -> None:
+    for combiner in ("oneOf", "anyOf"):
+        problems = minischema.errors("x", {combiner: []})
+        assert problems and "no branches" in problems[0]
+
+
+def test_region_coverage_clamps_overlap_double_counting() -> None:
+    from fidelity_scorers import speech_region_coverage
+
+    # Two fully-overlapping captured segments over the same speech region must
+    # not report coverage 2.0.
+    result = speech_region_coverage(
+        speech_regions=[(0.0, 2.0)],
+        captured_segments=[(0.0, 2.0), (0.5, 1.5)],
+    )
+    assert result["coverage"] <= 1.0
+    assert result["uncovered_regions"] == []
