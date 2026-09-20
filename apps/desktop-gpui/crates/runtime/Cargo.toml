@@ -1,0 +1,26 @@
+[package]
+name = "starling-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sims1253/starling"
+description = "Starling native runtime (E17 Mode A): the five I0 state machines behind the versioned envelope"
+
+[dependencies]
+starling-dictation = { path = "../dictation" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Exposes `starling_runtime::testing` (scripted capture sources and other
+# test doubles) to this crate's own integration tests via the self
+# dev-dependency below. Production builds never enable it.
+test-doubles = []
+
+[dev-dependencies]
+starling-runtime = { path = ".", features = ["test-doubles"] }
+tempfile = "3"

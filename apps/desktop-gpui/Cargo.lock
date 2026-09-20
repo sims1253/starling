@@ -5596,6 +5596,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "starling-dictation",
+ "starling-runtime",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

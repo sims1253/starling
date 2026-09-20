@@ -1,0 +1,18 @@
+{
+  "machine": "capture",
+  "description": "Unknown envelope version: v=2 is not parseable by a v1 receiver. The message must be rejected by the v1 schemas AND answered with runtime.nack{reason: unsupported_version} carrying corr = the rejected message id; the payload is never applied.",
+  "initial": "Idle",
+  "schema_valid": false,
+  "replay": "nack_unsupported_version",
+  "messages": [
+    {
+      "v": 2,
+      "id": "cmd_900",
+      "ts": "2026-09-20T10:09:00Z",
+      "corr": "take_99",
+      "seq": 1,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    }
+  ]
+}
