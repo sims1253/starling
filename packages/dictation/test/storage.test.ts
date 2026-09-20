@@ -341,16 +341,34 @@ describe("retry-safe session storage", () => {
     assert.equal(assigned.attemptCount, 1);
     assert.notEqual(new Date(assigned.updatedAt).getTime(), 0);
 
-    // Re-assignment moves the label in place, like re-refining overwrites.
+    // The assignment stamps the append sequence (B11): a finite, non-negative
+    // moment that orders the thread's turns by join order, not recording age.
+    const stamp = assigned.threadJoinedAt;
+
+    assert.ok(stamp !== undefined);
+    assert.ok(Number.isFinite(stamp) && stamp >= 0);
+
+    // An idempotent repeat on the same thread keeps the original stamp: it
+    // must not silently move the take to the end of its own thread.
+    const repeated = await memory.assignThread("threaded", "thread-9f1c");
+
+    assert.equal(repeated.threadJoinedAt, stamp);
+
+    // Re-assignment moves the label in place, like re-refining overwrites,
+    // and re-stamps the append: joining a different thread is a fresh append
+    // there.
     const moved = await memory.assignThread("threaded", "thread-next");
 
     assert.equal(moved.threadId, "thread-next");
+    assert.ok((moved.threadJoinedAt ?? 0) >= stamp);
     assert.equal(moved.transcript?.text, "raw words");
     assert.equal(exportDictationSession(moved).manifest.threadId, "thread-next");
+    assert.equal(exportDictationSession(moved).manifest.threadJoinedAt, moved.threadJoinedAt);
 
-    // Sessions nobody assigned stay unthreaded.
+    // Sessions nobody assigned stay unthreaded — and unstamped.
     await memory.create({ id: "lonely", wav });
     assert.equal((await memory.get("lonely"))?.threadId, undefined);
+    assert.equal((await memory.get("lonely"))?.threadJoinedAt, undefined);
 
     await assert.rejects(
       memory.assignThread("missing", "thread-9f1c"),
@@ -358,6 +376,36 @@ describe("retry-safe session storage", () => {
     );
     await assert.rejects(memory.assignThread("lonely", ""), TypeError);
     await assert.rejects(memory.assignThread("lonely", "bad\nid"), TypeError);
+  });
+
+  it("records the captured base identity on a threaded refinement", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "based", wav });
+    await memory.markAttempt("based");
+    await memory.saveTranscript("based", { text: "raw", segments: [] });
+    await memory.assignThread("based", "thread-1a");
+
+    // A refinement built on another member's text records which member that
+    // was, so the base stays explainable; re-refining overwrites it in place.
+    const refined = await memory.saveRefinedTranscript("based", {
+      text: "Refined on the head.",
+      model: "llama3.1",
+      createdAt: 5,
+      contextSourceId: "head-take",
+    });
+
+    assert.equal(refined.refined?.contextSourceId, "head-take");
+
+    const overwritten = await memory.saveRefinedTranscript("based", {
+      text: "Refined again.",
+      model: "llama3.1",
+      createdAt: 6,
+    });
+
+    assert.equal(overwritten.refined?.text, "Refined again.");
+    assert.equal(overwritten.refined?.contextSourceId, undefined);
+    assert.equal(exportDictationSession(overwritten).manifest.refined?.contextSourceId, undefined);
   });
 
   it("keeps thread assignment across an IndexedDB reopen", async () => {
@@ -378,9 +426,12 @@ describe("retry-safe session storage", () => {
 
     assert.equal(assigned.threadId, "thread-abc12345");
     assert.equal(assigned.transcript?.text, "raw");
+    assert.ok(assigned.threadJoinedAt !== undefined);
     store.close();
 
-    // The assignment survives the reopen: same label, same records.
+    // The assignment survives the reopen: same label, same records, and the
+    // same append stamp — the sequence is data, so the reading order a
+    // reload recomputes is the one the joins produced.
     const reopened = new IndexedDbSessionStore(options);
     const restored = await reopened.get("reopened-thread");
 
@@ -388,6 +439,7 @@ describe("retry-safe session storage", () => {
     assert.equal(restored.threadId, "thread-abc12345");
     assert.equal(restored.transcript?.text, "raw");
     assert.equal(restored.refined?.text, "Raw.");
+    assert.equal(restored.threadJoinedAt, assigned.threadJoinedAt);
     assert.equal(exportDictationSession(restored).manifest.threadId, "thread-abc12345");
     assert.deepEqual((await reopened.listReport()).invalid, []);
     reopened.close();
@@ -416,12 +468,15 @@ describe("retry-safe session storage", () => {
 
     assert.ok(restored);
     assert.equal(restored.threadId, undefined);
+    assert.equal(restored.threadJoinedAt, undefined);
     assert.equal(restored.transcript?.text, "written before threads existed");
 
-    // Thread membership still attaches to such a record without migration.
+    // Thread membership still attaches to such a record without migration,
+    // and the append stamps with it.
     const assigned = await store.assignThread("pre-thread", "thread-late");
 
     assert.equal(assigned.threadId, "thread-late");
+    assert.ok(assigned.threadJoinedAt !== undefined);
     assert.deepEqual((await store.listReport()).invalid, []);
     store.close();
   });

@@ -37,10 +37,23 @@ import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings }
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
-import { activeThreadId, newThreadId, threadContext, threadTurns } from "./threads";
+import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./threads";
 import type { PendingAudioState } from "../electron/ipc.js";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
+
+/**
+ * Mutable draft for one refined copy — the SessionDraft pattern from
+ * storage.ts — so the captured base identity (B11) is added only when the
+ * refinement actually had prior context, never as a present-but-undefined
+ * field.
+ */
+interface RefinedDraft {
+  text: string;
+  model: string;
+  createdAt: number;
+  contextSourceId?: string;
+}
 
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 
@@ -749,6 +762,11 @@ export default function App() {
 
       try {
         let contextText: string | undefined;
+        // Captured base identity (B11): the member whose refined text the
+        // context came from, recorded on the saved refinement so the base a
+        // thread edit used stays explainable instead of being recomputed
+        // from whatever order a later listing reads in.
+        let contextSourceId: string | undefined;
 
         if (inThread) {
           // Thread state is read fresh from the store — the same read
@@ -799,8 +817,15 @@ export default function App() {
           // The context itself comes from the same fresh snapshot: the
           // assignment only labeled THIS take, so the thread's other members
           // — the earlier turns this walks — are exactly what the store
-          // holds right now.
-          contextText = threadContext(fresh.sessions, threadId, session.id);
+          // holds right now. Because the assignment stamped this take as the
+          // thread's latest append, the walk finds the same base here as the
+          // pre-assignment read did: a joining take — older or not — refines
+          // against the thread's current document, and a retry computes the
+          // same answer as the press that joined (B11).
+          const base = threadContextBase(fresh.sessions, threadId, session.id);
+
+          contextText = base?.refined?.text;
+          contextSourceId = base?.id;
         }
 
         const text = await Effect.runPromise(
@@ -810,11 +835,13 @@ export default function App() {
           }),
         );
 
-        await store.saveRefinedTranscript(session.id, {
-          text,
-          model: refineModel.trim(),
-          createdAt: Date.now(),
-        });
+        // The refined copy is drafted mutable so the captured base identity
+        // is added only when this refinement actually had one.
+        const refined: RefinedDraft = { text, model: refineModel.trim(), createdAt: Date.now() };
+
+        if (contextSourceId !== undefined) refined.contextSourceId = contextSourceId;
+
+        await store.saveRefinedTranscript(session.id, refined);
         await refresh();
       } catch (caught) {
         // A refine failure after a fresh join must not read as though the

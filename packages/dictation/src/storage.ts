@@ -27,6 +27,15 @@ export const RefinedTranscriptSchema = Schema.Struct({
   /** The chat model that produced this refinement, shown with the text. */
   model: Schema.NonEmptyString,
   createdAt: NonNegativeFinite,
+  /**
+   * Captured base identity (B11): the id of the thread member whose refined
+   * text was the context this refinement built on. Absent for standalone
+   * refinements and thread heads — anything refined without prior context —
+   * so the base each saved edit used stays recorded and explainable instead
+   * of being recomputed from whatever order the listing happens to read in.
+   * Additive and optional like the fields around it: no schema version bump.
+   */
+  contextSourceId: Schema.optional(Schema.NonEmptyString),
 });
 
 export type RefinedTranscript = (typeof RefinedTranscriptSchema)["Type"];
@@ -63,6 +72,18 @@ export const DictationSessionSchema = Schema.Struct({
    * which transcript is primary, and a take keeps its own raw transcript.
    */
   threadId: Schema.optional(Schema.NonEmptyString),
+  /**
+   * When this take was appended to its thread, in epoch ms (B11): the
+   * explicit append sequence. createdAt stays the recording's own capture
+   * time — accurate and untouched — while this stamp is the order turns
+   * joined the conversation, so an older recording that joins later reads as
+   * the thread's latest turn instead of rewinding the reading order before
+   * the head. Additive and optional like `threadId`, so records persisted
+   * before the sequence existed decode unchanged — they simply sort as the
+   * oldest appends — and no session schema or database version bump is
+   * needed.
+   */
+  threadJoinedAt: Schema.optional(NonNegativeFinite),
 });
 
 export type DictationSession = (typeof DictationSessionSchema)["Type"];
@@ -137,10 +158,15 @@ export interface DictationSessionStore {
    * bumps `updatedAt`, and touches nothing else — the raw transcript, its
    * history, any refined copy, and the status all stay exactly as they were.
    * Membership is a label for chaining refinement context, never a mutation
-   * of the take's own records. Assignment is permanent for the session's
-   * lifetime: there is deliberately no un-assign, and moving a take between
-   * threads can only arrive as a future explicit feature — a re-assignment
-   * to a different id supersedes the label, but nothing ever clears it.
+   * of the take's own records, and the assignment also stamps
+   * `threadJoinedAt` (B11): the append sequence that orders the thread's
+   * turns, so an older recording joining an existing thread appends as the
+   * latest turn instead of rewinding the reading order before the head.
+   * Assignment is permanent for the session's lifetime: there is
+   * deliberately no un-assign, and moving a take between threads can only
+   * arrive as a future explicit feature — a re-assignment to a different id
+   * supersedes the label and re-stamps the append, but nothing ever clears
+   * it.
    */
   assignThread(id: string, threadId: string): Promise<DictationSession>;
   /**
@@ -186,6 +212,7 @@ export interface DictationSessionManifest {
   readonly streamError?: string;
   readonly refined?: RefinedTranscript;
   readonly threadId?: string;
+  readonly threadJoinedAt?: number;
 }
 
 export interface DictationSessionExport {
@@ -209,6 +236,7 @@ interface ManifestDraft {
   streamError?: string;
   refined?: RefinedTranscript;
   threadId?: string;
+  threadJoinedAt?: number;
 }
 
 export class DictationStorageError extends Data.TaggedError("DictationStorageError")<{
@@ -323,10 +351,26 @@ interface SessionDraft {
   streamError?: string | undefined;
   refined?: RefinedTranscript | undefined;
   threadId?: string | undefined;
+  threadJoinedAt?: number | undefined;
+}
+
+interface RefinedDraft {
+  text: string;
+  model: string;
+  createdAt: number;
+  contextSourceId?: string;
 }
 
 function freezeRefined(value: RefinedTranscript): RefinedTranscript {
-  return Object.freeze({ text: value.text, model: value.model, createdAt: value.createdAt });
+  const refined: RefinedDraft = {
+    text: value.text,
+    model: value.model,
+    createdAt: value.createdAt,
+  };
+
+  if (value.contextSourceId !== undefined) refined.contextSourceId = value.contextSourceId;
+
+  return Object.freeze(refined);
 }
 
 function freezeSession(value: DictationSession): DictationSession {
@@ -353,6 +397,8 @@ function freezeSession(value: DictationSession): DictationSession {
   if (value.refined !== undefined) session.refined = freezeRefined(value.refined);
 
   if (value.threadId !== undefined) session.threadId = value.threadId;
+
+  if (value.threadJoinedAt !== undefined) session.threadJoinedAt = value.threadJoinedAt;
 
   return Object.freeze(session);
 }
@@ -386,7 +432,27 @@ type SessionUpdate = Partial<{
   streamError: string;
   refined: RefinedTranscript;
   threadId: string;
+  threadJoinedAt: number;
 }>;
+
+/**
+ * The fields one explicit thread assignment writes: the label plus the append
+ * sequence stamp (B11). Appending to a thread stamps now — even when the
+ * recording itself is older than the thread's head — so the reading order
+ * follows the conversation, not the recording clock. Re-assigning to the
+ * thread the take already belongs to keeps its original stamp: an idempotent
+ * repeat must not silently move the take to the end of the thread, while a
+ * move to a different thread is a fresh append there and stamps again.
+ */
+function threadAssignment(current: DictationSession, threadId: string): SessionUpdate {
+  return {
+    threadId,
+    threadJoinedAt:
+      current.threadId === threadId && current.threadJoinedAt !== undefined
+        ? current.threadJoinedAt
+        : Date.now(),
+  };
+}
 
 function updatedSession(current: DictationSession, update: SessionUpdate): DictationSession {
   return freezeSession({
@@ -425,6 +491,8 @@ export function exportDictationSession(session: DictationSession): DictationSess
   if (session.refined !== undefined) manifest.refined = freezeRefined(session.refined);
 
   if (session.threadId !== undefined) manifest.threadId = session.threadId;
+
+  if (session.threadJoinedAt !== undefined) manifest.threadJoinedAt = session.threadJoinedAt;
 
   return Object.freeze({ manifest: Object.freeze(manifest), wav: session.wav });
 }
@@ -696,7 +764,9 @@ export class MemorySessionStore implements DictationSessionStore, DictationStrea
   async assignThread(id: string, threadId: string): Promise<DictationSession> {
     assertThreadId(threadId);
 
-    return this.update(id, (current) => updatedSession(current, { threadId }));
+    return this.update(id, (current) =>
+      updatedSession(current, threadAssignment(current, threadId)),
+    );
   }
 
   async transcriptionInFlight(id: string): Promise<boolean> {
@@ -1503,11 +1573,13 @@ export class IndexedDbSessionStore implements DictationSessionStore, DictationSt
   async assignThread(id: string, threadId: string): Promise<DictationSession> {
     assertThreadId(threadId);
 
-    return this.update(id, (current) => updatedSession(current, { threadId }));
+    return this.update(id, (current) =>
+      updatedSession(current, threadAssignment(current, threadId)),
+    );
   }
 
   /**
-   * True while ANY live owner (this window or another) holds an attempt
+   * True when ANY live owner (this window or another) holds an attempt
    * signal for the session. A contended second attempt carries its own
    * signal, so it stays visible even after the first settler's release —
    * the sweep must not mistake a live contender for a dead owner (#162).
