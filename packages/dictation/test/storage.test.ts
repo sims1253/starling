@@ -1784,3 +1784,120 @@ describe("cross-window capture ownership", () => {
     second.close();
   });
 });
+
+describe("retranscription attempts (B04)", () => {
+  it("keeps the previous usable transcript when a retranscription attempt fails", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "keep", wav });
+    await memory.markAttempt("keep");
+    await memory.saveTranscript(
+      "keep",
+      { text: "good words", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    await memory.markAttempt("keep");
+    const failed = await memory.saveFailure("keep", new Error("server offline"));
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.lastError, "server offline");
+    assert.equal(failed.transcript?.text, "good words");
+    assert.equal(failed.transcript?.model, "parakeet");
+    assert.deepEqual(failed.transcriptHistory, []);
+    assert.equal((await memory.get("keep"))?.transcript?.text, "good words");
+  });
+
+  it("preserves a successful transcript as a separate history attempt with its provenance", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "again", wav });
+    await memory.markAttempt("again");
+    const first = await memory.saveTranscript(
+      "again",
+      { text: "good words", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    await memory.markAttempt("again");
+    const second = await memory.saveTranscript(
+      "again",
+      { text: "better words", segments: [] },
+      { model: "other-model", protocol: "openai" },
+    );
+
+    assert.equal(second.status, "transcribed");
+    assert.equal(second.attemptCount, 2);
+    assert.equal(second.transcript?.text, "better words");
+    assert.equal(second.transcript?.model, "other-model");
+    assert.equal(second.transcript?.protocol, "openai");
+
+    assert.equal(second.transcriptHistory?.length, 1);
+    assert.equal(second.transcriptHistory?.[0]?.text, "good words");
+    assert.equal(second.transcriptHistory?.[0]?.model, "parakeet");
+    assert.equal(second.transcriptHistory?.[0]?.protocol, "starling");
+    assert.equal(second.transcriptHistory?.[0]?.savedAt, first.transcript?.savedAt);
+
+    const manifest = exportDictationSession(second).manifest;
+
+    assert.equal(manifest.transcriptHistory?.[0]?.model, "parakeet");
+    assert.equal(manifest.transcript?.model, "other-model");
+  });
+
+  it("stores an empty result as transcribed and stays retriable without reimport", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "empty", wav });
+    await memory.markAttempt("empty");
+    const empty = await memory.saveTranscript("empty", { text: "", segments: [] });
+
+    assert.equal(empty.status, "transcribed");
+    assert.equal(empty.transcript?.text, "");
+    assert.ok(empty.transcript?.savedAt !== undefined);
+
+    const remarked = await memory.markAttempt("empty");
+
+    assert.equal(remarked.status, "transcribing");
+    assert.equal(remarked.transcript?.text, "");
+    assert.equal(remarked.attemptCount, 2);
+  });
+
+  it("rejects empty provenance values instead of storing unusable labels", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "labeled", wav });
+
+    await assert.rejects(
+      memory.saveTranscript("labeled", { text: "x", segments: [] }, { model: "" }),
+      TypeError,
+    );
+    await assert.rejects(
+      memory.saveTranscript("labeled", { text: "x", segments: [] }, { protocol: "" }),
+      TypeError,
+    );
+  });
+
+  it("keeps attempt provenance across an IndexedDB round trip", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "provenance-roundtrip", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "durable", wav });
+    await store.markAttempt("durable");
+    await store.saveTranscript(
+      "durable",
+      { text: "kept", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    store.close();
+
+    const reopened = new IndexedDbSessionStore(options);
+    const restored = await reopened.get("durable");
+
+    assert.equal(restored?.transcript?.model, "parakeet");
+    assert.equal(restored?.transcript?.protocol, "starling");
+    assert.ok(restored?.transcript?.savedAt !== undefined);
+    reopened.close();
+  });
+});

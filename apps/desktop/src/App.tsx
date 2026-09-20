@@ -11,7 +11,6 @@ import {
   type DictationSession,
   type InvalidStoredSession,
   type RefinedDraft,
-  type RefinedTranscript,
   type TranscriptionProtocol,
   type TranscriptionResult,
 } from "@starling/dictation";
@@ -39,6 +38,14 @@ import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings }
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
+import {
+  attemptProvenanceLabel,
+  canTranscribeAgain,
+  refinedTranscriptStamp,
+  sessionTitle,
+  transcriptExportText,
+  transcribeAgainLabel,
+} from "./transcriptAttempts";
 import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./threads";
 import type { PendingAudioState } from "../electron/ipc.js";
 
@@ -84,15 +91,8 @@ function formatWhen(iso: string) {
     : date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function takeTitle(session: DictationSession) {
-  return (
-    session.transcript?.text ||
-    (session.status === "failed" ? "Saved. Retry available" : "Transcribing…")
-  );
-}
-
 function historyRowLabel(session: DictationSession) {
-  const title = takeTitle(session);
+  const title = sessionTitle(session);
   const codePoints = Array.from(title);
   const brief = codePoints.length > 60 ? `${codePoints.slice(0, 60).join("")}…` : title;
 
@@ -103,16 +103,6 @@ function historyRowLabel(session: DictationSession) {
 
 function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
-}
-
-/** The "model, when" attribution stamped on every refined copy. */
-function refinedTranscriptStamp(refined: RefinedTranscript, when: string) {
-  return `${refined.model}, ${when}`;
-}
-
-/** The separator line that appends a refined copy to a text export. */
-function refinedTranscriptSeparator(refined: RefinedTranscript, iso: string) {
-  return `--- REFINED TRANSCRIPT — ${refinedTranscriptStamp(refined, iso)} ---`;
 }
 
 /**
@@ -628,7 +618,14 @@ export default function App() {
 
         const result = await Effect.runPromise(request);
 
-        await store.saveTranscript(session.id, result);
+        // The settling save records this attempt's provenance (B04): the
+        // model and protocol are stamped beside the transcript, so when a
+        // later "Transcribe again" supersedes it, the history entry that
+        // keeps it stays explainable.
+        await store.saveTranscript(session.id, result, {
+          model: model.trim() || undefined,
+          protocol,
+        });
         setConnection("ready");
       } catch (caught) {
         let failure = messageFrom(caught);
@@ -1297,13 +1294,11 @@ export default function App() {
   function exportTranscript() {
     if (!selected?.transcript) return;
 
-    // The raw transcript stays first and intact; a refined copy, when one
-    // exists, is appended under a clear separator instead of replacing it.
-    const refined = selected.refined;
-
-    const text = refined
-      ? `${selected.transcript.text}\n\n${refinedTranscriptSeparator(refined, new Date(refined.createdAt).toISOString())}\n\n${refined.text}\n`
-      : selected.transcript.text;
+    // The raw transcript stays first and intact; earlier recognition
+    // attempts and any refined copy are appended under their own separators
+    // instead of replacing it, so every transcript version leaves with the
+    // same session (B04).
+    const text = transcriptExportText(selected);
 
     const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
 
@@ -1704,7 +1699,7 @@ export default function App() {
                   {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
                 </span>
                 <span className="take-copy">
-                  <strong>{takeTitle(session)}</strong>
+                  <strong>{sessionTitle(session)}</strong>
                   <small>
                     {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
                     {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
@@ -1729,9 +1724,9 @@ export default function App() {
               <span>No cleanup or silent rewriting</span>
             </div>
             <div className="transcript-actions">
-              {selected.status !== "transcribed" && !activeIds.has(selected.id) && (
+              {canTranscribeAgain(selected.status, activeIds.has(selected.id)) && (
                 <button onClick={() => void transcribe(selected)}>
-                  <RefreshCw size={16} /> Retry
+                  <RefreshCw size={16} /> {transcribeAgainLabel(selected.status)}
                 </button>
               )}
               <button onClick={exportAudio}>
@@ -1773,6 +1768,23 @@ export default function App() {
             )}
             {selected.transcript && (
               <p>{selected.transcript.text || <em>The model returned an empty transcript.</em>}</p>
+            )}
+            {(selected.transcriptHistory?.length ?? 0) > 0 && (
+              <section className="attempt-history" aria-label="Earlier transcription attempts">
+                <p className="attempt-history-head">
+                  {selected.transcriptHistory?.length === 1
+                    ? "1 earlier attempt — kept when a new one succeeds"
+                    : `${selected.transcriptHistory?.length} earlier attempts — kept when a new one succeeds`}
+                </p>
+                <ul>
+                  {(selected.transcriptHistory ?? []).map((attempt, index) => (
+                    <li key={index}>
+                      <small>{attemptProvenanceLabel(attempt, formatWhen)}</small>
+                      <span>{attempt.text || <em>empty transcript</em>}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
             )}
           </div>
           {selected.transcript && (

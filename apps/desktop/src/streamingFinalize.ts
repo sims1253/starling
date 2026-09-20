@@ -20,7 +20,7 @@ export interface StreamingFinalizeStore {
   saveTranscript(
     id: string,
     transcript: TranscriptionResult,
-    options?: { streamed?: boolean },
+    options?: { streamed?: boolean; protocol?: string },
   ): Promise<DictationSession>;
   noteStreamError(id: string, message: string): Promise<DictationSession>;
   delete(id: string): Promise<void>;
@@ -146,7 +146,13 @@ export async function finishStreamingTake(
   }
 
   if (result.streamed && result.transcript) {
-    await store.saveTranscript(result.session.id, result.transcript, { streamed: true });
+    // The streamed attempt ran on the Starling native protocol by
+    // construction — streaming is Starling-only — so its transcript is
+    // settled with that provenance (B04).
+    await store.saveTranscript(result.session.id, result.transcript, {
+      streamed: true,
+      protocol: "starling",
+    });
 
     // A Discard that landed during the save settles the session without
     // the take: undo this finalize's completed write instead of surfacing

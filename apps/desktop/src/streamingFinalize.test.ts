@@ -151,7 +151,7 @@ class SilentCapture {
 }
 
 class FakeStore {
-  saved: Array<{ id: string; streamed?: boolean }> = [];
+  saved: Array<{ id: string; streamed?: boolean; protocol?: string }> = [];
   noted: Array<{ id: string; message: string }> = [];
   deleted: string[] = [];
   selected: string[] = [];
@@ -161,9 +161,9 @@ class FakeStore {
   async saveTranscript(
     id: string,
     value: TranscriptionResult,
-    options?: { streamed?: boolean },
+    options?: { streamed?: boolean; protocol?: string },
   ): Promise<DictationSession> {
-    this.saved.push({ id, streamed: options?.streamed });
+    this.saved.push({ id, streamed: options?.streamed, protocol: options?.protocol });
 
     const current = this.sessions.get(id) ?? session(id);
 
@@ -273,7 +273,7 @@ describe("finishStreamingTake", () => {
     expect(result.streamed).toBe(true);
     expect(result.session?.id).toBe("take-one");
     expect(result.batchFallback).toBe(false);
-    expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
+    expect(store.saved).toEqual([{ id: "take-one", streamed: true, protocol: "starling" }]);
     expect(store.deleted).toEqual([]);
   });
 
@@ -300,7 +300,7 @@ describe("finishStreamingTake", () => {
     );
 
     expect(result.discarded).toBe(true);
-    expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
+    expect(store.saved).toEqual([{ id: "take-one", streamed: true, protocol: "starling" }]);
     expect(store.deleted).toEqual(["take-one"]);
     expect(store.selected).toEqual([]);
   });
