@@ -671,11 +671,37 @@ impl StarlingApp {
     }
 
     pub fn retry_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(session) = self.selected() {
-            let id = session.id.clone();
-            let wav = session.wav.clone();
-            self.transcribe(id, wav, cx);
-        }
+        let Some(session) = self.selected() else {
+            return;
+        };
+        let id = session.id.clone();
+        // G02: history holds metadata only — fetch this one recording's
+        // audio on demand (a damaged record surfaces its reason here).
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let loaded = {
+                let store = store.clone();
+                let id = id.clone();
+                cx.background_spawn(async move { store.get(&id) }).await
+            };
+            this.update(cx, |app, cx| match loaded {
+                Ok(Some(session)) => {
+                    app.transcribe(session.id.clone(), session.wav.clone(), cx);
+                }
+                Ok(None) => {
+                    app.error = Some(format!("Recording {id} was not found."));
+                    cx.notify();
+                }
+                Err(err) => {
+                    app.error = Some(err.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -685,7 +711,9 @@ pub(crate) async fn refresh_sessions(
     cx: &mut AsyncApp,
 ) {
     let store = store.clone();
-    let result = cx.background_spawn(async move { store.list() }).await;
+    // G02: metadata-only listing — good and orphan-recovered records arrive
+    // as summaries, damaged ones flagged with their reason.
+    let result = cx.background_spawn(async move { store.list_records() }).await;
     match result {
         Ok(list) => {
             this.update(cx, |app, cx| {

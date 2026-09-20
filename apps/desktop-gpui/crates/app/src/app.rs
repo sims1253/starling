@@ -20,7 +20,7 @@ use starling_dictation::{
     player::Player,
     recorder::RecorderHandle,
     settings::{self, Settings},
-    storage::{DictationSession, FileSessionStore, SessionStatus},
+    storage::{DamagedRecord, FileSessionStore, ListedRecord, SessionStatus, SessionSummary},
 };
 
 use crate::{input::TextField, theme, upload::refresh_sessions, views};
@@ -62,7 +62,12 @@ pub struct StarlingApp {
     pub connection: Connection,
     pub server_model: String,
 
-    pub sessions: Vec<DictationSession>,
+    /// History as metadata-only summaries (G02): the listing never loads
+    /// audio; play/export/retry fetch one recording's WAV on demand.
+    pub sessions: Vec<SessionSummary>,
+    /// Records the store flagged as damaged (G02), shown in history with
+    /// their reason and never deleted.
+    pub damaged: Vec<DamagedRecord>,
     pub selected_id: Option<String>,
     pub active_ids: HashSet<String>,
     pub error: Option<String>,
@@ -154,6 +159,35 @@ fn rss_bytes() -> u64 {
             })
         })
         .unwrap_or(0)
+}
+
+/// Split a metadata-only listing (G02): readable summaries in listing
+/// order, damaged records flagged alongside them.
+pub(crate) fn split_listing(
+    list: Vec<ListedRecord>,
+) -> (Vec<SessionSummary>, Vec<DamagedRecord>) {
+    let mut sessions = Vec::new();
+    let mut damaged = Vec::new();
+    for record in list {
+        match record {
+            ListedRecord::Session(summary) => sessions.push(summary),
+            ListedRecord::Damaged(record) => damaged.push(record),
+        }
+    }
+    (sessions, damaged)
+}
+
+/// The selection after applying a listing (G02): kept while the selected
+/// record is still readable, otherwise reset to the newest readable take —
+/// never left pointing at a record the store just flagged as damaged.
+pub(crate) fn next_selection(
+    current: Option<&str>,
+    sessions: &[SessionSummary],
+) -> Option<String> {
+    if current.is_some_and(|id| sessions.iter().any(|session| session.id == id)) {
+        return current.map(str::to_string);
+    }
+    sessions.first().map(|session| session.id.clone())
 }
 
 /// The persisted `user_set_model` flag after an explicit settings save (R02).
@@ -296,6 +330,7 @@ impl StarlingApp {
             connection: Connection::Checking,
             server_model: "server".to_string(),
             sessions: Vec::new(),
+            damaged: Vec::new(),
             selected_id: None,
             active_ids: HashSet::new(),
             unsaved: Vec::new(),
@@ -317,14 +352,20 @@ impl StarlingApp {
             let fix_store = store.clone();
             cx.spawn(async move |this, cx| {
                 let listed = cx
-                    .background_spawn(async move { list_store.list() })
+                    .background_spawn(async move { list_store.list_records() })
                     .await;
                 match listed {
-                    Ok(sessions) => {
-                        let interrupted: Vec<String> = sessions
+                    Ok(records) => {
+                        let interrupted: Vec<String> = records
                             .iter()
-                            .filter(|session| session.status == SessionStatus::Transcribing)
-                            .map(|session| session.id.clone())
+                            .filter_map(|record| match record {
+                                ListedRecord::Session(summary)
+                                    if summary.status == SessionStatus::Transcribing =>
+                                {
+                                    Some(summary.id.clone())
+                                }
+                                _ => None,
+                            })
                             .collect();
                         if !interrupted.is_empty() {
                             let fix = cx.background_spawn(async move {
@@ -395,7 +436,7 @@ impl StarlingApp {
         !self.active_ids.is_empty()
     }
 
-    pub fn selected(&self) -> Option<&DictationSession> {
+    pub fn selected(&self) -> Option<&SessionSummary> {
         self.selected_id
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
@@ -405,15 +446,30 @@ impl StarlingApp {
         self.active_ids.contains(id)
     }
 
-    pub fn apply_sessions(&mut self, list: Vec<DictationSession>) {
-        let keep = self
-            .selected_id
-            .as_ref()
-            .is_some_and(|current| list.iter().any(|session| &session.id == current));
-        if !keep {
-            self.selected_id = list.first().map(|session| session.id.clone());
+    /// Split a metadata-only listing (G02) into readable summaries and
+    /// damaged records. Selection survives when the selected record is
+    /// still readable; a selection that became damaged (or vanished) falls
+    /// back to the newest readable take rather than leaving the drawer
+    /// pointed at a record that can no longer be read.
+    pub fn apply_sessions(&mut self, list: Vec<ListedRecord>) {
+        let (sessions, damaged) = split_listing(list);
+        self.selected_id = next_selection(self.selected_id.as_deref(), &sessions);
+        self.sessions = sessions;
+        self.damaged = damaged;
+    }
+
+    /// G02: interacting with a damaged history row surfaces the recorded
+    /// reason — the quarantine is visible and explained, never a silent
+    /// gap, and nothing behind it was deleted.
+    pub fn surface_damage(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(damaged) = self.damaged.iter().find(|record| record.id == id) {
+            self.error = Some(format!(
+                "This recording could not be read and was kept as-is: {}. Nothing was deleted; \
+                 the files are untouched for manual recovery.",
+                damaged.reason
+            ));
+            cx.notify();
         }
-        self.sessions = list;
     }
 
     pub fn check_health(&mut self, endpoint: String, cx: &mut Context<Self>) {
@@ -622,8 +678,35 @@ impl StarlingApp {
             "starling-{}.wav",
             session.created_at.replace([':', '.'], "-")
         );
-        let wav = session.wav.clone();
-        self.write_download(name, wav, true, true, cx);
+        let id = session.id.clone();
+        // G02: history holds metadata only — fetch this one recording's
+        // audio on demand (a damaged record surfaces its reason here).
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let loaded = {
+                let store = store.clone();
+                let id = id.clone();
+                cx.background_spawn(async move { store.get(&id) }).await
+            };
+            this.update(cx, |app, cx| match loaded {
+                Ok(Some(session)) => {
+                    let wav = session.wav.clone();
+                    app.write_download(name, wav, true, true, cx);
+                }
+                Ok(None) => {
+                    app.error = Some(format!("Recording {id} was not found."));
+                    cx.notify();
+                }
+                Err(err) => {
+                    app.error = Some(err.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn export_unsaved_audio(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -740,30 +823,70 @@ impl StarlingApp {
         let Some(player) = self.player.as_ref() else {
             return;
         };
-        let Some(session) = self.sessions.iter().find(|session| session.id == id) else {
+        let known = self.sessions.iter().any(|session| session.id == id);
+        if !known {
             return;
-        };
+        }
         if self.playing_id.as_deref() == Some(id) {
             player.stop();
             self.playing_id = None;
             self.retire_playback_generation();
-        } else {
-            player.stop();
-            match player.play(session.wav.as_slice()) {
-                Ok(()) => {
-                    self.playing_id = Some(id.to_string());
-                    // New playback, new generation: any watcher still polling
-                    // for the previous playback is stale from here on.
-                    self.retire_playback_generation();
-                    self.watch_playback(cx);
-                }
-                Err(err) => {
-                    self.playing_id = None;
-                    self.error = Some(err.to_string());
-                }
-            }
+            cx.notify();
+            return;
         }
+
+        // Stop whatever is playing now; the new clip starts once its audio
+        // has been fetched (G02: history holds metadata only, so playback
+        // loads one recording's WAV on demand — a damaged record surfaces
+        // its reason through the same path).
+        player.stop();
+        self.playing_id = None;
+        self.retire_playback_generation();
         cx.notify();
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let loaded = {
+                let store = store.clone();
+                let id = id.clone();
+                cx.background_spawn(async move { store.get(&id) }).await
+            };
+            this.update(cx, |app, cx| {
+                match loaded {
+                    Ok(Some(session)) => {
+                        let Some(player) = app.player.as_ref() else {
+                            return;
+                        };
+                        match player.play(session.wav.as_slice()) {
+                            Ok(()) => {
+                                app.playing_id = Some(session.id.clone());
+                                // New playback, new generation: any watcher
+                                // still polling for the previous playback is
+                                // stale from here on.
+                                app.retire_playback_generation();
+                                app.watch_playback(cx);
+                            }
+                            Err(err) => {
+                                app.playing_id = None;
+                                app.error = Some(err.to_string());
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        app.error = Some(format!("Recording {id} was not found."));
+                    }
+                    Err(err) => {
+                        app.error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn stop_playback(&mut self) {
@@ -1123,5 +1246,72 @@ mod tests {
         assert_eq!(path, dir.join("starling-t-2.txt"));
         assert_eq!(std::fs::read(&path).expect("export content"), b"EXPORT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            created_at: "2026-09-20T00:00:00.000Z".to_string(),
+            updated_at: "2026-09-20T00:00:00.000Z".to_string(),
+            status: SessionStatus::Captured,
+            duration_ms: None,
+            attempt_count: 0,
+            transcript: None,
+            last_error: None,
+            journal_id: None,
+        }
+    }
+
+    fn damaged_record(id: &str, reason: &str) -> DamagedRecord {
+        DamagedRecord {
+            id: id.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_listing_splits_into_summaries_and_damaged_records() {
+        // G02: both kinds arrive in one listing; the app keeps the readable
+        // takes in order and the damaged flags beside them.
+        let (sessions, damaged) = split_listing(vec![
+            ListedRecord::Session(summary("good")),
+            ListedRecord::Damaged(damaged_record("torn", "recording.wav: not found")),
+            ListedRecord::Session(summary("recovered")),
+        ]);
+
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["good", "recovered"]
+        );
+        assert_eq!(damaged.len(), 1);
+        assert_eq!(damaged[0].id, "torn");
+        assert_eq!(damaged[0].reason, "recording.wav: not found");
+    }
+
+    #[test]
+    fn the_selection_survives_while_the_record_stays_readable() {
+        let sessions = vec![summary("newest"), summary("selected")];
+        assert_eq!(
+            next_selection(Some("selected"), &sessions),
+            Some("selected".to_string())
+        );
+    }
+
+    #[test]
+    fn a_selection_that_became_damaged_falls_back_to_the_newest_take() {
+        // G02: the store flagged the selected record between refreshes —
+        // the drawer must not stay pointed at a record it can no longer
+        // read, and must not show nothing either.
+        let sessions = vec![summary("newest"), summary("next")];
+        assert_eq!(
+            next_selection(Some("now-damaged"), &sessions),
+            Some("newest".to_string())
+        );
+    }
+
+    #[test]
+    fn no_sessions_leaves_no_selection() {
+        assert_eq!(next_selection(Some("gone"), &[]), None);
+        assert_eq!(next_selection(None, &[]), None);
     }
 }

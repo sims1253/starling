@@ -1,7 +1,8 @@
-//! The 350px history column: archive head and the session row list.
+//! The 350px history column: archive head, the session row list, and the
+//! damaged-record rows G02 appends after them.
 
 use gpui::{Context, Div, FontWeight, SharedString, Window, div, prelude::*, px};
-use starling_dictation::storage::{DictationSession, SessionStatus};
+use starling_dictation::storage::{DamagedRecord, SessionStatus, SessionSummary};
 
 use crate::app::StarlingApp;
 use crate::theme;
@@ -18,6 +19,13 @@ pub fn render_history(
         .map(|session| row_data(app, session))
         .collect();
     let rows: Vec<_> = rows.iter().map(|data| render_row(data, cx)).collect();
+    // G02: quarantined records stay visible with their reason, sorted after
+    // every readable take.
+    let damaged_rows: Vec<_> = app
+        .damaged
+        .iter()
+        .map(|damaged| render_damaged_row(damaged, cx))
+        .collect();
 
     div()
         .id("history-pane")
@@ -84,7 +92,8 @@ pub fn render_history(
                             .child("Your recordings will collect here, ready to retry or export."),
                     )
                 })
-                .children(rows),
+                .children(rows)
+                .children(damaged_rows),
         )
 }
 
@@ -96,7 +105,7 @@ struct RowData {
     status: SessionStatus,
 }
 
-fn row_data(app: &StarlingApp, session: &DictationSession) -> RowData {
+fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
     let title = session
         .transcript
         .as_ref()
@@ -229,4 +238,67 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
             16.,
             if active { theme::LIME } else { theme::DIM },
         ))
+}
+
+/// A quarantined record (G02): visible, explained, never deletable by the
+/// app itself. Clicking surfaces the recorded reason; the underlying files
+/// stay untouched for manual recovery.
+fn render_damaged_row(
+    damaged: &DamagedRecord,
+    cx: &mut Context<StarlingApp>,
+) -> gpui::Stateful<Div> {
+    let id = damaged.id.clone();
+
+    div()
+        .id(SharedString::from(format!("history-row-{}", damaged.id)))
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.))
+        .w_full()
+        .min_h(px(78.))
+        .px(px(18.))
+        .py(px(15.))
+        .border_b_1()
+        .border_color(theme::LINE)
+        .opacity(0.8)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::HOVER_BG))
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.surface_damage(&id, cx);
+        }))
+        .child(
+            div()
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .child(icon("icons/alert-circle.svg", 12., theme::CORAL)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::DIM)
+                        .truncate()
+                        .child("Damaged recording — kept as-is"),
+                )
+                .child(
+                    div()
+                        .font(theme::mono_font())
+                        .text_size(px(9.))
+                        .text_color(theme::DIM)
+                        .truncate()
+                        .child(damaged.reason.clone()),
+                ),
+        )
 }

@@ -82,6 +82,81 @@ pub enum StorageError {
     Invalid(String),
 }
 
+/// Metadata-only view of one session (G02): everything the history list and
+/// drawer need — never the WAV bytes. Audio loads lazily per record on
+/// demand (open/play/transcribe), so a listing never pulls the full history
+/// into memory.
+#[derive(Clone, Debug)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: SessionStatus,
+    pub duration_ms: Option<f64>,
+    pub attempt_count: u32,
+    pub transcript: Option<TranscriptionResult>,
+    pub last_error: Option<String>,
+    pub journal_id: Option<String>,
+}
+
+impl From<&DictationSession> for SessionSummary {
+    fn from(session: &DictationSession) -> Self {
+        Self {
+            id: session.id.clone(),
+            created_at: session.created_at.clone(),
+            updated_at: session.updated_at.clone(),
+            status: session.status,
+            duration_ms: session.duration_ms,
+            attempt_count: session.attempt_count,
+            transcript: session.transcript.clone(),
+            last_error: session.last_error.clone(),
+            journal_id: session.journal_id.clone(),
+        }
+    }
+}
+
+/// One record as [`FileSessionStore::list_records`] reports it (G02): a
+/// readable session — good, or recovered from a WAV-only orphan directory —
+/// or a damaged record quarantined in place with the reason it failed.
+///
+/// Damaged records are flagged, never deleted: the audio and manifest stay
+/// exactly where they are until the user decides (the data may still be
+/// recoverable by hand), and every read of that record (`get`, `update`,
+/// play, transcribe) surfaces `reason` instead of a generic error.
+#[derive(Clone, Debug)]
+pub struct DamagedRecord {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum ListedRecord {
+    Session(SessionSummary),
+    Damaged(DamagedRecord),
+}
+
+impl ListedRecord {
+    /// Sort key shared with the listing order: `updated_at` for sessions,
+    /// empty for damaged records, so quarantined entries sort after every
+    /// readable session instead of at a made-up timestamp.
+    fn sort_key(&self) -> &str {
+        match self {
+            ListedRecord::Session(summary) => &summary.updated_at,
+            ListedRecord::Damaged(_) => "",
+        }
+    }
+}
+
+/// One page of a metadata-only listing (G02): the records in
+/// `[offset, offset + limit)` of the full ordering plus the un-paged
+/// `total`, so callers can page without re-deriving counts.
+#[derive(Clone, Debug)]
+pub struct SessionPage {
+    pub records: Vec<ListedRecord>,
+    pub total: usize,
+    pub offset: usize,
+}
+
 /// On-disk mirror of `DictationSessionManifest` from storage.ts (camelCase
 /// JSON): `{ schemaVersion, id, createdAt, updatedAt, status, audioFile,
 /// durationMs?, attemptCount, transcript?, transcriptHistory, lastError? }`.
@@ -213,8 +288,16 @@ impl FileSessionStore {
         self.read_session(id)
     }
 
-    pub fn list(&self) -> Result<Vec<DictationSession>, StorageError> {
-        let mut sessions = Vec::new();
+    /// Metadata-only listing (G02): reads manifests and WAV headers, never
+    /// loads audio into memory. One damaged record — corrupt manifest,
+    /// missing/invalid audio, unsupported schema version, identity or path
+    /// mismatch — quarantines only itself: it is returned as
+    /// [`ListedRecord::Damaged`] with the reason while every other record
+    /// stays visible. WAV-only directories (crash before the manifest write)
+    /// come back as interrupted-but-usable sessions with the duration
+    /// computed from the verified WAV bytes. Nothing is deleted or moved.
+    pub fn list_records(&self) -> Result<Vec<ListedRecord>, StorageError> {
+        let mut records = Vec::new();
 
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -226,14 +309,51 @@ impl FileSessionStore {
 
             let id = entry.file_name().to_string_lossy().into_owned();
 
-            if let Some(session) = self.read_session(&id)? {
-                sessions.push(session);
-            }
+            let record = match self.classify_record(&id) {
+                RecordState::Manifest(manifest) => {
+                    ListedRecord::Session(SessionSummary::from_manifest(manifest))
+                }
+                RecordState::Orphan(orphan) => {
+                    ListedRecord::Session(orphan.into_summary(&id))
+                }
+                RecordState::Damaged(reason) => {
+                    ListedRecord::Damaged(DamagedRecord { id, reason })
+                }
+                // Vanished between `read_dir` and the classification read:
+                // nothing to report.
+                RecordState::Missing => continue,
+            };
+            records.push(record);
         }
 
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        // Newest first; damaged records (empty key) after every readable
+        // session, ties broken by id so pages are deterministic.
+        records.sort_by(|left, right| {
+            right
+                .sort_key()
+                .cmp(left.sort_key())
+                .then_with(|| record_id(left).cmp(&record_id(right)))
+        });
 
-        Ok(sessions)
+        Ok(records)
+    }
+
+    /// [`Self::list_records`] paged: records `[offset, offset + limit)` of
+    /// the full ordering plus the un-paged `total`.
+    pub fn list_page(&self, offset: usize, limit: usize) -> Result<SessionPage, StorageError> {
+        let records = self.list_records()?;
+        let total = records.len();
+        let records = records
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        Ok(SessionPage {
+            records,
+            total,
+            offset,
+        })
     }
 
     pub fn mark_attempt(&self, id: &str) -> Result<DictationSession, StorageError> {
@@ -299,7 +419,7 @@ impl FileSessionStore {
     /// journal recovery runs at startup must not eagerly read every WAV
     /// (the G02 direction). A directory whose manifest cannot be parsed is
     /// skipped, not fatal: it cannot be linked, and quarantining damaged
-    /// records is I2's job.
+    /// records is I2's job; G02's `list_records` flags them in the listing.
     pub fn journal_ids(&self) -> Result<HashSet<String>, StorageError> {
         let mut linked = HashSet::new();
 
@@ -330,7 +450,8 @@ impl FileSessionStore {
     /// (already deleted) or an unparseable manifest has no known linkage
     /// (`None`) — deletion then proceeds without a tombstone, matching
     /// [`Self::journal_ids`]' tolerance for damaged records (quarantining
-    /// those is I2's job). A linkage that is not a safe path component is
+    /// those is I2's job; G02's `list_records` flags them). A linkage that
+    /// is not a safe path component is
     /// likewise dropped: it can never equal a scanned journal stem (file
     /// stems contain no separators), so dropping it cannot resurrect
     /// anything, while honoring it would brick the deletion.
@@ -363,28 +484,70 @@ impl FileSessionStore {
         self.root.join(id)
     }
 
+    /// Load one session in full (manifest plus audio bytes) for `get` and
+    /// `update` — the only paths that may read a WAV (G02: audio loads
+    /// lazily per record, never for a listing). A damaged record surfaces
+    /// its exact classification reason; a WAV-only orphan directory is
+    /// synthesized into a usable interrupted session (the first write — a
+    /// retry, a status update — persists a manifest and heals it).
     fn read_session(&self, id: &str) -> Result<Option<DictationSession>, StorageError> {
-        let manifest_path = self.session_dir(id).join(MANIFEST_FILE);
-        let manifest_bytes = match std::fs::read(&manifest_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
+        match self.classify_record(id) {
+            RecordState::Missing => Ok(None),
+            RecordState::Damaged(reason) => Err(StorageError::Invalid(reason)),
+            RecordState::Manifest(manifest) => {
+                let wav = std::fs::read(self.session_dir(id).join(AUDIO_FILE))
+                    .map_err(|error| StorageError::Invalid(format!("{AUDIO_FILE}: {error}")))?;
+                Ok(Some(manifest.into_session(wav)))
+            }
+            RecordState::Orphan(orphan) => {
+                let wav = std::fs::read(self.session_dir(id).join(AUDIO_FILE))?;
+                Ok(Some(orphan.into_session(id, Arc::new(wav))))
+            }
+        }
+    }
 
-        let manifest: SessionManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|error| StorageError::Invalid(format!("{MANIFEST_FILE}: {error}")))?;
-
-        if manifest.schema_version != DICTATION_SESSION_SCHEMA_VERSION {
-            return Err(StorageError::Invalid(format!(
-                "unsupported manifest schemaVersion {} (expected {DICTATION_SESSION_SCHEMA_VERSION})",
-                manifest.schema_version
-            )));
+    /// Classify one session directory without loading its audio (G02):
+    /// usable manifest, recoverable orphan, damaged with a reason, or not
+    /// present. Every manifest read is bounded; the WAV is verified by a
+    /// bounded header scan only.
+    fn classify_record(&self, id: &str) -> RecordState {
+        let dir = self.session_dir(id);
+        if !dir.is_dir() {
+            return RecordState::Missing;
         }
 
-        let wav = std::fs::read(self.session_dir(id).join(AUDIO_FILE))
-            .map_err(|error| StorageError::Invalid(format!("{AUDIO_FILE}: {error}")))?;
+        let manifest_path = dir.join(MANIFEST_FILE);
+        match std::fs::metadata(&manifest_path) {
+            // No manifest: the classic orphan (crash before the manifest
+            // write — `create` publishes audio first). Recoverable when the
+            // WAV verifies.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match scan_orphan(&dir) {
+                Ok(orphan) => RecordState::Orphan(orphan),
+                Err(reason) => {
+                    RecordState::Damaged(format!("no {MANIFEST_FILE}; {reason}"))
+                }
+            },
+            Err(error) => RecordState::Damaged(format!("{MANIFEST_FILE}: {error}")),
+            Ok(_) => {
+                let manifest_bytes = match read_manifest_bounded(&manifest_path) {
+                    Ok(bytes) => bytes,
+                    Err(reason) => return RecordState::Damaged(reason),
+                };
 
-        Ok(Some(manifest.into_session(wav)))
+                match serde_json::from_slice::<SessionManifest>(&manifest_bytes) {
+                    Ok(manifest) => validate_manifest(id, manifest, &dir),
+                    // Unusable manifest with the audio intact is still an
+                    // orphan: recovering the recording matters more than the
+                    // file that failed to describe it.
+                    Err(parse_error) => match scan_orphan(&dir) {
+                        Ok(orphan) => RecordState::Orphan(orphan),
+                        Err(wav_reason) => RecordState::Damaged(format!(
+                            "{MANIFEST_FILE}: {parse_error}; {wav_reason}"
+                        )),
+                    },
+                }
+            }
+        }
     }
 
     fn write_manifest(&self, session: &DictationSession) -> Result<(), StorageError> {
@@ -635,6 +798,272 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// G02: per-record damage classification and orphan recovery.
+// ---------------------------------------------------------------------------
+
+/// Upper bound on a manifest read ("bound file reads"): real manifests are a
+/// few KiB of JSON; anything past this is damaged, not loaded.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Upper bound on the WAV header chunk walk, so a corrupt file with a
+/// zero-size chunk loop cannot spin the scanner.
+const MAX_WAV_SCAN_CHUNKS: usize = 4096;
+
+/// The note an orphan-recovered session carries in `last_error`: it states
+/// exactly what survived and what to do with it, in the voice of the other
+/// `Interrupted` notes (e17 §2.1).
+const ORPHAN_RECOVERY_NOTE: &str = "Recovered from a recording that was left without its \
+     session data — the app most likely stopped before the session was saved. The audio was \
+     kept untouched; you can play it, export it, or retry transcription.";
+
+/// What one session directory's classification found (G02).
+enum RecordState {
+    /// Manifest parsed and validated; the audio file is present with a
+    /// verifiable WAV header.
+    Manifest(SessionManifest),
+    /// No usable manifest, but the WAV verified: a recoverable take with the
+    /// duration computed from the verified bytes and a timestamp taken from
+    /// the audio file.
+    Orphan(OrphanRecord),
+    /// The record is damaged; the reason is surfaced by listings and reads.
+    Damaged(String),
+    /// The directory does not exist (deleted, or never created).
+    Missing,
+}
+
+/// A WAV-only session directory promoted to a recoverable take (G02).
+struct OrphanRecord {
+    /// Duration from the verified WAV bytes (data length / byte rate).
+    duration_ms: Option<f64>,
+    /// RFC3339 millis timestamp from the audio file's mtime — the only clock
+    /// an orphan has.
+    stamp: String,
+}
+
+impl OrphanRecord {
+    fn into_summary(self, id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            created_at: self.stamp.clone(),
+            updated_at: self.stamp,
+            status: SessionStatus::Interrupted,
+            duration_ms: self.duration_ms,
+            attempt_count: 0,
+            transcript: None,
+            last_error: Some(ORPHAN_RECOVERY_NOTE.to_string()),
+            journal_id: None,
+        }
+    }
+
+    fn into_session(self, id: &str, wav: Arc<Vec<u8>>) -> DictationSession {
+        DictationSession {
+            id: id.to_string(),
+            created_at: self.stamp.clone(),
+            updated_at: self.stamp,
+            status: SessionStatus::Interrupted,
+            wav,
+            duration_ms: self.duration_ms,
+            attempt_count: 0,
+            transcript: None,
+            transcript_history: Vec::new(),
+            last_error: Some(ORPHAN_RECOVERY_NOTE.to_string()),
+            journal_id: None,
+        }
+    }
+}
+
+impl SessionSummary {
+    fn from_manifest(manifest: SessionManifest) -> Self {
+        Self {
+            id: manifest.id,
+            created_at: manifest.created_at,
+            updated_at: manifest.updated_at,
+            status: manifest.status,
+            duration_ms: manifest.duration_ms,
+            attempt_count: manifest.attempt_count,
+            transcript: manifest.transcript,
+            last_error: manifest.last_error,
+            journal_id: manifest.journal_id,
+        }
+    }
+}
+
+fn record_id(record: &ListedRecord) -> &str {
+    match record {
+        ListedRecord::Session(summary) => &summary.id,
+        ListedRecord::Damaged(damaged) => &damaged.id,
+    }
+}
+
+/// Validate a parsed manifest against its directory (G02): schema version,
+/// identity (manifest id == directory name) and audio path must agree, and
+/// the audio file must exist with a WAV header. The audio itself is never
+/// loaded here — the bounded header read is the check.
+fn validate_manifest(id: &str, manifest: SessionManifest, dir: &Path) -> RecordState {
+    if manifest.schema_version != DICTATION_SESSION_SCHEMA_VERSION {
+        return RecordState::Damaged(format!(
+            "unsupported manifest schemaVersion {} (expected \
+             {DICTATION_SESSION_SCHEMA_VERSION})",
+            manifest.schema_version
+        ));
+    }
+
+    if manifest.id != id {
+        return RecordState::Damaged(format!(
+            "manifest id {:?} does not match its session directory {:?}",
+            manifest.id, id
+        ));
+    }
+
+    if manifest.audio_file != AUDIO_FILE {
+        return RecordState::Damaged(format!(
+            "manifest audioFile {:?} does not match the stored recording \
+             {AUDIO_FILE:?}",
+            manifest.audio_file
+        ));
+    }
+
+    match verify_wav_header(&dir.join(AUDIO_FILE)) {
+        Ok(()) => RecordState::Manifest(manifest),
+        Err(reason) => RecordState::Damaged(reason),
+    }
+}
+
+/// Read a manifest with a hard byte bound. Returns the parse-ready bytes or
+/// the damaged-record reason (including a NotFound mapped by the caller's
+/// metadata pre-check, so this only sees real read failures).
+fn read_manifest_bounded(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("{MANIFEST_FILE}: {error}"))?;
+    let mut bytes = Vec::new();
+    let mut bounded = file.take(MAX_MANIFEST_BYTES + 1);
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{MANIFEST_FILE}: {error}"))?;
+
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "{MANIFEST_FILE}: larger than {MAX_MANIFEST_BYTES} bytes and not a session \
+             manifest"
+        ));
+    }
+
+    Ok(bytes)
+}
+
+/// Verify a session's audio with one bounded read: the 12-byte
+/// RIFF/WAVE magic. Full validation happens when the audio is actually
+/// loaded (play/transcribe decode it anyway); a listing must never read
+/// the body.
+fn verify_wav_header(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+    let mut magic = [0u8; 12];
+    file.read_exact(&mut magic)
+        .map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+
+    if &magic[0..4] != b"RIFF" || &magic[8..12] != b"WAVE" {
+        return Err(format!("{AUDIO_FILE}: not a RIFF/WAVE recording"));
+    }
+
+    Ok(())
+}
+
+/// Scan a WAV-only directory for a recoverable take (G02): verify the WAV
+/// header structure with bounded reads (never load the samples) and compute
+/// the duration from the data chunk length over the fmt byte rate, clamped
+/// to the bytes actually present — a crash mid-write leaves the data size
+/// field promising more than the file holds, and the honest duration is the
+/// verified one.
+fn scan_orphan(dir: &Path) -> Result<OrphanRecord, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = dir.join(AUDIO_FILE);
+    let mut file =
+        std::fs::File::open(&path).map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("{AUDIO_FILE}: {error}"))?
+        .len();
+
+    let mut magic = [0u8; 12];
+    file.read_exact(&mut magic)
+        .map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+    if &magic[0..4] != b"RIFF" || &magic[8..12] != b"WAVE" {
+        return Err(format!("{AUDIO_FILE}: not a RIFF/WAVE recording"));
+    }
+
+    let mut byte_rate: Option<u32> = None;
+    let mut data_len: Option<u64> = None;
+    let mut offset: u64 = 12;
+
+    for _ in 0..MAX_WAV_SCAN_CHUNKS {
+        if offset + 8 > file_len {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+        let chunk_id = [header[0], header[1], header[2], header[3]];
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        let body = offset + 8;
+        let available = file_len.saturating_sub(body);
+
+        if &chunk_id == b"fmt " {
+            if size < 16 {
+                return Err(format!("{AUDIO_FILE}: fmt chunk is truncated"));
+            }
+            let mut fmt = [0u8; 16];
+            file.read_exact(&mut fmt)
+                .map_err(|error| format!("{AUDIO_FILE}: {error}"))?;
+            let rate = u32::from_le_bytes([fmt[8], fmt[9], fmt[10], fmt[11]]);
+            if rate == 0 {
+                return Err(format!("{AUDIO_FILE}: fmt chunk has a zero byte rate"));
+            }
+            byte_rate = Some(rate);
+        } else if &chunk_id == b"data" {
+            // Clamp to the bytes actually on disk: a torn write promises
+            // more data than the file holds.
+            data_len = Some(size.min(available));
+            if byte_rate.is_some() {
+                break;
+            }
+        }
+
+        offset = body + size + (size % 2);
+        if offset >= file_len {
+            break;
+        }
+    }
+
+    let duration_ms = match (byte_rate, data_len) {
+        (Some(rate), Some(len)) => len as f64 * 1000.0 / f64::from(rate),
+        _ => return Err(format!("{AUDIO_FILE}: missing fmt or data chunk")),
+    };
+
+    let stamp = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| {
+            OffsetDateTime::from(modified)
+                .format(RFC3339_MILLIS)
+                .ok()
+        })
+        .unwrap_or_else(now_iso);
+
+    Ok(OrphanRecord {
+        duration_ms: Some(duration_ms),
+        stamp,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -642,8 +1071,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A minimal valid WAV (canonical header, no samples). Since G02 the
+    /// store verifies the RIFF/WAVE magic even on metadata-only reads, so
+    /// test audio has to be a plausible recording.
     fn sample_wav() -> Vec<u8> {
-        vec![82, 73, 70, 70, 1, 2, 3, 4]
+        wav_bytes(0.0)
     }
 
     fn transcript(text: &str) -> TranscriptionResult {
@@ -655,7 +1087,9 @@ mod tests {
         }
     }
 
-    /// Shared method surface so one suite can cover both stores.
+    /// Shared method surface so one suite can cover both stores. Listing is
+    /// deliberately not part of it: `FileSessionStore` lists metadata-only
+    /// (G02) while the in-memory twin hands out its sessions directly.
     trait TestSessionStore {
         fn create(
             &self,
@@ -663,7 +1097,6 @@ mod tests {
             duration_ms: Option<f64>,
         ) -> Result<DictationSession, StorageError>;
         fn get(&self, id: &str) -> Result<Option<DictationSession>, StorageError>;
-        fn list(&self) -> Result<Vec<DictationSession>, StorageError>;
         fn mark_attempt(&self, id: &str) -> Result<DictationSession, StorageError>;
         fn save_transcript(
             &self,
@@ -685,10 +1118,6 @@ mod tests {
 
         fn get(&self, id: &str) -> Result<Option<DictationSession>, StorageError> {
             FileSessionStore::get(self, id)
-        }
-
-        fn list(&self) -> Result<Vec<DictationSession>, StorageError> {
-            FileSessionStore::list(self)
         }
 
         fn mark_attempt(&self, id: &str) -> Result<DictationSession, StorageError> {
@@ -723,10 +1152,6 @@ mod tests {
 
         fn get(&self, id: &str) -> Result<Option<DictationSession>, StorageError> {
             MemorySessionStore::get(self, id)
-        }
-
-        fn list(&self) -> Result<Vec<DictationSession>, StorageError> {
-            MemorySessionStore::list(self)
         }
 
         fn mark_attempt(&self, id: &str) -> Result<DictationSession, StorageError> {
@@ -824,20 +1249,20 @@ mod tests {
         retains_audio_through_attempts_failures_and_retry(&store, false);
     }
 
-    fn list_orders_by_updated_at_desc(store: &dyn TestSessionStore) {
+    /// `list_ids` re-reads the store's listing (metadata-only for the file
+    /// store, G02) and returns the readable session ids in order.
+    fn list_orders_by_updated_at_desc(
+        store: &dyn TestSessionStore,
+        list_ids: impl Fn() -> Vec<String>,
+    ) {
         let first = store.create(sample_wav(), None).expect("create first");
         std::thread::sleep(Duration::from_millis(15));
         let second = store.create(sample_wav(), None).expect("create second");
         std::thread::sleep(Duration::from_millis(15));
         let third = store.create(sample_wav(), None).expect("create third");
 
-        let listed = store.list().expect("list");
-        let ids = listed
-            .iter()
-            .map(|session| session.id.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            ids,
+            list_ids(),
             [third.id.as_str(), second.id.as_str(), first.id.as_str()]
         );
 
@@ -845,28 +1270,44 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         store.mark_attempt(&first.id).expect("mark_attempt");
 
-        let listed = store.list().expect("list after touch");
-        let ids = listed
-            .iter()
-            .map(|session| session.id.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            ids,
+            list_ids(),
             [first.id.as_str(), third.id.as_str(), second.id.as_str()]
         );
     }
 
     #[test]
     fn memory_store_lists_by_updated_at_desc() {
-        list_orders_by_updated_at_desc(&MemorySessionStore::new());
+        let store = MemorySessionStore::new();
+        let listed = || {
+            store
+                .list()
+                .expect("list")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+        };
+
+        list_orders_by_updated_at_desc(&store, listed);
     }
 
     #[test]
     fn file_store_lists_by_updated_at_desc() {
         let temp = TempDir::new().expect("tempdir");
         let store = FileSessionStore::open(temp.path()).expect("open");
+        let listed = || {
+            store
+                .list_records()
+                .expect("list")
+                .into_iter()
+                .filter_map(|record| match record {
+                    ListedRecord::Session(summary) => Some(summary.id),
+                    ListedRecord::Damaged(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
 
-        list_orders_by_updated_at_desc(&store);
+        list_orders_by_updated_at_desc(&store, listed);
     }
 
     /// storage.test.ts: "retains the original recognition when a later retry
@@ -1057,13 +1498,17 @@ mod tests {
     }
 
     /// storage.test.ts: "rejects corrupted IndexedDB records at the schema
-    /// boundary" — same idea for a corrupted manifest.json.
+    /// boundary" — same idea for a corrupted manifest.json. The audio is
+    /// removed alongside, so the record cannot fall back to orphan recovery
+    /// and must surface as damaged (the intact-audio variants live in the
+    /// G02 mixed-store suite below).
     #[test]
     fn file_store_rejects_corrupted_manifests() {
         let temp = TempDir::new().expect("tempdir");
         let store = FileSessionStore::open(temp.path()).expect("open");
         let session = store.create(sample_wav(), None).expect("create");
-        let manifest_path = temp.path().join(&session.id).join(MANIFEST_FILE);
+        let session_dir = temp.path().join(&session.id);
+        let manifest_path = session_dir.join(MANIFEST_FILE);
 
         // Mirror the TS test: attemptCount holding a string instead of a number.
         let wrong_type = format!(
@@ -1071,13 +1516,23 @@ mod tests {
             id = session.id
         );
         std::fs::write(&manifest_path, wrong_type).expect("write corrupted manifest");
+        std::fs::remove_file(session_dir.join(AUDIO_FILE)).expect("remove wav");
         match store.get(&session.id) {
-            Err(StorageError::Invalid(_)) => {}
+            Err(StorageError::Invalid(reason)) => {
+                assert!(reason.contains("manifest.json"), "{reason}")
+            }
             other => panic!("expected Invalid for wrong-typed attemptCount, got {other:?}"),
         }
-        match store.list() {
-            Err(StorageError::Invalid(_)) => {}
-            other => panic!("expected Invalid listing a corrupted session, got {other:?}"),
+        // G02: one corrupt record no longer fails the listing — it is the
+        // only record, flagged with the reason.
+        let listed = store.list_records().expect("listing survives damage");
+        assert_eq!(listed.len(), 1);
+        match &listed[0] {
+            ListedRecord::Damaged(damaged) => {
+                assert_eq!(damaged.id, session.id);
+                assert!(damaged.reason.contains("manifest.json"), "{}", damaged.reason);
+            }
+            other => panic!("expected a damaged record, got {other:?}"),
         }
 
         // Truncated JSON.
@@ -1085,14 +1540,6 @@ mod tests {
         match store.get(&session.id) {
             Err(StorageError::Invalid(_)) => {}
             other => panic!("expected Invalid for truncated manifest, got {other:?}"),
-        }
-
-        // Unsupported schema version.
-        std::fs::write(&manifest_path, r#"{"schemaVersion":999,"id":"x"}"#)
-            .expect("write future manifest");
-        match store.get(&session.id) {
-            Err(StorageError::Invalid(_)) => {}
-            other => panic!("expected Invalid for future schemaVersion, got {other:?}"),
         }
     }
 
@@ -1273,10 +1720,380 @@ mod tests {
         );
 
         // A directory with a corrupt manifest cannot be linked and must not
-        // abort the scan (quarantine is I2's job).
+        // abort the scan (the record itself is flagged by `list_records`).
         std::fs::create_dir_all(temp.path().join("broken")).expect("broken dir");
         std::fs::write(temp.path().join("broken").join(MANIFEST_FILE), b"{nope")
             .expect("corrupt manifest");
         assert!(store.journal_ids().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // G02: per-record isolation and WAV-only orphan recovery.
+    // -----------------------------------------------------------------
+
+    /// Canonical 44-byte-header WAV: PCM16 mono 16 kHz silence (the shape
+    /// `crate::audio::encode_wav_16k` writes), built by hand so the storage
+    /// tests do not depend on the audio module.
+    fn wav_bytes(duration_seconds: f64) -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 16_000;
+        let data_len = (SAMPLE_RATE as f64 * duration_seconds).round() as u32 * 2;
+
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        wav
+    }
+
+    fn session_summary(record: &ListedRecord) -> &SessionSummary {
+        match record {
+            ListedRecord::Session(summary) => summary,
+            ListedRecord::Damaged(_) => panic!("expected a readable session, got {record:?}"),
+        }
+    }
+
+    fn damaged(record: &ListedRecord) -> &DamagedRecord {
+        match record {
+            ListedRecord::Damaged(damaged) => damaged,
+            ListedRecord::Session(_) => panic!("expected a damaged record, got {record:?}"),
+        }
+    }
+
+    /// The G02 fixture: a store holding one good record plus every damaged
+    /// shape and both orphan shapes at once. Returns the ids in a fixed
+    /// order for the assertions.
+    struct MixedStore {
+        temp: TempDir,
+        good: String,
+        missing_wav: String,
+        corrupt_manifest: String,
+        corrupt_manifest_intact_wav: String,
+        orphan: String,
+        future_schema: String,
+        id_mismatch: String,
+        garbage_wav: String,
+    }
+
+    fn mixed_store() -> MixedStore {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+
+        let good = store
+            .create(wav_bytes(0.3), Some(300.0))
+            .expect("create good");
+
+        // Manifest intact, audio gone.
+        let missing_wav = store.create(wav_bytes(0.2), None).expect("create missing-wav");
+        std::fs::remove_file(temp.path().join(&missing_wav.id).join(AUDIO_FILE))
+            .expect("remove wav");
+
+        // Manifest corrupt and nothing recoverable left.
+        let corrupt_manifest = store
+            .create(wav_bytes(0.2), None)
+            .expect("create corrupt-manifest");
+        std::fs::write(temp.path().join(&corrupt_manifest.id).join(MANIFEST_FILE), b"{nope")
+            .expect("corrupt manifest");
+        std::fs::remove_file(temp.path().join(&corrupt_manifest.id).join(AUDIO_FILE))
+            .expect("remove wav too");
+
+        // Manifest corrupt but the audio intact: recoverable as an orphan.
+        let corrupt_manifest_intact_wav = store
+            .create(wav_bytes(0.4), None)
+            .expect("create corrupt-manifest-intact-wav");
+        std::fs::write(
+            temp.path()
+                .join(&corrupt_manifest_intact_wav.id)
+                .join(MANIFEST_FILE),
+            "{\"schemaVersion\":1,",
+        )
+        .expect("truncate manifest");
+
+        // WAV-only orphan: the crash-before-manifest-write shape.
+        let orphan_dir = temp.path().join("orphan-take");
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+        let orphan_wav = wav_bytes(0.75);
+        std::fs::write(orphan_dir.join(AUDIO_FILE), &orphan_wav).expect("orphan wav");
+
+        // A complete, well-formed manifest from a future schema version.
+        let future_dir = temp.path().join("future-take");
+        std::fs::create_dir_all(&future_dir).expect("future dir");
+        std::fs::write(
+            future_dir.join(MANIFEST_FILE),
+            r#"{"schemaVersion":999,"id":"future-take","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z","status":"captured","audioFile":"recording.wav","attemptCount":0,"transcriptHistory":[]}"#,
+        )
+        .expect("future manifest");
+        std::fs::write(future_dir.join(AUDIO_FILE), wav_bytes(0.1)).expect("future wav");
+
+        // Identity mismatch: the manifest describes a different id.
+        let mismatch_dir = temp.path().join("moved-take");
+        std::fs::create_dir_all(&mismatch_dir).expect("mismatch dir");
+        std::fs::write(
+            mismatch_dir.join(MANIFEST_FILE),
+            r#"{"schemaVersion":1,"id":"someone-else","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z","status":"captured","audioFile":"recording.wav","attemptCount":0,"transcriptHistory":[]}"#,
+        )
+        .expect("mismatch manifest");
+        std::fs::write(mismatch_dir.join(AUDIO_FILE), wav_bytes(0.1)).expect("mismatch wav");
+
+        // WAV-only directory whose audio is not a WAV at all.
+        let garbage_dir = temp.path().join("garbage-wav");
+        std::fs::create_dir_all(&garbage_dir).expect("garbage dir");
+        std::fs::write(garbage_dir.join(AUDIO_FILE), b"definitely not audio")
+            .expect("garbage wav");
+
+        MixedStore {
+            temp,
+            good: good.id,
+            missing_wav: missing_wav.id,
+            corrupt_manifest: corrupt_manifest.id,
+            corrupt_manifest_intact_wav: corrupt_manifest_intact_wav.id,
+            orphan: "orphan-take".to_string(),
+            future_schema: "future-take".to_string(),
+            id_mismatch: "moved-take".to_string(),
+            garbage_wav: "garbage-wav".to_string(),
+        }
+    }
+
+    #[test]
+    fn mixed_store_listing_isolates_damage_and_recovers_orphans() {
+        let fixture = mixed_store();
+        let store = FileSessionStore::open(fixture.temp.path()).expect("open");
+
+        let listed = store.list_records().expect("listing never aborts on damage");
+
+        let find = |id: &str| {
+            listed
+                .iter()
+                .find(|record| record_id(record) == id)
+                .unwrap_or_else(|| panic!("record {id} missing from listing"))
+        };
+
+        // Good records stay visible.
+        let good = session_summary(find(&fixture.good));
+        assert_eq!(good.status, SessionStatus::Captured);
+        assert_eq!(good.duration_ms, Some(300.0));
+
+        // The WAV-only orphan becomes a recoverable interrupted take with
+        // the duration computed from the verified bytes.
+        let orphan = session_summary(find(&fixture.orphan));
+        assert_eq!(orphan.status, SessionStatus::Interrupted);
+        assert_eq!(orphan.duration_ms, Some(750.0));
+        assert_eq!(orphan.attempt_count, 0);
+        assert!(orphan.transcript.is_none());
+        assert_eq!(orphan.created_at.len(), 24, "RFC3339 millis stamp");
+        let note = orphan.last_error.as_deref().expect("recovery note");
+        assert!(note.contains("Recovered"), "{note}");
+        assert!(note.contains("kept untouched"), "{note}");
+
+        // A corrupt manifest with the audio intact recovers the same way —
+        // the recording outranks the file that failed to describe it.
+        let intact = session_summary(find(&fixture.corrupt_manifest_intact_wav));
+        assert_eq!(intact.status, SessionStatus::Interrupted);
+        assert_eq!(intact.duration_ms, Some(400.0));
+
+        // Damaged records are flagged with their reason, not hidden.
+        assert_eq!(damaged(find(&fixture.missing_wav)).id, fixture.missing_wav);
+        let reason = &damaged(find(&fixture.missing_wav)).reason;
+        assert!(reason.contains("recording.wav"), "{reason}");
+        let reason = &damaged(find(&fixture.corrupt_manifest)).reason;
+        assert!(reason.contains("manifest.json"), "{reason}");
+        let reason = &damaged(find(&fixture.future_schema)).reason;
+        assert!(
+            reason.contains("unsupported manifest schemaVersion 999"),
+            "{reason}"
+        );
+        let reason = &damaged(find(&fixture.id_mismatch)).reason;
+        assert!(reason.contains("does not match"), "{reason}");
+        let reason = &damaged(find(&fixture.garbage_wav)).reason;
+        assert!(reason.contains("recording.wav"), "{reason}");
+
+        // Every record is present: 3 readable sessions (good, orphan,
+        // corrupt-manifest-with-intact-audio) + 5 damaged ones.
+        assert_eq!(listed.len(), 8);
+
+        // Damaged records sort after every readable session.
+        let first_damaged = listed
+            .iter()
+            .position(|record| matches!(record, ListedRecord::Damaged(_)))
+            .expect("damaged records present");
+        assert!(
+            listed[..first_damaged]
+                .iter()
+                .all(|record| matches!(record, ListedRecord::Session(_))),
+            "readable sessions sort before damaged records"
+        );
+
+        // Nothing was deleted or moved: every directory still exists, and
+        // the orphan's audio is byte-for-byte untouched.
+        for id in [
+            &fixture.good,
+            &fixture.missing_wav,
+            &fixture.corrupt_manifest,
+            &fixture.corrupt_manifest_intact_wav,
+            &fixture.orphan,
+            &fixture.future_schema,
+            &fixture.id_mismatch,
+            &fixture.garbage_wav,
+        ] {
+            assert!(
+                fixture.temp.path().join(id).is_dir(),
+                "directory {id} must survive the listing"
+            );
+        }
+        assert_eq!(
+            std::fs::read(fixture.temp.path().join(&fixture.orphan).join(AUDIO_FILE))
+                .expect("orphan wav"),
+            wav_bytes(0.75)
+        );
+
+        // The orphan loads in full on demand — audio and all.
+        let loaded = store
+            .get(&fixture.orphan)
+            .expect("get orphan")
+            .expect("orphan is a session");
+        assert_eq!(loaded.status, SessionStatus::Interrupted);
+        assert_eq!(loaded.wav.as_slice(), wav_bytes(0.75).as_slice());
+    }
+
+    #[test]
+    fn damaged_reads_surface_the_recorded_reason() {
+        let fixture = mixed_store();
+        let store = FileSessionStore::open(fixture.temp.path()).expect("open");
+
+        for (id, expected) in [
+            (&fixture.missing_wav, "recording.wav"),
+            (&fixture.future_schema, "unsupported manifest schemaVersion 999"),
+            (&fixture.id_mismatch, "does not match"),
+            (&fixture.garbage_wav, "recording.wav"),
+        ] {
+            match store.get(id) {
+                Err(StorageError::Invalid(reason)) => {
+                    assert!(reason.contains(expected), "{id}: {reason}")
+                }
+                other => panic!("{id}: expected Invalid, got {other:?}"),
+            }
+            // The transcribe path (`mark_attempt`) surfaces the same reason.
+            match store.mark_attempt(id) {
+                Err(StorageError::Invalid(reason)) => {
+                    assert!(reason.contains(expected), "{id}: {reason}")
+                }
+                other => panic!("{id}: expected Invalid from mark_attempt, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_first_write_heals_the_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+
+        let orphan_dir = temp.path().join("crash-before-manifest");
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+        let wav = wav_bytes(0.5);
+        std::fs::write(orphan_dir.join(AUDIO_FILE), &wav).expect("orphan wav");
+
+        // Reads are side-effect free: the manifest appears only once a
+        // write goes through, and the audio never moves.
+        assert!(
+            !orphan_dir.join(MANIFEST_FILE).exists(),
+            "reading an orphan must not write anything"
+        );
+        let recovered = store
+            .get("crash-before-manifest")
+            .expect("get")
+            .expect("orphan session");
+        assert_eq!(recovered.status, SessionStatus::Interrupted);
+        assert!(
+            !orphan_dir.join(MANIFEST_FILE).exists(),
+            "get must stay read-only"
+        );
+
+        // The first write persists a manifest: the take is healed into a
+        // first-class session from here on.
+        let attempted = store
+            .mark_attempt("crash-before-manifest")
+            .expect("retry on the recovered take");
+        assert_eq!(attempted.status, SessionStatus::Transcribing);
+        assert_eq!(attempted.attempt_count, 1);
+
+        let manifest_path = orphan_dir.join(MANIFEST_FILE);
+        let raw = std::fs::read_to_string(&manifest_path).expect("manifest was written");
+        let manifest: serde_json::Value = serde_json::from_str(&raw).expect("parse manifest");
+        assert_eq!(manifest["id"], "crash-before-manifest");
+        assert_eq!(manifest["status"], "transcribing");
+        assert_eq!(manifest["audioFile"], "recording.wav");
+
+        // It now lists as a regular record, and the audio is untouched.
+        let listed = store.list_records().expect("list");
+        let healed = session_summary(&listed[0]);
+        assert_eq!(healed.id, "crash-before-manifest");
+        assert_eq!(healed.status, SessionStatus::Transcribing);
+        assert_eq!(
+            std::fs::read(orphan_dir.join(AUDIO_FILE)).expect("wav"),
+            wav
+        );
+    }
+
+    #[test]
+    fn orphan_duration_is_clamped_to_the_bytes_actually_present() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+
+        // A torn write: the data header promises 4 seconds (128_000 bytes)
+        // but the file holds only 1 second of samples (32_000 bytes).
+        let mut wav = wav_bytes(1.0);
+        wav.truncate(44 + 32_000);
+        wav[40..44].copy_from_slice(&128_000u32.to_le_bytes());
+        let torn_dir = temp.path().join("torn-take");
+        std::fs::create_dir_all(&torn_dir).expect("torn dir");
+        std::fs::write(torn_dir.join(AUDIO_FILE), &wav).expect("torn wav");
+
+        let listed = store.list_records().expect("list");
+        let recovered = session_summary(&listed[0]);
+        assert_eq!(recovered.duration_ms, Some(1000.0), "verified bytes only");
+    }
+
+    #[test]
+    fn list_page_slices_the_full_ordering() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+
+        let first = store.create(wav_bytes(0.1), None).expect("first");
+        std::thread::sleep(Duration::from_millis(15));
+        let second = store.create(wav_bytes(0.1), None).expect("second");
+        std::thread::sleep(Duration::from_millis(15));
+        let third = store.create(wav_bytes(0.1), None).expect("third");
+
+        let page = store.list_page(0, 2).expect("first page");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 0);
+        let ids = page
+            .records
+            .iter()
+            .map(record_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [third.id.as_str(), second.id.as_str()]);
+
+        let page = store.list_page(2, 2).expect("tail page");
+        assert_eq!(page.total, 3);
+        assert_eq!(
+            page.records.iter().map(record_id).collect::<Vec<_>>(),
+            [first.id.as_str()]
+        );
+
+        // Off the end: empty, not an error, with the total still true.
+        let page = store.list_page(9, 2).expect("past the end");
+        assert_eq!(page.total, 3);
+        assert!(page.records.is_empty());
     }
 }
