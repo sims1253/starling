@@ -78,8 +78,9 @@ use crate::storage::{is_safe_path_component, now_iso};
 
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
-/// is refused at open.
-pub const V2_SCHEMA_VERSION: u32 = 1;
+/// is refused at open. v2 added `recognition_attempts.created_utc` (the
+/// real updated-at source for the summaries).
+pub const V2_SCHEMA_VERSION: u32 = 2;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -132,7 +133,8 @@ CREATE TABLE IF NOT EXISTS recognition_attempts (
     partial_or_final TEXT NOT NULL,
     status           TEXT NOT NULL,
     timing_json      TEXT,
-    extra_json       TEXT
+    extra_json       TEXT,
+    created_utc      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_recognition_attempts_capture
     ON recognition_attempts(capture_id);
@@ -203,6 +205,12 @@ pub enum StoreV2Error {
     Invalid(String),
     #[error("capture {0} was not found")]
     NotFound(String),
+    /// The journal handed to [`StoreV2::adopt_journal`] held no verified
+    /// samples — a header-only journal from a writer that faulted before
+    /// its first boundary. Not a storage fault: the caller falls back to
+    /// storing its encoded WAV instead of adopting.
+    #[error("capture journal {id} has no verified samples; nothing to adopt")]
+    NoVerifiedSamples { id: String },
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
     #[error("audio error: {0}")]
@@ -295,6 +303,10 @@ pub struct AttemptRecord {
     pub status: String,
     pub timing_json: Option<String>,
     pub extra_json: Option<String>,
+    /// When the attempt was inserted (`now_iso`), the real updated-at
+    /// source for summaries. `None` only on rows written before the v2
+    /// schema added the column.
+    pub created_utc: Option<String>,
 }
 
 impl AttemptRecord {
@@ -428,9 +440,30 @@ impl StoreV2 {
                 // version row is sane and touch nothing else.
             }
             Some(found) if found < V2_SCHEMA_VERSION => {
-                // Lower version: apply the (idempotent) schema and bump.
+                // Lower version: apply the (idempotent) schema, add any
+                // columns introduced since `found` (`CREATE TABLE IF NOT
+                // EXISTS` cannot extend an existing table), and bump.
                 let tx = conn.transaction()?;
                 tx.execute_batch(SCHEMA_SQL)?;
+                if found < 2 {
+                    // v1 → v2: attempts gained a creation timestamp. Rows
+                    // written before the upgrade keep NULL — readers fall
+                    // back to the capture's creation time.
+                    let has_created: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM pragma_table_info('recognition_attempts')
+                             WHERE name = 'created_utc'",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !has_created {
+                        tx.execute_batch(
+                            "ALTER TABLE recognition_attempts ADD COLUMN created_utc TEXT",
+                        )?;
+                    }
+                }
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -719,14 +752,15 @@ impl StoreV2 {
         Ok(())
     }
 
-    /// Inserts a `recognition_attempts` row.
+    /// Inserts a `recognition_attempts` row, stamped with its creation
+    /// time (the summary's updated-at source).
     pub fn insert_attempt(&mut self, attempt: &AttemptRecord) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO recognition_attempts(
                 id, capture_id, backend, model_hash, language, options_json, text,
-                partial_or_final, status, timing_json, extra_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                partial_or_final, status, timing_json, extra_json, created_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 attempt.id,
                 attempt.capture_id,
@@ -739,10 +773,30 @@ impl StoreV2 {
                 attempt.status,
                 attempt.timing_json,
                 attempt.extra_json,
+                attempt.created_utc.clone().unwrap_or_else(now_iso),
             ],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Map one `recognition_attempts` row (column order shared by every
+    /// SELECT in this file).
+    fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRecord> {
+        Ok(AttemptRecord {
+            id: row.get(0)?,
+            capture_id: row.get(1)?,
+            backend: row.get(2)?,
+            model_hash: row.get(3)?,
+            language: row.get(4)?,
+            options_json: row.get(5)?,
+            text: row.get(6)?,
+            partial_or_final: row.get(7)?,
+            status: row.get(8)?,
+            timing_json: row.get(9)?,
+            extra_json: row.get(10)?,
+            created_utc: row.get(11)?,
+        })
     }
 
     /// All attempts for a capture, oldest first (insertion id order is
@@ -750,29 +804,57 @@ impl StoreV2 {
     pub fn attempts_for(&self, capture_id: &str) -> Result<Vec<AttemptRecord>, StoreV2Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, capture_id, backend, model_hash, language, options_json, text,
-                    partial_or_final, status, timing_json, extra_json
+                    partial_or_final, status, timing_json, extra_json, created_utc
              FROM recognition_attempts WHERE capture_id = ?1 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(params![capture_id], |row| {
-            Ok(AttemptRecord {
-                id: row.get(0)?,
-                capture_id: row.get(1)?,
-                backend: row.get(2)?,
-                model_hash: row.get(3)?,
-                language: row.get(4)?,
-                options_json: row.get(5)?,
-                text: row.get(6)?,
-                partial_or_final: row.get(7)?,
-                status: row.get(8)?,
-                timing_json: row.get(9)?,
-                extra_json: row.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![capture_id], Self::row_to_attempt)?;
         let mut attempts = Vec::new();
         for row in rows {
             attempts.push(row?);
         }
         Ok(attempts)
+    }
+
+    /// All attempts for every capture in `capture_ids`, oldest first,
+    /// grouped by capture id — one query per chunk instead of one per
+    /// record (the listing path runs after every save, transcript,
+    /// failure, and delete, so the per-record round-trips added up).
+    /// Captures with no attempts are simply absent from the map.
+    pub fn attempts_grouped_by_capture(
+        &self,
+        capture_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<AttemptRecord>>, StoreV2Error> {
+        let mut grouped: std::collections::HashMap<String, Vec<AttemptRecord>> =
+            std::collections::HashMap::new();
+        // Stay well under SQLite's default 999 host-parameter limit.
+        for chunk in capture_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, capture_id, backend, model_hash, language, options_json, text,
+                        partial_or_final, status, timing_json, extra_json, created_utc
+                 FROM recognition_attempts WHERE capture_id IN ({placeholders}) ORDER BY rowid"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), Self::row_to_attempt)?;
+            for row in rows {
+                let attempt = row?;
+                grouped
+                    .entry(attempt.capture_id.clone())
+                    .or_default()
+                    .push(attempt);
+            }
+        }
+        Ok(grouped)
     }
 
     // ------------------------------------------------------------------
@@ -1242,9 +1324,7 @@ impl StoreV2 {
             ))
         })?;
         if parsed.samples.is_empty() {
-            return Err(StoreV2Error::Invalid(format!(
-                "capture journal {id} has no verified samples; nothing to adopt"
-            )));
+            return Err(StoreV2Error::NoVerifiedSamples { id: id.clone() });
         }
 
         // An unsealed or torn journal is sealed to its verified prefix
@@ -1364,6 +1444,7 @@ impl StoreV2 {
             status: "started".to_string(),
             timing_json: None,
             extra_json: None,
+            created_utc: None,
         })?;
         Ok(id)
     }
@@ -1807,12 +1888,101 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_schema_database_is_upgraded_in_place() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(40, 0));
+        let id = take.record.id.clone();
+        store
+            .begin_recognition(&id, "starling:parakeet", None)
+            .expect("begin");
+        drop(store);
+
+        // Rewind the database to the v1 shape: drop the created_utc
+        // column's data by rebuilding the table without it (SQLite cannot
+        // drop columns portably) and stamp schema_version 1.
+        {
+            let conn = Connection::open(dir.path().join("v2").join(DB_FILE)).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE recognition_attempts_v1 (
+                    id TEXT PRIMARY KEY,
+                    capture_id TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+                    backend TEXT NOT NULL,
+                    model_hash TEXT,
+                    language TEXT,
+                    options_json TEXT,
+                    text TEXT NOT NULL,
+                    partial_or_final TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timing_json TEXT,
+                    extra_json TEXT
+                 );
+                 INSERT INTO recognition_attempts_v1
+                    SELECT id, capture_id, backend, model_hash, language, options_json,
+                           text, partial_or_final, status, timing_json, extra_json
+                    FROM recognition_attempts;
+                 DROP TABLE recognition_attempts;
+                 ALTER TABLE recognition_attempts_v1 RENAME TO recognition_attempts;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+            )
+            .expect("rewind to v1");
+        }
+
+        // Opening upgrades: version bumped, column added, and the
+        // pre-upgrade attempt reads back with NULL created_utc (readers
+        // fall back to the capture's creation time).
+        let mut store = store_in(&dir);
+        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].created_utc, None);
+        // The upgraded store accepts new work normally.
+        store
+            .finish_recognition(&id, RecognitionOutcome::Failed { message: "x" })
+            .expect("finish on upgraded schema");
+    }
+
+    #[test]
+    fn attempts_grouped_by_capture_fetches_a_page_in_one_query() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let first = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
+        let second = committed_take(&mut store, &ramp(30, 1)).record.id.clone();
+        store
+            .begin_recognition(&first, "starling:parakeet", None)
+            .expect("begin first");
+        store
+            .begin_recognition(&second, "starling:parakeet", None)
+            .expect("begin second");
+        store
+            .finish_recognition(&first, RecognitionOutcome::Failed { message: "nope" })
+            .expect("fail first");
+        store
+            .begin_recognition(&first, "starling:parakeet", None)
+            .expect("retry first");
+
+        let grouped = store
+            .attempts_grouped_by_capture(&[first.clone(), second.clone()])
+            .expect("grouped");
+        assert_eq!(grouped.len(), 2, "both captures present");
+        assert_eq!(grouped[&first].len(), 2, "history + retry, oldest first");
+        assert_eq!(grouped[&first][0].status, "failed");
+        assert_eq!(grouped[&first][1].status, "started");
+        assert_eq!(grouped[&second].len(), 1);
+
+        // Ids with no attempts are absent, not empty entries.
+        let empty = store
+            .attempts_grouped_by_capture(&["c_nope".to_string()])
+            .expect("grouped");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn higher_schema_version_database_is_refused_without_mutation() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
         let take = committed_take(&mut store, &ramp(50, 0));
         drop(store);
-
         // A future build stamped a higher version.
         {
             let conn = Connection::open(dir.path().join("v2").join(DB_FILE)).expect("open");
@@ -1928,8 +2098,15 @@ mod tests {
                 status: "completed".to_string(),
                 timing_json: Some(r#"{"totalMs":120}"#.to_string()),
                 extra_json: Some(extra.to_string()),
+                created_utc: None,
             })
             .expect("insert attempt");
+
+        // Insert stamped it with a creation time (the summary's real
+        // updated-at source), and it round-trips.
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].created_utc.is_some(), "stamped on insert");
 
         let attempts = store.attempts_for(&id).expect("attempts");
         assert_eq!(attempts.len(), 1);
@@ -2478,10 +2655,10 @@ mod tests {
         // Header-only journal: a take that never reached its first boundary.
         let source = external_journal(&dir, "j_empty", &[], true);
         match store.adopt_journal(&source, None) {
-            Err(StoreV2Error::Invalid(reason)) => {
-                assert!(reason.contains("no verified samples"), "{reason}")
+            Err(StoreV2Error::NoVerifiedSamples { id }) => {
+                assert_eq!(id, "j_empty");
             }
-            other => panic!("expected refusal, got {other:?}"),
+            other => panic!("expected a typed refusal, got {other:?}"),
         }
         assert!(source.exists(), "the source is kept for the caller");
         assert!(

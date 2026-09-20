@@ -120,6 +120,18 @@ impl Store {
     ) -> Result<String, storage::StorageError> {
         let mut store = lock_v2(&self.0);
         if let Some(id) = adopt_or_none(&mut store, journal, Some(note))? {
+            // A salvaged take is interrupted no matter what its journal
+            // looked like (R34): the QuiesceTimeout path carries an
+            // already-finalized journal — the writer's exit path closed
+            // it — which adoption alone marks Complete. Interrupted-ness
+            // derives from the salvage, not the journal's finalized-ness.
+            // The note itself is already stored by the adoption (merged
+            // with any torn-tail wording under `extra_json.recovery`), so
+            // this only forces the status — passing no note keeps that
+            // combined wording intact.
+            store
+                .update_capture_status(&id, CaptureStatus::Interrupted, None)
+                .map_err(v2_err)?;
             return Ok(id);
         }
         let take = store
@@ -196,9 +208,9 @@ impl Store {
 /// Adopt the recorder's journal into v2 when it holds verified samples.
 /// `Ok(Some(id))` — adopted, with `note` (the salvage note) riding along
 /// when given. `Ok(None)` — no journal, or one without verified samples
-/// (the writer faulted before its first boundary): not an error, the
-/// caller stores the take from its encoded WAV instead. Any other failure
-/// propagates.
+/// ([`StoreV2Error::NoVerifiedSamples`]: the writer faulted before its
+/// first boundary): not an error, the caller stores the take from its
+/// encoded WAV instead. Any other failure propagates.
 fn adopt_or_none(
     store: &mut StoreV2,
     journal: Option<&recorder::JournalReport>,
@@ -209,7 +221,7 @@ fn adopt_or_none(
     };
     match store.adopt_journal(&report.path, note) {
         Ok(record) => Ok(Some(record.id)),
-        Err(StoreV2Error::Invalid(reason)) if reason.contains("no verified samples") => Ok(None),
+        Err(StoreV2Error::NoVerifiedSamples { .. }) => Ok(None),
         Err(err) => Err(v2_err(err)),
     }
 }
@@ -225,10 +237,27 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
         let page = store.list_records(offset, PAGE).map_err(v2_err)?;
         let total = page.total;
         let listed = page.records.len();
+        // One attempts query per page, not per record: this listing runs
+        // after every save, transcript, failure, and delete, and the
+        // per-record round-trips added up.
+        let ids: Vec<String> = page
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                ListedCapture::Capture(listing) => Some(listing.record.id.clone()),
+                ListedCapture::Damaged(_) => None,
+            })
+            .collect();
+        let attempts = store
+            .attempts_grouped_by_capture(&ids)
+            .map_err(v2_err)?;
         for record in page.records {
             records.push(match record {
                 ListedCapture::Capture(listing) => {
-                    let attempts = store.attempts_for(&listing.record.id).map_err(v2_err)?;
+                    let attempts = attempts
+                        .get(&listing.record.id)
+                        .cloned()
+                        .unwrap_or_default();
                     ListedRecord::Session(v2_summary(&listing.record, &listing.problems, &attempts))
                 }
                 ListedCapture::Damaged(damaged) => {
@@ -281,8 +310,16 @@ pub(crate) fn v2_summary(
         .last()
         .filter(|attempt| attempt.status == "failed")
         .and_then(AttemptRecord::failure_message);
-    if last_error.is_none() && record.status == CaptureStatus::Interrupted {
-        last_error = record.recovery_note();
+    if record.status == CaptureStatus::Interrupted {
+        // The gap note survives alongside any attempt outcome: the user
+        // should always know part of the audio was discarded, whether or
+        // not a later recognition attempt also failed or is in flight.
+        if let Some(note) = record.recovery_note() {
+            last_error = Some(match last_error {
+                Some(existing) => format!("{existing} {note}"),
+                None => note,
+            });
+        }
     }
     if !problems.is_empty() {
         let note = problems.join("; ");
@@ -301,7 +338,13 @@ pub(crate) fn v2_summary(
     SessionSummary {
         id: record.id.clone(),
         created_at: record.created_utc.clone(),
-        updated_at: record.created_utc.clone(),
+        // A real updated-at: the latest attempt's creation time, falling
+        // back to the capture's creation time when no attempt (or a
+        // pre-schema-v2 attempt row without a timestamp) exists.
+        updated_at: attempts
+            .last()
+            .and_then(|attempt| attempt.created_utc.clone())
+            .unwrap_or_else(|| record.created_utc.clone()),
         status,
         duration_ms,
         attempt_count: attempts.len() as u32,
@@ -366,7 +409,12 @@ mod tests {
 
     // ---- the v2 summary mapping ----------------------------------------
 
-    fn attempt(status: &str, final_text: Option<&str>, extra: Option<&str>) -> AttemptRecord {
+    fn attempt(
+        status: &str,
+        final_text: Option<&str>,
+        extra: Option<&str>,
+        created_utc: Option<&str>,
+    ) -> AttemptRecord {
         AttemptRecord {
             id: format!("a_{status}"),
             capture_id: "c_x".to_string(),
@@ -379,7 +427,14 @@ mod tests {
             status: status.to_string(),
             timing_json: None,
             extra_json: extra.map(str::to_string),
+            created_utc: created_utc.map(str::to_string),
         }
+    }
+
+    /// All attempt fixtures below default to no recorded timestamp
+    /// (pre-schema-v2 rows); tests that care pass one.
+    fn plain_attempt(status: &str, final_text: Option<&str>, extra: Option<&str>) -> AttemptRecord {
+        attempt(status, final_text, extra, None)
     }
 
     fn record(status: CaptureStatus, extra: Option<&str>) -> CaptureRecord {
@@ -420,7 +475,7 @@ mod tests {
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[attempt("started", None, None)],
+            &[plain_attempt("started", None, None)],
         );
         assert_eq!(summary.status, SessionStatus::Transcribing);
         assert_eq!(summary.attempt_count, 1);
@@ -431,32 +486,75 @@ mod tests {
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[attempt("completed", Some("hello v2"), Some(&extra))],
+            &[plain_attempt("completed", Some("hello v2"), Some(&extra))],
         );
         assert_eq!(summary.status, SessionStatus::Transcribed);
         assert_eq!(summary.transcript.as_ref().unwrap().text, "hello v2");
 
         // A failed retry: failed, but the earlier transcript survives and
         // the failure surfaces — the v1 save_failure semantics.
-        let failed = attempt("failed", None, Some(r#"{"error":"offline"}"#));
+        let failed = plain_attempt("failed", None, Some(r#"{"error":"offline"}"#));
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[attempt("completed", Some("hello v2"), Some(&extra)), failed],
+            &[plain_attempt("completed", Some("hello v2"), Some(&extra)), failed],
         );
         assert_eq!(summary.status, SessionStatus::Failed);
         assert_eq!(summary.transcript.as_ref().unwrap().text, "hello v2");
         assert_eq!(summary.last_error.as_deref(), Some("offline"));
 
-        // A retry of an interrupted take reports the retry, not the
-        // interruption (the note stays available via last_error ordering:
-        // the attempt error wins while present).
+        // A retry of an interrupted take reports the retry as its status,
+        // and the recovery note rides alongside the attempt outcome — the
+        // user never loses sight of the gap (R34).
         let summary = v2_summary(
             &record(CaptureStatus::Interrupted, Some(r#"{"recovery":"gap"}"#)),
             &[],
-            &[attempt("started", None, None)],
+            &[plain_attempt("started", None, None)],
         );
         assert_eq!(summary.status, SessionStatus::Transcribing);
+        assert_eq!(summary.last_error.as_deref(), Some("gap"));
+
+        // A failed retry of an interrupted take surfaces both sentences.
+        let failed = plain_attempt("failed", None, Some(r#"{"error":"offline"}"#));
+        let summary = v2_summary(
+            &record(CaptureStatus::Interrupted, Some(r#"{"recovery":"gap"}"#)),
+            &[],
+            &[failed],
+        );
+        assert_eq!(summary.status, SessionStatus::Failed);
+        let last_error = summary.last_error.expect("both messages");
+        assert!(last_error.starts_with("offline"), "{last_error}");
+        assert!(last_error.ends_with("gap"), "{last_error}");
+    }
+
+    #[test]
+    fn updated_at_is_the_latest_attempt_time_not_the_creation_time() {
+        // No attempts (or none with a timestamp — pre-schema-v2 rows):
+        // falls back to the capture's creation time.
+        let summary = v2_summary(
+            &record(CaptureStatus::Complete, None),
+            &[],
+            &[plain_attempt("failed", None, Some(r#"{"error":"x"}"#))],
+        );
+        assert_eq!(summary.created_at, "2026-09-20T10:00:00.000Z");
+        assert_eq!(summary.updated_at, "2026-09-20T10:00:00.000Z");
+
+        // A timestamped attempt moves the updated-at with it.
+        let summary = v2_summary(
+            &record(CaptureStatus::Complete, None),
+            &[],
+            &[
+                attempt(
+                    "completed",
+                    Some("first"),
+                    None,
+                    Some("2026-09-20T10:00:05.000Z"),
+                ),
+                attempt("started", None, None, Some("2026-09-20T10:42:00.000Z")),
+            ],
+        );
+        assert_eq!(summary.created_at, "2026-09-20T10:00:00.000Z");
+        assert_eq!(summary.updated_at, "2026-09-20T10:42:00.000Z");
     }
 
     #[test]
@@ -528,6 +626,87 @@ mod tests {
         assert!(store.audio_wav(&id).expect("missing id").is_none());
     }
 
+    /// A journal the recorder finalized before handing it over — the
+    /// QuiesceTimeout salvage shape (the writer's exit path closes the
+    /// journal even when the device never quiesced). Built through a
+    /// scratch store's public take protocol: `begin_take` + `finalize`
+    /// leaves the finished journal in the scratch root's `staging/`, the
+    /// same on-disk shape the recorder produces.
+    fn finalized_journal(tag: &str, samples: &[f32]) -> recorder::JournalReport {
+        let root = scratch_dir(tag);
+        let scratch = StoreV2::open(root.join("scratch")).expect("scratch store");
+        let mut take = scratch
+            .begin_take(store_v2::TakeMeta::for_device("test"))
+            .expect("begin take");
+        take.append_frames(samples).expect("append");
+        take.write_boundary().expect("boundary");
+        let finalized = take.finalize().expect("finalize");
+        recorder::JournalReport {
+            path: root
+                .join("scratch")
+                .join("staging")
+                .join(format!("{}.sj", finalized.id)),
+            id: finalized.id,
+            sample_rate: finalized.sample_rate,
+            acknowledged_samples: finalized.total_samples,
+            finalized: true,
+            fault: None,
+        }
+    }
+
+    #[test]
+    fn a_quiesce_salvaged_take_with_a_finalized_journal_is_still_interrupted() {
+        // R34 regression: adoption alone marks a finalized, intact journal
+        // Complete — but a take saved through the salvage path is
+        // interrupted regardless, exactly as the v1 mark did, and its
+        // salvage note must surface.
+        let store = v2_store("quiesce-salvage");
+        let samples: Vec<f32> = (0..120).map(|i| (i % 31) as f32 * 0.002).collect();
+        let report = finalized_journal("quiesce-salvage-src", &samples);
+
+        let id = store
+            .save_interrupted_capture(
+                tiny_wav(120),
+                Some(&report),
+                "all captured samples were salvaged and kept as this interrupted recording",
+            )
+            .expect("salvaged save");
+
+        // The journal moved in and became the stored audio.
+        assert!(!report.path.exists());
+        assert!(
+            lock_v2(&store.0)
+                .load_audio(&id)
+                .expect("audio")
+                .finalized
+        );
+
+        // The listing shows the take as interrupted with its note — not
+        // "Captured" with the note invisible.
+        let summary = summary_of(&store, &id);
+        assert_eq!(summary.status, SessionStatus::Interrupted);
+        let last_error = summary.last_error.expect("the salvage note surfaces");
+        assert!(last_error.contains("salvaged and kept"), "{last_error}");
+    }
+
+    #[test]
+    fn a_cleanly_stopped_take_with_a_finalized_journal_stays_captured() {
+        // The mirror of the R34 fix: forcing interrupted-ness belongs to
+        // the salvage path only — a normal completion that adopts a
+        // finalized journal stays a complete take.
+        let store = v2_store("clean-adopt");
+        let samples: Vec<f32> = (0..90).map(|i| (i % 17) as f32 * 0.003).collect();
+        let report = finalized_journal("clean-adopt-src", &samples);
+
+        let id = store
+            .save_capture(tiny_wav(90), Some(&report))
+            .expect("clean save");
+
+        let summary = summary_of(&store, &id);
+        assert_eq!(summary.status, SessionStatus::Captured);
+        assert_eq!(summary.last_error, None);
+    }
+
     #[test]
     fn a_missing_v2_audio_surfaces_its_error_instead_of_falling_back() {
         let store = v2_store("degrade");
@@ -570,11 +749,15 @@ mod tests {
     }
 
     fn session_status(store: &Store, id: &str) -> SessionStatus {
+        summary_of(store, id).status
+    }
+
+    fn summary_of(store: &Store, id: &str) -> SessionSummary {
         let listed = store.list().expect("list");
         listed
             .iter()
             .find_map(|record| match record {
-                ListedRecord::Session(summary) if &summary.id == id => Some(summary.status),
+                ListedRecord::Session(summary) if &summary.id == id => Some(summary.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("record {id} missing from listing"))
