@@ -271,11 +271,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "status": "integrated",
+   "owner": "impl-agent-2 + coordinator",
+   "branch": "program/wave-a",
+   "evidence": [
+    "95/95 pytest rerun by coordinator; provenance schema-locked to synthetic; all 7 mutants caught by declared gates (commit a88dbbf)"
+   ],
+   "notes": "contract+frozen gates delivered; real consented audio + ASR-model runs remain validation gaps; feeds E07/E13/E24"
   },
   {
    "id": "E07",
@@ -336,11 +338,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
+   "status": "in_progress",
+   "owner": "impl-agent-6",
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "capability descriptor + conformance fixtures; evidence-derived from live server code"
   },
   {
    "id": "E11",
@@ -739,11 +741,13 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "status": "integrated",
+   "owner": "impl-agent-2 + coordinator",
+   "branch": "program/wave-a",
+   "evidence": [
+    "95/95 pytest rerun; schema has no raw-text fields + explicit rejection test; deletion-dominates-replay, sync dedupe, negative time-proxy frozen (commit 5fe0e0b)"
+   ],
+   "notes": "contract+oracle delivered; product surface = E29; production impl lands in E17 native runtime"
   },
   {
    "id": "E29",
@@ -1251,12 +1255,11 @@
  "active_assignments": [
   {
    "ids": [
-    "E06",
-    "E28"
+    "E10"
    ],
-   "agent": "impl-agent-2",
+   "agent": "impl-agent-6",
    "branch": "program/wave-a",
-   "scope": "packages/contracts + tests (light)"
+   "scope": "packages/contracts/capabilities + tests (light)"
   },
   {
    "ids": [
