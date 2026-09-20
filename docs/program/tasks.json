@@ -646,9 +646,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
    "evidence": [],
    "notes": "solution specified in design note \u00a74 (I2): per-record quarantine, orphan recovery, lease ownership"
   },
@@ -1278,9 +1278,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
@@ -1294,9 +1294,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
@@ -1456,11 +1456,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-29",
    "branch": "gpui/fixes-wave-a9",
    "evidence": [
-    "flagged by impl-26 during R05: remove_session leaves journal on disk; startup recovery resurrects it as an interrupted take, contradicting B05 deletionWarning (\"audio ... will be gone\")"
+    "coordinator rerun: 139/139 + 35/35 (84073a7, pushed); rename-to-quarantine tombstone before row removal; crash matrix covered incl. reappeared-file case; unsafe manifest linkages read as None (no traversal, deletion never bricked)"
    ],
    "notes": "fix in gpui worktree: confirmed delete removes or quarantines the journal linked via journal_id; recovery skips deliberately-deleted ids (needs a tombstone list or rename convention); dispatch next gpui slot"
   }
