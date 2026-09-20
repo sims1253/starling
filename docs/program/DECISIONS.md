@@ -41,3 +41,20 @@ Every tasks.json item carries one status from the fixed vocabulary; a compiled
 change is `implemented`, merged into a program branch is `integrated`, and only
 executed-on-named-hardware evidence yields `verified_on_target`. Historical
 cumulative speedups from unmerged branches are not counted as gains.
+
+## D6 — 2026-09-20 — E17 sequencing: library-first, envelope before IPC
+Adopted the design note (e576a7a): `starling-runtime` in-process library (Mode A)
+first, thin user-scoped host (Mode B) behind the identical versioned envelope
+later; increments I0 (envelope contracts) → I1 (capture hardening) → I2
+(storage v2 + migration) → I3 (runtime crate Mode A) → I4 (IPC host) → I5
+(documents/context/delivery). IPC crate choice and per-OS auth are I4 decisions,
+not now. **Rejected:** building the service host first; ad-hoc internal API
+before the envelope.
+
+## D7 — 2026-09-20 — Streaming resampler for I1: stateful port, no new deps
+I1's streaming capture needs a stateful anti-aliased resampler; G06 landed the
+stateless whole-recording port of the master #122 windowed-sinc kernel with no
+new dependencies. Decision: extend that kernel to a streaming/stateful form
+rather than adopting rubato or another crate; revisit only with measured
+spectral/latency evidence showing it inadequate. **Rejected:** new resampler
+dependency without evidence; keeping linear interpolation anywhere on the path.

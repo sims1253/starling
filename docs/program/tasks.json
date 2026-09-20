@@ -454,10 +454,12 @@
    "deps": [],
    "existing_issue": null,
    "status": "in_progress",
-   "owner": null,
+   "owner": "design-agent + coordinator",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": "design note by design-agent; doc only"
+   "evidence": [
+    "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded"
+   ],
+   "notes": "I0 (envelope contracts) dispatched; I1 capture hardening next; open Qs 2-6 deferred to their increments (I2/I4/I5)"
   },
   {
    "id": "E18",
@@ -604,7 +606,7 @@
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "blocked-by-design only; solution specified in design note \u00a73 (I1); structural RT-ring + writer-journal + quiesce handshake"
   },
   {
    "id": "G02",
@@ -618,7 +620,7 @@
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "solution specified in design note \u00a74 (I2): per-record quarantine, orphan recovery, lease ownership"
   },
   {
    "id": "G03",
@@ -1293,6 +1295,14 @@
    "agent": "impl-agent-5",
    "branch": "program/s01-moss-kv-clear",
    "scope": "starling-s01 worktree; sole heavy-build slot (-j3)"
+  },
+  {
+   "ids": [
+    "E17-I0"
+   ],
+   "agent": "impl-agent-7",
+   "branch": "program/wave-a",
+   "scope": "packages/contracts/runtime-protocol + tests (light)"
   }
  ]
 }
