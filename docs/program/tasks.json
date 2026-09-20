@@ -855,7 +855,8 @@
    "evidence": [
     "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction",
     "LOCAL DEVICE EVIDENCE: tdt_graph_budget_test PASS with real ReplayGraphs on Vulkan device (entry_bytes=3080 vs 3136 CPU - device-adaptive accounting); pointer stability under eviction verified on-device",
-    "REAL-MODEL iGPU run: parakeet q8_0 720M loaded 1.5s, request 0.77s, {\"text\":\"\"} for tone input (correct no-speech behavior); MOSS tone produced a hallucination (expected for non-speech input) - pipeline-level evidence only, not quality"
+    "REAL-MODEL iGPU run: parakeet q8_0 720M loaded 1.5s, request 0.77s, {\"text\":\"\"} for tone input (correct no-speech behavior); MOSS tone produced a hallucination (expected for non-speech input) - pipeline-level evidence only, not quality",
+    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)"
    ],
    "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
   },
