@@ -351,15 +351,24 @@ the identical R30 one-line CI run-loop change and therefore report
 `mergeable=CONFLICTING` against the moved master (which gained #193–#195);
 the conflict is that single line in `.github/workflows/ci-starling-serve.yml`
 (resolution: keep the branches' version — it adds `tdt_graph_budget_test`
-to the run loop). Merged in order #196 → #197 → #198 → #199 with that
-resolution; merge SHAs recorded below.
+to the run loop). `gh pr merge` refuses conflicted PRs, so the merges were
+performed as local `--no-ff` merge commits pushed to master (GitHub marks
+the PRs MERGED when their head commits become reachable — verified below).
+Merged in order #196 → #197 → #198 → #199 with that resolution.
 
-| PR | merge commit |
-|---|---|
-| #196 | `<filled after merge>` |
-| #197 | `<filled after merge>` |
-| #198 | `<filled after merge>` |
-| #199 | `<filled after merge>` |
+Two equivalence checks before pushing: `git diff 12b6548 d05648c -- cpp/
+third_party/` is empty (master's engine code was unchanged between the A/B
+baseline and the merge base, so the A/B sides stay valid), and
+`git diff <merge-result> 52f393d -- cpp/ .github/workflows/ci-starling-serve.yml`
+is empty (the merged master's engine + CI content is byte-identical to the
+validated tip — the binaries this document validates are the merged content).
+
+| PR | merge commit | state |
+|---|---|---|
+| #196 | `deeb34512c5e9a6eed0a1a274c4066e028a8e19d` | MERGED 2026-09-20T19:02:23Z |
+| #197 | `3af1c001555b880152ecbb2909e1779c8930e4d0` | MERGED 2026-09-20T19:02:23Z |
+| #198 | `3d09d59702c45dcbc265a15760f00237f2fccb5a` | MERGED 2026-09-20T19:02:24Z |
+| #199 | `24ae1a230efbd5b7a5f8b7bbd69f9bb3d8bd6a3b` | MERGED 2026-09-20T19:02:23Z |
 
 ## Raw artifacts
 
