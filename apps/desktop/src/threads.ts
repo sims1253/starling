@@ -28,16 +28,25 @@ export function newThreadId(): string {
  * the recording clock. A thread is a conversation, and conversations grow by
  * appends — an older recording that joins an existing thread appends as the
  * thread's latest turn, so its refinement context is the thread's current
- * document and the next turn after it sees its edit (B11). Members persisted
- * before the stamp existed have none: they joined before the sequence did,
- * so they read first, keeping their old createdAt order. createdAt then id
- * tiebreak stamps shared in the same millisecond — racing windows — so the
- * order is always deterministic regardless of the input array's order.
+ * document and the next turn after it sees its edit (B11).
+ *
+ * Members persisted before the stamp existed have none: they joined before
+ * the sequence did, so they read before every stamped join. That makes the
+ * stamp comparison a tie exactly when a thread is fully legacy — no member
+ * carries a stamp — and the tiebreak below then compares createdAt then id
+ * for every pair: precisely the pre-B11 reading order. Existing threads
+ * therefore keep the order their data was already sorted by instead of
+ * regressing on upgrade, while mixed threads keep stamp-first semantics.
+ * createdAt then id also tiebreak stamps shared in the same millisecond —
+ * racing windows — so the order is always deterministic regardless of the
+ * input array's order.
  */
 function compareTakeOrder(left: DictationSession, right: DictationSession): number {
   const leftJoined = left.threadJoinedAt ?? Number.NEGATIVE_INFINITY;
   const rightJoined = right.threadJoinedAt ?? Number.NEGATIVE_INFINITY;
 
+  // A tie here means both sides carry the same stamp, or neither carries
+  // one — the fully-legacy case that falls back to the old order below.
   if (leftJoined !== rightJoined) return leftJoined - rightJoined;
 
   const byCreated = left.createdAt.localeCompare(right.createdAt);

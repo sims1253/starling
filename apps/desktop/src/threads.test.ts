@@ -247,6 +247,70 @@ describe("threadTurns", () => {
     ]);
   });
 
+  it("reads a fully-legacy thread in exactly the old createdAt order (R14)", () => {
+    // A thread where NO member has a stamp — every join predates the append
+    // sequence — must keep the reading order such a thread always had:
+    // createdAt then id. The true join sequence is unrecoverable, and the
+    // old order is what the user last saw, so a fully-legacy thread must not
+    // reorder on upgrade. Here the 09:00 recording joined the thread LAST
+    // (after the 10:00 and 11:00 takes) yet still reads first — the pre-B11
+    // behavior existing data was sorted by.
+    const sessions = [
+      take({
+        id: "last-join",
+        createdAt: "2025-09-01T09:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "middle",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "head",
+        createdAt: "2025-09-01T11:00:00.000Z",
+        threadId: "t1",
+      }),
+    ];
+
+    const ids = threadTurns(sessions, "t1").map((turn) => turn.id);
+
+    expect(ids).toEqual(["last-join", "middle", "head"]);
+    expect(threadTurns([...sessions].reverse(), "t1").map((turn) => turn.id)).toEqual(ids);
+  });
+
+  it("keeps stamp-first semantics once any member carries a stamp (R14)", () => {
+    // The same legacy members plus one stamped join: the mixed thread is
+    // where the append sequence takes over. The legacy members all predate
+    // the sequence, so they read first in createdAt order — including one
+    // whose recording is older than the stamped join's — and the stamped
+    // member reads as the latest append whatever its recording age.
+    const sessions = [
+      take({
+        id: "stamped-join",
+        createdAt: "2025-09-01T08:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 900,
+      }),
+      take({
+        id: "legacy-newer",
+        createdAt: "2025-09-01T11:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "legacy-older",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+      }),
+    ];
+
+    expect(threadTurns(sessions, "t1").map((turn) => turn.id)).toEqual([
+      "legacy-older",
+      "legacy-newer",
+      "stamped-join",
+    ]);
+  });
+
   it("breaks equal append stamps deterministically without depending on input order", () => {
     // Two windows can append within the same millisecond; the tiebreak is
     // createdAt, then id — the same keys the legacy order uses.
