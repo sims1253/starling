@@ -994,11 +994,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-31",
+   "branch": "program/s11-tail-reuse",
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "branch_note": "engine worktree"
   },
   {
    "id": "S12",
@@ -1440,11 +1441,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-28",
    "branch": "program/s02-tdt-budget",
    "evidence": [
-    "PR #198 OCR run 35507119114, 2026-09-20 11:15Z (12 findings)"
+    "coordinator rerun: tdt_graph_budget_test PASS + stream_session 235/235 CPU, agent also re-ran on Vulkan0 device (0cb6a2b, c3fbdee pushed to PR #198); strtoll+clamp env parse w/ diagnostics; single-pass trim w/ identical victim set; zero-budget throws; trace pin marker additive"
    ],
    "notes": "dispatch into starling-s01 worktree when coordinator next fills the engine slot; budget parse = strtoll+clamp; trim = single-pass back-iteration"
   },
