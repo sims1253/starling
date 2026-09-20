@@ -72,6 +72,10 @@ pub struct StarlingApp {
     pub copied: bool,
     pub wav_saved: bool,
     pub playing_id: Option<String>,
+    /// Identifies the current playback so poll-watchers can detect that they
+    /// are stale (G04). Bumped whenever playback starts, stops, or is
+    /// replaced; watchers capture the value at spawn time.
+    pub playback_generation: u64,
 
     pub recorder: Option<RecorderHandle>,
     pub levels: Vec<f32>,
@@ -84,6 +88,49 @@ pub(crate) fn client_protocol(protocol: settings::Protocol) -> client::Protocol 
     match protocol {
         settings::Protocol::Starling => client::Protocol::Starling,
         settings::Protocol::OpenAI => client::Protocol::OpenAi,
+    }
+}
+
+/// What a playback poll-watcher does after one tick (G04).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaybackWatch {
+    /// The watched playback is still live: sleep and poll again.
+    Poll,
+    /// The watched playback drained naturally: the watcher clears
+    /// `playing_id`, notifies, and exits.
+    Finished,
+    /// The watcher is stale or playback already ended by another path
+    /// (stop, replacement, selection change, session deletion): exit
+    /// without touching state.
+    Cancelled,
+}
+
+/// Pure tick decision for a watcher that captured `watched` when its
+/// playback started, against the app's current playback state.
+///
+/// `playing` is `playing_id.is_some()`; `player_is_playing` is `None` when
+/// no player exists. Staleness is decided first, so a superseded watcher can
+/// never report [`PlaybackWatch::Finished`] — and therefore never clear
+/// `playing_id` — for a newer playback, even one that has already drained.
+pub(crate) fn playback_watch(
+    watched: u64,
+    current: u64,
+    playing: bool,
+    player_is_playing: Option<bool>,
+) -> PlaybackWatch {
+    if watched != current {
+        return PlaybackWatch::Cancelled;
+    }
+
+    if !playing {
+        return PlaybackWatch::Cancelled;
+    }
+
+    match player_is_playing {
+        Some(true) => PlaybackWatch::Poll,
+        // Natural drain, or the player vanished mid-playback: this watcher
+        // owns the still-recorded playback and releases it.
+        Some(false) | None => PlaybackWatch::Finished,
     }
 }
 
@@ -212,6 +259,7 @@ impl StarlingApp {
             copied: false,
             wav_saved: false,
             playing_id: None,
+            playback_generation: 0,
             recorder: None,
             levels: vec![0.06; 52],
             elapsed_ms: 0.0,
@@ -574,11 +622,15 @@ impl StarlingApp {
         if self.playing_id.as_deref() == Some(id) {
             player.stop();
             self.playing_id = None;
+            self.retire_playback_generation();
         } else {
             player.stop();
             match player.play(session.wav.as_slice()) {
                 Ok(()) => {
                     self.playing_id = Some(id.to_string());
+                    // New playback, new generation: any watcher still polling
+                    // for the previous playback is stale from here on.
+                    self.retire_playback_generation();
                     self.watch_playback(cx);
                 }
                 Err(err) => {
@@ -595,27 +647,44 @@ impl StarlingApp {
             player.stop();
         }
         self.playing_id = None;
+        self.retire_playback_generation();
+    }
+
+    /// Invalidate every playback watcher spawned so far (G04).
+    ///
+    /// Watchers capture the generation when their playback starts; bumping it
+    /// makes their next tick [`PlaybackWatch::Cancelled`], so stop,
+    /// replacement, selection change, and session deletion each end the
+    /// previous polling task instead of leaving it polling forever.
+    fn retire_playback_generation(&mut self) {
+        self.playback_generation = self.playback_generation.wrapping_add(1);
     }
 
     fn watch_playback(&mut self, cx: &mut Context<Self>) {
+        let generation = self.playback_generation;
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(250)).await;
-                let finished = this
+                // A failed update means the entity is destroyed: stop polling.
+                let watch = this
                     .update(cx, |app, cx| {
-                        let finished = app.playing_id.is_some()
-                            && app
-                                .player
-                                .as_ref()
-                                .is_none_or(|player| !player.is_playing());
-                        if finished {
+                        let watch = playback_watch(
+                            generation,
+                            app.playback_generation,
+                            app.playing_id.is_some(),
+                            app.player.as_ref().map(|player| player.is_playing()),
+                        );
+                        if watch == PlaybackWatch::Finished {
+                            // Only the watcher of the current generation ever
+                            // lands here, so a stale watcher cannot clear
+                            // `playing_id` for a newer playback.
                             app.playing_id = None;
                             cx.notify();
                         }
-                        finished
+                        watch
                     })
-                    .unwrap_or(true);
-                if finished {
+                    .unwrap_or(PlaybackWatch::Cancelled);
+                if watch != PlaybackWatch::Poll {
                     break;
                 }
             }
@@ -725,6 +794,65 @@ mod tests {
         assert_eq!(download_name_candidate("readme", 3), "readme-3");
         // A leading dot is the stem, not an extension.
         assert_eq!(download_name_candidate(".zshrc", 2), ".zshrc-2");
+    }
+
+    #[test]
+    fn watcher_polls_only_while_the_current_generation_is_audibly_playing() {
+        assert_eq!(
+            playback_watch(7, 7, true, Some(true)),
+            PlaybackWatch::Poll
+        );
+    }
+
+    #[test]
+    fn natural_drain_or_a_missing_player_finishes_the_current_watcher() {
+        // Player drained: the current watcher clears playing_id and exits.
+        assert_eq!(
+            playback_watch(7, 7, true, Some(false)),
+            PlaybackWatch::Finished
+        );
+        // Player vanished mid-playback: release the recorded playback.
+        assert_eq!(playback_watch(7, 7, true, None), PlaybackWatch::Finished);
+    }
+
+    #[test]
+    fn a_stale_watcher_cancels_instead_of_clearing_newer_playback() {
+        // Superseded generation: must never report Finished — not even when
+        // nothing is audibly playing — or it would clear the newer
+        // playback's playing_id.
+        assert_eq!(
+            playback_watch(6, 7, true, Some(false)),
+            PlaybackWatch::Cancelled
+        );
+        assert_eq!(
+            playback_watch(6, 7, true, None),
+            PlaybackWatch::Cancelled
+        );
+        assert_eq!(
+            playback_watch(6, 7, true, Some(true)),
+            PlaybackWatch::Cancelled
+        );
+        // Generation wrap-around still compares unequal.
+        assert_eq!(
+            playback_watch(u64::MAX, 0, true, Some(true)),
+            PlaybackWatch::Cancelled
+        );
+    }
+
+    #[test]
+    fn playback_ended_by_any_other_path_cancels_the_current_watcher() {
+        // playing_id cleared with the generation otherwise unchanged (stop,
+        // selection change, session deletion): the watcher must exit rather
+        // than poll forever waiting for playing_id to return.
+        assert_eq!(
+            playback_watch(7, 7, false, Some(true)),
+            PlaybackWatch::Cancelled
+        );
+        assert_eq!(
+            playback_watch(7, 7, false, Some(false)),
+            PlaybackWatch::Cancelled
+        );
+        assert_eq!(playback_watch(7, 7, false, None), PlaybackWatch::Cancelled);
     }
 
     #[test]
