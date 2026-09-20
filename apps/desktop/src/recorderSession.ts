@@ -52,7 +52,6 @@ export async function discardRecorderHandles(handles: RecorderHandles): Promise<
 /** The stopped-capture fields the keep/discard verdict depends on. */
 export interface StoppedTakeCapture {
   readonly sampleCount: number;
-  readonly durationMs: number;
 }
 
 /** What Stop should do with the capture a take produced. */
@@ -67,8 +66,9 @@ export type StoppedTakeVerdict =
  * with samples is kept whatever its duration — a short answer such as a
  * letter or "no" is exactly the payload dictation exists for — and only a
  * capture with no samples at all is an accidental empty activation. Duration
- * is accepted so the rule stays visible, but it never discards audio alone;
- * explicit discard is a separate path that never consults this verdict.
+ * is deliberately not an input: no capture length that produced samples is
+ * ever discarded here, and explicit discard is a separate path that never
+ * consults this verdict.
  */
 export function stoppedTakeVerdict(capture: StoppedTakeCapture | undefined): StoppedTakeVerdict {
   if (capture && capture.sampleCount > 0) return { keep: true };

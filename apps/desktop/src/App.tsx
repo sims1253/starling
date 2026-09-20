@@ -1146,12 +1146,7 @@ export default function App() {
         // Any capture with samples is a real take, however short (B02): a
         // one-letter answer stays reviewable and retryable, and only an
         // empty capture — no samples at all — is an accidental activation.
-        const verdict = stoppedTakeVerdict(
-          capture && {
-            sampleCount: capture.audio.samples.length,
-            durationMs: capture.durationMs,
-          },
-        );
+        const verdict = stoppedTakeVerdict(capture && { sampleCount: capture.audio.samples.length });
 
         if (!capture || !verdict.keep) {
           await discardStreamingTake();

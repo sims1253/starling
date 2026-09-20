@@ -180,7 +180,7 @@ describe("discardRecorderHandles", () => {
 describe("stoppedTakeVerdict", () => {
   /** A short answer as the recorder captured it: 16 kHz mono, N ms long. */
   function shortAnswer(durationMs: number): StoppedTakeCapture {
-    return { sampleCount: Math.max(1, Math.round((durationMs / 1_000) * 16_000)), durationMs };
+    return { sampleCount: Math.max(1, Math.round((durationMs / 1_000) * 16_000)) };
   }
 
   it("keeps captured short answers below and at the old 250 ms cutoff (B02)", () => {
@@ -192,28 +192,24 @@ describe("stoppedTakeVerdict", () => {
   it("keeps an immediate press/release capture at the start/stop boundary", () => {
     // The shortest real take: Stop landed on the first chunk, so samples
     // exist even though essentially no time passed between press and release.
-    expect(stoppedTakeVerdict({ sampleCount: 16, durationMs: 1 })).toEqual({ keep: true });
-    expect(stoppedTakeVerdict({ sampleCount: 1, durationMs: 0 })).toEqual({ keep: true });
+    expect(stoppedTakeVerdict({ sampleCount: 16 })).toEqual({ keep: true });
+    expect(stoppedTakeVerdict({ sampleCount: 1 })).toEqual({ keep: true });
   });
 
-  it("never lets duration alone discard audio that has samples", () => {
+  it("keeps audio at every capture length — duration is not an input", () => {
+    // The verdict reads sample presence only, so a capture of any length the
+    // recorder produced samples for is kept; there is no duration that
+    // discards, by construction.
     for (const durationMs of [1, 10, 100, 249, 250, 400, 10_000]) {
       expect(stoppedTakeVerdict(shortAnswer(durationMs)).keep).toBe(true);
     }
   });
 
-  it("drops only a genuinely empty capture, however long the take ran", () => {
+  it("drops only a genuinely empty capture", () => {
     // The accidental activation the empty check exists for: no samples
-    // arrived at all. Explicit discard stays a separate path that never
-    // consults this verdict.
-    expect(stoppedTakeVerdict({ sampleCount: 0, durationMs: 0 })).toEqual({
-      keep: false,
-      reason: "empty",
-    });
-    expect(stoppedTakeVerdict({ sampleCount: 0, durationMs: 2_000 })).toEqual({
-      keep: false,
-      reason: "empty",
-    });
+    // arrived at all, whatever the recorder's clock said. Explicit discard
+    // stays a separate path that never consults this verdict.
+    expect(stoppedTakeVerdict({ sampleCount: 0 })).toEqual({ keep: false, reason: "empty" });
     expect(stoppedTakeVerdict(undefined)).toEqual({ keep: false, reason: "empty" });
   });
 });
