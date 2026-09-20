@@ -20,15 +20,10 @@ use starling_dictation::{
     player::Player,
     recorder::RecorderHandle,
     settings::{self, Settings},
-    storage::{DamagedRecord, FileSessionStore, ListedRecord, SessionStatus, SessionSummary},
-    store_v2::StoreV2,
+    storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
-use crate::{
-    input::TextField, migration::MigrationUi,
-    store::{Store, StorageKind, lock_v2, select_backend}, theme, upload::refresh_sessions,
-    views,
-};
+use crate::{input::TextField, store::Store, theme, upload::refresh_sessions, views};
 
 actions!(starling, [ToggleRecording]);
 
@@ -47,24 +42,13 @@ pub struct UnsavedWav {
 }
 
 pub struct StarlingApp {
-    /// The active storage backend for this session (E02 cutover): the v1
-    /// file store or the v2 SQLite+journals store, chosen once at startup
-    /// and never switched mid-session — a v2 failure surfaces its error;
-    /// the documented way back to v1 is a restart with the flag cleared
-    /// and the saved choice rolled back.
+    /// The recording store: storage v2, unconditionally (D14 — there is
+    /// no backend choice and no fallback). `None` only when the store
+    /// could not be opened at startup; the error is surfaced honestly and
+    /// new takes are kept in memory until it is fixed and the app is
+    /// restarted.
     pub store: Option<Store>,
-    pub storage_kind: StorageKind,
-    /// Why the active backend is active ("default", "STARLING_STORAGE_V2
-    /// is set", "your saved storage choice") — shown verbatim in settings
-    /// so the status line never over-claims.
-    pub storage_reason: &'static str,
     pub store_error: Option<String>,
-    /// The v2 handle used by the migration flow (lazily opened when the
-    /// session runs on v1; the active handle reused when it runs on v2).
-    pub migration_store: Option<Arc<std::sync::Mutex<StoreV2>>>,
-    /// The reviewed migration flow (dry-run → verified import → cutover /
-    /// rollback), driven from the settings screen.
-    pub migration: MigrationUi,
     pub player: Option<Player>,
     pub root_focus: FocusHandle,
 
@@ -234,17 +218,6 @@ pub(crate) fn banner_notice<'a>(
 /// Highest `-N` suffix attempted when dodging an existing download name.
 const MAX_DOWNLOAD_NAME_ATTEMPTS: u32 = 1_000;
 
-/// Persist the storage choice for the next start (the cutover/rollback
-/// write). Never a silent default: an unresolvable config directory or a
-/// failed save surfaces as an error, and the caller keeps the flow on its
-/// pre-confirm screen.
-fn persist_storage_choice(backend: settings::StorageBackend) -> Result<(), String> {
-    let path = Settings::default_path().map_err(|err| err.to_string())?;
-    let mut settings = Settings::load(&path);
-    settings.storage_backend = backend;
-    settings.save(&path).map_err(|err| err.to_string())
-}
-
 /// The `attempt`-th candidate name for a download: the first attempt is the
 /// requested name itself, later ones insert `-N` before the extension
 /// (`"starling-a.wav"` → `"starling-a-2.wav"`). A leading dot belongs to the
@@ -324,39 +297,20 @@ impl StarlingApp {
         let model = settings.model.clone();
         let terms_input = settings.expected_terms_input();
 
-        // E02 cutover: pick the backend once. The STARLING_STORAGE_V2 flag
-        // (existing testing semantics) wins while set; otherwise the
-        // persisted choice applies; the default is v1. An open failure is
-        // surfaced, never swapped for the other backend mid-flight.
-        let (storage_kind, storage_reason) = select_backend(
-            std::env::var(starling_dictation::store_v2::STORAGE_V2_FLAG_ENV)
-                .ok()
-                .as_deref(),
-            settings.storage_backend,
-        );
-        let (store, store_error) = match storage_kind {
-            StorageKind::V1 => match FileSessionStore::default_root()
-                .and_then(FileSessionStore::open)
-            {
-                Ok(store) => (Some(Store::V1(Arc::new(store))), None),
-                Err(err) => (
-                    None,
-                    Some(format!("Could not open saved recordings: {err}")),
-                ),
-            },
-            StorageKind::V2 => match StoreV2::default_root().and_then(StoreV2::open) {
-                Ok(store) => (
-                    Some(Store::V2(Arc::new(std::sync::Mutex::new(store)))),
-                    None,
-                ),
-                Err(err) => (
-                    None,
-                    Some(format!(
-                        "Could not open storage v2: {err}. Restart without \
-                         STARLING_STORAGE_V2 to use the v1 file store."
-                    )),
-                ),
-            },
+        // D14: storage v2 is THE store, opened unconditionally. An open
+        // failure is a hard, honest startup error — there is no other
+        // backend to fall back to and no flag to clear; the cause must be
+        // fixed and the app restarted.
+        let (store, store_error) = match Store::open() {
+            Ok(store) => (Some(store), None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "Could not open the recording store (storage v2): {err}. There is no \
+                     fallback store — fix the cause and restart. Until then, new recordings are \
+                     kept in memory only and can be downloaded from the unsaved list."
+                )),
+            ),
         };
 
         let player = Player::new().ok();
@@ -369,11 +323,7 @@ impl StarlingApp {
             capture_warning: None,
             export_notice: None,
             store,
-            storage_kind,
-            storage_reason,
             store_error,
-            migration_store: None,
-            migration: MigrationUi::new(),
             player,
             root_focus: cx.focus_handle(),
             endpoint,
@@ -407,77 +357,38 @@ impl StarlingApp {
 
     pub fn init(&mut self, cx: &mut Context<Self>) {
         if let Some(store) = self.store.clone() {
-            let list_store = store.clone();
-            let fix_store = store.clone();
             cx.spawn(async move |this, cx| {
-                let listed = cx
-                    .background_spawn(async move { list_store.list() })
-                    .await;
-                match listed {
-                    Ok(records) => {
-                        let interrupted: Vec<String> = records
-                            .iter()
-                            .filter_map(|record| match record {
-                                ListedRecord::Session(summary)
-                                    if summary.status == SessionStatus::Transcribing =>
-                                {
-                                    Some(summary.id.clone())
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if !interrupted.is_empty() {
-                            let note = "Interrupted before the server returned a transcript. Your audio is ready to retry.".to_string();
-                            let fix = cx.background_spawn(async move {
-                                for id in interrupted {
-                                    let _ = fix_store.save_failure(&id, &note);
-                                }
-                            });
-                            fix.await;
-                        }
-
-                        // Startup recovery, per backend (E02 cutover): v1
-                        // scans the journals directory for takes the
-                        // previous run never saved; v2 reconciles journals
-                        // and metadata rows (§4) and fails stale
-                        // recognition attempts. Findings surface through
-                        // the same banner; recovery is never a reason to
-                        // abort startup.
-                        let recovered = {
-                            let store = store.clone();
-                            cx.background_spawn(async move { store.startup_recovery() })
-                                .await
-                        };
-                        match recovered {
-                            Ok(summary) if !summary.is_empty() => {
-                                this.update(cx, |app, cx| {
-                                    app.error = Some(summary);
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                this.update(cx, |app, cx| {
-                                    app.error = Some(format!(
-                                        "Could not recover interrupted recordings: {err}"
-                                    ));
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                        }
-
-                        refresh_sessions(&this, &store, cx).await;
+                // Startup recovery, v2 (§4): reconcile journals against the
+                // metadata rows and fail recognition attempts a previous
+                // run left "started" (the "stuck in Transcribing" fix —
+                // same note, same outcome). Findings surface through the
+                // error banner; recovery is never a reason to abort
+                // startup.
+                let recovered = {
+                    let store = store.clone();
+                    cx.background_spawn(async move { store.startup_recovery() }).await
+                };
+                match recovered {
+                    Ok(summary) if !summary.is_empty() => {
+                        this.update(cx, |app, cx| {
+                            app.error = Some(summary);
+                            cx.notify();
+                        })
+                        .ok();
                     }
+                    Ok(_) => {}
                     Err(err) => {
                         this.update(cx, |app, cx| {
-                            app.error = Some(format!("Could not open saved recordings: {err}"));
+                            app.error = Some(format!(
+                                "Could not recover interrupted recordings: {err}"
+                            ));
                             cx.notify();
                         })
                         .ok();
                     }
                 }
+
+                refresh_sessions(&this, &store, cx).await;
             })
             .detach();
         }
@@ -599,294 +510,6 @@ impl StarlingApp {
         self.check_health(draft, cx);
     }
 
-    // ------------------------------------------------------------------
-    // Storage migration (E02 cutover phase 1): every destructive or
-    // persisting step sits behind the reviewed-flow state machine, and the
-    // v1 originals are never touched by any path (the core imports by
-    // copy; rollback quarantines the copies).
-    // ------------------------------------------------------------------
-
-    /// The v2 handle for the migration flow: the active backend's handle
-    /// when running v2, otherwise a lazily opened one (the v2 skeleton is
-    /// only created when the user actually starts the flow).
-    fn migration_v2_handle(&mut self, cx: &mut Context<Self>) -> Option<Arc<std::sync::Mutex<StoreV2>>> {
-        if let Some(handle) = &self.migration_store {
-            return Some(handle.clone());
-        }
-        let handle = match self.store.as_ref().and_then(Store::as_v2) {
-            Some(active) => active,
-            None => match StoreV2::default_root().and_then(StoreV2::open) {
-                Ok(store) => Arc::new(std::sync::Mutex::new(store)),
-                Err(err) => {
-                    self.error = Some(format!("Could not open storage v2 for migration: {err}"));
-                    cx.notify();
-                    return None;
-                }
-            },
-        };
-        self.migration_store = Some(handle.clone());
-        Some(handle)
-    }
-
-    /// The v1 store root the migration reads (and only reads).
-    fn migration_v1_root(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
-        match FileSessionStore::default_root() {
-            Ok(root) => Some(root),
-            Err(err) => {
-                self.error = Some(format!("Could not resolve the v1 recordings directory: {err}"));
-                cx.notify();
-                None
-            }
-        }
-    }
-
-    pub fn migration_start_dry_run(&mut self, cx: &mut Context<Self>) {
-        if self.migration.busy {
-            return;
-        }
-        let Some(handle) = self.migration_v2_handle(cx) else {
-            return;
-        };
-        let Some(v1_root) = self.migration_v1_root(cx) else {
-            return;
-        };
-        self.migration.busy = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let report = {
-                let handle = handle.clone();
-                cx.background_spawn(async move {
-                    let mut store = lock_v2(&handle);
-                    store.migrate_v1_dry_run(&v1_root)
-                })
-                .await
-            };
-            this.update(cx, |app, _| match report {
-                Ok(report) => {
-                    app.migration.dry_run_finished(report);
-                }
-                Err(err) => {
-                    app.migration.op_failed();
-                    app.error = Some(format!(
-                        "Migration preview failed: {err}. Nothing was changed."
-                    ));
-                }
-            })
-            .ok();
-            // Notify for the phase change either way.
-            this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
-    }
-
-    pub fn migration_arm_apply(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.arm_apply() {
-            self.error = Some(reason.to_string());
-        }
-        cx.notify();
-    }
-
-    pub fn migration_cancel_apply(&mut self, cx: &mut Context<Self>) {
-        self.migration.cancel_apply();
-        cx.notify();
-    }
-
-    pub fn migration_confirm_apply(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.apply_confirmed() {
-            self.error = Some(reason.to_string());
-            cx.notify();
-            return;
-        }
-        let Some(handle) = self.migration_v2_handle(cx) else {
-            self.migration.op_failed();
-            return;
-        };
-        let Some(v1_root) = self.migration_v1_root(cx) else {
-            self.migration.op_failed();
-            return;
-        };
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let report = {
-                let handle = handle.clone();
-                cx.background_spawn(async move {
-                    let mut store = lock_v2(&handle);
-                    store.migrate_v1_apply(&v1_root)
-                })
-                .await
-            };
-            let applied = this
-                .update(cx, |app, cx| match report {
-                    Ok(report) => {
-                        let _ = app.migration.apply_finished(report);
-                        cx.notify();
-                        true
-                    }
-                    Err(err) => {
-                        app.migration.op_failed();
-                        app.error = Some(format!(
-                            "Migration failed: {err}. Nothing in your v1 recordings was \
-                             touched; the preview is still available."
-                        ));
-                        cx.notify();
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            // An apply changed what the history lists when v2 is the
-            // active backend; refresh either way so the screen never lies.
-            if applied {
-                let store = this.update(cx, |app, _| app.store.clone()).ok().flatten();
-                if let Some(store) = store {
-                    refresh_sessions(&this, &store, cx).await;
-                }
-            }
-        })
-        .detach();
-    }
-
-    pub fn migration_arm_cutover(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.arm_cutover() {
-            self.error = Some(reason.to_string());
-        }
-        cx.notify();
-    }
-
-    pub fn migration_cancel_cutover(&mut self, cx: &mut Context<Self>) {
-        self.migration.cancel_cutover();
-        cx.notify();
-    }
-
-    pub fn migration_confirm_cutover(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.cutover_confirmed() {
-            self.error = Some(reason.to_string());
-            cx.notify();
-            return;
-        }
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let saved = cx
-                .background_spawn(async move {
-                    persist_storage_choice(settings::StorageBackend::V2)
-                })
-                .await;
-            this.update(cx, |app, _| match saved {
-                Ok(()) => {
-                    let _ = app.migration.cutover_finished();
-                }
-                Err(err) => {
-                    app.migration.op_failed();
-                    app.error = Some(format!(
-                        "Could not save the storage choice: {err}. v1 remains the store of \
-                         record; nothing else changed."
-                    ));
-                }
-            })
-            .ok();
-            this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
-    }
-
-    pub fn migration_arm_rollback(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.arm_rollback() {
-            self.error = Some(reason.to_string());
-        }
-        cx.notify();
-    }
-
-    pub fn migration_cancel_rollback(&mut self, cx: &mut Context<Self>) {
-        self.migration.cancel_rollback();
-        cx.notify();
-    }
-
-    pub fn migration_confirm_rollback(&mut self, cx: &mut Context<Self>) {
-        if let Err(reason) = self.migration.rollback_confirmed() {
-            self.error = Some(reason.to_string());
-            cx.notify();
-            return;
-        }
-        let Some(batch) = self.migration.applied_batch.clone() else {
-            self.migration.op_failed();
-            return;
-        };
-        let Some(handle) = self.migration_v2_handle(cx) else {
-            self.migration.op_failed();
-            return;
-        };
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let outcome = {
-                let handle = handle.clone();
-                let batch = batch.clone();
-                cx.background_spawn(async move {
-                    let mut store = lock_v2(&handle);
-                    let discarded = store.rollback_import(&batch)?;
-                    // A cutover that had persisted the v2 choice goes back
-                    // with the import it vouched for.
-                    let reset_choice = match Settings::default_path() {
-                        Ok(path) if Settings::load(&path).storage_backend
-                            == settings::StorageBackend::V2 =>
-                        {
-                            let mut settings = Settings::load(&path);
-                            settings.storage_backend = settings::StorageBackend::V1;
-                            settings.save(&path).map_err(|err| err.to_string())
-                        }
-                        _ => Ok(()),
-                    };
-                    Ok::<_, starling_dictation::store_v2::StoreV2Error>((discarded, reset_choice))
-                })
-                .await
-            };
-            let rolled_back = this
-                .update(cx, |app, cx| match outcome {
-                    Ok((discarded, Ok(()))) => {
-                        let _ = app.migration.rollback_finished(discarded);
-                        cx.notify();
-                        true
-                    }
-                    Ok((discarded, Err(err))) => {
-                        // The rows are gone; the saved choice is not. Say
-                        // exactly that instead of pretending a clean state.
-                        app.migration.op_failed();
-                        app.error = Some(format!(
-                            "Rolled back {discarded} imported recordings, but resetting your \
-                             saved storage choice failed: {err}. Clear STARLING_STORAGE_V2 or \
-                             retry the rollback to finish switching back."
-                        ));
-                        cx.notify();
-                        false
-                    }
-                    Err(err) => {
-                        app.migration.op_failed();
-                        app.error = Some(format!(
-                            "Rollback failed: {err}. The v1 originals were never touched."
-                        ));
-                        cx.notify();
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            if rolled_back {
-                let store = this.update(cx, |app, _| app.store.clone()).ok().flatten();
-                if let Some(store) = store {
-                    refresh_sessions(&this, &store, cx).await;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// After a finished flow (cutover or rollback), clear the screen back
-    /// to the dry-run entry point.
-    pub fn migration_reset(&mut self, cx: &mut Context<Self>) {
-        if self.migration.busy {
-            return;
-        }
-        self.migration = MigrationUi::new();
-        cx.notify();
-    }
-
     pub fn save_settings(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
         let clean = draft.trim().trim_end_matches('/').to_string();
@@ -903,21 +526,12 @@ impl StarlingApp {
         self.model = draft_model;
         self.expected_terms_input = self.draft_terms.read(cx).value();
 
-        // The storage choice is owned by the migration flow (cutover /
-        // rollback persist it themselves); a connection save carries the
-        // current choice through untouched.
-        let storage_backend = if self.migration.cutover_persisted {
-            settings::StorageBackend::V2
-        } else {
-            Settings::load_or_default().storage_backend
-        };
         let mut settings = Settings {
             endpoint: self.endpoint.clone(),
             protocol: self.protocol,
             model: self.model.clone(),
             expected_terms: Vec::new(),
             user_set_model: self.user_set_model,
-            storage_backend,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
 
@@ -1374,6 +988,7 @@ impl Render for StarlingApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_dictation::storage::SessionStatus;
 
     /// A fresh scratch directory under the system temp dir, removed first so
     /// reruns start clean. Each test uses its own tag.

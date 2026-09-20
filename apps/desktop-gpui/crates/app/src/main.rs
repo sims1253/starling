@@ -3,7 +3,6 @@
 mod app;
 mod assets;
 mod input;
-mod migration;
 mod store;
 mod theme;
 mod upload;

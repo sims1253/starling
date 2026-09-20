@@ -1,10 +1,9 @@
 //! Storage v2 core (I2, `docs/program/design/e17-native-runtime.md` §4).
 //!
-//! One data root — `<data-root>/starling-gpui/` — holds both stores side by
-//! side during the transition: the v1 `sessions/` + `journals/` trees (the
-//! default until the user completes the reviewed migration flow; see
-//! [`STORAGE_V2_FLAG_ENV`] and the cutover step of the migration below)
-//! and the v2 layout:
+//! This is THE store (D14: no backwards compatibility of any kind — the
+//! v1 file store remains in the tree only where the runtime state machine
+//! and journal recovery still reference it). The data root —
+//! `<data-root>/starling-gpui/` — holds the v2 layout:
 //!
 //! ```text
 //! <root>/starling.db   SQLite (WAL) transactional metadata
@@ -65,31 +64,17 @@
 //! - tombstoned ids (a `tombstones` row or a file under `quarantine/`,
 //!   R21 semantics) stay dead — recovery never resurrects a confirmed
 //!   deletion, and an interrupted delete is completed, not half-kept.
-//!
-//! # Migration (additive, reversible, dry-run)
-//!
-//! [`StoreV2::migrate_v1_dry_run`] / [`StoreV2::migrate_v1_apply`] import
-//! the v1 [`crate::storage::FileSessionStore`] directories: copies only
-//! (originals are never rewritten), verified by per-record content hashes
-//! in the *sample domain* plus counts — not just row counts — with a
-//! `migration_report.json` written for user review before any cutover.
-//! Unknown v1 manifest fields land in `extra_json`. Rollback
-//! ([`StoreV2::rollback_import`]) discards the imported rows and
-//! quarantines their journals; the v1 originals are untouched throughout.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::audio::{PcmAudio, decode_pcm16_wav};
+use crate::audio::decode_pcm16_wav;
 use crate::journal::{
     self, JournalWriter, read_journal, samples_hash, seal_recovered_journal, sync_dir,
 };
-use crate::storage::{
-    DictationSession, FileSessionStore, SessionStatus, TranscriptionResult, is_safe_path_component,
-    now_iso,
-};
+use crate::storage::{is_safe_path_component, now_iso};
 
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
@@ -109,13 +94,10 @@ const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
 const DB_FILE: &str = "starling.db";
 
-/// The migration report file written beside the database for user review.
-pub const MIGRATION_REPORT_FILE: &str = "migration_report.json";
-
-/// Environment variable that opts the app into the v2 store (E02 cutover
-/// phase 1: the app selects the backend at startup — the flag while set,
-/// otherwise the persisted `storageBackend` choice written by the
-/// reviewed migration flow's cutover step, otherwise v1).
+/// Environment variable the runtime state machine's capture store uses to
+/// opt its persistence into v2 (I2: v2 ships alongside v1 there, with no
+/// automatic switchover). The desktop app itself runs v2 unconditionally
+/// (D14) and never reads this flag.
 pub const STORAGE_V2_FLAG_ENV: &str = "STARLING_STORAGE_V2";
 
 /// The §4 schema, in one place. `CREATE ... IF NOT EXISTS` throughout so
@@ -323,7 +305,7 @@ impl AttemptRecord {
 
     /// The v1-shaped transcript this attempt carries, when it has one: the
     /// verbatim result a writer preserved in `extra_json` (the shape both
-    /// the app and the v1 migration write).
+    /// the app writes).
     pub fn transcript(&self) -> Option<crate::storage::TranscriptionResult> {
         self.extra_json
             .as_deref()
@@ -558,8 +540,7 @@ impl StoreV2 {
     }
 
     /// [`Self::begin_take`] with a caller-chosen id and journal sample
-    /// rate — the migration path (the v1 session id becomes the capture
-    /// id so imports are traceable and re-runnable).
+    /// rate (the WAV-save path, which mints its own id).
     fn begin_take_with_id(
         &self,
         id: String,
@@ -792,26 +773,6 @@ impl StoreV2 {
             attempts.push(row?);
         }
         Ok(attempts)
-    }
-
-    fn meta_get(&self, key: &str) -> Result<Option<String>, StoreV2Error> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    fn meta_set(&mut self, key: &str, value: &str) -> Result<(), StoreV2Error> {
-        self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1236,261 +1197,9 @@ impl StoreV2 {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // v1 migration (additive, reversible, dry-run).
-    // ------------------------------------------------------------------
-
-    /// Dry-run: classify the v1 store and hash every importable record
-    /// without writing anything to v2. The report is written to
-    /// `<root>/migration_report.json` for user review.
-    pub fn migrate_v1_dry_run(
-        &mut self,
-        v1_root: impl AsRef<Path>,
-    ) -> Result<MigrationReport, StoreV2Error> {
-        let v1_root = v1_root.as_ref();
-        let batch_id = format!("mig_{}", uuid::Uuid::new_v4().simple());
-        let (planned, skipped) = plan_v1_import(v1_root)?;
-        let report = MigrationReport::for_plan(&batch_id, v1_root, &planned, skipped, true);
-        self.write_migration_report(&report)?;
-        Ok(report)
-    }
-
-    /// Verified import: each importable v1 record is copied through the §4
-    /// crash protocol into v2 (staging journal → finalize → promote →
-    /// commit), then verified by re-reading the journal and comparing
-    /// sample-domain content hashes and counts. Originals are only ever
-    /// read. The verified report is written to
-    /// `<root>/migration_report.json`; the batch id it carries is the
-    /// rollback handle ([`Self::rollback_import`]).
-    pub fn migrate_v1_apply(
-        &mut self,
-        v1_root: impl AsRef<Path>,
-    ) -> Result<MigrationReport, StoreV2Error> {
-        let v1_root = v1_root.as_ref();
-        let batch_id = format!("mig_{}", uuid::Uuid::new_v4().simple());
-        let (planned, skipped) = plan_v1_import(v1_root)?;
-        let mut report = MigrationReport::for_plan(&batch_id, v1_root, &planned, skipped, false);
-
-        for planned_record in &planned {
-            let entry = report.records.iter_mut().find(|r| r.id == planned_record.id);
-            let entry = match entry {
-                Some(entry) => entry,
-                None => continue,
-            };
-            match self.import_one(&batch_id, planned_record) {
-                Ok(ImportOutcome {
-                    journal_hash,
-                    sample_hash,
-                    sample_count,
-                }) => {
-                    entry.dest_journal_hash = Some(journal_hash);
-                    entry.dest_sample_hash = Some(sample_hash);
-                    entry.dest_sample_count = Some(sample_count);
-                    entry.verified = Some(
-                        entry.dest_sample_hash.as_deref()
-                            == Some(entry.source_sample_hash.as_str())
-                            && entry.dest_sample_count == Some(entry.source_sample_count),
-                    );
-                }
-                Err(err) => {
-                    entry.error = Some(err.to_string());
-                    entry.verified = Some(false);
-                }
-            }
-        }
-
-        report.counts.imported = report.records.iter().filter(|r| r.error.is_none()).count();
-        report.counts.verified = report
-            .records
-            .iter()
-            .filter(|r| r.verified == Some(true))
-            .count();
-        self.write_migration_report(&report)?;
-        self.meta_set(
-            &format!("migration:{batch_id}"),
-            &serde_json::to_string(&report)
-                .map_err(|err| StoreV2Error::Invalid(err.to_string()))?,
-        )?;
-        Ok(report)
-    }
-
-    fn import_one(
-        &mut self,
-        batch_id: &str,
-        planned: &PlannedRecord,
-    ) -> Result<ImportOutcome, StoreV2Error> {
-        if !is_safe_path_component(&planned.id) {
-            return Err(StoreV2Error::Invalid(format!(
-                "v1 session id {:?} is not a safe path component",
-                planned.id
-            )));
-        }
-        if self.get_capture(&planned.id)?.is_some() || self.audio_path(&planned.id).exists() {
-            return Err(StoreV2Error::Invalid(format!(
-                "destination already holds capture {}; refusing to overwrite (re-run after a \
-                 rollback if this was a retry)",
-                planned.id
-            )));
-        }
-
-        // Copy through the crash protocol: staging → finalize → promote →
-        // commit. A crash mid-import leaves a recoverable orphan, exactly
-        // like a take. The v1 session id becomes the capture id.
-        let extra = serde_json::json!({
-            "importedFrom": "file-v1",
-            "importBatch": batch_id,
-            "v1": planned.v1_extra,
-        });
-        let meta = TakeMeta {
-            tz: String::new(),
-            device: String::new(),
-            policy: "v1-import".to_string(),
-            retention_class: "standard".to_string(),
-            extra_json: Some(
-                serde_json::to_string(&extra)
-                    .map_err(|err| StoreV2Error::Invalid(err.to_string()))?,
-            ),
-        };
-        let mut take = self.begin_take_with_id(planned.id.clone(), planned.pcm.sample_rate, meta)?;
-        for chunk in planned.pcm.samples.chunks(4096) {
-            take.append_frames(chunk)?;
-        }
-        let ack = take.write_boundary()?;
-        if ack != planned.pcm.samples.len() as u64 {
-            return Err(StoreV2Error::Invalid(format!(
-                "journal acknowledged {ack} samples for {} written",
-                planned.pcm.samples.len()
-            )));
-        }
-        let finalized = take.finalize()?;
-        self.promote_from_staging(&finalized.id)?;
-        let record = CaptureRecord {
-            id: finalized.id.clone(),
-            created_utc: planned.created_utc.clone(),
-            tz: finalized.meta.tz,
-            device: finalized.meta.device,
-            actual_rate: finalized.sample_rate,
-            policy: finalized.meta.policy,
-            frame_count: finalized.total_samples,
-            ack_sample_index: finalized.total_samples,
-            journal_hash: finalized.content_hash,
-            status: if planned.v1_interrupted {
-                CaptureStatus::Interrupted
-            } else {
-                CaptureStatus::Complete
-            },
-            retention_class: finalized.meta.retention_class,
-            extra_json: finalized.meta.extra_json,
-        };
-        self.commit_capture(&record)?;
-
-        // Recognition history: one attempt row per retained transcript
-        // (history first, current last — the reading order).
-        let mut history = planned.transcript_history.clone();
-        if let Some(current) = planned.transcript.clone() {
-            history.push(current);
-        }
-        for transcript in history {
-            let extra = serde_json::to_string(&transcript)
-                .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-            self.insert_attempt(&AttemptRecord {
-                id: format!("a_{}", uuid::Uuid::new_v4().simple()),
-                capture_id: planned.id.clone(),
-                backend: "v1-import".to_string(),
-                model_hash: None,
-                language: None,
-                options_json: None,
-                text: transcript.text,
-                partial_or_final: "final".to_string(),
-                status: "completed".to_string(),
-                timing_json: None,
-                extra_json: Some(extra),
-            })?;
-        }
-
-        // Verify: re-read the journal from disk and hash its verified
-        // samples — the destination is checked in the sample domain
-        // against the source, not against what we intended to write.
-        let parsed = read_journal(&self.audio_path(&planned.id))
-            .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        Ok(ImportOutcome {
-            journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
-            sample_hash: fnv1a_hex_samples(&parsed.samples),
-            sample_count: parsed.samples.len() as u64,
-        })
-    }
-
-    fn write_migration_report(&self, report: &MigrationReport) -> Result<(), StoreV2Error> {
-        let json = serde_json::to_string_pretty(report)
-            .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        std::fs::write(self.root.join(MIGRATION_REPORT_FILE), json)?;
-        Ok(())
-    }
-
-    /// The stored report of a completed migration batch (see
-    /// [`Self::migrate_v1_apply`]), for review before cutover and as the
-    /// record of what a rollback would discard.
-    pub fn migration_report(&self, batch_id: &str) -> Result<Option<MigrationReport>, StoreV2Error> {
-        match self.meta_get(&format!("migration:{batch_id}"))? {
-            None => Ok(None),
-            Some(text) => serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|err| StoreV2Error::Invalid(format!("stored migration report: {err}"))),
-        }
-    }
-
-    /// Rollback (reversible migration): discard every row imported by
-    /// `batch_id` — their journals are moved into `quarantine/` (never
-    /// unlinked; reconciliation treats them as tombstoned) — and drop the
-    /// batch's `meta` entry. The v1 originals are of course untouched.
-    /// Returns how many captures were discarded.
-    pub fn rollback_import(&mut self, batch_id: &str) -> Result<usize, StoreV2Error> {
-        let marker = format!("\"importBatch\":\"{batch_id}\"");
-        let mut ids = Vec::new();
-        {
-            let mut stmt = self.conn.prepare("SELECT id, extra_json FROM captures")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
-            for row in rows {
-                let (id, extra) = row?;
-                if extra.as_deref().is_some_and(|text| text.contains(&marker)) {
-                    ids.push(id);
-                }
-            }
-        }
-
-        for id in &ids {
-            let audio = self.audio_path(id);
-            if audio.exists() {
-                std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
-                let destination = self.quarantine_path(id);
-                let _ = std::fs::remove_file(&destination);
-                std::fs::rename(&audio, &destination)?;
-                sync_dir(&self.root.join(AUDIO_DIR))?;
-                sync_dir(&self.root.join(QUARANTINE_DIR))?;
-            }
-        }
-
-        let tx = self.conn.transaction()?;
-        for id in &ids {
-            tx.execute(
-                "INSERT OR REPLACE INTO tombstones(id, kind, deleted_utc, retention)
-                 VALUES (?1, 'migration-rollback', ?2, 'quarantined')",
-                params![id, now_iso()],
-            )?;
-            tx.execute("DELETE FROM captures WHERE id = ?1", params![id])?;
-        }
-        tx.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![format!("migration:{batch_id}")],
-        )?;
-        tx.commit()?;
-        Ok(ids.len())
-    }
 
     // ------------------------------------------------------------------
-    // Daily-use operations (E02 cutover phase 1).
+    // Daily-use operations.
     // ------------------------------------------------------------------
 
     /// Adopts a finalized (or faulted) capture journal written elsewhere —
@@ -1502,7 +1211,7 @@ impl StoreV2 {
     /// the `captures` row committed. The source is only ever read and
     /// moved — if any step fails before the rename it stays exactly where
     /// it was. The capture id is the journal's file stem, so an adopted
-    /// take stays traceable to its origin (same rule as the migration).
+    /// take stays traceable to its origin.
     pub fn adopt_journal(
         &mut self,
         source: impl AsRef<Path>,
@@ -1714,8 +1423,7 @@ impl StoreV2 {
 
     /// [`Self::finish_recognition`] with the v1-shaped transcript result:
     /// the full result (text, segments, duration, request id) is preserved
-    /// verbatim in the attempt row — the same shape the v1 migration
-    /// writes, so one reader serves both.
+    /// verbatim in the attempt row.
     pub fn finish_recognition_transcript(
         &mut self,
         capture_id: &str,
@@ -1966,141 +1674,13 @@ pub struct RecoveredTake {
     pub torn_tail_bytes: u64,
 }
 
-/// The JSON migration report produced for user review before any cutover.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigrationReport {
-    /// Report format version (independent of the DB schema version).
-    pub schema_version: u32,
-    pub generated_at: String,
-    pub source_root: String,
-    pub dry_run: bool,
-    pub batch_id: String,
-    pub counts: MigrationCounts,
-    pub records: Vec<MigratedRecord>,
-    pub skipped_damaged: Vec<SkippedRecord>,
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigrationCounts {
-    /// Readable v1 records found (sessions plus recovered orphans).
-    pub source_sessions: usize,
-    /// v1 records too damaged to read.
-    pub source_damaged: usize,
-    /// Records copied into v2 without error.
-    pub imported: usize,
-    /// Records whose re-read destination content hash + count matched the
-    /// source exactly.
-    pub verified: usize,
-    /// Damaged records listed in `skipped_damaged`.
-    pub skipped_damaged: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigratedRecord {
-    pub id: String,
-    /// "session" (manifest present) or "orphan" (WAV-only directory).
-    pub category: String,
-    pub v1_status: String,
-    /// FNV-1a 64 hex over the source `recording.wav` bytes.
-    pub source_wav_hash: String,
-    /// FNV-1a 64 hex over the source's decoded f32 samples (little-endian
-    /// bit patterns) — the domain the destination is verified in.
-    pub source_sample_hash: String,
-    pub source_sample_count: u64,
-    pub dest_journal_hash: Option<String>,
-    pub dest_sample_hash: Option<String>,
-    pub dest_sample_count: Option<u64>,
-    pub verified: Option<bool>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkippedRecord {
-    pub id: String,
-    pub reason: String,
-}
-
-/// Internal: everything needed to import one v1 record.
-struct PlannedRecord {
-    id: String,
-    category: &'static str,
-    v1_interrupted: bool,
-    v1_status: String,
-    created_utc: String,
-    transcript: Option<TranscriptionResult>,
-    transcript_history: Vec<TranscriptionResult>,
-    pcm: PcmAudio,
-    wav_hash: String,
-    sample_hash: String,
-    v1_extra: serde_json::Value,
-}
-
-struct ImportOutcome {
-    journal_hash: String,
-    sample_hash: String,
-    sample_count: u64,
-}
-
-impl MigrationReport {
-    fn for_plan(
-        batch_id: &str,
-        source_root: &Path,
-        planned: &[PlannedRecord],
-        skipped: Vec<SkippedRecord>,
-        dry_run: bool,
-    ) -> Self {
-        let records = planned
-            .iter()
-            .map(|record| MigratedRecord {
-                id: record.id.clone(),
-                category: record.category.to_string(),
-                v1_status: record.v1_status.clone(),
-                source_wav_hash: record.wav_hash.clone(),
-                source_sample_hash: record.sample_hash.clone(),
-                source_sample_count: record.pcm.samples.len() as u64,
-                dest_journal_hash: None,
-                dest_sample_hash: None,
-                dest_sample_count: None,
-                verified: None,
-                error: None,
-            })
-            .collect();
-        let counts = MigrationCounts {
-            source_sessions: planned.len(),
-            source_damaged: skipped.len(),
-            imported: 0,
-            verified: 0,
-            skipped_damaged: skipped.len(),
-        };
-        Self {
-            schema_version: 1,
-            generated_at: now_iso(),
-            source_root: source_root.display().to_string(),
-            dry_run,
-            batch_id: batch_id.to_string(),
-            counts,
-            records,
-            skipped_damaged: skipped,
-        }
-    }
-
-    /// The path this report is written to under the store root.
-    pub fn path_for_root(root: &Path) -> PathBuf {
-        root.join(MIGRATION_REPORT_FILE)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Free helpers.
 // ---------------------------------------------------------------------------
 
-/// Whether the testing flag is on. The app combines it with the persisted
-/// backend choice at startup (E02 cutover phase 1): the flag wins while
-/// set, otherwise the saved choice applies, otherwise v1.
+/// Whether the testing flag is on. Only the runtime state machine reads
+/// it (see [`STORAGE_V2_FLAG_ENV`]); the desktop app runs v2
+/// unconditionally (D14).
 pub fn v2_enabled_for_testing() -> bool {
     v2_enabled_from(std::env::var(STORAGE_V2_FLAG_ENV).ok().as_deref())
 }
@@ -2171,151 +1751,6 @@ fn journal_ids_in(dir: &Path) -> Vec<String> {
     ids
 }
 
-/// FNV-1a 64 over raw bytes, hex-encoded — the house content hash.
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-/// The v1 manifest keys this migration understands; anything else is an
-/// unknown field and lands in `extra_json` verbatim.
-const KNOWN_V1_MANIFEST_FIELDS: &[&str] = &[
-    "schemaVersion",
-    "id",
-    "createdAt",
-    "updatedAt",
-    "status",
-    "audioFile",
-    "durationMs",
-    "attemptCount",
-    "transcript",
-    "transcriptHistory",
-    "lastError",
-    "journalId",
-];
-
-/// Classify a v1 store for migration. Readable records (including
-/// recovered orphans — G02's classification) become [`PlannedRecord`]s
-/// with source hashes; damaged records become skips with reasons.
-/// Originals are only read.
-fn plan_v1_import(v1_root: &Path) -> Result<(Vec<PlannedRecord>, Vec<SkippedRecord>), StoreV2Error> {
-    let store = FileSessionStore::open(v1_root)?;
-    let mut planned = Vec::new();
-    let mut skipped = Vec::new();
-
-    for record in store.list_records()? {
-        match record {
-            crate::storage::ListedRecord::Session(summary) => {
-                let Some(session) = store.get(&summary.id)? else {
-                    skipped.push(SkippedRecord {
-                        id: summary.id.clone(),
-                        reason: "record vanished while planning the migration".to_string(),
-                    });
-                    continue;
-                };
-                match plan_one(v1_root, &session) {
-                    Ok(record) => planned.push(record),
-                    Err(reason) => skipped.push(SkippedRecord {
-                        id: session.id,
-                        reason,
-                    }),
-                }
-            }
-            crate::storage::ListedRecord::Damaged(damaged) => {
-                skipped.push(SkippedRecord {
-                    id: damaged.id,
-                    reason: damaged.reason,
-                });
-            }
-        }
-    }
-
-    planned.sort_by(|left, right| left.id.cmp(&right.id));
-    skipped.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok((planned, skipped))
-}
-
-/// Build one [`PlannedRecord`]: decode the WAV (the sample-domain hashes
-/// are computed over its decoded samples), collect unknown manifest
-/// fields.
-fn plan_one(v1_root: &Path, session: &DictationSession) -> Result<PlannedRecord, String> {
-    let dir = v1_root.join(&session.id);
-    let wav_path = dir.join("recording.wav");
-    let wav_bytes =
-        std::fs::read(&wav_path).map_err(|err| format!("recording.wav: {err}"))?;
-    let pcm = decode_pcm16_wav(&wav_bytes)
-        .map_err(|err| format!("recording.wav does not decode: {err}"))?;
-
-    // Unknown manifest fields → extra_json, verbatim values.
-    let mut v1_extra = serde_json::Map::new();
-    if let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) {
-        if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            let unknown: serde_json::Map<String, serde_json::Value> = fields
-                .into_iter()
-                .filter(|(key, _)| !KNOWN_V1_MANIFEST_FIELDS.contains(&key.as_str()))
-                .collect();
-            if !unknown.is_empty() {
-                v1_extra.insert("unknownFields".to_string(), unknown.into());
-            }
-        }
-    }
-    v1_extra.insert(
-        "status".to_string(),
-        serde_json::Value::String(status_to_text(session.status).to_string()),
-    );
-    if let Some(duration) = session.duration_ms {
-        v1_extra.insert("durationMs".to_string(), serde_json::json!(duration));
-    }
-    v1_extra.insert("attemptCount".to_string(), serde_json::json!(session.attempt_count));
-    if let Some(error) = &session.last_error {
-        v1_extra.insert("lastError".to_string(), serde_json::json!(error));
-    }
-    if let Some(journal_id) = &session.journal_id {
-        v1_extra.insert("journalId".to_string(), serde_json::json!(journal_id));
-    }
-
-    let category = if dir.join("manifest.json").exists() {
-        "session"
-    } else {
-        "orphan"
-    };
-    let samples = &pcm.samples;
-    Ok(PlannedRecord {
-        id: session.id.clone(),
-        category,
-        v1_interrupted: session.status == SessionStatus::Interrupted,
-        v1_status: status_to_text(session.status).to_string(),
-        created_utc: session.created_at.clone(),
-        transcript: session.transcript.clone(),
-        transcript_history: session.transcript_history.clone(),
-        sample_hash: fnv1a_hex_samples(samples),
-        wav_hash: fnv1a_hex(&wav_bytes),
-        pcm,
-        v1_extra: serde_json::Value::Object(v1_extra),
-    })
-}
-
-/// Sample-domain hash: FNV-1a 64 over the little-endian bit patterns of
-/// the f32 samples — identical to what a journal seals into its trailer,
-/// so source and destination compare without re-encoding WAV headers.
-fn fnv1a_hex_samples(samples: &[f32]) -> String {
-    format!("{:016x}", samples_hash(samples))
-}
-
-fn status_to_text(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Captured => "captured",
-        SessionStatus::Transcribing => "transcribing",
-        SessionStatus::Transcribed => "transcribed",
-        SessionStatus::Failed => "failed",
-        SessionStatus::Interrupted => "interrupted",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -2916,7 +2351,7 @@ mod tests {
         }
     }
 
-    // ---- migration ----------------------------------------------------
+    // ---- hand-built WAV fixture ---------------------------------------
 
     /// A minimal canonical WAV built by hand (same shape the storage tests
     /// use) so this suite stays independent of the audio encoder.
@@ -2947,316 +2382,7 @@ mod tests {
         wav
     }
 
-    /// The mixed v1 fixture: good sessions (one with transcripts and
-    /// history, one with unknown manifest fields), an orphan, and every
-    /// damaged shape. Returns (tempdir, expected readable ids).
-    fn mixed_v1_store() -> (TempDir, Vec<String>) {
-        let temp = TempDir::new().expect("tempdir");
-        let store = FileSessionStore::open(temp.path().join("sessions"))
-            .expect("open v1 store");
-
-        let plain = store
-            .create(wav_bytes(&ramp(100, 0)), Some(100.0))
-            .expect("plain session");
-
-        let transcribed = store
-            .create(wav_bytes(&ramp(150, 100)), None)
-            .expect("transcribed session");
-        store
-            .save_transcript(
-                &transcribed.id,
-                TranscriptionResult {
-                    text: "first pass".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .expect("first transcript");
-        store
-            .save_transcript(
-                &transcribed.id,
-                TranscriptionResult {
-                    text: "second pass".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: Some("req-2".to_string()),
-                },
-            )
-            .expect("second transcript");
-
-        let interrupted = store
-            .create_with_journal(wav_bytes(&ramp(80, 250)), Some(80.0), Some("j_v1"))
-            .expect("interrupted session");
-        store
-            .mark_interrupted(&interrupted.id, "torn tail of 12 bytes")
-            .expect("mark interrupted");
-
-        // Unknown manifest fields from a future v1 writer.
-        let unknown = store.create(wav_bytes(&ramp(60, 330)), None).expect("unknown");
-        let manifest_path = temp
-            .path()
-            .join("sessions")
-            .join(&unknown.id)
-            .join("manifest.json");
-        let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
-        let mut manifest: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        manifest
-            .as_object_mut()
-            .expect("object")
-            .insert("futureField".into(), serde_json::json!({"a": 1}));
-        manifest
-            .as_object_mut()
-            .expect("object")
-            .insert("anotherUnknown".into(), serde_json::json!("kept verbatim"));
-        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
-            .expect("rewrite manifest");
-
-        // A WAV-only orphan directory.
-        let orphan_dir = temp.path().join("sessions").join("orphan-take");
-        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
-        std::fs::write(orphan_dir.join("recording.wav"), wav_bytes(&ramp(70, 400)))
-            .expect("orphan wav");
-
-        // Damaged shapes the migration must skip, not choke on.
-        let missing_wav = store.create(wav_bytes(&ramp(10, 0)), None).expect("missing wav");
-        std::fs::remove_file(
-            temp.path().join("sessions").join(&missing_wav.id).join("recording.wav"),
-        )
-        .expect("remove wav");
-
-        let garbage_dir = temp.path().join("sessions").join("garbage-wav");
-        std::fs::create_dir_all(&garbage_dir).expect("garbage dir");
-        std::fs::write(garbage_dir.join("recording.wav"), b"not audio").expect("garbage wav");
-
-        let mut ids = vec![
-            plain.id.clone(),
-            transcribed.id.clone(),
-            interrupted.id.clone(),
-            unknown.id.clone(),
-            "orphan-take".to_string(),
-        ];
-        ids.sort();
-        (temp, ids)
-    }
-
-    /// Snapshot every file under `dir` as (path, hash) for byte-identity
-    /// checks.
-    fn snapshot(dir: &Path) -> Vec<(PathBuf, String)> {
-        let mut files = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(current) = stack.pop() {
-            for entry in std::fs::read_dir(&current).expect("read dir") {
-                let path = entry.expect("entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let bytes = std::fs::read(&path).expect("read file");
-                    files.push((path, fnv1a_hex(&bytes)));
-                }
-            }
-        }
-        files.sort();
-        files
-    }
-
-    #[test]
-    fn migration_dry_run_reports_without_touching_either_side() {
-        let (v1, expected_ids) = mixed_v1_store();
-        let before = snapshot(&v1.path().join("sessions"));
-        let dir = TempDir::new().expect("tempdir");
-        let mut store = store_in(&dir);
-
-        let report = store
-            .migrate_v1_dry_run(v1.path().join("sessions"))
-            .expect("dry run");
-
-        assert!(report.dry_run);
-        assert_eq!(report.counts.source_sessions, 5, "4 sessions + 1 orphan");
-        assert_eq!(report.counts.source_damaged, 2);
-        assert_eq!(report.counts.imported, 0, "a dry run imports nothing");
-        let got: Vec<String> = {
-            let mut ids: Vec<String> = report.records.iter().map(|r| r.id.clone()).collect();
-            ids.sort();
-            ids
-        };
-        assert_eq!(got, expected_ids);
-        let skipped: Vec<String> = report
-            .skipped_damaged
-            .iter()
-            .map(|record| record.id.clone())
-            .collect();
-        assert!(skipped.contains(&"garbage-wav".to_string()));
-        assert!(
-            report
-                .skipped_damaged
-                .iter()
-                .any(|record| record.reason.contains("recording.wav")),
-            "damaged reasons are surfaced: {:?}",
-            report.skipped_damaged
-        );
-        // Orphan vs session categorization.
-        let orphan = report
-            .records
-            .iter()
-            .find(|record| record.id == "orphan-take")
-            .expect("orphan planned");
-        assert_eq!(orphan.category, "orphan");
-        assert_eq!(orphan.v1_status, "interrupted");
-
-        // Nothing entered v2…
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        assert!(journal_ids_in(&store.root.join(AUDIO_DIR)).is_empty());
-        // …but the report file exists for review.
-        assert!(MigrationReport::path_for_root(&store.root).exists());
-
-        // …and the v1 originals are byte-identical.
-        assert_eq!(snapshot(&v1.path().join("sessions")), before);
-    }
-
-    #[test]
-    fn migration_apply_verifies_hashes_and_preserves_originals() {
-        let (v1, _) = mixed_v1_store();
-        let sessions = v1.path().join("sessions");
-        let before = snapshot(&sessions);
-        let dir = TempDir::new().expect("tempdir");
-        let mut store = store_in(&dir);
-
-        let report = store.migrate_v1_apply(&sessions).expect("apply");
-        assert!(!report.dry_run);
-        assert_eq!(report.counts.imported, 5);
-        assert_eq!(report.counts.verified, 5, "every record verified");
-        assert!(report.records.iter().all(|record| record.error.is_none()));
-        for record in &report.records {
-            assert_eq!(record.verified, Some(true), "{:?}", record.id);
-            assert_eq!(
-                record.dest_sample_hash.as_deref(),
-                Some(record.source_sample_hash.as_str()),
-                "sample-domain hashes match for {}",
-                record.id
-            );
-            assert_eq!(record.dest_sample_count, Some(record.source_sample_count));
-            assert!(!record.source_wav_hash.is_empty());
-        }
-
-        // The v1 originals were only read.
-        assert_eq!(snapshot(&sessions), before, "originals byte-identical");
-
-        // v2 now lists every imported capture, metadata-only.
-        let page = store.list_records(0, 10).expect("list");
-        assert_eq!(page.total, 5);
-        for record in &page.records {
-            match record {
-                ListedCapture::Capture(listing) => {
-                    assert!(listing.problems.is_empty());
-                    // Unknown manifest fields survived in extra_json.
-                    let extra: serde_json::Value = serde_json::from_str(
-                        listing.record.extra_json.as_deref().expect("extra"),
-                    )
-                    .expect("parse extra");
-                    assert_eq!(extra["importedFrom"], "file-v1");
-                    assert_eq!(extra["importBatch"], report.batch_id);
-                    if listing.record.id == "orphan-take" {
-                        assert_eq!(listing.record.status, CaptureStatus::Interrupted);
-                        assert_eq!(extra["v1"]["status"], "interrupted");
-                    }
-                }
-                other => panic!("imported records must be clean: {other:?}"),
-            }
-        }
-
-        // The session with unknown fields carried them verbatim.
-        let unknown_row = {
-            let mut found = None;
-            for record in &page.records {
-                if let ListedCapture::Capture(listing) = record {
-                    let extra: serde_json::Value = serde_json::from_str(
-                        listing.record.extra_json.as_deref().expect("extra"),
-                    )
-                    .expect("parse");
-                    if extra["v1"]["unknownFields"]["futureField"]["a"] == serde_json::json!(1) {
-                        found = Some(listing.record.id.clone());
-                    }
-                }
-            }
-            found.expect("unknown fields landed in extra_json")
-        };
-        assert!(!unknown_row.is_empty());
-
-        // The transcribed session's history became attempts (oldest first).
-        let with_attempts = page
-            .records
-            .iter()
-            .filter_map(|record| match record {
-                ListedCapture::Capture(listing) => Some(listing.record.id.clone()),
-                _ => None,
-            })
-            .find(|id| store.attempts_for(id).expect("attempts").len() == 2)
-            .expect("history + current transcript imported");
-        let attempts = store.attempts_for(&with_attempts).expect("attempts");
-        assert_eq!(attempts[0].text, "first pass");
-        assert_eq!(attempts[1].text, "second pass");
-        assert_eq!(attempts[1].partial_or_final, "final");
-        let extra: serde_json::Value =
-            serde_json::from_str(attempts[1].extra_json.as_deref().expect("extra")).expect("parse");
-        assert_eq!(extra["requestId"], "req-2");
-
-        // Imported audio loads lazily and is bit-identical to the source
-        // samples in the sample domain.
-        let audio = store.load_audio(&unknown_row).expect("load imported audio");
-        assert!(audio.finalized);
-        let expected = decode_pcm16_wav(
-            &std::fs::read(sessions.join(&unknown_row).join("recording.wav")).expect("source wav"),
-        )
-        .expect("decode source");
-        assert_eq!(audio.samples, expected.samples);
-
-        // The verified report is on disk for review, with the batch id.
-        let raw =
-            std::fs::read_to_string(MigrationReport::path_for_root(&store.root)).expect("report");
-        let on_disk: MigrationReport = serde_json::from_str(&raw).expect("parse report");
-        assert!(!on_disk.dry_run);
-        assert_eq!(on_disk.batch_id, report.batch_id);
-        assert_eq!(on_disk.counts.verified, 5);
-
-        // A rerun without a rollback refuses to overwrite (no double import).
-        let second = store.migrate_v1_apply(&sessions).expect("rerun report");
-        assert_eq!(second.counts.imported, 0);
-        assert!(second.records.iter().all(|record| record.error.is_some()));
-        assert_eq!(store.list_records(0, 10).expect("list").total, 5);
-    }
-
-    #[test]
-    fn migration_rollback_discards_the_import_and_stays_dead() {
-        let (v1, _) = mixed_v1_store();
-        let sessions = v1.path().join("sessions");
-        let before = snapshot(&sessions);
-        let dir = TempDir::new().expect("tempdir");
-        let mut store = store_in(&dir);
-
-        let report = store.migrate_v1_apply(&sessions).expect("apply");
-        assert_eq!(store.list_records(0, 10).expect("list").total, 5);
-
-        let discarded = store.rollback_import(&report.batch_id).expect("rollback");
-        assert_eq!(discarded, 5);
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        // The imported journals were quarantined, not unlinked…
-        assert_eq!(journal_ids_in(&store.root.join(QUARANTINE_DIR)).len(), 5);
-        assert!(journal_ids_in(&store.root.join(AUDIO_DIR)).is_empty());
-        // …and reconciliation treats them as tombstoned: no resurrection.
-        let rerun = store.reconcile().expect("reconcile");
-        assert!(rerun.orphan_sessions.is_empty());
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        // The meta entry for the batch is gone.
-        assert!(store.meta_get(&format!("migration:{}", report.batch_id)).expect("meta").is_none());
-
-        // Originals still byte-identical, and a fresh import works again.
-        assert_eq!(snapshot(&sessions), before);
-        let again = store.migrate_v1_apply(&sessions).expect("re-import");
-        assert_eq!(again.counts.verified, 5);
-    }
-
-    // ---- daily-use operations (E02 cutover phase 1) --------------------
+    // ---- daily-use operations -----------------------------------------
 
     /// A finalized capture journal in the recorder's own tree, outside the
     /// store (the live-capture shape: `journals/<id>.sj`).

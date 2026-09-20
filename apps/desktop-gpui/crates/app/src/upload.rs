@@ -163,7 +163,6 @@ impl StarlingApp {
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
-            let duration_ms = handle.elapsed().as_secs_f64() * 1000.0;
             // G03: clipping is measured on the raw captured samples (before
             // the attenuation-only auto gain), so an already-clipped source
             // stays visible even when its attenuated copy peaks below
@@ -180,9 +179,8 @@ impl StarlingApp {
                     if let Some(fault) = capture_fault {
                         self.error = Some(fault);
                     }
-                    // The journal→session linkage is additive metadata on
-                    // the v1 manifest; on v2 the journal itself becomes
-                    // the stored audio (adopted by the facade).
+                    // The journal itself becomes the stored audio (adopted
+                    // by the facade).
                     let journal_report = take.journal.clone();
                     cx.notify();
                     cx.spawn(async move |this, cx| {
@@ -192,12 +190,7 @@ impl StarlingApp {
                         match encoded {
                             Ok(wav) => {
                                 this.update(cx, |app, cx| {
-                                    app.save_and_transcribe(
-                                        Arc::new(wav),
-                                        Some(duration_ms),
-                                        journal_report,
-                                        cx,
-                                    );
+                                    app.save_and_transcribe(Arc::new(wav), journal_report, cx);
                                 })
                                 .ok();
                             }
@@ -233,11 +226,6 @@ impl StarlingApp {
                     ));
                     cx.notify();
                     cx.spawn(async move |this, cx| {
-                        // Duration from the salvaged sample count at the
-                        // device rate — not the wall clock, which includes
-                        // the drain wait.
-                        let duration_ms = audio.samples.len() as f64 * 1000.0
-                            / audio.sample_rate as f64;
                         let encoded = cx
                             .background_spawn(async move {
                                 audio::encode_wav_16k(&audio)
@@ -248,7 +236,6 @@ impl StarlingApp {
                                 this.update(cx, |app, cx| {
                                     app.save_interrupted_take(
                                         Arc::new(wav),
-                                        duration_ms,
                                         journal_report,
                                         note,
                                         cx,
@@ -295,7 +282,6 @@ impl StarlingApp {
     pub fn save_and_transcribe(
         &mut self,
         wav: Arc<Vec<u8>>,
-        duration_ms: Option<f64>,
         journal: Option<recorder::JournalReport>,
         cx: &mut Context<Self>,
     ) {
@@ -320,7 +306,7 @@ impl StarlingApp {
             let create_store = store.clone();
             let created = cx
                 .background_spawn(async move {
-                    create_store.save_capture(job_wav, duration_ms, journal.as_ref())
+                    create_store.save_capture(job_wav, journal.as_ref())
                 })
                 .await;
             match created {
@@ -352,7 +338,6 @@ impl StarlingApp {
     pub fn save_interrupted_take(
         &mut self,
         wav: Arc<Vec<u8>>,
-        duration_ms: f64,
         journal: Option<recorder::JournalReport>,
         note: String,
         cx: &mut Context<Self>,
@@ -373,12 +358,7 @@ impl StarlingApp {
             let note_store = store.clone();
             let created = cx
                 .background_spawn(async move {
-                    note_store.save_interrupted_capture(
-                        job_wav,
-                        duration_ms,
-                        journal.as_ref(),
-                        &note,
-                    )
+                    note_store.save_interrupted_capture(job_wav, journal.as_ref(), &note)
                 })
                 .await;
             match created {
@@ -659,12 +639,7 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(
-                                    Arc::new(prepared.wav),
-                                    Some(prepared.duration_ms),
-                                    None,
-                                    cx,
-                                );
+                                app.save_and_transcribe(Arc::new(prepared.wav), None, cx);
                             })
                             .ok();
                         }
