@@ -140,4 +140,183 @@ private:
     Map map_;
 };
 
+// A byte-aware bounded LRU with pin (lease) semantics, for caches whose
+// entries hold captured graphs whose DEVICE cost — not their count — is the
+// resource that must stay bounded (issue #177 / experiment S02).
+//
+// Semantics:
+//   * Each entry carries a caller-supplied tracked-bytes figure (the `init`
+//     callback returns it after filling the value; the figure must not change
+//     while the entry is resident). The cache enforces a BYTE budget, not an
+//     entry cap.
+//   * Address stability: values live in unordered_map nodes and are never
+//     moved; a returned Value* stays valid until ITS key is evicted/erased.
+//   * Lease: get_pinned/get_or_init_pinned mark the entry pinned; release()
+//     unpins. PINNED ENTRIES ARE NEVER EVICTED — a caller replaying a captured
+//     graph keeps stable pointers for the whole lease even while other
+//     entries are inserted and evicted. Eviction runs at insert time (to make
+//     room) and at release time (to trim), by LRU of last use, skipping pins.
+//   * Oversized entries: an entry whose bytes alone exceed the whole budget is
+//     still admitted (refusing would rebuild it on every use); every unpinned
+//     entry is evicted first and the overshoot is trimmed at release. The
+//     invariant is bytes_in_use() <= max(byte_budget(), pinned bytes) — i.e.
+//     the budget always holds AT REST, and is exceeded only by live leases.
+//   * Failure: if `init` throws, the half-built entry is erased (no bytes
+//     retained) and the exception propagates — a failed build never poisons
+//     the cache. (Callers that can leave a VALID-but-unusable entry must
+//     poison the value itself, like the encoder's pos-projection failure.)
+//
+// As above: callers serialize cache access; `label` names the cache in the
+// STARLING_TRACE "cache" records (size/capacity are BYTES here, evicted is an
+// entry count).
+template <typename Key, typename Value,
+          typename Hash = std::hash<Key>,
+          typename KeyEqual = std::equal_to<Key>>
+class ByteBudgetLruCache {
+public:
+    explicit ByteBudgetLruCache(size_t byte_budget, const char* label = nullptr)
+        : budget_(byte_budget == 0 ? 1 : byte_budget), label_(label) {}
+
+    size_t size() const { return map_.size(); }
+    size_t byte_budget() const { return budget_; }
+    size_t bytes_in_use() const { return bytes_; }
+    size_t pinned_size() const { return pinned_; }
+
+    // Plain LRU lookup (touch, no pin). Stable until a non-const operation
+    // evicts THIS key. Nullptr on miss.
+    Value* get(const Key& key) {
+        auto it = map_.find(key);
+        if (it == map_.end()) return nullptr;
+        touch(it);
+        return &entry(it).value;
+    }
+
+    // Lease lookup: like get(), but the entry is pinned until release(key).
+    // Nullptr on miss. Re-pinning an already-pinned entry is a no-op (single
+    // lease per key; serialized callers acquire once per use).
+    Value* get_pinned(const Key& key) {
+        auto it = map_.find(key);
+        if (it == map_.end()) return nullptr;
+        touch(it);
+        pin(it);
+        trace("hit", 0);
+        return &entry(it).value;
+    }
+
+    // Lease fetch-or-build. On miss: insert a default value at a stable
+    // address, PIN it (so the trim below can never drop the entry being
+    // built), call `init(value)` — which fills the value and returns its
+    // tracked bytes — account the bytes, then evict unpinned LRU entries
+    // until back under budget. If `init` throws, the entry is erased and the
+    // exception rethrown (no bytes retained).
+    template <typename Init>
+    Value* get_or_init_pinned(const Key& key, Init&& init) {
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            touch(it);
+            pin(it);
+            trace("hit", 0);
+            return &entry(it).value;
+        }
+        // try_emplace default-constructs the value IN PLACE (no move): the
+        // entry types used here (captured-graph holders) may be move-suppressed
+        // (deleted copy ctors), so the LruCache emplace pattern would not work.
+        lru_.push_front(key);
+        auto inserted = map_.end();
+        try {
+            inserted = map_.try_emplace(key).first;
+            inserted->second.first = lru_.begin();
+            pin(inserted);
+            entry(inserted).bytes = init(entry(inserted).value);
+            bytes_ += entry(inserted).bytes;
+            const size_t evicted = trim_over_budget();
+            trace("miss", evicted);
+            return &entry(inserted).value;
+        } catch (...) {
+            if (inserted != map_.end()) {
+                if (entry(inserted).pinned) --pinned_;
+                map_.erase(inserted);  // destroys the half-built value
+            }
+            lru_.pop_front();
+            throw;
+        }
+    }
+
+    // End the lease. If the cache is over budget afterwards (e.g. an
+    // oversized entry just unpinned), evict unpinned LRU entries until it is
+    // not. Releasing a key that is not resident/pinned is a no-op.
+    void release(const Key& key) {
+        auto it = map_.find(key);
+        if (it == map_.end() || !entry(it).pinned) return;
+        entry(it).pinned = false;
+        --pinned_;
+        const size_t evicted = trim_over_budget();
+        if (evicted > 0) trace("evict", evicted);
+    }
+
+    void clear() {
+        map_.clear();
+        lru_.clear();
+        bytes_ = 0;
+        pinned_ = 0;
+    }
+
+private:
+    struct Entry {
+        Value value;
+        size_t bytes = 0;   // tracked bytes (init's return value)
+        bool pinned = false;
+    };
+    using ListIt = typename std::list<Key>::iterator;
+    using MapVal = std::pair<ListIt, Entry>;
+    using Map = std::unordered_map<Key, MapVal, Hash, KeyEqual>;
+
+    // The map's mapped value is MapVal (ListIt + Entry pair); the Entry lives
+    // at .second.second (same shape as LruCache's MapVal).
+    static Entry& entry(typename Map::iterator it) { return it->second.second; }
+
+    void touch(typename Map::iterator it) {
+        lru_.splice(lru_.begin(), lru_, it->second.first);
+        it->second.first = lru_.begin();
+    }
+    void pin(typename Map::iterator it) {
+        if (!entry(it).pinned) { entry(it).pinned = true; ++pinned_; }
+    }
+
+    // Evict unpinned LRU entries while over budget. Stops when only pinned
+    // entries remain (the at-rest invariant's escape hatch for oversized
+    // live leases). Returns the number of victims.
+    size_t trim_over_budget() {
+        size_t evicted = 0;
+        while (bytes_ > budget_) {
+            bool evicted_one = false;
+            // LRU-back-to-front scan for the first unpinned entry.
+            for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
+                auto mit = map_.find(*lit);
+                if (mit == map_.end() || entry(mit).pinned) continue;
+                bytes_ -= entry(mit).bytes;
+                lru_.erase(std::next(lit).base());
+                map_.erase(mit);
+                ++evicted;
+                evicted_one = true;
+                break;                       // rescan from the new LRU back
+            }
+            if (!evicted_one) break;         // everything left is pinned
+        }
+        return evicted;
+    }
+
+    void trace(const char* op, size_t evicted) const {
+        if (label_)
+            trace::cache_event(label_, op, evicted, bytes_, budget_, -1);
+    }
+
+    size_t budget_;
+    const char* label_ = nullptr;
+    size_t bytes_ = 0;
+    size_t pinned_ = 0;
+    std::list<Key> lru_;
+    Map map_;
+};
+
 }  // namespace starling::ggml

@@ -31,12 +31,18 @@
 //
 // K is T-aware: 16 for T<=512 (lowest per-replay latency), 64 for T>512 (halves
 // the replay count on long). Both byte-exact. Override with STARLING_GGML_TDT_KSTEP.
+//
+// S02: the per-(T,K) graph map is bounded by a BYTE budget (default 128 MiB of
+// tracked gallocr bytes, STARLING_TDT_GRAPH_BUDGET_MB) with LRU eviction and
+// pin/lease semantics — see the KStepCache accounting note at the cache
+// definition below.
 
 #include "tdt_multistep.hpp"
 
 #include "runtime/backend.hpp"   // ReplayGraph, graph_input_tensor, clone_weight,
                                 // capture_graph_output, add_graph_root
 #include "runtime/graph.hpp"     // global_backend
+#include "runtime/lru_cache.hpp" // ByteBudgetLruCache (S02 byte-aware TDT budget)
 
 #include "ggml.h"
 #include "ggml-backend.h"        // ggml_backend_alloc_ctx_tensors / tensor_set (DecodeDevCache)
@@ -46,10 +52,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace starling::ggml::parakeet {
@@ -234,11 +240,63 @@ struct KStepGraph {
 };
 
 // Per-model graph cache keyed on (T, K).
+//
+// S02: this map was an unbounded unordered_map — every distinct encoder
+// length pinned its own captured K-step graph + private gallocr device
+// buffer until model destruction, bypassing STARLING_REPLAY_CACHE_SIZE (the
+// encoder's entry-count LRU never saw it). It is now a ByteBudgetLruCache
+// (runtime/lru_cache.hpp): a BYTE budget, LRU eviction by last use (the
+// encoder LRU is the pattern), and pin/lease semantics so the graph an
+// ongoing decode replays is never evicted mid-use.
+//
+// Accounting (what one entry's "tracked bytes" counts — the dominant,
+// measurable, and exactly-what-eviction-frees device cost):
+//   * the entry's ReplayGraph PRIVATE gallocr buffer (ReplayGraph::
+//     device_alloc_bytes): the (T,K) graph's input tensors + intermediates.
+// Deliberately NOT tracked (documented so budgets are not over- or
+// under-read):
+//   * loader weights — shared with every other graph, owned and counted once
+//     by the loader ("count shared allocations once"); independent of entry
+//     count, so eviction reclaims none of it.
+//   * DecodeDevCache — likewise ONE model-owned allocation backing ALL (T,K)
+//     graphs (shape is (Hp,L), not (T,K)); it does not grow with entries.
+//   * CUDA-graph exec/driver-side allocations — ggml does not expose them
+//     ("distinguish tracked bytes from driver overhead"); the budget bounds
+//     the gallocr side, which scales with (T,K).
+//   * host-side metadata/tables/captures (ggml tensor metadata, the constant
+//     tables, cap_* rings) — O(K*(Hp*L + vocab)) floats, sub-MiB, host RAM.
 namespace {
 struct KKey { int T, K; bool operator==(const KKey& o) const { return T==o.T && K==o.K; } };
 struct KKeyHash { size_t operator()(const KKey& k) const noexcept {
     return (size_t)k.T * 257u + (size_t)k.K; } };
-using KStepCache = std::unordered_map<KKey, std::unique_ptr<KStepGraph>, KKeyHash>;
+
+// Default TDT graph-cache budget: 128 MiB of tracked gallocr bytes.
+// Derivation: one entry's tracked bytes are dominated by the enc_proj input
+// (Hj*T*4 B) plus K per-step temporaries; on the reference parakeet-tdt
+// geometry that is roughly 1.5-3 MiB for short/medium (T<=512, K=16) and
+// ~4-8 MiB for long audio (T~930, K=96; T is additionally capped at 4096 by
+// the caller's kstep_max_t guard). 128 MiB therefore retains dozens of
+// distinct encoder lengths at steady state — the same order as the encoder
+// LRU's 16 entries at its worst-case shape — while bounding what was
+// previously unbounded growth across distinct lengths. Override with
+// STARLING_TDT_GRAPH_BUDGET_MB (>= 1 MiB); read lazily at first cache
+// construction so tests can set the env first (replay_cache_size pattern).
+constexpr size_t kDefaultTdtGraphBudgetBytes = size_t(128) << 20;
+
+size_t tdt_graph_byte_budget() {
+    if (const char* e = std::getenv("STARLING_TDT_GRAPH_BUDGET_MB")) {
+        long v = std::atol(e);
+        if (v >= 1) return (size_t)v << 20;
+    }
+    return kDefaultTdtGraphBudgetBytes;
+}
+
+using KStepCache = ByteBudgetLruCache<KKey, KStepGraph, KKeyHash>;
+
+// One entry's tracked bytes (see the accounting note above).
+size_t kstep_graph_bytes(const KStepGraph& kg) {
+    return kg.rg ? kg.rg->device_alloc_bytes() : 0;
+}
 } // namespace
 
 // where(m, A, B) = m*A + (1-m)*B for scalar f32 mask m (f32 [1]) and equal-shape
@@ -265,337 +323,341 @@ static ggml_tensor* where_scalar1(ggml_context* ctx, ggml_tensor* mask1,
     return ggml_add(ctx, mA, nmB);
 }
 
-// Build (or fetch) the K-step graph for (T, K). Returns a ready KStepGraph with
-// its ReplayGraph allocated + the input/capture indices recorded, or nullptr on
-// failure.
-static KStepGraph* get_or_build_kstep(const PredictionNet& pred, const Joint& joint,
-                                      int T, int K, int blank_id,
-                                      const std::vector<int32_t>& durations,
-                                      DecodeDevCache* dc,
-                                      bool device_resident) {
-    auto& slot = pred.model_loader().cache<KStepCache>();
-    if (!slot) slot = std::make_unique<KStepCache>();
-    auto& kstep_cache = *slot;
+// Acquire (fetch-or-build, LEASED) the K-step graph for (T, K). Returns a
+// pinned KStepGraph with its ReplayGraph allocated + the input/capture
+// indices recorded, or throws on build failure (the cache rolls the
+// half-built entry back — no bytes retained — so a failure never poisons
+// later lookups; tdt_greedy_multistep turns that into a serial-loop fallback).
+// The entry stays PINNED until kstep_cache.release(key): eviction of older
+// LRU entries can therefore never invalidate this graph mid-replay.
+static KStepGraph* acquire_kstep(KStepCache& kstep_cache,
+                                 const PredictionNet& pred, const Joint& joint,
+                                 int T, int K, int blank_id,
+                                 const std::vector<int32_t>& durations,
+                                 DecodeDevCache* dc,
+                                 bool device_resident) {
+    const KKey key{ T, K };
+    if (KStepGraph* hit = kstep_cache.get_pinned(key)) return hit;
 
-    KKey key{ T, K };
-    auto it = kstep_cache.find(key);
-    if (it != kstep_cache.end()) return it->second.get();
+    return kstep_cache.get_or_init_pinned(key, [&](KStepGraph& kg) -> size_t {
+        // `raw` addresses the entry in place (stable node address — the
+        // ReplayGraph's build lambda and input registrations below capture
+        // it, matching the encoder's get_or_init pattern).
+        KStepGraph* raw = &kg;
 
-    const int Hj = joint.joint_hidden();
-    const int Hp = pred.hidden_size();
-    const int L  = pred.num_layers();
-    const int token_count = joint.vocab_size() + 1;
-    const int num_dur = (int)durations.size();
-    const int vocab_p1 = pred.vocab_p1();
-    const ModelLoader& pml = pred.model_loader();
-    const ModelLoader& jml = joint.model_loader();
+        const int Hj = joint.joint_hidden();
+        const int Hp = pred.hidden_size();
+        const int L  = pred.num_layers();
+        const int token_count = joint.vocab_size() + 1;
+        const int num_dur = (int)durations.size();
+        const int vocab_p1 = pred.vocab_p1();
+        const ModelLoader& pml = pred.model_loader();
+        const ModelLoader& jml = joint.model_loader();
 
-    auto kg = std::unique_ptr<KStepGraph>(new KStepGraph());
-    kg->K = K; kg->T = T; kg->Hj = Hj; kg->Hp = Hp; kg->L = L;
-    kg->token_count = token_count; kg->num_dur = num_dur; kg->blank_id = blank_id;
-    kg->device_resident = device_resident;
-    kg->dc = dc;   // persistent device-resident state (D1); used iff device_resident
+        kg.K = K; kg.T = T; kg.Hj = Hj; kg.Hp = Hp; kg.L = L;
+        kg.token_count = token_count; kg.num_dur = num_dur; kg.blank_id = blank_id;
+        kg.device_resident = device_resident;
+        kg.dc = dc;   // persistent device-resident state (D1); used iff device_resident
 
-    // Constant-table host backing (filled once, set once per utterance -- tiny).
-    kg->adv_mask_table.assign((size_t)vocab_p1, 1.0f);
-    kg->adv_mask_table[blank_id] = 0.0f;        // advance = (token != blank)
-    kg->dur_table_int = durations;              // verbatim [num_dur] i32
-    kg->zero_dur_table.assign((size_t)num_dur, 0.0f);
-    if (num_dur > 0) kg->zero_dur_table[0] = 1.0f;  // 1.0 where dur==0
-    kg->one_scalar.assign(1, 1.0f);
-    // Ring captures (both paths) + debug echoes (load-bearing for the gallocr
-    // layout, see cap_dbg_* comment in the struct).
-    kg->cap_tokens_f.assign((size_t)K, 0.0f);
-    kg->cap_frames_f.assign((size_t)K, 0.0f);
-    kg->cap_dbg_dur_idx_f.assign(1, 0.0f);
-    kg->cap_dbg_dur_final_f.assign(1, 0.0f);
-    kg->cap_dbg_one_f.assign(1, 0.0f);
-    kg->cap_dbg_dur_i32_f.assign(1, 0.0f);
-    // Baseline path only: per-replay state host backing + final-state captures.
-    if (!device_resident) {
-        kg->host_frame.assign(1, 0);
-        kg->host_last_tok.assign(1, 0);
-        kg->host_cc.assign((size_t)Hp, 0.0f);
-        kg->host_h.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
-        kg->host_c.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
-        kg->cap_h.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
-        kg->cap_c.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
-        kg->cap_cc_f.assign((size_t)Hp, 0.0f);
-    }
+        // Constant-table host backing (filled once, set once per utterance -- tiny).
+        kg.adv_mask_table.assign((size_t)vocab_p1, 1.0f);
+        kg.adv_mask_table[blank_id] = 0.0f;        // advance = (token != blank)
+        kg.dur_table_int = durations;              // verbatim [num_dur] i32
+        kg.zero_dur_table.assign((size_t)num_dur, 0.0f);
+        if (num_dur > 0) kg.zero_dur_table[0] = 1.0f;  // 1.0 where dur==0
+        kg.one_scalar.assign(1, 1.0f);
+        // Ring captures (both paths) + debug echoes (load-bearing for the gallocr
+        // layout, see cap_dbg_* comment in the struct).
+        kg.cap_tokens_f.assign((size_t)K, 0.0f);
+        kg.cap_frames_f.assign((size_t)K, 0.0f);
+        kg.cap_dbg_dur_idx_f.assign(1, 0.0f);
+        kg.cap_dbg_dur_final_f.assign(1, 0.0f);
+        kg.cap_dbg_one_f.assign(1, 0.0f);
+        kg.cap_dbg_dur_i32_f.assign(1, 0.0f);
+        // Baseline path only: per-replay state host backing + final-state captures.
+        if (!device_resident) {
+            kg.host_frame.assign(1, 0);
+            kg.host_last_tok.assign(1, 0);
+            kg.host_cc.assign((size_t)Hp, 0.0f);
+            kg.host_h.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
+            kg.host_c.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
+            kg.cap_h.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
+            kg.cap_c.assign((size_t)L, std::vector<float>((size_t)Hp, 0.0f));
+            kg.cap_cc_f.assign((size_t)Hp, 0.0f);
+        }
 
-    KStepGraph* raw = kg.get();
-    // Sizes used in multiple places.
-    int64_t HjT_ne[2]  = { Hj, T };            // enc_proj [Hj, T]
-    int64_t vp1_ne[2]  = { 1, vocab_p1 };      // adv_mask as [1, vocab_p1] for gather
-    int64_t ndur_ne[2] = { 1, num_dur };
+        // Sizes used in multiple places.
+        int64_t HjT_ne[2]  = { Hj, T };            // enc_proj [Hj, T]
+        int64_t vp1_ne[2]  = { 1, vocab_p1 };      // adv_mask as [1, vocab_p1] for gather
+        int64_t ndur_ne[2] = { 1, num_dur };
 
-    raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
-        global_backend(),
-        [&](ggml_context* ctx) -> ggml_tensor* {
-            // ---- Inputs (registration order is the set_input index). ----
-            // 0: enc_proj [Hj, T] (set once per utterance). The host backing
-            // pointer here is a placeholder -- ReplayGraph does NOT push it in
-            // the ctor; the real data arrives via set_input before each
-            // utterance's first compute. one_scalar is a stable valid pointer.
-            int64_t one1[1] = {1};
-            int64_t Hp_n[1] = { Hp };
-            ggml_tensor* enc_proj_t = graph_input_tensor(
-                ctx, GGML_TYPE_F32, 2, HjT_ne, raw->one_scalar.data(), (size_t)T*Hj*sizeof(float));
-            raw->in_enc_proj = 0;
-            size_t idx = 1;
+        raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
+            global_backend(),
+            [&](ggml_context* ctx) -> ggml_tensor* {
+                // ---- Inputs (registration order is the set_input index). ----
+                // 0: enc_proj [Hj, T] (set once per utterance). The host backing
+                // pointer here is a placeholder -- ReplayGraph does NOT push it in
+                // the ctor; the real data arrives via set_input before each
+                // utterance's first compute. one_scalar is a stable valid pointer.
+                int64_t one1[1] = {1};
+                int64_t Hp_n[1] = { Hp };
+                ggml_tensor* enc_proj_t = graph_input_tensor(
+                    ctx, GGML_TYPE_F32, 2, HjT_ne, raw->one_scalar.data(), (size_t)T*Hj*sizeof(float));
+                raw->in_enc_proj = 0;
+                size_t idx = 1;
 
-            // Running in-graph state tensors (read at step 0, advanced in-graph).
-            // device_resident (D1): seeded from the persistent device-cache
-            // leaves (external buffers, like loader weights); written back at
-            // the end. Otherwise: per-replay host-backed INPUT tensors.
-            ggml_tensor* frame;
-            ggml_tensor* last_tok;
-            ggml_tensor* cc_cur;
-            std::vector<ggml_tensor*> h_cur(L), c_cur(L);
-            if (raw->device_resident) {
-                frame    = raw->dc->frame;       // i32 [1]
-                last_tok = raw->dc->last_tok;    // i32 [1]
-                cc_cur   = raw->dc->cc;          // f32 [Hp]
-                for (int l = 0; l < L; ++l) { h_cur[(size_t)l] = raw->dc->h[(size_t)l];
-                                             c_cur[(size_t)l] = raw->dc->c[(size_t)l]; }
-            } else {
-                ggml_tensor* frame_in = graph_input_tensor(
-                    ctx, GGML_TYPE_I32, 1, one1, raw->host_frame.data(), sizeof(int32_t));
-                raw->in_frame = idx++;
-                ggml_tensor* last_tok_in = graph_input_tensor(
-                    ctx, GGML_TYPE_I32, 1, one1, raw->host_last_tok.data(), sizeof(int32_t));
-                raw->in_last_tok = idx++;
-                ggml_tensor* cc_in = graph_input_tensor(
-                    ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_cc.data(), (size_t)Hp*sizeof(float));
-                raw->in_cc = idx++;
-                raw->in_h.assign((size_t)L, 0);
-                raw->in_c.assign((size_t)L, 0);
-                std::vector<ggml_tensor*> h_in(L), c_in(L);
-                for (int l = 0; l < L; ++l) {
-                    h_in[(size_t)l] = graph_input_tensor(
-                        ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_h[(size_t)l].data(), (size_t)Hp*sizeof(float));
-                    raw->in_h[(size_t)l] = idx++;
-                    c_in[(size_t)l] = graph_input_tensor(
-                        ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_c[(size_t)l].data(), (size_t)Hp*sizeof(float));
-                    raw->in_c[(size_t)l] = idx++;
+                // Running in-graph state tensors (read at step 0, advanced in-graph).
+                // device_resident (D1): seeded from the persistent device-cache
+                // leaves (external buffers, like loader weights); written back at
+                // the end. Otherwise: per-replay host-backed INPUT tensors.
+                ggml_tensor* frame;
+                ggml_tensor* last_tok;
+                ggml_tensor* cc_cur;
+                std::vector<ggml_tensor*> h_cur(L), c_cur(L);
+                if (raw->device_resident) {
+                    frame    = raw->dc->frame;       // i32 [1]
+                    last_tok = raw->dc->last_tok;    // i32 [1]
+                    cc_cur   = raw->dc->cc;          // f32 [Hp]
+                    for (int l = 0; l < L; ++l) { h_cur[(size_t)l] = raw->dc->h[(size_t)l];
+                                                 c_cur[(size_t)l] = raw->dc->c[(size_t)l]; }
+                } else {
+                    ggml_tensor* frame_in = graph_input_tensor(
+                        ctx, GGML_TYPE_I32, 1, one1, raw->host_frame.data(), sizeof(int32_t));
+                    raw->in_frame = idx++;
+                    ggml_tensor* last_tok_in = graph_input_tensor(
+                        ctx, GGML_TYPE_I32, 1, one1, raw->host_last_tok.data(), sizeof(int32_t));
+                    raw->in_last_tok = idx++;
+                    ggml_tensor* cc_in = graph_input_tensor(
+                        ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_cc.data(), (size_t)Hp*sizeof(float));
+                    raw->in_cc = idx++;
+                    raw->in_h.assign((size_t)L, 0);
+                    raw->in_c.assign((size_t)L, 0);
+                    std::vector<ggml_tensor*> h_in(L), c_in(L);
+                    for (int l = 0; l < L; ++l) {
+                        h_in[(size_t)l] = graph_input_tensor(
+                            ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_h[(size_t)l].data(), (size_t)Hp*sizeof(float));
+                        raw->in_h[(size_t)l] = idx++;
+                        c_in[(size_t)l] = graph_input_tensor(
+                            ctx, GGML_TYPE_F32, 1, Hp_n, raw->host_c[(size_t)l].data(), (size_t)Hp*sizeof(float));
+                        raw->in_c[(size_t)l] = idx++;
+                    }
+                    frame = frame_in; last_tok = last_tok_in; cc_cur = cc_in;
+                    h_cur = h_in; c_cur = c_in;
                 }
-                frame = frame_in; last_tok = last_tok_in; cc_cur = cc_in;
-                h_cur = h_in; c_cur = c_in;
-            }
 
-            // Constant tables (registered after the state inputs in both paths;
-            // set once per utterance).
-            ggml_tensor* adv_mask = graph_input_tensor(
-                ctx, GGML_TYPE_F32, 2, vp1_ne, raw->adv_mask_table.data(),
-                (size_t)vocab_p1*sizeof(float));
-            raw->in_adv_mask = idx++;
-            ggml_tensor* dur_tbl = graph_input_tensor(
-                ctx, GGML_TYPE_I32, 2, ndur_ne, raw->dur_table_int.data(),
-                (size_t)num_dur*sizeof(int32_t));
-            raw->in_dur_tbl = idx++;
-            ggml_tensor* zero_dur = graph_input_tensor(
-                ctx, GGML_TYPE_F32, 2, ndur_ne, raw->zero_dur_table.data(),
-                (size_t)num_dur*sizeof(float));
-            raw->in_zero_dur = idx++;
-            ggml_tensor* one_t = graph_input_tensor(
-                ctx, GGML_TYPE_F32, 1, one1, raw->one_scalar.data(), sizeof(float));
-            raw->in_one = idx++;
-            // The embedding table + LSTM/joint weights: zero-copy loader leaves.
-            ggml_tensor* embed_w = clone_weight(ctx, pml, "decoder.prediction.embed.weight");
+                // Constant tables (registered after the state inputs in both paths;
+                // set once per utterance).
+                ggml_tensor* adv_mask = graph_input_tensor(
+                    ctx, GGML_TYPE_F32, 2, vp1_ne, raw->adv_mask_table.data(),
+                    (size_t)vocab_p1*sizeof(float));
+                raw->in_adv_mask = idx++;
+                ggml_tensor* dur_tbl = graph_input_tensor(
+                    ctx, GGML_TYPE_I32, 2, ndur_ne, raw->dur_table_int.data(),
+                    (size_t)num_dur*sizeof(int32_t));
+                raw->in_dur_tbl = idx++;
+                ggml_tensor* zero_dur = graph_input_tensor(
+                    ctx, GGML_TYPE_F32, 2, ndur_ne, raw->zero_dur_table.data(),
+                    (size_t)num_dur*sizeof(float));
+                raw->in_zero_dur = idx++;
+                ggml_tensor* one_t = graph_input_tensor(
+                    ctx, GGML_TYPE_F32, 1, one1, raw->one_scalar.data(), sizeof(float));
+                raw->in_one = idx++;
+                // The embedding table + LSTM/joint weights: zero-copy loader leaves.
+                ggml_tensor* embed_w = clone_weight(ctx, pml, "decoder.prediction.embed.weight");
 
-            // Ring: accumulate each step's (token, post-step frame) so the host
-            // can read all K at once. Built via concat at the end.
-            std::vector<ggml_tensor*> tok_nodes;
-            std::vector<ggml_tensor*> frame_nodes;
-            tok_nodes.reserve((size_t)K);
-            frame_nodes.reserve((size_t)K);
+                // Ring: accumulate each step's (token, post-step frame) so the host
+                // can read all K at once. Built via concat at the end.
+                std::vector<ggml_tensor*> tok_nodes;
+                std::vector<ggml_tensor*> frame_nodes;
+                tok_nodes.reserve((size_t)K);
+                frame_nodes.reserve((size_t)K);
 
-            // DEBUG: track the last step's dur_idx / dur_final for capture.
-            ggml_tensor* dbg_dur_idx = nullptr;
-            ggml_tensor* dbg_dur_final = nullptr;
-            ggml_tensor* dbg_one = nullptr;
-            ggml_tensor* dbg_dur_i32 = nullptr;
+                // DEBUG: track the last step's dur_idx / dur_final for capture.
+                ggml_tensor* dbg_dur_idx = nullptr;
+                ggml_tensor* dbg_dur_final = nullptr;
+                ggml_tensor* dbg_one = nullptr;
+                ggml_tensor* dbg_dur_i32 = nullptr;
 
-            for (int j = 0; j < K; ++j) {
-                // --- Prediction LSTM (mirrors step_fused_argmax's LSTM) ---
-                // Layer-0 input: embedding of last_tok (ON DEVICE gather).
-                //   get_rows(embed_w[Hp, vocab_p1], last_tok[i32,1]) -> [Hp, 1].
-                //   cont_1d -> [Hp].
-                ggml_tensor* emb_row = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, embed_w, last_tok), Hp);
-                ggml_tensor* layer_in = emb_row;
-                ggml_tensor* g_proj = nullptr;     // top-layer h' == decoder output g
-                std::vector<ggml_tensor*> h_new(L), c_new(L);
-                for (int l = 0; l < L; ++l) {
-                    const std::string s = "_l" + std::to_string(l);
-                    ggml_tensor* Wih = clone_weight(ctx, pml,
-                        ("decoder.prediction.dec_rnn.lstm.weight_ih" + s).c_str());
-                    ggml_tensor* Whh = clone_weight(ctx, pml,
-                        ("decoder.prediction.dec_rnn.lstm.weight_hh" + s).c_str());
-                    ggml_tensor* bih = clone_weight(ctx, pml,
-                        ("decoder.prediction.dec_rnn.lstm.bias_ih" + s).c_str());
-                    ggml_tensor* bhh = clone_weight(ctx, pml,
-                        ("decoder.prediction.dec_rnn.lstm.bias_hh" + s).c_str());
-                    ggml_tensor* z = ggml_add(ctx,
-                        ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
-                        ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_cur[l]), bhh));
-                    ggml_tensor* ig = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, 0)));
-                    ggml_tensor* fg = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp*sizeof(float))));
-                    ggml_tensor* cg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)2*Hp*sizeof(float))));
-                    ggml_tensor* og = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3*Hp*sizeof(float))));
-                    ggml_tensor* c_fresh = ggml_add(ctx, ggml_mul(ctx, fg, c_cur[l]),
-                                                    ggml_mul(ctx, ig, cg));
-                    ggml_tensor* h_fresh = ggml_mul(ctx, og, ggml_tanh(ctx, c_fresh));
-                    h_new[l] = h_fresh;
-                    c_new[l] = c_fresh;
-                    layer_in = h_fresh;
-                    g_proj   = h_fresh;
+                for (int j = 0; j < K; ++j) {
+                    // --- Prediction LSTM (mirrors step_fused_argmax's LSTM) ---
+                    // Layer-0 input: embedding of last_tok (ON DEVICE gather).
+                    //   get_rows(embed_w[Hp, vocab_p1], last_tok[i32,1]) -> [Hp, 1].
+                    //   cont_1d -> [Hp].
+                    ggml_tensor* emb_row = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, embed_w, last_tok), Hp);
+                    ggml_tensor* layer_in = emb_row;
+                    ggml_tensor* g_proj = nullptr;     // top-layer h' == decoder output g
+                    std::vector<ggml_tensor*> h_new(L), c_new(L);
+                    for (int l = 0; l < L; ++l) {
+                        const std::string s = "_l" + std::to_string(l);
+                        ggml_tensor* Wih = clone_weight(ctx, pml,
+                            ("decoder.prediction.dec_rnn.lstm.weight_ih" + s).c_str());
+                        ggml_tensor* Whh = clone_weight(ctx, pml,
+                            ("decoder.prediction.dec_rnn.lstm.weight_hh" + s).c_str());
+                        ggml_tensor* bih = clone_weight(ctx, pml,
+                            ("decoder.prediction.dec_rnn.lstm.bias_ih" + s).c_str());
+                        ggml_tensor* bhh = clone_weight(ctx, pml,
+                            ("decoder.prediction.dec_rnn.lstm.bias_hh" + s).c_str());
+                        ggml_tensor* z = ggml_add(ctx,
+                            ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
+                            ggml_add(ctx, ggml_mul_mat(ctx, Whh, h_cur[l]), bhh));
+                        ggml_tensor* ig = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, 0)));
+                        ggml_tensor* fg = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)Hp*sizeof(float))));
+                        ggml_tensor* cg = ggml_tanh   (ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)2*Hp*sizeof(float))));
+                        ggml_tensor* og = ggml_sigmoid(ctx, ggml_cont(ctx, ggml_view_1d(ctx, z, Hp, (size_t)3*Hp*sizeof(float))));
+                        ggml_tensor* c_fresh = ggml_add(ctx, ggml_mul(ctx, fg, c_cur[l]),
+                                                        ggml_mul(ctx, ig, cg));
+                        ggml_tensor* h_fresh = ggml_mul(ctx, og, ggml_tanh(ctx, c_fresh));
+                        h_new[l] = h_fresh;
+                        c_new[l] = c_fresh;
+                        layer_in = h_fresh;
+                        g_proj   = h_fresh;
+                    }
+                    // g_proj is the prediction output g [Hp] (top-layer h').
+
+                    // --- blank-skip freeze (device-side where on advance flag). ---
+                    // advance = (last_tok != blank) as f32 [1] via the adv_mask gather.
+                    ggml_tensor* adv = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, adv_mask, last_tok), 1);   // f32 [1]
+                    // decoder_out = where(advance, g_proj, cc_cur).
+                    ggml_tensor* decoder_out = where_scalar(ctx, adv, one_t, g_proj, cc_cur);
+                    // Committed state: freeze on blank.
+                    std::vector<ggml_tensor*> h_next(L), c_next(L);
+                    for (int l = 0; l < L; ++l) {
+                        h_next[l] = where_scalar(ctx, adv, one_t, h_new[l], h_cur[l]);
+                        c_next[l] = where_scalar(ctx, adv, one_t, c_new[l], c_cur[l]);
+                    }
+                    ggml_tensor* cc_next = decoder_out;  // cc always := this step's decoder_out
+
+                    // --- Joint (enc_proj[frame] + decoder_out -> logits). ---
+                    // Carry frame as f32 in-graph (cast from the i32 input on step 0,
+                    // advanced by dur_final each step). Clamp to [0, T-1] for the
+                    // gather on a cast copy (ggml_clamp is in-place, so cast first to
+                    // avoid corrupting the chained frame node), then cast to i32.
+                    ggml_tensor* frame_f = ggml_cast(ctx, frame, GGML_TYPE_F32);     // f32 [1]
+                    ggml_tensor* frame_f_clamped = ggml_clamp(ctx, frame_f, 0.0f, (float)(T-1));
+                    ggml_tensor* frame_clamped = ggml_cast(ctx, frame_f_clamped, GGML_TYPE_I32); // i32 [1]
+                    // enc_proj row for frame_clamped: get_rows(enc_proj[Hj,T], idx) -> [Hj,1]
+                    ggml_tensor* ep_row = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, enc_proj_t, frame_clamped), Hj);     // f32 [Hj]
+                    ggml_tensor* Wp = clone_weight(ctx, jml, "joint.pred.weight");
+                    ggml_tensor* pp = ggml_mul_mat(ctx, Wp, decoder_out);            // [Hj]
+                    ggml_tensor* bp = clone_weight(ctx, jml, "joint.pred.bias");
+                    pp = ggml_add(ctx, pp, bp);
+                    ggml_tensor* fr = ggml_relu(ctx, ggml_add(ctx, ep_row, pp));    // [Hj]
+                    ggml_tensor* Wo = clone_weight(ctx, jml, "joint.joint_net.2.weight");
+                    ggml_tensor* y  = ggml_mul_mat(ctx, Wo, fr);                    // [V]
+                    ggml_tensor* bo = clone_weight(ctx, jml, "joint.joint_net.2.bias");
+                    y = ggml_add(ctx, y, bo);                                       // [V_plus]
+
+                    // --- Argmax (token slice + duration slice) ON DEVICE. ---
+                    ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
+                    ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
+                                            (size_t)token_count * sizeof(float));
+                    ggml_tensor* tok = ggml_argmax(ctx, tok_view);   // i32 [1]
+                    ggml_tensor* dur_idx = ggml_argmax(ctx, dur_view); // i32 [1]
+
+                    // --- TDT frame-advance (in-graph). ---
+                    // dur = dur_table[dur_idx]  (i32 gather).
+                    ggml_tensor* dur_i32 = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, dur_tbl, dur_idx), 1);              // i32 [1]
+                    // blank_flag = (tok == blank) = 1 - advance_tok, where advance_tok
+                    //   = get_rows(adv_mask, tok).  dur0_flag = get_rows(zero_dur, dur).
+                    ggml_tensor* adv_tok = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, adv_mask, tok), 1);                 // f32 [1]
+                    ggml_tensor* blank_flag = ggml_sub(ctx, one_t, adv_tok);        // f32 [1]
+                    ggml_tensor* dur0_flag  = ggml_cont_1d(
+                        ctx, ggml_get_rows(ctx, zero_dur, dur_i32), 1);             // f32 [1]
+                    // force = blank_flag AND dur0_flag = blank_flag * dur0_flag.
+                    ggml_tensor* force = ggml_mul(ctx, blank_flag, dur0_flag);      // f32 [1]
+                    // dur_final = where(force, 1, dur_i32).
+                    ggml_tensor* dur_f = ggml_cast(ctx, dur_i32, GGML_TYPE_F32);
+                    ggml_tensor* dur_final = where_scalar1(ctx, force, one_t, one_t, dur_f);
+                    dbg_dur_idx   = dur_idx;
+                    dbg_dur_final = dur_final;
+                    dbg_one = one_t;
+                    dbg_dur_i32 = dur_i32;
+                    // frame_next = frame + dur_final.  Carry frame as f32 across steps.
+                    ggml_tensor* frame_next_f = ggml_add(ctx, frame_f, dur_final);    // f32 [1]
+
+                    // --- Ring writes: this step's token + post-step frame. ---
+                    // Cast the i32 token to f32 BEFORE pushing: the ring is built via
+                    // ggml_concat, and ggml-cuda's CONCAT rejects I32 operands (only
+                    // F32/F16 supported). Token ids are <= blank_id (8192) << 2^23,
+                    // so (float)tok is bit-exact and reversible via (int32_t)f.
+                    tok_nodes.push_back(ggml_cast(ctx, tok, GGML_TYPE_F32));   // f32 [1]
+                    frame_nodes.push_back(frame_next_f);
+
+                    // --- Chain state for step j+1. ---
+                    last_tok = tok;                 // i32 [1]
+                    cc_cur   = cc_next;             // f32 [Hp]
+                    h_cur    = h_next;
+                    // Cell state must chain through c_next (the freeze-selected value),
+                    // NOT c_new. On a blank-input step adv=0 -> c_next = c_cur (frozen);
+                    // chaining c_new would leak the discarded LSTM c' and corrupt the
+                    // decoder state across blank steps (the reference's termination fix).
+                    c_cur    = c_next;
+                    frame    = frame_next_f;        // f32 [1] from here on
                 }
-                // g_proj is the prediction output g [Hp] (top-layer h').
 
-                // --- blank-skip freeze (device-side where on advance flag). ---
-                // advance = (last_tok != blank) as f32 [1] via the adv_mask gather.
-                ggml_tensor* adv = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, adv_mask, last_tok), 1);   // f32 [1]
-                // decoder_out = where(advance, g_proj, cc_cur).
-                ggml_tensor* decoder_out = where_scalar(ctx, adv, one_t, g_proj, cc_cur);
-                // Committed state: freeze on blank.
-                std::vector<ggml_tensor*> h_next(L), c_next(L);
-                for (int l = 0; l < L; ++l) {
-                    h_next[l] = where_scalar(ctx, adv, one_t, h_new[l], h_cur[l]);
-                    c_next[l] = where_scalar(ctx, adv, one_t, c_new[l], c_cur[l]);
+                // ---- Captures: ring (tokens, frames) ONLY. The chained state
+                // (h/c/cc/frame/last_token) is NOT captured -- D1 keeps it in the
+                // persistent device cache, written back below via add_graph_root.
+                ggml_tensor* ring_tok = tok_nodes[0];
+                for (int j = 1; j < K; ++j)
+                    ring_tok = ggml_concat(ctx, ring_tok, tok_nodes[j], 0);   // f32 [K]
+                ggml_tensor* ring_frame = frame_nodes[0];
+                for (int j = 1; j < K; ++j)
+                    ring_frame = ggml_concat(ctx, ring_frame, frame_nodes[j], 0); // f32 [K]
+                capture_graph_output(ring_tok,   &raw->cap_tokens_f);
+                capture_graph_output(ring_frame, &raw->cap_frames_f);
+                // NOTE: the final frame_idx and last_token are NOT captured separately
+                // -- they are the ring's LAST element (frame_next_f / cast(tok) of the
+                // final step), so the host reads them from cap_frames_f[K-1] and
+                // cap_tokens_f[K-1].
+                capture_graph_output(dbg_dur_idx,   &raw->cap_dbg_dur_idx_f);
+                capture_graph_output(dbg_dur_final, &raw->cap_dbg_dur_final_f);
+                capture_graph_output(dbg_one,       &raw->cap_dbg_one_f);
+                capture_graph_output(dbg_dur_i32,   &raw->cap_dbg_dur_i32_f);
+
+                // ---- State sink: write the final K-step state back so the next
+                // replay resumes from it.
+                //   device_resident (D1): in-graph cpy into the persistent device
+                //     cache leaves (add_graph_root side effects; NO host readback).
+                //   baseline: capture h/c/cc for the host to seed the next replay.
+                if (raw->device_resident) {
+                    // frame is f32 here; dc->frame is i32 (matching the step-0 cast
+                    // topology), so cast f32->i32 first. Frame indices are small
+                    // integers, exact in f32 -> the round-trip is bit-identical.
+                    ggml_tensor* frame_i32 = ggml_cast(ctx, frame, GGML_TYPE_I32);
+                    add_graph_root(ggml_cpy(ctx, frame_i32,
+                        ggml_view_1d(ctx, raw->dc->frame, 1, 0)));
+                    add_graph_root(ggml_cpy(ctx, last_tok,
+                        ggml_view_1d(ctx, raw->dc->last_tok, 1, 0)));
+                    add_graph_root(ggml_cpy(ctx, cc_cur,
+                        ggml_view_1d(ctx, raw->dc->cc, Hp, 0)));
+                    for (int l = 0; l < L; ++l) {
+                        add_graph_root(ggml_cpy(ctx, h_cur[(size_t)l],
+                            ggml_view_1d(ctx, raw->dc->h[(size_t)l], Hp, 0)));
+                        add_graph_root(ggml_cpy(ctx, c_cur[(size_t)l],
+                            ggml_view_1d(ctx, raw->dc->c[(size_t)l], Hp, 0)));
+                    }
+                } else {
+                    for (int l = 0; l < L; ++l) {
+                        capture_graph_output(h_cur[(size_t)l], &raw->cap_h[(size_t)l]);
+                        capture_graph_output(c_cur[(size_t)l], &raw->cap_c[(size_t)l]);
+                    }
+                    capture_graph_output(cc_cur, &raw->cap_cc_f);
                 }
-                ggml_tensor* cc_next = decoder_out;  // cc always := this step's decoder_out
 
-                // --- Joint (enc_proj[frame] + decoder_out -> logits). ---
-                // Carry frame as f32 in-graph (cast from the i32 input on step 0,
-                // advanced by dur_final each step). Clamp to [0, T-1] for the
-                // gather on a cast copy (ggml_clamp is in-place, so cast first to
-                // avoid corrupting the chained frame node), then cast to i32.
-                ggml_tensor* frame_f = ggml_cast(ctx, frame, GGML_TYPE_F32);     // f32 [1]
-                ggml_tensor* frame_f_clamped = ggml_clamp(ctx, frame_f, 0.0f, (float)(T-1));
-                ggml_tensor* frame_clamped = ggml_cast(ctx, frame_f_clamped, GGML_TYPE_I32); // i32 [1]
-                // enc_proj row for frame_clamped: get_rows(enc_proj[Hj,T], idx) -> [Hj,1]
-                ggml_tensor* ep_row = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, enc_proj_t, frame_clamped), Hj);     // f32 [Hj]
-                ggml_tensor* Wp = clone_weight(ctx, jml, "joint.pred.weight");
-                ggml_tensor* pp = ggml_mul_mat(ctx, Wp, decoder_out);            // [Hj]
-                ggml_tensor* bp = clone_weight(ctx, jml, "joint.pred.bias");
-                pp = ggml_add(ctx, pp, bp);
-                ggml_tensor* fr = ggml_relu(ctx, ggml_add(ctx, ep_row, pp));    // [Hj]
-                ggml_tensor* Wo = clone_weight(ctx, jml, "joint.joint_net.2.weight");
-                ggml_tensor* y  = ggml_mul_mat(ctx, Wo, fr);                    // [V]
-                ggml_tensor* bo = clone_weight(ctx, jml, "joint.joint_net.2.bias");
-                y = ggml_add(ctx, y, bo);                                       // [V_plus]
-
-                // --- Argmax (token slice + duration slice) ON DEVICE. ---
-                ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
-                ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
-                                        (size_t)token_count * sizeof(float));
-                ggml_tensor* tok = ggml_argmax(ctx, tok_view);   // i32 [1]
-                ggml_tensor* dur_idx = ggml_argmax(ctx, dur_view); // i32 [1]
-
-                // --- TDT frame-advance (in-graph). ---
-                // dur = dur_table[dur_idx]  (i32 gather).
-                ggml_tensor* dur_i32 = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, dur_tbl, dur_idx), 1);              // i32 [1]
-                // blank_flag = (tok == blank) = 1 - advance_tok, where advance_tok
-                //   = get_rows(adv_mask, tok).  dur0_flag = get_rows(zero_dur, dur).
-                ggml_tensor* adv_tok = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, adv_mask, tok), 1);                 // f32 [1]
-                ggml_tensor* blank_flag = ggml_sub(ctx, one_t, adv_tok);        // f32 [1]
-                ggml_tensor* dur0_flag  = ggml_cont_1d(
-                    ctx, ggml_get_rows(ctx, zero_dur, dur_i32), 1);             // f32 [1]
-                // force = blank_flag AND dur0_flag = blank_flag * dur0_flag.
-                ggml_tensor* force = ggml_mul(ctx, blank_flag, dur0_flag);      // f32 [1]
-                // dur_final = where(force, 1, dur_i32).
-                ggml_tensor* dur_f = ggml_cast(ctx, dur_i32, GGML_TYPE_F32);
-                ggml_tensor* dur_final = where_scalar1(ctx, force, one_t, one_t, dur_f);
-                dbg_dur_idx   = dur_idx;
-                dbg_dur_final = dur_final;
-                dbg_one = one_t;
-                dbg_dur_i32 = dur_i32;
-                // frame_next = frame + dur_final.  Carry frame as f32 across steps.
-                ggml_tensor* frame_next_f = ggml_add(ctx, frame_f, dur_final);    // f32 [1]
-
-                // --- Ring writes: this step's token + post-step frame. ---
-                // Cast the i32 token to f32 BEFORE pushing: the ring is built via
-                // ggml_concat, and ggml-cuda's CONCAT rejects I32 operands (only
-                // F32/F16 supported). Token ids are <= blank_id (8192) << 2^23,
-                // so (float)tok is bit-exact and reversible via (int32_t)f.
-                tok_nodes.push_back(ggml_cast(ctx, tok, GGML_TYPE_F32));   // f32 [1]
-                frame_nodes.push_back(frame_next_f);
-
-                // --- Chain state for step j+1. ---
-                last_tok = tok;                 // i32 [1]
-                cc_cur   = cc_next;             // f32 [Hp]
-                h_cur    = h_next;
-                // Cell state must chain through c_next (the freeze-selected value),
-                // NOT c_new. On a blank-input step adv=0 -> c_next = c_cur (frozen);
-                // chaining c_new would leak the discarded LSTM c' and corrupt the
-                // decoder state across blank steps (the reference's termination fix).
-                c_cur    = c_next;
-                frame    = frame_next_f;        // f32 [1] from here on
-            }
-
-            // ---- Captures: ring (tokens, frames) ONLY. The chained state
-            // (h/c/cc/frame/last_token) is NOT captured -- D1 keeps it in the
-            // persistent device cache, written back below via add_graph_root.
-            ggml_tensor* ring_tok = tok_nodes[0];
-            for (int j = 1; j < K; ++j)
-                ring_tok = ggml_concat(ctx, ring_tok, tok_nodes[j], 0);   // f32 [K]
-            ggml_tensor* ring_frame = frame_nodes[0];
-            for (int j = 1; j < K; ++j)
-                ring_frame = ggml_concat(ctx, ring_frame, frame_nodes[j], 0); // f32 [K]
-            capture_graph_output(ring_tok,   &raw->cap_tokens_f);
-            capture_graph_output(ring_frame, &raw->cap_frames_f);
-            // NOTE: the final frame_idx and last_token are NOT captured separately
-            // -- they are the ring's LAST element (frame_next_f / cast(tok) of the
-            // final step), so the host reads them from cap_frames_f[K-1] and
-            // cap_tokens_f[K-1].
-            capture_graph_output(dbg_dur_idx,   &raw->cap_dbg_dur_idx_f);
-            capture_graph_output(dbg_dur_final, &raw->cap_dbg_dur_final_f);
-            capture_graph_output(dbg_one,       &raw->cap_dbg_one_f);
-            capture_graph_output(dbg_dur_i32,   &raw->cap_dbg_dur_i32_f);
-
-            // ---- State sink: write the final K-step state back so the next
-            // replay resumes from it.
-            //   device_resident (D1): in-graph cpy into the persistent device
-            //     cache leaves (add_graph_root side effects; NO host readback).
-            //   baseline: capture h/c/cc for the host to seed the next replay.
-            if (raw->device_resident) {
-                // frame is f32 here; dc->frame is i32 (matching the step-0 cast
-                // topology), so cast f32->i32 first. Frame indices are small
-                // integers, exact in f32 -> the round-trip is bit-identical.
-                ggml_tensor* frame_i32 = ggml_cast(ctx, frame, GGML_TYPE_I32);
-                add_graph_root(ggml_cpy(ctx, frame_i32,
-                    ggml_view_1d(ctx, raw->dc->frame, 1, 0)));
-                add_graph_root(ggml_cpy(ctx, last_tok,
-                    ggml_view_1d(ctx, raw->dc->last_tok, 1, 0)));
-                add_graph_root(ggml_cpy(ctx, cc_cur,
-                    ggml_view_1d(ctx, raw->dc->cc, Hp, 0)));
-                for (int l = 0; l < L; ++l) {
-                    add_graph_root(ggml_cpy(ctx, h_cur[(size_t)l],
-                        ggml_view_1d(ctx, raw->dc->h[(size_t)l], Hp, 0)));
-                    add_graph_root(ggml_cpy(ctx, c_cur[(size_t)l],
-                        ggml_view_1d(ctx, raw->dc->c[(size_t)l], Hp, 0)));
-                }
-            } else {
-                for (int l = 0; l < L; ++l) {
-                    capture_graph_output(h_cur[(size_t)l], &raw->cap_h[(size_t)l]);
-                    capture_graph_output(c_cur[(size_t)l], &raw->cap_c[(size_t)l]);
-                }
-                capture_graph_output(cc_cur, &raw->cap_cc_f);
-            }
-
-            // The graph output is arbitrary (ReplayGraph requires one); use the
-            // tokens ring (also captured). Mark it the output.
-            return ring_tok;
-        }));
-
-    if (raw->rg == nullptr) return nullptr;
-    it = kstep_cache.emplace(key, std::move(kg)).first;
-    return it->second.get();
+                // The graph output is arbitrary (ReplayGraph requires one); use the
+                // tokens ring (also captured). Mark it the output.
+                return ring_tok;
+            }));
+        // (A failed ReplayGraph construction THROWS — the exception propagates
+        // out of this lambda, and get_or_init_pinned rolls the entry back.)
+        return kstep_graph_bytes(kg);
+    });
 }
 
 std::optional<std::vector<int32_t>> tdt_greedy_multistep(
@@ -692,9 +754,29 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
         }
     }
 
-    // ---- 3. Get (or build) the K-step graph for (T, K), bound to dc (D1).
-    KStepGraph* kg = get_or_build_kstep(pred, joint, T, K, blank_id, durations, dc, d1);
-    if (!kg) return std::nullopt;       // graph build failed; caller falls back
+    // ---- 3. Acquire (build or fetch, LEASED) the K-step graph for (T, K),
+    // bound to dc (D1). The lease pins the entry for the whole decode: older
+    // entries may be evicted to satisfy the byte budget mid-decode, but THIS
+    // graph's pointers stay stable until release on every exit below. A build
+    // failure throws (allocation failure, unsupported captured node); the
+    // cache rolls the entry back and we fall back to the serial loop —
+    // matching tdt_greedy's "capture failure -> serial" contract.
+    KStepGraph* kg = nullptr;
+    auto& kstep_slot = pred.model_loader().cache<KStepCache>();
+    if (!kstep_slot) kstep_slot = std::make_unique<KStepCache>(tdt_graph_byte_budget());
+    KStepCache& kstep_cache = *kstep_slot;
+    const KKey kstep_key{ T, K };
+    struct KStepLease {
+        KStepCache& cache; KKey key;
+        ~KStepLease() { cache.release(key); }   // unpin + trim over-budget
+    } kstep_lease{ kstep_cache, kstep_key };
+    try {
+        kg = acquire_kstep(kstep_cache, pred, joint, T, K, blank_id, durations, dc, d1);
+    } catch (const std::exception& ex) {
+        if (dbg) std::fprintf(stderr, "[tdt_multistep] K-step graph build failed: %s\n", ex.what());
+        return std::nullopt;       // caller falls back to the serial loop
+    }
+    if (!kg) return std::nullopt;       // unreachable (acquire throws or returns)
     if (dbg) std::fprintf(stderr, "[tdt_multistep] K=%d T=%d d1=%d (graph built)\n", K, T, (int)d1);
     // Seed enc_proj once (persists across replays in the input tensor).
     kg->rg->set_input(kg->in_enc_proj, enc_proj.data(), (size_t)T * Hj * sizeof(float));
