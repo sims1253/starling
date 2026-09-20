@@ -34,9 +34,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-24",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -156,11 +156,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-22",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: 191/191 (14 files incl. completionVerdict suite), lint 0/0, tsc both configs, fmt clean; refusal>finish_reason>empty verdict order; length/content_filter/unknown rejected, omitted field accepted for local providers; recovery wording names num_predict/LM Studio"
+   ],
+   "notes": "App-level preservation guarantee code-read verified (no React harness); unrecognized explicit finish_reasons rejected by documented policy"
   },
   {
    "id": "B10",
@@ -170,11 +172,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-22",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "coordinator rerun: 191/191 + all gates; Linux basic_text/unknown safeStorage classified unprotected (encryptString never called); plaintext only via persisted explicit opt-in; session-only default leaves last valid encrypted key untouched; changed-key-blocks-save guidance; API key redacted from HTTP error surfaces"
+   ],
+   "notes": "narrow native request boundary (key stays out of renderer) deliberately deferred as architectural refactor"
   },
   {
    "id": "B11",
@@ -1449,20 +1453,19 @@
   },
   {
    "ids": [
-    "B09",
-    "B10"
-   ],
-   "agent": "impl-agent-22",
-   "branch": "program/wave-a",
-   "scope": "apps/desktop + electron main (light)"
-  },
-  {
-   "ids": [
     "G01-p2"
    ],
    "agent": "impl-agent-23",
    "branch": "gpui/fixes-wave-a7",
    "scope": "gpui worktree Rust (light-mid cargo)"
+  },
+  {
+   "ids": [
+    "B01"
+   ],
+   "agent": "impl-agent-24",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop CSP + transport (light)"
   }
  ],
  "prs": {
