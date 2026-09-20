@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "vite-plus/test";
 
 import {
@@ -45,5 +46,33 @@ describe("canonical WAV preparation", () => {
     const bytes = encodeWav16k({ samples: new Float32Array([0, 0]), sampleRate: 16_000 });
     new DataView(bytes.buffer).setUint32(40, 2_000, true);
     assert.throws(() => decodePcm16Wav(bytes), AudioFormatError);
+  });
+});
+
+describe("PCM16 rounding contract (shared fixture)", () => {
+  it("matches the fixture also consumed by the Rust port", () => {
+    // G07: this package is the semantic source of the quantization contract;
+    // apps/desktop-gpui/crates/dictation runs the identical fixture. The
+    // negative half-tie cases (e.g. -2^-16 scaling to exactly -0.5 -> 0)
+    // fail under an implementation that rounds ties away from zero.
+    const fixtureUrl = new URL(
+      "../../../apps/desktop-gpui/test-fixtures/pcm-rounding.json",
+      import.meta.url,
+    );
+    const fixture = JSON.parse(readFileSync(fixtureUrl, "utf8")) as {
+      cases: Array<{ input: number | string; expected: number }>;
+    };
+
+    assert.ok(fixture.cases.length >= 15, "fixture must keep its coverage");
+
+    const samples = Float32Array.from(
+      fixture.cases.map(({ input }) => (typeof input === "string" ? Number(input) : input)),
+    );
+    const bytes = encodeWav16k({ samples, sampleRate: 16_000 });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    fixture.cases.forEach(({ input, expected }, index) => {
+      assert.equal(view.getInt16(44 + index * 2, true), expected, `case ${index}: ${input}`);
+    });
   });
 });

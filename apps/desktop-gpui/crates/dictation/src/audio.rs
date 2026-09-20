@@ -166,18 +166,35 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     Ok(output)
 }
 
+/// ECMAScript `Math.round` for finite `x`: the closest integer, with ties
+/// going toward positive infinity (`Math.round(-0.5)` is `-0`,
+/// `Math.round(-1.5)` is `-1`). Rust's `f64::round` instead rounds ties
+/// away from zero — exactly the divergence G07 pinned down.
+fn js_round(x: f64) -> f64 {
+    let floor = x.floor();
+    let fraction = x - floor;
+    if fraction < 0.5 {
+        floor
+    } else {
+        floor + 1.0
+    }
+}
+
 /// Mirrors `pcm16` in audio.ts: non-finite becomes 0, clamps to -1..=1, then
-/// rounds half away from zero with the asymmetric scales JS applies
-/// (`0x8000` for negatives, `0x7fff` for non-negatives). The multiply happens
-/// in f64 because JS numbers are f64 even for Float32Array elements.
+/// rounds with JS `Math.round` semantics — ties toward positive infinity,
+/// not the half-away-from-zero of `f64::round` (G07: `-2^-16` scales to
+/// exactly -0.5, which `Math.round` maps to 0, where `f64::round` gave -1)
+/// — with the asymmetric scales JS applies (`0x8000` for negatives,
+/// `0x7fff` for non-negatives). The multiply happens in f64 because JS
+/// numbers are f64 even for Float32Array elements.
 fn pcm16(sample: f32) -> i16 {
     let finite = if sample.is_finite() { sample } else { 0.0 };
     let clamped = finite.max(-1.0).min(1.0);
 
     if clamped < 0.0 {
-        (f64::from(clamped) * f64::from(0x8000)).round() as i16
+        js_round(f64::from(clamped) * f64::from(0x8000)) as i16
     } else {
-        (f64::from(clamped) * f64::from(0x7fff)).round() as i16
+        js_round(f64::from(clamped) * f64::from(0x7fff)) as i16
     }
 }
 
@@ -442,6 +459,41 @@ mod tests {
         // +1.0 scales by 0x7fff, -1.0 scales by 0x8000.
         assert_eq!(&bytes[44..46], &0x7fffu16.to_le_bytes());
         assert_eq!(&bytes[46..48], &0x8000u16.to_le_bytes());
+    }
+
+    #[test]
+    fn pcm16_matches_the_shared_rounding_contract_fixture() {
+        // Shared with the TypeScript encoder (G07): packages/dictation's
+        // vitest suite consumes the same file, and audio.ts is the semantic
+        // source of the contract. The negative half-tie cases fail under a
+        // deliberate switch back to round-half-away-from-zero.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/pcm-rounding.json"
+        );
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read shared fixture {path}: {err}"));
+        let fixture: serde_json::Value =
+            serde_json::from_str(&raw).expect("fixture is valid JSON");
+        let cases = fixture["cases"].as_array().expect("fixture cases array");
+        assert!(cases.len() >= 15, "fixture must keep its coverage");
+
+        for case in cases {
+            let input = match &case["input"] {
+                serde_json::Value::Number(number) => {
+                    number.as_f64().expect("finite fixture input") as f32
+                }
+                serde_json::Value::String(literal) => match literal.as_str() {
+                    "NaN" => f32::NAN,
+                    "Infinity" => f32::INFINITY,
+                    "-Infinity" => f32::NEG_INFINITY,
+                    other => panic!("unsupported non-finite literal {other}"),
+                },
+                other => panic!("unsupported fixture input {other}"),
+            };
+            let expected = case["expected"].as_i64().expect("expected i16") as i16;
+            assert_eq!(pcm16(input), expected, "fixture case {case}");
+        }
     }
 
     #[test]

@@ -73,7 +73,9 @@ trimmed. Timeouts: default 180s, allowed 1ms..=600s. Redirects are blocked
 `PcmAudio { samples: Vec<f32>, sample_rate: u32, channels: u16 }` (interleaved
 -1..=1). `mix_to_mono`, `resample_to_16k` (linear interpolation, same rounding),
 `encode_wav_16k` (canonical 44-byte header, PCM16, 16 kHz mono, asymmetric clamp:
-negatives `*0x8000`, positives `*0x7fff`, round-half-away like JS `Math.round`),
+negatives `*0x8000`, positives `*0x7fff`, then `Math.round` semantics — ties
+toward +∞, e.g. `-2^-16` scales to exactly -0.5 and encodes as 0; shared
+contract fixture: `test-fixtures/pcm-rounding.json`, G07),
 `decode_pcm16_wav` (PCM-only, 16-bit, RIFF chunks walked with padding, same
 error messages), `prepare_wav_16k(bytes) -> PreparedWav { wav: Vec<u8>,
 duration_ms, duration_seconds }`.
