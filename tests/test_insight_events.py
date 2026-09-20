@@ -211,6 +211,39 @@ def test_structurally_impossible_counts_refused() -> None:
         aggregate(BASIC + [zero_rate])
 
 
+def test_nonfinite_event_fields_never_degrade_into_numbers() -> None:
+    # json.loads parses NaN/Infinity literals, so a corrupt sync file can
+    # carry them into aggregate(); the contract refuses them (finite check,
+    # not just `value < 0`, which NaN survives) instead of computing
+    # plausible-looking totals from them.
+    nan_words = copy.deepcopy(BASIC[1])
+    nan_words["event_id"] = "nan-words"
+    nan_words["attempt_id"] = "attempt-nan"
+    nan_words["selection_seq"] = 3
+    nan_words["lexical_words"] = float("nan")
+    with pytest.raises(ValueError, match="lexical_words must be finite"):
+        aggregate(BASIC + [nan_words])
+    inf_wait = copy.deepcopy(BASIC[1])
+    inf_wait["event_id"] = "inf-wait"
+    inf_wait["attempt_id"] = "attempt-inf"
+    inf_wait["selection_seq"] = 4
+    inf_wait["post_stop_ready_ms"] = float("inf")
+    with pytest.raises(ValueError, match="post_stop_ready_ms must be finite"):
+        aggregate(BASIC + [inf_wait])
+    nan_rate = copy.deepcopy(BASIC[0])
+    nan_rate["event_id"] = "nan-rate"
+    nan_rate["capture_id"] = "take-nan"
+    nan_rate["sample_rate"] = float("nan")
+    with pytest.raises(ValueError, match="sample_rate must be finite"):
+        aggregate(BASIC + [nan_rate])
+    nan_count = copy.deepcopy(BASIC[0])
+    nan_count["event_id"] = "nan-count"
+    nan_count["capture_id"] = "take-nan-2"
+    nan_count["sample_count"] = float("nan")
+    with pytest.raises(ValueError, match="sample_count must be finite"):
+        aggregate(BASIC + [nan_count])
+
+
 def test_bad_typing_baseline_refused() -> None:
     for value in (0, -1, float("nan")):
         with pytest.raises(ValueError):

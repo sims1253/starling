@@ -292,11 +292,30 @@ def test_chunk_split_and_reassembly_is_lossless() -> None:
     segments = fixture["synthesis"]["segments"]
     samples = synthesize_samples(segments)
     chunks = split_at_silences(samples, segments)
+    bounds = speech_frame_bounds(segments)
     assert len(chunks) == len(fixture["expected"]["capture"]["speech_regions"])
     reassembled = [frame for chunk in chunks for frame in chunk]
-    speech_frames = sum(end - start for start, end in speech_frame_bounds(segments))
-    assert len(reassembled) == speech_frames
+    expected = [frame for start, end in bounds for frame in samples[start:end]]
+    # Losslessness is about sample VALUES, not just counts: the reassembled
+    # stream must equal the original speech frames exactly.
+    assert reassembled == expected
+    assert len(reassembled) == sum(end - start for start, end in bounds)
     assert len(reassembled) < len(samples)  # silence dropped, speech intact
+
+
+def test_wav_round_trip_at_non_default_sample_rate() -> None:
+    # write_wav accepts a sample_rate; read_wav must assert the rate it was
+    # told (default 16000) instead of hardcoding it.
+    fixture = FIXTURES["fx-short-01"]
+    buffer = io.BytesIO()
+    write_wav(buffer, fixture["synthesis"]["segments"], sample_rate=8000)
+    buffer.seek(0)
+    frames, samples = read_wav(buffer, sample_rate=8000)
+    assert frames == len(samples)
+    assert frames > 0
+    buffer.seek(0)
+    with pytest.raises(AssertionError):
+        read_wav(buffer)  # default 16 kHz expectation must reject an 8 kHz file
 
 
 def test_mutation_of_fixture_data_never_touches_shared_state() -> None:
@@ -345,3 +364,37 @@ def test_region_coverage_clamps_overlap_double_counting() -> None:
     )
     assert result["coverage"] <= 1.0
     assert result["uncovered_regions"] == []
+
+
+# --------------------------------------------------------------------------- #
+# OCR review fixes (PR #195), second wave (R16): $ref JSON Pointer escapes,
+# malformed pointers report errors instead of crashing, sibling keywords
+# --------------------------------------------------------------------------- #
+def test_minischema_ref_unescapes_json_pointer_tokens() -> None:
+    tilde = {"$defs": {"a~b": {"type": "integer"}}, "$ref": "#/$defs/a~0b"}
+    slash = {"$defs": {"x/y": {"const": 7}}, "$ref": "#/$defs/x~1y"}
+    assert minischema.errors(3, tilde) == []
+    assert minischema.errors("x", tilde)
+    assert minischema.errors(7, slash) == []
+    assert minischema.errors(8, slash)
+
+
+def test_minischema_malformed_ref_pointer_is_a_validation_error() -> None:
+    missing_key = {"$defs": {}, "$ref": "#/$defs/nope"}
+    through_list = {"$defs": {"a": [1]}, "$ref": "#/$defs/a/b"}
+    non_local = {"$ref": "https://example.com/schema.json"}
+    for schema in (missing_key, through_list, non_local):
+        problems = minischema.errors("x", schema)
+        assert problems and "$ref" in problems[0]
+
+
+def test_minischema_applies_ref_sibling_keywords() -> None:
+    # 2020-12 behavior: $ref does not discard sibling keywords; both apply.
+    schema = {
+        "$defs": {"positive_int": {"type": "integer"}},
+        "$ref": "#/$defs/positive_int",
+        "minimum": 3,
+    }
+    assert minischema.errors(5, schema) == []
+    assert minischema.errors(2, schema) == ["$: 2 below minimum 3"]
+    assert minischema.errors("x", schema) == ["$: expected type integer, got str"]

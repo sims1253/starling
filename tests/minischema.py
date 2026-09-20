@@ -38,13 +38,18 @@ def _type_ok(value: Any, name: str) -> bool:
     raise ValueError(f"minischema does not know type {name!r}")
 
 
-def _resolve_ref(ref: str, root: dict[str, Any]) -> dict[str, Any]:
+def _resolve_ref(ref: str, root: dict[str, Any]) -> tuple[Any, str | None]:
+    """Resolve a local JSON Pointer; returns (node, error) so a malformed
+    pointer becomes a validation error instead of a crash."""
     if not ref.startswith("#/"):
-        raise ValueError(f"minischema only supports local $ref, got {ref!r}")
+        return None, f"minischema only supports local $ref, got {ref!r}"
     node: Any = root
     for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")  # JSON Pointer escapes
+        if not isinstance(node, dict) or part not in node:
+            return None, f"unresolvable $ref pointer {ref!r}"
         node = node[part]
-    return node
+    return node, None
 
 
 def errors(
@@ -63,8 +68,13 @@ def errors(
         return [f"{path}: schema forbids any value"]
 
     if "$ref" in schema:
-        target = _resolve_ref(schema["$ref"], root)
-        return errors(instance, target, root, path)
+        # 2020-12 behavior: the ref target applies AND any sibling keywords
+        # in this same schema object apply too (the code below evaluates them).
+        target, ref_error = _resolve_ref(schema["$ref"], root)
+        if ref_error is None:
+            found.extend(errors(instance, target, root, path))
+        else:
+            found.append(f"{path}: {ref_error}")
 
     if "type" in schema:
         names = schema["type"]

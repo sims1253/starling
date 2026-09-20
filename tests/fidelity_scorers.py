@@ -216,6 +216,12 @@ def speech_region_coverage(
 # --------------------------------------------------------------------------- #
 # Stage orchestration
 # --------------------------------------------------------------------------- #
+def _require(condition: bool, message: str) -> None:
+    """Contract guard that still raises under ``python -O`` (bare assert does not)."""
+    if not condition:
+        raise ValueError(message)
+
+
 def score_stage(fixture: dict[str, Any], stage: str, output: dict[str, Any]) -> dict[str, Any]:
     """Run every gate declared for `stage`; report per-gate results + overall."""
     expected = fixture["expected"][stage]
@@ -283,7 +289,7 @@ def score_stage(fixture: dict[str, Any], stage: str, output: dict[str, Any]) -> 
             result = duplicate_segments(tokens)
             gates["no_duplicate_segments"] = {"pass": result["clean"], "detail": result}
 
-    assert gates, f"no gates declared for fixture {fixture['id']} stage {stage}"
+    _require(gates, f"no gates declared for fixture {fixture['id']} stage {stage}")
     return {"gates": gates, "pass": all(g["pass"] for g in gates.values())}
 
 

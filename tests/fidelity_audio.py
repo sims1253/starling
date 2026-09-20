@@ -60,14 +60,16 @@ def write_wav(
     return len(samples)
 
 
-def read_wav(fileobj: io.BytesIO) -> tuple[int, array.array]:
+def read_wav(
+    fileobj: io.BytesIO, sample_rate: int = SAMPLE_RATE
+) -> tuple[int, array.array]:
     """(frame_count, samples) read back from a 16-bit mono WAV."""
     reader = wave.open(fileobj, "rb")
     try:
         assert reader.getnchannels() == 1 and reader.getsampwidth() == 2
         rate = reader.getframerate()
         raw = reader.readframes(reader.getnframes())
-        assert rate == SAMPLE_RATE
+        assert rate == sample_rate
     finally:
         reader.close()
     samples = array.array("h", raw)
