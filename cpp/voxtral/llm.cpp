@@ -143,7 +143,11 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
         prev = lib::spec_argmax(ctx.spec, dl);
         out.ids.push_back(prev);
     }
-    out.hit_eos = (prev == op.eos_token_id);
+    // S03 termination contract, mapped from this loop's own stop condition:
+    // last token was the EOS -> complete; the audio-row cap ended the loop ->
+    // budget-exhausted (truncated, not a completed decode).
+    out.stop_reason = prev == op.eos_token_id ? lib::GenStopReason::kEos
+                                              : lib::GenStopReason::kBudgetExhausted;
     return true;
 }
 

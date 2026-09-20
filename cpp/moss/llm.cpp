@@ -56,6 +56,9 @@ bool llm_prefill(const MossModel& m, const InputsEmbeds& i, int32_t maxc,
 
 bool greedy_generate(const MossModel& m, const InputsEmbeds& i,
                      const GenerateOptions& op, GenerateResult& o, std::string& e) {
+    // Single-stop contract (S03): no secondary EOS — eos2 stays -1 — and the
+    // shared stack honors a first-token PRIMARY EOS for MOSS like any other
+    // engine; o.stop_reason carries the truthful completion reason out.
     const lib::GenerateParams p{op.max_new_tokens, op.max_cache_len, op.eos_token_id};
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }

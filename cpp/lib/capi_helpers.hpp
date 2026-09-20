@@ -12,6 +12,14 @@ template<class Model, class Tokenizer> struct EngineContext {
     std::unique_ptr<Model> model;
     Tokenizer tokenizer;
     std::string err;
+    // S03 termination contract, C side: the completion status of the last
+    // SUCCESSFUL decode on this context, as the engine's completion-enum
+    // value (see the per-model capi_<model>.cpp that defines it). 0 = no
+    // successful decode yet / the engine has no explicit contract. Engines
+    // that report it reset this to 0 at the start of every decode attempt
+    // and set it after every successful one, so a failed decode never leaves
+    // a stale completion claim behind.
+    int last_completion = 0;
 };
 
 // The error must outlive an unsuccessful load, whose context is destroyed.
