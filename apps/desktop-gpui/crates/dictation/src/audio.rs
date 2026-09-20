@@ -87,8 +87,23 @@ pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
 
 /// Resample interleaved floating-point PCM to mono 16 kHz.
 ///
-/// Linear interpolation is intentionally dependency-free and deterministic.
-/// Native recording APIs should still request 16 kHz directly when possible.
+/// Anti-aliased and still dependency-free (issue #122), a port of
+/// `resampleTo16k` in `packages/dictation/src/audio.ts`: each output sample
+/// is a Blackman-windowed sinc kernel evaluated at its exact fractional
+/// input position — a windowed-sinc low-pass whose cutoff tracks the lower
+/// of the two Nyquist frequencies, so content above the output band is
+/// attenuated (>= 40 dB past the transition band; ~85 dB for 48/44.1 kHz
+/// inputs) instead of folding into it at full amplitude the way plain
+/// linear interpolation did (a 12 kHz tone at 48 kHz became a 4 kHz tone
+/// at unchanged level). Deterministic output, mono mixdown, and duration
+/// are preserved; edges are handled by replicating the first/last input
+/// sample. Native recording APIs should still request 16 kHz directly
+/// when possible.
+///
+/// Whole-recording batch contract: this runs once over the finished buffer
+/// (capture drains at Stop, imports arrive whole), so there is deliberately
+/// no inter-chunk filter state to carry; streaming/stateful resampling
+/// belongs to a capture-pipeline redesign, not to this function.
 pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     let mono = mix_to_mono(audio)?;
 
@@ -101,17 +116,51 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     .round()
     .max(1.0) as usize;
 
-    let mut output = Vec::with_capacity(output_length);
+    // Kernel design: cutoff at 90% of the lower Nyquist (7.2 kHz passband
+    // edge for 16 kHz output) with a half-width of four sinc main-lobe zero
+    // crossings on each side of every output position. The 3-term Blackman
+    // window yields ~-74 dB stopband sidelobes and keeps aliases past the
+    // transition band >= 40 dB down (>= 85 dB for 48 kHz and 44.1 kHz
+    // inputs); tapCount covers upsampling too (ratio < 1 keeps the full
+    // input band).
     let ratio = f64::from(audio.sample_rate) / f64::from(STARLING_SAMPLE_RATE);
-    let last = mono.len() - 1;
+    let cutoff = 0.45 * f64::min(1.0, 1.0 / ratio);
+    let half_taps = (4.0 / cutoff).ceil() as i64;
+    let last_input = mono.len() as i64 - 1;
+
+    let mut output = Vec::with_capacity(output_length);
 
     for index in 0..output_length {
         let position = index as f64 * ratio;
-        let left = (position.floor() as usize).min(last);
-        let right = (left + 1).min(last);
-        let fraction = position - left as f64;
-        let left_sample = f64::from(mono[left]);
-        output.push((left_sample + (f64::from(mono[right]) - left_sample) * fraction) as f32);
+        let center = position.floor() as i64;
+        let fraction = position - center as f64;
+
+        // Weighted sinc interpolation centered at `position` (in input
+        // samples). Normalizing by the weight sum pins the DC gain to
+        // exactly 1.
+        let mut sum = 0.0f64;
+        let mut weight_sum = 0.0f64;
+
+        for tap in -half_taps..=half_taps {
+            let offset = tap as f64 - fraction;
+            let cosine = (std::f64::consts::PI * offset / half_taps as f64).cos();
+            let window = 0.42 + 0.5 * cosine + 0.08 * (2.0 * cosine * cosine - 1.0);
+            let angle = 2.0 * std::f64::consts::PI * cutoff * offset;
+            let sinc = if angle == 0.0 { 1.0 } else { angle.sin() / angle };
+            let coefficient = window * sinc;
+
+            let sample_index = center + tap;
+            let sample = f64::from(mono[sample_index.clamp(0, last_input) as usize]);
+
+            sum += sample * coefficient;
+            weight_sum += coefficient;
+        }
+
+        output.push(if weight_sum > 0.0 {
+            (sum / weight_sum) as f32
+        } else {
+            0.0
+        });
     }
 
     Ok(output)
@@ -436,13 +485,14 @@ mod tests {
     }
 
     #[test]
-    fn resample_matches_lengths_and_interpolates_linearly() {
-        // Downsampling 8 kHz → 16 kHz: 3 frames become 6, interpolated.
+    fn resample_preserves_lengths_and_passes_native_through() {
+        // Downsampling 8 kHz → 16 kHz: 3 frames become 6, all finite.
+        // (Exact sample values are no longer pinned to linear interpolation;
+        // the anti-aliasing suite below owns spectral behavior.)
         let audio = mono(&[0.0, 1.0, 0.0], 8_000);
-        assert_eq!(
-            resample_to_16k(&audio).expect("resample succeeds"),
-            vec![0.0, 0.5, 1.0, 0.5, 0.0, 0.0]
-        );
+        let output = resample_to_16k(&audio).expect("resample succeeds");
+        assert_eq!(output.len(), 6);
+        assert!(output.iter().all(|sample| sample.is_finite()));
 
         // The output length never collapses to zero: round(1 * 16000/96000)
         // is 0, clamped to 1.
@@ -457,6 +507,162 @@ mod tests {
         assert_eq!(
             resample_to_16k(&native).expect("resample succeeds"),
             vec![0.25, -0.75]
+        );
+    }
+
+    /// Amplitude of `frequency_hz` in `samples` at `sample_rate`, by complex
+    /// correlation over a whole number of cycles (leakage-free for pure
+    /// tones whose cycle count is an integer).
+    fn tone_amplitude(samples: &[f32], sample_rate: u32, frequency_hz: f64) -> f64 {
+        let cycles = ((samples.len() as f64 * frequency_hz) / f64::from(sample_rate)).floor();
+        let window = ((cycles * f64::from(sample_rate)) / frequency_hz).round() as usize;
+        let mut real = 0.0f64;
+        let mut imaginary = 0.0f64;
+
+        for (index, &sample) in samples.iter().take(window).enumerate() {
+            let phase = 2.0 * std::f64::consts::PI * frequency_hz * index as f64
+                / f64::from(sample_rate);
+            real += f64::from(sample) * phase.cos();
+            imaginary -= f64::from(sample) * phase.sin();
+        }
+
+        if window == 0 {
+            return 0.0;
+        }
+        2.0 * (real * real + imaginary * imaginary).sqrt() / window as f64
+    }
+
+    /// The seeded linear interpolation this port originally shipped with
+    /// (issue #122 regression control): reads every `ratio`-th input sample.
+    fn linear_resample(mono_samples: &[f32], sample_rate: u32) -> Vec<f32> {
+        let output_length = ((mono_samples.len() as f64 * f64::from(STARLING_SAMPLE_RATE))
+            / f64::from(sample_rate))
+        .round()
+        .max(1.0) as usize;
+        let ratio = f64::from(sample_rate) / f64::from(STARLING_SAMPLE_RATE);
+        let last = mono_samples.len() - 1;
+        let mut output = Vec::with_capacity(output_length);
+
+        for index in 0..output_length {
+            let position = index as f64 * ratio;
+            let left = (position.floor() as usize).min(last);
+            let right = (left + 1).min(last);
+            let fraction = position - left as f64;
+            let left_sample = f64::from(mono_samples[left]);
+            output
+                .push((left_sample + (f64::from(mono_samples[right]) - left_sample) * fraction)
+                    as f32);
+        }
+
+        output
+    }
+
+    #[test]
+    fn suppresses_the_12khz_alias_from_48khz_input() {
+        // Issue #122: a 12 kHz tone at 48 kHz decimated 3:1 aliases to 4 kHz
+        // at unchanged level (the linear kernel reads positions 0, 3, 6, …
+        // of sin(pi/2 * n) → 0, -0.8, 0, 0.8 …).
+        let amplitude = 0.8f64;
+        let samples: Vec<f32> = (0..48_000)
+            .map(|index| {
+                (amplitude * (std::f64::consts::PI * index as f64 / 2.0).sin()) as f32
+            })
+            .collect();
+        let audio = mono(&samples, 48_000);
+
+        let output = resample_to_16k(&audio).expect("resample succeeds");
+        assert_eq!(output.len(), 16_000);
+
+        let leaked = tone_amplitude(&output, STARLING_SAMPLE_RATE, 4_000.0);
+        assert!(
+            leaked <= amplitude * 10.0f64.powf(-40.0 / 20.0),
+            "12 kHz must not fold to 4 kHz above -40 dB: leaked {leaked}"
+        );
+
+        // The fixture has teeth: the seeded linear implementation passes the
+        // alias at (essentially) full amplitude.
+        let linear = linear_resample(&samples, 48_000);
+        let linear_leak = tone_amplitude(&linear, STARLING_SAMPLE_RATE, 4_000.0);
+        assert!(
+            linear_leak > amplitude * 0.5,
+            "linear control must fail this fixture: leaked {linear_leak}"
+        );
+    }
+
+    #[test]
+    fn passes_a_1khz_tone_within_one_db_at_common_rates() {
+        for rate in [48_000u32, 44_100] {
+            let amplitude = 0.7f64;
+            let samples: Vec<f32> = (0..rate)
+                .map(|index| {
+                    (amplitude
+                        * (2.0 * std::f64::consts::PI * 1_000.0 * index as f64
+                            / f64::from(rate))
+                        .sin()) as f32
+                })
+                .collect();
+            let audio = mono(&samples, rate);
+
+            let output = resample_to_16k(&audio).expect("resample succeeds");
+            assert_eq!(output.len(), 16_000, "1 s at {rate} Hz → 16_000 frames");
+
+            // 1000 whole cycles at 16 kHz: exact correlation bin.
+            let passed = tone_amplitude(&output, STARLING_SAMPLE_RATE, 1_000.0);
+            let ratio = passed / amplitude;
+            assert!(
+                (10.0f64.powf(-1.0 / 20.0)..=10.0f64.powf(1.0 / 20.0)).contains(&ratio),
+                "{rate} Hz in-band 1 kHz tone must stay within 1 dB: {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn resample_passes_dc_with_unity_gain() {
+        let samples = vec![0.25f32; 1_000];
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 333); // round(1000 * 16000/48000)
+        for sample in &output {
+            assert!(
+                (sample - 0.25).abs() <= 1e-9,
+                "DC must pass at unity gain, got {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn resample_spreads_an_impulse_without_inventing_energy() {
+        let mut samples = vec![0.0f32; 4_800];
+        samples[2_400] = 1.0;
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 1_600);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let peak = output.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        assert!(peak <= 1.3, "windowed-sinc overshoot stays bounded: {peak}");
+
+        let energy: f64 = output.iter().map(|sample| f64::from(*sample).powi(2)).sum();
+        // Band-limiting keeps roughly the in-band share (~7.2/24 kHz = 0.3);
+        // no energy may be invented, none silently nulled.
+        assert!(
+            (0.05..=1.5).contains(&energy),
+            "impulse energy out of bounds: {energy}"
+        );
+    }
+
+    #[test]
+    fn resample_replicates_a_trailing_edge_without_smearing_it_away() {
+        // 10 ms of silence, then a full-scale step for the last 10 samples:
+        // boundary replication must represent the edge (duration kept, no
+        // blow-up, final output close to the step level).
+        let mut samples = vec![0.0f32; 470];
+        samples.resize(480, 1.0);
+        let output = resample_to_16k(&mono(&samples, 48_000)).expect("resample succeeds");
+        assert_eq!(output.len(), 160);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.3));
+        assert!(
+            output.last().copied().unwrap_or(0.0) >= 0.5,
+            "edge step must survive into the final output"
         );
     }
 
