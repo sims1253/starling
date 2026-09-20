@@ -209,9 +209,16 @@ fn sinc_sample(mono: &[f32], center: i64, fraction: f64, half_taps: i64, cutoff:
 }
 
 /// ECMAScript `Math.round` for finite `x`: the closest integer, with ties
-/// going toward positive infinity (`Math.round(-0.5)` is `-0`,
-/// `Math.round(-1.5)` is `-1`). Rust's `f64::round` instead rounds ties
-/// away from zero — exactly the divergence G07 pinned down.
+/// going toward positive infinity (`Math.round(-1.5)` is `-1`). Rust's
+/// `f64::round` instead rounds ties away from zero — exactly the
+/// divergence G07 pinned down.
+///
+/// One deliberate, documented divergence from the letter of ECMAScript:
+/// for `-0.5 <= x < 0` JS produces negative zero (`Math.round(-0.5)` and
+/// `Math.round(-0.2)` are both `-0`), while the `floor + 1.0` form here
+/// returns `+0.0`. Harmless for the only caller, [`pcm16`]: `-0.0` and
+/// `+0.0` both cast to the i16 sample `0`, so the encoded WAV is
+/// byte-identical either way.
 fn js_round(x: f64) -> f64 {
     let floor = x.floor();
     let fraction = x - floor;
@@ -671,6 +678,21 @@ mod tests {
         let input = [0.25f32; 64];
         assert_eq!(sinc_sample(&input, 32, 0.0, 9, 0.45), 0.25);
         assert_eq!(sinc_sample(&input, 32, 0.37, 9, 0.45), 0.25);
+    }
+
+    #[test]
+    fn js_round_ties_go_toward_positive_infinity_as_positive_zero() {
+        // Documented divergence (R17): ECMAScript yields -0 for
+        // -0.5 <= x < 0; the floor+1 form yields +0. Both encode to the
+        // same pcm16 sample, and the tie direction itself still matches
+        // JS for every nonzero result.
+        assert_eq!(js_round(-1.5), -1.0);
+        assert_eq!(js_round(-0.5), 0.0);
+        assert!(js_round(-0.5).is_sign_positive());
+        assert_eq!(js_round(-0.2), 0.0);
+        assert!(js_round(-0.2).is_sign_positive());
+        assert_eq!(js_round(0.5), 1.0);
+        assert_eq!(js_round(1.5), 2.0);
     }
 
     /// Amplitude of `frequency_hz` in `samples` at `sample_rate`, by complex
