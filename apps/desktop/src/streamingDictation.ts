@@ -1,4 +1,5 @@
 import type {
+  DictationSession,
   FinishedStreamCapture,
   StarlingStreamEvent,
   TranscriptionResult,
@@ -141,10 +142,16 @@ export class StreamingDictation {
    * cancellation probe runs after every await, before each durable write: a
    * discarded take finalizes nothing and leaves the session unwritten, so a
    * close-guard Discard racing Stop cannot be resurrected (#160).
+   *
+   * `onDurableSave` fires once the drained journal is durably owned by its
+   * session — after the cancellation probe, before any network work — so the
+   * caller can end the capture transition while the transcript is still in
+   * flight (B03). It never fires for a discarded take or a failed save.
    */
   async finish(
     durationMs?: number,
     isCancelled?: () => boolean,
+    onDurableSave?: (session: DictationSession) => void,
   ): Promise<StreamingDictationResult> {
     await this.pipeline;
 
@@ -161,6 +168,10 @@ export class StreamingDictation {
 
       return Object.freeze({ ...finished, streamed: false });
     }
+
+    // The journal is now durably owned by its session: report it before the
+    // commit, so a new take may start while the transcript is awaited (B03).
+    if (finished.session !== undefined) onDurableSave?.(finished.session);
 
     if (this.canCommit()) {
       try {

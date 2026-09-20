@@ -29,13 +29,20 @@ export interface StreamingFinalizeStore {
 export interface StreamingFinalizeDeps {
   readonly stream: StreamingDictation;
   readonly durationMs: number;
-  /** The take generation Stop settled on; false once Discard bumps it (#160). */
+  /** The take generation Stop settled on; false once Discard invalidates it (#160, B03). */
   readonly isCurrentTake: () => boolean;
   readonly parkUnsavedWav: (wav: Blob) => void;
   readonly refresh: () => Promise<void>;
   readonly setSelectedId: (id: string) => void;
   readonly setConnectionReady: () => void;
   readonly transcribe: (session: DictationSession) => Promise<void>;
+  /**
+   * Invoked once the drained journal is durably owned by its session, before
+   * any transcript work runs (B03): the caller ends the capture transition
+   * here, so a new take can start while transcription is still in flight.
+   * Never invoked for a discarded take or a failed durable save.
+   */
+  readonly onDurableSave?: () => void;
 }
 
 function messageFrom(cause: unknown): string {
@@ -69,6 +76,11 @@ async function dropProvisional(
  *
  * Returns batchFallback when the stream was never usable and the caller
  * should save the recorder's own capture via the batch path.
+ *
+ * `deps.onDurableSave` fires the moment the journal is durably owned by its
+ * session — before the commit, the transcript write, or any batch
+ * transcription — so the caller can release the recording lifecycle while
+ * inference is still in flight (B03).
  */
 export async function finishStreamingTake(
   deps: StreamingFinalizeDeps,
@@ -92,7 +104,11 @@ export async function finishStreamingTake(
     return { streamed: false, batchFallback: true };
   }
 
-  const result = await stream.finish(durationMs, () => !isCurrentTake());
+  const result = await stream.finish(
+    durationMs,
+    () => !isCurrentTake(),
+    () => deps.onDurableSave?.(),
+  );
 
   if (result.session === undefined) {
     if (!isCurrentTake()) {

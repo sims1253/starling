@@ -264,6 +264,10 @@ export default function App() {
   // Identity of the take being started, captured before any await; bumped
   // whenever the current take is invalidated so late work disposes itself.
   const takeSeqRef = useRef(0);
+  // Takes invalidated by an explicit Discard (B03): a newer take starting no
+  // longer cancels an older finalize — only a Discard does — so invalidation
+  // is recorded per generation instead of being implied by the sequence head.
+  const discardedTakesRef = useRef(new Set<number>());
 
   const selected = sessions.find((session) => session.id === selectedId);
   const [audioUrl, setAudioUrl] = useState<string>();
@@ -663,26 +667,34 @@ export default function App() {
     [endpoint, model, protocol, refresh],
   );
 
+  /**
+   * Durably save one finished capture as its own session (B03): once this
+   * resolves, the store owns the WAV and the recording lifecycle can be
+   * released while transcription runs separately. A storage failure parks
+   * the only in-memory copy in unsavedWavs and rejects.
+   */
+  const saveTake = useCallback(async (wav: Blob, durationMs?: number): Promise<DictationSession> => {
+    try {
+      return await store.create({ wav, durationMs });
+    } catch (caught) {
+      setUnsavedWavs((current) => [
+        ...current,
+        { id: unsavedWavId(), blob: wav, createdAt: new Date().toISOString() },
+      ]);
+      throw new Error(
+        `Local storage failed: ${messageFrom(caught)} Keep this window open and download the unsaved WAV to recover it.`,
+      );
+    }
+  }, []);
+
   const saveAndTranscribe = useCallback(
     async (wav: Blob, durationMs?: number) => {
-      let created: DictationSession;
-
-      try {
-        created = await store.create({ wav, durationMs });
-      } catch (caught) {
-        setUnsavedWavs((current) => [
-          ...current,
-          { id: unsavedWavId(), blob: wav, createdAt: new Date().toISOString() },
-        ]);
-        throw new Error(
-          `Local storage failed: ${messageFrom(caught)} Keep this window open and download the unsaved WAV to recover it.`,
-        );
-      }
+      const created = await saveTake(wav, durationMs);
 
       await refresh();
       await transcribe(created);
     },
-    [refresh, transcribe],
+    [refresh, saveTake, transcribe],
   );
 
   /**
@@ -986,7 +998,11 @@ export default function App() {
 
   const discardStreamingTake = useCallback(async (): Promise<void> => {
     // Invalidate the in-flight take identity: a beginStreamingTake that is
-    // still awaiting storage must not install its controller after this.
+    // still awaiting storage must not install its controller after this,
+    // and a finalize still running must write nothing further. A newer take
+    // starting does not invalidate an older finalize (B03); only this
+    // explicit discard does.
+    discardedTakesRef.current.add(takeSeqRef.current);
     takeSeqRef.current += 1;
 
     const stream = streamRef.current;
@@ -1013,27 +1029,33 @@ export default function App() {
   /**
    * Finalize the streamed take this Stop was issued against. The caller
    * captures the take generation before any await — a close-guard Discard
-   * offered while the stop itself is still running already bumped past it —
+   * offered while the stop itself is still running already invalidated it —
    * and the finalize re-validates it around each durable write, so a Discard
    * racing the finalize wins: the stale take writes nothing and leaves the
    * Discard's state untouched (#160). Returns false when the stream was
    * never usable and the caller should save the recorder's own capture via
    * the batch path.
+   *
+   * `releaseCapture` is invoked the moment the journal is durably owned by
+   * its session, before the transcript work: the stop transition ends there
+   * so the next take can start while transcription is in flight (B03).
    */
   const finishStreamingTake = useCallback(
     async (
       stream: StreamingDictation,
       durationMs: number,
       generation: number,
+      releaseCapture: () => void,
     ): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
 
-      // The take identity this Stop was issued against; the close-guard
-      // Discard bumps takeSeqRef, which flips this probe and cancels the
-      // finalize's writes.
-      const isCurrentTake = () => takeSeqRef.current === generation;
+      // The take identity this Stop was issued against. Only an explicit
+      // Discard invalidates it (B03): a newer take starting while this
+      // finalize still runs no longer cancels its writes. The close-guard
+      // Discard still wins its races (#160).
+      const isCurrentTake = () => !discardedTakesRef.current.has(generation);
 
       if (bailed) {
         setPartialText(undefined);
@@ -1059,6 +1081,7 @@ export default function App() {
             setSelectedId: (id) => setSelectedId(id),
             setConnectionReady: () => setConnection("ready"),
             transcribe,
+            onDurableSave: releaseCapture,
           },
           store,
         );
@@ -1067,9 +1090,13 @@ export default function App() {
 
         return !finalized.batchFallback;
       } finally {
-        setPartialText(undefined);
-        setStreamStatus(undefined);
-        setStreamingFinalize(false);
+        // A newer take may own the live-stream state by now (B03): only the
+        // take this finalize belonged to may clear it.
+        if (takeSeqRef.current === generation) {
+          setPartialText(undefined);
+          setStreamStatus(undefined);
+          setStreamingFinalize(false);
+        }
       }
     },
     [parkUnsavedWav, refresh, transcribe],
@@ -1089,8 +1116,7 @@ export default function App() {
 
       // The take identity this Stop was issued against, captured before any
       // await: a close-guard Discard offered while the stop itself is still
-      // running bumps takeSeqRef past it, so the finalize below sees a
-      // stale take from its first probe (#160).
+      // running invalidates exactly this generation (#160, B03).
       const generation = takeSeqRef.current;
 
       // The controller bound to the take being stopped, read before any
@@ -1105,6 +1131,26 @@ export default function App() {
       // the close guard reports it as journaled for the whole finalize.
       setStreamingFinalize(stream !== undefined);
       setFinalizing(true);
+
+      // Ends the capture transition the moment this take's audio is durably
+      // owned by its session (B03): the streamed journal's commit or the
+      // batch store.create. Transcription keeps running in the background,
+      // so a new take may start while it is in flight. Released at most
+      // once: a stop that already handed off must never end a newer take's
+      // transition from its finally.
+      let released = false;
+
+      const releaseCapture = () => {
+        if (released) return;
+
+        released = true;
+        lifecycle.endStop();
+        setTakePhase("idle");
+        setFinalizing(false);
+        // The session row (or the parked unsaved WAV) owns durability now,
+        // so the close-guard mirror no longer needs the journaled flag.
+        setStreamingFinalize(false);
+      };
 
       try {
         const capture = await stop();
@@ -1124,19 +1170,28 @@ export default function App() {
           throw new Error("No microphone audio was captured.");
         }
 
-        if (stream && (await finishStreamingTake(stream, capture.durationMs, generation))) {
+        if (
+          stream &&
+          (await finishStreamingTake(stream, capture.durationMs, generation, releaseCapture))
+        ) {
           return;
         }
 
         const prepared = await prepareWav16k(capture.audio);
-        await saveAndTranscribe(prepared.blob, capture.durationMs);
+        const created = await saveTake(prepared.blob, capture.durationMs);
+        await refresh();
+
+        // Durable: the session store owns the WAV. Release the capture
+        // lifecycle and let the transcription finish in the background
+        // (B03); the upload indicator tracks this session alone.
+        releaseCapture();
+        void transcribe(created);
       } catch (caught) {
         setError(messageFrom(caught));
       } finally {
-        lifecycle.endStop();
-        setTakePhase("idle");
-        setStreamingFinalize(false);
-        setFinalizing(false);
+        // Covers every path that never reached a durable save (failed
+        // starts of the finalize, storage failures, empty captures).
+        releaseCapture();
       }
 
       return;
@@ -1209,7 +1264,8 @@ export default function App() {
     finishStreamingTake,
     lifecycle,
     protocol,
-    saveAndTranscribe,
+    refresh,
+    saveTake,
     start,
     stop,
     streamLive,
