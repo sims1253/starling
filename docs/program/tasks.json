@@ -227,8 +227,10 @@
    "status": "in_progress",
    "owner": "impl-agent-33",
    "branch": "gpui/fixes-wave-a11",
-   "evidence": [],
-   "notes": "I2 storage v2 core dispatched (D11: rusqlite bundled)"
+   "evidence": [
+    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal"
+   ],
+   "notes": "cutover remains: app wiring behind STARLING_STORAGE_V2, user-reviewed dry-run->apply->accept UI, leases, retention sweep, bounded reads, E02 crash-injection docs"
   },
   {
    "id": "E03",
@@ -1495,9 +1497,9 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-35",
+   "branch": "program/s02-review-fixes3",
    "evidence": [
     "PR #198 OCR run 35511919623 (post-R22)"
    ],
@@ -1511,9 +1513,9 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-35",
+   "branch": "program/s11-review-fixes",
    "evidence": [
     "PR #199 OCR run 35511055827"
    ],
