@@ -1,0 +1,41 @@
+{
+ "known_review_comment_ids": [
+  4057838308,
+  4057838317,
+  4057838322,
+  4057838328,
+  4057838333,
+  4057838336,
+  4057838340,
+  4057838345,
+  4057856984,
+  4057856985,
+  4057856986,
+  4057858368,
+  4057858374,
+  4057858377,
+  4057858381
+ ],
+ "findings": [
+  {
+   "id": 4057858374,
+   "severity": "perf-medium",
+   "summary": "GgufMetadata perf issue"
+  },
+  {
+   "id": 4057856986,
+   "severity": "bug-medium",
+   "summary": "general.architecture attacker-controlled length up to 4MiB read budget - crafted file amplification"
+  },
+  {
+   "id": 4057856984,
+   "severity": "maint-low",
+   "summary": "validator coverage ends at KV section; loader does more"
+  },
+  {
+   "id": 4057856985,
+   "severity": "test-low",
+   "summary": "concurrent-import test discards results; assertions hold if race lost"
+  }
+ ]
+}

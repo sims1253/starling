@@ -1633,6 +1633,38 @@
     "5090 report Gate C: ReplayGraph rejects 24/1869 nodes (all CONV_2D_DW, src0=f16) on CUDA; plain master 12b6548 fails identically; ggml-cuda.cu:5533 returns src0->type==F32; convert_parakeet_gguf.py deliberately stores F16"
    ],
    "notes": "fix directions: extend pinned-ggml CUDA CONV_2D_DW to accept F16 src0 (patch series) or add a capture-time cast; blocks parakeet CUDA E2E + S02 VRAM-plateau evidence; coordinator to draft as GitHub issue for user review"
+  },
+  {
+   "id": "R33",
+   "title": "PR #200 review: GgufMetadata perf + attacker-controlled arch length + 13 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": "program/wave-b",
+   "evidence": [
+    "PR #200 OCR first review (15 findings)"
+   ],
+   "notes": "fetch full bodies before fixing; the arch-length amplification is the priority"
+  },
+  {
+   "id": "R34",
+   "title": "PR #201 review: 4-5 mediums (persisted-choice handling, v2 open failure, quiesce-salvage loses interrupted state, store perf) + lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "PR #201 OCR first review (13 findings)"
+   ],
+   "notes": "quiesce-salvage finding is the sharpest: finalized journal must still land as interrupted row on v2; fetch full bodies first"
   }
  ],
  "active_assignments": [

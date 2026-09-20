@@ -1,0 +1,64 @@
+{
+ "known_review_comment_ids": [
+  4057861584,
+  4057861588,
+  4057861590,
+  4057861592,
+  4057861596,
+  4057861601,
+  4057861604,
+  4057861607,
+  4057861611,
+  4057861614,
+  4057898194,
+  4057898196,
+  4057898199
+ ],
+ "findings": [
+  {
+   "id": 4057861584,
+   "severity": "bug-medium",
+   "summary": "persisted [storageBackend choice issue]"
+  },
+  {
+   "id": 4057861588,
+   "severity": "bug-medium",
+   "summary": "v2 open-[failure issue]"
+  },
+  {
+   "id": 4057861592,
+   "severity": "bug-medium",
+   "summary": "failure [path issue]"
+  },
+  {
+   "id": 4057861596,
+   "severity": "perf-medium",
+   "summary": "store.rs perf"
+  },
+  {
+   "id": 4057861604,
+   "severity": "perf-medium",
+   "summary": "store.rs perf 2"
+  },
+  {
+   "id": 4057861607,
+   "severity": "bug-medium",
+   "summary": "last_error issue"
+  },
+  {
+   "id": 4057898194,
+   "severity": "bug-medium",
+   "summary": "quiesce-salvaged take loses interrupted state on v2 (finalized journal vs interrupt row)"
+  },
+  {
+   "id": 4057898196,
+   "severity": "bug-low",
+   "summary": "saved-choice v2 open failure: env-flag advice is a no-op"
+  },
+  {
+   "id": 4057898199,
+   "severity": "doc-low",
+   "summary": "fallback sentence renders for every v2 session; only actionable for flag reason"
+  }
+ ]
+}
