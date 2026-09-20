@@ -130,11 +130,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/wave-b",
+   "evidence": [
+    "coordinator rerun (clean --rerun-tasks): 94/94 unit tests; sentinel port of the landed Python fix; byte-mirror parity fixtures w/ Python suite 7/7; negation-drop repro red-first"
+   ],
+   "notes": "algorithm+parity verified; on-device streaming E2E remains device-gated"
   },
   {
    "id": "B08",
@@ -144,11 +146,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/wave-b",
+   "evidence": [
+    "coordinator rerun 94/94; import fully under lock w/ unique staging + fsync + atomic rename promotion (old model never deleted first); GGUF metadata validator w/ accept/reject matrix; concurrent-import race test"
+   ],
+   "notes": "host-JVM verified; SAF/f2fs/engine-reload paths remain device-gated"
   },
   {
    "id": "B09",
