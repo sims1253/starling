@@ -112,11 +112,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 151/151 (12 files incl. settingsTransaction + connectionProbe suites), lint 0/0, tsc clean, fmt gate restored after fixing 3 drifted test files; rollback on injected mid-write storage failure tested; probes isolated + latest-wins sequenced; probes never write model state"
+   ],
+   "notes": "dialog JSX wiring not component-tested (no React harness in repo); pre-existing fmt drift fixed in same push (c33dfea)"
   },
   {
    "id": "B07",
@@ -154,9 +156,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-22",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -168,9 +170,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-22",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -1444,6 +1446,15 @@
    "agent": "impl-agent-19",
    "branch": "gpui/fixes-wave-a5",
    "scope": "gpui worktree Rust (light)"
+  },
+  {
+   "ids": [
+    "B09",
+    "B10"
+   ],
+   "agent": "impl-agent-22",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop + electron main (light)"
   }
  ],
  "prs": {
