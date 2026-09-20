@@ -994,11 +994,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-31",
    "branch": "program/s11-tail-reuse",
-   "evidence": [],
-   "notes": "",
+   "evidence": [
+    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open"
+   ],
+   "notes": "no real-model/GPU timing claims; reuse count reported separately from latency; serving first-wave (S01/S02/S03/S11) now ALL implemented+CPU/Vulkan-verified",
    "branch_note": "engine worktree"
   },
   {
@@ -1473,9 +1475,9 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-32",
+   "branch": "program/s02-review-fixes2",
    "evidence": [
     "PR #198 OCR run 35510136933 (post-R20 push): 2 medium + 2 low"
    ],
