@@ -19,13 +19,19 @@ use starling_dictation::{
     },
 };
 
-/// Map a v2 failure onto the app's existing storage error plumbing, keeping
-/// [`storage::StorageError::NotFound`] intact — the transcription job's
-/// delete-race decision keys on exactly that variant (R05).
+/// Map a v2 failure onto the app's existing storage error plumbing.
+/// [`storage::StorageError::NotFound`] stays intact — the transcription
+/// job's delete-race decision keys on exactly that variant (R05) — and an
+/// I/O failure keeps its class ([`storage::StorageError::Io`]): a disk
+/// fault must not read as "the record was invalid" in diagnostics. The
+/// remaining variants (database, schema-too-new, storage, audio) already
+/// carry their class in their display text and land in `Invalid` with it
+/// preserved.
 fn v2_err(err: StoreV2Error) -> storage::StorageError {
     match err {
         StoreV2Error::NotFound(id) => storage::StorageError::NotFound(id),
         StoreV2Error::Invalid(reason) => storage::StorageError::Invalid(reason),
+        StoreV2Error::Io(io) => storage::StorageError::Io(io),
         other => storage::StorageError::Invalid(other.to_string()),
     }
 }
@@ -217,23 +223,36 @@ impl Store {
     /// The startup recovery pass: reconcile journals against the metadata
     /// rows (§4), then fail recognition attempts still marked started by a
     /// previous run. Returns a user-facing summary string, empty when
-    /// there was nothing to report.
+    /// there was nothing to report. The two repairs are independent
+    /// (journal state vs. recognition-attempt rows), so both always run —
+    /// a reconciliation failure must not strand records stuck in
+    /// "Transcribing", and vice versa; when both fail the errors combine.
     pub(crate) fn startup_recovery(&self) -> Result<String, storage::StorageError> {
         /// The note a stale recognition attempt gets at startup — same
         /// wording as the v1 "stuck in Transcribing" fix.
         const STALE_ATTEMPT_NOTE: &str =
             "Interrupted before the server returned a transcript. Your audio is ready to retry.";
-        let mut store = lock_v2(&self.0);
-        let report = store.reconcile().map_err(v2_err)?;
-        let summary = if report.has_findings() {
-            report.summary()
-        } else {
-            String::new()
+        let (reconciled, staled) = {
+            let mut store = lock_v2(&self.0);
+            (
+                store.reconcile(),
+                store.interrupt_stale_attempts(STALE_ATTEMPT_NOTE),
+            )
         };
-        store
-            .interrupt_stale_attempts(STALE_ATTEMPT_NOTE)
-            .map_err(v2_err)?;
-        Ok(summary)
+        match (reconciled.map_err(v2_err), staled.map_err(v2_err)) {
+            (Ok(report), Ok(_)) => {
+                let summary = if report.has_findings() {
+                    report.summary()
+                } else {
+                    String::new()
+                };
+                Ok(summary)
+            }
+            (Err(reconcile_err), Err(stale_err)) => Err(storage::StorageError::Invalid(format!(
+                "{reconcile_err}; {stale_err}"
+            ))),
+            (Err(err), Ok(_)) | (Ok(_), Err(err)) => Err(err),
+        }
     }
 
     /// Write a take from decoded PCM through the §4 protocol with the
@@ -851,6 +870,150 @@ mod tests {
         // After the pass the stale attempt is failed, ready to retry.
         assert_eq!(session_status(&store, &id), SessionStatus::Failed);
         assert!(transcript_text(&store, &id).is_none());
+    }
+
+    #[test]
+    fn an_io_failure_keeps_its_class_at_the_boundary() {
+        // A disk fault must surface as an I/O error, not "invalid record"
+        // — the class is what tells the user (and any caller branching on
+        // it) what actually went wrong.
+        let mapped = v2_err(StoreV2Error::Io(std::io::Error::other("disk on fire")));
+        match mapped {
+            storage::StorageError::Io(err) => {
+                assert!(err.to_string().contains("disk on fire"), "{err}")
+            }
+            other => panic!("expected an Io error, got {other:?}"),
+        }
+        // Variants without a StorageError counterpart keep their class in
+        // the message: a schema refusal must read as a schema problem.
+        let mapped = v2_err(StoreV2Error::SchemaTooNew {
+            found: 99,
+            supported: 2,
+        });
+        match mapped {
+            storage::StorageError::Invalid(reason) => {
+                assert!(reason.contains("schema version 99"), "{reason}")
+            }
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_adopted_take_transcribes_the_stored_audio_not_the_caller_wav() {
+        // The adopted journal is the stored evidence every retry loads. A
+        // faulted writer can leave the journal shorter than the in-memory
+        // take, so the first transcript must run on the stored bytes too —
+        // otherwise attempt one and its retry transcribe different audio.
+        let store = v2_store("adopt-consistent");
+        let samples: Vec<f32> = (0..120).map(|i| (i % 23) as f32 * 0.004).collect();
+        let report = finalized_journal("adopt-consistent-src", &samples);
+
+        // The caller's WAV carries more samples than the journal does.
+        let saved = store
+            .save_capture(tiny_wav(300), Some(&report))
+            .expect("adopting save");
+
+        let decoded = audio::decode_pcm16_wav(&saved.wav).expect("decode");
+        assert_eq!(decoded.samples.len(), 120, "the stored journal's samples");
+        // And exactly what a retry loads, so the two can never diverge.
+        let reloaded = store.audio_wav(&saved.id).expect("reload").expect("present");
+        let reloaded = audio::decode_pcm16_wav(&reloaded).expect("decode");
+        assert_eq!(reloaded.samples, decoded.samples);
+    }
+
+    #[test]
+    fn an_unusable_journal_still_saves_the_take_from_its_wav() {
+        // An adoption failure is a journal-level problem; the store is
+        // healthy and the fully encoded WAV is in hand. The save must not
+        // abort (that would drop the take into the memory-only stash) — it
+        // falls through to the WAV path.
+        let store = v2_store("adopt-fallback");
+        let junk_root = scratch_dir("adopt-fallback-junk");
+        let junk_path = junk_root.join("j_unreadable.sj");
+        std::fs::write(&junk_path, b"not a journal at all").expect("write junk journal");
+        let report = recorder::JournalReport {
+            path: junk_path.clone(),
+            id: "j_unreadable".to_string(),
+            sample_rate: 16_000,
+            acknowledged_samples: 0,
+            finalized: true,
+            fault: None,
+        };
+
+        let saved = store
+            .save_capture(tiny_wav(90), Some(&report))
+            .expect("the take is saved from its WAV");
+
+        assert_ne!(saved.id, "j_unreadable", "a fresh take, not the journal id");
+        let decoded = audio::decode_pcm16_wav(&saved.wav).expect("decode");
+        assert_eq!(decoded.samples.len(), 90);
+        let summary = summary_of(&store, &saved.id);
+        assert_eq!(summary.status, SessionStatus::Captured);
+        // The unusable journal was left where it was.
+        assert!(junk_path.exists());
+    }
+
+    #[test]
+    fn a_wav_path_salvage_lands_interrupted_with_its_note() {
+        // The no-journal salvage path: the interruption and its note are
+        // committed with the take (one transaction — R34 leaves no crash
+        // window between "saved" and "marked").
+        let store = v2_store("wav-salvage");
+        let id = store
+            .save_interrupted_capture(tiny_wav(60), None, "kept from memory after the fault")
+            .expect("salvage save");
+
+        let summary = summary_of(&store, &id);
+        assert_eq!(summary.status, SessionStatus::Interrupted);
+        let last_error = summary.last_error.expect("the salvage note surfaces");
+        assert!(last_error.contains("kept from memory"), "{last_error}");
+        // The audio is playable: the stored take round-trips.
+        let loaded = store.audio_wav(&id).expect("audio").expect("present");
+        let decoded = audio::decode_pcm16_wav(&loaded).expect("decode");
+        assert_eq!(decoded.samples.len(), 60);
+    }
+
+    #[test]
+    fn startup_recovery_repairs_stale_attempts_even_when_reconciliation_fails() {
+        // The two startup repairs are independent: a reconciliation failure
+        // must not leave records stuck in "Transcribing" from a previous
+        // run — the stale-attempt repair runs anyway and the reconcile
+        // error still surfaces.
+        let store = v2_store("reconcile-fail");
+        let stuck = store
+            .save_capture(tiny_wav(70), None)
+            .expect("save")
+            .id;
+        store.mark_attempt(&stuck, "starling:parakeet").expect("begin");
+
+        // Sabotage reconciliation only: a tombstoned capture whose journal
+        // was resurrected under audio/ while its quarantine destination is
+        // a directory — the tombstone-completion rename cannot succeed, so
+        // reconcile errors while the rest of the store stays healthy.
+        let doomed = store
+            .save_capture(tiny_wav(30), None)
+            .expect("save")
+            .id;
+        store.delete(&doomed).expect("delete");
+        {
+            let inner = lock_v2(&store.0);
+            let audio = inner.root().join("audio").join(format!("{doomed}.sj"));
+            let quarantine = inner.root().join("quarantine").join(format!("{doomed}.sj"));
+            std::fs::copy(&quarantine, &audio).expect("resurrect the journal");
+            std::fs::remove_file(&quarantine).expect("clear the destination");
+            std::fs::create_dir(&quarantine).expect("the destination is now a directory");
+        }
+
+        assert!(
+            store.startup_recovery().is_err(),
+            "the sabotaged reconciliation must surface its error"
+        );
+        // …but the stale attempt was still repaired: the stuck take is
+        // retryable (failed with its note), not still "Transcribing".
+        assert_eq!(session_status(&store, &stuck), SessionStatus::Failed);
+        let summary = summary_of(&store, &stuck);
+        let last_error = summary.last_error.expect("the stale-attempt note");
+        assert!(last_error.contains("ready to retry"), "{last_error}");
     }
 
     fn session_status(store: &Store, id: &str) -> SessionStatus {
