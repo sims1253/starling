@@ -154,3 +154,22 @@ builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
   dispatch concurrency held at 1-2.
 - Next: I3 runtime crate (dispatched), then Android B07/B08 (gradle window),
   E02 cutover UI, E15/E12 packaging parity, S13/S14 quant track.
+
+## Update 2026-09-20 (late night) — CI fully green, review loop at zero
+
+- PR #195 ALL checks green (Desktop 3x OS, browser-and-api, build-cpu,
+  engine guards, SONAR, android): lint gate satisfied (56 anti-slop errors
+  fixed via schema-parse/SAFETY/named-type idioms, 4ffe6fd), fake-indexeddb
+  declared at its package boundary, conditional engine-target CI wiring.
+- PR #194 ALL green: X11/Wayland link libs, headless player-test guards,
+  Schema-based G07 fixture parser, fmt-clean TS.
+- Engine PRs #198/#199 green through review batch-4 (R25/R26 integrated:
+  373/373 S11 lineage, 235/235 + budget PASS S02 lineage).
+- Open review comments: ZERO across all PRs. Bots confirmed fixes in-thread.
+- Process lessons recorded: pipeline-exit-code false greens (`cmd | tail;
+  echo $?`) eliminated from coordinator verification; CI-exact invocations
+  (pnpm run lint/fmt:check from repo root) replace scoped manual runs;
+  temp-file staging in shared checkouts uses untracked names only (a real
+  tracked test was nearly lost to a staging copy - restored, gates re-run).
+- I3 runtime crate integrated (161+42+50). Lint-cleanup agent final state:
+  0 warnings 0 errors.
