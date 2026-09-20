@@ -1,0 +1,130 @@
+[
+  {
+    "schema_version": 1,
+    "event_id": "g-c1",
+    "capture_id": "take-g1",
+    "occurred_at": "2026-09-20T15:00:00Z",
+    "type": "capture_finalized",
+    "sample_count": 640000,
+    "sample_rate": 16000,
+    "complete_audio": true,
+    "mode_id": "code-guidance",
+    "reporting_timezone": "Europe/Berlin"
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-a1",
+    "capture_id": "take-g1",
+    "occurred_at": "2026-09-20T15:00:01Z",
+    "type": "recognition_selected",
+    "attempt_id": "g-attempt-1",
+    "selection_seq": 1,
+    "lexical_words": 100,
+    "raw_words": 100,
+    "tokenizer": "uax29-en-v1",
+    "post_stop_ready_ms": 4000
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-t1a",
+    "capture_id": "take-g1",
+    "occurred_at": "2026-09-20T15:00:02Z",
+    "type": "transformation_completed",
+    "revision_id": "rev-g1",
+    "revision_seq": 1,
+    "transformation_kind": "model_authoring",
+    "formula_version": 1,
+    "change_counts": {
+      "structural": 0,
+      "user": 0,
+      "dictionary": 0,
+      "snippet": 0,
+      "style": 5
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-t1b",
+    "capture_id": "take-g1",
+    "occurred_at": "2026-09-20T15:00:03Z",
+    "type": "transformation_completed",
+    "revision_id": "rev-g1",
+    "revision_seq": 2,
+    "transformation_kind": "model_authoring",
+    "formula_version": 1,
+    "change_counts": {
+      "structural": 0,
+      "user": 0,
+      "dictionary": 0,
+      "snippet": 0,
+      "style": 2
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-d1",
+    "capture_id": "take-g1",
+    "occurred_at": "2026-09-20T15:00:04Z",
+    "type": "delivery_recorded",
+    "delivery_id": "g-delivery-1",
+    "delivery_seq": 1,
+    "status": "confirmed",
+    "output_words": 150,
+    "generated_words": 60
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-c2",
+    "capture_id": "take-g2",
+    "occurred_at": "2026-09-20T15:05:00Z",
+    "type": "capture_finalized",
+    "sample_count": 160000,
+    "sample_rate": 16000,
+    "complete_audio": true,
+    "mode_id": "faithful",
+    "reporting_timezone": "Europe/Berlin"
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-a2",
+    "capture_id": "take-g2",
+    "occurred_at": "2026-09-20T15:05:01Z",
+    "type": "recognition_selected",
+    "attempt_id": "g-attempt-2",
+    "selection_seq": 1,
+    "lexical_words": 10,
+    "raw_words": 10,
+    "tokenizer": "uax29-en-v1",
+    "post_stop_ready_ms": null
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-t2",
+    "capture_id": "take-g2",
+    "occurred_at": "2026-09-20T15:05:02Z",
+    "type": "transformation_completed",
+    "revision_id": "rev-g2",
+    "revision_seq": 1,
+    "transformation_kind": "snippet_expansion",
+    "formula_version": 1,
+    "change_counts": {
+      "structural": 0,
+      "user": 0,
+      "dictionary": 0,
+      "snippet": 1,
+      "style": 0
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "g-d2",
+    "capture_id": "take-g2",
+    "occurred_at": "2026-09-20T15:05:03Z",
+    "type": "delivery_recorded",
+    "delivery_id": "g-delivery-2",
+    "delivery_seq": 1,
+    "status": "confirmed",
+    "output_words": 90,
+    "generated_words": 85
+  }
+]
