@@ -1674,13 +1674,29 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "coordinator rerun: 277/277 (624a1c8 pushed to #201); mutex scoped off blocking (structural, staged-vs-direct equivalence test); Io class preserved (reviewer premise corrected); stored-journal-is-transcript-source; salvage lands interrupted atomically; both startup repairs always run (deterministic sabotage test); adopt-failure falls through to WAV (D14 intact)"
+   ],
+   "notes": "fetch full bodies; mutex-across-blocking is the priority (UI jank class); several mediums cluster around the v2 facade error paths"
+  },
+  {
+   "id": "R36",
+   "title": "PR #201 re-review tails: 2 mediums (finish_recognition NotFound collapse; interrupt_stale per-item ? aborts sweep) + 2 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
    "status": "pending",
    "owner": null,
    "branch": "program/e02-cutover",
    "evidence": [
-    "PR #201 OCR re-review run 35537380843 (17 findings on fe510da)"
+    "same OCR round as R35; missed in first harvest, flagged by the fix agent"
    ],
-   "notes": "fetch full bodies; mutex-across-blocking is the priority (UI jank class); several mediums cluster around the v2 facade error paths"
+   "notes": "small focused pass on store_v2.rs"
   }
  ],
  "active_assignments": [
