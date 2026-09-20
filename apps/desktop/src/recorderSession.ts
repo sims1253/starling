@@ -49,6 +49,33 @@ export async function discardRecorderHandles(handles: RecorderHandles): Promise<
   }
 }
 
+/** The stopped-capture fields the keep/discard verdict depends on. */
+export interface StoppedTakeCapture {
+  readonly sampleCount: number;
+}
+
+/** What Stop should do with the capture a take produced. */
+export type StoppedTakeVerdict =
+  /** Real audio was captured; the take must stay reviewable and retryable. */
+  | { readonly keep: true }
+  /** No samples arrived; an accidental empty activation, safe to drop. */
+  | { readonly keep: false; readonly reason: "empty" };
+
+/**
+ * Decide whether a stopped capture is a take worth keeping (B02): any capture
+ * with samples is kept whatever its duration — a short answer such as a
+ * letter or "no" is exactly the payload dictation exists for — and only a
+ * capture with no samples at all is an accidental empty activation. Duration
+ * is deliberately not an input: no capture length that produced samples is
+ * ever discarded here, and explicit discard is a separate path that never
+ * consults this verdict.
+ */
+export function stoppedTakeVerdict(capture: StoppedTakeCapture | undefined): StoppedTakeVerdict {
+  if (capture && capture.sampleCount > 0) return { keep: true };
+
+  return { keep: false, reason: "empty" };
+}
+
 /**
  * Owns the Web Audio handles of the current microphone capture.
  *

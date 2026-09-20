@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:insight-event:v1",
+  "$comment": [
+    "Starling local Insight events, schema v1 (issue draft E28).",
+    "Privacy contract: every branch sets additionalProperties:false, so any",
+    "accidental raw-text/selection/path/window-title/secret field makes the",
+    "event invalid. Events carry counts, IDs, versions and categories only.",
+    "Idempotency: event_id is the dedupe key. A retry or sync replay must",
+    "resend a byte-identical payload under the same event_id; a differing",
+    "payload under a known event_id is a conflict, not a harmless replay.",
+    "Deletion: capture_deleted is a tombstone that dominates stale replays;",
+    "replayed pre-deletion events can never resurrect the capture's totals."
+  ],
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "capture_id": { "$ref": "#/$defs/eventId" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "type": { "const": "capture_finalized" },
+        "sample_count": { "type": "integer", "minimum": 0 },
+        "sample_rate": { "type": "integer", "minimum": 1 },
+        "complete_audio": { "type": "boolean" },
+        "mode_id": { "$ref": "#/$defs/safeToken" },
+        "reporting_timezone": { "$ref": "#/$defs/tzName" }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type",
+        "sample_count",
+        "sample_rate",
+        "complete_audio",
+        "mode_id",
+        "reporting_timezone"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "capture_id": { "$ref": "#/$defs/eventId" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "type": { "const": "recognition_selected" },
+        "attempt_id": { "$ref": "#/$defs/eventId" },
+        "selection_seq": { "type": "integer", "minimum": 0 },
+        "lexical_words": { "type": "integer", "minimum": 0 },
+        "raw_words": { "type": "integer", "minimum": 0 },
+        "tokenizer": { "$ref": "#/$defs/safeToken" },
+        "post_stop_ready_ms": { "type": ["number", "null"], "minimum": 0 }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type",
+        "attempt_id",
+        "selection_seq",
+        "lexical_words",
+        "raw_words",
+        "tokenizer",
+        "post_stop_ready_ms"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "capture_id": { "$ref": "#/$defs/eventId" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "type": { "const": "transformation_completed" },
+        "revision_id": { "$ref": "#/$defs/eventId" },
+        "revision_seq": { "type": "integer", "minimum": 0 },
+        "transformation_kind": {
+          "enum": [
+            "model_authoring",
+            "snippet_expansion",
+            "user_edit",
+            "dictionary_substitution"
+          ]
+        },
+        "formula_version": { "const": 1 },
+        "change_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "structural": { "type": "integer", "minimum": 0 },
+            "user": { "type": "integer", "minimum": 0 },
+            "dictionary": { "type": "integer", "minimum": 0 },
+            "snippet": { "type": "integer", "minimum": 0 },
+            "style": { "type": "integer", "minimum": 0 }
+          },
+          "required": [
+            "structural",
+            "user",
+            "dictionary",
+            "snippet",
+            "style"
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type",
+        "revision_id",
+        "revision_seq",
+        "transformation_kind",
+        "formula_version",
+        "change_counts"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "capture_id": { "$ref": "#/$defs/eventId" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "type": { "const": "delivery_recorded" },
+        "delivery_id": { "$ref": "#/$defs/eventId" },
+        "delivery_seq": { "type": "integer", "minimum": 0 },
+        "status": {
+          "enum": [
+            "confirmed",
+            "submitted_unconfirmed",
+            "failed",
+            "conflict",
+            "cancelled"
+          ]
+        },
+        "output_words": { "type": "integer", "minimum": 0 },
+        "generated_words": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type",
+        "delivery_id",
+        "delivery_seq",
+        "status",
+        "output_words",
+        "generated_words"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "event_id": { "$ref": "#/$defs/eventId" },
+        "capture_id": { "$ref": "#/$defs/eventId" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "type": { "const": "capture_deleted" }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type"
+      ]
+    }
+  ],
+  "$defs": {
+    "eventId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+    },
+    "safeToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:+-]{1,128}$"
+    },
+    "tzName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_+/-]{1,64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    }
+  }
+}

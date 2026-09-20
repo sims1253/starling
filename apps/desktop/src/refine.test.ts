@@ -5,6 +5,7 @@ import {
   REFINEMENT_DEFAULT_INSTRUCTION,
   REFINEMENT_THREAD_INSTRUCTION,
   RefinementHttpError,
+  RefinementIncompleteError,
   RefinementInputError,
   RefinementProtocolError,
   RefinementTimeoutError,
@@ -31,6 +32,43 @@ interface RecordingFetcher {
 
 function completion(content: string): Response {
   return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content } }] }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** Named wire contracts for terminatedCompletion's response body (B09). */
+interface WireCompletionMessage {
+  readonly role: "assistant";
+  readonly content: string;
+  readonly refusal?: string;
+}
+
+interface WireCompletionChoice {
+  readonly message: WireCompletionMessage;
+  readonly finish_reason?: string | null;
+}
+
+/**
+ * A completion response carrying termination metadata (B09): finish_reason
+ * and, for the refusal case, the message's own refusal field.
+ */
+function terminatedCompletion(fields: {
+  content: string;
+  finishReason?: string | null;
+  refusal?: string;
+}): Response {
+  const message: WireCompletionMessage =
+    fields.refusal === undefined
+      ? { role: "assistant", content: fields.content }
+      : { role: "assistant", content: fields.content, refusal: fields.refusal };
+
+  const choice: WireCompletionChoice =
+    fields.finishReason === undefined
+      ? { message }
+      : { message, finish_reason: fields.finishReason };
+
+  return new Response(JSON.stringify({ choices: [choice] }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
@@ -401,6 +439,182 @@ describe("refineEffect", () => {
 
     expect(emptyContent).toBeInstanceOf(RefinementProtocolError);
     expect(emptyContent.message).toContain("empty refined transcript");
+  });
+
+  it("rejects whitespace-only content as an empty transcript", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect("hello", settings, {
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                choices: [{ message: { role: "assistant", content: "   \n\t  " } }],
+              }),
+              { status: 200 },
+            ),
+        }),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementProtocolError);
+    expect(failure.message).toContain("empty refined transcript");
+  });
+
+  it("rejects a non-empty but truncated completion instead of refining with it", async () => {
+    // finish_reason "length" means the content is only a prefix: accepting it
+    // would store a silent omission as a complete refinement (B09).
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect("a long dictated take", settings, {
+          fetchImpl: async () =>
+            terminatedCompletion({ content: "Only the first half of", finishReason: "length" }),
+        }),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementIncompleteError);
+    expect(failure.message).toContain('finish_reason "length"');
+    expect(failure.message).toContain("output limit");
+
+    if (failure instanceof RefinementIncompleteError) expect(failure.finishReason).toBe("length");
+  });
+
+  it("rejects a content-filtered completion", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect("hello", settings, {
+          fetchImpl: async () =>
+            terminatedCompletion({ content: "", finishReason: "content_filter" }),
+        }),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementIncompleteError);
+    expect(failure.message).toContain("content_filter");
+  });
+
+  it("rejects a model refusal carried in the message", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect("hello", settings, {
+          fetchImpl: async () =>
+            terminatedCompletion({
+              content: "",
+              finishReason: "stop",
+              refusal: "I cannot edit this transcript.",
+            }),
+        }),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementIncompleteError);
+    expect(failure.message).toContain("refused");
+    expect(failure.message).toContain("I cannot edit this transcript.");
+  });
+
+  it("rejects an unrecognized finish_reason instead of treating it as stop", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect("hello", settings, {
+          fetchImpl: async () =>
+            terminatedCompletion({ content: "Something.", finishReason: "eos" }),
+        }),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementIncompleteError);
+    expect(failure.message).toContain('"eos"');
+  });
+
+  it("accepts an explicit stop and a compatible local response without the field", async () => {
+    const stopped = await Effect.runPromise(
+      refineEffect("hello", settings, {
+        fetchImpl: async () => terminatedCompletion({ content: "Stopped.", finishReason: "stop" }),
+      }),
+    );
+
+    expect(stopped).toBe("Stopped.");
+
+    const nullReason = await Effect.runPromise(
+      refineEffect("hello", settings, {
+        fetchImpl: async () =>
+          terminatedCompletion({ content: "Null reason.", finishReason: null }),
+      }),
+    );
+
+    expect(nullReason).toBe("Null reason.");
+
+    const omitted = await Effect.runPromise(
+      refineEffect("hello", settings, { fetchImpl: async () => completion("Omitted.") }),
+    );
+
+    expect(omitted).toBe("Omitted.");
+  });
+
+  it("shows an actionable recovery path when a long transcript hits the output limit", async () => {
+    // A transcript long enough to strain a local model's output budget, sent
+    // whole: the recovery path must be about limits and shorter takes, not a
+    // protocol complaint.
+    const longTranscript = `${"so i says to her the model keeps going and ".repeat(400)}`;
+
+    const truncated = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(longTranscript, settings, {
+          fetchImpl: async () =>
+            terminatedCompletion({
+              content: "So I says to her the model keeps going and ".repeat(40),
+              finishReason: "length",
+            }),
+        }),
+      ),
+    );
+
+    expect(truncated).toBeInstanceOf(RefinementIncompleteError);
+    expect(truncated.message).toContain("num_predict");
+    expect(truncated.message).toContain("shorter take");
+
+    // The same long transcript with a whole answer still refines: limits are
+    // the server's verdict, not an assumption about transcript size.
+    const whole = await Effect.runPromise(
+      refineEffect(longTranscript, settings, {
+        fetchImpl: async () =>
+          terminatedCompletion({
+            content: `${longTranscript.trim()}.`,
+            finishReason: "stop",
+          }),
+      }),
+    );
+
+    expect(whole.endsWith(".")).toBe(true);
+  });
+
+  it("redacts an echoed API key from surfaced error text and bodies (B10)", async () => {
+    // A misbehaving server can echo the Authorization header inside its own
+    // error detail; the surfaced error must not repeat the credential.
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { ...settings, apiKey: "sk-secret-value" },
+          {
+            fetchImpl: async () =>
+              new Response(JSON.stringify({ detail: "Invalid API key: Bearer sk-secret-value" }), {
+                status: 401,
+                statusText: "Unauthorized",
+              }),
+          },
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementHttpError);
+    expect(failure.message).not.toContain("sk-secret-value");
+    expect(failure.message).toContain("[redacted]");
+
+    if (failure instanceof RefinementHttpError) {
+      expect(failure.responseBody).not.toContain("sk-secret-value");
+      expect(failure.responseBody).toContain("[redacted]");
+    }
   });
 
   it("turns its deadline into a timeout error and aborts the request", async () => {

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
-import { discardRecorderHandles, RecorderSession, type RecorderHandles } from "./recorderSession";
+import {
+  discardRecorderHandles,
+  RecorderSession,
+  stoppedTakeVerdict,
+  type RecorderHandles,
+  type StoppedTakeCapture,
+} from "./recorderSession";
 
 function fakeHandles() {
   const calls = { trackStops: 0, closes: 0, processorDisconnects: 0 };
@@ -168,5 +174,42 @@ describe("discardRecorderHandles", () => {
     await discardRecorderHandles(handles);
 
     expect(disconnects).toBe(1);
+  });
+});
+
+describe("stoppedTakeVerdict", () => {
+  /** A short answer as the recorder captured it: 16 kHz mono, N ms long. */
+  function shortAnswer(durationMs: number): StoppedTakeCapture {
+    return { sampleCount: Math.max(1, Math.round((durationMs / 1_000) * 16_000)) };
+  }
+
+  it("keeps captured short answers below and at the old 250 ms cutoff (B02)", () => {
+    for (const durationMs of [50, 100, 200, 249, 250]) {
+      expect(stoppedTakeVerdict(shortAnswer(durationMs))).toEqual({ keep: true });
+    }
+  });
+
+  it("keeps an immediate press/release capture at the start/stop boundary", () => {
+    // The shortest real take: Stop landed on the first chunk, so samples
+    // exist even though essentially no time passed between press and release.
+    expect(stoppedTakeVerdict({ sampleCount: 16 })).toEqual({ keep: true });
+    expect(stoppedTakeVerdict({ sampleCount: 1 })).toEqual({ keep: true });
+  });
+
+  it("keeps audio at every capture length — duration is not an input", () => {
+    // The verdict reads sample presence only, so a capture of any length the
+    // recorder produced samples for is kept; there is no duration that
+    // discards, by construction.
+    for (const durationMs of [1, 10, 100, 249, 250, 400, 10_000]) {
+      expect(stoppedTakeVerdict(shortAnswer(durationMs)).keep).toBe(true);
+    }
+  });
+
+  it("drops only a genuinely empty capture", () => {
+    // The accidental activation the empty check exists for: no samples
+    // arrived at all, whatever the recorder's clock said. Explicit discard
+    // stays a separate path that never consults this verdict.
+    expect(stoppedTakeVerdict({ sampleCount: 0 })).toEqual({ keep: false, reason: "empty" });
+    expect(stoppedTakeVerdict(undefined)).toEqual({ keep: false, reason: "empty" });
   });
 });

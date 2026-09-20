@@ -2,11 +2,11 @@ import type { DictationSession } from "@starling/dictation";
 
 /**
  * Pure thread logic for multi-turn refinement (#117). A thread is just a
- * `threadId` label on sessions, assigned only by an explicit "Refine in
- * thread" press; these helpers read that label out of the session listing so
- * the UI never derives thread state from anything but stored sessions. Every
- * function is pure over its input — no store, no React, no globals except
- * the id generator's crypto fallback.
+ * `threadId` label plus its `threadJoinedAt` append stamp on sessions,
+ * assigned only by an explicit "Refine in thread" press; these helpers read
+ * that state out of the session listing so the UI never derives thread state
+ * from anything but stored sessions. Every function is pure over its input —
+ * no store, no React, no globals except the id generator's crypto fallback.
  */
 
 /**
@@ -23,12 +23,32 @@ export function newThreadId(): string {
 }
 
 /**
- * The reading order of one thread's turns. createdAt is the history pane's
- * ordering key; a thread reads oldest-first (turn 1 → N), so this is the
- * pane's order reversed. The id tiebreak keeps takes that share a timestamp
- * deterministic regardless of the input array's order.
+ * The reading order of one thread's turns: the explicit append sequence
+ * (`threadJoinedAt`, stamped when the take was assigned to the thread), not
+ * the recording clock. A thread is a conversation, and conversations grow by
+ * appends — an older recording that joins an existing thread appends as the
+ * thread's latest turn, so its refinement context is the thread's current
+ * document and the next turn after it sees its edit (B11).
+ *
+ * Members persisted before the stamp existed have none: they joined before
+ * the sequence did, so they read before every stamped join. That makes the
+ * stamp comparison a tie exactly when a thread is fully legacy — no member
+ * carries a stamp — and the tiebreak below then compares createdAt then id
+ * for every pair: precisely the pre-B11 reading order. Existing threads
+ * therefore keep the order their data was already sorted by instead of
+ * regressing on upgrade, while mixed threads keep stamp-first semantics.
+ * createdAt then id also tiebreak stamps shared in the same millisecond —
+ * racing windows — so the order is always deterministic regardless of the
+ * input array's order.
  */
 function compareTakeOrder(left: DictationSession, right: DictationSession): number {
+  const leftJoined = left.threadJoinedAt ?? Number.NEGATIVE_INFINITY;
+  const rightJoined = right.threadJoinedAt ?? Number.NEGATIVE_INFINITY;
+
+  // A tie here means both sides carry the same stamp, or neither carries
+  // one — the fully-legacy case that falls back to the old order below.
+  if (leftJoined !== rightJoined) return leftJoined - rightJoined;
+
   const byCreated = left.createdAt.localeCompare(right.createdAt);
 
   return byCreated !== 0 ? byCreated : left.id.localeCompare(right.id);
@@ -74,8 +94,9 @@ export function activeThreadId(sessions: readonly DictationSession[]): string | 
 }
 
 /**
- * One thread's turns in reading order: members sorted by the history pane's
- * ordering key, oldest first. Sessions outside the thread are ignored.
+ * One thread's turns in reading order: members sorted by append sequence
+ * (see compareTakeOrder), first append to latest. Sessions outside the
+ * thread are ignored.
  */
 export function threadTurns(
   sessions: readonly DictationSession[],
@@ -88,22 +109,28 @@ export function threadTurns(
 }
 
 /**
- * The refinement context for a take about to be refined inside its thread:
- * the refined text of the most recent earlier turn that HAS a refined copy.
- * undefined when there is none — the thread head, or nobody refined yet — in
- * which case a threaded refine behaves like a standalone one.
+ * The refinement base for a take about to be refined inside its thread: the
+ * nearest earlier turn that HAS a refined copy, returned as the member
+ * itself so the caller can both read its text and record its id — the
+ * captured base identity (B11) that keeps a rerun's base stable and
+ * explainable. undefined when there is none — the thread head, or nobody
+ * refined yet — in which case a threaded refine behaves like a standalone
+ * one.
  *
- * "Earlier" follows the thread's reading order (see compareTakeOrder), the
- * same ordering the history pane's newest-first listing reverses. A
- * `beforeTakeId` that is not (yet) a member — its assignment still in
- * flight — counts every current member as earlier, which is exactly the
- * join-an-existing-thread case the drawer computes before assigning.
+ * "Earlier" follows the thread's reading order (see compareTakeOrder), so a
+ * joining take — appended last whatever its recording age — refines against
+ * the thread's current document. A `beforeTakeId` that is not (yet) a member
+ * — its assignment still in flight — counts every current member as earlier,
+ * which is exactly the join-an-existing-thread case the drawer computes
+ * before assigning; once the assignment stamps its append, the take is the
+ * latest turn and computes the same base, so a retry never sees a different
+ * answer than the press that joined.
  */
-export function threadContext(
+export function threadContextBase(
   sessions: readonly DictationSession[],
   threadId: string,
   beforeTakeId: string,
-): string | undefined {
+): DictationSession | undefined {
   const turns = threadTurns(sessions, threadId);
   const boundary = turns.findIndex((turn) => turn.id === beforeTakeId);
   const earlier = boundary === -1 ? turns : turns.slice(0, boundary);
@@ -116,9 +143,10 @@ export function threadContext(
   // here at all: the storage schema treats it as damage and quarantines the
   // record out of the listing.)
   for (let index = earlier.length - 1; index >= 0; index -= 1) {
-    const refined = earlier[index]?.refined;
+    const member = earlier[index];
+    const refined = member?.refined;
 
-    if (refined !== undefined && refined.text.trim() !== "") return refined.text;
+    if (refined !== undefined && refined.text.trim() !== "") return member;
   }
 
   return undefined;

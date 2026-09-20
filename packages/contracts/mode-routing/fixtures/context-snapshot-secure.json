@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "snapshot-2",
+  "capture_id": "take-2",
+  "adapter_id": "vscode-example",
+  "captured_at": "2026-09-20T12:10:00Z",
+  "expires_at": "2026-09-20T12:15:00Z",
+  "secure_field": true,
+  "granted_sources": [
+    "app_identity"
+  ],
+  "capabilities": {
+    "selection": false,
+    "document_version": false,
+    "content_digest": false,
+    "conditional_apply": false
+  }
+}

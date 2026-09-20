@@ -1,0 +1,88 @@
+{
+  "name": "Native health, health alias, and warmup",
+  "route": "/health",
+  "protocol": "starling-legacy",
+  "sources": [
+    "cpp/serve/main.cpp:528-563 (routes), cpp/serve/server.cpp:463-474 (health_json)",
+    "tests/test_native_serve.py:test_health, test_health_alias, test_warmup",
+    "docs/native-serving.md#api-contract"
+  ],
+  "cases": [
+    {
+      "name": "health on an eager-loaded server",
+      "request": {
+        "method": "GET",
+        "path": "/health"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "status": "ok",
+          "model": "parakeet",
+          "loaded": true,
+          "busy": false,
+          "phase": "ready",
+          "queue_depth": 0
+        }
+      },
+      "note": "Phase drives the UI: unloaded -> loading -> ready -> busy. busy is transient during inference."
+    },
+    {
+      "name": "health on a lazy server",
+      "request": {
+        "method": "GET",
+        "path": "/health"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "status": "ok",
+          "model": "parakeet",
+          "loaded": false,
+          "busy": false,
+          "phase": "unloaded",
+          "queue_depth": 0
+        }
+      },
+      "note": "--no-eager-load defers the model load to the first request."
+    },
+    {
+      "name": "root path is a health alias",
+      "request": {
+        "method": "GET",
+        "path": "/"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "status": "ok",
+          "model": "parakeet",
+          "loaded": false,
+          "busy": false,
+          "phase": "unloaded",
+          "queue_depth": 0
+        }
+      },
+      "note": "GET / returns the same body as GET /health."
+    },
+    {
+      "name": "warmup is asynchronous and idempotent",
+      "request": {
+        "method": "POST",
+        "path": "/warmup"
+      },
+      "response": {
+        "status": 202,
+        "content_type": "application/json",
+        "body_json": {
+          "status": "warmup started",
+          "phase": "loading"
+        }
+      },
+      "note": "phase is \"ready\" when the model is already loaded. The warmup itself runs in a detached worker; repeated calls do not spawn workers."
+    }
+  ]
+}

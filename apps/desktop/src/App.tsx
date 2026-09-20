@@ -7,10 +7,10 @@ import {
   invalidSessionWav,
   prepareWav16k,
   StarlingClient,
-  StarlingStream,
   type DictationSession,
   type InvalidStoredSession,
-  type RefinedTranscript,
+  type RefinedDraft,
+  type ServerHealth,
   type TranscriptionProtocol,
   type TranscriptionResult,
 } from "@starling/dictation";
@@ -33,12 +33,45 @@ import {
   X,
 } from "lucide-react";
 import { useRecorder } from "./useRecorder";
+import { stoppedTakeVerdict } from "./recorderSession";
 import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings } from "./refine";
-import { StreamingDictation, type StreamingState } from "./streamingDictation";
+import {
+  StreamingDictation,
+  type StreamingState,
+  type StreamingTransport,
+} from "./streamingDictation";
+import { createStreamingTransport } from "./streamTransport";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
-import { activeThreadId, newThreadId, threadContext, threadTurns } from "./threads";
+import { SessionDeleteDialog, deletionWarning } from "./sessionDeletion";
+import {
+  attemptProvenanceLabel,
+  canTranscribeAgain,
+  refinedTranscriptStamp,
+  sessionTitle,
+  transcriptExportText,
+  transcribeAgainLabel,
+} from "./transcriptAttempts";
+import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./threads";
+import {
+  CheckSequencer,
+  connectionFailureMessage,
+  probeOutcomeFromFailure,
+  probeOutcomeFromHealth,
+  settingsCalloutView,
+  type ConnectionProbe,
+} from "./connectionProbe";
+import {
+  normalizeSettings,
+  persistSettings,
+  readCommittedSettings,
+  refinementKeyPlan,
+  type SecureKeyStorage,
+  type SettingsSnapshot,
+} from "./settingsTransaction";
 import type { PendingAudioState } from "../electron/ipc.js";
+import { InsightRecorder, wavCaptureStats } from "./insights/insightEmitter";
+import { IndexedDbInsightEventStore, type InsightEvent } from "./insights/insightEvents";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
@@ -66,6 +99,15 @@ const THREAD_REFINE_BUSY_MESSAGE =
 
 const store = new IndexedDbSessionStore();
 
+/**
+ * Local insight events (E29): a dedicated IndexedDB log, separate from
+ * session audio and transcripts. Events carry counts and constrained tokens
+ * only — never text, selections, paths or secrets — and recording one must
+ * never break the action it describes: every emit below is fire-and-forget
+ * with failures surfaced as an Insights notice instead of a take error.
+ */
+const insights = new InsightRecorder(new IndexedDbInsightEventStore());
+
 function formatDuration(ms?: number) {
   if (!ms) return "0:00";
   const total = Math.round(ms / 1000);
@@ -82,15 +124,8 @@ function formatWhen(iso: string) {
     : date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function takeTitle(session: DictationSession) {
-  return (
-    session.transcript?.text ||
-    (session.status === "failed" ? "Saved. Retry available" : "Transcribing…")
-  );
-}
-
 function historyRowLabel(session: DictationSession) {
-  const title = takeTitle(session);
+  const title = sessionTitle(session);
   const codePoints = Array.from(title);
   const brief = codePoints.length > 60 ? `${codePoints.slice(0, 60).join("")}…` : title;
 
@@ -101,16 +136,6 @@ function historyRowLabel(session: DictationSession) {
 
 function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
-}
-
-/** The "model, when" attribution stamped on every refined copy. */
-function refinedTranscriptStamp(refined: RefinedTranscript, when: string) {
-  return `${refined.model}, ${when}`;
-}
-
-/** The separator line that appends a refined copy to a text export. */
-function refinedTranscriptSeparator(refined: RefinedTranscript, iso: string) {
-  return `--- REFINED TRANSCRIPT — ${refinedTranscriptStamp(refined, iso)} ---`;
 }
 
 /**
@@ -160,22 +185,47 @@ async function nativeTranscribe(
   });
 }
 
+/**
+ * Ask the desktop bridge how the host's secret store received the key (B10).
+ * Resolves null when there is nothing to ask — an empty key, no bridge (the
+ * browser preview), or an older preload without the channel — and never
+ * throws: an IPC failure reads as a failed store, so the caller's decision
+ * always runs on classified information.
+ */
+async function resolveSecureKeyStorage(apiKey: string): Promise<SecureKeyStorage | null> {
+  const bridge = window.starlingDesktop;
+
+  if (apiKey === "" || !bridge?.storeRefinementKey) return null;
+
+  try {
+    const saved = await bridge.storeRefinementKey({ apiKey });
+
+    // A null ciphertext with a claimed "encrypted" status would violate the
+    // bridge contract; reading it as a failed store keeps the decision honest.
+    return saved.ciphertext === null
+      ? {
+          kind: saved.protection === "encrypted" ? "failed" : saved.protection,
+          backend: saved.backend,
+        }
+      : { kind: "encrypted", ciphertext: saved.ciphertext };
+  } catch {
+    return { kind: "failed" };
+  }
+}
+
 export default function App() {
-  const [endpoint, setEndpoint] = useState(
-    () => localStorage.getItem("starling:endpoint") ?? DEFAULT_ENDPOINT,
-  );
+  // Committed settings (B06): one decoder reads every key, and the values
+  // only ever change as a whole configuration when a settings save lands.
+  const [initialSettings] = useState(() => readCommittedSettings(localStorage, DEFAULT_ENDPOINT));
 
-  const [protocol, setProtocol] = useState<TranscriptionProtocol>(() =>
-    localStorage.getItem("starling:protocol") === "openai" ? "openai" : "starling",
-  );
+  const [endpoint, setEndpoint] = useState(initialSettings.endpoint);
 
-  const [model, setModel] = useState(() => localStorage.getItem("starling:model") ?? "parakeet");
+  const [protocol, setProtocol] = useState<TranscriptionProtocol>(initialSettings.protocol);
 
-  const [streamLive, setStreamLive] = useState(
-    () => localStorage.getItem("starling:streaming") !== "0",
-  );
+  const [model, setModel] = useState(initialSettings.model);
 
-  const [draftEndpoint, setDraftEndpoint] = useState(endpoint);
+  const [streamLive, setStreamLive] = useState(initialSettings.streamLive);
+
   const [connection, setConnection] = useState<Connection>("checking");
   const [serverModel, setServerModel] = useState("server");
   const [sessions, setSessions] = useState<DictationSession[]>([]);
@@ -185,29 +235,42 @@ export default function App() {
   const activeUploadsRef = useRef(new Set<string>());
   const [error, setError] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [testingConnection, setTestingConnection] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const [expectedTerms, setExpectedTerms] = useState(
-    () => localStorage.getItem("starling:terms") ?? "",
-  );
+  // The insight event log state (E29): the population the Insights surface
+  // aggregates plus the one storage/recording notice it can show. Events
+  // refresh after each emit, so opening the view later always reads the
+  // current population.
+  const [, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
+
+  const [, setInsightsIssue] = useState<string>();
+
+  // Post-Stop timestamps for takes whose first transcript has not settled
+  // yet, keyed by session id and consumed by that first recognition: the
+  // measured Stop-press-to-ready wait. A "Transcribe again" press finds no
+  // entry, and its wait is honestly unknown (null) instead of guessed.
+  const stopWaitStartsRef = useRef(new Map<string, number>());
+  // A streamed take's session id exists only once the durable save hands it
+  // over; the Stop timestamp waits here until onDurableSave names the session.
+  const pendingStreamStopAtRef = useRef<number | null>(null);
+
+  const [expectedTerms, setExpectedTerms] = useState(initialSettings.expectedTerms);
 
   // Transcript refinement settings: optional, and inert until both a base URL
   // and a model are configured. The raw transcript is never rewritten.
-  const [refineBaseUrl, setRefineBaseUrl] = useState(
-    () => localStorage.getItem("starling:refine:baseUrl") ?? "",
-  );
+  const [refineBaseUrl, setRefineBaseUrl] = useState(initialSettings.refineBaseUrl);
 
-  const [refineModel, setRefineModel] = useState(
-    () => localStorage.getItem("starling:refine:model") ?? "",
-  );
+  const [refineModel, setRefineModel] = useState(initialSettings.refineModel);
 
-  const [refineApiKey, setRefineApiKey] = useState(
-    () => localStorage.getItem("starling:refine:apiKey") ?? "",
-  );
+  const [refineApiKey, setRefineApiKey] = useState(initialSettings.refineApiKey);
 
-  const [refineInstruction, setRefineInstruction] = useState(
-    () => localStorage.getItem("starling:refine:instruction") ?? "",
+  const [refineInstruction, setRefineInstruction] = useState(initialSettings.refineInstruction);
+
+  // The explicit choice to store the refinement key as plaintext when no OS
+  // secret store can encrypt it (B10). Off by default: without it, a key
+  // that cannot be encrypted is kept for the session only.
+  const [refineKeyPlaintextOptIn, setRefineKeyPlaintextOptIn] = useState(
+    initialSettings.refineKeyPlaintextOptIn,
   );
 
   // Multi-turn threads (#117): the active-thread hint is pure UI state, never
@@ -226,7 +289,44 @@ export default function App() {
   const settingsDialogRef = useRef<HTMLElement>(null);
   const endpointInputRef = useRef<HTMLInputElement>(null);
 
-  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+  // The settings dialog's own state (B06), all of it discarded with the
+  // dialog: the complete draft configuration (defined only while the dialog
+  // is open), the isolated Test Connection probe, and the inline validation
+  // or save error. None of it can outlive Cancel, Escape, or an outside
+  // click, and none of it is committed state.
+  const [draft, setDraft] = useState<SettingsSnapshot>();
+
+  const [probe, setProbe] = useState<ConnectionProbe>();
+
+  const [settingsIssue, setSettingsIssue] = useState<string>();
+
+  // Post-save key-protection status (B10): set when a save succeeded but the
+  // key ended up session-only, so the dialog stays open and the accurate
+  // per-save protection status is read in context. Cleared with the dialog.
+  const [settingsNotice, setSettingsNotice] = useState<string>();
+
+  // Live connection checks and dialog probes are sequenced separately: a
+  // probe may never be silenced by a background live check or vice versa,
+  // but within each family only the newest may report (B06).
+  const [healthSequencer] = useState(() => new CheckSequencer());
+
+  const [probeSequencer] = useState(() => new CheckSequencer());
+
+  /**
+   * Close the settings dialog and discard the draft (B06). Cancel, Escape,
+   * and an outside click all land here: every field edit lived in the draft
+   * alone, so committed settings and their storage entries were never
+   * touched and there is nothing to undo. In-flight probes are retired with
+   * the dialog so a late result cannot land in the next dialog session.
+   */
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    setDraft(undefined);
+    setProbe(undefined);
+    setSettingsIssue(undefined);
+    setSettingsNotice(undefined);
+    probeSequencer.cancelAll();
+  }, [probeSequencer]);
 
   const { recording, elapsedMs, levels, start, stop } = useRecorder();
 
@@ -247,11 +347,41 @@ export default function App() {
   // issued mid-transition cannot interleave with it (#143).
   const [lifecycle] = useState(() => new TakeLifecycle());
   const [takePhase, setTakePhase] = useState<TakePhase>("idle");
+
+  // Deletion confirmation state (B05): the dialog is the only path to
+  // store.delete() for a saved recording. The guard instance sequences
+  // request/confirm/cancel; deletePendingId is its render mirror, so the
+  // modal appears and disappears with the guard's own truth.
+  const [deleteDialog] = useState(() => new SessionDeleteDialog());
+  const [deletePendingId, setDeletePendingId] = useState<string | undefined>(undefined);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
+  const deleteDialogRef = useRef<HTMLElement>(null);
+  const trashButtonRef = useRef<HTMLButtonElement>(null);
+
+  /** Close the confirmation without deleting anything (Cancel or Escape). */
+  const cancelDeleteSession = useCallback(() => {
+    deleteDialog.cancel();
+    setDeletePendingId(undefined);
+  }, [deleteDialog]);
+
   // Identity of the take being started, captured before any await; bumped
   // whenever the current take is invalidated so late work disposes itself.
   const takeSeqRef = useRef(0);
+  // Takes invalidated by an explicit Discard (B03): a newer take starting no
+  // longer cancels an older finalize — only a Discard does — so invalidation
+  // is recorded per generation instead of being implied by the sequence head.
+  const discardedTakesRef = useRef(new Set<number>());
 
   const selected = sessions.find((session) => session.id === selectedId);
+
+  // The take the deletion confirmation targets, while its dialog is open. A
+  // take removed from another window mid-dialog makes this undefined and the
+  // dialog simply closes: nothing is left to confirm (B05).
+  const deleteTarget =
+    deletePendingId === undefined
+      ? undefined
+      : sessions.find((session) => session.id === deletePendingId);
+
   const [audioUrl, setAudioUrl] = useState<string>();
 
   const [unsavedWavs, setUnsavedWavs] = useState<
@@ -286,6 +416,20 @@ export default function App() {
   // mount-time decrypt below must never clobber what they typed while it was
   // in flight, so an edited field is off limits to the async load.
   const refineApiKeyEditedRef = useRef(false);
+
+  // The refinement key this app knows is durably at rest, and in which form
+  // (B10): seeded from the plaintext entry a legacy version may have left,
+  // replaced when the mount-time decrypt applies the encrypted copy, and
+  // updated by every save that actually persisted a key. A key typed into
+  // the dialog is compared against this: unchanged means the stored copy
+  // already speaks for it, changed means a failed secure save must block
+  // rather than strand a mismatched endpoint/key pair.
+  const retainedKeyRef = useRef<{ key: string; form: "encrypted" | "plaintext" } | undefined>(
+    initialSettings.refineApiKey === ""
+      ? undefined
+      : { key: initialSettings.refineApiKey, form: "plaintext" },
+  );
+
   // Which takes are refining WITH thread context, keyed by session id like
   // refiningIds: each of the drawer's two refine buttons reflects its own
   // take and mode, so a standalone refine on one take never animates the
@@ -374,8 +518,11 @@ export default function App() {
   // Refinement key at rest: prefer the safeStorage ciphertext the main
   // process can decrypt over any plaintext copy. The loaded key only fills
   // a field the user has not edited meanwhile (the decrypt is async and can
-  // resolve after they start typing); once it applied, the plaintext copy
-  // that predates the encrypted form is residue and is removed.
+  // resolve after they start typing); a settings draft already open gets the
+  // same value patched in, so saving the dialog cannot clobber the just
+  // decrypted key with the stale empty field it was copied from. Once it
+  // applied, the plaintext copy that predates the encrypted form is residue
+  // and is removed.
   useEffect(() => {
     const bridge = window.starlingDesktop;
     const encrypted = localStorage.getItem("starling:refine:apiKeyEnc");
@@ -385,10 +532,20 @@ export default function App() {
     void bridge
       .loadRefinementKey({ ciphertext: encrypted })
       .then((loaded) => {
-        if (!loaded.apiKey) return;
+        const apiKey = loaded.apiKey;
+
+        if (!apiKey) return;
+
+        // The encrypted copy is now the durable record of this key (B10);
+        // the decrypt also patches any open draft so a save cannot clobber
+        // the just-decrypted key with the stale field it was copied from.
+        retainedKeyRef.current = { key: apiKey, form: "encrypted" };
 
         if (refineApiKeyEditedRef.current) return;
-        setRefineApiKey(loaded.apiKey);
+        setRefineApiKey(apiKey);
+        setDraft((current) =>
+          current === undefined ? current : { ...current, refineApiKey: apiKey },
+        );
         localStorage.removeItem("starling:refine:apiKey");
       })
       .catch(() => {
@@ -397,6 +554,83 @@ export default function App() {
   }, []);
 
   const busy = activeIds.size > 0;
+
+  // The insight event log loads once, best-effort: a damaged log becomes an
+  // Insights notice, never a startup failure (dictation works without it).
+  useEffect(() => {
+    void insights
+      .load()
+      .then(() => setInsightEvents(insights.snapshot()))
+      .catch((caught) =>
+        setInsightsIssue(`Insights could not open the local event log: ${messageFrom(caught)}`),
+      );
+  }, []);
+
+  /**
+   * Record one insight event without ever blocking the action it describes
+   * (E29): the emit is fire-and-forget, load() inside is idempotent so the
+   * mirror exists before sequence numbers are derived, a failure lands in
+   * the Insights notice instead of the take's flow, and the mirror refreshes
+   * on success so the Insights view reads the new event without a reopen.
+   */
+  const recordInsight = useCallback((action: () => Promise<void>) => {
+    void insights
+      .load()
+      .then(action)
+      .then(() => setInsightEvents(insights.snapshot()))
+      .catch((caught) =>
+        setInsightsIssue(`Insights could not record an event: ${messageFrom(caught)}`),
+      );
+  }, []);
+
+  /**
+   * Emit recognition_selected for a settled transcript (E29): word counts
+   * only, with the measured post-Stop wait when this is the take's first
+   * transcript and null when it is not (a retranscription happens at
+   * leisure; its wait is unknown, which suppresses the typing-time proxy
+   * rather than fabricating one).
+   */
+  const recordRecognitionSelected = useCallback(
+    (sessionId: string, transcriptText: string) => {
+      const startedAt = stopWaitStartsRef.current.get(sessionId);
+
+      stopWaitStartsRef.current.delete(sessionId);
+      recordInsight(() =>
+        insights.recognitionSelected({
+          captureId: sessionId,
+          transcriptText,
+          postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
+        }),
+      );
+    },
+    [recordInsight],
+  );
+
+  /**
+   * Emit capture_finalized once a take's audio is durably owned by a session
+   * (E29): sample frames are read from the canonical WAV itself, and
+   * complete_audio is true on every path that reaches here — a take with
+   * incomplete audio is parked or discarded before a session owns it.
+   */
+  const recordCaptureFinalized = useCallback(
+    (session: DictationSession) => {
+      recordInsight(async () => {
+        const stats = await wavCaptureStats(session.wav);
+
+        await insights.captureFinalized({
+          captureId: session.id,
+          sampleCount: stats.sampleCount,
+          sampleRate: stats.sampleRate,
+          completeAudio: true,
+        });
+      });
+    },
+    [recordInsight],
+  );
+
+  // The dialog's status line (B06): the probe's own outcome while one is
+  // running or has settled, else the committed endpoint's live status.
+  const settingsCallout = settingsCalloutView(probe, connection, endpoint);
 
   const fidelity = useMemo(
     () =>
@@ -422,49 +656,56 @@ export default function App() {
     );
   }, []);
 
-  const checkHealth = useCallback(
-    (target = endpoint) => {
+  /** Shared health-check transport: the desktop bridge, else the browser client. */
+  const runHealthCheck = useCallback(
+    (target: string, targetProtocol: TranscriptionProtocol): Promise<ServerHealth> => {
       const bridge = window.starlingDesktop;
 
-      const request = bridge
-        ? Effect.tryPromise({
-            try: () => bridge.health({ endpoint: target, protocol }),
-            catch: (cause) => new Error(messageFrom(cause)),
-          })
-        : new StarlingClient({ baseUrl: target, protocol }).healthEffect();
-
-      return Effect.runPromise(
-        request.pipe(
-          Effect.match({
-            onSuccess: (health) => {
-              setServerModel(health.model ?? "server");
-
-              if (
-                protocol === "openai" &&
-                health.model !== undefined &&
-                !localStorage.getItem("starling:model")
-              )
-                setModel(health.model);
-              setConnection(health.busy || (health.queueDepth ?? 0) > 0 ? "busy" : "ready");
-              setError(undefined);
-            },
-            onFailure: (failure) => {
-              setConnection("offline");
-              // The bridge keeps validation reasons (bad scheme, embedded
-              // credentials) verbatim; only transport failures arrive
-              // pre-wrapped, and those are the ones worth naming the target.
-              setError(
-                failure.message.startsWith("Could not reach the transcription server")
-                  ? `Could not reach the transcription server at ${target}.`
-                  : failure.message,
-              );
-            },
-          }),
-        ),
-      );
+      return bridge
+        ? bridge.health({ endpoint: target, protocol: targetProtocol })
+        : Effect.runPromise(
+            new StarlingClient({ baseUrl: target, protocol: targetProtocol }).healthEffect(),
+          );
     },
-    [endpoint, protocol],
+    [],
   );
+
+  /**
+   * Check the health of the COMMITTED endpoint and protocol (B06). The probe
+   * behind Test Connection never routes through here: it owns its own
+   * outcome, so a draft endpoint's failure cannot paint the live connection
+   * offline. Each check claims a sequence token before awaiting anything, so
+   * a slower check against an endpoint that has since been replaced is
+   * dropped instead of overwriting the newer status.
+   */
+  const checkHealth = useCallback(() => {
+    const token = healthSequencer.begin();
+
+    return runHealthCheck(endpoint, protocol).then(
+      (health) => {
+        if (!healthSequencer.isCurrent(token)) return;
+
+        setServerModel(health.model ?? "server");
+
+        if (
+          protocol === "openai" &&
+          health.model !== undefined &&
+          !localStorage.getItem("starling:model")
+        )
+          setModel(health.model);
+        setConnection(health.busy || (health.queueDepth ?? 0) > 0 ? "busy" : "ready");
+        setError(undefined);
+      },
+      (failure) => {
+        if (!healthSequencer.isCurrent(token)) return;
+
+        setConnection("offline");
+        // Validation reasons (bad scheme, embedded credentials) stay
+        // verbatim; transport failures name the endpoint actually checked.
+        setError(connectionFailureMessage(endpoint, failure));
+      },
+    );
+  }, [endpoint, healthSequencer, protocol, runHealthCheck]);
 
   useEffect(() => {
     void (async () => {
@@ -598,6 +839,52 @@ export default function App() {
     };
   }, [closeSettings, settingsOpen]);
 
+  // The deletion confirmation (B05): focus lands on Cancel, never on the
+  // destructive button, so keyboard activation of the trash button cannot
+  // roll straight into a confirmed delete — Enter alone opens and then
+  // cancels. Escape closes, Tab stays inside the dialog, and focus returns
+  // to the trash button that opened it.
+  useEffect(() => {
+    if (deletePendingId === undefined) return;
+
+    deleteCancelRef.current?.focus();
+    const trash = trashButtonRef.current;
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        cancelDeleteSession();
+
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const items = Array.from(
+        deleteDialogRef.current?.querySelectorAll<HTMLElement>(SETTINGS_FOCUSABLE) ?? [],
+      );
+
+      if (items.length === 0) return;
+
+      const active = items.findIndex((item) => item === document.activeElement);
+      const last = items.length - 1;
+
+      const next = event.shiftKey
+        ? items[active <= 0 ? last : active - 1]
+        : items[active === -1 || active === last ? 0 : active + 1];
+
+      if (!next) return;
+      event.preventDefault();
+      next.focus();
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      trash?.focus();
+    };
+  }, [cancelDeleteSession, deletePendingId]);
+
   const transcribe = useCallback(
     async (session: DictationSession) => {
       if (activeUploadsRef.current.has(session.id)) return;
@@ -622,7 +909,15 @@ export default function App() {
 
         const result = await Effect.runPromise(request);
 
-        await store.saveTranscript(session.id, result);
+        // The settling save records this attempt's provenance (B04): the
+        // model and protocol are stamped beside the transcript, so when a
+        // later "Transcribe again" supersedes it, the history entry that
+        // keeps it stays explainable.
+        await store.saveTranscript(session.id, result, {
+          model: model.trim() || undefined,
+          protocol,
+        });
+        recordRecognitionSelected(session.id, result.text);
         setConnection("ready");
       } catch (caught) {
         let failure = messageFrom(caught);
@@ -646,15 +941,25 @@ export default function App() {
         }
       }
     },
-    [endpoint, model, protocol, refresh],
+    [endpoint, model, protocol, recordRecognitionSelected, refresh],
   );
 
-  const saveAndTranscribe = useCallback(
-    async (wav: Blob, durationMs?: number) => {
-      let created: DictationSession;
-
+  /**
+   * Durably save one finished capture as its own session (B03): once this
+   * resolves, the store owns the WAV and the recording lifecycle can be
+   * released while transcription runs separately. A storage failure parks
+   * the only in-memory copy in unsavedWavs and rejects.
+   */
+  const saveTake = useCallback(
+    async (wav: Blob, durationMs?: number): Promise<DictationSession> => {
       try {
-        created = await store.create({ wav, durationMs });
+        const created = await store.create({ wav, durationMs });
+
+        // A durable take now exists for Insights (E29); the emit is
+        // fire-and-forget so insights can never break the capture path.
+        recordCaptureFinalized(created);
+
+        return created;
       } catch (caught) {
         setUnsavedWavs((current) => [
           ...current,
@@ -664,11 +969,18 @@ export default function App() {
           `Local storage failed: ${messageFrom(caught)} Keep this window open and download the unsaved WAV to recover it.`,
         );
       }
+    },
+    [recordCaptureFinalized],
+  );
+
+  const saveAndTranscribe = useCallback(
+    async (wav: Blob, durationMs?: number) => {
+      const created = await saveTake(wav, durationMs);
 
       await refresh();
       await transcribe(created);
     },
-    [refresh, transcribe],
+    [refresh, saveTake, transcribe],
   );
 
   /**
@@ -749,6 +1061,11 @@ export default function App() {
 
       try {
         let contextText: string | undefined;
+        // Captured base identity (B11): the member whose refined text the
+        // context came from, recorded on the saved refinement so the base a
+        // thread edit used stays explainable instead of being recomputed
+        // from whatever order a later listing reads in.
+        let contextSourceId: string | undefined;
 
         if (inThread) {
           // Thread state is read fresh from the store — the same read
@@ -799,8 +1116,15 @@ export default function App() {
           // The context itself comes from the same fresh snapshot: the
           // assignment only labeled THIS take, so the thread's other members
           // — the earlier turns this walks — are exactly what the store
-          // holds right now.
-          contextText = threadContext(fresh.sessions, threadId, session.id);
+          // holds right now. Because the assignment stamped this take as the
+          // thread's latest append, the walk finds the same base here as the
+          // pre-assignment read did: a joining take — older or not — refines
+          // against the thread's current document, and a retry computes the
+          // same answer as the press that joined (B11).
+          const base = threadContextBase(fresh.sessions, threadId, session.id);
+
+          contextText = base?.refined?.text;
+          contextSourceId = base?.id;
         }
 
         const text = await Effect.runPromise(
@@ -810,12 +1134,24 @@ export default function App() {
           }),
         );
 
-        await store.saveRefinedTranscript(session.id, {
-          text,
-          model: refineModel.trim(),
-          createdAt: Date.now(),
-        });
+        // The refined copy is drafted mutable so the captured base identity
+        // is added only when this refinement actually had one.
+        const refined: RefinedDraft = { text, model: refineModel.trim(), createdAt: Date.now() };
+
+        if (contextSourceId !== undefined) refined.contextSourceId = contextSourceId;
+
+        await store.saveRefinedTranscript(session.id, refined);
         await refresh();
+        // One authored revision exists now (E29): change counts come from
+        // the word-level diff between raw and refined text, and are never
+        // labeled corrected errors.
+        recordInsight(() =>
+          insights.transformationCompleted({
+            captureId: session.id,
+            rawText: transcript.text,
+            revisedText: text,
+          }),
+        );
       } catch (caught) {
         // A refine failure after a fresh join must not read as though the
         // join failed: the take IS threaded now, and only the refinement
@@ -850,6 +1186,7 @@ export default function App() {
     [
       activeThread,
       applyThreadHint,
+      recordInsight,
       refresh,
       refineApiKey,
       refineBaseUrl,
@@ -899,10 +1236,13 @@ export default function App() {
       setStreamStatus({ state: "connecting" });
       streamBailedRef.current = false;
 
-      let transport: StarlingStream;
+      let transport: StreamingTransport;
 
       try {
-        transport = new StarlingStream({ baseUrl: endpoint });
+        // The packaged app streams over the main process's native bridge;
+        // the browser preview opens the renderer socket its CSP permits
+        // (loopback or the page-origin ws proxy) — same interface (B01).
+        transport = createStreamingTransport(endpoint);
       } catch {
         setStreamStatus(undefined);
 
@@ -958,7 +1298,11 @@ export default function App() {
 
   const discardStreamingTake = useCallback(async (): Promise<void> => {
     // Invalidate the in-flight take identity: a beginStreamingTake that is
-    // still awaiting storage must not install its controller after this.
+    // still awaiting storage must not install its controller after this,
+    // and a finalize still running must write nothing further. A newer take
+    // starting does not invalidate an older finalize (B03); only this
+    // explicit discard does.
+    discardedTakesRef.current.add(takeSeqRef.current);
     takeSeqRef.current += 1;
 
     const stream = streamRef.current;
@@ -985,27 +1329,33 @@ export default function App() {
   /**
    * Finalize the streamed take this Stop was issued against. The caller
    * captures the take generation before any await — a close-guard Discard
-   * offered while the stop itself is still running already bumped past it —
+   * offered while the stop itself is still running already invalidated it —
    * and the finalize re-validates it around each durable write, so a Discard
    * racing the finalize wins: the stale take writes nothing and leaves the
    * Discard's state untouched (#160). Returns false when the stream was
    * never usable and the caller should save the recorder's own capture via
    * the batch path.
+   *
+   * `releaseCapture` is invoked the moment the journal is durably owned by
+   * its session, before the transcript work: the stop transition ends there
+   * so the next take can start while transcription is in flight (B03).
    */
   const finishStreamingTake = useCallback(
     async (
       stream: StreamingDictation,
       durationMs: number,
       generation: number,
+      releaseCapture: () => void,
     ): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
       streamBailedRef.current = false;
 
-      // The take identity this Stop was issued against; the close-guard
-      // Discard bumps takeSeqRef, which flips this probe and cancels the
-      // finalize's writes.
-      const isCurrentTake = () => takeSeqRef.current === generation;
+      // The take identity this Stop was issued against. Only an explicit
+      // Discard invalidates it (B03): a newer take starting while this
+      // finalize still runs no longer cancels its writes. The close-guard
+      // Discard still wins its races (#160).
+      const isCurrentTake = () => !discardedTakesRef.current.has(generation);
 
       if (bailed) {
         setPartialText(undefined);
@@ -1031,20 +1381,34 @@ export default function App() {
             setSelectedId: (id) => setSelectedId(id),
             setConnectionReady: () => setConnection("ready"),
             transcribe,
+            onDurableSave: releaseCapture,
+            onStreamedSettled: (session, transcript) =>
+              recordRecognitionSelected(session.id, transcript.text),
           },
           store,
         );
+
+        // A streamed take's journal became its session (E29): the take now
+        // exists for Insights. A discarded or batch-fallback take never
+        // reaches here — the batch path's own save emits instead.
+        if (finalized.session !== undefined) {
+          recordCaptureFinalized(finalized.session);
+        }
 
         if (finalized.discarded) return true;
 
         return !finalized.batchFallback;
       } finally {
-        setPartialText(undefined);
-        setStreamStatus(undefined);
-        setStreamingFinalize(false);
+        // A newer take may own the live-stream state by now (B03): only the
+        // take this finalize belonged to may clear it.
+        if (takeSeqRef.current === generation) {
+          setPartialText(undefined);
+          setStreamStatus(undefined);
+          setStreamingFinalize(false);
+        }
       }
     },
-    [parkUnsavedWav, refresh, transcribe],
+    [parkUnsavedWav, recordCaptureFinalized, recordRecognitionSelected, refresh, transcribe],
   );
 
   const toggleRecording = useCallback(async () => {
@@ -1061,13 +1425,20 @@ export default function App() {
 
       // The take identity this Stop was issued against, captured before any
       // await: a close-guard Discard offered while the stop itself is still
-      // running bumps takeSeqRef past it, so the finalize below sees a
-      // stale take from its first probe (#160).
+      // running invalidates exactly this generation (#160, B03).
       const generation = takeSeqRef.current;
 
       // The controller bound to the take being stopped, read before any
       // await: Stop must finalize the take that was recorded (#143).
       const stream = streamRef.current;
+
+      // When this Stop was pressed (E29): the origin of the post-Stop wait
+      // the first recognition for this take measures. A streamed take knows
+      // its journal's session id up front; the batch path registers the id
+      // once the session exists.
+      const stopPressedAt = Date.now();
+
+      if (stream !== undefined) pendingStreamStopAtRef.current = stopPressedAt;
 
       setTakePhase("stopping");
 
@@ -1078,33 +1449,69 @@ export default function App() {
       setStreamingFinalize(stream !== undefined);
       setFinalizing(true);
 
+      // Ends the capture transition the moment this take's audio is durably
+      // owned by its session (B03): the streamed journal's commit or the
+      // batch store.create. Transcription keeps running in the background,
+      // so a new take may start while it is in flight. Released at most
+      // once: a stop that already handed off must never end a newer take's
+      // transition from its finally.
+      let released = false;
+
+      const releaseCapture = (session?: DictationSession) => {
+        if (released) return;
+
+        if (session && pendingStreamStopAtRef.current !== null) {
+          stopWaitStartsRef.current.set(session.id, pendingStreamStopAtRef.current);
+          pendingStreamStopAtRef.current = null;
+        }
+
+        released = true;
+        lifecycle.endStop();
+        setTakePhase("idle");
+        setFinalizing(false);
+        // The session row (or the parked unsaved WAV) owns durability now,
+        // so the close-guard mirror no longer needs the journaled flag.
+        setStreamingFinalize(false);
+      };
+
       try {
         const capture = await stop();
 
-        // Test scripts stop after 400 ms; keep this cutoff at or below 250 ms.
-        if (!capture || capture.audio.samples.length === 0) {
+        // Any capture with samples is a real take, however short (B02): a
+        // one-letter answer stays reviewable and retryable, and only an
+        // empty capture — no samples at all — is an accidental activation.
+        const verdict = stoppedTakeVerdict(
+          capture && { sampleCount: capture.audio.samples.length },
+        );
+
+        if (!capture || !verdict.keep) {
           await discardStreamingTake();
           throw new Error("No microphone audio was captured.");
         }
 
-        if (capture.durationMs < 250) {
-          await discardStreamingTake();
-          throw new Error("Recording was too short to keep.");
-        }
-
-        if (stream && (await finishStreamingTake(stream, capture.durationMs, generation))) {
+        if (
+          stream &&
+          (await finishStreamingTake(stream, capture.durationMs, generation, releaseCapture))
+        ) {
           return;
         }
 
         const prepared = await prepareWav16k(capture.audio);
-        await saveAndTranscribe(prepared.blob, capture.durationMs);
+        const created = await saveTake(prepared.blob, capture.durationMs);
+        stopWaitStartsRef.current.set(created.id, stopPressedAt);
+        await refresh();
+
+        // Durable: the session store owns the WAV. Release the capture
+        // lifecycle and let the transcription finish in the background
+        // (B03); the upload indicator tracks this session alone.
+        releaseCapture();
+        void transcribe(created);
       } catch (caught) {
         setError(messageFrom(caught));
       } finally {
-        lifecycle.endStop();
-        setTakePhase("idle");
-        setStreamingFinalize(false);
-        setFinalizing(false);
+        // Covers every path that never reached a durable save (failed
+        // starts of the finalize, storage failures, empty captures).
+        releaseCapture();
       }
 
       return;
@@ -1177,10 +1584,12 @@ export default function App() {
     finishStreamingTake,
     lifecycle,
     protocol,
-    saveAndTranscribe,
+    refresh,
+    saveTake,
     start,
     stop,
     streamLive,
+    transcribe,
   ]);
 
   useEffect(() => {
@@ -1226,13 +1635,11 @@ export default function App() {
   function exportTranscript() {
     if (!selected?.transcript) return;
 
-    // The raw transcript stays first and intact; a refined copy, when one
-    // exists, is appended under a clear separator instead of replacing it.
-    const refined = selected.refined;
-
-    const text = refined
-      ? `${selected.transcript.text}\n\n${refinedTranscriptSeparator(refined, new Date(refined.createdAt).toISOString())}\n\n${refined.text}\n`
-      : selected.transcript.text;
+    // The raw transcript stays first and intact; earlier recognition
+    // attempts and any refined copy are appended under their own separators
+    // instead of replacing it, so every transcript version leaves with the
+    // same session (B04).
+    const text = transcriptExportText(selected);
 
     const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
 
@@ -1320,6 +1727,45 @@ export default function App() {
     }
   }
 
+  /**
+   * Open the deletion confirmation (B05) — the trash button never deletes
+   * straight away. A take whose transcription or refinement is still in
+   * flight is refused with the reason; anything else waits for the dialog's
+   * explicit confirm.
+   */
+  function requestDeleteSession(session: DictationSession) {
+    const intent = deleteDialog.request(session.id, {
+      transcribing: activeUploadsRef.current.has(session.id),
+      refining: refiningIdsRef.current.has(session.id),
+    });
+
+    if (intent.kind === "blocked") {
+      setError(intent.message);
+
+      return;
+    }
+
+    setDeletePendingId(intent.id);
+  }
+
+  /**
+   * The one path from the confirmation to the destructive write: the id
+   * handoff is exactly-once, so a double activation cannot re-delete, and
+   * the dialog is dismissed before the first await.
+   */
+  async function confirmDeleteSession() {
+    const id = deleteDialog.confirm();
+
+    setDeletePendingId(undefined);
+
+    if (id !== undefined) await removeSession(id);
+  }
+
+  /**
+   * Delete one saved recording. Reached only through the confirmation
+   * dialog's explicit confirm (B05); a failed delete leaves the recording
+   * and its versions intact and surfaces the error instead.
+   */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
@@ -1331,93 +1777,175 @@ export default function App() {
     }
   }
 
+  /**
+   * Open the settings dialog on a complete draft of the committed
+   * configuration (B06). Every field the dialog shows is drafted — endpoint,
+   * protocol, model, streaming, terms, and every refinement field — and the
+   * draft exists only while the dialog is open.
+   */
   function openSettings() {
-    setDraftEndpoint(endpoint);
+    probeSequencer.cancelAll();
+    setProbe(undefined);
+    setSettingsIssue(undefined);
+    setDraft({
+      endpoint,
+      protocol,
+      model,
+      streamLive,
+      expectedTerms,
+      refineBaseUrl,
+      refineModel,
+      refineApiKey,
+      refineInstruction,
+      refineKeyPlaintextOptIn,
+    });
+    setSettingsIssue(undefined);
+    setSettingsNotice(undefined);
     setSettingsOpen(true);
   }
 
+  /**
+   * Test the DRAFT configuration without touching committed state (B06). The
+   * probe runs against the draft endpoint AND the draft protocol — the
+   * combination about to be saved — and its outcome lands in the dialog's
+   * own probe state: the live connection status, the server model, the
+   * committed model, and the global error banner are never written from
+   * here. Only the newest probe may report, so a slow earlier probe cannot
+   * overwrite a newer result.
+   */
   async function testConnection() {
-    setTestingConnection(true);
+    if (!draft) return;
+
+    const normalized = normalizeSettings(draft);
+
+    if (!normalized.ok) {
+      setProbe({
+        state: "done",
+        outcome: { state: "failed", endpoint: draft.endpoint, message: normalized.reason },
+      });
+
+      return;
+    }
+
+    const target = normalized.settings.endpoint;
+    const token = probeSequencer.begin();
+
+    setProbe({ state: "testing", endpoint: target });
 
     try {
-      await checkHealth(draftEndpoint);
-    } finally {
-      setTestingConnection(false);
+      const health = await runHealthCheck(target, draft.protocol);
+
+      if (!probeSequencer.isCurrent(token)) return;
+
+      setProbe({ state: "done", outcome: probeOutcomeFromHealth(target, health) });
+    } catch (failure) {
+      if (!probeSequencer.isCurrent(token)) return;
+
+      setProbe({ state: "done", outcome: probeOutcomeFromFailure(target, failure) });
     }
   }
 
   /**
-   * Persist the refinement API key. With the desktop bridge and OS-backed
-   * encryption available, only safeStorage ciphertext is written and any
-   * plaintext copy is removed. Without either (browser preview, or a host
-   * with no keychain backend), the key falls back to plaintext localStorage —
-   * a documented, deliberate fallback, never a silent one.
-   *
-   * The lifecycle is symmetric on every path: whenever a plaintext key is
-   * written, the ciphertext entry is removed too — otherwise the next mount
-   * would decrypt the stale ciphertext over the newer plaintext. Saving an
-   * empty key clears both entries: there is nothing to encrypt and no
-   * residue to keep.
+   * Apply the whole draft as one transaction (B06): validate the complete
+   * configuration, ask the secret store how it could hold the refinement key
+   * (B10), decide that key's destination, persist every settings key as an
+   * all-or-nothing storage transition — with rollback on failure — and only
+   * then swap the committed React state to the same normalized snapshot. A
+   * failed or blocked save leaves the dialog open with a clear error and
+   * nothing partially applied; a save whose key stayed session-only keeps
+   * the dialog open with the accurate protection status; the health-check
+   * effect re-probes on its own when the committed endpoint or protocol
+   * actually changed.
    */
-  async function persistRefinementKey(apiKey: string): Promise<void> {
-    if (apiKey === "") {
-      localStorage.removeItem("starling:refine:apiKey");
-      localStorage.removeItem("starling:refine:apiKeyEnc");
+  async function saveSettings() {
+    if (!draft) return;
+
+    const normalized = normalizeSettings(draft);
+
+    if (!normalized.ok) {
+      setSettingsIssue(normalized.reason);
 
       return;
     }
 
-    const bridge = window.starlingDesktop;
+    setSettingsIssue(undefined);
 
-    if (!bridge?.storeRefinementKey) {
-      localStorage.setItem("starling:refine:apiKey", apiKey);
-      localStorage.removeItem("starling:refine:apiKeyEnc");
+    // The secret store runs before any storage write: by the time the
+    // transaction starts, the key's destination is already decided, so the
+    // transaction is the only writer and a failure cannot strand a
+    // half-persisted key. Plaintext is written only on the explicit opt-in
+    // (B10); without it an unencryptable key stays session-only or blocks
+    // the save outright.
+    const secure = await resolveSecureKeyStorage(normalized.settings.refineApiKey);
+
+    const plan = refinementKeyPlan({
+      apiKey: normalized.settings.refineApiKey,
+      secure,
+      plaintextOptIn: normalized.settings.refineKeyPlaintextOptIn,
+      retained: retainedKeyRef.current,
+    });
+
+    if (plan.outcome === "blocked") {
+      setSettingsIssue(plan.message);
 
       return;
     }
 
-    try {
-      const stored = await bridge.storeRefinementKey({ apiKey });
+    const persisted = persistSettings(normalized.settings, plan, localStorage);
 
-      if (stored.ciphertext === null) {
-        localStorage.setItem("starling:refine:apiKey", apiKey);
-        localStorage.removeItem("starling:refine:apiKeyEnc");
+    if (!persisted.ok) {
+      setSettingsIssue(
+        `Could not save settings: ${persisted.message} Nothing was changed — try again, or cancel to keep the current settings.`,
+      );
 
-        return;
-      }
-
-      localStorage.setItem("starling:refine:apiKeyEnc", stored.ciphertext);
-      localStorage.removeItem("starling:refine:apiKey");
-    } catch {
-      localStorage.setItem("starling:refine:apiKey", apiKey);
-      localStorage.removeItem("starling:refine:apiKeyEnc");
+      return;
     }
+
+    const committed = normalized.settings;
+
+    // Committed state lands only after storage did: every setter receives
+    // the same normalized snapshot the transaction wrote, so state and
+    // storage activate this configuration together or not at all.
+    setEndpoint(committed.endpoint);
+    setProtocol(committed.protocol);
+    setModel(committed.model);
+    setStreamLive(committed.streamLive);
+    setExpectedTerms(committed.expectedTerms);
+    setRefineBaseUrl(committed.refineBaseUrl);
+    setRefineModel(committed.refineModel);
+    setRefineApiKey(committed.refineApiKey);
+    setRefineInstruction(committed.refineInstruction);
+    setRefineKeyPlaintextOptIn(committed.refineKeyPlaintextOptIn);
+
+    // The durable record of the key follows what the save actually wrote:
+    // encrypted and opt-in plaintext install a new durable copy, clearing
+    // removes it, and a session-only save stored nothing — the plan already
+    // guaranteed the untouched entries still speak for this same key.
+    if (plan.outcome === "encrypted")
+      retainedKeyRef.current = { key: committed.refineApiKey, form: "encrypted" };
+    else if (plan.outcome === "plaintext")
+      retainedKeyRef.current = { key: committed.refineApiKey, form: "plaintext" };
+    else if (plan.outcome === "cleared") retainedKeyRef.current = undefined;
+
+    if (plan.outcome === "session-only") {
+      // Saved, but the key is not protected at rest: keep the dialog open so
+      // the status is read where the choice can be changed (B10).
+      setSettingsNotice(plan.status);
+    } else {
+      closeSettings();
+    }
+
+    // Re-check health from the saved configuration, as saves always did. The
+    // call's closure may predate the commit above: when the endpoint or
+    // protocol changed it probes the older pair, and the effect that fires
+    // on the new checkHealth identity supersedes it via the sequence token —
+    // only the check against the committed values survives.
+    void checkHealth();
   }
 
-  async function saveSettings() {
-    const clean = draftEndpoint.trim().replace(/\/$/, "");
-
-    if (!clean) return;
-    setEndpoint(clean);
-    localStorage.setItem("starling:endpoint", clean);
-    localStorage.setItem("starling:protocol", protocol);
-    localStorage.setItem("starling:model", model);
-    localStorage.setItem("starling:streaming", streamLive ? "1" : "0");
-    localStorage.setItem("starling:terms", expectedTerms);
-    localStorage.setItem("starling:refine:baseUrl", refineBaseUrl.trim());
-    localStorage.setItem("starling:refine:model", refineModel.trim());
-    localStorage.setItem("starling:refine:instruction", refineInstruction);
-
-    try {
-      await persistRefinementKey(refineApiKey);
-    } catch (caught) {
-      // The fire-and-forget click must not swallow this: persistence can
-      // fail without the bridge too (quota, private mode).
-      setError(`Could not save the refinement API key: ${messageFrom(caught)}`);
-    }
-
-    closeSettings();
-    void checkHealth(clean);
+  /** Patch fields of the open draft; the committed configuration is untouched. */
+  function updateDraft(patch: Partial<SettingsSnapshot>) {
+    setDraft((current) => (current === undefined ? current : { ...current, ...patch }));
   }
 
   return (
@@ -1633,7 +2161,7 @@ export default function App() {
                   {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
                 </span>
                 <span className="take-copy">
-                  <strong>{takeTitle(session)}</strong>
+                  <strong>{sessionTitle(session)}</strong>
                   <small>
                     {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
                     {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
@@ -1658,9 +2186,9 @@ export default function App() {
               <span>No cleanup or silent rewriting</span>
             </div>
             <div className="transcript-actions">
-              {selected.status !== "transcribed" && !activeIds.has(selected.id) && (
+              {canTranscribeAgain(selected.status, activeIds.has(selected.id)) && (
                 <button onClick={() => void transcribe(selected)}>
-                  <RefreshCw size={16} /> Retry
+                  <RefreshCw size={16} /> {transcribeAgainLabel(selected.status)}
                 </button>
               )}
               <button onClick={exportAudio}>
@@ -1674,9 +2202,10 @@ export default function App() {
                 <Download size={16} /> Export
               </button>
               <button
+                ref={trashButtonRef}
                 className="danger"
                 disabled={activeIds.has(selected.id)}
-                onClick={() => void removeSession(selected.id)}
+                onClick={() => requestDeleteSession(selected)}
                 aria-label="Delete saved recording"
               >
                 <Trash2 size={16} />
@@ -1702,6 +2231,23 @@ export default function App() {
             )}
             {selected.transcript && (
               <p>{selected.transcript.text || <em>The model returned an empty transcript.</em>}</p>
+            )}
+            {(selected.transcriptHistory?.length ?? 0) > 0 && (
+              <section className="attempt-history" aria-label="Earlier transcription attempts">
+                <p className="attempt-history-head">
+                  {selected.transcriptHistory?.length === 1
+                    ? "1 earlier attempt — kept when a new one succeeds"
+                    : `${selected.transcriptHistory?.length} earlier attempts — kept when a new one succeeds`}
+                </p>
+                <ul>
+                  {(selected.transcriptHistory ?? []).map((attempt, index) => (
+                    <li key={index}>
+                      <small>{attemptProvenanceLabel(attempt, formatWhen)}</small>
+                      <span>{attempt.text || <em>empty transcript</em>}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
             )}
           </div>
           {selected.transcript && (
@@ -1803,7 +2349,43 @@ export default function App() {
         </section>
       )}
 
-      {settingsOpen && (
+      {deleteTarget && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => event.target === event.currentTarget && cancelDeleteSession()}
+        >
+          <section
+            ref={deleteDialogRef}
+            className="settings-card confirm-card"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-confirm-title"
+            aria-describedby="delete-confirm-warning"
+          >
+            <div className="settings-head">
+              <p className="eyebrow">DELETE RECORDING</p>
+              <h2 id="delete-confirm-title">Delete this saved recording?</h2>
+            </div>
+            <div className="settings-body">
+              <p id="delete-confirm-warning" className="confirm-warning">
+                {deletionWarning(deleteTarget)}
+              </p>
+            </div>
+            <div className="settings-footer">
+              {/* Focus starts on Cancel (the effect above), so the
+                  destructive button is never the default action. */}
+              <button className="secondary" ref={deleteCancelRef} onClick={cancelDeleteSession}>
+                Cancel
+              </button>
+              <button className="danger" onClick={() => void confirmDeleteSession()}>
+                Delete permanently
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {settingsOpen && draft !== undefined && (
         <div
           className="modal-layer"
           onMouseDown={(event) => event.target === event.currentTarget && closeSettings()}
@@ -1835,8 +2417,8 @@ export default function App() {
                 Server endpoint
                 <input
                   ref={endpointInputRef}
-                  value={draftEndpoint}
-                  onChange={(event) => setDraftEndpoint(event.target.value)}
+                  value={draft.endpoint}
+                  onChange={(event) => updateDraft({ endpoint: event.target.value })}
                   placeholder="http://127.0.0.1:8181"
                 />
               </label>
@@ -1844,9 +2426,11 @@ export default function App() {
                 <label>
                   API format
                   <select
-                    value={protocol}
+                    value={draft.protocol}
                     onChange={(event) =>
-                      setProtocol(event.target.value === "openai" ? "openai" : "starling")
+                      updateDraft({
+                        protocol: event.target.value === "openai" ? "openai" : "starling",
+                      })
                     }
                   >
                     <option value="starling">Starling native</option>
@@ -1856,8 +2440,8 @@ export default function App() {
                 <label>
                   Model
                   <input
-                    value={model}
-                    onChange={(event) => setModel(event.target.value)}
+                    value={draft.model}
+                    onChange={(event) => updateDraft({ model: event.target.value })}
                     placeholder="parakeet"
                   />
                 </label>
@@ -1865,9 +2449,9 @@ export default function App() {
               <label className="settings-check">
                 <input
                   type="checkbox"
-                  checked={streamLive}
-                  disabled={protocol === "openai"}
-                  onChange={(event) => setStreamLive(event.target.checked)}
+                  checked={draft.streamLive}
+                  disabled={draft.protocol === "openai"}
+                  onChange={(event) => updateDraft({ streamLive: event.target.checked })}
                 />
                 <span>
                   Live streaming transcript
@@ -1881,8 +2465,8 @@ export default function App() {
               <label>
                 Words to watch
                 <input
-                  value={expectedTerms}
-                  onChange={(event) => setExpectedTerms(event.target.value)}
+                  value={draft.expectedTerms}
+                  onChange={(event) => updateDraft({ expectedTerms: event.target.value })}
                   placeholder="auth, Starling, GGUF"
                 />
                 <small>
@@ -1900,8 +2484,8 @@ export default function App() {
                 <label>
                   Base URL
                   <input
-                    value={refineBaseUrl}
-                    onChange={(event) => setRefineBaseUrl(event.target.value)}
+                    value={draft.refineBaseUrl}
+                    onChange={(event) => updateDraft({ refineBaseUrl: event.target.value })}
                     placeholder="http://127.0.0.1:11434/v1"
                   />
                   <small>
@@ -1913,8 +2497,8 @@ export default function App() {
                   <label>
                     Refinement model
                     <input
-                      value={refineModel}
-                      onChange={(event) => setRefineModel(event.target.value)}
+                      value={draft.refineModel}
+                      onChange={(event) => updateDraft({ refineModel: event.target.value })}
                       placeholder="llama3.1"
                     />
                   </label>
@@ -1922,26 +2506,44 @@ export default function App() {
                     API key (optional)
                     <input
                       type="password"
-                      value={refineApiKey}
+                      value={draft.refineApiKey}
                       onChange={(event) => {
-                        setRefineApiKey(event.target.value);
+                        updateDraft({ refineApiKey: event.target.value });
                         // Typed input outranks the async decrypt from mount.
                         refineApiKeyEditedRef.current = true;
                       }}
                       placeholder="Local servers need none"
                     />
                     <small>
-                      Stored encrypted via your OS keychain in the desktop app when available; the
-                      browser preview keeps it in local storage as plaintext.
+                      Stored encrypted via your OS keychain when the desktop app has one. Without
+                      one — the browser preview, or Linux without a secret store — it is kept for
+                      the current session only unless you explicitly choose plaintext storage below.
                     </small>
                   </label>
                 </div>
+                <label className="settings-check">
+                  <input
+                    type="checkbox"
+                    checked={draft.refineKeyPlaintextOptIn}
+                    onChange={(event) =>
+                      updateDraft({ refineKeyPlaintextOptIn: event.target.checked })
+                    }
+                  />
+                  <span>
+                    Store API key unencrypted
+                    <small>
+                      Not recommended. Tick this to keep the key in plain local storage when no OS
+                      keychain is available. Leave it off and an unencryptable key is used for this
+                      session only, never written to disk.
+                    </small>
+                  </span>
+                </label>
                 <label>
                   Instruction
                   <textarea
                     rows={4}
-                    value={refineInstruction}
-                    onChange={(event) => setRefineInstruction(event.target.value)}
+                    value={draft.refineInstruction}
+                    onChange={(event) => updateDraft({ refineInstruction: event.target.value })}
                     placeholder={REFINEMENT_DEFAULT_INSTRUCTION}
                   />
                   <small>
@@ -1950,23 +2552,37 @@ export default function App() {
                   </small>
                 </label>
               </div>
-              <div className="settings-callout">
-                <span className={`status-dot ${connection}`} />
+              {/* The status line belongs to the probe once one ran (B06): a
+                  draft endpoint's test result never paints the committed
+                  connection, and without a probe the committed status shows. */}
+              <div className="settings-callout" role="status">
+                <span className={`status-dot ${settingsCallout.dot}`} />
                 <div>
-                  <strong>
-                    {connection === "ready" ? "Server connected" : "Server needs attention"}
-                  </strong>
-                  <span>{endpoint}</span>
+                  <strong>{settingsCallout.title}</strong>
+                  <span>{settingsCallout.detail}</span>
                 </div>
               </div>
             </div>
+            {settingsIssue && (
+              <p className="settings-issue" role="alert">
+                <CircleAlert size={15} /> {settingsIssue}
+              </p>
+            )}
+            {settingsNotice && (
+              <p className="settings-notice" role="status">
+                <Check size={15} /> {settingsNotice}
+              </p>
+            )}
             <div className="settings-footer">
+              <button className="secondary" onClick={closeSettings}>
+                Cancel
+              </button>
               <button
                 className="secondary"
-                disabled={testingConnection}
+                disabled={probe?.state === "testing"}
                 onClick={() => void testConnection()}
               >
-                {testingConnection ? "Testing…" : "Test connection"}
+                {probe?.state === "testing" ? "Testing…" : "Test connection"}
               </button>
               <button className="primary" onClick={() => void saveSettings()}>
                 Save settings

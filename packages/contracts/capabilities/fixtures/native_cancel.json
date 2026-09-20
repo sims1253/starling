@@ -1,0 +1,50 @@
+{
+  "name": "Native request cancellation",
+  "route": "/inference/{request_id}",
+  "protocol": "starling-legacy",
+  "sources": [
+    "cpp/serve/main.cpp:925-940",
+    "cpp/serve/server.cpp:212-219 (cancel_request)",
+    "tests/test_native_serve.py:test_cancel_notfound, test_real_cancel_queued"
+  ],
+  "cases": [
+    {
+      "name": "cancel a queued or in-flight request",
+      "request": {
+        "method": "DELETE",
+        "path": "/inference/cancel-victim"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": { "status": "cancelled", "request_id": "cancel-victim" }
+      },
+      "note": "The cancelled POST answers 499 (see native_transcribe.json)."
+    },
+    {
+      "name": "cancel an unknown request id",
+      "request": {
+        "method": "DELETE",
+        "path": "/inference/nonexistent"
+      },
+      "response": {
+        "status": 404,
+        "content_type": "application/json",
+        "body_json": { "status": "not_found", "request_id": "nonexistent" }
+      }
+    },
+    {
+      "name": "cancel after completion is a no-op",
+      "request": {
+        "method": "DELETE",
+        "path": "/inference/already-done"
+      },
+      "response": {
+        "status": 404,
+        "content_type": "application/json",
+        "body_json": { "status": "not_found", "request_id": "already-done" }
+      },
+      "note": "Completion claims the request context; a late cancel cannot retroactively discard a delivered result."
+    }
+  ]
+}

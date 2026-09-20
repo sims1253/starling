@@ -1,0 +1,193 @@
+{
+ "known_review_comment_ids": [
+  4056810545,
+  4056810551,
+  4056810558,
+  4056810560,
+  4056810564,
+  4056810568,
+  4056810571,
+  4056810574,
+  4056810577,
+  4056810584,
+  4056822688,
+  4056919733,
+  4056919736,
+  4056919739,
+  4056919742,
+  4056994667,
+  4056994669,
+  4056994672,
+  4056994674,
+  4056998637,
+  4056998640,
+  4057070006,
+  4057070012,
+  4057070016,
+  4057070021,
+  4057070028,
+  4057075326,
+  4057075406,
+  4057250314,
+  4057250316
+ ],
+ "known_issue_comment_ids": [
+  5749428749,
+  5749451634,
+  5749747674,
+  5750624137
+ ],
+ "last_review_comment_at": "2026-09-20T12:20:00Z",
+ "findings": [
+  {
+   "id": 4056810545,
+   "severity": "bug-medium",
+   "summary": "budget env parse: atol truncation + unbounded MB<<20 overflow -> wrapped budgets, silent"
+  },
+  {
+   "id": 4056810574,
+   "severity": "perf-medium",
+   "summary": "trim_over_budget O(n^2) mass eviction (rescan + map lookup per entry) on inference thread"
+  },
+  {
+   "id": 4056810551,
+   "severity": "maint-low",
+   "summary": "cache constructed without [injectable clock/hooks?]"
+  },
+  {
+   "id": 4056810558,
+   "severity": "maint-low",
+   "summary": "catch only std::exception"
+  },
+  {
+   "id": 4056810560,
+   "severity": "maint-low",
+   "summary": "dead branch in acquire_kstep"
+  },
+  {
+   "id": 4056810564,
+   "severity": "style-low",
+   "summary": "zero budget clamped to 1 masks misconfiguration"
+  },
+  {
+   "id": 4056810568,
+   "severity": "style-low",
+   "summary": "trace asymmetry get vs pinned"
+  },
+  {
+   "id": 4056810571,
+   "severity": "maint-low",
+   "summary": "plain get() silent while pinned logs"
+  },
+  {
+   "id": 4056810577,
+   "severity": "test-low",
+   "summary": "test helper returns raw pointer to evictable entry"
+  },
+  {
+   "id": 4056810584,
+   "severity": "test-low",
+   "summary": "steady-state assumption unguarded in test init"
+  },
+  {
+   "id": 4056822688,
+   "severity": "other-low",
+   "summary": "trace() maps bytes_/budget_ into cache_event size/capacity - rename when reporting work lands"
+  },
+  {
+   "id": 4056919733,
+   "severity": "bug-medium",
+   "summary": "sched-path graphs account 0 bytes (galloc_ null) -> byte budget silently degenerates to unbounded entry cache"
+  },
+  {
+   "id": 4056919739,
+   "severity": "bug-medium",
+   "summary": "exception rollback leaks accounted bytes (bytes_+= before trim; vector push_back in trim can throw) -> permanent over-eviction"
+  },
+  {
+   "id": 4056919742,
+   "severity": "bug-low",
+   "summary": "rollback pop_front assumes half-built entry at front; add structural assert"
+  },
+  {
+   "id": 4056919736,
+   "severity": "doc-low",
+   "summary": "comment overclaims WHOLE-list behavior"
+  },
+  {
+   "id": 4056998637,
+   "severity": "other-low",
+   "summary": "8MiB floor \"never under-counts\" claim false at T<=4096 (bytes scale w/ T); count cap is the real bound - soften comment or shape-aware floor"
+  },
+  {
+   "id": 4056998640,
+   "severity": "test-low",
+   "summary": "rollback test misses the floored branch (400-byte entries only)"
+  },
+  {
+   "id": 4056994667,
+   "severity": "style-low",
+   "summary": "rejection message lumps negatives"
+  },
+  {
+   "id": 4056994669,
+   "severity": "maint-low",
+   "summary": "budget_ member note"
+  },
+  {
+   "id": 4056994672,
+   "severity": "maint-low",
+   "summary": "eviction event note"
+  },
+  {
+   "id": 4056994674,
+   "severity": "perf-low",
+   "summary": "enforce_floored_cap rescans when avoidable"
+  },
+  {
+   "id": 4057070012,
+   "severity": "bug-medium",
+   "summary": "negative-overflow input gets out-of-range message instead of ERANGE-clamp message (order: v<=0 checked before ERANGE)"
+  },
+  {
+   "id": 4057070006,
+   "severity": "maint-low",
+   "summary": "tdt_multistep comment"
+  },
+  {
+   "id": 4057070016,
+   "severity": "maint-low",
+   "summary": "detail:: hook note"
+  },
+  {
+   "id": 4057070021,
+   "severity": "doc-low",
+   "summary": "test header doc"
+  },
+  {
+   "id": 4057070028,
+   "severity": "style-low",
+   "summary": "entry param style"
+  },
+  {
+   "id": 4057075326,
+   "severity": "resolved",
+   "summary": "bot confirmed floor-comment fix addressed in 5d63153"
+  },
+  {
+   "id": 4057075406,
+   "severity": "resolved",
+   "summary": "bot confirmed floored-rollback test addressed in 5d63153"
+  },
+  {
+   "id": 4057250314,
+   "severity": "test-medium",
+   "summary": "CLAIM: env_budget_bytes untested - REBUTTED: test_env_budget_parsing at tdt_graph_budget_test.cpp:264 pins grammar, per-case diagnostics, both-sign ERANGE clamp (8-case matrix + negative-overflow case added in R20/R25); verified against pushed branch head"
+  },
+  {
+   "id": 4057250316,
+   "severity": "maint-low",
+   "summary": "trim_fault_hook null-reset is manual - early-abort leaves hook set; RAII scope guard in the test"
+  }
+ ]
+}

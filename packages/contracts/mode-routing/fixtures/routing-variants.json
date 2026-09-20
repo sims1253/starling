@@ -1,0 +1,113 @@
+[
+  {
+    "name": "alias_collision_is_not_a_guess",
+    "profiles": "profiles-alias-collision.json",
+    "request": {
+      "raw_text": "code this: now"
+    },
+    "expected": {
+      "mode": null,
+      "source": "phrase_conflict",
+      "payload": "code this: now",
+      "status": "needs_resolution"
+    }
+  },
+  {
+    "name": "longest_alias_wins",
+    "profiles": "profiles-longest-alias.json",
+    "request": {
+      "raw_text": "code this carefully: explain",
+      "selection_available": true,
+      "selection_granted": true
+    },
+    "expected": {
+      "mode": "ask-selection",
+      "source": "phrase:code this carefully",
+      "payload": "explain",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "equal_rank_rule_conflict",
+    "profiles": "profiles-rule-conflict.json",
+    "request": {
+      "raw_text": "hello",
+      "app_id": "vscode"
+    },
+    "expected": {
+      "mode": null,
+      "source": "rule_conflict",
+      "payload": "hello",
+      "status": "needs_resolution"
+    }
+  },
+  {
+    "name": "project_rule_overrides_app_rule",
+    "profiles": "profiles-project-priority.json",
+    "request": {
+      "raw_text": "hello",
+      "app_id": "vscode",
+      "project_id": "notes-project"
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "rule:project",
+      "payload": "hello",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "phrase_overrides_app_rule",
+    "request": {
+      "raw_text": "code this: add logs",
+      "app_id": "vscode"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add logs",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "site_rule_beats_app_rule_by_specificity",
+    "request": {
+      "raw_text": "Keep auth unchanged.",
+      "site": "github.com",
+      "app_id": "vscode"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "rule:github-guidance",
+      "payload": "Keep auth unchanged.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "locked_manual_beats_literal_escape",
+    "request": {
+      "raw_text": "literal code this stays",
+      "manual_mode": "verbatim"
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "manual",
+      "payload": "literal code this stays",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "policy_blocks_even_locked_manual",
+    "request": {
+      "raw_text": "hello",
+      "secure_field": true,
+      "manual_mode": "verbatim"
+    },
+    "expected": {
+      "mode": null,
+      "source": "policy:secure-field",
+      "payload": "hello",
+      "status": "blocked"
+    }
+  }
+]

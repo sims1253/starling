@@ -1,0 +1,122 @@
+{
+  "machine": "jobs",
+  "description": "Scheduler lifecycle: explicit limits, one job through Queued -> Dispatched -> Loading -> Recognizing -> Completed (the Dispatched/Loading/Recognizing steps are runtime-internal and marked with $advance directives), one admission Rejected (queue full), one job Cancelled after dispatch. Job identity travels on the corr of the submit/queued pair.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_100",
+      "ts": "2026-09-20T10:04:00Z",
+      "corr": "sched",
+      "seq": 1,
+      "type": "jobs.setLimits",
+      "payload": {
+        "maxQueued": 8,
+        "maxConcurrent": 2,
+        "perRoute": [{ "route": "local-default", "maxConcurrent": 1 }]
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_101",
+      "ts": "2026-09-20T10:04:02Z",
+      "corr": "job-1",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_77", "route": "local-default", "budget": "standard" }
+    },
+    {
+      "v": 1,
+      "id": "evt_100",
+      "ts": "2026-09-20T10:04:02Z",
+      "corr": "job-1",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    { "$advance": "Dispatched" },
+    { "$advance": "Loading" },
+    { "$advance": "Recognizing" },
+    {
+      "v": 1,
+      "id": "evt_101",
+      "ts": "2026-09-20T10:04:10Z",
+      "corr": "job-1",
+      "seq": 3,
+      "type": "jobs.progress",
+      "payload": { "partial": "hello wor", "stabilityHint": "growing" }
+    },
+    {
+      "v": 1,
+      "id": "evt_102",
+      "ts": "2026-09-20T10:04:12Z",
+      "corr": "job-1",
+      "seq": 4,
+      "type": "jobs.progress",
+      "payload": { "partial": "hello world", "stabilityHint": "stable" }
+    },
+    {
+      "v": 1,
+      "id": "evt_103",
+      "ts": "2026-09-20T10:04:14Z",
+      "corr": "job-1",
+      "seq": 5,
+      "type": "jobs.completed",
+      "payload": {
+        "attemptId": "att-1",
+        "text": "Hello world.",
+        "backend": "local-parakeet-tdt",
+        "timing": 812.5,
+        "completionEvidence": "final_decode"
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_102",
+      "ts": "2026-09-20T10:04:20Z",
+      "corr": "job-2",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_78", "route": "local-default", "budget": "standard" }
+    },
+    {
+      "v": 1,
+      "id": "evt_104",
+      "ts": "2026-09-20T10:04:20Z",
+      "corr": "job-2",
+      "seq": 2,
+      "type": "jobs.rejected",
+      "payload": { "reason": "queue_full" }
+    },
+    {
+      "v": 1,
+      "id": "cmd_103",
+      "ts": "2026-09-20T10:04:25Z",
+      "corr": "job-3",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_78", "route": "local-default", "budget": "standard" }
+    },
+    {
+      "v": 1,
+      "id": "evt_105",
+      "ts": "2026-09-20T10:04:25Z",
+      "corr": "job-3",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    { "$advance": "Dispatched" },
+    {
+      "v": 1,
+      "id": "cmd_104",
+      "ts": "2026-09-20T10:04:27Z",
+      "corr": "job-3",
+      "seq": 3,
+      "type": "jobs.cancel",
+      "payload": { "jobId": "job-3" }
+    }
+  ]
+}

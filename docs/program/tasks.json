@@ -1,0 +1,1681 @@
+{
+ "program": "Starling integrated implementation program",
+ "generated": "2026-09-20T02:16:00",
+ "baseline": {
+  "master": "12b6548c96ecfa1c989abb7afd39e90080cfb92f",
+  "pr193_head": "4569e67268adeb65119aad9f5b83fbab134e0833",
+  "ggml": "e91ded11bdcd78c42f9c8d3978ff6686eb4c1226 (+ local Starling patch series, uncommitted in submodule)",
+  "app_package": "starling-final-package v3.0 (2026-09-20)",
+  "serving_package": "starling-serving-optimization (2026-09-20)"
+ },
+ "counts": {
+  "app": 48,
+  "serving": 19
+ },
+ "status_vocab": [
+  "pending",
+  "in_progress",
+  "implemented",
+  "integrated",
+  "verified_on_target",
+  "review_ready",
+  "blocked",
+  "no_go",
+  "inconclusive",
+  "obsolete_duplicate",
+  "done"
+ ],
+ "items": [
+  {
+   "id": "B01",
+   "title": "Desktop CSP blocks the default ws:// live-transcription connection",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-25 (retry after rate-limit failure)",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator-completed after 2 agent rate-limit deaths: static CSP loopback-only ws/wss synced w/ connectPolicy.ts (asserted); native stream bridge for non-loopback; 38 new tests; 229/229, lint 0/0, tsc both, fmt clean (b694047)"
+   ],
+   "notes": "packaged Electron run not executed (headless); Playwright CSP repro skipped (no browsers cached)"
+  },
+  {
+   "id": "B02",
+   "title": "Do not discard captured short answers solely because a take is under 250 ms",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-11",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: full desktop suite 103/103, tsc -b clean on 4ae4021; stoppedTakeVerdict: samples-present keeps any duration; only empty discards"
+   ],
+   "notes": "cross-client acceptance retained for GPUI port (verdict logic documented)"
+  },
+  {
+   "id": "B03",
+   "title": "Release the recording lifecycle after durable save, not after network transcription",
+   "priority": "P1",
+   "kind": "bug / workflow defect",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-11",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 103/103 + tsc clean on 7b3dfda; onDurableSave fires before transport.commit; per-generation invalidation stops older finalize deleting its row; out-of-order responses attach per-session"
+   ],
+   "notes": "no React component harness - App wiring verified at unit level; no explicit upload queue cap (pre-existing single-flight retained)"
+  },
+  {
+   "id": "B04",
+   "title": "Allow retranscription of successful and empty transcripts without losing previous attempts",
+   "priority": "P1",
+   "kind": "bug / missing recovery action",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-17",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: desktop 127/127 (10 files incl. new transcriptAttempts/sessionDeletion suites), dictation package green, tsc + lint 0/0 after style fix; attempts carry model/protocol/savedAt provenance, history never erased; retry offered for every settled take incl. success + empty"
+   ],
+   "notes": "live-server/model paths unit-tested only; rendered-DOM a11y untested (no component harness)"
+  },
+  {
+   "id": "B05",
+   "title": "Protect saved-recording deletion with undo or explicit confirmation",
+   "priority": "P2",
+   "kind": "bug / destructive UX",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-17",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 127/127; explicit confirm dialog is sole delete path, focus starts on Cancel, Escape/backdrop cancel, failed deletes keep the recording"
+   ],
+   "notes": "undo variant not implemented (spec allows either); GPUI remove_session parity is separate"
+  },
+  {
+   "id": "B06",
+   "title": "Make desktop settings transactional and isolate connection-test results",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 151/151 (12 files incl. settingsTransaction + connectionProbe suites), lint 0/0, tsc clean, fmt gate restored after fixing 3 drifted test files; rollback on injected mid-write storage failure tested; probes isolated + latest-wins sequenced; probes never write model state"
+   ],
+   "notes": "dialog JSX wiring not component-tested (no React harness in repo); pre-existing fmt drift fixed in same push (c33dfea)"
+  },
+  {
+   "id": "B07",
+   "title": "Port the empty-token stitch guard to Android to prevent dropped words and negations",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B08",
+   "title": "Make Android model replacement transactional and preserve the last usable model",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "B09",
+   "title": "Do not accept truncated chat completions as complete transcript refinements",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-22",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 191/191 (14 files incl. completionVerdict suite), lint 0/0, tsc both configs, fmt clean; refusal>finish_reason>empty verdict order; length/content_filter/unknown rejected, omitted field accepted for local providers; recovery wording names num_predict/LM Studio"
+   ],
+   "notes": "App-level preservation guarantee code-read verified (no React harness); unrecognized explicit finish_reasons rejected by documented policy"
+  },
+  {
+   "id": "B10",
+   "title": "Avoid automatic plaintext API-key fallback and detect unprotected safeStorage backends",
+   "priority": "P1",
+   "kind": "security hardening / unsafe fallback",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-22",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 191/191 + all gates; Linux basic_text/unknown safeStorage classified unprotected (encryptString never called); plaintext only via persisted explicit opt-in; session-only default leaves last valid encrypted key untouched; changed-key-blocks-save guidance; API key redacted from HTTP error surfaces"
+   ],
+   "notes": "narrow native request boundary (key stays out of renderer) deliberately deferred as architectural refactor"
+  },
+  {
+   "id": "B11",
+   "title": "Preserve appended-turn context when an older recording joins a thread",
+   "priority": "P1",
+   "kind": "correctness regression following #192",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: threads+refine 41/41, storage 53/53 on program/wave-a 0707f82; root cause = compareTakeOrder keyed on createdAt; fix = persisted threadJoinedAt append sequence + contextSourceId provenance"
+   ],
+   "notes": "stable cross-window same-take refined copy still last-write-wins; full revision model is E21"
+  },
+  {
+   "id": "E01",
+   "title": "Move authoritative desktop recording into a native capture service with drained Stop",
+   "priority": "P1",
+   "kind": "capture architecture replacement",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E02",
+   "title": "Journal every desktop take in native durable storage and make history recoverable at scale",
+   "priority": "P1",
+   "kind": "product gap / storage architecture",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": "impl-agent-33",
+   "branch": "gpui/fixes-wave-a11",
+   "evidence": [
+    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal"
+   ],
+   "notes": "cutover remains: app wiring behind STARLING_STORAGE_V2, user-reviewed dry-run->apply->accept UI, leases, retention sweep, bounded reads, E02 crash-injection docs"
+  },
+  {
+   "id": "E03",
+   "title": "Implement focus-safe system-wide desktop dictation and target insertion",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E01",
+    "E02",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E04",
+   "title": "Add tray/overlay dictation controls, configurable hold/toggle shortcuts, and permission onboarding",
+   "priority": "P1",
+   "kind": "core product gap / UX",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E05",
+   "title": "Deliver terminal-free local setup with a verified model manager and supervised native server",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E16"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E06",
+   "title": "Create an audio-backed fidelity gate for the six original dictation failure modes",
+   "priority": "P1",
+   "kind": "core product gap / evaluation",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-2 + coordinator",
+   "branch": "program/wave-a",
+   "evidence": [
+    "95/95 pytest rerun by coordinator; provenance schema-locked to synthetic; all 7 mutants caught by declared gates (commit a88dbbf)"
+   ],
+   "notes": "contract+frozen gates delivered; real consented audio + ASR-model runs remain validation gaps; feeds E07/E13/E24"
+  },
+  {
+   "id": "E07",
+   "title": "Turn Words to watch into capability-aware vocabulary and explicit contextual corrections",
+   "priority": "P1",
+   "kind": "core product gap",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E06"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E08",
+   "title": "Make transformations reversible and policy-driven, with meaningful diffs and revision provenance",
+   "priority": "P1",
+   "kind": "authoring and trust model",
+   "area": "app",
+   "deps": [
+    "E21",
+    "B09"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E09",
+   "title": "Provide a coherent authenticated remote-endpoint and phone-pairing flow",
+   "priority": "P1",
+   "kind": "product gap / privacy hardening",
+   "area": "app",
+   "deps": [
+    "E10",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E10",
+   "title": "Consume the existing capability endpoint and share cross-client protocol conformance fixtures",
+   "priority": "P2",
+   "kind": "integration gap / maintainability",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": "impl-agent-6",
+   "branch": null,
+   "evidence": [],
+   "notes": "capability descriptor + conformance fixtures; evidence-derived from live server code"
+  },
+  {
+   "id": "E11",
+   "title": "Define and measure an interactive dictation latency profile end to end",
+   "priority": "P1",
+   "kind": "product performance gap",
+   "area": "app",
+   "deps": [
+    "E01",
+    "E17",
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E12",
+   "title": "Gate app releases on packaged workflows, signing, updates, and real device evidence",
+   "priority": "P1",
+   "kind": "distribution / validation gap",
+   "area": "app",
+   "deps": [
+    "E15",
+    "E03",
+    "E05",
+    "E16"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E13",
+   "title": "Graduate Android on-device inference with explicit model lifetime and resource budgets",
+   "priority": "P2",
+   "kind": "product gap / mobile reliability",
+   "area": "app",
+   "deps": [
+    "E06",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E14",
+   "title": "Build an iOS keyboard\u2013host-app dictation flow and system quick-capture integrations",
+   "priority": "P1",
+   "kind": "mobile product and platform integration",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E15",
+   "title": "Graduate the existing GPUI port through parity, accessibility, packaging and fair renderer comparison",
+   "priority": "P1",
+   "kind": "architecture",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E16",
+   "title": "Make dependency and build-tool adoption reproducible, scoped, and reviewable",
+   "priority": "P2",
+   "kind": "maintainability / supply-chain hardening",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-18",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: lint gate 0/0; policy doc + CI frozen-lockfile/uv-lock drift steps with negative probes proving gates fail on drift; bun.lock determined stale one-off (kept, documented)"
+   ],
+   "notes": "Android gradle locking + CI-resolved tool pins reported as follow-ups; cargo surface lands with PR #193 merge"
+  },
+  {
+   "id": "E17",
+   "title": "Extract the existing Rust dictation foundation into a renderer-independent native runtime",
+   "priority": "P1",
+   "kind": "architecture",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": "design-agent + coordinator",
+   "branch": "program/wave-a",
+   "evidence": [
+    "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded",
+    "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)",
+    "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)"
+   ],
+   "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain"
+  },
+  {
+   "id": "E18",
+   "title": "Offer distinct Dictate, Edit and Capture workflows with policy-level consent",
+   "priority": "P1",
+   "kind": "product interaction model",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
+   "evidence": [
+    "mode-routing contract committed 5192b01; coordinator rerun 133/133; precedence frozen: secure-field policy > locked manual > literal escape > longest unambiguous alias > specificity rules > default; conflicts surfaced not hidden"
+   ],
+   "notes": "contract level; Mode Studio UI = E30; runtime wiring = I3"
+  },
+  {
+   "id": "E19",
+   "title": "Add permission-scoped app, site and project context with inspectable output profiles",
+   "priority": "P1",
+   "kind": "context-aware authoring",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
+   "evidence": [
+    "context-snapshot schema: activation-frozen, capabilities, range+offset_encoding, expiry; secure-field branch structurally excludes selected_text"
+   ],
+   "notes": "same as E18"
+  },
+  {
+   "id": "E20",
+   "title": "Add scoped voice snippets, literal spelling and precise technical-text controls",
+   "priority": "P2",
+   "kind": "voice productivity feature set",
+   "area": "app",
+   "deps": [
+    "E18",
+    "E08"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E21",
+   "title": "Replace thread labels and mutable refined text with named documents and immutable revisions",
+   "priority": "P1",
+   "kind": "document data-model rebuild",
+   "area": "app",
+   "deps": [
+    "E02",
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E22",
+   "title": "Support the Android RECOGNIZE_SPEECH popup alongside the existing IME and recognizer service",
+   "priority": "P1",
+   "kind": "missing standard integration",
+   "area": "app",
+   "deps": [
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E23",
+   "title": "Expose explicitly shared notes and revisions through CLI and MCP adapters",
+   "priority": "P2",
+   "kind": "agent and external-tool interoperability",
+   "area": "app",
+   "deps": [
+    "E21",
+    "E09"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E24",
+   "title": "Make multilingual dictation, code-switching and locale-aware text a tested product contract",
+   "priority": "P1",
+   "kind": "language and accessibility product gap",
+   "area": "app",
+   "deps": [
+    "E06",
+    "E10"
+   ],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-16",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: 58 multilingual + 66 fidelity tests green (65af808); Turkic SpecialCasing, fa-IR digits, fr NBSP quotes frozen; astral codepoint-offset mutant test"
+   ],
+   "notes": "contract-level complete; runtime gaps declared: language-selection UI (capability false today), IME/bidi editing tests, per-language quality reporting (model-gated)"
+  },
+  {
+   "id": "E25",
+   "title": "Separate optional cross-device sync and handoff from remote inference",
+   "priority": "P2",
+   "kind": "cross-device product architecture",
+   "area": "app",
+   "deps": [
+    "E21",
+    "E09",
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "G01",
+   "title": "GPUI: checkpoint active audio and surface capture/close failures",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-10",
+   "branch": "gpui/fixes-wave-a7",
+   "evidence": [
+    "I1 PHASE 1 complete: coordinator rerun 106/106 + 17/17 on gpui/fixes-wave-a4 8be559c, pushed to PR #194; RT callback = atomics only (R01 structurally fixed), SPSC ring + 25ms writer thread, gap spans surfaced, quiesce-stop handshake with typed QuiesceTimeout carrying intact samples (R09)",
+    "PHASE 2 complete: coordinator rerun 133/133 + 23/23 (9343bb1, pushed to #194); journals with 250ms/64KiB fsync boundaries; ack == last fsynced boundary (atomic durable_ack); torn-tail recovery to checksum-valid boundary; interrupted sessions with journal linkage; quiesce salvage wired; fault injection via FaultSink"
+   ],
+   "notes": "I1 COMPLETE (ring + journal). Deferred to I2: SQLite metadata, staging->audio rename, gap records in journal, bounded reads, GC/retention (never-delete policy until then)"
+  },
+  {
+   "id": "G02",
+   "title": "GPUI: isolate damaged history and recover WAV-only orphan sessions",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
+   "evidence": [
+    "coordinator rerun: 144/144 + 42/42 (cf70f35, pushed); list_records metadata-only w/ 1MiB manifest cap + WAV magic check; 8-record mixed store surfaces damaged with reasons; WAV-only orphans recover as interrupted takes w/ torn-write duration clamp; heal-on-first-write; paging API"
+   ],
+   "notes": "crash-injection/fsync documentation + multi-process leases remain E02 storage-v2 scope per the issues own migration framing"
+  },
+  {
+   "id": "G03",
+   "title": "GPUI: detect source clipping before attenuation and report correct percentages",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
+   "evidence": [
+    "impl-agent-1 + coordinator rerun: cargo test -p starling-dictation 94/94, -p starling-gpui 7/7 on gpui/fixes-wave-a ba2abd3"
+   ],
+   "notes": "live-mic capture test ran on real hardware; no full-app 44.1/48k E2E run yet"
+  },
+  {
+   "id": "G04",
+   "title": "GPUI: cancel playback watchers when Stop or selection change ends playback",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "gpui/fixes-wave-a2",
+   "evidence": [
+    "coordinator rerun: 95/95 dictation, 11/11 app tests on gpui/fixes-wave-a2 c9e4951; pure playback_watch decision fn tested incl. stale-watcher cancel"
+   ],
+   "notes": "live gpui-entity end-to-end watcher lifetime untested (headless crate)"
+  },
+  {
+   "id": "G05",
+   "title": "GPUI: do not silently overwrite exports in the Downloads directory",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
+   "evidence": [
+    "coordinator rerun: 7/7 app-crate tests; create_new semantics incl. symlink dodge; a889f89"
+   ],
+   "notes": "Windows/macOS path behavior untested; no reveal action"
+  },
+  {
+   "id": "G06",
+   "title": "GPUI port: restore anti-aliased resampling before promoting native capture",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-1",
+   "branch": "gpui/fixes-wave-a",
+   "evidence": [
+    "coordinator rerun: 94/94 dictation tests; 12kHz@48k alias <= -40dB with seeded linear control that fails; d47b1d0"
+   ],
+   "notes": "PORT.md update deferred to next agent (gpui/fixes-wave-a2); real hardware capture path unverified"
+  },
+  {
+   "id": "G07",
+   "title": "GPUI: resolve negative-half PCM rounding divergence and test cross-language contracts",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "gpui/fixes-wave-a2",
+   "evidence": [
+    "coordinator rerun 95/95; js_round ties-to-+inf matches TS Math.round; 21-case shared fixture rejects old away-from-zero behavior (974df60)"
+   ],
+   "notes": "TS vitest side not executed here (worktree lacks node_modules); validated via dependency-free node Math.round replication; runs in CI after merge"
+  },
+  {
+   "id": "E26",
+   "title": "Route explicit leading voice phrases to versioned modes without losing literal speech",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E19",
+    "E18"
+   ],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
+   "evidence": [
+    "leading-phrase routing oracle: 25 reference cases byte-faithful + 8 variants incl. locked-manual-beats-escape, policy-beats-locked-manual; payload view preserves raw, removes prefix only from derived view"
+   ],
+   "notes": "same as E18"
+  },
+  {
+   "id": "E27",
+   "title": "Use selected text as scoped context or a conflict-checked edit target",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E03",
+    "E19",
+    "E21"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "E28",
+   "title": "Define local Insight events and truthful, deletion-aware metric calculations",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E17"
+   ],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-2 + coordinator",
+   "branch": "program/wave-a",
+   "evidence": [
+    "95/95 pytest rerun; schema has no raw-text fields + explicit rejection test; deletion-dominates-replay, sync dedupe, negative time-proxy frozen (commit 5fe0e0b)"
+   ],
+   "notes": "contract+oracle delivered; product surface = E29; production impl lands in E17 native runtime"
+  },
+  {
+   "id": "E29",
+   "title": "Build delightful personal Insights: usage, voice patterns and actionable quality",
+   "priority": "P2",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E28"
+   ],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-34",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator-completed after agent rate-limit death: 287/287 (19 files incl. 3 insight suites, 58 tests), lint 0/0, tsc+fmt clean; oracle-semantics TS port + emitter wiring + usage/quality views"
+   ],
+   "notes": "phase 1; Your Voice patterns (E29 part 2) + share cards + weekly recap polish remain; model-free (metrics from local events only); lint gate satisfied 4ffe6fd (56 errors -> 0)"
+  },
+  {
+   "id": "E30",
+   "title": "Ship a Mode Studio with contextual rules, prompt previews and safe editor/browser adapters",
+   "priority": "P1",
+   "kind": "feature",
+   "area": "app",
+   "deps": [
+    "E19",
+    "E08",
+    "E26",
+    "E27"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S01",
+   "title": "Clear MOSS KV tensors on-device instead of uploading full host-zero arrays",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/s01-moss-kv-clear",
+   "evidence": [
+    "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending",
+    "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196",
+    "LOCAL DEVICE EVIDENCE: device_cache_clear_test backend=Vulkan0 all checks passed on AMD Cezanne/RADV (program/gpu-validation build-vk) - Vulkan fillBuffer path now executed-device-verified; CUDA still source-read only pending 5090 run",
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+   ],
+   "notes": "CPU-verified; CUDA/Vulkan source-read only; no GPU timing or real-model A/B (validation gaps)"
+  },
+  {
+   "id": "S02",
+   "title": "Bound Parakeet TDT graph retention and account for every replay-cache owner",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": 177,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction",
+    "LOCAL DEVICE EVIDENCE: tdt_graph_budget_test PASS with real ReplayGraphs on Vulkan device (entry_bytes=3080 vs 3136 CPU - device-adaptive accounting); pointer stability under eviction verified on-device",
+    "REAL-MODEL iGPU run: parakeet q8_0 720M loaded 1.5s, request 0.77s, {\"text\":\"\"} for tone input (correct no-speech behavior); MOSS tone produced a hallucination (expected for non-speech input) - pipeline-level evidence only, not quality",
+    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)"
+   ],
+   "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
+  },
+  {
+   "id": "S03",
+   "title": "Honor prefill EOS for single-stop decoders under an explicit termination contract",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-12",
+   "branch": "program/s03-eos-contract",
+   "evidence": [
+    "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction",
+    "LOCAL DEVICE EVIDENCE: greedy_termination_test PASS under Vulkan backend; stream_session_test 235/235 on Vulkan",
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+   ],
+   "notes": "model-gated gaps: real MOSS GGUF E2E, GPU K-step branch, real-audio acceptance evals; serve/Python wiring of completion status deferred"
+  },
+  {
+   "id": "S04",
+   "title": "Keep intermediate audio/model tensors on-device across native pipeline stages",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S05",
+   "title": "Fuse MOSS window attention without materializing full scores and probabilities",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S06",
+   "title": "Eliminate repeated V-prefix transposition in the shared MOSS decoder",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S01"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S07",
+   "title": "Fuse Parakeet query-dependent relative bias into tiled attention",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S08",
+   "title": "Reduce cold-shape setup by sharing immutable projections and preparing real workload shapes",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S09",
+   "title": "Optimize CPU GEMV/repacking and selective execution-plan reuse for MOSS and Parakeet",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S10",
+   "title": "Reduce TDT recurrent/control work with explicit stateful kernels and real blank reuse",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S11",
+   "title": "Reuse an exact successful streaming-tail result at commit and coalesce stale preview work",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-31",
+   "branch": "program/s11-tail-reuse",
+   "evidence": [
+    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open"
+   ],
+   "notes": "no real-model/GPU timing claims; reuse count reported separately from latency; serving first-wave (S01/S02/S03/S11) now ALL implemented+CPU/Vulkan-verified",
+   "branch_note": "engine worktree"
+  },
+  {
+   "id": "S12",
+   "title": "Propagate cancellation into safe engine boundaries and extend contention scheduling",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": 178,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S13",
+   "title": "Select per-device quant recipes using task quality, latency and resident memory together",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S14",
+   "title": "Make MOSS calibration reproducible and repair quality-evaluation provenance",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S15",
+   "title": "Fuse projections and elementwise epilogues where traced shapes justify register reuse",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S16",
+   "title": "Use the existing experiment harness to gate native workload-level optimizations",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": 171,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S17",
+   "title": "Reuse stable frontend work across growing audio windows without stale model state",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S11"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S18",
+   "title": "Evaluate native batching and local-attention modes as explicit workload experiments",
+   "priority": "P2",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S12"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "S19",
+   "title": "Use file-backed weight ownership and avoid retaining an unnecessary full host heap copy on GPU",
+   "priority": "P1",
+   "kind": "experiment",
+   "area": "serving",
+   "deps": [
+    "S02"
+   ],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [],
+   "notes": ""
+  },
+  {
+   "id": "R01",
+   "title": "Recorder: mutex locking on the real-time audio thread (attenuator + ring)",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "feeds G01/E01 capture rework; OCR bug-high"
+  },
+  {
+   "id": "R02",
+   "title": "user_set_model force-set on every save + raw-file string sniffing",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-8",
+   "branch": "gpui/fixes-wave-a3",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 96/96 dictation, 17/17 app on gpui/fixes-wave-a3 021d7e0; persisted userSetModel flag replaces file sniffing; migration=conservative false"
+   ],
+   "notes": "pushed to PR #194"
+  },
+  {
+   "id": "R03",
+   "title": "Connection state derived from transcription job outcome, not a health probe",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-8",
+   "branch": "gpui/fixes-wave-a3",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun 17/17 incl. storage-failure-does-not-touch-connection test; check_health is sole connection writer (bf50e61)"
+   ],
+   "notes": "pushed to PR #194; note: same latent bug exists in Electron App.tsx - fold into B-fix wave"
+  },
+  {
+   "id": "R04",
+   "title": "Duplicate GPUI element IDs: history-spinner, dot-blink, protocol toggle",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 133/133 + 35/35 (8a21cf8, pushed); per-session spinner ids, per-call-site dot ids, selection-stable protocol ids"
+   ],
+   "notes": "shared per-element state corruption"
+  },
+  {
+   "id": "R05",
+   "title": "Transcript saved without re-checking session existence after in-flight delete",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 35/35; save_race_decision classifies NotFound as delete-race (SessionDeleted): WAV stashed to recovery + surfaced, never a job failure; disk-full stays Local failure"
+   ],
+   "notes": "judgment call: delete-mid-transcribe keeps audio for explicit discard - aligns with never-orphan-data"
+  },
+  {
+   "id": "R06",
+   "title": "Client copies full WAV into request and buffers unbounded response body",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "client.rs; 256MB recording doubles peak memory"
+  },
+  {
+   "id": "R07",
+   "title": "Editing keybindings registered with None context (global shadowing risk)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: all 13 editing bindings scoped to TextField context; global toggle unaffected"
+   ],
+   "notes": "input.rs"
+  },
+  {
+   "id": "R08",
+   "title": "Capture banner: error/success text conflation; no dismiss when unsaved recordings remain",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-26",
+   "branch": "gpui/fixes-wave-a8",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: error banners never show reassurance footer; dismiss always available with an error; unsaved-only keeps download/discard exits"
+   ],
+   "notes": "capture.rs"
+  },
+  {
+   "id": "R09",
+   "title": "Recorder: poisoned mutex silently drains empty; stop() lacks callback quiesce handshake",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+   ],
+   "notes": "folds into G01 capture lifecycle rework"
+  },
+  {
+   "id": "R10",
+   "title": "Render/perf hygiene: per-line divs, double history allocation, per-playback threads, mono.clone()",
+   "priority": "P3",
+   "kind": "perf",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun 42/42; single long-lived watcher thread (zero idle wakeups); transcript one text element; history single pass; mono.clone verified absorbed by ring rewrite"
+   ],
+   "notes": "batch; low severity"
+  },
+  {
+   "id": "R11",
+   "title": "Metadata/hygiene: Cargo license/rust-version, dual Protocol enums, config_dir cwd fallback, chrono %-I, probe int-division percent",
+   "priority": "P3",
+   "kind": "maintainability",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-30",
+   "branch": "gpui/fixes-wave-a10",
+   "evidence": [
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun; single Protocol enum w/ stable serde strings; typed ConfigDir/DataDir errors replace cwd fallbacks; component date formatting; rust-version 1.85 + MIT + repository metadata"
+   ],
+   "notes": "batch; E16-adjacent"
+  },
+  {
+   "id": "R12",
+   "title": "Fix 5 OCR findings on PR #195 contract code (low severity)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "all 4 code fixes + 3 regression tests; 98+0 passed (test_fidelity_corpus+insight_events), server_routing 21 unregressed"
+   ],
+   "notes": "trailing newline (pr193-log.json, already fixed in harvest); LE-safe WAV bytes (fidelity_audio.py); overlap clamp (fidelity_scorers.py L203); bool/int type-aware const/enum equality + empty-combiner guard (minischema.py L78/L121). Execute in coordinator session; tests/ is agent-shared."
+  },
+  {
+   "id": "R13",
+   "title": "Address PR #194 OCR review on GPUI fixes (6 findings; 1 medium: stale connection badge after mid-session transport failure)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-19",
+   "branch": "gpui/fixes-wave-a5",
+   "evidence": [
+    "coordinator rerun: 111/111 dictation + 21/21 app tests; transport/local failure classifier + probe-on-transport-only keeps check_health sole connection writer; resampler 384kHz ceiling + edge replication; recorder finding verified ABSORBED by ring rewrite; pushed to PR #194 (51ec75e incl. workflow timeout fix)"
+   ],
+   "notes": "dispatched after I1-phase1; recorder finding absorbed by ring rewrite - verify"
+  },
+  {
+   "id": "R14",
+   "title": "Address PR #195 OCR review on Electron/dictation code (2 medium: legacy threadJoinedAt stamp/ordering regressions; RefinedDraft duplication; threadContext pass-through; durationMs dead weight)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-15",
+   "branch": "program/wave-a",
+   "evidence": [
+    "coordinator rerun: desktop 105/105, storage 54/54, tsc clean (451859c..e1df3d8); finding 1 resolved as do-NOT-stamp-legacy with justified semantics; finding 2 proven unreachable -> regression locks only; durationMs removed as dead weight"
+   ],
+   "notes": "dispatched after B02/B03 verified; durationMs finding resolved against stoppedTakeVerdict design"
+  },
+  {
+   "id": "R15",
+   "title": "Address PR #195 OCR review on capabilities contract (2 medium: fixtures envelope unexercised, adoption scan misses .tsx; plus (fixed) cli_flag doc)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215",
+    "coordinator rerun: 146/146 across capabilities+fidelity+insight+runtime-protocol suites (4f1bdd2, 4eb5286); NaN finding premise stale (already guarded by isfinite), pinned with new test"
+   ],
+   "notes": "files owned by completed E10 agent; dispatchable now"
+  },
+  {
+   "id": "R16",
+   "title": "Contract-test hardening from PR #195 review (5 findings: read_wav rate assert, assert-under-O, nonnegative NaN, $ref siblings+escapes, losslessness compares values)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215",
+    "coordinator rerun: 146/146 across capabilities+fidelity+insight+runtime-protocol suites (4f1bdd2, 4eb5286); NaN finding premise stale (already guarded by isfinite), pinned with new test"
+   ],
+   "notes": "dispatching now; resolved-by-R12: bool/enum equality, empty combiner, overlap clamp (bots reviewed pre-R12 state)"
+  },
+  {
+   "id": "R17",
+   "title": "Address PR #194 second review batch (recorder edge cases + rust CI workflow)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-21",
+   "branch": "gpui/fixes-wave-a6",
+   "evidence": [
+    "coordinator rerun: 116/116 + 22/22; quiesce timeout now Arc-defers teardown (no callback race, design-conform), drain watermark single-sourced via take_pending, channels==0 typed rejection, writer panic surfaced w/ samples still returned, example modernized, fsync split by recoverability, export notice own slot; pushed 911f305"
+   ],
+   "notes": "follow-up folded into I1-phase2: upload.rs should consume QuiesceTimeout salvaged audio"
+  },
+  {
+   "id": "R18",
+   "title": "Wire greedy_termination_test and device_cache_clear_test into ci-starling-serve.yml",
+   "priority": "P2",
+   "kind": "ci",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "both engine test targets added to ci-starling-serve.yml build+run lists with comment; yaml validated"
+   ],
+   "notes": "explicit --target list + run list in ci-starling-serve.yml; device_cache_clear_test likely same gap - verify"
+  },
+  {
+   "id": "R19",
+   "title": "Fix PR #194 CI: rust workflow needs libasound2-dev; G07 TS test fails lint gate",
+   "priority": "P1",
+   "kind": "ci",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "coordinator",
+   "branch": "gpui/fixes-wave-a7",
+   "evidence": [
+    "boundary parser replaces type assertion (lint+fmt verified via main-checkout toolchain, 0/0); libasound2-dev install step added; pushed 80aa4a1 -> PR #194 re-runs checks",
+    "follow-up: X11/Wayland link libs + player-test headless guards + audio.test.ts Schema-parse + fmt (e016826, 90d5f8a); pipeline-exit-code false-green in coordinator verification found and eliminated"
+   ],
+   "notes": "audio.test.ts authored in gpui worktree which lacks node_modules - JS gates never ran there; fixing + verifying via main-checkout lint. code-review bot workflow itself failed on #196/#197 at open time (bot-side exit 1; later runs on other PRs succeeded) - no action possible from agents; re-triggers on next push."
+  },
+  {
+   "id": "R20",
+   "title": "Address PR #198 OCR review on S02 (2 medium: env-parse overflow, O(n^2) trim; 10 low)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-28",
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator rerun: tdt_graph_budget_test PASS + stream_session 235/235 CPU, agent also re-ran on Vulkan0 device (0cb6a2b, c3fbdee pushed to PR #198); strtoll+clamp env parse w/ diagnostics; single-pass trim w/ identical victim set; zero-budget throws; trace pin marker additive"
+   ],
+   "notes": "dispatch into starling-s01 worktree when coordinator next fills the engine slot; budget parse = strtoll+clamp; trim = single-pass back-iteration"
+  },
+  {
+   "id": "R21",
+   "title": "Confirmed deletion must also remove the linked journal (B05 warning contract vs never-drop recovery policy)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-29",
+   "branch": "gpui/fixes-wave-a9",
+   "evidence": [
+    "coordinator rerun: 139/139 + 35/35 (84073a7, pushed); rename-to-quarantine tombstone before row removal; crash matrix covered incl. reappeared-file case; unsafe manifest linkages read as None (no traversal, deletion never bricked)"
+   ],
+   "notes": "fix in gpui worktree: confirmed delete removes or quarantines the journal linked via journal_id; recovery skips deliberately-deleted ids (needs a tombstone list or rename convention); dispatch next gpui slot"
+  },
+  {
+   "id": "R22",
+   "title": "Address PR #198 re-review: sched-path zero-byte accounting degenerates budget; rollback byte leak",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-32",
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator-completed after agent rate-limit death: 3 new tests (floor+warn-once+bounded, floored count cap, fault-hook rollback restoration); tdt_graph_budget_test PASS + stream_session 235/235; 8MiB floor + count cap + stored-iterator rollback (8dc7b36, pushed to #198)"
+   ],
+   "notes": "P1: the zero-byte case silently voids S02s entire guarantee. Fix directions: nonzero accounting for sched-path graphs (sched memory estimate or declared minimum) OR separate entry-count bound for zero-byte entries + one-time diagnostic; NEVER silently unbounded. Rollback: restore bytes_ in catch. Queue AFTER S11 completes (same worktree)."
+  },
+  {
+   "id": "R23",
+   "title": "PR #198 third-pass review: floor comment overclaims at T<=4096; rollback test misses floored branch; 4 lows",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-35",
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator rerun: tdt PASS + stream 235/235 (5d63153, pushed to #198); floor comment now states observed-range + count-cap-is-the-bound; floored-branch rollback test; split rejection diagnostics; loop-invariant cap predicate"
+   ],
+   "notes": "soften floor comment to observed-range + count-cap-is-the-bound (or shape-aware floor); extend rollback test w/ floored entry; queue engine slot"
+  },
+  {
+   "id": "R24",
+   "title": "PR #199 review: callback swap must invalidate/join the tail-reuse key; 5 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": "impl-agent-35",
+   "branch": "program/s11-tail-reuse",
+   "evidence": [
+    "coordinator rerun after branch-correct rebuild: stream_session_test 363/363 (1aa3a08, pushed to #199); tx_gen_ joins StreamTailKey (in-flight-write immune by construction); callback-swap recompute test; TailFixture dedupe; CHECK_NEAR"
+   ],
+   "notes": "MEDIUM: set_transcribe_fn swaps custom_tx_ w/o clearing retained entry -> stale replay; callback identity joins the key or swap clears; add test; queue engine slot behind R23"
+  },
+  {
+   "id": "R25",
+   "title": "PR #198 batch-4: ERANGE message ordering + 5 lows",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/s02-tdt-budget",
+   "evidence": [
+    "coordinator rerun: tdt PASS + stream 235/235 (8a158eb pushed); ERANGE-first ordering w/ negative-overflow test proven failing pre-fix; to_string dangling-temporary fix; release_after null-check"
+   ],
+   "notes": "check ERANGE before the <=0 branch so huge-magnitude negatives get the clamp message; rest are message/doc/test nits"
+  },
+  {
+   "id": "R26",
+   "title": "PR #199 batch-2: snapshot tx_gen_ with the callback at active_tx() creation; reset-collision enforcement; 8 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/s11-tail-reuse",
+   "evidence": [
+    "coordinator rerun after branch rebuild: stream_session_test 373/373 (8d416f8 pushed); generation snapshotted beside the callback (mid-step swap test); reset() bumps audio_rev_ (enforced, not comment-only)"
+   ],
+   "notes": "MEDIUM: capture inner AND tx_gen_ together atomically (the R24 keying has a creation/invocation gap); verify+enforce the reset safety argument in code not just comments"
+  },
+  {
+   "id": "R27",
+   "title": "PR #198 batch-5: RAII guard for trim_fault_hook reset (low); env-budget-tests claim rebutted",
+   "priority": "P3",
+   "kind": "test",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35518206319 (2 findings)"
+   ],
+   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch"
+  },
+  {
+   "id": "R28",
+   "title": "Cherry-pick conditional engine-test CI wiring onto all four engine branches",
+   "priority": "P2",
+   "kind": "ci",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": "coordinator",
+   "branch": null,
+   "evidence": [
+    "PR #197 rerun finding 4057347666: R18 wiring exists only on program/wave-a; engine branches build explicit target lists without device_cache_clear/greedy_termination/tdt_graph_budget tests"
+   ],
+   "notes": "cherry-pick 6f64d8f (conditional version) onto s01/s02/s03/s11 branches + push"
+  },
+  {
+   "id": "R29",
+   "title": "PR #199 batch-3 lows (active_tx cost, step perf note, TailFixture style, fake-engine key)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #199 OCR rerun 35518232105-2"
+   ],
+   "notes": "verify-then-fix; fold into next engine touch with R27"
+  }
+ ],
+ "active_assignments": [
+  {
+   "ids": [
+    "E10"
+   ],
+   "agent": "impl-agent-6",
+   "branch": "program/wave-a",
+   "scope": "packages/contracts/capabilities + tests (light)"
+  },
+  {
+   "ids": [
+    "B11"
+   ],
+   "agent": "impl-agent-4",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop TS (light)"
+  },
+  {
+   "ids": [
+    "E17"
+   ],
+   "agent": "design-agent",
+   "branch": "program/wave-a",
+   "scope": "docs/program/design only"
+  },
+  {
+   "ids": [
+    "B04",
+    "B05"
+   ],
+   "agent": "impl-agent-17",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop + packages/dictation (light)"
+  },
+  {
+   "ids": [
+    "E16"
+   ],
+   "agent": "impl-agent-18",
+   "branch": "program/wave-a",
+   "scope": "root build files + docs + workflows (light)"
+  },
+  {
+   "ids": [
+    "R13"
+   ],
+   "agent": "impl-agent-19",
+   "branch": "gpui/fixes-wave-a5",
+   "scope": "gpui worktree Rust (light)"
+  },
+  {
+   "ids": [
+    "G01-p2"
+   ],
+   "agent": "impl-agent-23",
+   "branch": "gpui/fixes-wave-a7",
+   "scope": "gpui worktree Rust (light-mid cargo)"
+  },
+  {
+   "ids": [
+    "B01"
+   ],
+   "agent": "impl-agent-24",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop CSP + transport (light)"
+  }
+ ],
+ "prs": {
+  "194": "gpui/fixes-wave-a2 -> gpui-port (G03-G07 fixes)",
+  "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
+  "196": "program/s01-moss-kv-clear -> master (S01)"
+ }
+}

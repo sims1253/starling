@@ -1,0 +1,1656 @@
+{
+  "schema_version": 1,
+  "name": "starling-fidelity-corpus",
+  "provenance_policy": "Every fixture is synthetic: expected content and reference outputs were authored by hand, and audio synthesis parameters describe sine/noise segments used only as transport and stitch evidence. No real, consented or licensed human speech is included; adding such audio is a tracked future gap and must come with its own consent record. Nothing here is ASR-quality evidence.",
+  "fixtures": [
+    {
+      "id": "fx-resume-01",
+      "category": "resumed-numbering",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 16.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 6.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 6.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              8.0,
+              14.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              6.0,
+              8.0
+            ],
+            [
+              14.0,
+              16.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "oat",
+            "milk",
+            "eggs",
+            "stop"
+          ],
+          "numeric_values": [
+            "5",
+            "6",
+            "7"
+          ],
+          "list_continuation": {
+            "prior_index": 4,
+            "markers": [
+              "5",
+              "6",
+              "7"
+            ]
+          }
+        },
+        "authored": {
+          "critical_tokens": [
+            "oat",
+            "milk",
+            "eggs",
+            "stop"
+          ],
+          "list_continuation": {
+            "prior_index": 4,
+            "markers": [
+              "5",
+              "6",
+              "7"
+            ]
+          }
+        },
+        "delivered": {
+          "critical_tokens": [
+            "oat",
+            "milk",
+            "eggs",
+            "stop"
+          ],
+          "final_phrases": [
+            [
+              "7",
+              "stop",
+              "there"
+            ]
+          ],
+          "superseded_phrases": [
+            [
+              "4",
+              "stop",
+              "there"
+            ]
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              8.0,
+              14.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "5",
+            "buy",
+            "oat",
+            "milk",
+            "6",
+            "buy",
+            "eggs",
+            "7",
+            "stop",
+            "there"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "5",
+            "buy",
+            "oat",
+            "milk",
+            "6",
+            "buy",
+            "eggs",
+            "7",
+            "stop",
+            "there"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "5",
+            "buy",
+            "oat",
+            "milk",
+            "6",
+            "buy",
+            "eggs",
+            "7",
+            "stop",
+            "there"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-tech-01",
+      "category": "technical-terms",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 12.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 4.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 4.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 2.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              4.0
+            ],
+            [
+              5.0,
+              9.0
+            ],
+            [
+              10.0,
+              12.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              4.0,
+              5.0
+            ],
+            [
+              9.0,
+              10.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "ingress",
+            "acceleration",
+            "kubernetes",
+            "traefik",
+            "webgpu"
+          ],
+          "entities": [
+            "kubernetes",
+            "traefik",
+            "webgpu"
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "ingress",
+            "acceleration",
+            "kubernetes",
+            "traefik",
+            "webgpu"
+          ],
+          "entities": [
+            "kubernetes",
+            "traefik",
+            "webgpu"
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "ingress",
+            "acceleration",
+            "kubernetes",
+            "traefik",
+            "webgpu"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              4.0
+            ],
+            [
+              5.0,
+              9.0
+            ],
+            [
+              10.0,
+              12.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "the",
+            "deployment",
+            "runs",
+            "on",
+            "kubernetes",
+            "the",
+            "ingress",
+            "uses",
+            "traefik",
+            "and",
+            "webgpu",
+            "acceleration"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "the",
+            "deployment",
+            "runs",
+            "on",
+            "kubernetes",
+            "and",
+            "the",
+            "ingress",
+            "uses",
+            "traefik",
+            "with",
+            "webgpu",
+            "acceleration"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "the",
+            "deployment",
+            "runs",
+            "on",
+            "kubernetes",
+            "and",
+            "the",
+            "ingress",
+            "uses",
+            "traefik",
+            "with",
+            "webgpu",
+            "acceleration"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-selfcor-01",
+      "category": "self-correction",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 12.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 6.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              7.0,
+              12.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              6.0,
+              7.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "deploy",
+            "friday",
+            "monday",
+            "saturday"
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "deploy",
+            "monday",
+            "standup",
+            "saturday"
+          ],
+          "corrections": [
+            {
+              "mode": "replacement",
+              "retracted": [
+                "deploy",
+                "on",
+                "friday"
+              ],
+              "final": [
+                "deploy",
+                "on",
+                "monday"
+              ]
+            },
+            {
+              "mode": "disjunction",
+              "alternatives": [
+                "friday",
+                "saturday"
+              ]
+            }
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "deploy",
+            "monday",
+            "standup",
+            "saturday"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              7.0,
+              12.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "deploy",
+            "on",
+            "friday",
+            "no",
+            "wait",
+            "deploy",
+            "on",
+            "monday",
+            "instead",
+            "if",
+            "that",
+            "fails",
+            "use",
+            "friday",
+            "or",
+            "saturday"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "deploy",
+            "on",
+            "monday",
+            "before",
+            "the",
+            "standup",
+            "meeting",
+            "if",
+            "that",
+            "fails",
+            "use",
+            "friday",
+            "or",
+            "saturday"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "deploy",
+            "on",
+            "monday",
+            "before",
+            "the",
+            "standup",
+            "meeting",
+            "if",
+            "that",
+            "fails",
+            "use",
+            "friday",
+            "or",
+            "saturday"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-neg-01",
+      "category": "negation",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 12.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 6.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              7.0,
+              12.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              6.0,
+              7.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "production",
+            "keys",
+            "firewall"
+          ],
+          "negation_spans": [
+            {
+              "negator": "never",
+              "governed": [
+                "share",
+                "the",
+                "production",
+                "keys"
+              ]
+            },
+            {
+              "negator": "not",
+              "governed": [
+                "disable",
+                "the",
+                "firewall"
+              ]
+            }
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "production",
+            "keys",
+            "firewall"
+          ],
+          "negation_spans": [
+            {
+              "negator": "never",
+              "governed": [
+                "share",
+                "the",
+                "production",
+                "keys"
+              ]
+            },
+            {
+              "negator": "not",
+              "governed": [
+                "disable",
+                "the",
+                "firewall"
+              ]
+            }
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "production",
+            "keys",
+            "firewall"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              6.0
+            ],
+            [
+              7.0,
+              12.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "never",
+            "share",
+            "the",
+            "production",
+            "keys",
+            "and",
+            "do",
+            "not",
+            "disable",
+            "the",
+            "firewall",
+            "tonight"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "never",
+            "share",
+            "the",
+            "production",
+            "keys",
+            "and",
+            "do",
+            "not",
+            "disable",
+            "the",
+            "firewall",
+            "tonight"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "never",
+            "share",
+            "the",
+            "production",
+            "keys",
+            "and",
+            "do",
+            "not",
+            "disable",
+            "the",
+            "firewall",
+            "tonight"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-filler-01",
+      "category": "intentional-filler",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 8.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 4.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 3.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              4.0
+            ],
+            [
+              5.0,
+              8.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              4.0,
+              5.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "restart",
+            "router"
+          ],
+          "fillers": [
+            "um",
+            "uh",
+            "like"
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "restart",
+            "router"
+          ],
+          "fillers": [
+            "um",
+            "uh",
+            "like"
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "restart",
+            "router"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              4.0
+            ],
+            [
+              5.0,
+              8.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "um",
+            "so",
+            "like",
+            "i",
+            "said",
+            "uh",
+            "restart",
+            "the",
+            "router",
+            "already"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "um",
+            "so",
+            "like",
+            "i",
+            "said",
+            "uh",
+            "restart",
+            "the",
+            "router",
+            "already"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "um",
+            "so",
+            "like",
+            "i",
+            "said",
+            "uh",
+            "restart",
+            "the",
+            "router",
+            "already"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-short-01",
+      "category": "short-answers",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 4.1,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 0.8
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 0.4
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 0.6
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 0.4
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 0.5
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 0.4
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 1.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              0.8
+            ],
+            [
+              1.2,
+              1.8
+            ],
+            [
+              2.2,
+              2.7
+            ],
+            [
+              3.1,
+              4.1
+            ]
+          ],
+          "silence_regions": [
+            [
+              0.8,
+              1.2
+            ],
+            [
+              1.8,
+              2.2
+            ],
+            [
+              2.7,
+              3.1
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "yes",
+            "no",
+            "forty"
+          ],
+          "short_answers": [
+            [
+              "yes"
+            ],
+            [
+              "no"
+            ],
+            [
+              "b"
+            ],
+            [
+              "forty",
+              "two"
+            ]
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "yes",
+            "no",
+            "forty"
+          ],
+          "short_answers": [
+            [
+              "yes"
+            ],
+            [
+              "no"
+            ],
+            [
+              "b"
+            ],
+            [
+              "forty",
+              "two"
+            ]
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "yes",
+            "no",
+            "forty"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              0.8
+            ],
+            [
+              1.2,
+              1.8
+            ],
+            [
+              2.2,
+              2.7
+            ],
+            [
+              3.1,
+              4.1
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "yes",
+            "no",
+            "b",
+            "forty",
+            "two"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "yes",
+            "no",
+            "b",
+            "forty",
+            "two"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "yes",
+            "no",
+            "b",
+            "forty",
+            "two"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-long-01",
+      "category": "long-passage",
+      "languages": [
+        "en"
+      ],
+      "duration_seconds": 600.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 58.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 2.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              58.0
+            ],
+            [
+              60.0,
+              118.0
+            ],
+            [
+              120.0,
+              178.0
+            ],
+            [
+              180.0,
+              238.0
+            ],
+            [
+              240.0,
+              298.0
+            ],
+            [
+              300.0,
+              358.0
+            ],
+            [
+              360.0,
+              418.0
+            ],
+            [
+              420.0,
+              478.0
+            ],
+            [
+              480.0,
+              538.0
+            ],
+            [
+              540.0,
+              598.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              58.0,
+              60.0
+            ],
+            [
+              118.0,
+              120.0
+            ],
+            [
+              178.0,
+              180.0
+            ],
+            [
+              238.0,
+              240.0
+            ],
+            [
+              298.0,
+              300.0
+            ],
+            [
+              358.0,
+              360.0
+            ],
+            [
+              418.0,
+              420.0
+            ],
+            [
+              478.0,
+              480.0
+            ],
+            [
+              538.0,
+              540.0
+            ],
+            [
+              598.0,
+              600.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "latency",
+            "quantization",
+            "alignment",
+            "parakeet",
+            "benchmark",
+            "summary"
+          ],
+          "entities": [
+            "whisper",
+            "parakeet"
+          ],
+          "numeric_values": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5"
+          ],
+          "list_continuation": {
+            "prior_index": 0,
+            "markers": [
+              "1",
+              "2",
+              "3",
+              "4",
+              "5"
+            ]
+          }
+        },
+        "authored": {
+          "critical_tokens": [
+            "latency",
+            "quantization",
+            "alignment",
+            "parakeet",
+            "benchmark",
+            "summary"
+          ],
+          "list_continuation": {
+            "prior_index": 0,
+            "markers": [
+              "1",
+              "2",
+              "3",
+              "4",
+              "5"
+            ]
+          }
+        },
+        "delivered": {
+          "critical_tokens": [
+            "latency",
+            "quantization",
+            "alignment",
+            "parakeet",
+            "benchmark",
+            "summary"
+          ],
+          "final_phrases": [
+            [
+              "publish",
+              "the",
+              "summary"
+            ]
+          ],
+          "superseded_phrases": [
+            [
+              "draft",
+              "the",
+              "summary"
+            ]
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              58.0
+            ],
+            [
+              60.0,
+              118.0
+            ],
+            [
+              120.0,
+              178.0
+            ],
+            [
+              180.0,
+              238.0
+            ],
+            [
+              240.0,
+              298.0
+            ],
+            [
+              300.0,
+              358.0
+            ],
+            [
+              360.0,
+              418.0
+            ],
+            [
+              420.0,
+              478.0
+            ],
+            [
+              480.0,
+              538.0
+            ],
+            [
+              540.0,
+              598.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "quarterly",
+            "review",
+            "notes",
+            "1",
+            "review",
+            "the",
+            "latency",
+            "budget",
+            "2",
+            "check",
+            "the",
+            "quantization",
+            "report",
+            "checkpoint",
+            "saved",
+            "3",
+            "verify",
+            "the",
+            "whisper",
+            "alignment",
+            "4",
+            "rerun",
+            "the",
+            "parakeet",
+            "benchmark",
+            "checkpoint",
+            "saved",
+            "5",
+            "publish",
+            "the",
+            "summary"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "quarterly",
+            "review",
+            "notes",
+            "1",
+            "review",
+            "the",
+            "latency",
+            "budget",
+            "2",
+            "check",
+            "the",
+            "quantization",
+            "report",
+            "3",
+            "verify",
+            "the",
+            "whisper",
+            "alignment",
+            "4",
+            "rerun",
+            "the",
+            "parakeet",
+            "benchmark",
+            "5",
+            "publish",
+            "the",
+            "summary"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "quarterly",
+            "review",
+            "notes",
+            "1",
+            "review",
+            "the",
+            "latency",
+            "budget",
+            "2",
+            "check",
+            "the",
+            "quantization",
+            "report",
+            "3",
+            "verify",
+            "the",
+            "whisper",
+            "alignment",
+            "4",
+            "rerun",
+            "the",
+            "parakeet",
+            "benchmark",
+            "5",
+            "publish",
+            "the",
+            "summary"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    },
+    {
+      "id": "fx-multi-01",
+      "category": "multilingual-code-switching",
+      "languages": [
+        "de",
+        "en"
+      ],
+      "duration_seconds": 10.0,
+      "provenance": "synthetic",
+      "synthesis": {
+        "sample_rate": 16000,
+        "segments": [
+          {
+            "kind": "speech",
+            "duration_seconds": 5.0
+          },
+          {
+            "kind": "silence",
+            "duration_seconds": 1.0
+          },
+          {
+            "kind": "speech",
+            "duration_seconds": 4.0
+          }
+        ]
+      },
+      "expected": {
+        "capture": {
+          "speech_regions": [
+            [
+              0.0,
+              5.0
+            ],
+            [
+              6.0,
+              10.0
+            ]
+          ],
+          "silence_regions": [
+            [
+              5.0,
+              6.0
+            ]
+          ]
+        },
+        "asr": {
+          "critical_tokens": [
+            "server",
+            "läuft",
+            "ingress"
+          ],
+          "entities": [
+            "kubernetes",
+            "traefik"
+          ]
+        },
+        "authored": {
+          "critical_tokens": [
+            "server",
+            "läuft",
+            "ingress"
+          ],
+          "entities": [
+            "kubernetes",
+            "traefik"
+          ]
+        },
+        "delivered": {
+          "critical_tokens": [
+            "server",
+            "läuft",
+            "ingress"
+          ]
+        }
+      },
+      "reference_outputs": {
+        "capture": {
+          "segments": [
+            [
+              0.0,
+              5.0
+            ],
+            [
+              6.0,
+              10.0
+            ]
+          ]
+        },
+        "asr": {
+          "tokens": [
+            "der",
+            "server",
+            "läuft",
+            "auf",
+            "kubernetes",
+            "but",
+            "the",
+            "ingress",
+            "uses",
+            "traefik"
+          ]
+        },
+        "authored": {
+          "tokens": [
+            "der",
+            "server",
+            "läuft",
+            "auf",
+            "kubernetes",
+            "und",
+            "the",
+            "ingress",
+            "uses",
+            "traefik"
+          ]
+        },
+        "delivered": {
+          "tokens": [
+            "der",
+            "server",
+            "läuft",
+            "auf",
+            "kubernetes",
+            "und",
+            "the",
+            "ingress",
+            "uses",
+            "traefik"
+          ]
+        }
+      },
+      "stages": {
+        "capture_completeness": {
+          "min_speech_region_coverage": 0.99
+        },
+        "asr_content": {
+          "min_critical_token_recall": 1.0,
+          "min_entity_accuracy": 1.0,
+          "min_numeric_accuracy": 1.0
+        },
+        "authored_intent": {
+          "min_critical_token_recall": 1.0
+        },
+        "delivered_text": {
+          "min_critical_token_recall": 1.0,
+          "require_no_duplicates": true,
+          "require_fresh_revision": true
+        }
+      }
+    }
+  ]
+}

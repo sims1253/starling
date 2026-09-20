@@ -1,0 +1,272 @@
+{
+  "name": "Native legacy batch transcription (/transcribe and /inference)",
+  "route": "/transcribe",
+  "protocol": "starling-legacy",
+  "sources": [
+    "cpp/serve/main.cpp:566-738 (shared handler: payload selection, limits, error ladder)",
+    "cpp/serve/server.cpp:107-119,253-254 (success body and single segment)",
+    "tests/test_native_serve.py (transport contract and real-model round trips)",
+    "backends/native/tests/test_openai_api.py:test_legacy_route_remains_compatible",
+    "docs/native-serving.md#post-transcribe--post-inference"
+  ],
+  "cases": [
+    {
+      "name": "raw WAV upload succeeds and echoes the request id",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "application/octet-stream", "X-Request-Id": "e2e-roundtrip-1" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 2.5 }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "text": "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙",
+          "segments": [
+            {
+              "text": "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙",
+              "start_s": 0.0,
+              "end_s": 2.5
+            }
+          ],
+          "duration_s": 2.5,
+          "request_id": "e2e-roundtrip-1"
+        }
+      },
+      "note": "Fixture-engine transcript for the body shape; a real model returns its own raw recognition text. One segment spans the whole clip: start 0.0, end = audio duration. /inference takes the identical request and returns the identical shape."
+    },
+    {
+      "name": "multipart WAV upload (audio part)",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "multipart_file": {
+          "name": "audio",
+          "filename": "clip.wav",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.1 }
+        }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body_json": { "error": "model not loaded", "text": "", "request_id": "<generated>" }
+      },
+      "note": "On the placeholder (lazy, /dev/null GGUF) test server a well-formed upload parses and reaches inference, which fails 503 'model not loaded'; with a loaded model it returns the 200 shape above. A part named \"file\", any file part, or a filename-less audio/file field is equally accepted."
+    },
+    {
+      "name": "multipart upload on the /inference alias",
+      "request": {
+        "method": "POST",
+        "path": "/inference",
+        "multipart_file": {
+          "name": "audio",
+          "filename": "clip.wav",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.1 }
+        }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body_json": { "error": "model not loaded", "text": "", "request_id": "<generated>" }
+      },
+      "note": "/inference is an exact alias of /transcribe (same handler); on a loaded model it returns the 200 shape above."
+    },
+    {
+      "name": "raw PCM16 fallback",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "application/octet-stream" },
+        "body_audio": { "format": "pcm16le", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.1 }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body_json": { "error": "model not loaded", "text": "", "request_id": "<generated>" }
+      },
+      "note": "A payload without RIFF/WAVE magic is treated as raw mono PCM16 at 16 kHz little-endian; it passes decoding and reaches inference (503 on the placeholder server)."
+    },
+    {
+      "name": "empty body",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "body_text": ""
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": { "error": "empty request body" }
+      }
+    },
+    {
+      "name": "malformed WAV is not reinterpreted as PCM",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "application/octet-stream" },
+        "body_audio": {
+          "format": "wav",
+          "sample_rate_hz": 16000,
+          "note": "RF64 header whose ds64 sample count (0x100000000) exceeds the 8-byte data chunk"
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": { "error": "malformed audio payload", "text": "" }
+      },
+      "note": "A RIFF/RF64/RIFX+WAVE payload that fails WAV decoding (lying or truncated header) fails fast instead of falling through to raw PCM16."
+    },
+    {
+      "name": "wrong sample rate is rejected (no resampler)",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "application/octet-stream" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 8000, "channels": 1, "duration_s": 0.1 }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": { "error": "sample rate mismatch: expected 16000 got 8000" }
+      }
+    },
+    {
+      "name": "reserved request id prefix",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "#123" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": { "error": "invalid request id" }
+      },
+      "note": "'#' prefixes internal anonymous queue tickets; a client using one could collide with them."
+    },
+    {
+      "name": "duplicate active request id",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "dup-rid-1" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 409,
+        "content_type": "application/json",
+        "body_json": { "error": "request id already active", "text": "", "request_id": "dup-rid-1" }
+      },
+      "note": "Second of two concurrent requests with the same X-Request-Id; the first answers 200."
+    },
+    {
+      "name": "server busy when the waiter queue is full",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "barrage-1" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body_json": {
+          "error": "server busy",
+          "text": "",
+          "queue_depth": 0,
+          "request_id": "barrage-1"
+        }
+      },
+      "note": "Beyond 8 concurrent waiters (compile-time kMaxWaiters)."
+    },
+    {
+      "name": "cancelled request",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "cancel-victim" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 499,
+        "content_type": "application/json",
+        "body_json": { "error": "cancelled", "text": "", "request_id": "cancel-victim" }
+      },
+      "note": "Response to a queued request cancelled via DELETE /inference/cancel-victim."
+    },
+    {
+      "name": "queued request outlives the request timeout",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "timeout-victim" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 504,
+        "content_type": "application/json",
+        "body_json": { "error": "request timed out", "text": "", "request_id": "timeout-victim" }
+      },
+      "note": "Only while parked in the queue (--request-timeout-seconds, default 600, 0 = never)."
+    },
+    {
+      "name": "model not loaded",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "X-Request-Id": "lazy-1" },
+        "body_audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+      },
+      "response": {
+        "status": 503,
+        "content_type": "application/json",
+        "body_json": { "error": "model not loaded", "text": "", "request_id": "lazy-1" }
+      },
+      "note": "Lazy load failed (e.g. placeholder GGUF); structured JSON, not a crash or dead socket."
+    },
+    {
+      "name": "oversize upload rejected by the HTTP parser",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "audio/wav" },
+        "body_audio": {
+          "format": "wav",
+          "sample_rate_hz": 16000,
+          "channels": 1,
+          "bytes": 268435457,
+          "note": "above the 256 MiB payload cap"
+        }
+      },
+      "response": {
+        "status": 413,
+        "body_non_json": true,
+        "note": "The underlying HTTP parser answers with its own body; clients must tolerate non-JSON errors."
+      }
+    },
+    {
+      "name": "oversize payload seen by the handler",
+      "request": {
+        "method": "POST",
+        "path": "/transcribe",
+        "headers": { "Content-Type": "audio/wav" },
+        "body_audio": {
+          "format": "wav",
+          "sample_rate_hz": 16000,
+          "channels": 1,
+          "bytes": 268435457
+        }
+      },
+      "response": {
+        "status": 413,
+        "content_type": "application/json",
+        "body_json": { "error": "request body too large" }
+      },
+      "note": "Defense-in-depth branch when an oversized payload reaches the handler itself."
+    }
+  ]
+}

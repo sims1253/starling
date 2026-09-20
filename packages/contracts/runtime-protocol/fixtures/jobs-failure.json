@@ -1,0 +1,84 @@
+{
+  "machine": "jobs",
+  "description": "Failure and transform paths: job-4 runs the optional Transforming stage before Completed; job-5 is demoted to Failed{retryable} by a worker crash from Loading without touching capture or history.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_110",
+      "ts": "2026-09-20T10:05:00Z",
+      "corr": "job-4",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_77", "route": "local-default", "budget": "thorough" }
+    },
+    {
+      "v": 1,
+      "id": "evt_110",
+      "ts": "2026-09-20T10:05:00Z",
+      "corr": "job-4",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    { "$advance": "Dispatched" },
+    { "$advance": "Loading" },
+    { "$advance": "Recognizing" },
+    { "$advance": "Transforming" },
+    {
+      "v": 1,
+      "id": "evt_111",
+      "ts": "2026-09-20T10:05:08Z",
+      "corr": "job-4",
+      "seq": 3,
+      "type": "jobs.progress",
+      "payload": { "partial": "Hello world.", "stabilityHint": "stable" }
+    },
+    {
+      "v": 1,
+      "id": "evt_112",
+      "ts": "2026-09-20T10:05:10Z",
+      "corr": "job-4",
+      "seq": 4,
+      "type": "jobs.completed",
+      "payload": {
+        "attemptId": "att-2",
+        "text": "Hello, world.",
+        "backend": "local-parakeet-tdt",
+        "timing": 1030.0,
+        "completionEvidence": "final_decode"
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_111",
+      "ts": "2026-09-20T10:05:15Z",
+      "corr": "job-5",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": { "captureRef": "take_78", "route": "local-default", "budget": "standard" }
+    },
+    {
+      "v": 1,
+      "id": "evt_113",
+      "ts": "2026-09-20T10:05:15Z",
+      "corr": "job-5",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    { "$advance": "Dispatched" },
+    { "$advance": "Loading" },
+    {
+      "v": 1,
+      "id": "evt_114",
+      "ts": "2026-09-20T10:05:18Z",
+      "corr": "job-5",
+      "seq": 3,
+      "type": "jobs.failed",
+      "payload": { "reason": "worker_crash", "retryable": true }
+    }
+  ]
+}

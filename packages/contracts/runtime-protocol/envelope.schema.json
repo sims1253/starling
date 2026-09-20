@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:runtime-protocol:envelope:v1",
+  "$comment": [
+    "Starling runtime protocol envelope, v1 (E17 design note section 2).",
+    "This is the single wire shape shared by every command and event of the",
+    "five runtime state machines (capture, jobs, context/mode, docs, delivery).",
+    "commands.schema.json and events.schema.json refine this envelope per",
+    "message type; this schema is the structural baseline every message must",
+    "satisfy first.",
+    "Versioning: v identifies the payload grammar. v=1 is the grammar defined",
+    "by commands.schema.json / events.schema.json. A receiver that cannot",
+    "parse v MUST NOT apply the payload; it replies with the event",
+    "runtime.nack {reason: \"unsupported_version\"} carrying corr = the id of",
+    "the rejected message, and otherwise ignores the message. For a v1 schema",
+    "validator any v != 1 is therefore a validation failure.",
+    "Ordering: seq is per-stream monotonic (strictly increasing). A stream is",
+    "the correlation channel named by corr; messages without corr belong to",
+    "the direction stream of the connection (\"commands\" for commands,",
+    "\"events\" for events). A receiver must reject a message whose seq is not",
+    "greater than the last seq seen on its stream: duplicates and reordering",
+    "are failures to be surfaced, not silently absorbed.",
+    "Correlation: corr names the stream a message belongs to (for example the",
+    "take id across a capture start/stop pair). A command that expects an",
+    "outcome event and the event that resolves it must carry the same corr.",
+    "payload is required on every message; commands/events with no fields",
+    "carry an empty object."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "v": { "$ref": "#/$defs/version" },
+    "id": { "$ref": "#/$defs/msgId" },
+    "ts": { "$ref": "#/$defs/timestamp" },
+    "corr": { "$ref": "#/$defs/msgId" },
+    "seq": { "$ref": "#/$defs/seq" },
+    "type": { "$ref": "#/$defs/typeName" },
+    "payload": { "type": "object" }
+  },
+  "required": ["v", "id", "ts", "type", "payload"],
+  "$defs": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "msgId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "typeName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+    },
+    "safeToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:+-]{1,128}$"
+    }
+  }
+}

@@ -81,6 +81,7 @@ class FakeStream extends StreamingDictation {
   override async finish(
     _durationMs?: number,
     isCancelled?: () => boolean,
+    onDurableSave?: (session: DictationSession) => void,
   ): Promise<StreamingDictationResult> {
     if (this.pending) {
       const settled = await this.pending.promise;
@@ -88,7 +89,19 @@ class FakeStream extends StreamingDictation {
       // Mirrors StreamingDictation.finish: a take cancelled while the
       // journal drained skips the commit and hands the provisional row
       // back for deletion.
-      return isCancelled?.() ? { ...settled, streamed: false } : settled;
+      if (isCancelled?.()) return { ...settled, streamed: false };
+
+      if (settled.session !== undefined) onDurableSave?.(settled.session);
+
+      return settled;
+    }
+
+    // Mirrors StreamingDictation.finish's controller probe after the
+    // capture layer's own, then the durable report on the live path.
+    if (isCancelled?.()) return { ...this.finishResult, streamed: false };
+
+    if (this.finishResult.session !== undefined) {
+      onDurableSave?.(this.finishResult.session);
     }
 
     return this.finishResult;
@@ -138,7 +151,7 @@ class SilentCapture {
 }
 
 class FakeStore {
-  saved: Array<{ id: string; streamed?: boolean }> = [];
+  saved: Array<{ id: string; streamed?: boolean; protocol?: string }> = [];
   noted: Array<{ id: string; message: string }> = [];
   deleted: string[] = [];
   selected: string[] = [];
@@ -148,9 +161,9 @@ class FakeStore {
   async saveTranscript(
     id: string,
     value: TranscriptionResult,
-    options?: { streamed?: boolean },
+    options?: { streamed?: boolean; protocol?: string },
   ): Promise<DictationSession> {
-    this.saved.push({ id, streamed: options?.streamed });
+    this.saved.push({ id, streamed: options?.streamed, protocol: options?.protocol });
 
     const current = this.sessions.get(id) ?? session(id);
 
@@ -209,6 +222,19 @@ function handlersFor(
   };
 }
 
+/** Keeps a promise pending until open(), like a slow transcription backend. */
+function gate() {
+  let open: () => void = () => {};
+
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+
+  return { promise, open };
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 describe("finishStreamingTake", () => {
   it("abandons an empty journal and falls back to the batch path", async () => {
     const stream = new FakeStream();
@@ -247,7 +273,7 @@ describe("finishStreamingTake", () => {
     expect(result.streamed).toBe(true);
     expect(result.session?.id).toBe("take-one");
     expect(result.batchFallback).toBe(false);
-    expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
+    expect(store.saved).toEqual([{ id: "take-one", streamed: true, protocol: "starling" }]);
     expect(store.deleted).toEqual([]);
   });
 
@@ -263,18 +289,18 @@ describe("finishStreamingTake", () => {
       transcript,
     });
 
-    // Current through the pre-save probes (calls 1–2), stale at the
-    // post-save probe (call 3): the completed row is this finalize's to
-    // remove, and the dropped take must not be surfaced.
+    // Current through the controller probe and the pre-save probes (calls
+    // 1–3), stale at the post-save probe (call 4): the completed row is
+    // this finalize's to remove, and the dropped take must not be surfaced.
     let probes = 0;
 
     const result = await finishStreamingTake(
-      handlersFor(stream, store, () => ++probes < 3),
+      handlersFor(stream, store, () => ++probes < 4),
       store,
     );
 
     expect(result.discarded).toBe(true);
-    expect(store.saved).toEqual([{ id: "take-one", streamed: true }]);
+    expect(store.saved).toEqual([{ id: "take-one", streamed: true, protocol: "starling" }]);
     expect(store.deleted).toEqual(["take-one"]);
     expect(store.selected).toEqual([]);
   });
@@ -404,13 +430,13 @@ describe("finishStreamingTake", () => {
       streamNote: "socket closed",
     });
 
-    // Current through the pre-transcribe probes (calls 1–3), stale at the
-    // post-transcribe probe (call 4): the transcription completed, but the
-    // row is this finalize's to remove.
+    // Current through the controller probe and the pre-transcribe probes
+    // (calls 1–4), stale at the post-transcribe probe (call 5): the
+    // transcription completed, but the row is this finalize's to remove.
     let probes = 0;
 
     const result = await finishStreamingTake(
-      handlersFor(stream, store, () => ++probes < 4),
+      handlersFor(stream, store, () => ++probes < 5),
       store,
     );
 
@@ -440,6 +466,172 @@ describe("finishStreamingTake", () => {
     expect(result.discarded).toBeUndefined();
     expect(store.noted).toEqual([{ id: "take-one", message: "socket closed" }]);
     expect(store.transcribed).toEqual(["take-one"]);
+    expect(store.deleted).toEqual([]);
+  });
+
+  it("releases the capture lifecycle at the durable save, before the transcription runs (B03)", async () => {
+    // The B03 acceptance shape: a deliberately delayed transcription
+    // response. The release fires once the journal is durably owned by its
+    // session, while the transcript work is still pending — a new take may
+    // start here.
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 1;
+    stream.finishResult = Object.freeze({
+      wav,
+      durationMs: 500,
+      session: session(),
+      streamed: false,
+    });
+
+    const transcribing = gate();
+    const released: number[] = [];
+    const handlers = handlersFor(stream, store, () => true);
+
+    const finalizing = finishStreamingTake(
+      {
+        ...handlers,
+        transcribe: () =>
+          transcribing.promise.then(() => {
+            store.transcribed.push("take-one");
+          }),
+        onDurableSave: () => released.push(released.length),
+      },
+      store,
+    );
+
+    await flush();
+
+    expect(released.length).toBe(1);
+    expect(store.transcribed).toEqual([]);
+
+    let settled = false;
+
+    void finalizing.then(() => {
+      settled = true;
+    });
+
+    await flush();
+    expect(settled).toBe(false);
+
+    transcribing.open();
+    const result = await finalizing;
+
+    expect(result.batchFallback).toBe(false);
+    expect(released.length).toBe(1);
+    expect(store.transcribed).toEqual(["take-one"]);
+  });
+
+  it("does not release the capture lifecycle for a discarded take", async () => {
+    // The #160 protection: a close-guard Discard that lands mid-finalize
+    // settles the take without it; the release belongs to the durable save
+    // that never happened (#160 + B03).
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 1;
+
+    const gateKeeper = stream.blockFinish();
+    const released: number[] = [];
+
+    const finalizing = finishStreamingTake(
+      {
+        ...handlersFor(stream, store, () => false),
+        onDurableSave: () => released.push(released.length),
+      },
+      store,
+    );
+
+    gateKeeper.resolve(
+      Object.freeze({ wav, durationMs: 500, session: session(), streamed: false }),
+    );
+
+    const result = await finalizing;
+
+    expect(result.discarded).toBe(true);
+    expect(released).toEqual([]);
+    expect(store.deleted).toEqual(["take-one"]);
+  });
+
+  it("attaches late transcripts only to their originating takes, in any order (B03)", async () => {
+    // Two takes finalizing against one store while a slow backend answers
+    // the second first: each transcript lands on the session that recorded
+    // it, and each take's release fired exactly once, at its own save.
+    const store = new FakeStore();
+
+    const streamOne = new FakeStream();
+    streamOne.journaled = 1;
+
+    const streamTwo = new FakeStream();
+    streamTwo.journaled = 1;
+
+    // Both journals are still draining; neither take is durable yet.
+    const gateOne = streamOne.blockFinish();
+    const gateTwo = streamTwo.blockFinish();
+
+    const released: string[] = [];
+
+    const finalizeOne = finishStreamingTake(
+      {
+        ...handlersFor(streamOne, store, () => true),
+        onDurableSave: () => released.push("take-one"),
+      },
+      store,
+    );
+
+    const finalizeTwo = finishStreamingTake(
+      {
+        ...handlersFor(streamTwo, store, () => true),
+        onDurableSave: () => released.push("take-two"),
+      },
+      store,
+    );
+
+    await flush();
+
+    expect(released).toEqual([]);
+
+    // The second take's backend responds first: its journal commits, its
+    // release fires, its transcript saves — while the first take is still
+    // waiting for its own response.
+    gateTwo.resolve(
+      Object.freeze({
+        wav,
+        durationMs: 500,
+        session: session("take-two"),
+        streamed: true,
+        transcript,
+      }),
+    );
+
+    const resultTwo = await finalizeTwo;
+
+    expect(released).toEqual(["take-two"]);
+
+    let oneSettled = false;
+
+    void finalizeOne.then(() => {
+      oneSettled = true;
+    });
+
+    await flush();
+    expect(oneSettled).toBe(false);
+
+    gateOne.resolve(
+      Object.freeze({
+        wav,
+        durationMs: 500,
+        session: session("take-one"),
+        streamed: true,
+        transcript,
+      }),
+    );
+
+    const resultOne = await finalizeOne;
+
+    expect(resultOne.session?.id).toBe("take-one");
+    expect(resultTwo.session?.id).toBe("take-two");
+    expect(released).toEqual(["take-two", "take-one"]);
+    expect(store.saved.map((saved) => saved.id)).toEqual(["take-two", "take-one"]);
     expect(store.deleted).toEqual([]);
   });
 });

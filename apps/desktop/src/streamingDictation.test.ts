@@ -17,9 +17,12 @@ class FakeTransport implements StreamingTransport {
   commitFailure: Error | undefined;
   /** Keeps open() pending until releaseOpen(), like a real handshake. */
   blockOpen = false;
+  /** Keeps commit() pending until releaseCommit(), like a slow backend. */
+  blockCommit = false;
   private listeners = new Set<(event: StarlingStreamEvent) => void>();
   private open_ = false;
   private release?: () => void;
+  private releaseCommitGate?: () => void;
 
   get isOpen(): boolean {
     return this.open_;
@@ -50,7 +53,16 @@ class FakeTransport implements StreamingTransport {
 
     if (this.commitFailure) throw this.commitFailure;
 
+    if (this.blockCommit) {
+      await new Promise<void>((resolve) => (this.releaseCommitGate = resolve));
+    }
+
     return this.commitResult;
+  }
+
+  releaseCommit(): void {
+    this.releaseCommitGate?.();
+    this.releaseCommitGate = undefined;
   }
 
   close(): void {
@@ -442,5 +454,73 @@ describe("StreamingDictation", () => {
     expect(result.streamed).toBe(true);
     expect(result.session).toBeTruthy();
     expect(transport.commits).toBe(1);
+  });
+
+  it("reports the durable save before a slow commit resolves (B03)", async () => {
+    // The B03 acceptance shape: the transcription backend stalls, but the
+    // journal is already durably owned by its session — the caller can end
+    // the capture transition and start a new take while this commit runs.
+    const transport = new FakeTransport();
+    transport.blockCommit = true;
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    await drained();
+
+    const durable: string[] = [];
+
+    const finishing = controller.finish(
+      500,
+      () => false,
+      (session) => durable.push(session.id),
+    );
+
+    await drained();
+
+    expect(durable).toEqual(["streamed-take"]);
+    expect(transport.commits).toBe(1);
+
+    // The transcript work is still in flight; the durable report preceded it.
+    let settled = false;
+
+    void finishing.then(() => {
+      settled = true;
+    });
+
+    await drained();
+    expect(settled).toBe(false);
+
+    transport.releaseCommit();
+
+    const result = await finishing;
+
+    expect(result.streamed).toBe(true);
+    expect(result.transcript?.text).toBe("stream final");
+  });
+
+  it("does not report a durable save for a take cancelled while draining", async () => {
+    // A close-guard Discard wins the race (#160): the release must not fire
+    // for a take whose journal was dropped instead of saved.
+    const transport = new FakeTransport();
+    const capture = new FakeCapture();
+    const controller = new StreamingDictation(transport, capture);
+
+    await controller.connect();
+    controller.onChunk(frame(4));
+    await drained();
+
+    const durable: string[] = [];
+
+    const result = await controller.finish(
+      500,
+      () => true,
+      (session) => durable.push(session.id),
+    );
+
+    expect(durable).toEqual([]);
+    expect(result.session).toBeUndefined();
+    expect(transport.commits).toBe(0);
   });
 });

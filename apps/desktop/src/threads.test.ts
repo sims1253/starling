@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import type { DictationSession } from "@starling/dictation";
-import { activeThreadId, newThreadId, threadContext, threadTurns } from "./threads";
+import { activeThreadId, newThreadId, threadContextBase, threadTurns } from "./threads";
 
 interface Fixture {
   readonly id: string;
@@ -9,6 +9,7 @@ interface Fixture {
   readonly updatedAt?: string;
   readonly threadId?: string;
   readonly refinedText?: string;
+  readonly threadJoinedAt?: number;
 }
 
 /**
@@ -25,6 +26,7 @@ interface FixtureDraft {
   attemptCount: number;
   transcript: { text: string; segments: [] };
   threadId?: string;
+  threadJoinedAt?: number;
   refined?: { text: string; model: string; createdAt: number };
 }
 
@@ -41,6 +43,8 @@ function take(fields: Fixture): DictationSession {
   };
 
   if (fields.threadId !== undefined) session.threadId = fields.threadId;
+
+  if (fields.threadJoinedAt !== undefined) session.threadJoinedAt = fields.threadJoinedAt;
 
   if (fields.refinedText !== undefined) {
     session.refined = { text: fields.refinedText, model: "llama3.1", createdAt: 1 };
@@ -181,9 +185,143 @@ describe("threadTurns", () => {
 
     expect(sessions.map((session) => session.id)).toEqual(["later", "earlier"]);
   });
+
+  it("reads a thread in append order, so an older take that joins later appends last (B11)", () => {
+    // B recorded at 10:00 opened the thread; C (08:00) and A (09:00) are both
+    // older recordings that joined afterwards, C first. The reading order is
+    // the order takes were appended, not the order they were recorded.
+    const sessions = [
+      take({
+        id: "a",
+        createdAt: "2025-09-01T09:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 300,
+      }),
+      take({
+        id: "b",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 100,
+      }),
+      take({
+        id: "c",
+        createdAt: "2025-09-01T08:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 200,
+      }),
+    ];
+
+    expect(threadTurns(sessions, "t1").map((turn) => turn.id)).toEqual(["b", "c", "a"]);
+    expect(threadTurns([...sessions].reverse(), "t1").map((turn) => turn.id)).toEqual([
+      "b",
+      "c",
+      "a",
+    ]);
+  });
+
+  it("keeps createdAt order for members persisted before the append sequence existed", () => {
+    // Legacy members carry no threadJoinedAt: they joined before the field
+    // existed, so they sort before every stamped join and keep their old
+    // createdAt order among themselves.
+    const sessions = [
+      take({
+        id: "stamped",
+        createdAt: "2025-09-01T11:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 1,
+      }),
+      take({ id: "legacy-new", createdAt: "2025-09-01T10:00:00.000Z", threadId: "t1" }),
+      take({ id: "legacy-old", createdAt: "2025-09-01T09:00:00.000Z", threadId: "t1" }),
+    ];
+
+    expect(threadTurns(sessions, "t1").map((turn) => turn.id)).toEqual([
+      "legacy-old",
+      "legacy-new",
+      "stamped",
+    ]);
+  });
+
+  it("reads a fully-legacy thread in exactly the old createdAt order (R14)", () => {
+    // A thread where NO member has a stamp — every join predates the append
+    // sequence — must keep the reading order such a thread always had:
+    // createdAt then id. The true join sequence is unrecoverable, and the
+    // old order is what the user last saw, so a fully-legacy thread must not
+    // reorder on upgrade. Here the 09:00 recording joined the thread LAST
+    // (after the 10:00 and 11:00 takes) yet still reads first — the pre-B11
+    // behavior existing data was sorted by.
+    const sessions = [
+      take({
+        id: "last-join",
+        createdAt: "2025-09-01T09:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "middle",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "head",
+        createdAt: "2025-09-01T11:00:00.000Z",
+        threadId: "t1",
+      }),
+    ];
+
+    const ids = threadTurns(sessions, "t1").map((turn) => turn.id);
+
+    expect(ids).toEqual(["last-join", "middle", "head"]);
+    expect(threadTurns([...sessions].reverse(), "t1").map((turn) => turn.id)).toEqual(ids);
+  });
+
+  it("keeps stamp-first semantics once any member carries a stamp (R14)", () => {
+    // The same legacy members plus one stamped join: the mixed thread is
+    // where the append sequence takes over. The legacy members all predate
+    // the sequence, so they read first in createdAt order — including one
+    // whose recording is older than the stamped join's — and the stamped
+    // member reads as the latest append whatever its recording age.
+    const sessions = [
+      take({
+        id: "stamped-join",
+        createdAt: "2025-09-01T08:00:00.000Z",
+        threadId: "t1",
+        threadJoinedAt: 900,
+      }),
+      take({
+        id: "legacy-newer",
+        createdAt: "2025-09-01T11:00:00.000Z",
+        threadId: "t1",
+      }),
+      take({
+        id: "legacy-older",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+      }),
+    ];
+
+    expect(threadTurns(sessions, "t1").map((turn) => turn.id)).toEqual([
+      "legacy-older",
+      "legacy-newer",
+      "stamped-join",
+    ]);
+  });
+
+  it("breaks equal append stamps deterministically without depending on input order", () => {
+    // Two windows can append within the same millisecond; the tiebreak is
+    // createdAt, then id — the same keys the legacy order uses.
+    const tied = [
+      take({ id: "n", createdAt: "2025-09-01T10:00:00.000Z", threadId: "t1", threadJoinedAt: 50 }),
+      take({ id: "m", createdAt: "2025-09-01T09:00:00.000Z", threadId: "t1", threadJoinedAt: 50 }),
+      take({ id: "o", createdAt: "2025-09-01T11:00:00.000Z", threadId: "t1", threadJoinedAt: 40 }),
+    ];
+
+    const ids = threadTurns(tied, "t1").map((turn) => turn.id);
+
+    expect(ids).toEqual(["o", "m", "n"]);
+    expect(threadTurns([...tied].reverse(), "t1").map((turn) => turn.id)).toEqual(ids);
+  });
 });
 
-describe("threadContext", () => {
+describe("threadContextBase", () => {
   const sessions = [
     take({
       id: "turn-1",
@@ -207,23 +345,23 @@ describe("threadContext", () => {
     }),
   ];
 
-  it("returns the nearest earlier refined text in the thread", () => {
-    expect(threadContext(sessions, "t1", "turn-4")).toBe("Turn three, refined.");
-    expect(threadContext(sessions, "t1", "turn-3")).toBe("Turn one, refined.");
-    expect(threadContext(sessions, "t1", "turn-2")).toBe("Turn one, refined.");
+  it("returns the nearest earlier refined member, whose text is the context", () => {
+    expect(threadContextBase(sessions, "t1", "turn-4")?.refined?.text).toBe("Turn three, refined.");
+    expect(threadContextBase(sessions, "t1", "turn-3")?.refined?.text).toBe("Turn one, refined.");
+    expect(threadContextBase(sessions, "t1", "turn-2")?.refined?.text).toBe("Turn one, refined.");
   });
 
   it("is undefined for the thread head or when nobody refined yet", () => {
-    expect(threadContext(sessions, "t1", "turn-1")).toBeUndefined();
+    expect(threadContextBase(sessions, "t1", "turn-1")).toBeUndefined();
 
     const unrefined = [
       take({ id: "u1", createdAt: "2025-09-01T10:00:00.000Z", threadId: "t1" }),
       take({ id: "u2", createdAt: "2025-09-01T10:01:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(unrefined, "t1", "u2")).toBeUndefined();
-    expect(threadContext([], "t1", "u2")).toBeUndefined();
-    expect(threadContext(sessions, "missing", "turn-4")).toBeUndefined();
+    expect(threadContextBase(unrefined, "t1", "u2")).toBeUndefined();
+    expect(threadContextBase([], "t1", "u2")).toBeUndefined();
+    expect(threadContextBase(sessions, "missing", "turn-4")).toBeUndefined();
   });
 
   it("skips unrefined members instead of stopping at them", () => {
@@ -240,7 +378,7 @@ describe("threadContext", () => {
     ];
 
     // m3 never refined; the context for m4 reaches back to m1.
-    expect(threadContext(mixed, "t1", "m4")).toBe("Oldest refined.");
+    expect(threadContextBase(mixed, "t1", "m4")?.refined?.text).toBe("Oldest refined.");
   });
 
   it("skips whitespace-only refined text instead of treating it as context", () => {
@@ -264,7 +402,7 @@ describe("threadContext", () => {
       take({ id: "w3", createdAt: "2025-09-01T10:02:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(blank, "t1", "w3")).toBe("Real text.");
+    expect(threadContextBase(blank, "t1", "w3")?.refined?.text).toBe("Real text.");
 
     const onlyBlank = [
       take({
@@ -276,19 +414,101 @@ describe("threadContext", () => {
       take({ id: "b2", createdAt: "2025-09-01T10:01:00.000Z", threadId: "t1" }),
     ];
 
-    expect(threadContext(onlyBlank, "t1", "b2")).toBeUndefined();
+    expect(threadContextBase(onlyBlank, "t1", "b2")).toBeUndefined();
   });
 
   it("ignores refined takes that are not members of the thread", () => {
-    expect(threadContext(sessions, "t1", "turn-3")).not.toBe("A different thread entirely.");
+    expect(threadContextBase(sessions, "t1", "turn-3")?.refined?.text).not.toBe(
+      "A different thread entirely.",
+    );
 
     // A take outside the thread must never supply or block context.
-    expect(threadContext(sessions, "t2", "other-thread")).toBeUndefined();
+    expect(threadContextBase(sessions, "t2", "other-thread")).toBeUndefined();
   });
 
   it("treats every member as earlier when the boundary take is not yet a member", () => {
     // The join case: context is computed for an unthreaded take right before
     // its assignment lands, so its id is absent from the member list.
-    expect(threadContext(sessions, "t1", "about-to-join")).toBe("Turn three, refined.");
+    expect(threadContextBase(sessions, "t1", "about-to-join")?.refined?.text).toBe(
+      "Turn three, refined.",
+    );
+  });
+
+  it("keeps an appended older take's base stable from join through retry (B11)", () => {
+    // A recorded at 09:00, unthreaded. B recorded at 10:00 and is the refined
+    // head of thread t1 (appended at 100).
+    const head = take({
+      id: "b",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      threadId: "t1",
+      refinedText: "B, refined.",
+      threadJoinedAt: 100,
+    });
+
+    const older = take({ id: "a", createdAt: "2025-09-01T09:00:00.000Z" });
+
+    // First press: the context is computed before the assignment lands, so
+    // the joining take counts every member as earlier and picks B.
+    expect(threadContextBase([head, older], "t1", "a")?.id).toBe("b");
+    expect(threadContextBase([head, older], "t1", "a")?.refined?.text).toBe("B, refined.");
+
+    // The assignment stamps the append sequence (A appended at 200). A retry
+    // — after a failure, a cancel, or a reload — computes the same base: A is
+    // the thread's latest append, so B is still its nearest predecessor.
+    const joined = take({
+      id: "a",
+      createdAt: "2025-09-01T09:00:00.000Z",
+      threadId: "t1",
+      threadJoinedAt: 200,
+    });
+
+    expect(threadContextBase([head, joined], "t1", "a")?.id).toBe("b");
+    expect(threadContextBase([head, joined], "t1", "a")?.refined?.text).toBe("B, refined.");
+
+    // A's completed edit is now the thread's current document: the next turn
+    // appended after it (C, at 300) includes that edit, not the stale head.
+    const appended = {
+      ...joined,
+      refined: { text: "A, refined.", model: "llama3.1", createdAt: 1 },
+    };
+
+    const next = take({ id: "c", createdAt: "2025-09-01T11:00:00.000Z" });
+
+    expect(threadContextBase([head, appended, next], "t1", "c")?.id).toBe("a");
+    expect(threadContextBase([head, appended, next], "t1", "c")?.refined?.text).toBe("A, refined.");
+
+    // Deletion of the appended member falls back to the previous refined
+    // member instead of inventing a base.
+    expect(threadContextBase([head, next], "t1", "c")?.id).toBe("b");
+    expect(threadContextBase([head, next], "t1", "c")?.refined?.text).toBe("B, refined.");
+  });
+
+  it("returns the member whose refined text is the base, so the base identity is capturable", () => {
+    const identity = [
+      take({
+        id: "head",
+        createdAt: "2025-09-01T10:00:00.000Z",
+        threadId: "t1",
+        refinedText: "Head, refined.",
+        threadJoinedAt: 100,
+      }),
+      take({
+        id: "appended",
+        createdAt: "2025-09-01T09:00:00.000Z",
+        threadId: "t1",
+        refinedText: "Appended, refined.",
+        threadJoinedAt: 200,
+      }),
+    ];
+
+    // The appended take — recorded earlier, joined later — refines against
+    // the head; the next member refines against the appended take.
+    expect(threadContextBase(identity, "t1", "appended")?.id).toBe("head");
+    expect(threadContextBase(identity, "t1", "appended")?.refined?.text).toBe("Head, refined.");
+    expect(threadContextBase(identity, "t1", "unjoined")?.id).toBe("appended");
+
+    // No refined predecessor, or no thread: no base to capture.
+    expect(threadContextBase(identity, "t1", "head")).toBeUndefined();
+    expect(threadContextBase([], "t1", "head")).toBeUndefined();
   });
 });

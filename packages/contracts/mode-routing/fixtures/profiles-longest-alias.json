@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "default_profile": "faithful",
+  "profiles": [
+    {
+      "id": "faithful",
+      "version": 1,
+      "name": "Faithful dictation",
+      "description": "Light punctuation and clear self-correction; preserve meaning, numbering, negations and intentional words.",
+      "intent": "dictate",
+      "behavior": "faithful",
+      "prompt_file": "prompts/faithful.md",
+      "aliases": [],
+      "allow_spoken_overrides": true,
+      "vocabulary": [
+        "never",
+        "verbatim"
+      ],
+      "snippets": [
+        {
+          "spoken": "new paragraph",
+          "expansion": "\n\n"
+        }
+      ],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-default",
+      "local_only": true,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "delivery": "insert",
+      "automatic_delivery": true
+    },
+    {
+      "id": "verbatim",
+      "version": 1,
+      "name": "Verbatim notes",
+      "description": "Literal escape and notes-app default: no LLM cleanup, raw recognition text returned as-is.",
+      "intent": "dictate",
+      "behavior": "verbatim",
+      "prompt_file": null,
+      "aliases": [],
+      "allow_spoken_overrides": false,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": null,
+      "local_only": true,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "delivery": "insert",
+      "automatic_delivery": true
+    },
+    {
+      "id": "code-guidance",
+      "version": 1,
+      "name": "Code guidance",
+      "description": "Turn speech into precise instructions for a coding agent; preserve constraints and identifiers, never invent requirements or execute anything.",
+      "intent": "dictate",
+      "behavior": "code_guidance",
+      "prompt_file": "prompts/code-guidance.md",
+      "aliases": [
+        "code this"
+      ],
+      "allow_spoken_overrides": true,
+      "vocabulary": [
+        "Enter",
+        "auth",
+        "idempotency",
+        "UTF-8",
+        "snake_case"
+      ],
+      "snippets": [
+        {
+          "spoken": "snake case",
+          "expansion": "snake_case"
+        }
+      ],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-default",
+      "local_only": true,
+      "selected_text": "reference",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 8000,
+      "delivery": "insert",
+      "automatic_delivery": true
+    },
+    {
+      "id": "edit-selection",
+      "version": 1,
+      "name": "Edit selection",
+      "description": "Apply the spoken edit to the captured selected text against the frozen edit target.",
+      "intent": "edit",
+      "behavior": "edit_selection",
+      "prompt_file": "prompts/edit-selection.md",
+      "aliases": [
+        "edit this"
+      ],
+      "allow_spoken_overrides": true,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-default",
+      "local_only": true,
+      "selected_text": "edit_target",
+      "selection_required": true,
+      "clipboard": false,
+      "max_context_characters": 8000,
+      "delivery": "replace_selection",
+      "automatic_delivery": true
+    },
+    {
+      "id": "ask-selection",
+      "version": 1,
+      "name": "Ask selection",
+      "description": "Answer questions about the captured selection without modifying it.",
+      "intent": "ask",
+      "behavior": "ask_selection",
+      "prompt_file": "prompts/ask-selection.md",
+      "aliases": [
+        "code this carefully"
+      ],
+      "allow_spoken_overrides": true,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-default",
+      "local_only": true,
+      "selected_text": "reference",
+      "selection_required": true,
+      "clipboard": false,
+      "max_context_characters": 8000,
+      "delivery": "preview",
+      "automatic_delivery": false
+    },
+    {
+      "id": "capture",
+      "version": 1,
+      "name": "Capture note",
+      "description": "Keep a named durable note without touching the foreground editor.",
+      "intent": "capture",
+      "behavior": "capture",
+      "prompt_file": "prompts/capture.md",
+      "aliases": [
+        "save note"
+      ],
+      "allow_spoken_overrides": true,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-default",
+      "local_only": true,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "delivery": "save_note",
+      "automatic_delivery": true
+    }
+  ],
+  "rules": [
+    {
+      "id": "vscode-guidance",
+      "profile_id": "code-guidance",
+      "priority": 20,
+      "app_id": "vscode"
+    },
+    {
+      "id": "notes-verbatim",
+      "profile_id": "verbatim",
+      "priority": 20,
+      "app_id": "notes"
+    },
+    {
+      "id": "github-guidance",
+      "profile_id": "code-guidance",
+      "priority": 10,
+      "site": "github.com"
+    }
+  ]
+}

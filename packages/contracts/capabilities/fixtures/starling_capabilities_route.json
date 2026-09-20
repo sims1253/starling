@@ -1,0 +1,38 @@
+{
+  "name": "Starling capability extension (partial live shape)",
+  "route": "/v1/starling/capabilities",
+  "protocol": "starling-extension",
+  "sources": [
+    "cpp/serve/main.cpp:748-756 (exact response body)",
+    "backends/native/tests/test_openai_api.py:test_capabilities_are_honest",
+    "packages/contracts/openapi.json (/v1/starling/capabilities)",
+    "docs/api.md#openai-compatible-routes"
+  ],
+  "cases": [
+    {
+      "name": "partial capability shape served by the live route",
+      "request": {
+        "method": "GET",
+        "path": "/v1/starling/capabilities"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "schema_version": 1,
+          "model": "parakeet",
+          "audio_transcription": true,
+          "audio_formats": ["wav"],
+          "sample_rate_hz": 16000,
+          "response_formats": ["json", "text"],
+          "prompt": false,
+          "language_selection": false,
+          "word_timestamps": false,
+          "streaming_transcriptions": false,
+          "legacy_websocket_path": "/stream"
+        }
+      },
+      "note": "Subset of capability.json; the field-by-field mapping is pinned in README.md and enforced by tests/test_capabilities_conformance.py. audio_transcription is false when the resident model is a text model (s1)."
+    }
+  ]
+}

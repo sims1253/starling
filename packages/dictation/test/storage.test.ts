@@ -341,16 +341,34 @@ describe("retry-safe session storage", () => {
     assert.equal(assigned.attemptCount, 1);
     assert.notEqual(new Date(assigned.updatedAt).getTime(), 0);
 
-    // Re-assignment moves the label in place, like re-refining overwrites.
+    // The assignment stamps the append sequence (B11): a finite, non-negative
+    // moment that orders the thread's turns by join order, not recording age.
+    const stamp = assigned.threadJoinedAt;
+
+    assert.ok(stamp !== undefined);
+    assert.ok(Number.isFinite(stamp) && stamp >= 0);
+
+    // An idempotent repeat on the same thread keeps the original stamp: it
+    // must not silently move the take to the end of its own thread.
+    const repeated = await memory.assignThread("threaded", "thread-9f1c");
+
+    assert.equal(repeated.threadJoinedAt, stamp);
+
+    // Re-assignment moves the label in place, like re-refining overwrites,
+    // and re-stamps the append: joining a different thread is a fresh append
+    // there.
     const moved = await memory.assignThread("threaded", "thread-next");
 
     assert.equal(moved.threadId, "thread-next");
+    assert.ok((moved.threadJoinedAt ?? 0) >= stamp);
     assert.equal(moved.transcript?.text, "raw words");
     assert.equal(exportDictationSession(moved).manifest.threadId, "thread-next");
+    assert.equal(exportDictationSession(moved).manifest.threadJoinedAt, moved.threadJoinedAt);
 
-    // Sessions nobody assigned stay unthreaded.
+    // Sessions nobody assigned stay unthreaded — and unstamped.
     await memory.create({ id: "lonely", wav });
     assert.equal((await memory.get("lonely"))?.threadId, undefined);
+    assert.equal((await memory.get("lonely"))?.threadJoinedAt, undefined);
 
     await assert.rejects(
       memory.assignThread("missing", "thread-9f1c"),
@@ -358,6 +376,36 @@ describe("retry-safe session storage", () => {
     );
     await assert.rejects(memory.assignThread("lonely", ""), TypeError);
     await assert.rejects(memory.assignThread("lonely", "bad\nid"), TypeError);
+  });
+
+  it("records the captured base identity on a threaded refinement", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "based", wav });
+    await memory.markAttempt("based");
+    await memory.saveTranscript("based", { text: "raw", segments: [] });
+    await memory.assignThread("based", "thread-1a");
+
+    // A refinement built on another member's text records which member that
+    // was, so the base stays explainable; re-refining overwrites it in place.
+    const refined = await memory.saveRefinedTranscript("based", {
+      text: "Refined on the head.",
+      model: "llama3.1",
+      createdAt: 5,
+      contextSourceId: "head-take",
+    });
+
+    assert.equal(refined.refined?.contextSourceId, "head-take");
+
+    const overwritten = await memory.saveRefinedTranscript("based", {
+      text: "Refined again.",
+      model: "llama3.1",
+      createdAt: 6,
+    });
+
+    assert.equal(overwritten.refined?.text, "Refined again.");
+    assert.equal(overwritten.refined?.contextSourceId, undefined);
+    assert.equal(exportDictationSession(overwritten).manifest.refined?.contextSourceId, undefined);
   });
 
   it("keeps thread assignment across an IndexedDB reopen", async () => {
@@ -378,9 +426,12 @@ describe("retry-safe session storage", () => {
 
     assert.equal(assigned.threadId, "thread-abc12345");
     assert.equal(assigned.transcript?.text, "raw");
+    assert.ok(assigned.threadJoinedAt !== undefined);
     store.close();
 
-    // The assignment survives the reopen: same label, same records.
+    // The assignment survives the reopen: same label, same records, and the
+    // same append stamp — the sequence is data, so the reading order a
+    // reload recomputes is the one the joins produced.
     const reopened = new IndexedDbSessionStore(options);
     const restored = await reopened.get("reopened-thread");
 
@@ -388,6 +439,7 @@ describe("retry-safe session storage", () => {
     assert.equal(restored.threadId, "thread-abc12345");
     assert.equal(restored.transcript?.text, "raw");
     assert.equal(restored.refined?.text, "Raw.");
+    assert.equal(restored.threadJoinedAt, assigned.threadJoinedAt);
     assert.equal(exportDictationSession(restored).manifest.threadId, "thread-abc12345");
     assert.deepEqual((await reopened.listReport()).invalid, []);
     reopened.close();
@@ -416,12 +468,60 @@ describe("retry-safe session storage", () => {
 
     assert.ok(restored);
     assert.equal(restored.threadId, undefined);
+    assert.equal(restored.threadJoinedAt, undefined);
     assert.equal(restored.transcript?.text, "written before threads existed");
 
-    // Thread membership still attaches to such a record without migration.
+    // Thread membership still attaches to such a record without migration,
+    // and the append stamps with it.
     const assigned = await store.assignThread("pre-thread", "thread-late");
 
     assert.equal(assigned.threadId, "thread-late");
+    assert.ok(assigned.threadJoinedAt !== undefined);
+    assert.deepEqual((await store.listReport()).invalid, []);
+    store.close();
+  });
+
+  it("stamps a legacy thread member's join exactly once", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "legacy-thread-stamp";
+    const store = new IndexedDbSessionStore({ databaseName, indexedDB: factory });
+
+    // A record exactly as the pre-stamp store wrote it: assigned to a thread
+    // between #117 and B11, so it carries the label but no threadJoinedAt.
+    const v1 = await openVersionOneSessionDatabase(factory, databaseName, {
+      id: "legacy-member",
+      createdAt: "2025-09-01T10:00:00.000Z",
+      updatedAt: "2025-09-01T10:00:01.000Z",
+      status: "transcribed",
+      wav,
+      durationMs: 25,
+      attemptCount: 1,
+      transcript: { text: "assigned before the append sequence existed", segments: [] },
+      threadId: "thread-legacy",
+    });
+
+    v1.close();
+
+    const restored = await store.get("legacy-member");
+
+    assert.ok(restored);
+    assert.equal(restored.threadId, "thread-legacy");
+    assert.equal(restored.threadJoinedAt, undefined);
+
+    // The join already happened — before the sequence existed — so an
+    // idempotent same-thread repeat must not stamp it now: a fresh stamp
+    // would silently move the take from its legacy position to the end of
+    // the thread. The absence is preserved exactly like a real stamp is.
+    const repeated = await store.assignThread("legacy-member", "thread-legacy");
+
+    assert.equal(repeated.threadId, "thread-legacy");
+    assert.equal(repeated.threadJoinedAt, undefined);
+
+    // Only a move to a different thread is a fresh append, and that stamps.
+    const moved = await store.assignThread("legacy-member", "thread-fresh");
+
+    assert.equal(moved.threadId, "thread-fresh");
+    assert.ok(moved.threadJoinedAt !== undefined);
     assert.deepEqual((await store.listReport()).invalid, []);
     store.close();
   });
@@ -481,6 +581,8 @@ type VersionOneSession = {
   durationMs?: number;
   attemptCount: number;
   transcript?: { text: string; segments: [] };
+  /** As written between #117 and B11: a thread label with no append stamp. */
+  threadId?: string;
 };
 
 /**
@@ -1680,5 +1782,124 @@ describe("cross-window capture ownership", () => {
     assert.equal(await owner.transcriptionInFlight("doomed"), false);
     owner.close();
     second.close();
+  });
+});
+
+describe("retranscription attempts (B04)", () => {
+  it("keeps the previous usable transcript when a retranscription attempt fails", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "keep", wav });
+    await memory.markAttempt("keep");
+    await memory.saveTranscript(
+      "keep",
+      { text: "good words", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    await memory.markAttempt("keep");
+    const failed = await memory.saveFailure("keep", new Error("server offline"));
+
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.lastError, "server offline");
+    assert.equal(failed.transcript?.text, "good words");
+    assert.equal(failed.transcript?.model, "parakeet");
+    assert.deepEqual(failed.transcriptHistory, []);
+    assert.equal((await memory.get("keep"))?.transcript?.text, "good words");
+  });
+
+  it("preserves a successful transcript as a separate history attempt with its provenance", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "again", wav });
+    await memory.markAttempt("again");
+
+    const first = await memory.saveTranscript(
+      "again",
+      { text: "good words", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    await memory.markAttempt("again");
+
+    const second = await memory.saveTranscript(
+      "again",
+      { text: "better words", segments: [] },
+      { model: "other-model", protocol: "openai" },
+    );
+
+    assert.equal(second.status, "transcribed");
+    assert.equal(second.attemptCount, 2);
+    assert.equal(second.transcript?.text, "better words");
+    assert.equal(second.transcript?.model, "other-model");
+    assert.equal(second.transcript?.protocol, "openai");
+
+    assert.equal(second.transcriptHistory?.length, 1);
+    assert.equal(second.transcriptHistory?.[0]?.text, "good words");
+    assert.equal(second.transcriptHistory?.[0]?.model, "parakeet");
+    assert.equal(second.transcriptHistory?.[0]?.protocol, "starling");
+    assert.equal(second.transcriptHistory?.[0]?.savedAt, first.transcript?.savedAt);
+
+    const manifest = exportDictationSession(second).manifest;
+
+    assert.equal(manifest.transcriptHistory?.[0]?.model, "parakeet");
+    assert.equal(manifest.transcript?.model, "other-model");
+  });
+
+  it("stores an empty result as transcribed and stays retriable without reimport", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "empty", wav });
+    await memory.markAttempt("empty");
+    const empty = await memory.saveTranscript("empty", { text: "", segments: [] });
+
+    assert.equal(empty.status, "transcribed");
+    assert.equal(empty.transcript?.text, "");
+    assert.ok(empty.transcript?.savedAt !== undefined);
+
+    const remarked = await memory.markAttempt("empty");
+
+    assert.equal(remarked.status, "transcribing");
+    assert.equal(remarked.transcript?.text, "");
+    assert.equal(remarked.attemptCount, 2);
+  });
+
+  it("rejects empty provenance values instead of storing unusable labels", async () => {
+    const memory = new MemorySessionStore();
+
+    await memory.create({ id: "labeled", wav });
+
+    await assert.rejects(
+      memory.saveTranscript("labeled", { text: "x", segments: [] }, { model: "" }),
+      TypeError,
+    );
+    await assert.rejects(
+      memory.saveTranscript("labeled", { text: "x", segments: [] }, { protocol: "" }),
+      TypeError,
+    );
+  });
+
+  it("keeps attempt provenance across an IndexedDB round trip", async () => {
+    const factory = new IDBFactory();
+    const options = { databaseName: "provenance-roundtrip", indexedDB: factory };
+    const store = new IndexedDbSessionStore(options);
+
+    await store.create({ id: "durable", wav });
+    await store.markAttempt("durable");
+    await store.saveTranscript(
+      "durable",
+      { text: "kept", segments: [] },
+      { model: "parakeet", protocol: "starling" },
+    );
+
+    store.close();
+
+    const reopened = new IndexedDbSessionStore(options);
+    const restored = await reopened.get("durable");
+
+    assert.equal(restored?.transcript?.model, "parakeet");
+    assert.equal(restored?.transcript?.protocol, "starling");
+    assert.ok(restored?.transcript?.savedAt !== undefined);
+    reopened.close();
   });
 });

@@ -14,10 +14,16 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
+import { storeRefinementKeySafe } from "./keyProtection.js";
+import { StreamBridge, type StreamSink } from "./streamBridge.js";
 import {
   HealthInputSchema,
   RefinementKeyLoadInputSchema,
   RefinementKeySaveInputSchema,
+  StreamCloseInputSchema,
+  StreamCommandInputSchema,
+  StreamOpenInputSchema,
+  StreamSendInputSchema,
   TranscribeInputSchema,
   type DesktopDiagnostics,
   type HealthInput,
@@ -26,6 +32,10 @@ import {
   type RefinementKeySaveInput,
   type RefinementKeySaveResult,
   type RefinementKeyLoadResult,
+  type StreamCloseInput,
+  type StreamCommandInput,
+  type StreamOpenInput,
+  type StreamSendInput,
   type TranscribeInput,
   type TranscriptionResult,
   type ServerHealth,
@@ -389,26 +399,17 @@ function transcribeProgram(input: TranscribeInput) {
 }
 
 /**
- * Encrypt the refinement API key with the OS keychain-backed safeStorage and
- * hand back base64 ciphertext; the plaintext never persists anywhere. A host
- * without an encryption backend resolves ciphertext null, which tells the
- * renderer to keep its documented plaintext fallback rather than fail.
+ * Store the refinement API key under the host's secret store (B10). The
+ * decision lives in keyProtection.ts: ciphertext is produced only by a real
+ * OS secret store — never by Linux's basic_text fallback, whose hardcoded
+ * password is not protection — and every other outcome reports its status
+ * instead of throwing, so the renderer can demand an explicit choice before
+ * any plaintext persists. The result never carries the key itself.
  */
 function storeRefinementKeyProgram(
   input: RefinementKeySaveInput,
-): Effect.Effect<RefinementKeySaveResult, RequestTransportError> {
-  return Effect.try({
-    try: () => ({
-      ciphertext: safeStorage.isEncryptionAvailable()
-        ? safeStorage.encryptString(input.apiKey).toString("base64")
-        : null,
-    }),
-    catch: (cause) =>
-      new RequestTransportError({
-        message: "Could not encrypt the refinement API key.",
-        cause,
-      }),
-  });
+): Effect.Effect<RefinementKeySaveResult, never> {
+  return Effect.sync(() => storeRefinementKeySafe(safeStorage, process.platform, input.apiKey));
 }
 
 /**
@@ -445,6 +446,35 @@ function trustedRenderer(raw: string): boolean {
 function validateSender(event: IpcMainInvokeEvent): void {
   if (!event.senderFrame || !trustedRenderer(event.senderFrame.url))
     throw new RequestInputError({ message: "Request rejected from an untrusted window." });
+}
+
+/**
+ * The packaged app's live-streaming sockets live in the main process (B01):
+ * the renderer's static CSP cannot enumerate user-configured LAN ws:// or
+ * wss:// endpoints, so the renderer drives its takes over the IPC channels
+ * below instead of opening a WebSocket itself. The endpoint arrives under the
+ * same validation as the batch channels, and the ws/wss derivation happens
+ * only here.
+ */
+const streamBridge = new StreamBridge();
+
+function streamTransportError(cause: unknown): RequestTransportError {
+  return new RequestTransportError({
+    message: cause instanceof Error ? cause.message : "The streaming connection failed.",
+    cause,
+  });
+}
+
+/** Route one stream's events to the WebContents that opened it, until it dies. */
+function streamSink(event: IpcMainInvokeEvent): StreamSink {
+  const contents = event.sender;
+
+  return {
+    send: (message) => {
+      if (!contents.isDestroyed()) contents.send("starling:stream:event", message);
+    },
+    onceDestroyed: (cleanup) => contents.once("destroyed", cleanup),
+  };
 }
 
 function runForSender<A, E>(event: IpcMainInvokeEvent, effect: Effect.Effect<A, E>): Promise<A> {
@@ -521,6 +551,67 @@ ipcMain.handle("starling:diagnostics", (event) => {
     });
 
   return diagnostics();
+});
+
+// Streaming transport channels (B01): decode at the boundary, then hand the
+// validated payload to the bridge. Failures reject with the transport wording
+// the preload's readableRejection already knows how to surface.
+ipcMain.handle("starling:stream:open", (event, input: StreamOpenInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamOpenInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.gen(function* () {
+          // Input-error wording parity with the batch channels; the bridge
+          // applies the same rule when it derives the ws(s):// URL.
+          yield* cleanEndpoint(decoded.endpoint);
+
+          return yield* Effect.tryPromise({
+            try: () => streamBridge.open(decoded, streamSink(event)),
+            catch: (cause) => streamTransportError(cause),
+          });
+        }),
+      ),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:stream:send", (event, input: StreamSendInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamSendInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.tryPromise({
+          try: () => streamBridge.send(decoded),
+          catch: (cause) => streamTransportError(cause),
+        }),
+      ),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:stream:command", (event, input: StreamCommandInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamCommandInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.tryPromise({
+          try: () => streamBridge.command(decoded),
+          catch: (cause) => streamTransportError(cause),
+        }),
+      ),
+    ),
+  ),
+);
+
+// Fire-and-forget teardown from the renderer's close(): no reply is needed,
+// and a dropped packet only strands a socket the destroyed cleanup reaps.
+ipcMain.on("starling:stream:close", (event, input: StreamCloseInput) => {
+  if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
+  const decoded = Schema.decodeUnknownOption(StreamCloseInputSchema)(input);
+
+  if (Option.isSome(decoded)) streamBridge.close(decoded.value.streamId);
 });
 
 ipcMain.on("starling:renderer-ready", (event) => {
@@ -695,7 +786,12 @@ app.on("before-quit", () => {
   quitting = true;
 });
 
-app.on("will-quit", () => globalShortcut.unregisterAll());
+app.on("will-quit", () => {
+  globalShortcut.unregisterAll();
+
+  // Live takes cannot survive the process; close their sockets before exit.
+  streamBridge.closeAll();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
