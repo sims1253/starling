@@ -646,11 +646,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": null,
    "branch": "gpui/fixes-wave-a2",
-   "evidence": [],
-   "notes": "impl-agent-3, stacked branch"
+   "evidence": [
+    "coordinator rerun: 95/95 dictation, 11/11 app tests on gpui/fixes-wave-a2 c9e4951; pure playback_watch decision fn tested incl. stale-watcher cancel"
+   ],
+   "notes": "live gpui-entity end-to-end watcher lifetime untested (headless crate)"
   },
   {
    "id": "G05",
@@ -692,11 +694,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": null,
    "branch": "gpui/fixes-wave-a2",
-   "evidence": [],
-   "notes": "impl-agent-3, shared PCM fixture"
+   "evidence": [
+    "coordinator rerun 95/95; js_round ties-to-+inf matches TS Math.round; 21-case shared fixture rejects old away-from-zero behavior (974df60)"
+   ],
+   "notes": "TS vitest side not executed here (worktree lacks node_modules); validated via dependency-free node Math.round replication; runs in CI after merge"
   },
   {
    "id": "E26",
@@ -1101,13 +1105,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-8",
+   "branch": "gpui/fixes-wave-a3",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
-   "notes": "kills model auto-sync; app.rs"
+   "notes": "impl-agent-8"
   },
   {
    "id": "R03",
@@ -1117,13 +1121,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-8",
+   "branch": "gpui/fixes-wave-a3",
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
-   "notes": "upload.rs; storage errors flip to Offline"
+   "notes": "impl-agent-8"
   },
   {
    "id": "R04",
@@ -1265,15 +1269,6 @@
   },
   {
    "ids": [
-    "G04",
-    "G07"
-   ],
-   "agent": "impl-agent-3",
-   "branch": "gpui/fixes-wave-a2",
-   "scope": "gpui worktree Rust (light)"
-  },
-  {
-   "ids": [
     "B11"
    ],
    "agent": "impl-agent-4",
@@ -1303,6 +1298,15 @@
    "agent": "impl-agent-7",
    "branch": "program/wave-a",
    "scope": "packages/contracts/runtime-protocol + tests (light)"
+  },
+  {
+   "ids": [
+    "R02",
+    "R03"
+   ],
+   "agent": "impl-agent-8",
+   "branch": "gpui/fixes-wave-a3",
+   "scope": "gpui worktree Rust (light)"
   }
  ]
 }
