@@ -1,0 +1,74 @@
+{
+ "known_review_comment_ids": [
+  4056547381,
+  4056547383,
+  4056547387,
+  4056547388,
+  4056547390,
+  4056560525,
+  4056560532,
+  4056560534,
+  4056560536,
+  4056560538,
+  4056560540,
+  4056560543,
+  4056560545,
+  4056560549,
+  4056560551,
+  4056560552,
+  4056568134,
+  4056568136,
+  4056568138,
+  4056568142,
+  4056568147,
+  4056568150,
+  4056568153,
+  4056568157,
+  4056590123,
+  4056590126,
+  4056590130,
+  4056590131,
+  4056590135,
+  4056590139
+ ],
+ "known_issue_comment_ids": [
+  5748731252,
+  5748750591
+ ],
+ "findings": [
+  {
+   "id": 4056547381,
+   "path": "docs/program/pr/pr193-log.json",
+   "summary": "missing trailing newline at EOF",
+   "severity": "style-low"
+  },
+  {
+   "id": 4056547383,
+   "path": "tests/fidelity_audio.py",
+   "summary": "array(h) native byte order vs wave little-endian on BE hosts",
+   "severity": "bug-low"
+  },
+  {
+   "id": 4056547387,
+   "path": "tests/fidelity_scorers.py",
+   "summary": "region_covered can double-count overlap; clamp to region span",
+   "severity": "maint-low"
+  },
+  {
+   "id": 4056547388,
+   "path": "tests/minischema.py",
+   "summary": "bool/int equality in const/enum matching (True==1); needs type-aware compare",
+   "severity": "bug-low"
+  },
+  {
+   "id": 4056547390,
+   "path": "tests/minischema.py",
+   "summary": "empty oneOf/anyOf combiner raises IndexError instead of validation error",
+   "severity": "bug-low"
+  }
+ ],
+ "source_run": "OpenCodeReview run 35500294649-1",
+ "harvested_at": "2026-09-20T08:46:28+00:00",
+ "last_review_comment_at": null,
+ "last_issue_comment_at": null
+}

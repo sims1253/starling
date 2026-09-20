@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "name": "starling-locale-text-fixtures",
+  "provenance_policy": "Synthetic only: expected strings are hand-authored per frozen rule tables, not sampled from any library or model output.",
+  "span_encoding": "unicode_codepoints",
+  "fixtures": [
+    {
+      "id": "ml-num-01",
+      "kind": "number-locale",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en-US",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (United States)"
+        },
+        {
+          "tag": "de-DE",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German (Germany)"
+        },
+        {
+          "tag": "en-IN",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (India)"
+        },
+        {
+          "tag": "fa-IR",
+          "script": "Arab",
+          "direction": "rtl",
+          "display_name": "Persian (Iran)"
+        }
+      ],
+      "input": "1,234.56",
+      "source_locale": "en-US",
+      "cases": [
+        {
+          "locale": "de-DE",
+          "expected": "1.234,56",
+          "rule": "latn-group3-dot-decimal-comma"
+        },
+        {
+          "locale": "en-IN",
+          "expected": "1,234.56",
+          "rule": "latn-group322-comma-decimal-dot"
+        },
+        {
+          "locale": "fa-IR",
+          "expected": "۱٬۲۳۴٫۵۶",
+          "rule": "arabext-group3-thousands-decimal"
+        }
+      ],
+      "notes": "de-DE swaps separator roles; en-IN grouping only differs from 3-3-3 once the integer part exceeds six digits (see ml-num-big-01); fa-IR uses extended Arabic-Indic digits with U+066C/U+066B separators."
+    },
+    {
+      "id": "ml-num-big-01",
+      "kind": "number-locale",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en-US",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (United States)"
+        },
+        {
+          "tag": "de-DE",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German (Germany)"
+        },
+        {
+          "tag": "en-IN",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (India)"
+        },
+        {
+          "tag": "fa-IR",
+          "script": "Arab",
+          "direction": "rtl",
+          "display_name": "Persian (Iran)"
+        }
+      ],
+      "input": "12,345,678.9",
+      "source_locale": "en-US",
+      "cases": [
+        {
+          "locale": "de-DE",
+          "expected": "12.345.678,9",
+          "rule": "latn-group3-dot-decimal-comma"
+        },
+        {
+          "locale": "en-IN",
+          "expected": "1,23,45,678.9",
+          "rule": "latn-group322-comma-decimal-dot"
+        },
+        {
+          "locale": "fa-IR",
+          "expected": "۱۲٬۳۴۵٬۶۷۸٫۹",
+          "rule": "arabext-group3-thousands-decimal"
+        }
+      ],
+      "notes": "Shows grouping schemes, not just separator swapping: en-IN groups the rightmost three digits, then twos (1,23,45,678)."
+    },
+    {
+      "id": "ml-num-small-01",
+      "kind": "number-locale",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en-US",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (United States)"
+        },
+        {
+          "tag": "de-DE",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German (Germany)"
+        },
+        {
+          "tag": "fa-IR",
+          "script": "Arab",
+          "direction": "rtl",
+          "display_name": "Persian (Iran)"
+        }
+      ],
+      "input": "3.14",
+      "source_locale": "en-US",
+      "cases": [
+        {
+          "locale": "de-DE",
+          "expected": "3,14",
+          "rule": "latn-group3-dot-decimal-comma"
+        },
+        {
+          "locale": "fa-IR",
+          "expected": "۳٫۱۴",
+          "rule": "arabext-group3-thousands-decimal"
+        }
+      ],
+      "notes": "No grouping applies below the first group size."
+    },
+    {
+      "id": "ml-quote-01",
+      "kind": "quotation-locale",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en-US",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English (United States)"
+        },
+        {
+          "tag": "de-DE",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German (Germany)"
+        },
+        {
+          "tag": "fr-FR",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "French (France)"
+        },
+        {
+          "tag": "ru-RU",
+          "script": "Cyrl",
+          "direction": "ltr",
+          "display_name": "Russian (Russia)"
+        },
+        {
+          "tag": "ja-JP",
+          "script": "Jpan",
+          "direction": "ltr",
+          "display_name": "Japanese (Japan)"
+        }
+      ],
+      "text": "ship it",
+      "cases": [
+        {
+          "locale": "en-US",
+          "quoted": "“ship it”",
+          "rule": "double-curved"
+        },
+        {
+          "locale": "de-DE",
+          "quoted": "„ship it“",
+          "rule": "low-open-high-close"
+        },
+        {
+          "locale": "fr-FR",
+          "quoted": "« ship it »",
+          "rule": "guillemets-nbsp-inside"
+        },
+        {
+          "locale": "ru-RU",
+          "quoted": "«ship it»",
+          "rule": "guillemets-no-inner-space"
+        },
+        {
+          "locale": "ja-JP",
+          "quoted": "「ship it」",
+          "rule": "corner-brackets"
+        }
+      ],
+      "notes": "Exact code points are frozen: U+201C/U+201D (en), U+201E/U+201C (de), U+00AB/U+00BB with U+00A0 on both inner sides (fr), U+00AB/U+00BB with no inner space (ru), U+300C/U+300D (ja)."
+    },
+    {
+      "id": "ml-case-tr-01",
+      "kind": "casing-locale",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "tr-TR",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "Turkish (Turkey)"
+        }
+      ],
+      "locale": "tr-TR",
+      "rule": "unicode-specialcasing-tr-az",
+      "cases": [
+        {
+          "input": "istanbul",
+          "operation": "upper",
+          "expected": "İSTANBUL"
+        },
+        {
+          "input": "istiklal",
+          "operation": "upper",
+          "expected": "İSTİKLAL"
+        },
+        {
+          "input": "ısı",
+          "operation": "upper",
+          "expected": "ISI"
+        },
+        {
+          "input": "DİYARBAKIR",
+          "operation": "lower",
+          "expected": "diyarbakır"
+        },
+        {
+          "input": "İstanbul",
+          "operation": "lower",
+          "expected": "istanbul"
+        },
+        {
+          "input": "IRADE",
+          "operation": "lower",
+          "expected": "ırade"
+        }
+      ],
+      "notes": "Unicode SpecialCasing.txt Turkic mappings (tr, az): upper i→İ (U+0130), ı→I; lower I→ı (U+0131), İ→i (plain U+0069, overriding the unconditional İ→i+U+0307). Locale-independent str.upper/lower/casefold cannot produce these."
+    }
+  ]
+}

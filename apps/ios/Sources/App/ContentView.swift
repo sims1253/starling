@@ -171,6 +171,15 @@ private struct HistorySection: View {
                     }
                 }
             }
+
+            if model.unreadableSessionCount > 0 {
+                Text(
+                    "\(model.unreadableSessionCount) recording\(model.unreadableSessionCount == 1 ? "" : "s") could not be read from storage and \(model.unreadableSessionCount == 1 ? "is" : "are") not shown."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 }

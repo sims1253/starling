@@ -1,0 +1,40 @@
+{
+  "machine": "capture",
+  "description": "Non-monotonic seq on a stream: every message is individually schema-valid, but capture.stop (seq 299) arrives on the take_99 stream after capture.started (seq 301). Per-stream monotonicity is violated; the receiver must surface it, not reorder silently.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "seq_not_monotonic",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_901",
+      "ts": "2026-09-20T10:09:01Z",
+      "corr": "take_99",
+      "seq": 300,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_901",
+      "ts": "2026-09-20T10:09:01Z",
+      "corr": "take_99",
+      "seq": 301,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_902",
+      "ts": "2026-09-20T10:09:04Z",
+      "corr": "take_99",
+      "seq": 299,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    }
+  ]
+}

@@ -47,6 +47,15 @@ jobs:
           cache: true
           run-install: true
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - name: Fail on pnpm lockfile drift
+        # E16 gate: a manifest edit without a regenerated pnpm-lock.yaml
+        # fails here (ERR_PNPM_OUTDATED_LOCKFILE) instead of re-resolving.
+        # Plain --frozen-lockfile only; --dry-run re-resolves and exits 0.
+        run: pnpm install --frozen-lockfile
+      - name: Fail on uv lockfile drift
+        # Root pyproject.toml gate (E16). quants is gated by --locked below;
+        # benchmarks/sonar by test.yml. No PR gate existed for the root lock.
+        run: uv lock --check
       - name: Build real HTTP handlers with a deterministic test engine
         run: |
           cmake --preset native-cpu
@@ -74,6 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          submodules: recursive
           persist-credentials: false
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:

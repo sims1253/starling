@@ -4,9 +4,29 @@
 `libstarling_ggml` and does not require Python, PyTorch, Transformers, or Triton.
 GPU builds still need the platform's driver and runtime libraries.
 
-Start with [build](#build) and [usage](#usage), or see
-[release artifacts](#release-artifacts) for binary prerequisites. The
-[API contract](#api-contract) covers differences from `starling.server`.
+Start with [build](#build) and [usage](#usage), [install with npm](#install-with-npm)
+for the prebuilt path, or see [release artifacts](#release-artifacts) for
+binary prerequisites. The [API contract](#api-contract) covers differences
+from `starling.server`.
+
+## Install with npm
+
+The `starling-serve` npm package ([packages/serve](../packages/serve/)) is a
+launcher: it picks the release artifact for your platform and backend,
+downloads it from GitHub Releases on first run, verifies both checksum layers,
+caches it, and execs it with the arguments you pass. No compiler or GPU
+required, and no postinstall script — see [packaging](packaging.md) for why.
+
+```bash
+npx starling-serve --model parakeet --gguf model.gguf --port 8181
+pnpm dlx starling-serve --model parakeet --gguf model.gguf --port 8181
+```
+
+The launcher defaults to `metal` on Apple Silicon, `vulkan` on Linux when the
+Vulkan loader is present (`cpu` otherwise), and `cpu` on Windows. Force a
+backend with `--starling-backend cuda` or `STARLING_SERVE_BACKEND=cuda`. The
+full matrix, cache layout, and environment overrides are documented in
+[packaging](packaging.md).
 
 ## Build
 
@@ -64,7 +84,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, higgs, hojo, granite, qwen3, s1, audex |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, s1, audex, voxtral |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port |
@@ -195,13 +215,49 @@ cap. It only fires when the un-finalized buffer itself grows past the limit
 (e.g. streaming faster than the engine finalizes, or a session where
 transcription never succeeds).
 
+**Invalid audio frames** (issue #145): a binary frame the server cannot accept
+is refused with one error frame, exactly like the buffer cap:
+
+- a malformed WAV (fails decoding),
+- a WAV whose sample rate is not 16 kHz (the native server has no resampler;
+  the HTTP paths reject the same inputs with `400`),
+- raw PCM16 with an odd byte count: frames are sequences of whole int16
+  samples, so an odd length means a sample was split at a transport boundary.
+  The dangling byte is not silently dropped — the client should re-send on
+  whole-sample boundaries.
+
+```json
+{"type":"error","message":"WAV sample rate mismatch: expected 16000; audio ignored until reset"}
+{"type":"error","message":"malformed WAV frame rejected; audio ignored until reset"}
+{"type":"error","message":"odd-length PCM frame rejected (split sample); audio ignored until reset"}
+```
+
+A refused frame also **invalidates the take**: all further binary frames are
+ignored (no more partials), and `{"type":"commit"}` is refused with
+
+```json
+{"type":"error","message":"take invalidated (sample_rate_mismatch); reset and resend"}
+```
+
+instead of a successful `final` — the buffered audio is provably incomplete,
+so the client must fall back to its authoritative local recording. The
+machine-readable reason codes are `malformed_wav`, `sample_rate_mismatch`,
+and `odd_pcm_length`. As with the buffer cap, the connection stays alive
+(control frames keep working) and `{"type":"reset"}` clears the invalidation
+and re-enables audio. The deprecated Python server shares this contract for
+malformed WAV and odd-length PCM; its one divergence is that it resamples
+non-16 kHz WAVs via scipy instead of rejecting them with `sample_rate_mismatch`
+(see [divergence note](python-serving.md#invalid-stream-audio-and-the-remaining-divergence-from-the-native-server)).
+
 Control frames (JSON text):
 
 - `{"type":"commit"}`: finalize all buffered audio. Returns `final` on success;
   if bounded retries stay busy, returns `{"type":"error","message":"server busy"}`
-  and retains the audio. Retry `commit` after a delay.
+  and retains the audio. Retry `commit` after a delay. A commit on an
+  invalidated take (see above) is refused with an error instead.
 - `{"type":"reset"}`: discard buffer without finalizing (returns reset_ack;
-  also re-enables audio after a buffer-cap error)
+  also re-enables audio after a buffer-cap error or an invalid-audio
+  rejection)
 - `{"type":"ping"}`: heartbeat (returns pong)
 
 ## Architecture
@@ -219,6 +275,79 @@ during busy retries. Successful windows advance the committed boundary;
 incomplete commits preserve the remaining audio for a later retry. Transcript
 stitching uses matching words rather than timestamps, so disagreements between
 neighboring windows can still omit or duplicate words.
+
+## Timing trace
+
+`STARLING_TRACE=1 starling-serve …` turns on an opt-in structured timing trace
+(issue #180): one JSON record per line on stderr, prefixed `[trace] `, that
+correlates one transcription request's timing across the layers it touches.
+With the variable unset (the default) nothing is measured, formatted, or
+printed, and the replay fast path is untouched.
+
+```text
+[trace] {"v":1,"ts":1840,"tid":91255231,"ev":"queue_enter","req":"req-42","policy":"block","depth":1}
+[trace] {"v":1,"ts":1841,"tid":91255231,"ev":"queue_wait","req":"req-42","dur_ms":0.612}
+[trace] {"v":1,"ts":1842,"tid":91255231,"ev":"chunk","chunk":1,"dur_ms":410.2,"req":"req-42"}
+[trace] {"v":1,"ts":2600,"tid":91255231,"ev":"stage","stage":"mel_enc_proj","dur_ms":180.4,"req":"req-42","chunk":1}
+[trace] {"v":1,"ts":2610,"tid":91255231,"ev":"graph_replay","dur_ms":0.31,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
+[trace] {"v":1,"ts":2790,"tid":91255231,"ev":"readback_sync","dur_ms":178.9,"uid":3,"nodes":2418,"out_ne":[1024,0,0,0],"device":"CUDA0","req":"req-42","chunk":1}
+[trace] {"v":1,"ts":3410,"tid":91255231,"ev":"request","dur_ms":1568.3,"req":"req-42"}
+[trace] {"v":1,"ts":3412,"tid":91255231,"ev":"queue_exit","req":"req-42","reason":"completed","depth":0}
+[trace] {"v":1,"ts":3413,"tid":91255231,"ev":"response","dur_ms":0.02,"req":"req-42"}
+```
+
+Record kinds and fields:
+
+| `ev` | Layer | Fields |
+| --- | --- | --- |
+| `queue_enter` | serving | `req`, `policy` (`block`/`skip_if_busy`), `depth` (waiters after enqueue) |
+| `queue_wait` | serving | `req`, `dur_ms` (host time blocked waiting for the serial-queue turn; emitted on turn acquisition AND on abandoned departures — skip refusal, timeout, cancellation) |
+| `request` | serving | `dur_ms` (engine-call wall time) |
+| `queue_exit` | serving | `req`, `reason` (`completed`/`cancelled`/`server_busy`/`timed_out`), `depth` (waiters after release). Terminal: every `queue_enter` balances exactly one `queue_exit` |
+| `response` | serving | `dur_ms` (result marshalling; the HTTP body build and socket write are outside the trace) |
+| `chunk` | engine | `chunk` (1-based), `dur_ms` |
+| `stage` | engine | `stage` (`mel_enc_proj`, `prompt_embeds`, `generate`), `dur_ms` |
+| `graph_build` | runtime | `dur_ms` (construction + allocation of one captured shape), `uid`, `nodes`, `out_ne`, `device`, `mem_free` (device free bytes after admission, or `unavailable`) |
+| `graph_replay` | runtime | `dur_ms` (the async launch — **host enqueue**), `uid`, `nodes`, `out_ne`, `device` |
+| `readback_sync` | runtime | `dur_ms` (the single trailing sync — **host blocked**), `uid`, `nodes`, `out_ne`, `device` |
+| `cache` | runtime | `cache` (e.g. `granite.encoder`, `qwen.prefill`, `parakeet.encoder`), `op` (`hit`/`miss`), `evicted`, `size`, `cap`, `mem_free` |
+
+Every record carries `v` (schema version), `ts` (µs since the first record),
+`tid`, and — when active — `req` (the HTTP request id, or the synthesized
+`#anon-N` ticket of an anonymous caller) and `chunk`. Engine-layer records
+inherit both through the request scope, so a replay graph fired inside chunk 3
+of request `req-42` carries `req` and `chunk:3`.
+
+Reading the numbers correctly (binding rules):
+
+- **Host enqueue vs. host blocked vs. device time are different things.**
+  `graph_replay` measures the async launch (returns almost immediately on
+  CUDA). `readback_sync` measures the single trailing sync and *includes
+  waiting for prior GPU work* — it is **not** transfer time alone. True
+  per-graph device time is not measured and never fabricated. On the CPU
+  backend the launch is itself synchronous, so `graph_replay` approximates
+  the full compute — check `device` before interpreting.
+- **Wall times are clock-nested; never add a child into its parent.**
+  Aggregate by summing sibling records of ONE kind: the three `stage` records
+  of a chunk sum to that chunk's engine work; the `chunk` records of a request
+  sum to its engine time inside `request`. `graph_replay` + `readback_sync`
+  overlap the stage walls (they are leaves, not additional time).
+- **The queue ledger balances.** Every `queue_enter` has exactly one
+  terminal `queue_exit` whose `reason` says how the ticket left
+  (`completed`, `server_busy`, `timed_out`, `cancelled`), and `queue_wait`
+  fires for abandoned waits too — the contention outcomes the trace exists
+  to diagnose are never invisible.
+- **No contents.** Records carry ids, indices, shape dimensions, and cache
+  occupancy — never audio, transcripts, prompts, or tensor contents.
+- **Scope.** Chunk/stage spans currently come from the granite engine (the
+  multi-chunk reference); other engines emit the serving and runtime records
+  without chunk attribution. One-shot (non-captured) computes are not traced.
+  The trace is a diagnostic tool, not telemetry: nothing is sent anywhere.
+
+The older gates remain independent: `STARLING_GRANITE_TIMING` (granite stage
+summaries) and `STARLING_REPLAY_TIMING` (per-replay split). The stage records
+share `STARLING_GRANITE_TIMING`'s clocks, so the two renderings cannot
+disagree.
 
 ## Pre-converted GGUF files
 
@@ -253,6 +382,8 @@ and input; the filename alone does not guarantee it. See the
 | parakeet | `scripts/convert_parakeet_gguf.py` |
 | moss | `scripts/convert_moss_gguf.py` |
 | ark | `scripts/convert_ark_gguf.py` |
+| ark06 | `scripts/convert_ark06_gguf.py` |
+| voxtral | `scripts/convert_voxtral_gguf.py` |
 | higgs | `scripts/convert_higgs_gguf.py` |
 | hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |
@@ -262,21 +393,24 @@ and input; the filename alone does not guarantee it. See the
 
 ## Release artifacts
 
-The release workflow packages six executables with SHA-256 checksums in
+The release workflow packages nine executables with SHA-256 checksums in
 `.tar.gz` archives on Linux/macOS and `.zip` archives on Windows. It links
 Starling and ggml into the executable, but does not bundle accelerator runtime
 libraries. These are not fully static binaries.
 
 | Backend | Runtime prerequisites |
 | --- | --- |
+| CPU | None beyond the platform C/C++ runtime (`libstdc++6` and `libgomp1` on Linux; the Windows build uses the static CRT). |
 | CUDA | Compatible NVIDIA driver and CUDA runtime/cuBLAS libraries. The workflow builds with CUDA 13.3. |
-| ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow installs ROCm from its `latest` repository. |
+| ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow builds with ROCm 7.2.4. |
 | Vulkan | Vulkan loader and a compatible GPU driver. |
 | Metal | Apple Silicon macOS with the system Metal frameworks. |
 
-The workflow runs startup checks on its build machines, where the development
-toolkits are already installed. Those checks do not establish that the archives
-run on a clean machine. Missing-runtime packaging is tracked in
+The Linux CUDA, Vulkan, and CPU archives are smoke-tested outside their
+build environment in a fresh Ubuntu 22.04 container with only the documented
+runtime packages (see the [runtime guide](release-runtime.md)); the Windows
+and macOS archives are checked on their build machines only. None of these
+startup checks verify GPU inference — hardware validation is tracked in
 [issue #57](https://github.com/sims1253/starling/issues/57).
 
 Choose the executable for your operating system, CPU architecture, and GPU:
@@ -286,9 +420,12 @@ Choose the executable for your operating system, CPU architecture, and GPU:
 | `starling-serve-linux-cuda` | Linux x86_64 | CUDA | NVIDIA |
 | `starling-serve-linux-rocm` | Linux x86_64 | ROCm / HIP | AMD Radeon & Instinct |
 | `starling-serve-linux-vulkan` | Linux x86_64 | Vulkan | Intel / AMD / NVIDIA |
+| `starling-serve-linux-cpu` | Linux x86_64 | CPU | No GPU required |
 | `starling-serve-windows-cuda.exe` | Windows x86_64 | CUDA | NVIDIA (static application CRT) |
 | `starling-serve-windows-vulkan.exe` | Windows x86_64 | Vulkan | AMD / Intel / NVIDIA (static application CRT) |
+| `starling-serve-windows-cpu.exe` | Windows x86_64 | CPU | No GPU required (static application CRT) |
 | `starling-serve-macos-metal` | macOS arm64 | Metal | Apple Silicon |
+| `starling-serve-macos-cpu` | macOS arm64 | CPU | Apple Silicon, no GPU needed |
 
 ### GPU selection
 

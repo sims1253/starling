@@ -16,8 +16,19 @@ native device testing.
 
 ## Run the server
 
-You need CMake, a C++17 compiler, Git, and Bash. Initialize the submodule, build,
-and supply a compatible GGUF model from the [model guide](docs/models.md):
+Quickest path — Node.js 20+, no compiler and no GPU required:
+
+```bash
+npx starling-serve --model parakeet --gguf /path/to/model.gguf --port 8181
+```
+
+The launcher downloads the prebuilt binary for your platform on first run and
+verifies its checksum; see [packaging](docs/packaging.md) for backend
+selection and overrides.
+
+To build from source instead, you need CMake, a C++17 compiler, Git, and Bash.
+Initialize the submodule, build, and supply a compatible GGUF model from the
+[model guide](docs/models.md):
 
 ```bash
 git submodule update --init --recursive
@@ -75,6 +86,7 @@ against destructive processing; they cannot guarantee ASR accuracy.
 | Android app and voice keyboard | [`apps/mobile/`](apps/mobile/) |
 | iOS app | [`apps/ios/`](apps/ios/) |
 | Shared TypeScript client and fidelity rules | [`packages/dictation/`](packages/dictation/) |
+| `starling-serve` npm launcher for prebuilt binaries | [`packages/serve/`](packages/serve/) |
 | Language-independent API contract | [`packages/contracts/`](packages/contracts/) |
 | Deprecated Python/CUDA serving | [`backends/python/`](backends/python/) · reference source in `src/starling/` |
 
@@ -87,5 +99,6 @@ serving work targets the native engine and the portable HTTP contract.
 [Architecture and platform status](docs/monorepo.md) · [API](docs/api.md) ·
 [TypeScript development](docs/typescript.md) ·
 [Models](docs/models.md) · [Native serving](docs/native-serving.md) ·
+[Packaging and the npm launcher](docs/packaging.md) ·
 [Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
 [Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md)

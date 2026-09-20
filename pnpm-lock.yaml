@@ -232,6 +232,9 @@ importers:
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
+      fake-indexeddb:
+        specifier: ^6.2.5
+        version: 6.2.5
       lucide-react:
         specifier: ^1.46.0
         version: 1.46.0(react@19.3.0)
@@ -263,6 +266,18 @@ importers:
       fake-indexeddb:
         specifier: ^6.2.5
         version: 6.2.5
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vite-plus:
+        specifier: 'catalog:'
+        version: 0.3.2(@types/node@24.13.4)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.13)(typescript@7.0.2)
+
+  packages/serve:
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 24.13.4
       typescript:
         specifier: 'catalog:'
         version: 7.0.2

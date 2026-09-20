@@ -8,7 +8,8 @@
     "./audio": "./src/audio.ts",
     "./client": "./src/client.ts",
     "./fidelity": "./src/fidelity.ts",
-    "./storage": "./src/storage.ts"
+    "./storage": "./src/storage.ts",
+    "./streaming": "./src/streaming.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",

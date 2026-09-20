@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fillViewport="true">
@@ -138,6 +139,50 @@
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/engine_heading"
+            android:textColor="@color/starling_ink"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/engine_input"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/engine_server"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/engine_server" />
+
+            <RadioButton
+                android:id="@+id/engine_on_device"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/engine_on_device" />
+        </RadioGroup>
+
+        <TextView
+            android:id="@+id/on_device_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/import_model_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/import_model" />
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
@@ -160,6 +205,18 @@
             android:layout_marginTop="8dp"
             android:textColor="@color/starling_muted"
             android:textSize="14sp" />
+
+        <!-- Live partial transcript while the recording streams to a
+             Starling server; hidden when recording is plain or the stream
+             failed (the durable WAV then decides the final text). -->
+        <TextView
+            android:id="@+id/live_transcript"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:textColor="@color/starling_ink"
+            android:textSize="15sp"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/record_button"
@@ -203,5 +260,21 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
             android:text="@string/open_keyboard_settings" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/voice_input_intro"
+            android:textColor="@color/starling_muted"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/open_voice_input_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp"
+            android:text="@string/open_voice_input_settings" />
     </LinearLayout>
 </ScrollView>

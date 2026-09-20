@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,12 +76,80 @@ static void test_stitch_punctuation() {
     CHECK(r[3] == "foo");
 }
 
+// ---- non-ASCII stitch keys (issue #118) ------------------------------------
+// std::isalnum is false for every byte >= 0x80 in the default C locale, so the
+// old byte filter mapped Cyrillic/CJK words to "" and runs of empty keys then
+// matched as an overlap, deleting the new chunk's words at every window
+// boundary. These tests pin the conservative UTF-8-aware keys.
+static void test_stitch_unicode_disjoint() {
+    // Disjoint Cyrillic chunks must keep ALL words (the empty-key bug
+    // returned just the committed half: ["привет", "мир"]).
+    auto r = stitch_words({u8"привет", u8"мир"}, {u8"совсем", u8"другое"});
+    CHECK(r.size() == 4);
+    CHECK(r[0] == u8"привет");
+    CHECK(r[1] == u8"мир");
+    CHECK(r[2] == u8"совсем");
+    CHECK(r[3] == u8"другое");
+
+    // Disjoint CJK chunks keep all words too.
+    r = stitch_words({u8"你好", u8"世界"}, {u8"再见", u8"朋友"});
+    CHECK(r.size() == 4);
+    CHECK(r[0] == u8"你好");
+    CHECK(r[3] == u8"朋友");
+}
+
+static void test_stitch_unicode_overlap() {
+    // A genuine Cyrillic overlap still dedupes across the window boundary.
+    auto r = stitch_words({u8"привет", u8"мир", u8"тут"}, {u8"мир", u8"тут", u8"ок"});
+    CHECK(r.size() == 4);  // ["привет", "мир", "тут", "ок"]
+    CHECK(r[0] == u8"привет");
+    CHECK(r[2] == u8"тут");
+    CHECK(r[3] == u8"ок");
+
+    // CJK overlap dedupes.
+    r = stitch_words({u8"今天", u8"天气", u8"很好"}, {u8"天气", u8"很好", u8"吗"});
+    CHECK(r.size() == 4);
+    CHECK(r[3] == u8"吗");
+
+    // Mixed-script boundary: a shared Cyrillic run inside ASCII text dedupes.
+    r = stitch_words({"hello", u8"мир", u8"тут"}, {u8"мир", u8"тут", "ok"});
+    CHECK(r.size() == 4);  // ["hello", "мир", "тут", "ok"]
+    CHECK(r[0] == "hello");
+    CHECK(r[3] == "ok");
+
+    // ASCII punctuation around non-ASCII words is still stripped for keys.
+    r = stitch_words({u8"привет,", u8"мир."}, {u8"привет", u8"мир", "!"});
+    CHECK(r.size() == 3);  // committed spelling kept: ["привет,", "мир.", "!"]
+    CHECK(r[0] == u8"привет,");
+    CHECK(r[2] == "!");
+}
+
+static void test_stitch_empty_keys_never_match() {
+    // Words that normalize to "" (pure ASCII punctuation) must never count as
+    // an overlap run — defense in depth for issue #118: matching empty keys
+    // would drop the new chunk's leading words.
+    auto r = stitch_words({"--", ";;"}, {"..", ",,", "word"});
+    CHECK(r.size() == 5);
+    CHECK(r[4] == "word");
+}
+
 // ---- norm_word test -------------------------------------------------------
 static void test_norm_word() {
     CHECK(norm_word("Hello") == "hello");
     CHECK(norm_word("World!") == "world");
     CHECK(norm_word("it's") == "it's");
     CHECK(norm_word("") == "");
+
+    // Non-ASCII words keep their UTF-8 bytes: no more empty keys (issue #118).
+    CHECK(norm_word(u8"привет") == u8"привет");
+    CHECK(norm_word(u8"你好") == u8"你好");
+    CHECK(norm_word(u8"café") == u8"café");
+    // ASCII inside UTF-8 text: punctuation stripped, ASCII lowercased,
+    // non-ASCII bytes kept verbatim (no Unicode case folding — the key only
+    // has to be deterministic and identical across chunk boundaries).
+    CHECK(norm_word(u8"Привет, World!") == u8"Приветworld");
+    // Pure-ASCII punctuation still normalizes to the empty string.
+    CHECK(norm_word("--") == "");
 }
 
 // ---- split/join tests -----------------------------------------------------
@@ -144,7 +214,7 @@ static void test_chunk_streamer_partial() {
 
 static void test_chunk_streamer_flush() {
     ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
-    TranscribeFn tx = [&](const float* s, int64_t n) -> std::optional<std::string> {
+    TranscribeFn tx = [](const float*, int64_t) -> std::optional<std::string> {
         return "flushed";
     };
 
@@ -152,6 +222,29 @@ static void test_chunk_streamer_flush() {
     std::vector<float> samples(8000, 0.0f);
     auto text = cs.flush(samples, tx);
     CHECK(text == "flushed");
+}
+
+static void test_chunk_streamer_unicode_boundary() {
+    // Cyrillic transcripts on two overlapping windows (issue #118): the
+    // shared boundary words dedupe AND every unique word survives. With the
+    // old empty-key normalization the second window's words were dropped
+    // entirely at the boundary.
+    ChunkStreamer cs(16000, 1.0, 0.5, 0.5, 0.0);
+    int call = 0;
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+        ++call;
+        return call == 1 ? u8"привет мир сегодня" : u8"мир сегодня хорошая";
+    };
+
+    // 1 s of audio: one full window [0,16000) finalizes, then the tail
+    // [8000,16000) is transcribed for the partial — the tail's transcript
+    // overlaps the window's by two words.
+    std::vector<float> samples(16000, 0.0f);
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(*result == u8"привет мир сегодня хорошая");
+    CHECK(call == 2);
+    CHECK(cs.boundary() == 8000);
 }
 
 // ---- model slug mapping tests ---------------------------------------------
@@ -175,7 +268,7 @@ static void test_model_mapping() {
 
     // Exact equality pins the registry-derived ordering (a reordered or
     // duplicated row would change it).
-    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3 s1 audex");
+    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3 s1 audex ark06 voxtral");
 }
 
 // ---- ChunkStreamer::rebase -------------------------------------------------
@@ -345,6 +438,122 @@ static void test_stream_session_busy_retry() {
     CHECK(session.buffered_seconds() == 1.5);
 }
 
+// Build a minimal mono PCM16 RIFF/WAVE container around raw little-endian
+// sample bytes (the same shape audio_parser_test's make_wav produces;
+// StreamSession decodes it via audio::wav_bytes_to_float32).
+static std::string make_wav_bytes(int sample_rate, const std::string& pcm) {
+    auto le32 = [](uint32_t v) {
+        std::string s(4, '\0');
+        s[0] = static_cast<char>(v & 0xff);
+        s[1] = static_cast<char>((v >> 8) & 0xff);
+        s[2] = static_cast<char>((v >> 16) & 0xff);
+        s[3] = static_cast<char>((v >> 24) & 0xff);
+        return s;
+    };
+    auto le16 = [](uint16_t v) {
+        std::string s(2, '\0');
+        s[0] = static_cast<char>(v & 0xff);
+        s[1] = static_cast<char>((v >> 8) & 0xff);
+        return s;
+    };
+    const uint32_t data_size = static_cast<uint32_t>(pcm.size());
+    std::string h = "RIFF";
+    h += le32(36 + data_size);
+    h += "WAVE";
+    h += "fmt ";
+    h += le32(16);       // fmt chunk size
+    h += le16(1);        // PCM
+    h += le16(1);        // mono
+    h += le32(static_cast<uint32_t>(sample_rate));
+    h += le32(static_cast<uint32_t>(sample_rate) * 2);  // byte rate
+    h += le16(2);        // block align
+    h += le16(16);       // bits per sample
+    h += "data";
+    h += le32(data_size);
+    h += pcm;
+    return h;
+}
+
+static void test_stream_session_append_rejection() {
+    // issue #145: a refused binary frame (malformed WAV, non-16 kHz WAV,
+    // odd-length PCM) must be observable to the caller as a typed outcome
+    // and must invalidate the take: further audio is refused (TakeInvalid)
+    // until reset(), so an incomplete capture is never mistaken for a whole
+    // one. This pins the session half of the policy; the WS transport half
+    // (error frames + refused commit) is covered by test_native_serve.py.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return "ok";
+    });
+
+    // (1) Malformed RIFF/WAVE frame: decoder refuses, take invalidated.
+    // (Explicit length: the literal embeds NULs, so the const char*
+    // constructor would truncate it to "RIFF".)
+    const std::string malformed("RIFF\x00\x00\x00\x00WAVEjunk", 16);
+    CHECK(session.append_wav(malformed) == AppendOutcome::MalformedWav);
+    CHECK(session.take_invalid());
+    CHECK(session.invalid_reason() == "malformed_wav");
+    CHECK(session.buffered_seconds() == 0.0);
+
+    // (2) Further audio is refused with TakeInvalid (same reason).
+    CHECK(session.append_pcm(pcm_for_range(0, 1600)) == AppendOutcome::TakeInvalid);
+    CHECK(session.buffered_seconds() == 0.0);
+    CHECK(session.append_wav(malformed) == AppendOutcome::TakeInvalid);
+
+    // (3) reset() clears the invalidation and re-enables audio.
+    session.reset();
+    CHECK(!session.take_invalid());
+    CHECK(session.invalid_reason().empty());
+    CHECK(session.append_pcm(pcm_for_range(0, 1600)) == AppendOutcome::Accepted);
+    CHECK(session.buffered_seconds() == 0.1);
+
+    // (4) Valid -> invalid -> valid (the issue's regression sequence):
+    // audio before the rejection is retained, audio after it is refused.
+    session.reset();
+    CHECK(session.append_pcm(pcm_for_range(0, 8000)) == AppendOutcome::Accepted);
+    const std::string wav8k = make_wav_bytes(8000, std::string(16000, '\0'));
+    CHECK(session.append_wav(wav8k) == AppendOutcome::RateMismatch);
+    CHECK(session.invalid_reason() == "sample_rate_mismatch");
+    CHECK(session.buffered_seconds() == 0.5);  // pre-rejection audio kept
+    CHECK(session.append_pcm(pcm_for_range(8000, 8000)) == AppendOutcome::TakeInvalid);
+    CHECK(session.buffered_seconds() == 0.5);  // post-rejection audio refused
+    session.reset();
+    CHECK(session.append_pcm(pcm_for_range(0, 8000)) == AppendOutcome::Accepted);
+    CHECK(session.buffered_seconds() == 0.5);
+    CHECK(session.stream_flush() == "ok");     // clean take finalizes normally
+
+    // (5) 48 kHz WAV is refused the same way as 8 kHz.
+    session.reset();
+    const std::string wav48k = make_wav_bytes(48000, std::string(96000, '\0'));
+    CHECK(session.append_wav(wav48k) == AppendOutcome::RateMismatch);
+    CHECK(session.invalid_reason() == "sample_rate_mismatch");
+    CHECK(session.buffered_seconds() == 0.0);
+
+    // (6) Odd-length raw PCM (a split int16 sample): the whole frame is
+    // refused and the take invalidated — the dangling byte is not silently
+    // dropped.
+    session.reset();
+    std::string odd = pcm_for_range(0, 800);
+    odd.push_back('\x7f');
+    CHECK(session.append_pcm(odd) == AppendOutcome::OddPcmLength);
+    CHECK(session.invalid_reason() == "odd_pcm_length");
+    CHECK(session.buffered_seconds() == 0.0);
+    // Even-length frames stay accepted no-ops/append as before.
+    session.reset();
+    CHECK(session.append_pcm(std::string()) == AppendOutcome::Accepted);
+    CHECK(!session.take_invalid());
+
+    // (7) A 16 kHz WAV still appends (the rejection is about validity,
+    // not the WAV container itself).
+    session.reset();
+    const std::string wav16k =
+        make_wav_bytes(16000, pcm_for_range(0, 8000));
+    CHECK(session.append_wav(wav16k) == AppendOutcome::Accepted);
+    CHECK(!session.take_invalid());
+    CHECK(session.buffered_seconds() == 0.5);
+}
+
 static void test_bounded_retry_recovery() {
     for (bool flush : {false, true}) {
         ChunkStreamer cs(1, 12, 2, 5, 0);
@@ -387,21 +596,189 @@ static void test_bounded_retry_recovery() {
     CHECK(cs.boundary() == 30);
 }
 
+// ---- stream window config validation (issue #146) --------------------------
+// Negative/NaN/oversized stream window values used to reach the chunker, whose
+// member-init list computed advance_ from the unclamped overlap_: a negative
+// --stream-overlap-seconds made windows skip audio and let flush() call the
+// transcriber with a negative sample count. Validation now rejects these at
+// the CLI (before model load) and at construction, and every callback must
+// stay within (0, chunk].
+
+static void test_strict_number_parsing() {
+    // Full-string, finite-only parses for CLI flags (std::stod/std::stoi
+    // alone accept partial parses and non-finite tokens).
+    CHECK(parse_double_strict("3.5") == 3.5);
+    CHECK(parse_double_strict(" 2.5 ") == 2.5);
+    CHECK(parse_double_strict("-0.25") == -0.25);
+    CHECK(!parse_double_strict("3abc").has_value());   // trailing junk
+    CHECK(!parse_double_strict("nan").has_value());
+    CHECK(!parse_double_strict("inf").has_value());
+    CHECK(!parse_double_strict("-infinity").has_value());
+    CHECK(!parse_double_strict("").has_value());
+    CHECK(parse_int_strict("42") == 42);
+    CHECK(parse_int_strict(" -7 ") == -7);
+    CHECK(!parse_int_strict("8181abc").has_value());   // trailing junk
+    CHECK(!parse_int_strict("3.5").has_value());
+    CHECK(!parse_int_strict("99999999999999").has_value());  // out of int range
+    CHECK(!parse_int_strict("").has_value());
+}
+
+static void test_stream_window_config_error() {
+    auto err = [](double chunk, double overlap, double min, double partial) {
+        return stream_window_config_error(16000, chunk, overlap, min, partial);
+    };
+    // The shipped defaults and the legacy whole-buffer switch are valid.
+    CHECK(err(12.0, 3.0, 5.0, 3.0).empty());
+    CHECK(err(0.0, 3.0, 5.0, 3.0).empty());
+    // Everything else must be rejected with an error message.
+    CHECK(!err(-12.0, 3.0, 5.0, 3.0).empty());            // negative chunk
+    CHECK(!err(12.0, -3.0, 5.0, 3.0).empty());            // negative overlap
+    CHECK(!err(12.0, 12.0, 5.0, 3.0).empty());            // overlap == chunk
+    CHECK(!err(12.0, 13.0, 5.0, 3.0).empty());            // overlap > chunk
+    CHECK(!err(12.0, 3.0, -5.0, 3.0).empty());            // negative min
+    CHECK(!err(12.0, 3.0, 5.0, -3.0).empty());            // negative partial
+    CHECK(err(12.0, 3.0, 5.0, 0.0).empty());              // zero partial is fine
+    CHECK(!err(1e-9, 3.0, 5.0, 3.0).empty());             // sub-sample window
+    CHECK(!err(1e12, 3.0, 5.0, 3.0).empty());             // sample-count overflow
+    CHECK(!err(12.0, 3.0, 1e12, 3.0).empty());            // min-count overflow
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(!err(nan, 3.0, 5.0, 3.0).empty());
+    CHECK(!err(12.0, nan, 5.0, 3.0).empty());
+    CHECK(!err(12.0, 3.0, inf, 3.0).empty());
+    CHECK(!err(12.0, 3.0, 5.0, nan).empty());
+    CHECK(!stream_window_config_error(0, 12.0, 3.0, 5.0, 3.0).empty());  // bad rate
+}
+
+static void test_chunk_streamer_rejects_invalid_config() {
+    auto ctor_throws = [](int sr, double chunk, double overlap,
+                          double min, double partial) {
+        try {
+            ChunkStreamer(sr, chunk, overlap, min, partial);
+        } catch (const std::invalid_argument&) {
+            return true;
+        } catch (...) {
+            return true;
+        }
+        return false;
+    };
+    // The issue #146 repro (12 s window, -3 s overlap) and its neighbors.
+    CHECK(ctor_throws(16000, 12.0, -3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 12.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 13.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 0.0, 3.0, 5.0, 0.0));   // legacy mode is CLI-only
+    CHECK(ctor_throws(16000, -12.0, 3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 1e-9, 0.0, 5.0, 0.0));  // sub-sample window
+    CHECK(ctor_throws(16000, 1e12, 3.0, 5.0, 0.0));  // sample-count overflow
+    CHECK(ctor_throws(16000, 12.0, 3.0, -5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 3.0, 5.0, -1.0));
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    CHECK(ctor_throws(16000, nan, 3.0, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, inf, 5.0, 0.0));
+    CHECK(ctor_throws(16000, 12.0, 3.0, nan, 0.0));
+    CHECK(ctor_throws(0, 12.0, 3.0, 5.0, 0.0));
+    // Valid configurations still construct.
+    CHECK(!ctor_throws(16000, 12.0, 3.0, 5.0, 3.0));
+    CHECK(!ctor_throws(1, 12.0, 2.0, 5.0, 0.0));     // existing sr=1 tests
+}
+
+static void test_chunk_streamer_overlap_clamped_to_half_chunk() {
+    // Overlap above half the chunk keeps its documented clamp (half the
+    // chunk): 1 s chunks with 0.75 s requested overlap advance 0.5 s.
+    ChunkStreamer cs(16000, 1.0, 0.75, 0.5, 0.0);
+    TranscribeFn tx = [](const float*, int64_t) -> std::optional<std::string> {
+        return "w";
+    };
+    std::vector<float> samples(16000, 0.0f);
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(cs.boundary() == 8000);  // advance = 16000 - 8000
+}
+
+static void test_chunk_streamer_windows_stay_in_range() {
+    // The issue #146 invariant: every transcriber callback receives a
+    // nonempty window of at most one chunk, inside the buffered samples.
+    ChunkStreamer cs(16000, 12.0, 3.0, 5.0, 0.0);
+    std::vector<float> samples(16000 * 30, 0.0f);
+    const float* base = samples.data();
+    const float* end = base + samples.size();
+    int calls = 0;
+    TranscribeFn tx = [&](const float* data, int64_t n) -> std::optional<std::string> {
+        ++calls;
+        CHECK(n > 0);
+        CHECK(n <= 16000 * 12);
+        CHECK(data >= base);
+        CHECK(data + n <= end);
+        return "w";
+    };
+    auto partial = cs.step(samples, 1.0, tx);
+    CHECK(partial.has_value());
+    auto final_text = cs.flush(samples, tx);
+    CHECK(final_text.has_value());
+    CHECK(calls == 4);  // three 12 s windows + the 3 s flush tail
+}
+
+static void test_chunk_streamer_never_transcribes_empty_window() {
+    // min=0 with an exactly-consumed buffer: the partial-tail branch must
+    // not call the transcriber with a zero-length window.
+    ChunkStreamer cs(16000, 1.0, 0.0, 0.0, 0.0);
+    int calls = 0;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        ++calls;
+        CHECK(n > 0);
+        return "w";
+    };
+    std::vector<float> samples(16000, 0.0f);  // exactly one window
+    auto result = cs.step(samples, 1.0, tx);
+    CHECK(result.has_value());
+    CHECK(calls == 1);  // the full window only; no empty partial
+}
+
+static void test_stream_session_rejects_invalid_window_config() {
+    // StreamSession builds its ChunkStreamer from the server config: an
+    // invalid stream window config must fail at construction, never reach a
+    // live transcription session (the CLI rejects it even earlier).
+    ServerConfig cfg = test_cfg();
+    cfg.stream_overlap_seconds = -3.0;
+    StarlingServer server(cfg);
+    bool threw = false;
+    try {
+        StreamSession session(&server);
+        (void)session;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // ---- main -----------------------------------------------------------------
 int main() {
     test_stitch_basic();
     test_stitch_empty();
     test_stitch_no_match();
     test_stitch_punctuation();
+    test_stitch_unicode_disjoint();
+    test_stitch_unicode_overlap();
+    test_stitch_empty_keys_never_match();
     test_norm_word();
     test_split_join();
     test_chunk_streamer_basic();
     test_chunk_streamer_partial();
     test_chunk_streamer_flush();
+    test_chunk_streamer_unicode_boundary();
     test_chunk_streamer_rebase();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
+    test_stream_session_append_rejection();
     test_bounded_retry_recovery();
+    test_strict_number_parsing();
+    test_stream_window_config_error();
+    test_chunk_streamer_rejects_invalid_config();
+    test_chunk_streamer_overlap_clamped_to_half_chunk();
+    test_chunk_streamer_windows_stay_in_range();
+    test_chunk_streamer_never_transcribes_empty_window();
+    test_stream_session_rejects_invalid_window_config();
     test_model_mapping();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);

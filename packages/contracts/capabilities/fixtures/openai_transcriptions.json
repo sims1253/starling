@@ -1,0 +1,440 @@
+{
+  "name": "OpenAI-compatible batch transcription subset",
+  "route": "/v1/audio/transcriptions",
+  "protocol": "openai-subset",
+  "sources": [
+    "cpp/serve/main.cpp:757-824 (route handler and error envelope)",
+    "backends/native/tests/test_openai_api.py (deterministic fixture-engine bodies)",
+    "tests/test_native_serve.py (transport contract on the live server)",
+    "docs/api.md#supported-subset",
+    "packages/contracts/openapi.json (/v1/audio/transcriptions)"
+  ],
+  "cases": [
+    {
+      "name": "json response preserves raw text",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "parakeet" }],
+        "multipart_file": {
+          "name": "file",
+          "filename": "audio.wav",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.01 }
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "headers": { "X-Request-Id": "<generated or echoed>" },
+        "body_json": {
+          "text": "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙"
+        }
+      },
+      "note": "Fixture-engine transcript (test_openai_api.py:RAW); a real model returns its own raw recognition text with no cleanup."
+    },
+    {
+      "name": "plain text response format",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "response_format", "value": "text" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "filename": "audio.wav",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.01 }
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "text/plain; charset=utf-8",
+        "body_text": "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙"
+      }
+    },
+    {
+      "name": "compatibility defaults stream=false temperature=0 are accepted",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "stream", "value": "false" },
+          { "name": "temperature", "value": "0" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1, "duration_s": 0.01 }
+        }
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "text": "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙"
+        }
+      },
+      "note": "temperature=0.0 is equally accepted; any other value is an unsupported option."
+    },
+    {
+      "name": "missing model field",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Exactly one model field is required; use GET /v1/models",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "model not served by this process",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "other" }],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 404,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Requested model is not served by this process; use GET /v1/models",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null
+          }
+        }
+      },
+      "note": "One-model server: only the configured slug is served; selection cannot load another model."
+    },
+    {
+      "name": "text model rejects audio",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "s1" }],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "This model accepts text, not audio",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null
+          }
+        }
+      },
+      "note": "When the resident model is s1 (text path)."
+    },
+    {
+      "name": "unsupported option: prompt",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "prompt", "value": "auth" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "prompt",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "unsupported option: language",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "language", "value": "de" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "language",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "unsupported option: stream=true",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "stream", "value": "true" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "stream",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "unsupported option: nonzero temperature",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "temperature", "value": "0.7" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "temperature",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "unsupported option: verbose_json",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "response_format", "value": "verbose_json" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "response_format",
+            "code": null
+          }
+        }
+      },
+      "note": "verbose_json trips the generic unsupported-option branch before the response-format check."
+    },
+    {
+      "name": "unsupported option: word timestamp granularities",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "timestamp_granularities[]", "value": "word" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Unsupported transcription option; see /v1/starling/capabilities",
+            "type": "invalid_request_error",
+            "param": "timestamp_granularities[]",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "duplicate field",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [
+          { "name": "model", "value": "parakeet" },
+          { "name": "model", "value": "parakeet" }
+        ],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Duplicate field",
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "file part with the wrong name",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "parakeet" }],
+        "multipart_file": {
+          "name": "audio",
+          "filename": "audio.wav",
+          "audio": { "format": "wav", "sample_rate_hz": 16000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Exactly one audio file named file is required",
+            "type": "invalid_request_error",
+            "param": "file",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "non-multipart body",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "headers": { "Content-Type": "application/json" },
+        "body_json": { "model": "parakeet" }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "Expected multipart/form-data with file and model",
+            "type": "invalid_request_error",
+            "param": "file",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "compressed audio is not reinterpreted as PCM",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "parakeet" }],
+        "multipart_file": {
+          "name": "file",
+          "filename": "audio.mp3",
+          "audio": { "format": "mp3", "note": "b\"ID3 unsupported mp3 data\"" }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "This backend accepts 16 kHz WAV files; convert compressed audio before upload",
+            "type": "invalid_request_error",
+            "param": "file",
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "wrong sample rate gets the standard error envelope",
+      "request": {
+        "method": "POST",
+        "path": "/v1/audio/transcriptions",
+        "multipart_fields": [{ "name": "model", "value": "parakeet" }],
+        "multipart_file": {
+          "name": "file",
+          "audio": { "format": "wav", "sample_rate_hz": 48000, "channels": 1 }
+        }
+      },
+      "response": {
+        "status": 400,
+        "content_type": "application/json",
+        "body_json": {
+          "error": {
+            "message": "sample rate mismatch: expected 16000 got 48000",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null
+          }
+        }
+      },
+      "note": "The legacy handler's flat error string is re-wrapped in the OpenAI envelope; the native server has no resampler."
+    }
+  ]
+}

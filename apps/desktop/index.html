@@ -4,9 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#171813" />
+    <!-- connect-src (B01): http:/https: stay for the batch, health, and refine
+         fetches; loopback WebSocket origins (any port) cover the default
+         ws://127.0.0.1:8181/stream live-dictation URL and the browser
+         preview's page-origin ws proxy. Non-loopback ws/wss endpoints are not
+         statically enumerable, so the packaged app streams them over the
+         native bridge in electron/streamBridge.ts instead of widening this
+         policy. Keep in sync with src/connectPolicy.ts
+         (STATIC_CONNECT_SRC, asserted by src/connectPolicy.test.ts). -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' http: https:"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' http: https: ws://127.0.0.1:* ws://localhost:* ws://[::1]:* wss://127.0.0.1:* wss://localhost:* wss://[::1]:*"
     />
     <title>Starling</title>
   </head>

@@ -1,0 +1,25 @@
+{
+ "known_review_comment_ids": [
+  4056704921,
+  4057347666
+ ],
+ "known_issue_comment_ids": [
+  5749119974,
+  5749177081
+ ],
+ "last_review_comment_at": "2026-09-20T10:41:02Z",
+ "findings": [
+  {
+   "id": 4056704921,
+   "path": "cpp/tests/greedy_termination_test.cpp",
+   "severity": "other-medium",
+   "summary": "test binary not in ci-starling-serve.yml explicit target/run lists"
+  },
+  {
+   "id": 4057347666,
+   "severity": "other-medium",
+   "summary": "REPEAT of CI-wiring finding - CORRECT for this branch: R18 wiring landed on program/wave-a only; engine branches still build explicit target lists without the new tests"
+  }
+ ],
+ "notes": "same code-review failure at open"
+}

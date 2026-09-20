@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "snapshot-1",
+  "capture_id": "take-1",
+  "adapter_id": "vscode-example",
+  "captured_at": "2026-09-20T12:00:00Z",
+  "expires_at": "2026-09-20T12:05:00Z",
+  "secure_field": false,
+  "granted_sources": [
+    "app_identity",
+    "selection"
+  ],
+  "capabilities": {
+    "selection": true,
+    "document_version": true,
+    "content_digest": true,
+    "conditional_apply": true
+  },
+  "target": {
+    "app_id": "vscode",
+    "window_id": "example-window",
+    "document_id": "example-document",
+    "document_version": 3,
+    "range": [
+      0,
+      15
+    ],
+    "offset_encoding": "utf16",
+    "content_sha256": "a7d3ae306be2c4d3d71690acce275be5f3a15bee72c3d313eca1d0874c2d3544",
+    "conditional_apply_supported": true
+  },
+  "selected_text": "never drop auth"
+}

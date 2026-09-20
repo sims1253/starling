@@ -10,9 +10,18 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: {
+    // IPv4 loopback so the dev launcher's 127.0.0.1 health poll and renderer URL resolve.
+    host: "127.0.0.1",
     port: 1420,
     strictPort: true,
     proxy: {
+      // Listed before "/api" so the longer prefix wins: WebSocket upgrades
+      // for live streaming need ws:true and the same /api strip.
+      "/api/stream": {
+        target: apiTarget.replace(/^http/, "ws"),
+        ws: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
       "/api": {
         target: apiTarget,
         changeOrigin: true,

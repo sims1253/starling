@@ -40,6 +40,9 @@ struct ggml_tensor;
 struct ggml_cgraph;
 struct ggml_backend;
 typedef struct ggml_backend* ggml_backend_t;
+// Same tag spelling as ggml-backend.h (which declares it non-opaquely).
+struct ggml_backend_device;
+typedef struct ggml_backend_device* ggml_backend_dev_t;
 struct ggml_gallocr;
 typedef struct ggml_gallocr* ggml_gallocr_t;
 
@@ -69,6 +72,11 @@ public:
     // GPU, where launch overhead dominates; callers gate on this).
     bool is_gpu() const;
 
+    // Device free memory in bytes, re-queried from the device on each call;
+    // -1 when the selected device cannot report it (never fabricated). Used
+    // by the STARLING_TRACE cache records; not a hot path.
+    long long device_memory_free() const;
+
     // The underlying ggml backend handle. Exposed so the loader can place
     // weight tensors in a buffer on the SAME backend graphs run on.
     ggml_backend_t handle() const;
@@ -91,6 +99,9 @@ private:
     std::unique_ptr<Impl> impl_;
     int   n_threads_ = 1;
     std::string device_name_ = "cpu";
+    // The selected registry device (null when only the CPU fallback engaged);
+    // retained for the trace-only memory queries.
+    ggml_backend_dev_t dev_ = nullptr;
 
     friend class ReplayGraph;
 };
@@ -146,6 +157,31 @@ void ensure_weights_realized(const ModelLoader& ml);
 // batch-norm folding). NOT for graph leaves (use clone_weight).
 void weight_to_host_f32(const ModelLoader& ml, const char* name,
                         std::vector<float>& out);
+
+// One captured-graph node an accelerator backend rejected (issue #184), with
+// the details the STARLING_SCHED_DEBUG report prints — kept as data so the
+// enumeration can be unit-tested without a GPU backend.
+struct UnsupportedGraphNode {
+    int         node_index;  // index into the cgraph's node list
+    std::string op;          // ggml_op_name of the node (e.g. "UNARY")
+    std::string dst_type;    // ggml_type_name of the node's own type
+    std::string srcs;        // "src0=f32(VIEW,STRIDED) src1=f32(MUL_MAT,cont)"
+};
+
+// Enumerate EVERY cgraph node for which `supports` returns false. Used by
+// ReplayGraph::alloc_internal with ggml_backend_supports_op; tests inject a
+// fake predicate. Never stops at the first rejection: the parakeet CUDA graph
+// of issue #184 had one rejected node per conformer layer, and naming only
+// the first hid the pattern. Null node slots are skipped. (The pinned ggml's
+// graph accessors are non-const, so the parameter is too.)
+std::vector<UnsupportedGraphNode> enumerate_unsupported_graph_nodes(
+    ggml_cgraph* gf,
+    const std::function<bool(const ggml_tensor*)>& supports);
+
+// One sched-dbg report line for an entry, e.g.
+//   "node 96/1845: op=UNARY dst=f32 src0=f32(VIEW,STRIDED)"
+std::string format_unsupported_graph_node(const UnsupportedGraphNode& node,
+                                          int n_nodes);
 
 // A graph built once and replayed many times, keeping the same ggml context +
 // cgraph alive so ggml-cuda can capture + replay it. Callers feed fresh input

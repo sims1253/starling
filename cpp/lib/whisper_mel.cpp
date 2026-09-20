@@ -149,6 +149,11 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
     }
     float mx = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < nthr; ++i) mx = std::max(mx, chunk_max[i]);
+    // Fixed global log-mel max (voxtral): a finite fixed_log_mel_max replaces
+    // the computed per-utterance max as the clamp/normalize reference (the
+    // stock global_log_mel_max=1.5; a per-utterance max would leak future
+    // audio). NaN (default) keeps the legacy per-utterance max.
+    if (!std::isnan(p.fixed_log_mel_max)) mx = (float) p.fixed_log_mel_max;
     out.n_mels = M;
     out.n_frames = T;
     out.f32.resize(M * T);

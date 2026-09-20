@@ -24,6 +24,15 @@ class EndpointPolicyTest {
     }
 
     @Test
+    fun cgnatVpnHostsNeedOptInAndRangeCheck() {
+        assertTrue(EndpointPolicy.validate("http://100.101.42.1:8181", false) is EndpointValidation.Invalid)
+        assertTrue(EndpointPolicy.validate("http://100.63.1.20:8181", true) is EndpointValidation.Invalid)
+        assertTrue(EndpointPolicy.validate("http://100.64.0.1:8181", true) is EndpointValidation.Valid)
+        assertTrue(EndpointPolicy.validate("http://100.127.255.254:8181", true) is EndpointValidation.Valid)
+        assertTrue(EndpointPolicy.validate("http://100.128.1.20:8181", true) is EndpointValidation.Invalid)
+    }
+
+    @Test
     fun credentialsAndFragmentsAreRejected() {
         assertTrue(EndpointPolicy.validate("https://user:secret@server.example", false) is EndpointValidation.Invalid)
         assertTrue(EndpointPolicy.validate("https://server.example/inference?token=secret", false) is EndpointValidation.Invalid)

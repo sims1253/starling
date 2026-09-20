@@ -1,0 +1,18 @@
+{
+  "machine": "context",
+  "description": "Command illegal in the current state: mode.set in Observing, before any target snapshot exists. A mode decision is made against a snapshot (SnapshotTaken) or replaces an earlier decision (ModeDecided); it is also forbidden once RouteFrozen because a later decision cannot un-send audio.",
+  "initial": "Observing",
+  "schema_valid": true,
+  "replay": "illegal_command",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_940",
+      "ts": "2026-09-20T10:09:40Z",
+      "corr": "ctx-9",
+      "seq": 1,
+      "type": "mode.set",
+      "payload": { "mode": "code-guidance", "source": "manual" }
+    }
+  ]
+}

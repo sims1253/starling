@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Comparable to a standard keyboard. Living in a dimen keeps the
+         height adjustable for font scale or other configurations. -->
+    <dimen name="keyboard_height">260dp</dimen>
+</resources>

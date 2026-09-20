@@ -1,0 +1,319 @@
+[
+  {
+    "name": "default",
+    "request": {
+      "raw_text": "Keep the word never."
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "Keep the word never.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "vscode_rule",
+    "request": {
+      "raw_text": "Add a retry button.",
+      "app_id": "vscode"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "rule:vscode-guidance",
+      "payload": "Add a retry button.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "notes_rule_is_literal",
+    "request": {
+      "raw_text": "code this: keep these words",
+      "app_id": "notes"
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "rule:notes-verbatim",
+      "payload": "code this: keep these words",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "leading_alias",
+    "request": {
+      "raw_text": "Code this: add a retry button, but never send Enter."
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add a retry button, but never send Enter.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "leading_whitespace",
+    "request": {
+      "raw_text": "  code this add tests"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add tests",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "mid_sentence",
+    "request": {
+      "raw_text": "We should say code this in our documentation."
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "We should say code this in our documentation.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "quoted_prefix",
+    "request": {
+      "raw_text": "\"code this\" is an example."
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "\"code this\" is an example.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "boundary",
+    "request": {
+      "raw_text": "code thisway stays literal"
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "code thisway stays literal",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "literal_escape",
+    "request": {
+      "raw_text": "literal code this is an example"
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "escape:literal",
+      "payload": "code this is an example",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "locked_manual",
+    "request": {
+      "raw_text": "code this: keep the phrase",
+      "manual_mode": "verbatim"
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "manual",
+      "payload": "code this: keep the phrase",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "locked_faithful",
+    "request": {
+      "raw_text": "code this: keep the phrase",
+      "manual_mode": "faithful"
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "manual",
+      "payload": "code this: keep the phrase",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "manual_unlocked",
+    "request": {
+      "raw_text": "code this: add logs",
+      "manual_mode": "faithful",
+      "manual_locked": false
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add logs",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "required_selection_missing",
+    "request": {
+      "raw_text": "edit this: shorten it"
+    },
+    "expected": {
+      "mode": "edit-selection",
+      "source": "phrase:edit this",
+      "payload": "shorten it",
+      "status": "needs_input"
+    }
+  },
+  {
+    "name": "required_selection_ready",
+    "request": {
+      "raw_text": "edit this: shorten it",
+      "selection_available": true,
+      "selection_granted": true
+    },
+    "expected": {
+      "mode": "edit-selection",
+      "source": "phrase:edit this",
+      "payload": "shorten it",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "selection_not_granted",
+    "request": {
+      "raw_text": "explain this: why?",
+      "selection_available": true
+    },
+    "expected": {
+      "mode": "ask-selection",
+      "source": "phrase:explain this",
+      "payload": "why?",
+      "status": "needs_input"
+    }
+  },
+  {
+    "name": "ask_no_replace",
+    "request": {
+      "raw_text": "explain this: what is the type?",
+      "selection_available": true,
+      "selection_granted": true
+    },
+    "expected": {
+      "mode": "ask-selection",
+      "source": "phrase:explain this",
+      "payload": "what is the type?",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "alias_only",
+    "request": {
+      "raw_text": "code this"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "",
+      "status": "needs_input"
+    }
+  },
+  {
+    "name": "empty",
+    "request": {
+      "raw_text": "  "
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "  ",
+      "status": "needs_input"
+    }
+  },
+  {
+    "name": "private_target",
+    "request": {
+      "raw_text": "hello",
+      "secure_field": true
+    },
+    "expected": {
+      "mode": null,
+      "source": "policy:secure-field",
+      "payload": "hello",
+      "status": "blocked"
+    }
+  },
+  {
+    "name": "site_rule",
+    "request": {
+      "raw_text": "Keep auth unchanged.",
+      "site": "github.com"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "rule:github-guidance",
+      "payload": "Keep auth unchanged.",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "lookalike_site",
+    "request": {
+      "raw_text": "hello",
+      "site": "github.com.attacker.example"
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "hello",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "session_aliases_off",
+    "request": {
+      "raw_text": "code this: preserve",
+      "session_allows_aliases": false
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "code this: preserve",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "capture",
+    "request": {
+      "raw_text": "save note: agreed"
+    },
+    "expected": {
+      "mode": "capture",
+      "source": "phrase:save note",
+      "payload": "agreed",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "verbatim_manual_unlocked_still_literal",
+    "request": {
+      "raw_text": "edit this: not a command",
+      "manual_mode": "verbatim",
+      "manual_locked": false
+    },
+    "expected": {
+      "mode": "verbatim",
+      "source": "manual",
+      "payload": "edit this: not a command",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "numeric_list",
+    "request": {
+      "raw_text": "5. Never change auth. 6. Like, keep this."
+    },
+    "expected": {
+      "mode": "faithful",
+      "source": "default",
+      "payload": "5. Never change auth. 6. Like, keep this.",
+      "status": "ready"
+    }
+  }
+]

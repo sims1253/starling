@@ -45,7 +45,7 @@ private:
     };
     struct ReplayCache {
         LruCache<int, ReplayEntry> by_T;
-        explicit ReplayCache(size_t cap) : by_T(cap) {}
+        explicit ReplayCache(size_t cap) : by_T(cap, "parakeet.encoder") {}
         void clear() { by_T.clear(); }
     };
 

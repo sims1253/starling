@@ -1,20 +1,41 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   globalShortcut,
   ipcMain,
+  safeStorage,
   session,
+  type IpcMainEvent,
   type IpcMainInvokeEvent,
 } from "electron";
 import { Data, Effect, Option, Schema } from "effect";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
+import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
+import { storeRefinementKeySafe } from "./keyProtection.js";
+import { StreamBridge, type StreamSink } from "./streamBridge.js";
 import {
   HealthInputSchema,
+  RefinementKeyLoadInputSchema,
+  RefinementKeySaveInputSchema,
+  StreamCloseInputSchema,
+  StreamCommandInputSchema,
+  StreamOpenInputSchema,
+  StreamSendInputSchema,
   TranscribeInputSchema,
   type DesktopDiagnostics,
   type HealthInput,
+  type PendingAudioState,
+  type RefinementKeyLoadInput,
+  type RefinementKeySaveInput,
+  type RefinementKeySaveResult,
+  type RefinementKeyLoadResult,
+  type StreamCloseInput,
+  type StreamCommandInput,
+  type StreamOpenInput,
+  type StreamSendInput,
   type TranscribeInput,
   type TranscriptionResult,
   type ServerHealth,
@@ -39,6 +60,52 @@ let readyToShowMs: number | undefined;
 let rendererReady = false;
 
 let pendingToggle = false;
+
+// The renderer's mirror of audio that exists only in its memory (#121). The
+// close guard reads it synchronously when a close or quit must be gated.
+let pendingAudio: PendingAudioState = { recording: false, finalizing: false, unsavedCount: 0 };
+
+let quitting = false;
+
+// How long an explicit Discard waits for the renderer to delete a durable
+// streaming journal before the window is destroyed anyway.
+const DISCARD_CLEANUP_BUDGET_MS = 400;
+
+/**
+ * After an explicit Discard, ask the renderer to drop its durable streaming
+ * journal, then wait (bounded) for the confirmation so the window is not
+ * destroyed mid-delete. A renderer that never replies — hung, or an older
+ * build without the channel — times out and the journal survives, which
+ * recovery turns into a retryable session on next start: fail-safe.
+ */
+function discardPendingAudio(window: BrowserWindow): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const settle = (): void => {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timer);
+      ipcMain.removeListener("starling:discard-cleaned", onCleaned);
+      resolve();
+    };
+
+    const timer = setTimeout(settle, DISCARD_CLEANUP_BUDGET_MS);
+
+    const onCleaned = (event: IpcMainEvent): void => {
+      // Same trust rule as every renderer→main channel: an unconfirmed
+      // sender simply never confirms, and the budget expires instead.
+      if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
+      settle();
+    };
+
+    ipcMain.on("starling:discard-cleaned", onCleaned);
+
+    window.webContents.send("starling:discard-pending");
+  });
+}
 
 class RequestInputError extends Data.TaggedError("RequestInputError")<{
   readonly message: string;
@@ -331,6 +398,39 @@ function transcribeProgram(input: TranscribeInput) {
   });
 }
 
+/**
+ * Store the refinement API key under the host's secret store (B10). The
+ * decision lives in keyProtection.ts: ciphertext is produced only by a real
+ * OS secret store — never by Linux's basic_text fallback, whose hardcoded
+ * password is not protection — and every other outcome reports its status
+ * instead of throwing, so the renderer can demand an explicit choice before
+ * any plaintext persists. The result never carries the key itself.
+ */
+function storeRefinementKeyProgram(
+  input: RefinementKeySaveInput,
+): Effect.Effect<RefinementKeySaveResult, never> {
+  return Effect.sync(() => storeRefinementKeySafe(safeStorage, process.platform, input.apiKey));
+}
+
+/**
+ * Decrypt a previously stored ciphertext. Undecryptable input (corrupt or
+ * produced by another app/origin) resolves apiKey null instead of failing:
+ * losing the key only disables hosted refinement, it must never block use.
+ */
+function loadRefinementKeyProgram(
+  input: RefinementKeyLoadInput,
+): Effect.Effect<RefinementKeyLoadResult, never> {
+  return Effect.sync(() => {
+    if (!safeStorage.isEncryptionAvailable()) return { apiKey: null };
+
+    try {
+      return { apiKey: safeStorage.decryptString(Buffer.from(input.ciphertext, "base64")) };
+    } catch {
+      return { apiKey: null };
+    }
+  });
+}
+
 function trustedRenderer(raw: string): boolean {
   try {
     const url = new URL(raw);
@@ -346,6 +446,35 @@ function trustedRenderer(raw: string): boolean {
 function validateSender(event: IpcMainInvokeEvent): void {
   if (!event.senderFrame || !trustedRenderer(event.senderFrame.url))
     throw new RequestInputError({ message: "Request rejected from an untrusted window." });
+}
+
+/**
+ * The packaged app's live-streaming sockets live in the main process (B01):
+ * the renderer's static CSP cannot enumerate user-configured LAN ws:// or
+ * wss:// endpoints, so the renderer drives its takes over the IPC channels
+ * below instead of opening a WebSocket itself. The endpoint arrives under the
+ * same validation as the batch channels, and the ws/wss derivation happens
+ * only here.
+ */
+const streamBridge = new StreamBridge();
+
+function streamTransportError(cause: unknown): RequestTransportError {
+  return new RequestTransportError({
+    message: cause instanceof Error ? cause.message : "The streaming connection failed.",
+    cause,
+  });
+}
+
+/** Route one stream's events to the WebContents that opened it, until it dies. */
+function streamSink(event: IpcMainInvokeEvent): StreamSink {
+  const contents = event.sender;
+
+  return {
+    send: (message) => {
+      if (!contents.isDestroyed()) contents.send("starling:stream:event", message);
+    },
+    onceDestroyed: (cleanup) => contents.once("destroyed", cleanup),
+  };
 }
 
 function runForSender<A, E>(event: IpcMainInvokeEvent, effect: Effect.Effect<A, E>): Promise<A> {
@@ -392,6 +521,27 @@ ipcMain.handle("starling:transcribe", (event, input: TranscribeInput) =>
   ),
 );
 
+// Same trust rule and decode-at-the-boundary recipe as the channels above:
+// only the trusted renderer may hand keys in for encryption or ciphertexts
+// in for decryption.
+ipcMain.handle("starling:refine-key:save", (event, input: RefinementKeySaveInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(RefinementKeySaveInputSchema)(input).pipe(
+      Effect.flatMap(storeRefinementKeyProgram),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:refine-key:load", (event, input: RefinementKeyLoadInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(RefinementKeyLoadInputSchema)(input).pipe(
+      Effect.flatMap(loadRefinementKeyProgram),
+    ),
+  ),
+);
+
 ipcMain.handle("starling:diagnostics", (event) => {
   validateSender(event);
 
@@ -401,6 +551,67 @@ ipcMain.handle("starling:diagnostics", (event) => {
     });
 
   return diagnostics();
+});
+
+// Streaming transport channels (B01): decode at the boundary, then hand the
+// validated payload to the bridge. Failures reject with the transport wording
+// the preload's readableRejection already knows how to surface.
+ipcMain.handle("starling:stream:open", (event, input: StreamOpenInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamOpenInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.gen(function* () {
+          // Input-error wording parity with the batch channels; the bridge
+          // applies the same rule when it derives the ws(s):// URL.
+          yield* cleanEndpoint(decoded.endpoint);
+
+          return yield* Effect.tryPromise({
+            try: () => streamBridge.open(decoded, streamSink(event)),
+            catch: (cause) => streamTransportError(cause),
+          });
+        }),
+      ),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:stream:send", (event, input: StreamSendInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamSendInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.tryPromise({
+          try: () => streamBridge.send(decoded),
+          catch: (cause) => streamTransportError(cause),
+        }),
+      ),
+    ),
+  ),
+);
+
+ipcMain.handle("starling:stream:command", (event, input: StreamCommandInput) =>
+  runForSender(
+    event,
+    Schema.decodeUnknownEffect(StreamCommandInputSchema)(input).pipe(
+      Effect.flatMap((decoded) =>
+        Effect.tryPromise({
+          try: () => streamBridge.command(decoded),
+          catch: (cause) => streamTransportError(cause),
+        }),
+      ),
+    ),
+  ),
+);
+
+// Fire-and-forget teardown from the renderer's close(): no reply is needed,
+// and a dropped packet only strands a socket the destroyed cleanup reaps.
+ipcMain.on("starling:stream:close", (event, input: StreamCloseInput) => {
+  if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
+  const decoded = Schema.decodeUnknownOption(StreamCloseInputSchema)(input);
+
+  if (Option.isSome(decoded)) streamBridge.close(decoded.value.streamId);
 });
 
 ipcMain.on("starling:renderer-ready", (event) => {
@@ -413,8 +624,17 @@ ipcMain.on("starling:renderer-ready", (event) => {
   }
 });
 
+ipcMain.on("starling:pending-audio", (event, state: PendingAudioState) => {
+  if (!event.senderFrame || !trustedRenderer(event.senderFrame.url)) return;
+
+  const parsed = parsePendingAudio(state);
+
+  if (parsed) pendingAudio = parsed;
+});
+
 function createWindow(): BrowserWindow {
   rendererReady = false;
+  pendingAudio = { recording: false, finalizing: false, unsavedCount: 0 };
 
   const window = new BrowserWindow({
     title: "Starling",
@@ -449,6 +669,71 @@ function createWindow(): BrowserWindow {
     if (!trustedRenderer(event.url)) event.preventDefault();
   });
 
+  // Closing the window, quitting the app, or reloading the renderer destroys
+  // audio that exists only in renderer memory (#121). Only an explicit
+  // Discard in a native dialog may proceed past this gate.
+  const confirmDiscard = (detail: string): boolean =>
+    dialog.showMessageBoxSync(window, {
+      type: "warning",
+      title: "Discard unsaved audio?",
+      message: "Discard unsaved audio?",
+      detail,
+      buttons: ["Discard", "Cancel"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }) === 0;
+
+  // Bumped by every close request; a discard winding down checks it before
+  // destroying so a second dialog the user cancelled is never overridden.
+  let closeRequests = 0;
+
+  window.on("close", (event) => {
+    closeRequests += 1;
+
+    const detail = pendingAudioWarning(pendingAudio);
+
+    if (!detail) return;
+
+    event.preventDefault();
+
+    if (!confirmDiscard(detail)) {
+      // cancelled: keep the window open and abort any quit in progress
+      quitting = false;
+
+      return;
+    }
+
+    // Discard: give a responsive renderer a beat to drop its durable
+    // streaming journal, so the take cannot resurrect on next start; a hung
+    // renderer times out and keeps the journal (fail-safe toward recovery).
+    // destroy() skips this handler. A quit in progress still completes once
+    // the last window is gone; the explicit restart is a cross-version
+    // safety net, not a requirement on current Electron. If another close
+    // request arrived while this budget ran — the nested dialog lets the
+    // user reconsider — this flow stands down for that decision instead.
+    const request = closeRequests;
+
+    void discardPendingAudio(window).then(() => {
+      if (request !== closeRequests) return;
+
+      window.destroy();
+
+      if (quitting) app.quit();
+    });
+  });
+
+  // The renderer's beforeunload handler blocks reloads while audio is at
+  // risk; preventDefault here ignores that handler and lets the reload
+  // through — only after an explicit Discard. A reload cannot wait out the
+  // journal delete, so a journaled take is told it will be recovered, not
+  // deleted.
+  window.webContents.on("will-prevent-unload", (event) => {
+    const detail = pendingAudioReloadWarning(pendingAudio) ?? "Reload discards unsaved audio.";
+
+    if (confirmDiscard(detail)) event.preventDefault();
+  });
+
   if (rendererUrl) void window.loadURL(rendererUrl);
   else void window.loadFile(packagedRenderer);
 
@@ -456,20 +741,22 @@ function createWindow(): BrowserWindow {
 }
 
 void app.whenReady().then(() => {
+  // clipboard-sanitized-write backs navigator.clipboard.writeText; clipboard reads stay denied.
   session.defaultSession.setPermissionCheckHandler(
     (contents, permission, _requestingOrigin, details) =>
-      permission === "media" &&
+      (permission === "clipboard-sanitized-write" ||
+        (permission === "media" && details.mediaType === "audio")) &&
       contents !== null &&
       details.isMainFrame &&
-      details.mediaType === "audio" &&
       trustedRenderer(details.requestingUrl ?? ""),
   );
   session.defaultSession.setPermissionRequestHandler((_contents, permission, callback, details) => {
     callback(
-      permission === "media" &&
-        "mediaTypes" in details &&
-        details.mediaTypes?.length === 1 &&
-        details.mediaTypes.every((type) => type === "audio") &&
+      (permission === "clipboard-sanitized-write" ||
+        (permission === "media" &&
+          "mediaTypes" in details &&
+          details.mediaTypes?.length === 1 &&
+          details.mediaTypes.every((type) => type === "audio"))) &&
         details.isMainFrame &&
         trustedRenderer(details.requestingUrl),
     );
@@ -495,7 +782,16 @@ void app.whenReady().then(() => {
   });
 });
 
-app.on("will-quit", () => globalShortcut.unregisterAll());
+app.on("before-quit", () => {
+  quitting = true;
+});
+
+app.on("will-quit", () => {
+  globalShortcut.unregisterAll();
+
+  // Live takes cannot survive the process; close their sockets before exit.
+  streamBridge.closeAll();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

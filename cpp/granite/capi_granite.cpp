@@ -1,7 +1,8 @@
 // capi_granite.cpp — granite-speech-4.1-2b C API entry points behind the
 // shared shell. C API flow: load -> (chunk policy) -> per chunk {mel -> encode
 // +project -> prompt/embeds -> greedy decode -> detokenize} -> join, with a
-// STARLING_GRANITE_TIMING phase-timing gate.
+// STARLING_GRANITE_TIMING phase-timing gate (per-chunk summaries plus a
+// whole-request aggregate; see stage_timing.hpp).
 //
 // The chunk policy mirrors the Python server path (GraniteBackend.transcribe)
 // exactly: audio up to min(30 s, (max_new_tokens-32)/5) goes through single
@@ -16,9 +17,11 @@
 #include "encoder.hpp"
 #include "prompt.hpp"
 #include "llm.hpp"
+#include "stage_timing.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/backend.hpp"
+#include "runtime/trace.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -47,6 +50,8 @@ int32_t decode_budget(const starling::ggml::granite::Config& c, double duration_
 }
 
 // One chunk through mel -> encoder+projector -> prompt -> greedy -> text.
+// stage_ms (optional) receives THIS chunk's three stage durations — the
+// caller accumulates them across chunks via StageTiming (stage_timing.hpp).
 bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budget,
                       std::string& text, double* stage_ms = nullptr) {
     using namespace starling::ggml::granite;
@@ -80,6 +85,17 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
         stage_ms[0] = ms(t0, t1);  // mel + encode + project
         stage_ms[1] = ms(t1, t2);  // prompt + embeds
         stage_ms[2] = ms(t2, t3);  // generate
+    }
+    if (starling::ggml::trace::on()) {
+        // Same clocks as stage_ms (single source: the trace and the
+        // STARLING_GRANITE_TIMING lines cannot disagree). Chunk index comes
+        // from the enclosing ChunkScope's thread-local correlation.
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        starling::ggml::trace::stage_event("mel_enc_proj", ms(t0, t1));
+        starling::ggml::trace::stage_event("prompt_embeds", ms(t1, t2));
+        starling::ggml::trace::stage_event("generate", ms(t2, t3));
     }
     return true;
 }
@@ -153,16 +169,42 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
         const double duration_s = (double) n / kSampleRate;
 
         std::vector<std::string> texts;
-        double stage_ms[3] = {0, 0, 0};
-        if (chunk_samples <= 0 || n <= chunk_samples) {
+        StageTiming stages;  // accumulates every chunk's stage durations
+        // One piece through the pipeline + timing bookkeeping. Fills `text`,
+        // accumulates the piece's stages, and emits the per-chunk summary
+        // line under the timing gate. ChunkScope numbers the runtime-layer
+        // trace records (graph replays, cache events) with this chunk's
+        // 1-based index; the chunk record itself closes the scope so its
+        // wall time covers exactly what the scope covered.
+        auto run_piece = [&](const float* pcm_piece, int64_t piece_n, int32_t budget) {
+            double piece_ms[kStageCount] = {0, 0, 0};
             std::string text;
-            if (!transcribe_piece(*c, pcm, n, decode_budget(cfg, duration_s), text,
-                                  stage_ms))
+            const bool tr_on = starling::ggml::trace::on();
+            const auto t_piece0 = std::chrono::steady_clock::now();
+            bool ok;
             {
+                starling::ggml::trace::ChunkScope chunk_scope(stages.chunks + 1);
+                ok = transcribe_piece(*c, pcm_piece, piece_n, budget, text, piece_ms);
+            }
+            if (tr_on && ok) {
+                starling::ggml::trace::chunk_event(stages.chunks + 1,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_piece0).count());
+            }
+            if (!ok) {
                 report(err_out, c->err);
-                return nullptr;
+                return false;
             }
             texts.push_back(std::move(text));
+            stages.add_chunk(piece_ms);
+            if (timing)
+                std::fprintf(stderr, "%s\n",
+                    format_stage_chunk_line(stages, stages.chunks).c_str());
+            return true;
+        };
+        if (chunk_samples <= 0 || n <= chunk_samples) {
+            if (!run_piece(pcm, n, decode_budget(cfg, duration_s)))
+                return nullptr;
         } else {
             std::vector<float> padded((size_t) chunk_samples, 0.0f);
             for (int64_t start = 0; start < n; start += chunk_samples) {
@@ -185,26 +227,24 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
                 const int64_t headroom =
                     (int64_t) cfg.llm.max_cache - prompt_len - 1;
                 if ((int64_t) budget > headroom) budget = (int32_t) std::max<int64_t>(1, headroom);
-                std::string text;
-                if (!transcribe_piece(*c, padded.data(), chunk_samples, budget, text,
-                                      stage_ms))
-                {
-                    report(err_out, c->err);
+                if (!run_piece(padded.data(), chunk_samples, budget))
                     return nullptr;
-                }
-                texts.push_back(std::move(text));
             }
         }
+        // Whole-request wall time covers the chunk loop AND the final text
+        // join, so join_texts is attributed to bookkeeping, not silently
+        // dropped from the request summary (the output-buffer malloc/copy is
+        // response emission and stays outside).
+        const std::string text = join_texts(texts);
         auto t_end = now();
         if (timing) {
-            std::fprintf(stderr,
-                "GRANITE_STAGE chunks=%zu audio=%.2fs mel+enc+proj=%.1fms "
-                "prompt+embeds=%.1fms gen=%.1fms total=%.1fms\n",
-                texts.size(), duration_s, stage_ms[0], stage_ms[1], stage_ms[2],
-                std::chrono::duration<double, std::milli>(t_end - t_start).count());
+            std::fprintf(stderr, "%s\n",
+                format_stage_request_line(
+                    stages, duration_s,
+                    std::chrono::duration<double, std::milli>(t_end - t_start).count())
+                    .c_str());
         }
 
-        const std::string text = join_texts(texts);
         char* out = static_cast<char*>(std::malloc(text.size() + 1));
         if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
         std::memcpy(out, text.data(), text.size());

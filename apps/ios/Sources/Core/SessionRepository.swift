@@ -1,16 +1,46 @@
 import Foundation
+import os
+
+private let sessionLogger = Logger(subsystem: "dev.starling.voice", category: "SessionRepository")
 
 public enum SessionRepositoryError: LocalizedError, Equatable {
     case missingRecording(UUID)
     case missingSession(UUID)
     case unsupportedSchema(Int)
+    case pendingRecoveryFailed([String])
 
     public var errorDescription: String? {
         switch self {
         case .missingRecording: "The saved recording is missing."
         case .missingSession: "The saved dictation session is missing."
         case let .unsupportedSchema(version): "Session schema version \(version) is not supported."
+        case let .pendingRecoveryFailed(failures):
+            "Pending recordings could not be recovered: \(failures.joined(separator: "; "))"
         }
+    }
+}
+
+/// A session directory that could not be read during a listing. Its files are
+/// left untouched on disk for manual recovery.
+public struct DamagedSessionDirectory: Equatable, Sendable {
+    public let name: String
+    public let reason: String
+
+    public init(name: String, reason: String) {
+        self.name = name
+        self.reason = reason
+    }
+}
+
+/// The readable half of the session history plus the directories that had to
+/// be skipped so one damaged directory cannot hide the healthy sessions.
+public struct SessionListing: Equatable, Sendable {
+    public let sessions: [SessionRecord]
+    public let damagedDirectories: [DamagedSessionDirectory]
+
+    public init(sessions: [SessionRecord] = [], damagedDirectories: [DamagedSessionDirectory] = []) {
+        self.sessions = sessions
+        self.damagedDirectories = damagedDirectories
     }
 }
 
@@ -105,14 +135,25 @@ public actor SessionRepository {
         }
         // A process can exit after copying the WAV into its destination
         // directory but before writing the manifest. Keep the staged source,
-        // remove that incomplete destination, and repeat the promotion.
-        // Empty or unrelated destination directories remain an obstruction so
-        // an accidental collision does not remove user data.
+        // remove that incomplete destination, and repeat the promotion. A
+        // process can also exit between creating the destination directory
+        // and copying the WAV, leaving that destination empty. An empty
+        // directory holds no audio, so it is reclaimed instead of obstructing
+        // every later promotion; any other content is left untouched so an
+        // unrelated collision cannot remove user data.
         let destinationDirectory = directoryURL(for: id)
         let destinationAudio = recordingURL(for: SessionRecord(id: id))
         if fileManager.fileExists(atPath: destinationDirectory.path) {
-            guard fileManager.fileExists(atPath: destinationAudio.path) else {
-                throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destinationDirectory.path])
+            if !fileManager.fileExists(atPath: destinationAudio.path) {
+                // A directory whose contents cannot even be enumerated stays
+                // an obstruction: it must not look empty and get deleted.
+                guard let leftover = try? fileManager.contentsOfDirectory(
+                    at: destinationDirectory,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                ), leftover.isEmpty else {
+                    throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destinationDirectory.path])
+                }
             }
             try fileManager.removeItem(at: destinationDirectory)
         }
@@ -128,7 +169,9 @@ public actor SessionRepository {
     }
 
     /// Recover recordings that reached app-private storage before an app exit
-    /// but were not yet promoted into history.
+    /// but were not yet promoted into history. A file that cannot be promoted
+    /// does not block recovery of the remaining files; every failure is
+    /// reported together after all files were attempted.
     @discardableResult
     public func recoverPendingRecordings() throws -> [SessionRecord] {
         guard fileManager.fileExists(atPath: pendingURL.path) else { return [] }
@@ -138,16 +181,27 @@ public actor SessionRepository {
             options: [.skipsHiddenFiles]
         )
         var recovered: [SessionRecord] = []
+        var failures: [String] = []
         for file in files where file.pathExtension.lowercased() == "wav" {
-            recovered.append(try commitStagedRecording(at: file))
+            do {
+                recovered.append(try commitStagedRecording(at: file))
+            } catch {
+                sessionLogger.error(
+                    "Pending recording \(file.lastPathComponent, privacy: .public) could not be promoted: \(String(describing: error), privacy: .public)"
+                )
+                failures.append("\(file.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            throw SessionRepositoryError.pendingRecoveryFailed(failures)
         }
         return recovered
     }
 
-    public func list() throws -> [SessionRecord] {
+    public func list() throws -> SessionListing {
         if !fileManager.fileExists(atPath: rootURL.path) {
             try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
-            return []
+            return SessionListing()
         }
         let keys: [URLResourceKey] = [.isDirectoryKey]
         let directories = try fileManager.contentsOfDirectory(
@@ -155,12 +209,28 @@ public actor SessionRepository {
             includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles]
         )
-        return try directories.compactMap { directory in
-            guard directory.lastPathComponent != "Pending" else { return nil }
-            guard (try? directory.resourceValues(forKeys: Set(keys)).isDirectory) == true else { return nil }
-            return try readManifest(in: directory)
+        var records: [SessionRecord] = []
+        var damaged: [DamagedSessionDirectory] = []
+        for directory in directories {
+            guard directory.lastPathComponent != "Pending" else { continue }
+            guard (try? directory.resourceValues(forKeys: Set(keys)).isDirectory) == true else { continue }
+            do {
+                records.append(try readManifest(in: directory))
+            } catch {
+                // Skip unreadable directories instead of failing the whole
+                // listing. Their files remain on disk for manual recovery.
+                sessionLogger.error(
+                    "Skipping unreadable session directory \(directory.lastPathComponent, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+                damaged.append(
+                    DamagedSessionDirectory(name: directory.lastPathComponent, reason: error.localizedDescription)
+                )
+            }
         }
-        .sorted { $0.updatedAt > $1.updatedAt }
+        return SessionListing(
+            sessions: records.sorted { $0.updatedAt > $1.updatedAt },
+            damagedDirectories: damaged
+        )
     }
 
     public func get(_ id: UUID) throws -> SessionRecord {
@@ -199,6 +269,33 @@ public actor SessionRepository {
             record.lastError = error.localizedDescription
         }
     }
+
+    /// A freshly launched process has no transcription requests in flight, so
+    /// a session still marked `.transcribing` after a relaunch belongs to an
+    /// app exit mid-request. Move it to a retryable failed state instead of
+    /// showing a request that no longer exists. Audio, existing transcripts,
+    /// transcript history, and attempt counts are preserved.
+    @discardableResult
+    public func reconcileInterruptedTranscriptions() throws -> [SessionRecord] {
+        let stale = try list().sessions.filter { $0.status == .transcribing }
+        var reconciled: [SessionRecord] = []
+        for record in stale {
+            do {
+                reconciled.append(try update(record.id) { current in
+                    current.status = .failed
+                    current.lastError = Self.interruptedTranscriptionMessage
+                })
+            } catch {
+                sessionLogger.error(
+                    "Could not reconcile interrupted session \(record.id, privacy: .public): \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+        return reconciled
+    }
+
+    private static let interruptedTranscriptionMessage =
+        "Interrupted before the server returned a transcript. Your audio is ready to retry."
 
     public func delete(_ id: UUID) throws {
         let directory = directoryURL(for: id)

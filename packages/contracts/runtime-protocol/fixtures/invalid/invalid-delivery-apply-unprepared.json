@@ -1,0 +1,18 @@
+{
+  "machine": "delivery",
+  "description": "Command illegal in the current state: delivery.apply in Idle. Nothing is prepared; apply revalidates and submits an existing prepared delivery, it never conjures one. The delivery service also has no command that auto-sends or injects keys.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "illegal_command",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_960",
+      "ts": "2026-09-20T10:09:55Z",
+      "corr": "dlv-9",
+      "seq": 1,
+      "type": "delivery.apply",
+      "payload": { "deliveryId": "dlv-9a" }
+    }
+  ]
+}

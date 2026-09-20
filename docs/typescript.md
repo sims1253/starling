@@ -22,8 +22,20 @@ network requests, and release resources when an operation ends. Promise methods
 remain available at React, Electron, and browser API boundaries. Pure audio and
 text transformations can stay ordinary TypeScript functions.
 
-The renderer displays the returned text without cleanup. Changing the compiler,
+The renderer displays the returned text without cleanup. The optional transcript
+refinement layer keeps that stance: it runs only on an explicit per-take action,
+stores its result in a separate labeled `refined` field beside the raw transcript,
+and never rewrites the raw transcript or its history. Changing the compiler,
 error handling, or schemas must not change transcripts or discard saved audio.
+
+Multi-turn threads (#117) keep the same stance. A take joins a thread only
+through the explicit "Refine in thread" action, which stores an optional
+`threadId` label on the session — additive like `refined`, so no session-schema
+or database version bump. A threaded refine sends the thread's current text as
+an assistant turn before the new dictated turn; each turn keeps its own
+immutable raw transcript, and each turn's `refined` copy is the thread's state
+at that turn. Threading is visible in the history pane and escapable at any
+time: "start new thread" only clears a UI hint and never mutates sessions.
 
 ## Checks
 

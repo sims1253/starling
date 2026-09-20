@@ -201,6 +201,7 @@ const AudioSourceSchema = Schema.Union([
 interface BufferedResponse {
   readonly body: string;
   readonly ok: boolean;
+  readonly opaqueRedirect: boolean;
   readonly requestId: string | null;
   readonly status: number;
   readonly statusText: string;
@@ -278,6 +279,29 @@ function ensureOk(response: BufferedResponse): Effect.Effect<BufferedResponse, D
       serverErrorDetail(response.body),
     ),
   );
+}
+
+function ensureNotRedirected(
+  response: BufferedResponse,
+): Effect.Effect<BufferedResponse, DictationHttpError> {
+  // Node and Electron surface the real 3xx for redirect: "manual"; a Chromium
+  // renderer hands back an opaque redirect instead. Both are refused with the
+  // Electron bridge wording so audio and credentials are never re-sent to an
+  // origin the user did not configure.
+  if (response.opaqueRedirect || (response.status >= 300 && response.status < 400)) {
+    const status = response.opaqueRedirect ? undefined : response.status;
+
+    return Effect.fail(
+      new DictationHttpError(
+        response.status,
+        response.statusText,
+        response.body,
+        `Server redirect blocked${status ? ` (${status})` : ""}. Set the final endpoint explicitly.`,
+      ),
+    );
+  }
+
+  return Effect.succeed(response);
 }
 
 function protocolError(label: string): DictationProtocolError {
@@ -561,19 +585,23 @@ export class StarlingClient {
   ): Effect.Effect<BufferedResponse, DictationClientError> {
     const request = Effect.tryPromise({
       try: async (signal) => {
-        const response = await this.fetcher(url, { ...init, signal });
+        // Redirects are blocked with the same policy as the Electron bridge
+        // and the iOS client: audio and credentials must never silently
+        // follow a server redirect to an origin the user did not configure.
+        const response = await this.fetcher(url, { ...init, signal, redirect: "manual" });
         const body = await response.text();
 
         return {
           body,
           ok: response.ok,
+          opaqueRedirect: response.type === "opaqueredirect",
           requestId: response.headers.get("X-Request-Id"),
           status: response.status,
           statusText: response.statusText,
         } satisfies BufferedResponse;
       },
       catch: (cause) => new DictationTransportError(describeCause(cause)),
-    }).pipe(Effect.flatMap(ensureOk));
+    }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
 
     return withTimeout(request, this.timeoutMs);
   }

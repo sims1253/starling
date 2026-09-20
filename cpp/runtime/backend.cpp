@@ -15,6 +15,7 @@
 #include "imatrix.hpp"
 #include "lru_cache.hpp"
 #include "model_loader.hpp"
+#include "trace.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -216,6 +217,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     }
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
+        dev_ = chosen;
         impl_->backend = ggml_backend_dev_init(chosen, nullptr);
         // Record the replay-cache default for this device class before any
         // model can construct its per-shape caches.
@@ -267,6 +269,16 @@ void Backend::set_n_threads(int n_threads) {
 
 bool Backend::is_gpu() const { return impl_ && impl_->use_sched; }
 ggml_backend_t Backend::handle() const { return impl_ ? impl_->backend : nullptr; }
+
+long long Backend::device_memory_free() const {
+    // Trace-only query (STARLING_TRACE cache records). -1 = the device cannot
+    // report it; the trace renders that as "unavailable" rather than
+    // fabricating a number. The CPU device reports zeros — treated the same.
+    if (!dev_) return -1;
+    struct ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev_, &props);
+    return props.memory_free > 0 ? (long long)props.memory_free : -1;
+}
 
 void Backend::register_input(ggml_tensor* t, const void* host, size_t nbytes) {
     if (t_pending_inputs) t_pending_inputs->push_back({t, host, nbytes});
@@ -486,11 +498,55 @@ void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<flo
 
 
 // --------------------------------------------------------------------------- //
+// Unsupported-graph-node enumeration (issue #184).
+// --------------------------------------------------------------------------- //
+std::vector<UnsupportedGraphNode> enumerate_unsupported_graph_nodes(
+    ggml_cgraph* gf,
+    const std::function<bool(const ggml_tensor*)>& supports) {
+    std::vector<UnsupportedGraphNode> out;
+    if (!gf) return out;
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor* n = ggml_graph_node(gf, i);
+        if (!n || supports(n)) continue;
+        UnsupportedGraphNode e;
+        e.node_index = i;
+        e.op         = ggml_op_name(n->op);
+        e.dst_type   = ggml_type_name(n->type);
+        for (int s = 0; s < 3 && n->src[s]; ++s) {
+            if (!e.srcs.empty()) e.srcs += ' ';
+            e.srcs += "src" + std::to_string(s) + "=" +
+                      ggml_type_name(n->src[s]->type) + "(" +
+                      ggml_op_name(n->src[s]->op) + "," +
+                      (ggml_is_contiguous(n->src[s]) ? "cont" : "STRIDED") + ")";
+        }
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::string format_unsupported_graph_node(const UnsupportedGraphNode& node,
+                                          int n_nodes) {
+    char head[96];
+    std::snprintf(head, sizeof head, "node %d/%d: op=%s dst=%s",
+                  node.node_index, n_nodes, node.op.c_str(),
+                  node.dst_type.c_str());
+    std::string line = head;
+    if (!node.srcs.empty()) line += " " + node.srcs;
+    return line;
+}
+
+// --------------------------------------------------------------------------- //
 // ReplayGraph
 // --------------------------------------------------------------------------- //
 ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
+    // graph_build spans construction + allocation of one captured shape (the
+    // one-time cost a replay-cache miss pays). Includes the build lambda and
+    // alloc_internal(); the gated F1 histogram below is inside the window.
+    const bool tr_on = trace::on();
+    const auto t_build0 = std::chrono::steady_clock::now();
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize
                          + ggml_graph_overhead_custom(kGraphSize, false),
@@ -533,6 +589,14 @@ ReplayGraph::ReplayGraph(Backend& backend,
                 captures_.emplace_back(c.t, c.dst);
             }
             if (!alloc_internal()) throw std::runtime_error("ReplayGraph allocation failed");
+            if (tr_on) {
+                long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+                trace::graph_build_event(
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_build0).count(),
+                    (unsigned)gf_->uid, gf_->n_nodes, ne, backend_.device_name(),
+                    backend_.device_memory_free());
+            }
             // F1: one-time op histogram for this graph (gated). Counts nodes by op
             // name and, for MUL_MAT, the source (weight) dtype so we can confirm the
             // f16 tensor-core cuBLAS path vs an f32 fallback. Printed once per ctor.
@@ -569,28 +633,60 @@ ReplayGraph::ReplayGraph(Backend& backend,
 }
 
 bool ReplayGraph::alloc_internal() {
-    // Decide sched vs gallocr (same logic as Backend::compute).
+    // Decide sched vs gallocr (same logic as Backend::compute) — with one
+    // deliberate exception: an op the accelerator REJECTS must not route a
+    // captured graph onto sched. One-shot graphs re-upload their inputs
+    // through the sched-aware ggml_backend_tensor_set, but ReplayGraph
+    // replays upload via ggml_backend_tensor_set_async with the PRIMARY
+    // backend, which aborts on sched-allocated buffers ("unsupported buffer
+    // type", issue #184). So for captured graphs the unsupported-op route is
+    // a hard allocation error, not a fallback. (The imatrix route below stays
+    // a supported sched configuration.)
     need_sched_ = ImatrixCollector::enabled();
     if (backend_.is_gpu() && !need_sched_) {
-        for (int i = 0; i < ggml_graph_n_nodes(gf_); ++i) {
-            if (!ggml_backend_supports_op(backend_.handle(), ggml_graph_node(gf_, i))) {
-                need_sched_ = true;
-                // STARLING_SCHED_DEBUG names the first unsupported node (the
-                // sched path breaks ReplayGraph input uploads, so any hit here
-                // is a hard error for captured graphs, not a fallback).
-                if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
-                    debug && debug[0] == '1') {
-                    ggml_tensor* n = ggml_graph_node(gf_, i);
-                    std::fprintf(stderr, "[sched-dbg] unsupported node %d/%d: op=%s dst=%s",
-                        i, ggml_graph_n_nodes(gf_), ggml_op_name(n->op), ggml_type_name(n->type));
-                    for (int s = 0; s < 3 && n->src[s]; ++s)
-                        std::fprintf(stderr, " src%d=%s(%s%s)", s, ggml_type_name(n->src[s]->type),
-                            ggml_op_name(n->src[s]->op),
-                            ggml_is_contiguous(n->src[s]) ? ",cont" : ",STRIDED");
-                    std::fprintf(stderr, "\n");
-                }
-                break;
+        ggml_backend_t backend = backend_.handle();
+        const std::vector<UnsupportedGraphNode> unsupported =
+            enumerate_unsupported_graph_nodes(
+                gf_, [backend](const ggml_tensor* n) {
+                    return ggml_backend_supports_op(backend, n);
+                });
+        if (!unsupported.empty()) {
+            const int n_nodes = ggml_graph_n_nodes(gf_);
+            // STARLING_SCHED_DEBUG echoes the enumeration to stderr at
+            // allocation time; it survives callers that log only part of the
+            // thrown error below.
+            if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
+                debug && debug[0] == '1') {
+                for (const auto& u : unsupported)
+                    std::fprintf(stderr, "[sched-dbg] unsupported %s\n",
+                                 format_unsupported_graph_node(u, n_nodes).c_str());
             }
+            std::string msg =
+                "ReplayGraph allocation failed: device '" +
+                std::string(backend_.device_name()) + "' rejected " +
+                std::to_string(unsupported.size()) + " of " +
+                std::to_string(n_nodes) + " captured-graph nodes:\n";
+            // The message crosses the C API into a 2048-byte error buffer
+            // (g_last_error in capi.cpp), so cap the embedded per-node lines
+            // or the actionable tail below would truncate away first. The
+            // STARLING_SCHED_DEBUG echo above always prints every node.
+            constexpr size_t kMaxEmbeddedLines = 16;
+            for (size_t i = 0; i < unsupported.size() && i < kMaxEmbeddedLines; ++i)
+                msg += "  " + format_unsupported_graph_node(unsupported[i], n_nodes) + "\n";
+            if (unsupported.size() > kMaxEmbeddedLines)
+                msg += "  ... and " +
+                       std::to_string(unsupported.size() - kMaxEmbeddedLines) +
+                       " more rejected node(s) - run with STARLING_SCHED_DEBUG=1"
+                       " to print all of them\n";
+            msg +=
+                "A captured (replayed) graph cannot fall back to"
+                " ggml_backend_sched: its input uploads run on the primary"
+                " backend against sched-allocated buffers and abort inside"
+                " ggml. This is a starling graph-construction bug - please"
+                " report it (see https://github.com/sims1253/starling/issues/184)."
+                " Set STARLING_SCHED_DEBUG=1 to also print this enumeration to"
+                " stderr at allocation time.";
+            throw std::runtime_error(msg);
         }
     }
     if (!need_sched_) {
@@ -673,9 +769,13 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     Backend::Impl* impl = backend_.impl_.get();
     // Fast path: graph_compute_async (skip the sync-wrapping graph_compute so the
     // readbacks can pipeline behind the graph on the same stream), then async
-    // readback + single sync.
+    // readback + single sync. The trace timestamps ride the same clocks as the
+    // STARLING_REPLAY_TIMING split; with both gates off the only added work is
+    // the gate load.
     const bool t_on = replay_timing_on();
-    const int64_t t_gc0 = t_on ? ggml_time_us() : 0;
+    const bool tr_on = trace::on();
+    const bool any_gate = t_on || tr_on;
+    const int64_t t_gc0 = any_gate ? ggml_time_us() : 0;
     bool ok;
     if (!need_sched_) {
         ok = (ggml_backend_graph_compute_async(impl->backend, gf_) == GGML_STATUS_SUCCESS);
@@ -713,11 +813,27 @@ bool ReplayGraph::compute(std::vector<float>& out) {
                 ggml_type_name(a->type));
         }
     }
-    const int64_t t_gc1 = t_on ? ggml_time_us() : 0;
+    const int64_t t_gc1 = any_gate ? ggml_time_us() : 0;
+    if (tr_on) {
+        long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+        trace::graph_event("graph_replay",
+                           (double)(t_gc1 - t_gc0) / 1000.0,
+                           gf_ ? (unsigned)gf_->uid : 0u, gf_ ? gf_->n_nodes : -1,
+                           ne, backend_.device_name());
+    }
     out.resize((size_t)ggml_nelements(out_));
     readback_async_then_sync(impl, out_, out);
+    const int64_t t_rb1 = any_gate ? ggml_time_us() : 0;
+    if (tr_on) {
+        long long ne[4] = {out_->ne[0], out_->ne[1], out_->ne[2], out_->ne[3]};
+        // Host blocked on the single trailing sync — includes waiting for
+        // prior GPU work, so it is NOT transfer time alone (see trace.hpp).
+        trace::graph_event("readback_sync",
+                           (double)(t_rb1 - t_gc1) / 1000.0,
+                           gf_ ? (unsigned)gf_->uid : 0u, gf_ ? gf_->n_nodes : -1,
+                           ne, backend_.device_name());
+    }
     if (t_on) {
-        const int64_t t_rb1 = ggml_time_us();
         std::fprintf(stderr,
             "[enc-timing]   graph_compute=%lldus readback=%lldus n_nodes=%d uid=%u\n",
             (long long)(t_gc1 - t_gc0), (long long)(t_rb1 - t_gc1),

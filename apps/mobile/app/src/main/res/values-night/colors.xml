@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Night palette: darkened surface/card/line, lightened ink/muted, and the
+         olive accent lifted in lightness so it keeps contrast on dark surfaces.
+         starling_ink reuses the light theme's surface tone for symmetry. -->
+    <color name="starling_ink">#E8E4D9</color>
+    <color name="starling_muted">#A6A897</color>
+    <color name="starling_accent">#9DB05F</color>
+    <color name="starling_surface">#14150F</color>
+    <color name="starling_card">#1F2018</color>
+    <color name="starling_line">#37392C</color>
+</resources>

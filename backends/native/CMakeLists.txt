@@ -103,6 +103,7 @@ file(GLOB STARLING_GGML_GRANITE_CPP ${STARLING_REPO_ROOT}/cpp/granite/*.cpp)
 file(GLOB STARLING_GGML_QWEN3_CPP ${STARLING_REPO_ROOT}/cpp/qwen3/*.cpp)
 file(GLOB STARLING_GGML_S1_CPP ${STARLING_REPO_ROOT}/cpp/s1/*.cpp)
 file(GLOB STARLING_GGML_AUDEX_CPP ${STARLING_REPO_ROOT}/cpp/audex/*.cpp)
+file(GLOB STARLING_GGML_VOXTRAL_CPP ${STARLING_REPO_ROOT}/cpp/voxtral/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
     ${STARLING_GGML_LIB_CPP}
@@ -115,6 +116,7 @@ set(STARLING_GGML_CPP
     ${STARLING_GGML_QWEN3_CPP}
     ${STARLING_GGML_S1_CPP}
     ${STARLING_GGML_AUDEX_CPP}
+    ${STARLING_GGML_VOXTRAL_CPP}
     ${STARLING_REPO_ROOT}/cpp/capi.cpp)
 
 add_library(starling_ggml_core OBJECT ${STARLING_GGML_CPP})
@@ -171,6 +173,18 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp)
       target_include_directories(${test_name} PRIVATE
           ${STARLING_REPO_ROOT}/cpp/serve)
+    endif()
+
+    # The serve_trace_test drives StarlingServer directly (server.cpp only —
+    # no WS transport) with the tiny synthesized granite GGUF (issue #180).
+    if(test_name STREQUAL "serve_trace_test")
+      target_sources(${test_name} PRIVATE
+          ${STARLING_REPO_ROOT}/cpp/serve/server.cpp)
+      target_include_directories(${test_name} PRIVATE
+          ${STARLING_REPO_ROOT}/cpp/include
+          ${STARLING_REPO_ROOT}/cpp/serve)
+      find_package(Threads REQUIRED)
+      target_link_libraries(${test_name} PRIVATE Threads::Threads)
     endif()
 
     set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

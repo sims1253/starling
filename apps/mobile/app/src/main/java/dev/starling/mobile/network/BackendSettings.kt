@@ -9,11 +9,17 @@ data class BackendConfig(
     val allowTrustedLanHttp: Boolean,
     val protocol: BackendProtocol = BackendProtocol.STARLING,
     val model: String = "parakeet",
+    val engine: TranscriptionEngine = TranscriptionEngine.REMOTE,
 )
 
 enum class BackendProtocol {
     STARLING,
     OPENAI,
+}
+
+enum class TranscriptionEngine {
+    REMOTE,
+    ON_DEVICE,
 }
 
 /** User-editable, non-secret connection settings. No auth token is persisted. */
@@ -30,6 +36,9 @@ class BackendSettings(context: Context) {
             ?.let { value -> runCatching { BackendProtocol.valueOf(value) }.getOrDefault(BackendProtocol.STARLING) }
             ?: BackendProtocol.STARLING,
         model = preferences.getString(KEY_MODEL, DEFAULT_MODEL) ?: DEFAULT_MODEL,
+        engine = preferences.getString(KEY_ENGINE, TranscriptionEngine.REMOTE.name)
+            ?.let { value -> runCatching { TranscriptionEngine.valueOf(value) }.getOrDefault(TranscriptionEngine.REMOTE) }
+            ?: TranscriptionEngine.REMOTE,
     )
 
     fun save(config: BackendConfig) {
@@ -44,6 +53,7 @@ class BackendSettings(context: Context) {
             .putBoolean(KEY_ALLOW_HTTP, config.allowTrustedLanHttp)
             .putString(KEY_PROTOCOL, config.protocol.name)
             .putString(KEY_MODEL, model)
+            .putString(KEY_ENGINE, config.engine.name)
             .apply()
     }
 
@@ -53,6 +63,7 @@ class BackendSettings(context: Context) {
         private const val KEY_ALLOW_HTTP = "allow_trusted_lan_http"
         private const val KEY_PROTOCOL = "protocol"
         private const val KEY_MODEL = "model"
+        private const val KEY_ENGINE = "engine"
         const val DEFAULT_MODEL = "parakeet"
 
         // HTTPS is the safe default. Local development can explicitly opt into
@@ -68,7 +79,8 @@ sealed interface EndpointValidation {
 
 /**
  * Runtime policy for the editable endpoint. Cleartext is accepted only after
- * an explicit checkbox and only for loopback/private/link-local addresses or
+ * an explicit checkbox and only for loopback/private/link-local addresses,
+ * CGNAT 100.64.0.0/10 (assigned by Tailscale-style VPN overlays), or
  * a .local mDNS name. Remote HTTP endpoints are rejected.
  */
 object EndpointPolicy {
@@ -99,7 +111,7 @@ object EndpointPolicy {
             }
             if (!isTrustedCleartextHost(host)) {
                 return EndpointValidation.Invalid(
-                    "HTTP is limited to localhost, private LAN, link-local, or .local hosts",
+                    "HTTP is limited to localhost, private LAN, link-local, CGNAT, or .local hosts",
                 )
             }
         }
@@ -130,10 +142,13 @@ object EndpointPolicy {
         if (values.any { it !in 0..255 }) return false
         val first = values[0]
         val second = values[1]
+        // 100.64.0.0/10 is shared CGNAT space, not RFC1918; Tailscale-style
+        // VPN overlays hand out addresses from it, so it is trusted like a LAN.
         return first == 10 ||
             (first == 172 && second in 16..31) ||
             (first == 192 && second == 168) ||
             (first == 169 && second == 254) ||
+            (first == 100 && second in 64..127) ||
             first == 127
     }
 }

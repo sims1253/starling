@@ -132,6 +132,45 @@ ggml_tensor* spec_mlp(ggml_context* c, const QwenDecodeSpec& s,
     return lin(c, ml, z, p + "ffn.down.weight");
 }
 
+// Voxtral's AdaRMSNorm modulation: fc2(gelu(fc0(t_cond))) over the baked
+// llm.t_cond leaf ([hidden] f32), returned bf16 [hidden, 1]. The branch runs
+// only under spec.ada_rms_norm, so other engines build no node here.
+// Oracle order (the Phase-2a linear_bf16_oracle discipline, bias-free):
+// GEMM rounds to bf16, exact GELU rounds to bf16, final GEMM rounds to bf16.
+ggml_tensor* ada_mod(ggml_context* c, const QwenDecodeSpec& s,
+                     const ModelLoader& ml, const std::string& p) {
+    ggml_tensor* t = weight(c, ml, "llm.t_cond");  // [hidden] f32 leaf
+    ggml_tensor* u = lin(c, ml, t, p + s.ada_fc0_suffix);
+    ggml_tensor* g = bf16(c, ggml_gelu_erf(c, f32(c, u)));  // exact (erf) GELU
+    ggml_tensor* m = lin(c, ml, g, p + s.ada_fc2_suffix);  // [hidden]
+    return ggml_reshape_2d(c, m, m->ne[0], 1);  // [hidden, 1] for broadcast
+}
+
+// Apply the ada modulation to the MLP-branch input n ([hidden, S] bf16):
+// n * (1 + mod) with mod [hidden, 1] broadcast over the S columns, f32 math,
+// one bf16 round. The ones are the loader-owned llm.ada_ones leaf (1-D
+// [hidden] f32, synthesized once per model like the mel constants): 1-D
+// keeps it at 12 KiB for the real model, inside the compat context's 1 MiB
+// budget (a [hidden, max_cache] leaf would be 50 MiB). The [hidden, 1] sum
+// repeats over S via a scratch template (repeat overwrites every element,
+// so the template needs no initialization); the leaf itself is stable and
+// device-resident, so captured prefill graphs replay with no host upload.
+ggml_tensor* apply_ada(ggml_context* c, const QwenDecodeSpec& s,
+                       const ModelLoader& ml, ggml_tensor* n,
+                       const std::string& p, int64_t S) {
+    if (!s.ada_rms_norm) return n;
+    ggml_tensor* mod = ada_mod(c, s, ml, p);  // [hidden, 1] bf16
+    const int64_t H = n->ne[0];
+    ggml_tensor* ones = weight(c, ml, "llm.ada_ones");  // [hidden] f32
+    ggml_tensor* sum = ggml_add(c, f32(c, ones), f32(c, mod));  // [hidden, 1]
+    // Stock runs h * (1 + m) as two bf16 stores: round (1 + m) first (it is
+    // [hidden, 1], so the round is free), then round the product.
+    sum = bf16(c, sum);
+    ggml_tensor* tpl = ggml_new_tensor_2d(c, GGML_TYPE_F32, H, S);
+    ggml_tensor* scale = ggml_repeat(c, f32(c, sum), tpl);  // [hidden, S]
+    return bf16(c, ggml_mul(c, f32(c, n), scale));
+}
+
 // Append `add` new rows of k/v (src layout [heads, add, D] f32) to the cache
 // (layout [heads, old+add, D] bf16).
 void append_kv(std::vector<ggml_bf16_t>& dst, const std::vector<float>& src,
@@ -390,6 +429,7 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         if (st0 && stage.is("xmid")) return ff(c, x);
 
         n = spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
+        n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
         ggml_tensor* dn = spec_mlp(c, m.spec, m.loader, n, p);
         if (st0 && stage.is("down")) return ff(c, dn);
         x = residual_add(c, m.spec, r, dn);
@@ -512,7 +552,7 @@ struct PrefillReplayEntry {
 
 struct PrefillCache {
     LruCache<int64_t, PrefillReplayEntry> by_S;
-    explicit PrefillCache(size_t cap) : by_S(cap) {}
+    explicit PrefillCache(size_t cap) : by_S(cap, "qwen.prefill") {}
     void clear() { by_S.clear(); }
 };
 
@@ -531,6 +571,8 @@ struct KStepGraph {
     std::vector<float> host_iota;                // [vocab] descending column iota (bf16-tie mode)
     float host_one = 1.0f;                       // scalar 1.0 for the tie-break mask
     size_t in_iota = 0, in_one = 0;              // constant-input slots (re-set per replay)
+    std::vector<float> host_ban;                 // [vocab] 0 / penalty row (suppression mode)
+    size_t in_ban = 0;                           // constant-input slot (re-set per replay)
 };
 
 // ONE captured K-step graph per K (start_past is a runtime input, so a single
@@ -732,9 +774,13 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
         ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));  // [K, D, KV]
         ggml_tensor* co = ggml_mul_mat(c, vt, pr);                 // [D, S, H]
-        // heads -> features: [D,S,H] -> [D,H,S] -> [hidden=D*H, S].
+        // heads -> features: [D,S,H] -> [D,H,S] -> [D*H, S]. Spelled
+        // relationally: voxtral's q-width (D*H = 4096) is WIDER than its
+        // hidden (3072); the o_proj weight (ne0 = D*H) takes it from here.
+        // Every existing engine has D*H == hidden, so their graphs are
+        // unchanged by the spelling.
         joined = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, co, 0, 2, 1, 3)),
-                                 (int64_t)D * H, S);                  // [hidden, S]
+                                 (int64_t)D * H, S);                  // [D*H, S]
         joined = bf(c, joined);
     } else {
         joined = nullptr;
@@ -759,6 +805,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     r = x;
     n = F ? rmsf(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps)
           : spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
+    n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
     ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.spec, m.loader, n, p);
     x = F ? residual_add_f(c, m.spec, r, dn) : residual_add(c, m.spec, r, dn);
     return x;  // [hidden, S] bf16 (F32 in F mode)
@@ -894,10 +941,13 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
 
 // Whole-model decode-step graph (S=1): embed(prev) -> layers -> lm_head.
 // Exact-width KV (one-shot per step). Reads slots [0, past), writes slot
-// `past`, attention over [0, past).
+// `past`, attention over [0, past). Under spec.decode_add with a non-null
+// audio_row, the [hidden] f32 row is added (bf16 round) to the looked-up
+// embedding — voxtral's additive injection. Null row keeps the historical
+// op sequence for every other engine.
 bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                     LlmState& state, std::vector<float>& logits,
-                    std::string& e) {
+                    std::string& e, const float* audio_row = nullptr) {
     const auto& lc = m.dims;
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
@@ -926,6 +976,15 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                                                &prev_token, sizeof(int32_t));
         ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), id_t);
         x = apply_embed_mul(c, m.spec, x);
+        if (m.spec.decode_add && audio_row) {
+            // Voxtral: inputs_embeds = token_embed + audio_row (stock adds in
+            // the model dtype; addb rounds once at the bf16 boundary).
+            int64_t rne[2] = {lc.hidden, 1};
+            ggml_tensor* row_t = graph_input_tensor(
+                c, GGML_TYPE_F32, 2, rne, audio_row,
+                (size_t)lc.hidden * sizeof(float));
+            x = addb(c, x, row_t);
+        }
         ggml_tensor* pos_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                 pos.data(), sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos_t);  // [D, 1]
@@ -954,16 +1013,25 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
 // Greedy pick under the bf16-tie mode: round the logits to bf16 (the
 // reference reads the lm_head output stored as bf16) and keep the FIRST
 // index on the exact ties that creates — argmax_low otherwise.
-int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    if (!s.argmax_low_ties) return argmax_low(x);
+// Suppression (spec.n_banned > 0): banned ids never win, at any step, so
+// they are skipped in the scan (the K-step graph applies the equivalent
+// additive penalty row before its in-graph argmax).
+int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
+    if (!s.argmax_low_ties && s.n_banned == 0) return argmax_low(x);
+    auto is_banned = [&s](int32_t i) {
+        return s.n_banned > 0 &&
+               std::binary_search(s.banned_ids, s.banned_ids + s.n_banned, i);
+    };
     auto bf = [](float v) {
         return ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
     };
     int32_t best = 0;
-    float bv = bf(x[0]);
+    float bv = s.argmax_low_ties ? bf(x[0]) : x[0];
+    if (is_banned(0)) { best = -1; bv = 0.0f; }
     for (int32_t i = 1; i < (int32_t) x.size(); ++i) {
-        const float v = bf(x[i]);
-        if (v > bv) { bv = v; best = i; }
+        if (is_banned(i)) continue;
+        const float v = s.argmax_low_ties ? bf(x[i]) : x[i];
+        if (best < 0 || v > bv) { bv = v; best = i; }
     }
     return best;
 }
@@ -982,8 +1050,9 @@ int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
 // reduction width differs, so CER-gated. <env>_NOBUCKET forces full-capacity.
 //
 // Graph cache keyed on (K, W): positions stay runtime inputs, so a handful of
-// graphs serve every decode step and every utterance; graphs are cached
-// process-globally and reused across reps / same-prompt runs.
+// graphs serve every decode step and every utterance; graphs live in the
+// loader-keyed SpecState (state_for) and are reused across reps / same-prompt
+// runs.
 // ===========================================================================
 
 int kstep_K(const QwenDecodeSpec& spec) {
@@ -1058,6 +1127,23 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::st
             kg->host_iota[(size_t) col] = (float) (vocab - col);
         kg->host_one = 1.0f;
     }
+    // Suppression mode: constant [vocab] additive row, 0.0 for allowed ids
+    // and a huge-negative (finite, bf16-representable) penalty for banned
+    // ones. Applied before the in-graph argmax (and its tie-break chain), so
+    // a banned id can never win a K-step pick; the host spec_argmax skips
+    // the same ids. Empty list -> no tensor, no node: graphs built for the
+    // other engines keep their exact historical op sequence.
+    if (m.spec.n_banned > 0) {
+        const ggml_tensor* ew = m.loader.tensor("llm.embed.weight");
+        const int64_t vocab = ew ? ew->ne[1] : 0;
+        if (vocab <= 0) {
+            e = std::string(m.spec.label) + " K-step needs llm.embed.weight for the ban row";
+            return nullptr;
+        }
+        kg->host_ban.assign((size_t) vocab, 0.0f);
+        for (size_t i = 0; i < m.spec.n_banned; ++i)
+            kg->host_ban[(size_t) m.spec.banned_ids[i]] = -3.0e38f;
+    }
     raw->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(global_backend(),
         [&](ggml_context* c) -> ggml_tensor* {
             int64_t one[1] = {1};
@@ -1106,6 +1192,16 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::st
                                            &raw->host_one, sizeof(float));
                 raw->in_one = idx++;
             }
+            // Constant suppression penalty row (only under the flag; one
+            // input shared by all K steps — see the host_ban fill above).
+            ggml_tensor* ban_t = nullptr;
+            if (!raw->host_ban.empty()) {
+                int64_t bw[2] = {(int64_t) raw->host_ban.size(), 1};
+                ban_t = graph_input_tensor(c, GGML_TYPE_F32, 2, bw,
+                                           raw->host_ban.data(),
+                                           raw->host_ban.size() * sizeof(float));
+                raw->in_ban = idx++;
+            }
             // Chain K steps in-graph: tok = prev-token; each step's argmax feeds
             // the next step's embed (get_rows), all on device. Cache prefix
             // views [D, W, KV] (static for the graph) are the set_rows targets
@@ -1137,6 +1233,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::st
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
                 ggml_tensor* logits = ggml_mul_mat(c, head_w, gemm_act(c, head_w, n));  // [vocab, 1]
+                if (ban_t)
+                    // Suppression: banned ids drop to -3e38 before the argmax
+                    // (and before the bf16-round/tie chain, whose (x-max)*2^20
+                    // overflow clamps them out of the equality mask).
+                    logits = ggml_add(c, logits, ban_t);
                 ggml_tensor* am_in = logits;
                 if (iota) {
                     // bf16-round (the reference's storage boundary), then the
@@ -1250,6 +1351,18 @@ size_t prefill_replay_cache_size(const ModelLoader& loader) {
     return st && st->prefill_cache ? st->prefill_cache->by_S.size() : 0;
 }
 
+int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x) {
+    return spec_argmax_impl(s, x);
+}
+
+bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
+                     const float* audio_row, LlmState& state,
+                     std::vector<float>& logits, std::string& e) {
+    ensure_weights_realized(m.loader);
+    return forward_decode(m, prev_token, state.length, state, logits, e,
+                          audio_row);
+}
+
 bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
                  PrefillResult& o, std::string& e) {
     if (i.n_tokens <= 0 || i.width != (int64_t)m.dims.hidden || i.n_tokens > maxc) {
@@ -1261,7 +1374,7 @@ bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
     bool ok = dbg ? forward_legacy(m, i.data, i.n_tokens, o.state, o.logits, e)
                   : forward_prefill(m, i.data, i.n_tokens, o.state, o.logits, e);
     if (!ok) return false;
-    o.first_token = spec_argmax(m.spec, o.logits);
+    o.first_token = spec_argmax_impl(m.spec, o.logits);
     // <env>_DUMP_LOGITS=<file> dumps prefill logits.
     if (const char* fp = env(m.spec, "_DUMP_LOGITS")) {
         if (FILE* f = std::fopen(fp, "wb")) {
@@ -1294,7 +1407,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             if (!forward_prefill(m, i.data, i.n_tokens, state, o.prefill_logits, e))
                 return false;
         }
-        int32_t prev = spec_argmax(m.spec, o.prefill_logits);
+        int32_t prev = spec_argmax_impl(m.spec, o.prefill_logits);
         o.ids.push_back(prev);
         // Engines whose reference stops on a SECONDARY token as well
         // (eos2_token_id: higgs <|im_end|>, s1's dual stop) also stop when
@@ -1352,7 +1465,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 std::vector<float> dl;
                 double s0 = timing ? (double)std::chrono::steady_clock::now().time_since_epoch().count() : 0.0;
                 if (!forward_decode(m, prev, state.length, state, dl, e)) return false;
-                prev = spec_argmax(m.spec, dl);
+                prev = spec_argmax_impl(m.spec, dl);
                 o.ids.push_back(prev);
                 if (timing) {
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
@@ -1391,7 +1504,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
 
             std::vector<float> logits;
             if (!forward_legacy(m, one.data, 1, p.state, logits, e)) return false;
-            prev = spec_argmax(m.spec, logits);
+            prev = spec_argmax_impl(m.spec, logits);
             o.ids.push_back(prev);
             if (prev == op.eos_token_id || prev == op.eos2_token_id) {
                 o.hit_eos = true; break;

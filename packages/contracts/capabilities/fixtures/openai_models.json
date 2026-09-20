@@ -1,0 +1,36 @@
+{
+  "name": "OpenAI-compatible model listing",
+  "route": "/v1/models",
+  "protocol": "openai-subset",
+  "sources": [
+    "cpp/serve/main.cpp:742-747",
+    "backends/native/tests/test_openai_api.py:test_models",
+    "docs/api.md#openai-compatible-routes",
+    "packages/contracts/openapi.json (/v1/models)"
+  ],
+  "cases": [
+    {
+      "name": "lists the one configured model",
+      "request": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body_json": {
+          "object": "list",
+          "data": [
+            {
+              "id": "parakeet",
+              "object": "model",
+              "created": 0,
+              "owned_by": "starling"
+            }
+          ]
+        }
+      },
+      "note": "Exactly one entry: the process serves one configured model. created is 0 because Starling does not track a model creation timestamp. The slug is deployment configuration (--model)."
+    }
+  ]
+}

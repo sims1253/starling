@@ -11,6 +11,8 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 
 namespace starling::serve {
@@ -19,16 +21,50 @@ namespace starling::serve {
 
 std::string norm_word(const std::string& word) {
     // Lowercase, strip non-word chars (port of _norm() from stream_chunk.py).
+    //
+    // UTF-8 aware (issue #118): the previous byte-wise filter kept only bytes
+    // where std::isalnum is true, which is false for every byte >= 0x80 in the
+    // default C locale — Cyrillic/CJK words normalized to "" and runs of empty
+    // keys then matched as overlap runs, deleting words at every streaming
+    // window boundary. Conservatively decode UTF-8 code points, lowercase
+    // ASCII A-Z only, keep code points >= 0x80 verbatim (no Unicode case
+    // folding), and strip ASCII whitespace/punctuation as before. The only
+    // property the overlap matcher needs: the key is deterministic per word
+    // and identical across chunk boundaries, which verbatim bytes guarantee.
     std::string out;
     out.reserve(word.size());
-    for (char c : word) {
-        unsigned char uc = static_cast<unsigned char>(c);
-        if (uc >= 'A' && uc <= 'Z') {
-            out += static_cast<char>(uc - 'A' + 'a');
-        } else if (std::isalnum(uc) || c == '\'') {
-            out += c;
+    size_t i = 0;
+    while (i < word.size()) {
+        unsigned char uc = static_cast<unsigned char>(word[i]);
+        if (uc < 0x80) {
+            if (uc >= 'A' && uc <= 'Z') {
+                out += static_cast<char>(uc - 'A' + 'a');
+            } else if (std::isalnum(uc) || uc == '\'') {
+                out += static_cast<char>(uc);
+            }
+            // else: strip punctuation
+            ++i;
+            continue;
         }
-        // else: strip punctuation
+        // Multi-byte UTF-8: copy the whole code point verbatim. A truncated
+        // or otherwise invalid sequence copies its lead byte alone — either
+        // way the same input always produces the same key.
+        size_t len = 0;
+        if (uc >= 0xc2 && uc <= 0xdf) len = 2;
+        else if (uc >= 0xe0 && uc <= 0xef) len = 3;
+        else if (uc >= 0xf0 && uc <= 0xf4) len = 4;
+        bool valid = len > 0 && i + len <= word.size();
+        for (size_t j = 1; valid && j < len; ++j) {
+            unsigned char cc = static_cast<unsigned char>(word[i + j]);
+            if (cc < 0x80 || cc > 0xbf) valid = false;
+        }
+        if (valid) {
+            out.append(word, i, len);
+            i += len;
+        } else {
+            out += word[i];
+            ++i;
+        }
     }
     return out;
 }
@@ -74,7 +110,10 @@ static Match find_longest_match(
     std::vector<std::vector<int>> dp(na + 1, std::vector<int>(nb + 1, 0));
     for (int i = 1; i <= na; ++i) {
         for (int j = 1; j <= nb; ++j) {
-            if (a[a_lo + i - 1] == b[b_lo + j - 1]) {
+            // Empty keys never participate in a match (issue #118 defense in
+            // depth): words that normalize to "" (pure punctuation like "--")
+            // would otherwise align as runs and drop unrelated boundary words.
+            if (!a[a_lo + i - 1].empty() && a[a_lo + i - 1] == b[b_lo + j - 1]) {
                 dp[i][j] = dp[i-1][j-1] + 1;
                 if (dp[i][j] > best_k) {
                     best_k = dp[i][j];
@@ -131,19 +170,141 @@ std::vector<std::string> stitch_words(
 
 // ---- ChunkStreamer --------------------------------------------------------
 
+std::optional<double> parse_double_strict(const std::string& text) {
+    // Full-string parse: std::stod accepts partial parses ("3abc" -> 3) and
+    // non-finite tokens ("nan", "inf"); the CLI must reject both (issue #146).
+    try {
+        std::size_t pos = 0;
+        const double value = std::stod(text, &pos);
+        // Allow trailing whitespace only; anything else is junk.
+        while (pos < text.size()
+               && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+        if (pos != text.size()) return std::nullopt;
+        if (!std::isfinite(value)) return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<int> parse_int_strict(const std::string& text) {
+    try {
+        std::size_t pos = 0;
+        const long value = std::stol(text, &pos);
+        while (pos < text.size()
+               && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+        if (pos != text.size()) return std::nullopt;
+        if (value < std::numeric_limits<int>::min()
+            || value > std::numeric_limits<int>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<int>(value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::string stream_window_config_error(int sample_rate, double chunk_seconds,
+                                       double overlap_seconds, double min_seconds,
+                                       double partial_interval) {
+    if (sample_rate <= 0) {
+        return "stream sample rate must be positive (got "
+               + std::to_string(sample_rate) + ")";
+    }
+    const struct {
+        const char* name;
+        double value;
+    } fields[] = {
+        {"stream chunk seconds", chunk_seconds},
+        {"stream overlap seconds", overlap_seconds},
+        {"stream min chunk seconds", min_seconds},
+        {"stream partial interval seconds", partial_interval},
+    };
+    for (const auto& f : fields) {
+        if (!std::isfinite(f.value)) {
+            return std::string(f.name) + " must be a finite number";
+        }
+    }
+    if (chunk_seconds < 0.0) {
+        return "stream chunk seconds must be nonnegative "
+               "(0 selects whole-buffer mode)";
+    }
+    if (overlap_seconds < 0.0) {
+        return "stream overlap seconds must be nonnegative";
+    }
+    if (min_seconds < 0.0) {
+        return "stream min chunk seconds must be nonnegative";
+    }
+    if (partial_interval < 0.0) {
+        return "stream partial interval seconds must be nonnegative";
+    }
+    // The sample counters (chunk_, overlap_, min_) are ints: reject windows
+    // whose sample counts do not fit, before the narrowing casts overflow.
+    const double max_seconds =
+        static_cast<double>(std::numeric_limits<int>::max()) / sample_rate;
+    if (chunk_seconds > 0.0) {
+        if (chunk_seconds * sample_rate < 1.0) {
+            return "stream chunk seconds too small: the window is shorter "
+                   "than one sample at this rate";
+        }
+        if (overlap_seconds >= chunk_seconds) {
+            return "stream overlap seconds must be smaller than "
+                   "stream chunk seconds";
+        }
+        if (chunk_seconds > max_seconds) {
+            return "stream chunk seconds too large: the window does not fit "
+                   "the sample counters";
+        }
+    }
+    if (min_seconds > max_seconds) {
+        return "stream min chunk seconds too large: the minimum does not fit "
+               "the sample counters";
+    }
+    return "";
+}
+
 ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
                              double overlap_seconds, double min_seconds,
                              double partial_interval)
-    : sr_(sample_rate),
-      chunk_(static_cast<int>(chunk_seconds * sample_rate)),
-      overlap_(static_cast<int>(
-          std::min(overlap_seconds, chunk_seconds * 0.5) * sample_rate)),
-      advance_(std::max(1, chunk_ - overlap_)),
-      min_(static_cast<int>(min_seconds * sample_rate)),
-      partial_interval_(partial_interval),
-      max_overlap_words_(std::max(8, static_cast<int>(overlap_seconds * 6) + 6)) {
-    if (chunk_ < 1) chunk_ = 1;
-    if (overlap_ < 0) overlap_ = 0;
+    : sr_(0),
+      chunk_(0),
+      overlap_(0),
+      advance_(1),
+      min_(0),
+      partial_interval_(0.0),
+      max_overlap_words_(0) {
+    // Validate the whole configuration before deriving anything, then build
+    // the members in dependency order (issue #146). The old member-init list
+    // computed advance_ from the unclamped overlap_: a negative overlap was
+    // baked into advance_ (every window advanced chunk+|overlap| samples,
+    // skipping audio), and the body's late `overlap_ < 0` clamp could not fix
+    // it — flush() could then hand the transcriber a negative-length window.
+    if (chunk_seconds <= 0.0) {
+        // 0 selects the legacy whole-buffer mode at the CLI; a chunker needs
+        // a real window.
+        throw std::invalid_argument(
+            "stream chunk seconds must be positive to build a chunked stream");
+    }
+    const std::string err = stream_window_config_error(
+        sample_rate, chunk_seconds, overlap_seconds, min_seconds,
+        partial_interval);
+    if (!err.empty()) throw std::invalid_argument(err);
+
+    sr_ = sample_rate;
+    chunk_ = static_cast<int>(chunk_seconds * sample_rate);
+    // Normalize overlap before deriving advance_: clamp to [0, chunk/2] (the
+    // documented cap; overlap >= chunk was already rejected above).
+    overlap_ = static_cast<int>(
+        std::max(0.0, std::min(overlap_seconds, chunk_seconds * 0.5))
+        * sample_rate);
+    advance_ = std::max(1, chunk_ - overlap_);
+    min_ = static_cast<int>(min_seconds * sample_rate);
+    partial_interval_ = partial_interval;
+    max_overlap_words_ = std::max(8, static_cast<int>(overlap_seconds * 6) + 6);
 }
 
 bool ChunkStreamer::finalize_full_windows(
@@ -177,7 +338,7 @@ std::optional<std::string> ChunkStreamer::step(
     }
     last_emit_ = now;
 
-    if (tail_len >= min_) {
+    if (tail_len > 0 && tail_len >= min_) {
         auto text = tx(samples.data() + boundary_, tail_len);
         if (!text.has_value()) {
             // Busy on the tail.
@@ -198,7 +359,10 @@ std::optional<std::string> ChunkStreamer::flush(
         finalize_full_windows(samples, tx);
         int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
         if (tail_len == 0) return join_words(committed_);
-        if (tail_len < chunk_) {
+        // Guard the tail's sign as well (issue #146): the window geometry is
+        // validated at construction, but the transcriber contract (a
+        // nonempty window inside the buffer) is enforced here regardless.
+        if (tail_len > 0 && tail_len < chunk_) {
             auto text = tx(samples.data() + boundary_, tail_len);
             if (text.has_value()) {
                 committed_ = stitch_words(committed_, split_words(*text),
@@ -253,14 +417,25 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     };
 }
 
-void StreamSession::append_pcm(const std::string& bytes) {
-    if (overflow_) return;  // capped: refuse audio until reset()
+AppendOutcome StreamSession::append_pcm(const std::string& bytes) {
+    if (overflow_) return AppendOutcome::Overflowed;  // capped: refuse until reset()
+    if (take_invalid_) return AppendOutcome::TakeInvalid;  // rejected take: refuse until reset()
     const size_t nbytes = bytes.size();
-    if (nbytes == 0) return;
+    if (nbytes == 0) return AppendOutcome::Accepted;
+    // Raw PCM is a sequence of whole int16 samples: an odd byte count means
+    // a sample was split mid-frame at a transport boundary. The old code
+    // silently dropped the dangling byte, hiding a misaligned client from
+    // itself; reject the frame and invalidate the take instead (issue #145).
+    if (nbytes % 2 == 1) {
+        std::fprintf(stderr,
+            "[starling-serve] dropping odd-length PCM chunk (len=%zu)\n",
+            bytes.size());
+        take_invalid_ = true;
+        invalid_reason_ = "odd_pcm_length";
+        return AppendOutcome::OddPcmLength;
+    }
     size_t nsamples = nbytes / 2;
-    // Drop odd trailing byte.
-    if (nbytes % 2 == 1) nsamples = (nbytes - 1) / 2;
-    if (nsamples == 0) return;
+    if (nsamples == 0) return AppendOutcome::Accepted;
     // Cap the LIVE buffer (samples_ memory). Finalized audio is trimmed from
     // samples_, so a long dictation session without commits keeps memory
     // bounded while the cumulative audio grows freely.
@@ -269,7 +444,7 @@ void StreamSession::append_pcm(const std::string& bytes) {
                + static_cast<double>(nsamples) / kSampleRate
              > max_buffer_seconds_) {
         overflow_ = true;
-        return;
+        return AppendOutcome::Overflowed;
     }
     const auto* src = reinterpret_cast<const int16_t*>(bytes.data());
     size_t old = samples_.size();
@@ -278,16 +453,17 @@ void StreamSession::append_pcm(const std::string& bytes) {
         samples_[old + i] = static_cast<float>(src[i]) / 32768.0f;
     }
     maybe_trim_samples();
+    return AppendOutcome::Accepted;
 }
 
-void StreamSession::append_wav(const std::string& bytes) {
-    if (overflow_) return;  // capped: refuse audio until reset()
+AppendOutcome StreamSession::append_wav(const std::string& bytes) {
+    if (overflow_) return AppendOutcome::Overflowed;  // capped: refuse until reset()
+    if (take_invalid_) return AppendOutcome::TakeInvalid;  // rejected take: refuse until reset()
     // Check for RIFF/WAVE header.
     if (bytes.size() < 12 || bytes.substr(0, 4) != "RIFF"
         || bytes.substr(8, 4) != "WAVE") {
         // Treat as raw PCM16.
-        append_pcm(bytes);
-        return;
+        return append_pcm(bytes);
     }
     std::vector<float> decoded;
     int sr = 0;
@@ -295,15 +471,20 @@ void StreamSession::append_wav(const std::string& bytes) {
         std::fprintf(stderr,
             "[starling-serve] dropping malformed WAV chunk (len=%zu)\n",
             bytes.size());
-        return;
+        take_invalid_ = true;
+        invalid_reason_ = "malformed_wav";
+        return AppendOutcome::MalformedWav;
     }
-    // Resample if needed (simple: if sr != 16k, we can't resample in C++ easily;
-    // assume 16k or let the engine handle it — the C API checks).
+    // No C++ resampler exists (the Python server resamples via scipy): a
+    // non-16 kHz WAV must be rejected loudly, not dropped silently — the
+    // client hears nothing back otherwise and blames the model (issue #145).
     if (sr != kSampleRate) {
         std::fprintf(stderr,
             "[starling-serve] dropping WAV chunk: sample rate %d != %d\n",
             sr, kSampleRate);
-        return;
+        take_invalid_ = true;
+        invalid_reason_ = "sample_rate_mismatch";
+        return AppendOutcome::RateMismatch;
     }
     if (!decoded.empty()) {
         if (max_buffer_seconds_ > 0.0
@@ -311,13 +492,14 @@ void StreamSession::append_wav(const std::string& bytes) {
                    + static_cast<double>(decoded.size()) / kSampleRate
                  > max_buffer_seconds_) {
             overflow_ = true;
-            return;
+            return AppendOutcome::Overflowed;
         }
         size_t old = samples_.size();
         samples_.resize(old + decoded.size());
         std::copy(decoded.begin(), decoded.end(), samples_.begin() + old);
     }
     maybe_trim_samples();
+    return AppendOutcome::Accepted;
 }
 
 void StreamSession::maybe_trim_samples() {
@@ -351,6 +533,8 @@ void StreamSession::reset() {
     last_partial_ts_ = 0.0;
     trimmed_samples_ = 0;
     overflow_ = false;
+    take_invalid_ = false;
+    invalid_reason_.clear();
     if (chunker_) chunker_->reset();
 }
 

@@ -35,16 +35,56 @@ std::vector<std::string> split_words(const std::string& s);
 // Join words with a single space (matching Python's " ".join()).
 std::string join_words(const std::vector<std::string>& words);
 
-// Normalize a word for overlap matching: lowercase, strip punctuation.
-// Direct port of _norm() from stream_chunk.py.
+// Normalize a word for overlap matching: lowercase ASCII, strip ASCII
+// punctuation/whitespace, keep non-ASCII (UTF-8) bytes verbatim. Port of
+// _norm() from stream_chunk.py, conservatively Unicode-aware (issue #118):
+// the key is deterministic per word and identical across chunk boundaries.
 std::string norm_word(const std::string& word);
 
 // Transcribe function: takes a window of mono float32 samples, returns text or
 // std::nullopt if the transcriber is busy (should retry without advancing state).
 using TranscribeFn = std::function<std::optional<std::string>(const float*, int64_t)>;
 
+// ---- stream window config validation (issue #146) ---------------------------
+// Strict numeric parse for CLI flags: the whole string must be one finite
+// number. std::stod/std::stoi alone accept partial parses ("3abc" -> 3) and
+// std::stod also accepts non-finite tokens ("nan", "inf"); both must be
+// rejected before the values reach the chunker.
+std::optional<double> parse_double_strict(const std::string& text);
+std::optional<int> parse_int_strict(const std::string& text);
+
+// Validate the stream window configuration: finite values, nonnegative
+// overlap/min/partial-interval, and the window/overlap relationships (the
+// window must span at least one sample and its sample counts must fit the
+// int counters; overlap must stay below the chunk). Returns an empty string
+// when valid, otherwise a human-readable error.
+//
+// `chunk_seconds == 0` is valid ONLY at the CLI level (it selects the legacy
+// whole-buffer mode and no chunker is constructed); ChunkStreamer's
+// constructor rejects it separately because a chunker needs a real window.
+std::string stream_window_config_error(int sample_rate, double chunk_seconds,
+                                       double overlap_seconds, double min_seconds,
+                                       double partial_interval);
+
+// Outcome of appending one binary audio frame to the session
+// (StreamSession::append_pcm / append_wav). A rejection invalidates the take:
+// the session refuses further audio and the WS layer reports the failure to
+// the client (a structured error frame) instead of committing an incomplete
+// capture as an ordinary successful final (issue #145). reset() clears the
+// invalidation and re-arms audio acceptance.
+enum class AppendOutcome {
+    Accepted,      // audio appended (empty frames are accepted no-ops)
+    MalformedWav,  // RIFF/WAVE frame the WAV decoder rejects
+    RateMismatch,  // WAV decodes but its sample rate is not 16 kHz
+    OddPcmLength,  // raw PCM16 with an odd byte count (a split sample)
+    Overflowed,    // refused: the per-connection buffer cap tripped
+    TakeInvalid,   // refused: the take was already invalidated
+};
+
 // ChunkStreamer: rolling fixed-window overlapping-chunk transcription state.
 // Direct port of ChunkStreamer from src/starling/stream_chunk.py.
+// Throws std::invalid_argument when the window configuration is invalid
+// (see stream_window_config_error; chunk_seconds must be positive here).
 class ChunkStreamer {
 public:
     ChunkStreamer(int sample_rate, double chunk_seconds, double overlap_seconds,
@@ -95,9 +135,17 @@ public:
     explicit StreamSession(StarlingServer* server);
 
     // Append raw PCM16 bytes (little-endian int16 → float32).
-    void append_pcm(const std::string& bytes);
-    // Append WAV bytes (decoded via dr_wav).
-    void append_wav(const std::string& bytes);
+    //
+    // Raw PCM frames are defined as sequences of whole int16 samples: an odd
+    // byte count means a sample was split mid-frame at a transport boundary.
+    // The session keeps the take honest the same way it does for WAV rejects
+    // (issue #145): the frame is refused and the take is invalidated rather
+    // than silently dropping the dangling byte. The client re-sends on
+    // whole-sample boundaries (e.g. even-length binary frames).
+    AppendOutcome append_pcm(const std::string& bytes);
+    // Append WAV bytes (decoded via dr_wav). Non-RIFF/WAVE payloads fall back
+    // to append_pcm.
+    AppendOutcome append_wav(const std::string& bytes);
 
     // True when a frame exceeded the per-connection buffer cap
     // (config.max_stream_seconds): the frame was refused and every further
@@ -107,6 +155,19 @@ public:
     // tripping the cap. The WS layer reports overflow to the client as an
     // error frame.
     bool overflowed() const { return overflow_; }
+
+    // True when a malformed-WAV / sample-rate / odd-PCM rejection invalidated
+    // the current take (see AppendOutcome). While set, appends are refused
+    // (TakeInvalid) and commit must not emit an ordinary successful final —
+    // the buffered audio is incomplete, so the client must reset() and fall
+    // back to its authoritative local WAV (issue #145). reset() clears it.
+    // overflow_ is independent: it also refuses audio, but reports the
+    // buffer-cap error instead and does not itself mark the take invalid.
+    bool take_invalid() const { return take_invalid_; }
+    // Short machine-readable code for the rejection that invalidated the
+    // take ("malformed_wav", "sample_rate_mismatch", "odd_pcm_length").
+    // Empty unless take_invalid().
+    const std::string& invalid_reason() const { return invalid_reason_; }
 
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.
     std::optional<std::string> stream_step(double now);
@@ -135,6 +196,8 @@ private:
     int64_t trimmed_samples_ = 0;
     double max_buffer_seconds_ = 0.0;  // from config; 0 = unlimited
     bool overflow_ = false;
+    bool take_invalid_ = false;   // set by an append rejection (issue #145)
+    std::string invalid_reason_;  // machine-readable code for the rejection
     TranscribeFn custom_tx_;  // when set, used instead of the server callback
     std::unique_ptr<ChunkStreamer> chunker_;
 };

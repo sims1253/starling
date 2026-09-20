@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:fidelity-corpus:v1",
+  "$comment": [
+    "Starling fidelity corpus manifest, schema v1 (issue draft E06).",
+    "Provenance is frozen to 'synthetic': real consented audio is a future",
+    "gap and must not be smuggled in as an untyped string.",
+    "Each fixture scores four stages separately: capture completeness, ASR",
+    "content, authored intent, delivered text. Expected-content contracts",
+    "carry no audio claims beyond region annotations used as transport/",
+    "stitch evidence."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "provenance_policy": { "type": "string", "minLength": 1 },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9-]{3,64}$" },
+          "category": {
+            "enum": [
+              "resumed-numbering",
+              "technical-terms",
+              "self-correction",
+              "negation",
+              "intentional-filler",
+              "short-answers",
+              "long-passage",
+              "multilingual-code-switching"
+            ]
+          },
+          "languages": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$" }
+          },
+          "duration_seconds": { "type": "number", "minimum": 0.1 },
+          "provenance": { "const": "synthetic" },
+          "synthesis": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "sample_rate": { "type": "integer", "minimum": 1 },
+              "segments": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": { "enum": ["speech", "silence"] },
+                    "duration_seconds": { "type": "number", "minimum": 0.05 }
+                  },
+                  "required": ["kind", "duration_seconds"]
+                }
+              }
+            },
+            "required": ["sample_rate", "segments"]
+          },
+          "expected": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "capture": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "speech_regions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": { "type": "number", "minimum": 0 }
+                    }
+                  },
+                  "silence_regions": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": { "type": "number", "minimum": 0 }
+                    }
+                  }
+                },
+                "required": ["speech_regions"]
+              },
+              "asr": { "$ref": "#/$defs/contentContract" },
+              "authored": { "$ref": "#/$defs/contentContract" },
+              "delivered": { "$ref": "#/$defs/contentContract" }
+            },
+            "required": ["capture", "asr", "authored", "delivered"]
+          },
+          "reference_outputs": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "capture": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "segments": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": { "type": "number", "minimum": 0 }
+                    }
+                  }
+                },
+                "required": ["segments"]
+              },
+              "asr": { "$ref": "#/$defs/tokenOutput" },
+              "authored": { "$ref": "#/$defs/tokenOutput" },
+              "delivered": { "$ref": "#/$defs/tokenOutput" }
+            },
+            "required": ["capture", "asr", "authored", "delivered"]
+          },
+          "stages": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "capture_completeness": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "min_speech_region_coverage": { "type": "number", "minimum": 0 }
+                }
+              },
+              "asr_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "min_critical_token_recall": { "type": "number", "minimum": 0 },
+                  "min_entity_accuracy": { "type": "number", "minimum": 0 },
+                  "min_numeric_accuracy": { "type": "number", "minimum": 0 }
+                }
+              },
+              "authored_intent": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "min_critical_token_recall": { "type": "number", "minimum": 0 }
+                }
+              },
+              "delivered_text": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "min_critical_token_recall": { "type": "number", "minimum": 0 },
+                  "require_no_duplicates": { "type": "boolean" },
+                  "require_fresh_revision": { "type": "boolean" }
+                }
+              }
+            },
+            "required": [
+              "capture_completeness",
+              "asr_content",
+              "authored_intent",
+              "delivered_text"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "category",
+          "languages",
+          "duration_seconds",
+          "provenance",
+          "synthesis",
+          "expected",
+          "reference_outputs",
+          "stages"
+        ]
+      }
+    }
+  },
+  "required": ["schema_version", "name", "provenance_policy", "fixtures"],
+  "$defs": {
+    "tokenOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tokens": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "required": ["tokens"]
+    },
+    "contentContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "critical_tokens": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "negation_spans": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "negator": { "type": "string", "minLength": 1 },
+              "governed": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            },
+            "required": ["negator", "governed"]
+          }
+        },
+        "entities": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "numeric_values": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[0-9][0-9,]*(\\.[0-9]+)?$" }
+        },
+        "list_continuation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prior_index": { "type": "integer", "minimum": 0 },
+            "markers": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^[0-9]+$" }
+            }
+          },
+          "required": ["prior_index", "markers"]
+        },
+        "fillers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "short_answers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "corrections": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": { "enum": ["replacement", "disjunction"] },
+              "retracted": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "final": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "alternatives": {
+                "type": "array",
+                "minItems": 2,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            },
+            "required": ["mode"]
+          }
+        },
+        "final_phrases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "superseded_phrases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

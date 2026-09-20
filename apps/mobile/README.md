@@ -7,26 +7,44 @@ request. The exact `text` returned by the server is stored as the raw
 transcript. Nothing in the client fixes numbering, removes filler words, or
 silently rewrites words such as `not`, `like`, or `auth`.
 
+While recording, the same 16 kHz chunks can also stream live over the native
+server's `WS /stream` protocol: growing partial transcripts appear in the
+recorder, become composing text in the voice keyboard, and are delivered as
+partial results through the system recognizer, and Stop commits the stream
+for the final transcript. Streaming only engages for the Starling protocol on
+a remote server (never the OpenAI-compatible route or the on-device engine)
+and under the same trusted-host rules as the batch client; otherwise the app
+records exactly as before.
+
 The same capture flow is available from the standalone app and the optional
 Starling Voice Input keyboard. The keyboard shows a transcript first; it only
-calls `InputConnection.commitText` after the user taps **Insert transcript**.
-It does not read surrounding editor text, package names, or selection context.
-An editor target generation and connection identity check prevents a late
-network response from being inserted into a field that has changed.
+calls `InputConnection.commitText` after the user taps **Insert transcript** —
+except while a live stream is running, where growing partials are shown as
+composing text (the Android dictation idiom) and the final text is committed
+once, on Stop, into the field the recording started in. The keyboard does not
+read surrounding editor text, package names, or selection context. An editor
+target generation and connection identity check prevents a late network
+response from being inserted into a field that has changed.
 
 ## Prerequisites
 
 - Android Studio Ladybug or newer, or JDK 17 with the Android SDK.
-- Android SDK platform 35 and build-tools 35.0.0 installed.
+- Android SDK platform 35 and build-tools 36.0.0 installed.
 - A running Starling native server (`starling-serve`). Native serving is the
   supported portable path and requires a 16 kHz WAV. The Python/CUDA server is
   retained for compatibility but is deprecated for new app deployments.
 - A device or emulator with a microphone. Android 8.0 / API 26 is the minimum.
 
-No Python, GPU, model file, or embedded inference runtime is bundled in this
-app. An in-process native Android engine is a future extension; a failed or
-unreachable server is surfaced and the local recording remains available for
-retry.
+No Python or GPU runtime is bundled. An optional **on-device engine**
+(experimental) embeds the repository's native Parakeet engine
+(`libstarling_ggml`) for offline transcription: import a Parakeet-TDT GGUF
+(for example `models/parakeet-tdt-0.6b-v3-q4_0.gguf`) through
+**Import model (.gguf)**, then select **This device** under *Transcribe on*.
+The model stays in app-private storage and is loaded on first use; no server
+or network is needed. Server transcription remains the default. When a
+transcription fails — unreachable server or missing model — the failure is
+surfaced and the local recording remains available for retry. Building the
+app additionally requires the Android NDK and CMake SDK packages.
 
 ## Build and run
 
@@ -49,10 +67,12 @@ address such as:
 ```text
 http://127.0.0.1:8181       # emulator: http://10.0.2.2:8181
 http://192.168.1.20:8181   # physical device on the same LAN
+http://100.101.42.1:8181   # Tailscale/CGNAT VPN overlay
 ```
 
-The HTTP setting accepts only loopback, RFC1918 private, link-local, or
-`.local` hosts. Remote HTTP URLs and credentials embedded in URLs are rejected.
+The HTTP setting accepts only loopback, RFC1918 private, link-local, CGNAT
+(`100.64.0.0/10`, as assigned by Tailscale-style VPN overlays), or `.local`
+hosts. Remote HTTP URLs and credentials embedded in URLs are rejected.
 The Android network policy is configured for this explicit private-LAN opt-in;
 HTTPS remains the default and is recommended whenever available. Existing
 Starling deployments have no authentication layer, so expose a server through
@@ -60,15 +80,46 @@ an authenticated reverse proxy when a network boundary matters. This client
 does not persist credentials or bearer tokens.
 
 Recordings are retained in the app's private files directory. Each item keeps
-its WAV, state, retry count, exact raw transcript, and any transport error.
-Automatic bounded retries cover transient HTTP/server failures; **Retry** is
-also available from the recording list. Deleting an item requires an explicit
-confirmation and removes its WAV and transcript from this app.
+its WAV, state, retry count, exact raw transcript, its provenance (streamed
+live or batch-uploaded), and any transport error. Automatic bounded retries
+cover transient HTTP/server failures; **Retry** is also available from the
+recording list. Deleting an item requires an explicit confirmation and removes
+its WAV and transcript from this app.
 
 To enable the keyboard, tap **Enable Starling keyboard**, enable Starling Voice
 Input in Android settings, then select it from the keyboard switcher. Switching
 apps or editor fields while a request is in flight leaves the transcript in
 Starling and disables insertion for the old target.
+
+### Live streaming and its fallback
+
+The WAV written during capture stays the source of truth: the stream is an
+observer of the same chunks, never a gate on them. The save still completes
+before any network use — on Stop the WAV is finalized and committed first,
+and only then is the stream committed for its final transcript. If the socket
+fails at any point (connect, mid-stream, at commit, or the server's 60 s live
+buffer cap fires), the stream is dropped, the interruption is shown, and the
+already-saved WAV is transcribed through the ordinary batch upload path with
+its normal retries. A streaming failure therefore loses nothing: the
+recording, retry, and failure story is indistinguishable from the
+non-streaming flow. In the voice keyboard a failed stream removes its
+composing text and falls back to the explicit **Insert transcript** flow.
+
+### Voice input inside other keyboards
+
+Starling also registers as a system speech recognizer
+(`StarlingRecognitionService`). Keyboards that use Android's `SpeechRecognizer`
+API — for example the open-source HeliBoard, OpenBoard, or AnySoftKeyboard —
+then show their own microphone button and transcribe through Starling, without
+switching keyboards. Tap **Set Starling as voice input** and choose Starling
+Voice Recognition as the voice input service. Closed keyboards such as Gboard
+or SwiftKey keep their bundled engines and cannot delegate to a custom
+recognizer. When the configuration supports streaming, growing partials are
+delivered through the platform's `partialResults` callback while you speak;
+the final result is still delivered once, after the stream commits or the
+batch transcription of the saved WAV completes. Every dictation stays visible
+in Saved recordings, including failed transcriptions, so it can be retried or
+deleted there.
 
 ## API compatibility
 
@@ -92,7 +143,8 @@ adapter without sending OpenAI fields to the legacy route.
 This directory contains the Android app. The sibling standalone iOS recorder is
 at `../ios`, and the desktop client is at `../desktop`. The
 Android app does not provide an iOS keyboard extension; its system-wide voice
-keyboard is Android-specific. Background recording, streaming `/stream`,
-push-to-talk hardware integration, and embedded native inference remain future
-extensions. The app does not ship model weights or third-party/copyrighted
-application code.
+keyboard is Android-specific. Background recording, push-to-talk hardware
+integration, and embedded native inference remain future extensions. Live
+streaming follows the `WS /stream` contract in `../../docs/native-serving.md`;
+it requires a native Starling server. The app does not ship model weights or
+third-party/copyrighted application code.

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "mutants": [
+    {
+      "id": "m-dropped-tail-capture",
+      "fixture": "fx-short-01",
+      "stage": "capture",
+      "defect": "dropped-tail",
+      "params": { "drop_last": 1 },
+      "expected_gate": "speech_region_coverage",
+      "description": "The capture pipeline loses the final speech region, which carries the 'forty two' answer; the missing region is real omitted speech, not silence."
+    },
+    {
+      "id": "m-dropped-negation-asr",
+      "fixture": "fx-neg-01",
+      "stage": "asr",
+      "defect": "dropped-negation",
+      "params": { "negator": "never" },
+      "expected_gate": "negation_retention",
+      "description": "The ASR hypothesis drops the negator 'never'; finding the remaining governed words in the output text proves nothing about the negation."
+    },
+    {
+      "id": "m-wrong-renumbering-authored",
+      "fixture": "fx-resume-01",
+      "stage": "authored",
+      "defect": "wrong-renumbering",
+      "params": { "markers": ["5", "6", "7"] },
+      "expected_gate": "list_continuation",
+      "description": "The authored output restarts the resumed list at 1 instead of continuing at 5, destroying the list continuation the user intended."
+    },
+    {
+      "id": "m-false-overlap-asr",
+      "fixture": "fx-long-01",
+      "stage": "asr",
+      "defect": "false-overlap",
+      "params": { "start": 20, "end": 25 },
+      "expected_gate": "critical_token_recall",
+      "description": "The stitcher declares a false chunk overlap and deletes an interior span containing 'parakeet' and 'benchmark'; tail presence cannot compensate."
+    },
+    {
+      "id": "m-truncated-refinement-authored",
+      "fixture": "fx-selfcor-01",
+      "stage": "authored",
+      "defect": "truncated-refinement",
+      "params": { "keep_tokens": 6 },
+      "expected_gate": "critical_token_recall",
+      "description": "The refinement stage truncates the authored output, losing the 'standup meeting' context the authored intent contract requires."
+    },
+    {
+      "id": "m-duplicate-insertion-delivered",
+      "fixture": "fx-long-01",
+      "stage": "delivered",
+      "defect": "duplicate-insertion",
+      "params": { "start": 3, "end": 10 },
+      "expected_gate": "no_duplicate_segments",
+      "description": "Delivery inserts a duplicated seven-token segment; the delivered text is not the authored revision even though every critical token is present."
+    },
+    {
+      "id": "m-stale-thread-update-delivered",
+      "fixture": "fx-resume-01",
+      "stage": "delivered",
+      "defect": "stale-thread-update",
+      "params": {
+        "find": ["7", "stop", "there"],
+        "replace": ["4", "stop", "there"]
+      },
+      "expected_gate": "revision_freshness",
+      "description": "The delivered text reflects a stale thread state: the superseded '4 stop there' revision is delivered after the list continued to 7."
+    }
+  ]
+}

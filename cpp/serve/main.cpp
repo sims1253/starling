@@ -119,22 +119,28 @@ static Args parse_args(int argc, char** argv) {
         auto next_int = [&](const char* name) -> int {
             std::string v = next(name);
             if (a.error) return 0;
-            try { return std::stoi(v); }
-            catch (...) {
+            // Strict parse: bare std::stoi accepts partial parses like "3abc"
+            // and silently truncates out-of-range values (issue #146).
+            auto parsed = serve::parse_int_strict(v);
+            if (!parsed.has_value()) {
                 std::fprintf(stderr, "error: %s requires an integer, got '%s'\n", name, v.c_str());
                 a.error = true;
                 return 0;
             }
+            return *parsed;
         };
         auto next_double = [&](const char* name) -> double {
             std::string v = next(name);
             if (a.error) return 0.0;
-            try { return std::stod(v); }
-            catch (...) {
-                std::fprintf(stderr, "error: %s requires a number, got '%s'\n", name, v.c_str());
+            // Strict parse: bare std::stod accepts partial parses like "3abc"
+            // and non-finite tokens like "nan"/"inf" (issue #146).
+            auto parsed = serve::parse_double_strict(v);
+            if (!parsed.has_value()) {
+                std::fprintf(stderr, "error: %s requires a finite number, got '%s'\n", name, v.c_str());
                 a.error = true;
                 return 0.0;
             }
+            return *parsed;
         };
         if (arg == "--model")          a.model = next("--model");
         else if (arg == "--gguf")      a.gguf = next("--gguf");
@@ -192,6 +198,45 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
+// ---- WS /stream binary-frame rejection --------------------------------------
+// Describe a refused binary audio frame as a structured WS error frame,
+// mirroring the buffer-cap error style. A refused frame invalidates the take
+// (or trips the buffer cap); the session then ignores audio until reset.
+static std::string ws_append_error(serve::AppendOutcome outcome,
+                                   const serve::StreamSession& session,
+                                   double max_stream_seconds) {
+    std::ostringstream ss;
+    ss << "{\"type\":\"error\",\"message\":\"";
+    switch (outcome) {
+    case serve::AppendOutcome::MalformedWav:
+        ss << "malformed WAV frame rejected; audio ignored until reset";
+        break;
+    case serve::AppendOutcome::RateMismatch:
+        ss << "WAV sample rate mismatch: expected " << serve::kSampleRate
+           << "; audio ignored until reset";
+        break;
+    case serve::AppendOutcome::OddPcmLength:
+        ss << "odd-length PCM frame rejected (split sample);"
+           << " audio ignored until reset";
+        break;
+    case serve::AppendOutcome::Overflowed:
+        ss << "stream buffer limit reached (" << max_stream_seconds
+           << " s live buffer); audio ignored until reset";
+        break;
+    case serve::AppendOutcome::TakeInvalid:
+        // Only reached on a frame AFTER the invalidating one (whose own
+        // outcome carried the reason); repeat that reason, not a generic.
+        // invalid_reason_ is an internal [a-z_] code: safe to embed raw.
+        ss << "take invalidated (" << session.invalid_reason()
+           << "); audio ignored until reset";
+        break;
+    case serve::AppendOutcome::Accepted:
+        break;
+    }
+    ss << "\"}";
+    return ss.str();
+}
+
 // ---- flat JSON string-field extraction (POST /normalize) ------------------
 // Extracts a top-level "key": "value" string field from a flat JSON object
 // (the /normalize request shape: string fields, no nesting). A single pass
@@ -201,8 +246,46 @@ static std::string json_escape(const std::string& s) {
 // top-level field. A candidate only qualifies when it starts outside any
 // string at depth 1, the previous non-whitespace char is `{` or `,`, and the
 // next non-whitespace char is `:`. Escapes (\", \\, \n, \t, \uXXXX) are
-// decoded; \u escapes encode a UTF-8 BMP codepoint. Returns false when the
-// field is absent or malformed.
+// decoded; a \u escape encodes UTF-8, with a valid surrogate pair combining
+// into one 4-byte sequence (issue #123).
+// Returns false when the field is absent or malformed.
+
+// Parse exactly four hex digits at body[start..start+4) into *out.
+// Returns false on a non-hex byte (malformed \u escape).
+static bool json_hex4(const std::string& body, size_t start, unsigned& out) {
+    if (start + 4 > body.size()) return false;
+    unsigned v = 0;
+    for (int i = 0; i < 4; ++i) {
+        char h = body[start + i];
+        v <<= 4;
+        if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+        else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+        else return false;
+    }
+    out = v;
+    return true;
+}
+
+// Append code point cp (<= 0x10FFFF) to out as UTF-8.
+static void json_append_utf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xc0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 63));
+    } else if (cp < 0x10000) {
+        out += (char)(0xe0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 63));
+        out += (char)(0x80 | (cp & 63));
+    } else {
+        out += (char)(0xf0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 63));
+        out += (char)(0x80 | ((cp >> 6) & 63));
+        out += (char)(0x80 | (cp & 63));
+    }
+}
+
 static bool json_get_string(const std::string& body, const std::string& key,
                             std::string& out) {
     // Pass 1: in-string/escape state + enclosing depth per byte.
@@ -268,25 +351,33 @@ static bool json_get_string(const std::string& body, const std::string& key,
             case 'b':  out += '\b'; break;
             case 'f':  out += '\f'; break;
             case 'u': {
-                if (q + 4 >= body.size()) return false;
                 unsigned cp = 0;
-                for (int i = 1; i <= 4; ++i) {
-                    char h = body[q + i];
-                    cp <<= 4;
-                    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
-                    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
-                    else return false;
+                if (!json_hex4(body, q + 1, cp)) return false;
+                // Surrogate pairs (issue #123): "\ud83d\ude00" is ONE code
+                // point and must decode to one 4-byte UTF-8 sequence, not to
+                // two 3-byte sequences (surrogate code points have no UTF-8
+                // encoding — that output was invalid UTF-8 while the raw
+                // character decoded correctly). An unpaired surrogate half
+                // decodes to U+FFFD (REPLACEMENT CHARACTER): JSON only
+                // permits paired escapes, but rejecting the whole request
+                // over one stray half would 400 transcripts that common
+                // serializers emit and other parsers accept; replacement is
+                // the WHATWG encoding standard's interoperable policy.
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    unsigned lo = 0;
+                    if (q + 10 < body.size() && body[q + 5] == '\\'
+                        && body[q + 6] == 'u'
+                        && json_hex4(body, q + 7, lo)
+                        && lo >= 0xdc00 && lo <= 0xdfff) {
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                        q += 6;  // consume the low escape's "\u" too
+                    } else {
+                        cp = 0xfffd;  // unpaired high surrogate
+                    }
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    cp = 0xfffd;      // unpaired low surrogate
                 }
-                if (cp < 0x80) out += (char)cp;
-                else if (cp < 0x800) {
-                    out += (char)(0xc0 | (cp >> 6));
-                    out += (char)(0x80 | (cp & 63));
-                } else {
-                    out += (char)(0xe0 | (cp >> 12));
-                    out += (char)(0x80 | ((cp >> 6) & 63));
-                    out += (char)(0x80 | (cp & 63));
-                }
+                json_append_utf8(out, cp);
                 q += 4;
                 break;
             }
@@ -342,6 +433,22 @@ int main(int argc, char** argv) {
     }
     if (args.error) {
         usage(argv[0]);
+        return 1;
+    }
+    // Validate the stream window configuration BEFORE the model is loaded
+    // (issue #146): out-of-range values used to surface much later, when the
+    // chunker derived a negative-length transcription window mid-session.
+    // (The stream flags already passed the strict finite-number parse above.)
+    if (auto err = serve::stream_window_config_error(
+            serve::kSampleRate, args.stream_chunk, args.stream_overlap,
+            args.min_chunk, args.partial_interval);
+        !err.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (args.max_stream_seconds < 0.0) {
+        std::fprintf(stderr,
+            "error: --max-stream-seconds must be nonnegative (0 = unlimited)\n");
         return 1;
     }
     if (args.model.empty() || args.gguf.empty()) {
@@ -837,9 +944,10 @@ int main(int argc, char** argv) {
         [&server, &cfg](const httplib::Request&,
                         httplib::ws::WebSocket& ws) {
             serve::StreamSession session(server.get());
-            // Sent once when the per-connection buffer cap trips; re-armed on
-            // reset so a fresh dictation gets a fresh error if it overflows.
-            bool cap_error_sent = false;
+            // Sent once when a binary frame is refused (buffer cap, malformed
+            // WAV, sample-rate mismatch, odd PCM length); re-armed on reset
+            // so a fresh dictation gets a fresh error if it is refused.
+            bool reject_error_sent = false;
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
@@ -873,6 +981,21 @@ int main(int argc, char** argv) {
                     }
 
                     if (type == "commit") {
+                        // An invalidated take (a rejected binary frame) holds
+                        // incomplete audio: committing it as an ordinary
+                        // successful final would silently miss speech, so the
+                        // commit is refused and the client falls back to its
+                        // authoritative local WAV after a reset (issue #145).
+                        // The busy-retry path below is untouched: it retains
+                        // VALID audio, while this path refuses INVALID audio.
+                        if (session.take_invalid()) {
+                            std::ostringstream ss;
+                            ss << "{\"type\":\"error\",\"message\":\"take "
+                               << "invalidated (" << session.invalid_reason()
+                               << "); reset and resend\"}";
+                            ws.send(ss.str());
+                            continue;
+                        }
                         double dur = session.buffered_seconds();
                         std::string text;
                         if (dur > 0.0) {
@@ -891,16 +1014,17 @@ int main(int argc, char** argv) {
                            << dur << "}],\"duration_s\":" << dur << "}";
                         ws.send(ss.str());
                         session.reset();
-                        // reset() re-enables audio (clears the buffer cap);
-                        // re-arm the one-shot error frame with it.
-                        cap_error_sent = false;
+                        // reset() re-enables audio (clears the buffer cap and
+                        // any take invalidation); re-arm the one-shot error
+                        // frame with it.
+                        reject_error_sent = false;
                         continue;
                     } else if (type == "ping") {
                         ws.send("{\"type\":\"pong\"}");
                         continue;
                     } else if (type == "reset") {
                         session.reset();
-                        cap_error_sent = false;
+                        reject_error_sent = false;
                         ws.send("{\"type\":\"reset_ack\"}");
                         continue;
                     } else {
@@ -914,26 +1038,28 @@ int main(int argc, char** argv) {
 
                 if (rr == httplib::ws::ReadResult::Binary) {
                     // Audio data. Enforce the per-connection buffer cap
-                    // (--max-stream-seconds): a frame that would exceed it is
-                    // refused, reported once as an error frame, and the
-                    // session stops accepting audio until it is reset.
-                    if (!session.overflowed()) {
+                    // (--max-stream-seconds) and the frame-validity policy
+                    // (issue #145): a refused frame is reported once as an
+                    // error frame, and the session stops accepting audio
+                    // until it is reset.
+                    serve::AppendOutcome outcome = serve::AppendOutcome::Accepted;
+                    if (!session.overflowed() && !session.take_invalid()) {
                         if (msg.size() >= 12 && msg.substr(0, 4) == "RIFF"
                             && msg.substr(8, 4) == "WAVE") {
-                            session.append_wav(msg);
+                            outcome = session.append_wav(msg);
                         } else {
-                            session.append_pcm(msg);
+                            outcome = session.append_pcm(msg);
                         }
+                    } else if (session.take_invalid()) {
+                        outcome = serve::AppendOutcome::TakeInvalid;
+                    } else {
+                        outcome = serve::AppendOutcome::Overflowed;
                     }
-                    if (session.overflowed()) {
-                        if (!cap_error_sent) {
-                            cap_error_sent = true;
-                            std::ostringstream ss;
-                            ss << "{\"type\":\"error\",\"message\":\"stream buffer"
-                               << " limit reached (" << cfg.max_stream_seconds
-                               << " s live buffer); audio ignored until"
-                               << " reset\"}";
-                            ws.send(ss.str());
+                    if (outcome != serve::AppendOutcome::Accepted) {
+                        if (!reject_error_sent) {
+                            reject_error_sent = true;
+                            ws.send(ws_append_error(
+                                outcome, session, cfg.max_stream_seconds));
                         }
                         continue;
                     }
