@@ -187,8 +187,57 @@ public:
     // uses the server-backed make_transcribe_fn).
     void set_transcribe_fn(TranscribeFn fn) { custom_tx_ = std::move(fn); }
 
+    // ---- exact streaming-tail result reuse (S11) ----------------------------
+    // A successful preview followed immediately by a commit used to call the
+    // engine again on the byte-identical tail window (two whole-model calls
+    // for one answer). The session retains the LAST successful raw window
+    // result, keyed by complete identity, and replays it for any later call
+    // with the same key — one engine callback becomes zero. Reuse is
+    // exact-input only: the retained entry never crosses an audio append, a
+    // reset, a take invalidation or an engine-identity change, and only
+    // complete successes are retained (empty text IS a success; busy,
+    // cancelled and failed calls never enter the entry).
+    //
+    // Engine identity: everything about the request that can change the raw
+    // window output — model slug, gguf artifact (which encodes the
+    // quantization), backend, and the stream window/overlap policy. The
+    // native server fixes these per process; set_engine_identity() is the
+    // invalidating hook for a reload/re-config (and for tests).
+    void set_engine_identity(std::string id);
+    const std::string& engine_identity() const { return engine_id_; }
+
+    // Number of transcribe calls answered from the retained exact-tail entry
+    // (the engine was not invoked). Observability for tests and for reporting
+    // inference calls avoided, separately from any latency claims.
+    int64_t tail_cache_hits() const { return tail_cache_hits_; }
+
 private:
     void maybe_trim_samples();
+
+    // Identity of one raw window result (S11): the exact sample window
+    // (absolute start index including the trimmed prefix, and length), the
+    // audio revision when the engine produced it, and the engine identity.
+    // Equal keys mean the two calls saw byte-identical samples through the
+    // same model/config/backend, so the earlier result answers the later one.
+    struct StreamTailKey {
+        int64_t abs_start = -1;   // absolute sample index of the window start
+        int64_t length = 0;       // window length in samples
+        uint64_t audio_rev = 0;   // audio revision at production time
+        std::string engine_id;    // model/quant/backend/window-config identity
+        bool operator==(const StreamTailKey& o) const {
+            return abs_start == o.abs_start && length == o.length
+                && audio_rev == o.audio_rev && engine_id == o.engine_id;
+        }
+    };
+
+    // The transcribe callback actually used by stream_step/stream_flush: the
+    // custom (test) or server callback wrapped with exact-tail reuse.
+    TranscribeFn active_tx();
+
+    // Drop the retained exact-tail entry (any event that could change the
+    // answer for a future window: append, reset, take invalidation, engine
+    // identity change).
+    void invalidate_tail_result();
 
     StarlingServer* server_;
     std::vector<float> samples_;
@@ -200,6 +249,17 @@ private:
     std::string invalid_reason_;  // machine-readable code for the rejection
     TranscribeFn custom_tx_;  // when set, used instead of the server callback
     std::unique_ptr<ChunkStreamer> chunker_;
+
+    // ---- exact streaming-tail result reuse (S11) ----------------------------
+    // Bumped on every append that actually adds samples and NEVER reset: keys
+    // recorded before a reset can never collide with keys recorded after it,
+    // even though absolute sample indices restart at 0.
+    uint64_t audio_rev_ = 0;
+    std::string engine_id_;       // identity snapshot (see set_engine_identity)
+    bool tail_valid_ = false;     // retained entry below is meaningful
+    StreamTailKey tail_key_;      // key of the retained result (iff tail_valid_)
+    std::string tail_text_;       // the raw window result ("" is a success)
+    int64_t tail_cache_hits_ = 0; // calls answered from the retained entry
 };
 
 } // namespace starling::serve

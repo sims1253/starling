@@ -596,6 +596,422 @@ static void test_bounded_retry_recovery() {
     CHECK(cs.boundary() == 30);
 }
 
+// ---- exact streaming-tail reuse (S11) ---------------------------------------
+// All of these drive StreamSession with an injected fake engine
+// (set_transcribe_fn) and count engine invocations. Scenario geometry: with
+// test_cfg() (1 s chunks, 0.25 s overlap, 0.5 s partial minimum) a 0.7 s
+// (11200-sample) append is a pure tail — below one chunk window, above the
+// partial minimum — so a preview transcribes exactly [0, 11200) and a commit
+// with no further audio used to transcribe the identical window a second
+// time. The retained exact-tail entry must turn that second call into a
+// replay, and must NEVER answer anything whose identity differs in the
+// slightest (one sample, one option, one model id, one invalidation).
+
+static void test_tail_reuse_preview_then_commit() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    auto partial = session.stream_step(1.0);
+    CHECK(partial.has_value());
+    CHECK(*partial == "alpha beta");
+    CHECK(engine_calls == 1);              // the preview's one engine call
+
+    // Stop arrives with no new audio: the flush tail is byte-identical to the
+    // previewed window → the retained result answers it. Two engine calls
+    // become one, with identical output.
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(*final_ == "alpha beta");
+    CHECK(engine_calls == 1);
+    CHECK(session.tail_cache_hits() == 1);
+
+    // Duplicate commit: everything is finalized (boundary == buffer end), so
+    // the second flush returns the committed text without any engine call —
+    // and without touching the retained entry.
+    auto again = session.stream_flush();
+    CHECK(again.has_value());
+    CHECK(*again == "alpha beta");
+    CHECK(engine_calls == 1);
+    CHECK(session.tail_cache_hits() == 1);
+}
+
+static void test_tail_reuse_one_appended_sample_forces_recompute() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());
+    CHECK(engine_calls == 1);
+
+    // One more sample arrives before Stop: the committed tail is longer than
+    // the previewed window, so the preview's result is not an exact answer.
+    // The engine must run again.
+    session.append_pcm(pcm_for_range(11200, 1));
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(*final_ == "alpha beta");
+    CHECK(engine_calls == 2);
+    CHECK(session.tail_cache_hits() == 0);
+}
+
+static void test_tail_reuse_engine_identity_change_forces_recompute() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());
+    CHECK(engine_calls == 1);
+
+    // The engine identity is part of the key: a reloaded/re-configured
+    // engine (here simulated by a quant swap in the identity string) can
+    // answer the same bytes differently → the retained result is dropped and
+    // the very same window must be recomputed.
+    session.set_engine_identity(session.engine_identity() + "|q8");
+    CHECK(session.stream_step(2.0) == std::optional<std::string>("alpha beta"));
+    CHECK(engine_calls == 2);
+    // The recomputation is retained under the new identity going forward:
+    // commit on unchanged audio reuses it.
+    auto final_ = session.stream_flush();
+    CHECK(final_ == std::optional<std::string>("alpha beta"));
+    CHECK(engine_calls == 2);
+    CHECK(session.tail_cache_hits() == 1);
+}
+
+static void test_tail_reuse_empty_text_is_a_valid_result() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "";  // a successful empty transcription (silence)
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    auto partial = session.stream_step(1.0);
+    CHECK(partial.has_value());
+    CHECK(partial->empty());
+    CHECK(engine_calls == 1);
+
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(final_->empty());
+    CHECK(engine_calls == 1);
+    CHECK(session.tail_cache_hits() == 1);
+}
+
+static void test_tail_reuse_busy_preview_recomputes_at_commit() {
+    // A busy/cancelled preview retains nothing (nullopt is never a reusable
+    // result): the commit must call the engine and produce the full text.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    bool busy = true;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        if (busy) return std::nullopt;  // "server busy" / "cancelled"
+        return "recovered words";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    auto partial = session.stream_step(1.0);
+    CHECK(!partial.has_value());
+    CHECK(engine_calls == 1);
+
+    busy = false;
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(*final_ == "recovered words");
+    CHECK(engine_calls == 2);
+    CHECK(session.tail_cache_hits() == 0);
+}
+
+static void test_tail_reuse_cancel_after_success_not_reused() {
+    // A successful preview, then new frames arrive ("during inference" in a
+    // paced session) and the next preview is cancelled/busy: the stale
+    // success must not answer the grown commit window.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    // Window-keyed fake engine: the 11200-sample window succeeds, the grown
+    // 12800-sample window is busy once, then succeeds with overlapping text.
+    session.set_transcribe_fn([&](const float*, int64_t n)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        if (n == 11200) return "alpha beta";
+        if (engine_calls == 2) return std::nullopt;  // cancelled preview
+        return "alpha beta gamma";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0) == std::optional<std::string>("alpha beta"));
+    session.append_pcm(pcm_for_range(11200, 1600));
+    CHECK(!session.stream_step(2.0).has_value());  // busy on the grown tail
+
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    // Stitching dedupes the 2-word overlap: "alpha beta" + "alpha beta gamma".
+    CHECK(*final_ == "alpha beta gamma");
+    CHECK(engine_calls == 3);              // preview, cancelled preview, commit
+    CHECK(session.tail_cache_hits() == 0); // nothing was reused
+}
+
+static void test_tail_reuse_commit_completes_while_engine_busy() {
+    // The commit path is never dropped or delayed by reuse/coalescing: with
+    // the exact answer already retained, a commit succeeds even while the
+    // engine is busy (nothing about the final audio is skipped — it was all
+    // transcribed by the preview on identical bytes).
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    bool busy = false;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        if (busy) return std::nullopt;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());
+    CHECK(engine_calls == 1);
+
+    busy = true;  // the engine goes busy before Stop
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(*final_ == "alpha beta");
+    CHECK(engine_calls == 1);             // answered by the retained result
+    CHECK(session.tail_cache_hits() == 1);
+}
+
+static void test_tail_reuse_invalidated_take_not_reused() {
+    // An invalidated take (a refused frame, issue #145) must never be answered
+    // from the retained entry. The WS layer refuses commit outright for an
+    // invalidated take; this pins the session-level defense for the case
+    // where stream_flush is reached anyway.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());
+    CHECK(engine_calls == 1);
+
+    std::string odd = pcm_for_range(11200, 800);
+    odd.push_back('\x7f');
+    CHECK(session.append_pcm(odd) == AppendOutcome::OddPcmLength);
+    CHECK(session.take_invalid());
+
+    CHECK(session.stream_flush().has_value());
+    CHECK(engine_calls == 2);             // recomputed, NOT reused
+    CHECK(session.tail_cache_hits() == 0);
+}
+
+static void test_tail_reuse_duplicate_snapshots_coalesced() {
+    // The WS layer calls stream_step after EVERY binary frame, including
+    // frames that append no new audio: duplicate step snapshots used to
+    // re-run the engine on the identical window. Coalescing: the stale
+    // generation is answered from the retained exact result instead.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "alpha beta";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0) == std::optional<std::string>("alpha beta"));
+    CHECK(engine_calls == 1);
+
+    for (int i = 0; i < 5; ++i) {
+        CHECK(session.append_pcm(std::string()) == AppendOutcome::Accepted);
+        auto partial = session.stream_step(2.0 + i);
+        CHECK(partial == std::optional<std::string>("alpha beta"));
+    }
+    CHECK(engine_calls == 1);             // five stale generations coalesced
+    CHECK(session.tail_cache_hits() == 5);
+
+    // The final commit still produces the full text with zero engine calls.
+    CHECK(session.stream_flush() == std::optional<std::string>("alpha beta"));
+    CHECK(engine_calls == 1);
+    CHECK(session.tail_cache_hits() == 6);
+}
+
+static void test_tail_reuse_newer_snapshot_wins() {
+    // Audio grows between previews: each preview reflects the NEWEST window
+    // only and each distinct window is transcribed exactly once — the
+    // superseded (stale) snapshot is never re-run, and the commit always
+    // uses the newest audio.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t n)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return std::to_string(n);  // reveals which window ran
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0) == std::optional<std::string>("11200"));
+    session.append_pcm(pcm_for_range(11200, 1600));
+    // Growing the tail supersedes the stale 11200-sample snapshot: the newest
+    // preview reflects the 12800-sample window (preview tails are not
+    // committed — each partial is the current tail stitched onto committed).
+    CHECK(session.stream_step(2.0) == std::optional<std::string>("12800"));
+
+    // The commit always uses the newest audio: the flush tail IS the newest
+    // 12800-sample window, answered from its own retained result.
+    auto final_ = session.stream_flush();
+    CHECK(final_ == std::optional<std::string>("12800"));
+    CHECK(engine_calls == 2);             // one call per distinct window
+    CHECK(session.tail_cache_hits() == 1);  // the commit reused the newest
+}
+
+static void test_tail_reuse_reset_clears_entry() {
+    // reset() starts a new take: a window at the same absolute indices with
+    // the same length must not inherit the previous take's result (the audio
+    // revision is monotonic across resets, so the keys cannot collide).
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    int engine_calls = 0;
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "take one";
+    });
+
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());
+    CHECK(engine_calls == 1);
+
+    session.reset();
+    session.set_transcribe_fn([&](const float*, int64_t)
+                                  -> std::optional<std::string> {
+        ++engine_calls;
+        return "take two";
+    });
+    session.append_pcm(pcm_for_range(0, 11200));  // same length, fresh take
+    CHECK(session.stream_step(2.0) == std::optional<std::string>("take two"));
+    CHECK(engine_calls == 2);
+    CHECK(session.stream_flush() == std::optional<std::string>("take two"));
+    CHECK(engine_calls == 2);
+    CHECK(session.tail_cache_hits() == 1);  // only the second take's commit
+}
+
+static void test_tail_reuse_aba_across_sessions() {
+    // A/B/A request pattern: each session owns exactly one retained entry,
+    // so nothing crosses sessions; every session independently gets the
+    // preview→commit reuse with its own engine's output.
+    struct Result { int calls; int64_t hits; std::string final_text; };
+    auto run = [](const std::string& slug, const std::string& text) {
+        ServerConfig cfg = test_cfg();
+        cfg.model_slug = slug;  // different model id → different identity
+        StarlingServer server(cfg);
+        StreamSession session(&server);
+        int calls = 0;
+        session.set_transcribe_fn([&](const float*, int64_t)
+                                      -> std::optional<std::string> {
+            ++calls;
+            return text;
+        });
+        (void)session.stream_step(0.0);  // no audio yet: no call
+        session.append_pcm(pcm_for_range(0, 11200));
+        CHECK(session.stream_step(1.0) == std::optional<std::string>(text));
+        auto final_ = session.stream_flush();
+        CHECK(final_ == std::optional<std::string>(text));
+        return Result{calls, session.tail_cache_hits(), *final_};
+    };
+
+    const Result a1 = run("parakeet", "alpha words");
+    const Result b = run("moss", "beta words");
+    const Result a2 = run("parakeet", "alpha words");
+    CHECK(a1.calls == 1 && a1.hits == 1 && a1.final_text == "alpha words");
+    CHECK(b.calls == 1 && b.hits == 1 && b.final_text == "beta words");
+    CHECK(a2.calls == 1 && a2.hits == 1 && a2.final_text == "alpha words");
+
+    // Different model slugs really do produce different engine identities.
+    ServerConfig ca = test_cfg(); ca.model_slug = "parakeet";
+    ServerConfig cb = test_cfg(); cb.model_slug = "moss";
+    StarlingServer sa(ca), sb(cb);
+    StreamSession session_a(&sa), session_b(&sb);
+    CHECK(session_a.engine_identity() != session_b.engine_identity());
+}
+
+static void test_tail_reuse_survives_overlap_rebasing() {
+    // Overlap rebasing/trim interaction: the key uses ABSOLUTE sample indices
+    // (live offset + trimmed prefix), so a preview after a trim and the
+    // commit on unchanged audio still name the same window and reuse, while
+    // the window handed to the engine provably starts at the right absolute
+    // sample (position-encoded audio).
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    std::vector<std::pair<int16_t, int64_t>> calls;  // first sample, length
+    TranscribeFn tx = [&](const float* p, int64_t n)
+                          -> std::optional<std::string> {
+        calls.emplace_back(static_cast<int16_t>(p[0] * 32768.0f), n);
+        return calls.size() <= 3 ? "w" : "tail words";
+    };
+    session.set_transcribe_fn(tx);
+
+    // 2.5 s: three full windows finalize (boundary → 36000).
+    session.append_pcm(pcm_for_range(0, 40000));
+    CHECK(session.stream_step(1.0) == std::optional<std::string>("w w w"));
+    CHECK(calls.size() == 3);
+    CHECK(session.buffered_seconds() == 2.5);
+
+    // The next append trims the 36000 finalized samples and rebases; then
+    // top the live buffer up to the 0.5 s partial minimum.
+    session.append_pcm(pcm_for_range(40000, 1600));
+    CHECK(session.live_seconds() == 0.35);  // 5600 live after the trim
+    session.append_pcm(pcm_for_range(41600, 2400));
+
+    // Preview on the rebased tail: live [0, 8000) = absolute [36000, 44000).
+    // The first sample encodes the absolute start: 36000 % 30000 - 15000.
+    CHECK(session.stream_step(2.0)
+          == std::optional<std::string>("w w w tail words"));
+    CHECK(calls.size() == 4);
+    if (calls.size() == 4) {
+        CHECK(calls[3].second == 8000);
+        CHECK(calls[3].first == 36000 % 30000 - 15000);
+    }
+
+    // Commit with no further audio: the flush names the same absolute window
+    // → reuse. Audio accounting is unchanged (nothing dropped or shortened).
+    auto final_ = session.stream_flush();
+    CHECK(final_ == std::optional<std::string>("w w w tail words"));
+    CHECK(calls.size() == 4);
+    CHECK(session.tail_cache_hits() == 1);
+    CHECK(session.buffered_seconds() == 2.75);
+}
+
+
 // ---- stream window config validation (issue #146) --------------------------
 // Negative/NaN/oversized stream window values used to reach the chunker, whose
 // member-init list computed advance_ from the unclamped overlap_: a negative
@@ -772,6 +1188,19 @@ int main() {
     test_stream_session_busy_retry();
     test_stream_session_append_rejection();
     test_bounded_retry_recovery();
+    test_tail_reuse_preview_then_commit();
+    test_tail_reuse_one_appended_sample_forces_recompute();
+    test_tail_reuse_engine_identity_change_forces_recompute();
+    test_tail_reuse_empty_text_is_a_valid_result();
+    test_tail_reuse_busy_preview_recomputes_at_commit();
+    test_tail_reuse_cancel_after_success_not_reused();
+    test_tail_reuse_commit_completes_while_engine_busy();
+    test_tail_reuse_invalidated_take_not_reused();
+    test_tail_reuse_duplicate_snapshots_coalesced();
+    test_tail_reuse_newer_snapshot_wins();
+    test_tail_reuse_reset_clears_entry();
+    test_tail_reuse_aba_across_sessions();
+    test_tail_reuse_survives_overlap_rebasing();
     test_strict_number_parsing();
     test_stream_window_config_error();
     test_chunk_streamer_rejects_invalid_config();

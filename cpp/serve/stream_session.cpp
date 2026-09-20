@@ -395,6 +395,20 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
             cfg.min_chunk_seconds, cfg.partial_interval);
     }
     max_buffer_seconds_ = cfg.max_stream_seconds;
+    // Engine identity for exact-tail reuse (S11): everything about the request
+    // that can change a raw window result. The native server fixes the model
+    // slug + gguf artifact (which encodes the quantization) per process and
+    // the backend at link time; the window/overlap policy shapes the very
+    // windows being keyed. std::to_string(double) is fixed-point, so the
+    // string is deterministic. There is no language/normalization parameter
+    // on the native streaming path (nothing extra to key on); a hypothetical
+    // reload/re-config goes through set_engine_identity(), which invalidates.
+    engine_id_ = cfg.model_slug + "|" + cfg.gguf_path + "|"
+               + starling_ggml_backend_name() + "|chunk="
+               + std::to_string(cfg.stream_chunk_seconds)
+               + "|overlap=" + std::to_string(cfg.stream_overlap_seconds)
+               + "|min=" + std::to_string(cfg.min_chunk_seconds)
+               + "|partial=" + std::to_string(cfg.partial_interval);
 }
 
 TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
@@ -432,6 +446,7 @@ AppendOutcome StreamSession::append_pcm(const std::string& bytes) {
             bytes.size());
         take_invalid_ = true;
         invalid_reason_ = "odd_pcm_length";
+        invalidate_tail_result();  // an invalidated take never reuses (S11)
         return AppendOutcome::OddPcmLength;
     }
     size_t nsamples = nbytes / 2;
@@ -452,6 +467,7 @@ AppendOutcome StreamSession::append_pcm(const std::string& bytes) {
     for (size_t i = 0; i < nsamples; ++i) {
         samples_[old + i] = static_cast<float>(src[i]) / 32768.0f;
     }
+    ++audio_rev_;  // any appended audio invalidates exact-tail reuse (S11)
     maybe_trim_samples();
     return AppendOutcome::Accepted;
 }
@@ -473,6 +489,7 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
             bytes.size());
         take_invalid_ = true;
         invalid_reason_ = "malformed_wav";
+        invalidate_tail_result();  // an invalidated take never reuses (S11)
         return AppendOutcome::MalformedWav;
     }
     // No C++ resampler exists (the Python server resamples via scipy): a
@@ -484,6 +501,7 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
             sr, kSampleRate);
         take_invalid_ = true;
         invalid_reason_ = "sample_rate_mismatch";
+        invalidate_tail_result();  // an invalidated take never reuses (S11)
         return AppendOutcome::RateMismatch;
     }
     if (!decoded.empty()) {
@@ -497,6 +515,7 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
         size_t old = samples_.size();
         samples_.resize(old + decoded.size());
         std::copy(decoded.begin(), decoded.end(), samples_.begin() + old);
+        ++audio_rev_;  // any appended audio invalidates exact-tail reuse (S11)
     }
     maybe_trim_samples();
     return AppendOutcome::Accepted;
@@ -516,15 +535,75 @@ void StreamSession::maybe_trim_samples() {
     chunker_->rebase(b);
 }
 
+// ---- exact streaming-tail result reuse (S11) -------------------------------
+//
+// Wrap the session's transcribe callback with the retained exact-tail entry.
+// Every window call is keyed by (absolute sample start including the trimmed
+// prefix, window length, audio revision, engine identity); a call whose key
+// equals the retained SUCCESSFUL result's key is answered without invoking
+// the engine — a successful preview followed by a commit on unchanged audio
+// becomes one engine call instead of two, and duplicate preview snapshots of
+// an unchanged buffer are coalesced into the retained result instead of
+// re-running a stale generation. The commit path is never dropped or
+// shortened by this: a hit returns the same complete raw text the engine
+// produced for those exact bytes, and a miss runs the engine as before (a
+// hit can even complete a commit while the engine is busy, because the exact
+// answer is already known).
+//
+// Only complete successes are retained — empty text included. Busy, cancelled
+// and failed calls return nullopt and never enter the entry; a stale retained
+// entry cannot false-match later because audio_rev_ only moves forward.
+TranscribeFn StreamSession::active_tx() {
+    TranscribeFn inner = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
+    return [this, inner](const float* p, int64_t n)
+               -> std::optional<std::string> {
+        StreamTailKey key;
+        // p always points into samples_ (the chunker passes
+        // samples.data() + boundary); with the trimmed prefix this is the
+        // absolute take-time sample index, stable across buffer trims.
+        key.abs_start = trimmed_samples_
+                        + static_cast<int64_t>(p - samples_.data());
+        key.length = n;
+        key.audio_rev = audio_rev_;
+        key.engine_id = engine_id_;
+        if (tail_valid_ && tail_key_ == key) {
+            ++tail_cache_hits_;
+            return tail_text_;  // exact-input reuse: engine not called
+        }
+        std::optional<std::string> result = inner(p, n);
+        if (result.has_value()) {
+            // Retain exactly the last success (bounded: one entry/session).
+            tail_valid_ = true;
+            tail_key_ = key;
+            tail_text_ = *result;
+        }
+        return result;
+    };
+}
+
+void StreamSession::invalidate_tail_result() {
+    tail_valid_ = false;
+    tail_text_.clear();
+    tail_key_ = StreamTailKey{};
+}
+
+void StreamSession::set_engine_identity(std::string id) {
+    if (id == engine_id_) return;
+    // A different model/quant/backend/config can answer the same bytes
+    // differently: the retained result is no longer an exact answer.
+    invalidate_tail_result();
+    engine_id_ = std::move(id);
+}
+
 std::optional<std::string> StreamSession::stream_step(double now) {
     if (!chunker_) return std::nullopt;
-    TranscribeFn tx = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
+    TranscribeFn tx = active_tx();
     return chunker_->step(samples_, now, tx);
 }
 
 std::optional<std::string> StreamSession::stream_flush() {
     if (!chunker_) return "";
-    TranscribeFn tx = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
+    TranscribeFn tx = active_tx();
     return chunker_->flush(samples_, tx);
 }
 
@@ -536,6 +615,10 @@ void StreamSession::reset() {
     take_invalid_ = false;
     invalid_reason_.clear();
     if (chunker_) chunker_->reset();
+    // A new take must never inherit the previous take's retained result.
+    // audio_rev_ stays monotonic so pre-reset keys cannot collide with
+    // post-reset keys even though absolute sample indices restart at 0.
+    invalidate_tail_result();
 }
 
 double StreamSession::buffered_seconds() const {
