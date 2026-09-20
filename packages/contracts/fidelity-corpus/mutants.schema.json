@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:fidelity-corpus:mutants:v1",
+  "$comment": [
+    "Seeded-defect definitions for the fidelity corpus. A mutant names a",
+    "transformation applied to a reference system output and the gate that",
+    "MUST fail when the defect is present. Clean reference outputs must pass",
+    "every gate (false-alarm contract)."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "mutants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9-]{3,64}$" },
+          "fixture": { "type": "string", "pattern": "^[a-z0-9-]{3,64}$" },
+          "stage": { "enum": ["capture", "asr", "authored", "delivered"] },
+          "defect": {
+            "enum": [
+              "dropped-tail",
+              "dropped-negation",
+              "wrong-renumbering",
+              "false-overlap",
+              "truncated-refinement",
+              "duplicate-insertion",
+              "stale-thread-update"
+            ]
+          },
+          "params": { "type": "object" },
+          "expected_gate": { "type": "string", "minLength": 1 },
+          "description": { "type": "string", "minLength": 1 }
+        },
+        "required": [
+          "id",
+          "fixture",
+          "stage",
+          "defect",
+          "params",
+          "expected_gate",
+          "description"
+        ]
+      }
+    }
+  },
+  "required": ["schema_version", "mutants"]
+}
