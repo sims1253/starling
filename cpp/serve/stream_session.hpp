@@ -184,19 +184,28 @@ public:
     TranscribeFn make_transcribe_fn(RequestContext* ctx);
 
     // Override the transcribe callback (unit tests inject a fake; production
-    // uses the server-backed make_transcribe_fn).
-    void set_transcribe_fn(TranscribeFn fn) { custom_tx_ = std::move(fn); }
+    // uses the server-backed make_transcribe_fn). Every swap bumps the
+    // transcribe-callback generation, which is part of the exact-tail
+    // retention key: a retained result can only ever answer a call made under
+    // the callback that produced it.
+    void set_transcribe_fn(TranscribeFn fn) {
+        custom_tx_ = std::move(fn);
+        ++tx_gen_;
+    }
 
     // ---- exact streaming-tail result reuse (S11) ----------------------------
     // A successful preview followed immediately by a commit used to call the
     // engine again on the byte-identical tail window (two whole-model calls
-    // for one answer). The session retains the LAST successful raw window
-    // result, keyed by complete identity, and replays it for any later call
+    // for one answer). The session retains exactly ONE entry — the most
+    // recent successful raw window result; each later success replaces the
+    // previous entry (bounded: one entry per session, never a growing cache).
+    // The entry is keyed by complete identity and replays for any later call
     // with the same key — one engine callback becomes zero. Reuse is
     // exact-input only: the retained entry never crosses an audio append, a
-    // reset, a take invalidation or an engine-identity change, and only
-    // complete successes are retained (empty text IS a success; busy,
-    // cancelled and failed calls never enter the entry).
+    // reset, a take invalidation, an engine-identity change, or a
+    // transcribe-callback swap (set_transcribe_fn), and only complete
+    // successes are retained (empty text IS a success; busy, cancelled and
+    // failed calls never enter the entry).
     //
     // Engine identity: everything about the request that can change the raw
     // window output — model slug, gguf artifact (which encodes the
@@ -216,17 +225,20 @@ private:
 
     // Identity of one raw window result (S11): the exact sample window
     // (absolute start index including the trimmed prefix, and length), the
-    // audio revision when the engine produced it, and the engine identity.
-    // Equal keys mean the two calls saw byte-identical samples through the
-    // same model/config/backend, so the earlier result answers the later one.
+    // audio revision when the engine produced it, the engine identity, and
+    // the transcribe-callback generation. Equal keys mean the two calls saw
+    // byte-identical samples through the same model/config/backend under the
+    // same callback, so the earlier result answers the later one.
     struct StreamTailKey {
         int64_t abs_start = -1;   // absolute sample index of the window start
         int64_t length = 0;       // window length in samples
         uint64_t audio_rev = 0;   // audio revision at production time
         std::string engine_id;    // model/quant/backend/window-config identity
+        uint64_t tx_gen = 0;      // transcribe-callback generation (PR #199)
         bool operator==(const StreamTailKey& o) const {
             return abs_start == o.abs_start && length == o.length
-                && audio_rev == o.audio_rev && engine_id == o.engine_id;
+                && audio_rev == o.audio_rev && engine_id == o.engine_id
+                && tx_gen == o.tx_gen;
         }
     };
 
@@ -255,6 +267,15 @@ private:
     // recorded before a reset can never collide with keys recorded after it,
     // even though absolute sample indices restart at 0.
     uint64_t audio_rev_ = 0;
+    // Bumped by every set_transcribe_fn() and never reset: the callback
+    // generation is part of the retention key, so a swapped-in callback is
+    // never answered by the previous callback's retained result. Keying (not
+    // clearing on swap) keeps the guarantee order-independent: active_tx()
+    // snapshots the callback when a call starts and writes the retained entry
+    // only after the callback returns, so an invalidation performed at swap
+    // time could be overwritten by an in-flight call's result — a generation
+    // recorded per entry makes the later match itself fail instead.
+    uint64_t tx_gen_ = 0;
     std::string engine_id_;       // identity snapshot (see set_engine_identity)
     bool tail_valid_ = false;     // retained entry below is meaningful
     StreamTailKey tail_key_;      // key of the retained result (iff tail_valid_)

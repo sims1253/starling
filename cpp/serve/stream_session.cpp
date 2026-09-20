@@ -539,16 +539,16 @@ void StreamSession::maybe_trim_samples() {
 //
 // Wrap the session's transcribe callback with the retained exact-tail entry.
 // Every window call is keyed by (absolute sample start including the trimmed
-// prefix, window length, audio revision, engine identity); a call whose key
-// equals the retained SUCCESSFUL result's key is answered without invoking
-// the engine — a successful preview followed by a commit on unchanged audio
-// becomes one engine call instead of two, and duplicate preview snapshots of
-// an unchanged buffer are coalesced into the retained result instead of
-// re-running a stale generation. The commit path is never dropped or
-// shortened by this: a hit returns the same complete raw text the engine
-// produced for those exact bytes, and a miss runs the engine as before (a
-// hit can even complete a commit while the engine is busy, because the exact
-// answer is already known).
+// prefix, window length, audio revision, engine identity, transcribe-callback
+// generation); a call whose key equals the retained SUCCESSFUL result's key is
+// answered without invoking the engine — a successful preview followed by a
+// commit on unchanged audio becomes one engine call instead of two, and
+// duplicate preview snapshots of an unchanged buffer are coalesced into the
+// retained result instead of re-running a stale generation. The commit path is
+// never dropped or shortened by this: a hit returns the same complete raw text
+// the engine produced for those exact bytes, and a miss runs the engine as
+// before (a hit can even complete a commit while the engine is busy, because
+// the exact answer is already known).
 //
 // Only complete successes are retained — empty text included. Busy, cancelled
 // and failed calls return nullopt and never enter the entry; a stale retained
@@ -566,13 +566,15 @@ TranscribeFn StreamSession::active_tx() {
         key.length = n;
         key.audio_rev = audio_rev_;
         key.engine_id = engine_id_;
+        key.tx_gen = tx_gen_;
         if (tail_valid_ && tail_key_ == key) {
             ++tail_cache_hits_;
             return tail_text_;  // exact-input reuse: engine not called
         }
         std::optional<std::string> result = inner(p, n);
         if (result.has_value()) {
-            // Retain exactly the last success (bounded: one entry/session).
+            // Retain exactly one entry: this success replaces any previous
+            // one (bounded: one entry per session, never a growing cache).
             tail_valid_ = true;
             tail_key_ = key;
             tail_text_ = *result;
