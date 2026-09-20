@@ -12,7 +12,7 @@ use starling_dictation::{
     storage::{self, FileSessionStore},
 };
 
-use crate::app::{StarlingApp, UnsavedWav, client_protocol};
+use crate::app::{StarlingApp, UnsavedWav};
 
 /// What a failed job says about server reachability (R13).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -425,7 +425,9 @@ impl StarlingApp {
         cx.notify();
 
         let endpoint = self.endpoint.clone();
-        let protocol = client_protocol(self.protocol);
+        // R11: one Protocol enum — the persisted setting is the client's
+        // wire protocol; no conversion layer.
+        let protocol = self.protocol;
         let model = self.model.clone();
         let store_for_job = store.clone();
 

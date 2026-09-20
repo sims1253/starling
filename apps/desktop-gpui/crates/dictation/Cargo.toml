@@ -2,6 +2,9 @@
 name = "starling-dictation"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sims1253/starling"
 description = "Rust port of @starling/dictation: audio prep, transcription client, session storage, fidelity analysis, capture and playback"
 
 [dependencies]

@@ -240,7 +240,7 @@ fn field_label(label: &str) -> Div {
 fn protocol_toggle(selected: settings::Protocol, cx: &mut Context<StarlingApp>) -> Div {
     let options = [
         (settings::Protocol::Starling, "Starling native"),
-        (settings::Protocol::OpenAI, "OpenAI compatible"),
+        (settings::Protocol::OpenAi, "OpenAI compatible"),
     ];
     let mut toggle = div()
         .flex()

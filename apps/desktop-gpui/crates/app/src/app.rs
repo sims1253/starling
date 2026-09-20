@@ -95,13 +95,6 @@ pub struct StarlingApp {
     pub diagnostics: Option<(Instant, bool)>,
 }
 
-pub(crate) fn client_protocol(protocol: settings::Protocol) -> client::Protocol {
-    match protocol {
-        settings::Protocol::Starling => client::Protocol::Starling,
-        settings::Protocol::OpenAI => client::Protocol::OpenAi,
-    }
-}
-
 /// What a playback poll-watcher does after one tick (G04).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlaybackWatch {
@@ -297,7 +290,9 @@ impl StarlingApp {
         let protocol = settings.protocol;
         let model = settings.model.clone();
         let terms_input = settings.expected_terms_input();
-        let (store, store_error) = match FileSessionStore::open(FileSessionStore::default_root()) {
+        let (store, store_error) = match FileSessionStore::default_root()
+            .and_then(FileSessionStore::open)
+        {
             Ok(store) => (Some(Arc::new(store)), None),
             Err(err) => (
                 None,
@@ -473,7 +468,9 @@ impl StarlingApp {
     }
 
     pub fn check_health(&mut self, endpoint: String, cx: &mut Context<Self>) {
-        let protocol = client_protocol(self.protocol);
+        // R11: one Protocol enum — the persisted setting is the client's
+        // wire protocol; no conversion layer.
+        let protocol = self.protocol;
         let model = self.model.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -570,8 +567,17 @@ impl StarlingApp {
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
 
+        // R11: an unresolvable config directory is surfaced, not swallowed —
+        // settings must not silently land in the current working directory.
+        let path = match Settings::default_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.error = Some(format!("Could not save settings: {err}"));
+                cx.notify();
+                return;
+            }
+        };
         cx.spawn(async move |this, cx| {
-            let path = Settings::default_path();
             let saved = cx
                 .background_spawn(async move { settings.save(&path) })
                 .await;

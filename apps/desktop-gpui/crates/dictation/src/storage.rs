@@ -80,6 +80,12 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("stored dictation session is invalid: {0}")]
     Invalid(String),
+    /// The platform data directory could not be resolved (on Linux,
+    /// `$XDG_DATA_HOME` and `$HOME` are both unset). Returned by
+    /// [`FileSessionStore::default_root`] instead of silently storing
+    /// sessions in whatever directory the app happened to start in (R11).
+    #[error("could not resolve the user data directory; set XDG_DATA_HOME or HOME")]
+    DataDirUnavailable,
 }
 
 /// Metadata-only view of one session (G02): everything the history list and
@@ -230,11 +236,14 @@ impl FileSessionStore {
         Ok(Self { root })
     }
 
-    pub fn default_root() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+    /// `dirs::data_dir()/starling-gpui/sessions`. A `None` from `dirs` is a
+    /// typed error (R11): recorded audio must never silently land in an
+    /// arbitrary working directory.
+    pub fn default_root() -> Result<PathBuf, StorageError> {
+        Ok(dirs::data_dir()
+            .ok_or(StorageError::DataDirUnavailable)?
             .join("starling-gpui")
-            .join("sessions")
+            .join("sessions"))
     }
 
     pub fn create(

@@ -146,7 +146,7 @@ pub(crate) fn protocol_option_id(protocol: dictation_settings::Protocol) -> Shar
 fn protocol_slug(protocol: dictation_settings::Protocol) -> &'static str {
     match protocol {
         dictation_settings::Protocol::Starling => "starling",
-        dictation_settings::Protocol::OpenAI => "openai",
+        dictation_settings::Protocol::OpenAi => "openai",
     }
 }
 
@@ -189,12 +189,12 @@ mod tests {
         // toggle — the ids depend only on which option they name, so they
         // are equal before and after the selection flips.
         let starling = protocol_option_id(dictation_settings::Protocol::Starling);
-        let openai = protocol_option_id(dictation_settings::Protocol::OpenAI);
+        let openai = protocol_option_id(dictation_settings::Protocol::OpenAi);
         assert_ne!(starling, openai);
         assert_eq!(
             starling,
             protocol_option_id(dictation_settings::Protocol::Starling)
         );
-        assert_eq!(openai, protocol_option_id(dictation_settings::Protocol::OpenAI));
+        assert_eq!(openai, protocol_option_id(dictation_settings::Protocol::OpenAi));
     }
 }
