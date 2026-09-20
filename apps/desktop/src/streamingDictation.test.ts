@@ -470,6 +470,7 @@ describe("StreamingDictation", () => {
     await drained();
 
     const durable: string[] = [];
+
     const finishing = controller.finish(
       500,
       () => false,

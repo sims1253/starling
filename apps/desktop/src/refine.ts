@@ -1,5 +1,6 @@
 import { Duration, Effect, Option, Predicate, Schema } from "effect";
 import { ServerErrorResponseSchema } from "@starling/dictation";
+import { completionRejectionMessage, completionVerdict } from "./completionVerdict";
 
 /**
  * Optional transcript refinement: an explicit, per-take request to an
@@ -96,12 +97,21 @@ interface BufferedCompletion {
 const NonNegativeFinite = Schema.Finite.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0)));
 
 /**
- * Lenient about extra fields; only the refined text is load-bearing. The
- * non-empty guarantee is enforced after decoding so an empty completion is
- * reported as its own protocol failure, not a parse error.
+ * Lenient about extra fields; the refined text and the termination metadata
+ * (finish_reason, message.refusal) are load-bearing (B09). The non-empty
+ * guarantee is enforced by the verdict after decoding so an empty completion
+ * is reported as its own protocol failure, not a parse error.
  */
 const ChatCompletionResponseSchema = Schema.Struct({
-  choices: Schema.Array(Schema.Struct({ message: Schema.Struct({ content: Schema.String }) })),
+  choices: Schema.Array(
+    Schema.Struct({
+      message: Schema.Struct({
+        content: Schema.String,
+        refusal: Schema.optionalKey(Schema.NullOr(Schema.String)),
+      }),
+      finish_reason: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    }),
+  ),
 });
 
 export class RefinementHttpError extends Schema.TaggedError<RefinementHttpError>()(
@@ -131,6 +141,25 @@ export class RefinementProtocolError extends Schema.TaggedError<RefinementProtoc
 ) {
   constructor(message: string) {
     super({ message });
+  }
+}
+
+/**
+ * The server answered, but its own termination metadata says the content is
+ * not a whole refinement: truncated on the output limit, filtered, refused,
+ * or carrying a finish_reason this client cannot vouch for (B09). Failing
+ * with this error keeps the take's previous refined text and raw transcript
+ * exactly as they were.
+ */
+export class RefinementIncompleteError extends Schema.TaggedError<RefinementIncompleteError>()(
+  "RefinementIncompleteError",
+  {
+    message: Schema.String,
+    finishReason: Schema.optionalKey(Schema.String),
+  },
+) {
+  constructor(message: string, finishReason?: string) {
+    super(finishReason === undefined ? { message } : { message, finishReason });
   }
 }
 
@@ -170,6 +199,7 @@ export class RefinementInputError extends Schema.TaggedError<RefinementInputErro
 
 export type RefinementError =
   | RefinementHttpError
+  | RefinementIncompleteError
   | RefinementInputError
   | RefinementProtocolError
   | RefinementTimeoutError
@@ -504,12 +534,28 @@ export function refineEffect(
       );
     }
 
-    if (choice.message.content.length === 0) {
-      return yield* new RefinementProtocolError(
-        "The refinement server returned an empty refined transcript.",
-      );
+    // Termination metadata decides before the content is trusted: a
+    // finish_reason of "length" means the non-empty content is only a
+    // prefix, and a stated refusal is not a refinement at all (B09).
+    const verdict = completionVerdict({
+      content: choice.message.content,
+      finishReason: choice.finish_reason,
+      refusal: choice.message.refusal,
+    });
+
+    if (!verdict.accepted) {
+      const message = completionRejectionMessage(verdict.rejection);
+
+      if (verdict.rejection.reason === "empty") {
+        return yield* new RefinementProtocolError(message);
+      }
+
+      const finishReason =
+        verdict.rejection.reason === "refusal" ? undefined : verdict.rejection.finishReason;
+
+      return yield* new RefinementIncompleteError(message, finishReason);
     }
 
-    return choice.message.content;
+    return verdict.content;
   })();
 }
