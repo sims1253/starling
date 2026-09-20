@@ -263,18 +263,24 @@ private:
     std::unique_ptr<ChunkStreamer> chunker_;
 
     // ---- exact streaming-tail result reuse (S11) ----------------------------
-    // Bumped on every append that actually adds samples and NEVER reset: keys
-    // recorded before a reset can never collide with keys recorded after it,
-    // even though absolute sample indices restart at 0.
+    // Bumped on every append that actually adds samples and on reset(); it
+    // never returns to a past value: keys recorded before a reset can never
+    // collide with keys recorded after it, even though absolute sample
+    // indices restart at 0 — reset() enforces this by bumping, not by relying
+    // on the retained-entry lifecycle.
     uint64_t audio_rev_ = 0;
     // Bumped by every set_transcribe_fn() and never reset: the callback
     // generation is part of the retention key, so a swapped-in callback is
     // never answered by the previous callback's retained result. Keying (not
     // clearing on swap) keeps the guarantee order-independent: active_tx()
-    // snapshots the callback when a call starts and writes the retained entry
-    // only after the callback returns, so an invalidation performed at swap
-    // time could be overwritten by an in-flight call's result — a generation
-    // recorded per entry makes the later match itself fail instead.
+    // writes the retained entry only after the callback returns, so an
+    // invalidation performed at swap time could be overwritten by an in-flight
+    // call's result — a generation recorded per entry makes the later match
+    // itself fail instead. active_tx() snapshots the callback and its
+    // generation TOGETHER when it is built (PR #199 batch-2): a call in
+    // flight across a mid-step swap runs its captured callback keyed by the
+    // generation that callback had at construction, so it can neither be
+    // answered by nor retain into the other generation's entries.
     uint64_t tx_gen_ = 0;
     std::string engine_id_;       // identity snapshot (see set_engine_identity)
     bool tail_valid_ = false;     // retained entry below is meaningful

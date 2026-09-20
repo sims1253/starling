@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -38,12 +39,19 @@ static int g_passed = 0;
 
 // Seconds accessors return doubles (sample_count / kSampleRate): compare
 // with a tolerance instead of exact == — a count whose quotient happens to be
-// binary-exact today need not stay that way.
+// binary-exact today need not stay that way. The tolerance is relative to
+// the expected magnitude (1e-9, with a 1.0 floor so near-zero expectations
+// keep an absolute bound): a fixed epsilon that is fine for seconds-scale
+// values would grow too tight for large durations and too loose for tiny
+// ones.
 #define CHECK_NEAR(a, b) do { \
     ++g_tests; \
-    if (std::fabs((a) - (b)) <= 1e-9) { ++g_passed; } \
+    const double got_ = static_cast<double>(a); \
+    const double want_ = static_cast<double>(b); \
+    const double tol_ = 1e-9 * std::max(1.0, std::fabs(want_)); \
+    if (std::fabs(got_ - want_) <= tol_) { ++g_passed; } \
     else { std::fprintf(stderr, "FAIL: %s:%d: %s != %s (got %s)\n", \
-        __FILE__, __LINE__, #a, #b, std::to_string(a).c_str()); } \
+        __FILE__, __LINE__, #a, #b, std::to_string(got_).c_str()); } \
 } while(0)
 
 // ---- stitch_words tests ---------------------------------------------------
@@ -638,6 +646,13 @@ struct TailFixture {
     // it replaces the canned text/busy logic entirely.
     std::function<std::optional<std::string>(int64_t)> hook;
 
+    // The session's fake engine captures `this`: a copied fixture would
+    // silently count its engine calls into the ORIGINAL (and read the
+    // original's text/busy/hook), so copies are deleted rather than trusted
+    // to be noticed.
+    TailFixture(const TailFixture&) = delete;
+    TailFixture& operator=(const TailFixture&) = delete;
+
     TailFixture() : server(test_cfg()), session(&server) {
         session.set_transcribe_fn([this](const float*, int64_t n)
                                       -> std::optional<std::string> {
@@ -652,7 +667,9 @@ struct TailFixture {
         CHECK(session.append_pcm(pcm_for_range(0, 11200))
               == AppendOutcome::Accepted);
         auto partial = session.stream_step(1.0);
-        CHECK(partial.has_value());
+        // The preview IS the canned result (the empty string too, when
+        // text == ""): has_value alone would not pin what was previewed.
+        CHECK(partial == std::optional<std::string>(text));
         CHECK(engine_calls == 1);
     }
 };
@@ -741,6 +758,61 @@ static void test_tail_reuse_callback_swap_forces_recompute() {
     // B's result is retained: the commit on unchanged audio reuses it.
     auto final_ = fx.session.stream_flush();
     CHECK(final_ == std::optional<std::string>("callback b text"));
+    CHECK(b_calls == 1);
+    CHECK(fx.session.tail_cache_hits() == 1);
+}
+
+static void test_tail_reuse_mid_step_swap_never_rekeys_in_flight_calls() {
+    // PR #199 batch-2 (medium): active_tx() used to capture the callback at
+    // construction but read the generation inside the lambda at invocation.
+    // One wrapper is invoked more than once per step (the full windows, then
+    // the tail), so a set_transcribe_fn() issued from INSIDE an earlier
+    // window's callback — between this wrapper's construction and its tail
+    // invocation — paired the OLD callback with the NEW generation: the old
+    // callback's tail result was retained under the new generation, where
+    // the new callback's next identical window replayed it without running
+    // (the stale match R24's keying must forbid). The fix snapshots the
+    // callback and its generation together, so the in-flight call stays
+    // keyed as the pair that existed at its construction.
+    TailFixture fx;
+    // Geometry: 24000 samples = one full window [0,16000) plus a 12000-sample
+    // tail (>= the 8000 partial minimum): one stream_step invokes the wrapper
+    // twice — the window first, the tail second.
+    int b_calls = 0;
+    fx.hook = [&](int64_t n) -> std::optional<std::string> {
+        if (n == 16000) {
+            // The full-window call: swap in callback B mid-step. The wrapper
+            // built for THIS step must keep running callback A — under A's
+            // generation — for the tail call that follows.
+            fx.hook = nullptr;  // A's tail call takes the canned text below
+            fx.session.set_transcribe_fn([&](const float*, int64_t)
+                                             -> std::optional<std::string> {
+                ++b_calls;
+                return "tail from b";
+            });
+            return "full window a";
+        }
+        return "tail from a";
+    };
+    fx.text = "tail from a";
+    fx.session.append_pcm(pcm_for_range(0, 24000));
+    CHECK(fx.session.stream_step(1.0)
+          == std::optional<std::string>("full window a tail from a"));
+    CHECK(fx.engine_calls == 2);             // A ran both the window and the tail
+    CHECK(b_calls == 0);                     // B has not run yet
+    CHECK(fx.session.tail_cache_hits() == 0);
+
+    // The next step runs under B (a fresh wrapper, the new generation): the
+    // tail window is unchanged, but A's retained result must NOT answer it —
+    // no stale match; B recomputes, and B's own result is what gets retained.
+    CHECK(fx.session.stream_step(2.0)
+          == std::optional<std::string>("full window a tail from b"));
+    CHECK(b_calls == 1);
+    CHECK(fx.session.tail_cache_hits() == 0);
+
+    // Commit on unchanged audio now reuses B's own retained result.
+    CHECK(fx.session.stream_flush()
+          == std::optional<std::string>("full window a tail from b"));
     CHECK(b_calls == 1);
     CHECK(fx.session.tail_cache_hits() == 1);
 }
@@ -887,8 +959,10 @@ static void test_tail_reuse_newer_snapshot_wins() {
 
 static void test_tail_reuse_reset_clears_entry() {
     // reset() starts a new take: a window at the same absolute indices with
-    // the same length must not inherit the previous take's result (the audio
-    // revision is monotonic across resets, so the keys cannot collide).
+    // the same length must not inherit the previous take's result. reset()
+    // drops the entry AND bumps the audio revision (enforced monotonicity),
+    // so the pre- and post-reset keys cannot collide even though absolute
+    // indices restart at 0.
     TailFixture fx;
     fx.text = "take one";
     fx.prime();
@@ -935,8 +1009,10 @@ static void test_tail_reuse_aba_across_sessions() {
     CHECK(a2.calls == 1 && a2.hits == 1 && a2.final_text == "alpha words");
 
     // Different model slugs really do produce different engine identities.
-    ServerConfig ca = test_cfg(); ca.model_slug = "parakeet";
-    ServerConfig cb = test_cfg(); cb.model_slug = "moss";
+    ServerConfig ca = test_cfg();
+    ca.model_slug = "parakeet";
+    ServerConfig cb = test_cfg();
+    cb.model_slug = "moss";
     StarlingServer sa(ca), sb(cb);
     StreamSession session_a(&sa), session_b(&sb);
     CHECK(session_a.engine_identity() != session_b.engine_identity());
@@ -988,6 +1064,7 @@ static void test_tail_reuse_survives_overlap_rebasing() {
     CHECK(session.tail_cache_hits() == 1);
     CHECK_NEAR(session.buffered_seconds(), 2.75);
 }
+
 // ---- stream window config validation (issue #146) --------------------------
 // Negative/NaN/oversized stream window values used to reach the chunker, whose
 // member-init list computed advance_ from the unclamped overlap_: a negative
@@ -1168,6 +1245,7 @@ int main() {
     test_tail_reuse_one_appended_sample_forces_recompute();
     test_tail_reuse_engine_identity_change_forces_recompute();
     test_tail_reuse_callback_swap_forces_recompute();
+    test_tail_reuse_mid_step_swap_never_rekeys_in_flight_calls();
     test_tail_reuse_empty_text_is_a_valid_result();
     test_tail_reuse_busy_preview_recomputes_at_commit();
     test_tail_reuse_cancel_after_success_not_reused();

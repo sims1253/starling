@@ -1069,6 +1069,11 @@ int main(int argc, char** argv) {
                             std::chrono::steady_clock::now().time_since_epoch()
                         ).count()) / 1000.0;
 
+                    // stream_step runs after EVERY accepted binary frame —
+                    // including audio-less no-ops (an empty payload is
+                    // Accepted): those duplicate snapshots of an unchanged
+                    // buffer are answered by the session's exact-tail reuse
+                    // instead of re-running the engine.
                     auto text_opt = session.stream_step(now);
                     if (text_opt.has_value()) {
                         std::string safe_text = json_escape(*text_opt);

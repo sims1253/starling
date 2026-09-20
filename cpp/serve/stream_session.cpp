@@ -555,7 +555,19 @@ void StreamSession::maybe_trim_samples() {
 // entry cannot false-match later because audio_rev_ only moves forward.
 TranscribeFn StreamSession::active_tx() {
     TranscribeFn inner = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
-    return [this, inner](const float* p, int64_t n)
+    // Snapshot the generation together with the callback it belongs to
+    // (PR #199 batch-2): reading tx_gen_ inside the lambda would pair the
+    // callback captured here with whatever generation is current when the
+    // chunker invokes the wrapper. One wrapper is invoked more than once per
+    // step (full windows, then the tail; flush retries), and a
+    // set_transcribe_fn() issued in between — e.g. from inside an earlier
+    // window's callback — would make a LATER invocation of the OLD callback
+    // retain its result under the NEW generation, where the new callback's
+    // next identical window would replay it without running. Snapshotted
+    // together, every invocation of this wrapper is keyed as the
+    // (callback, generation) pair that existed at construction.
+    const uint64_t tx_gen = tx_gen_;
+    return [this, inner = std::move(inner), tx_gen](const float* p, int64_t n)
                -> std::optional<std::string> {
         StreamTailKey key;
         // p always points into samples_ (the chunker passes
@@ -566,7 +578,7 @@ TranscribeFn StreamSession::active_tx() {
         key.length = n;
         key.audio_rev = audio_rev_;
         key.engine_id = engine_id_;
-        key.tx_gen = tx_gen_;
+        key.tx_gen = tx_gen;
         if (tail_valid_ && tail_key_ == key) {
             ++tail_cache_hits_;
             return tail_text_;  // exact-input reuse: engine not called
@@ -618,8 +630,13 @@ void StreamSession::reset() {
     invalid_reason_.clear();
     if (chunker_) chunker_->reset();
     // A new take must never inherit the previous take's retained result.
-    // audio_rev_ stays monotonic so pre-reset keys cannot collide with
-    // post-reset keys even though absolute sample indices restart at 0.
+    // Dropping the entry (below) covers the normal path; bumping audio_rev_
+    // ENFORCES the monotonicity the keying relies on instead of leaving it
+    // comment-only: absolute sample indices restart at 0 here, so without the
+    // bump a later key could otherwise repeat a pre-reset
+    // (abs_start, length, audio_rev) triple if any future path ever produced
+    // one without an intervening append.
+    ++audio_rev_;
     invalidate_tail_result();
 }
 
