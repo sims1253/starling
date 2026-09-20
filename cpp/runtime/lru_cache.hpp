@@ -44,12 +44,15 @@ inline size_t replay_cache_size() {
 // STARLING_*_BUDGET_MB pattern). Strict-ish, strtoll grammar: optional leading
 // whitespace and +/- sign, then decimal digits to the END of the value
 // (leading whitespace is accepted and " 32" == "32" is deliberate — pinned by
-// the test suite; a sign alone is not digits and is rejected), and the number
-// must land in [1, SIZE_MAX >> 20] MiB. Anything else — garbage like "foo",
-// trailing junk like "64x", an empty value, zero, or a negative — is REJECTED
-// with a one-line diagnostic on stderr and `default_bytes` is used (a
-// malformed knob must not silently disable or shrink the bound; atol's silent
-// truncation is exactly what this replaces).
+// the test suite; a sign alone is not digits and is rejected). Anything else
+// is REJECTED with a one-line diagnostic on stderr and `default_bytes` is
+// used (a malformed knob must not silently disable or shrink the bound;
+// atol's silent truncation is exactly what this replaces), with the wording
+// split by failure kind: a value that is not an integer number at all —
+// garbage like "foo", trailing junk like "64x", an empty value — and a
+// parseable-but-nonpositive value like "0" or "-5" each get their own
+// diagnostic, so an operator typing a number sees "out of range", not
+// "not a number".
 // A parseable value too large to represent (ERANGE, or > SIZE_MAX >> 20 —
 // whose << 20 would wrap) is loudly CLAMPED to the largest representable
 // budget, (SIZE_MAX >> 20) MiB, rather than rejected: the operator asked for
@@ -61,11 +64,18 @@ inline size_t env_budget_bytes(const char* var, size_t default_bytes) {
     char* end = nullptr;
     const long long v = std::strtoll(e, &end, 10);
     const size_t max_mib = SIZE_MAX >> 20;
-    if (end == e || *end != '\0' || v <= 0) {
+    if (end == e || *end != '\0') {
         std::fprintf(stderr,
-                     "starling: %s='%s' is invalid (expected an integer "
-                     "number of MiB >= 1); using the default budget "
-                     "(%zu bytes)\n",
+                     "starling: %s='%s' is not an integer number of MiB; "
+                     "using the default budget (%zu bytes)\n",
+                     var, e, default_bytes);
+        return default_bytes;
+    }
+    if (v <= 0) {
+        std::fprintf(stderr,
+                     "starling: %s='%s' MiB is out of range (the budget must "
+                     "be a whole number of MiB >= 1); using the default "
+                     "budget (%zu bytes)\n",
                      var, e, default_bytes);
         return default_bytes;
     }
@@ -222,7 +232,10 @@ private:
 //     a conservative floor (`zero_byte_floor`, default
 //     kZeroByteEntryFloorBytes) AND hard-capped in COUNT (`floored_cap`,
 //     default kFlooredEntryCap) so an all-sched workload stays bounded no
-//     matter how large the byte budget is. The first floored insert emits a
+//     matter how large the byte budget is — the floor covers the observed
+//     cost range, and the count cap is what stays a bound for extreme-T
+//     sched graphs beyond it (see kZeroByteEntryFloorBytes). The first
+//     floored insert emits a
 //     one-time stderr diagnostic naming the accounting that applies. Passing
 //     0 for either knob opts out of that guard (documented; the defaults keep
 //     every cache bounded).
@@ -243,11 +256,20 @@ private:
 
 // Conservative charge for an entry whose `init` reports ZERO tracked bytes
 // (R22; see the zero-byte floor bullet in the class comment). 8 MiB sits at
-// the top of the observed per-(T,K) TDT graph range (roughly 1.5-3 MiB
-// short/medium, ~4-8 MiB long), so it never UNDER-counts a sched-path graph
-// — over-charging only evicts earlier, the safe direction. Compile-time
-// nonzero so the default cache is bounded by construction: budget/floor is
-// an upper bound on all-floored entry count.
+// the top of the OBSERVED per-(T,K) TDT graph range (roughly 1.5-3 MiB
+// short/medium, ~4-8 MiB long; tdt_multistep.cpp's budget note has the
+// geometry). Precision on what that buys (R23 review): the floor covers the
+// OBSERVED range, it does not bound every sched-path graph — tracked bytes
+// scale with T (capped at 4096 by the caller's kstep_max_t), so an
+// extreme-T sched graph CAN outgrow 8 MiB and be under-counted. The bound
+// that holds at every geometry is the COUNT cap below: at most
+// kFlooredEntryCap floored entries exist, so per-entry under-counting can
+// never degenerate the byte budget into an unbounded entry cache — worst
+// case a bounded handful of entries each overshoot their charge. Inside the
+// observed range the floor over-charges at most, which only evicts earlier,
+// the safe direction. Compile-time nonzero so the default cache is bounded
+// by construction: budget/floor is an upper bound on all-floored entry
+// count.
 constexpr size_t kZeroByteEntryFloorBytes = size_t(8) << 20;
 // Hard COUNT cap on floored entries (R22): with an operator-sized byte budget
 // (STARLING_TDT_GRAPH_BUDGET_MB clamps up to SIZE_MAX>>20 MiB) budget/floor
@@ -443,22 +465,30 @@ private:
     // entry was floored), the pass additionally evicts until the floored
     // ENTRY count is within floored_cap_ — the hard count bound that keeps an
     // all-zero-byte (sched-path) workload bounded even when the byte budget
-    // itself is huge (R22).
+    // itself is huge (R22). The floored-cap condition is only evaluated and
+    // tracked while floored_ actually exceeds the cap (R23).
     size_t trim_over_budget(bool enforce_floored_cap = false) {
         // Test-only fault seam (see detail::trim_fault_hook): a throwing hook
         // lands in the caller's rollback path with the accounting committed.
         if (detail::trim_fault_hook) detail::trim_fault_hook();
+        // Evaluate the floored-cap condition ONCE, not per iteration (R23
+        // review): it is loop-invariant (floored_ only changes in the sweep
+        // below), and when the cap is already met — including every
+        // enforce_floored_cap=false call — the per-iteration subtraction and
+        // the victim_floored tracking cannot influence the break.
+        const bool over_floored_cap =
+            enforce_floored_cap && floored_ > floored_cap_;
         std::vector<typename Map::iterator> victims;
         size_t victim_bytes = 0;
         size_t victim_floored = 0;
         for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
             if (bytes_ - victim_bytes <= budget_ &&
-                (!enforce_floored_cap || floored_ - victim_floored <= floored_cap_))
-                break;   // budget (and floored cap, if enforced) met
+                (!over_floored_cap || floored_ - victim_floored <= floored_cap_))
+                break;   // budget (and floored cap, if over it) met
             auto mit = map_.find(*lit);
             if (mit == map_.end() || entry(mit).pinned) continue;
             victim_bytes += entry(mit).bytes;
-            if (entry(mit).floored) ++victim_floored;
+            if (over_floored_cap && entry(mit).floored) ++victim_floored;
             victims.push_back(mit);
         }
         // The sweep is safe: erasing an unordered_map node invalidates only
@@ -495,12 +525,19 @@ private:
     // cap=budget_ are BYTES here (not entries — see the class comment), and
     // `evicted` is an ENTRY count. `pins` marks hit/miss events from the
     // lease paths (rendered "pin":1) so they are distinguishable from the
-    // plain-LRU get()'s unmarked "hit" of the same kind.
+    // plain-LRU get()'s unmarked "hit" of the same kind. Eviction events:
+    // insert-time victims ride on the miss record's `evicted` count (no
+    // separate event); only release()'s post-unpin trim emits a standalone
+    // "evict" event, so one eviction wave is never reported twice.
     void trace(const char* op, size_t evicted, bool pins = false) const {
         if (label_)
             trace::cache_event(label_, op, evicted, bytes_, budget_, -1, pins);
     }
 
+    // Configured byte budget (production: env_budget_bytes, e.g.
+    // STARLING_TDT_GRAPH_BUDGET_MB; never 0 — the constructor rejects that).
+    // trim_over_budget() evicts unpinned entries until bytes_ <= budget_ at
+    // rest; only live leases may exceed it (the oversized-entry rule).
     size_t budget_;
     const char* label_ = nullptr;
     size_t bytes_ = 0;

@@ -264,16 +264,16 @@ void test_env_budget_parsing() {
     const char* var = "STARLING_TEST_GRAPH_BUDGET_MB";
     const size_t dflt = size_t(128) << 20;
 
-    struct Case { const char* value; size_t expect; bool loud; };
+    struct Case { const char* value; size_t expect; bool loud; const char* msg; };
     const Case cases[] = {
-        { "64",  size_t(64) << 20, false },  // valid override
-        { " 32", size_t(32) << 20, false },  // leading whitespace: strtoll skips it
-        { "1",   size_t(1) << 20,  false },  // minimum accepted value
-        { "",    dflt,             true  },  // set-but-empty
-        { "foo", dflt,             true  },  // pure garbage
-        { "64x", dflt,             true  },  // trailing garbage (atol read 64)
-        { "0",   dflt,             true  },  // zero: loud reject (was: silent default)
-        { "-5",  dflt,             true  },  // negative: loud reject
+        { "64",  size_t(64) << 20, false, nullptr },        // valid override
+        { " 32", size_t(32) << 20, false, nullptr },        // leading whitespace: strtoll skips it
+        { "1",   size_t(1) << 20,  false, nullptr },        // minimum accepted value
+        { "",    dflt,             true,  "not an integer" },  // set-but-empty
+        { "foo", dflt,             true,  "not an integer" },  // pure garbage
+        { "64x", dflt,             true,  "not an integer" },  // trailing garbage (atol read 64)
+        { "0",   dflt,             true,  "out of range" },     // zero: loud reject (was: silent default)
+        { "-5",  dflt,             true,  "out of range" },     // negative: loud reject
     };
     for (const Case& c : cases) {
         SETENV(var, c.value);
@@ -288,6 +288,12 @@ void test_env_budget_parsing() {
         check(loud == c.loud,
               "ENV: '" + std::string(c.value) + "' diagnostic " +
                   (c.loud ? "emitted" : "silent") + " (stderr: '" + err + "')");
+        // R23: the rejection wording is split by failure kind — not-a-number
+        // vs a parseable value out of range — not lumped into one message.
+        if (c.msg != nullptr)
+            check(err.find(c.msg) != std::string::npos,
+                  "ENV: '" + std::string(c.value) + "' diagnostic names '" +
+                      c.msg + "' (stderr: '" + err + "')");
     }
     UNSETENV(var);
     size_t got = 0;
@@ -620,7 +626,9 @@ void test_floored_count_cap() {
 // (17) Rollback restores accounting (R22): a throw between the accounting
 // commit and the return (trim's victim-vector allocation, modeled by the
 // fault hook) must leave bytes_in_use(), floored_size(), and the entry count
-// exactly as before the failed insert.
+// exactly as before the failed insert. R23: covers BOTH charge kinds — a
+// measured-bytes insert and a zero-reporting (floored) insert, whose floor
+// charge and floored count are committed before the same throwing trim.
 void test_rollback_restores_accounting() {
     std::printf("[A] throwing trim rolls back all accounting\n");
     ByteBudgetLruCache<int, FakeEntry> cache(1000, "rollback-test");
@@ -646,6 +654,51 @@ void test_rollback_restores_accounting() {
               ->payload == 2,
           "ROLLBACK: the key is re-insertable after rollback");
     cache.release(2);
+
+    // Floored branch (R23): a ZERO-reporting insert commits floor bytes AND
+    // increments floored_ before the same throwing trim — both must roll
+    // back, or a failed floored insert would permanently inflate
+    // bytes_in_use() and leave a phantom floored count.
+    ByteBudgetLruCache<int, FakeEntry> floored(4 * kZeroByteEntryFloorBytes,
+                                               "rollback-floored");
+    capture_stderr([&] {
+        release_after(floored, floored.get_or_init_pinned(1, [](FakeEntry& v) { v.payload = 1; return size_t(0); }), 1);
+    });
+    const size_t f_bytes_before = floored.bytes_in_use();
+    const size_t f_size_before = floored.size();
+    check(floored.floored_size() == 1,
+          "ROLLBACK: floored baseline is one floored entry");
+
+    starling::ggml::detail::trim_fault_hook = [] { throw std::bad_alloc(); };
+    threw = false;
+    try {
+        floored.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(0); });
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    starling::ggml::detail::trim_fault_hook = nullptr;
+
+    check(threw, "ROLLBACK: floored fault propagates");
+    check(floored.bytes_in_use() == f_bytes_before,
+          "ROLLBACK: floored bytes_in_use() restored (floor charge undone)");
+    check(floored.floored_size() == 1,
+          "ROLLBACK: floored_size() restored (no phantom floored entry)");
+    check(floored.size() == f_size_before && !floored.get(2),
+          "ROLLBACK: floored half-built entry is gone");
+    check(floored.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(0); })
+              ->payload == 2,
+          "ROLLBACK: floored key is re-insertable after rollback");
+    floored.release(2);
+
+    // The floored cache still enforces its byte budget afterwards: with a
+    // 4-floor budget, topping up to 5 floored entries must evict the oldest.
+    for (int k = 3; k <= 5; ++k) {
+        release_after(floored, floored.get_or_init_pinned(k, [k](FakeEntry& v) { v.payload = k; return size_t(0); }), k);
+    }
+    check(floored.size() == 4 && floored.bytes_in_use() == 4 * kZeroByteEntryFloorBytes,
+          "ROLLBACK: floored cache still evicts to budget after rollback");
+    check(!floored.get(1) && floored.floored_size() == 4,
+          "ROLLBACK: floored LRU order intact after rollback (key 1 evicted)");
 }
 
 int main() {
