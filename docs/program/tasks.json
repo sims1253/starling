@@ -174,11 +174,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": null,
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": "impl-agent-4, failing-test-first"
+   "evidence": [
+    "coordinator rerun: threads+refine 41/41, storage 53/53 on program/wave-a 0707f82; root cause = compareTakeOrder keyed on createdAt; fix = persisted threadJoinedAt append sequence + contextSourceId provenance"
+   ],
+   "notes": "stable cross-window same-take refined copy still last-write-wins; full revision model is E21"
   },
   {
    "id": "E01",
@@ -798,11 +800,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "implemented",
    "owner": null,
    "branch": "program/s01-moss-kv-clear",
-   "evidence": [],
-   "notes": "impl-agent-5 in starling-s01 worktree; -j3 cap; GPU timing = validation gap"
+   "evidence": [
+    "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending"
+   ],
+   "notes": "await agent handoff + coordinator verification of build/test evidence"
   },
   {
    "id": "S02",
@@ -1308,5 +1312,10 @@
    "branch": "gpui/fixes-wave-a3",
    "scope": "gpui worktree Rust (light)"
   }
- ]
+ ],
+ "prs": {
+  "194": "gpui/fixes-wave-a2 -> gpui-port (G03-G07 fixes)",
+  "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
+  "196": "program/s01-moss-kv-clear -> master (S01)"
+ }
 }

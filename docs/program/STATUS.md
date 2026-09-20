@@ -85,3 +85,15 @@ validation gaps on this machine unless run by the user.
 
 - None blocking. Standing constraints: no upstream PRs/issues from agents;
   no merges to master; no releases; local-only processing default.
+
+## Update 2026-09-20 (~11:30) — PRs opened per user authorization (D8)
+
+- PR #194: gpui/fixes-wave-a2 → gpui-port (G03-G07 + PORT.md; 95/95 + 11/11 rerun).
+- PR #195 (draft): program/wave-a → master (E28+E06 contracts 95/95 rerun, B11
+  verified 41/41+53/53, E17 design, control plane). Living branch — push updates.
+- PR #196: program/s01-moss-kv-clear → master (S01 committed f84e2a7; agent
+  verification pending at open time).
+- PR monitor (45 min) now covers all open PRs; new bot reviews are harvested
+  into docs/program/pr/ and triaged as R## items.
+- G04/G07 integrated (95/95, 11/11 on gpui/fixes-wave-a2). R02/R03 dispatched
+  (impl-8, gpui/fixes-wave-a3). Active: B11 reporting, S01 reporting, E10, I0.
