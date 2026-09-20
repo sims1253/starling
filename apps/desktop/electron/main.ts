@@ -14,6 +14,7 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { parsePendingAudio, pendingAudioReloadWarning, pendingAudioWarning } from "./closeGuard.js";
+import { storeRefinementKeySafe } from "./keyProtection.js";
 import {
   HealthInputSchema,
   RefinementKeyLoadInputSchema,
@@ -389,26 +390,17 @@ function transcribeProgram(input: TranscribeInput) {
 }
 
 /**
- * Encrypt the refinement API key with the OS keychain-backed safeStorage and
- * hand back base64 ciphertext; the plaintext never persists anywhere. A host
- * without an encryption backend resolves ciphertext null, which tells the
- * renderer to keep its documented plaintext fallback rather than fail.
+ * Store the refinement API key under the host's secret store (B10). The
+ * decision lives in keyProtection.ts: ciphertext is produced only by a real
+ * OS secret store — never by Linux's basic_text fallback, whose hardcoded
+ * password is not protection — and every other outcome reports its status
+ * instead of throwing, so the renderer can demand an explicit choice before
+ * any plaintext persists. The result never carries the key itself.
  */
 function storeRefinementKeyProgram(
   input: RefinementKeySaveInput,
-): Effect.Effect<RefinementKeySaveResult, RequestTransportError> {
-  return Effect.try({
-    try: () => ({
-      ciphertext: safeStorage.isEncryptionAvailable()
-        ? safeStorage.encryptString(input.apiKey).toString("base64")
-        : null,
-    }),
-    catch: (cause) =>
-      new RequestTransportError({
-        message: "Could not encrypt the refinement API key.",
-        cause,
-      }),
-  });
+): Effect.Effect<RefinementKeySaveResult, never> {
+  return Effect.sync(() => storeRefinementKeySafe(safeStorage, process.platform, input.apiKey));
 }
 
 /**

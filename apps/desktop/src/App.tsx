@@ -62,7 +62,7 @@ import {
   persistSettings,
   readCommittedSettings,
   refinementKeyPlan,
-  type RefinementKeyPlan,
+  type SecureKeyStorage,
   type SettingsSnapshot,
 } from "./settingsTransaction";
 import type { PendingAudioState } from "../electron/ipc.js";
@@ -171,22 +171,30 @@ async function nativeTranscribe(
 }
 
 /**
- * Resolve where the refinement API key will live, without writing anything
- * (B06): OS-keychain ciphertext when the bridge can produce it, an explicit
- * plaintext fallback otherwise (browser preview, no keychain backend, or an
- * unavailable bridge) — a documented, deliberate fallback, never a silent
- * one. Returning a plan instead of persisting keeps the settings transaction
- * the only writer, so a failure here cannot leave a half-persisted key.
+ * Ask the desktop bridge how the host's secret store received the key (B10).
+ * Resolves null when there is nothing to ask — an empty key, no bridge (the
+ * browser preview), or an older preload without the channel — and never
+ * throws: an IPC failure reads as a failed store, so the caller's decision
+ * always runs on classified information.
  */
-async function resolveRefinementKeyPlan(apiKey: string): Promise<RefinementKeyPlan> {
+async function resolveSecureKeyStorage(apiKey: string): Promise<SecureKeyStorage | null> {
   const bridge = window.starlingDesktop;
 
-  if (apiKey === "" || !bridge?.storeRefinementKey) return refinementKeyPlan(apiKey, null);
+  if (apiKey === "" || !bridge?.storeRefinementKey) return null;
 
   try {
-    return refinementKeyPlan(apiKey, (await bridge.storeRefinementKey({ apiKey })).ciphertext);
+    const saved = await bridge.storeRefinementKey({ apiKey });
+
+    // A null ciphertext with a claimed "encrypted" status would violate the
+    // bridge contract; reading it as a failed store keeps the decision honest.
+    return saved.ciphertext === null
+      ? {
+          kind: saved.protection === "encrypted" ? "failed" : saved.protection,
+          backend: saved.backend,
+        }
+      : { kind: "encrypted", ciphertext: saved.ciphertext };
   } catch {
-    return refinementKeyPlan(apiKey, null);
+    return { kind: "failed" };
   }
 }
 
@@ -226,6 +234,13 @@ export default function App() {
 
   const [refineInstruction, setRefineInstruction] = useState(initialSettings.refineInstruction);
 
+  // The explicit choice to store the refinement key as plaintext when no OS
+  // secret store can encrypt it (B10). Off by default: without it, a key
+  // that cannot be encrypted is kept for the session only.
+  const [refineKeyPlaintextOptIn, setRefineKeyPlaintextOptIn] = useState(
+    initialSettings.refineKeyPlaintextOptIn,
+  );
+
   // Multi-turn threads (#117): the active-thread hint is pure UI state, never
   // a session mutation. A stored id pins the thread the next "Refine in
   // thread" joins; a stored empty string is the "start new thread" veto that
@@ -253,6 +268,11 @@ export default function App() {
 
   const [settingsIssue, setSettingsIssue] = useState<string>();
 
+  // Post-save key-protection status (B10): set when a save succeeded but the
+  // key ended up session-only, so the dialog stays open and the accurate
+  // per-save protection status is read in context. Cleared with the dialog.
+  const [settingsNotice, setSettingsNotice] = useState<string>();
+
   // Live connection checks and dialog probes are sequenced separately: a
   // probe may never be silenced by a background live check or vice versa,
   // but within each family only the newest may report (B06).
@@ -271,6 +291,8 @@ export default function App() {
     setSettingsOpen(false);
     setDraft(undefined);
     setProbe(undefined);
+    setSettingsIssue(undefined);
+    setSettingsNotice(undefined);
     probeSequencer.cancelAll();
   }, [probeSequencer]);
 
@@ -362,6 +384,20 @@ export default function App() {
   // mount-time decrypt below must never clobber what they typed while it was
   // in flight, so an edited field is off limits to the async load.
   const refineApiKeyEditedRef = useRef(false);
+
+  // The refinement key this app knows is durably at rest, and in which form
+  // (B10): seeded from the plaintext entry a legacy version may have left,
+  // replaced when the mount-time decrypt applies the encrypted copy, and
+  // updated by every save that actually persisted a key. A key typed into
+  // the dialog is compared against this: unchanged means the stored copy
+  // already speaks for it, changed means a failed secure save must block
+  // rather than strand a mismatched endpoint/key pair.
+  const retainedKeyRef = useRef<{ key: string; form: "encrypted" | "plaintext" } | undefined>(
+    initialSettings.refineApiKey === ""
+      ? undefined
+      : { key: initialSettings.refineApiKey, form: "plaintext" },
+  );
+
   // Which takes are refining WITH thread context, keyed by session id like
   // refiningIds: each of the drawer's two refine buttons reflects its own
   // take and mode, so a standalone refine on one take never animates the
@@ -467,6 +503,11 @@ export default function App() {
         const apiKey = loaded.apiKey;
 
         if (!apiKey) return;
+
+        // The encrypted copy is now the durable record of this key (B10);
+        // the decrypt also patches any open draft so a save cannot clobber
+        // the just-decrypted key with the stale field it was copied from.
+        retainedKeyRef.current = { key: apiKey, form: "encrypted" };
 
         if (refineApiKeyEditedRef.current) return;
         setRefineApiKey(apiKey);
@@ -1607,7 +1648,10 @@ export default function App() {
       refineModel,
       refineApiKey,
       refineInstruction,
+      refineKeyPlaintextOptIn,
     });
+    setSettingsIssue(undefined);
+    setSettingsNotice(undefined);
     setSettingsOpen(true);
   }
 
@@ -1654,12 +1698,15 @@ export default function App() {
 
   /**
    * Apply the whole draft as one transaction (B06): validate the complete
-   * configuration, resolve the refinement key's destination, persist every
-   * settings key as an all-or-nothing storage transition — with rollback on
-   * failure — and only then swap the committed React state to the same
-   * normalized snapshot. A failed save leaves the dialog open with a clear
-   * error and nothing partially applied; the health-check effect re-probes
-   * on its own when the committed endpoint or protocol actually changed.
+   * configuration, ask the secret store how it could hold the refinement key
+   * (B10), decide that key's destination, persist every settings key as an
+   * all-or-nothing storage transition — with rollback on failure — and only
+   * then swap the committed React state to the same normalized snapshot. A
+   * failed or blocked save leaves the dialog open with a clear error and
+   * nothing partially applied; a save whose key stayed session-only keeps
+   * the dialog open with the accurate protection status; the health-check
+   * effect re-probes on its own when the committed endpoint or protocol
+   * actually changed.
    */
   async function saveSettings() {
     if (!draft) return;
@@ -1674,12 +1721,28 @@ export default function App() {
 
     setSettingsIssue(undefined);
 
-    // The keychain runs before any storage write: by the time the
+    // The secret store runs before any storage write: by the time the
     // transaction starts, the key's destination is already decided, so the
     // transaction is the only writer and a failure cannot strand a
-    // half-persisted key.
-    const keyPlan = await resolveRefinementKeyPlan(draft.refineApiKey);
-    const persisted = persistSettings(normalized.settings, keyPlan, localStorage);
+    // half-persisted key. Plaintext is written only on the explicit opt-in
+    // (B10); without it an unencryptable key stays session-only or blocks
+    // the save outright.
+    const secure = await resolveSecureKeyStorage(normalized.settings.refineApiKey);
+
+    const plan = refinementKeyPlan({
+      apiKey: normalized.settings.refineApiKey,
+      secure,
+      plaintextOptIn: normalized.settings.refineKeyPlaintextOptIn,
+      retained: retainedKeyRef.current,
+    });
+
+    if (plan.outcome === "blocked") {
+      setSettingsIssue(plan.message);
+
+      return;
+    }
+
+    const persisted = persistSettings(normalized.settings, plan, localStorage);
 
     if (!persisted.ok) {
       setSettingsIssue(
@@ -1703,8 +1766,25 @@ export default function App() {
     setRefineModel(committed.refineModel);
     setRefineApiKey(committed.refineApiKey);
     setRefineInstruction(committed.refineInstruction);
+    setRefineKeyPlaintextOptIn(committed.refineKeyPlaintextOptIn);
 
-    closeSettings();
+    // The durable record of the key follows what the save actually wrote:
+    // encrypted and opt-in plaintext install a new durable copy, clearing
+    // removes it, and a session-only save stored nothing — the plan already
+    // guaranteed the untouched entries still speak for this same key.
+    if (plan.outcome === "encrypted")
+      retainedKeyRef.current = { key: committed.refineApiKey, form: "encrypted" };
+    else if (plan.outcome === "plaintext")
+      retainedKeyRef.current = { key: committed.refineApiKey, form: "plaintext" };
+    else if (plan.outcome === "cleared") retainedKeyRef.current = undefined;
+
+    if (plan.outcome === "session-only") {
+      // Saved, but the key is not protected at rest: keep the dialog open so
+      // the status is read where the choice can be changed (B10).
+      setSettingsNotice(plan.status);
+    } else {
+      closeSettings();
+    }
 
     // Re-check health from the saved configuration, as saves always did. The
     // call's closure may predate the commit above: when the endpoint or
@@ -2286,11 +2366,29 @@ export default function App() {
                       placeholder="Local servers need none"
                     />
                     <small>
-                      Stored encrypted via your OS keychain in the desktop app when available; the
-                      browser preview keeps it in local storage as plaintext.
+                      Stored encrypted via your OS keychain when the desktop app has one. Without
+                      one — the browser preview, or Linux without a secret store — it is kept for
+                      the current session only unless you explicitly choose plaintext storage below.
                     </small>
                   </label>
                 </div>
+                <label className="settings-check">
+                  <input
+                    type="checkbox"
+                    checked={draft.refineKeyPlaintextOptIn}
+                    onChange={(event) =>
+                      updateDraft({ refineKeyPlaintextOptIn: event.target.checked })
+                    }
+                  />
+                  <span>
+                    Store API key unencrypted
+                    <small>
+                      Not recommended. Tick this to keep the key in plain local storage when no OS
+                      keychain is available. Leave it off and an unencryptable key is used for this
+                      session only, never written to disk.
+                    </small>
+                  </span>
+                </label>
                 <label>
                   Instruction
                   <textarea
@@ -2319,6 +2417,11 @@ export default function App() {
             {settingsIssue && (
               <p className="settings-issue" role="alert">
                 <CircleAlert size={15} /> {settingsIssue}
+              </p>
+            )}
+            {settingsNotice && (
+              <p className="settings-notice" role="status">
+                <Check size={15} /> {settingsNotice}
               </p>
             )}
             <div className="settings-footer">

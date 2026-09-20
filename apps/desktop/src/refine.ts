@@ -278,6 +278,15 @@ function describeCause(cause: unknown): string {
   return String(cause);
 }
 
+/**
+ * Replace the API key's own value wherever a server echoed it (B10): error
+ * details and bodies sometimes quote the Authorization header back, and the
+ * surfaced message must never repeat a credential.
+ */
+function redactSecret(text: string, secret: string | undefined): string {
+  return secret ? text.split(secret).join("[redacted]") : text;
+}
+
 function serverErrorDetail(body: string): string | undefined {
   const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ServerErrorResponseSchema))(
     body,
@@ -513,7 +522,22 @@ export function refineEffect(
         } satisfies BufferedCompletion;
       },
       catch: (cause) => new RefinementTransportError(describeCause(cause)),
-    }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
+    }).pipe(
+      Effect.flatMap(ensureNotRedirected),
+      Effect.flatMap(ensureOk),
+      // A server that echoes the Authorization header in its error detail
+      // must not get the key repeated back to the user (B10).
+      Effect.mapError((error) =>
+        error instanceof RefinementHttpError
+          ? new RefinementHttpError(
+              error.status,
+              error.statusText,
+              redactSecret(error.responseBody, apiKey),
+              redactSecret(error.message, apiKey),
+            )
+          : error,
+      ),
+    );
 
     const response = yield* withExternalAbort(withTimeout(request, timeoutMs), options.signal);
 

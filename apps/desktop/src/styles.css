@@ -1001,6 +1001,18 @@ kbd {
   font-size: 11px;
   line-height: 1.55;
 }
+/* Post-save key-protection status (B10): informational, not an error. */
+.settings-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  background: #e4e9d8;
+  color: #4d5c3a;
+  font-size: 11px;
+  line-height: 1.55;
+}
 .settings-footer {
   display: flex;
   justify-content: flex-end;

@@ -67,13 +67,31 @@ export type RefinementKeySaveInput = typeof RefinementKeySaveInputSchema.Type;
 
 export type RefinementKeyLoadInput = typeof RefinementKeyLoadInputSchema.Type;
 
+/**
+ * What the main process can honestly say about how (or whether) a key was
+ * protected (B10): "encrypted" only for a real OS secret store; "unprotected"
+ * for a backend that guards with a hardcoded password (Linux basic_text) or
+ * cannot be identified; "unavailable" for no store; "failed" for a store
+ * that answered available but refused the encryption call.
+ */
+export type KeyProtectionStatus = "encrypted" | "unprotected" | "unavailable" | "failed";
+
 export interface RefinementKeySaveResult {
   /**
    * Base64 safeStorage ciphertext for the renderer to persist, or null when
-   * this host cannot encrypt (no OS keychain backend): the caller then keeps
-   * its documented plaintext-localStorage fallback instead.
+   * this host cannot honestly encrypt (no OS secret store, an unprotected
+   * basic_text backend, or a keychain that refused the call).
    */
   readonly ciphertext: string | null;
+
+  /** Accurate per-save protection status; ciphertext is null unless "encrypted". */
+  readonly protection: KeyProtectionStatus;
+
+  /**
+   * The safeStorage backend the host selected, when it reported one (Linux:
+   * gnome_libsecret, kwallet5, basic_text…). Status reporting only.
+   */
+  readonly backend?: string;
 }
 
 export interface RefinementKeyLoadResult {
@@ -122,8 +140,9 @@ export interface StarlingDesktopBridge {
   setPendingAudio(state: PendingAudioState): void;
   /**
    * Optional so older preload builds (and the browser preview, which has no
-   * bridge at all) degrade to the renderer's plaintext-localStorage fallback
-   * instead of failing: callers must guard on the method's presence.
+   * bridge at all) degrade to session-only key retention instead of failing:
+   * callers must guard on the method's presence and read the returned
+   * protection status before persisting anything (B10).
    */
   storeRefinementKey?(input: RefinementKeySaveInput): Promise<RefinementKeySaveResult>;
   loadRefinementKey?(input: RefinementKeyLoadInput): Promise<RefinementKeyLoadResult>;

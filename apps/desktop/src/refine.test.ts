@@ -588,6 +588,35 @@ describe("refineEffect", () => {
     expect(whole.endsWith(".")).toBe(true);
   });
 
+  it("redacts an echoed API key from surfaced error text and bodies (B10)", async () => {
+    // A misbehaving server can echo the Authorization header inside its own
+    // error detail; the surfaced error must not repeat the credential.
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        refineEffect(
+          "hello",
+          { ...settings, apiKey: "sk-secret-value" },
+          {
+            fetchImpl: async () =>
+              new Response(JSON.stringify({ detail: "Invalid API key: Bearer sk-secret-value" }), {
+                status: 401,
+                statusText: "Unauthorized",
+              }),
+          },
+        ),
+      ),
+    );
+
+    expect(failure).toBeInstanceOf(RefinementHttpError);
+    expect(failure.message).not.toContain("sk-secret-value");
+    expect(failure.message).toContain("[redacted]");
+
+    if (failure instanceof RefinementHttpError) {
+      expect(failure.responseBody).not.toContain("sk-secret-value");
+      expect(failure.responseBody).toContain("[redacted]");
+    }
+  });
+
   it("turns its deadline into a timeout error and aborts the request", async () => {
     let requestAborted = false;
 

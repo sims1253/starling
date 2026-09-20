@@ -17,6 +17,13 @@ export interface SettingsSnapshot {
   refineModel: string;
   refineApiKey: string;
   refineInstruction: string;
+  /**
+   * The explicit, informed choice to store the refinement API key as
+   * plaintext when no OS secret store can encrypt it (B10). Defaults to
+   * false: without it a key that cannot be encrypted is kept for the
+   * session only and never written to disk.
+   */
+  refineKeyPlaintextOptIn: boolean;
 }
 
 /** Storage surface the settings transaction runs against. */
@@ -38,6 +45,7 @@ const KEYS = {
   refineInstruction: "starling:refine:instruction",
   refineApiKey: "starling:refine:apiKey",
   refineApiKeyEnc: "starling:refine:apiKeyEnc",
+  refineKeyPlaintextOptIn: "starling:refine:keyPlaintextOptIn",
 } as const;
 
 const DEFAULT_MODEL = "parakeet";
@@ -72,28 +80,118 @@ export function normalizeSettings(draft: SettingsSnapshot): SettingsNormalizatio
   };
 }
 
-/** Where the refinement API key lands: keychain ciphertext, plaintext, or nowhere. */
-export interface RefinementKeyPlan {
-  /** Value for starling:refine:apiKey, or null to remove the entry. */
-  plaintext: string | null;
+/**
+ * What the secure-save attempt concluded (B10): the desktop bridge's answer
+ * after classifying the host's secret store, or null when there is no bridge
+ * at all (browser preview) — a host with no keychain to ask.
+ */
+export type SecureKeyStorage =
+  | { readonly kind: "encrypted"; readonly ciphertext: string }
+  | { readonly kind: "unprotected" | "unavailable" | "failed"; readonly backend?: string };
 
-  /** Value for starling:refine:apiKeyEnc, or null to remove the entry. */
-  ciphertext: string | null;
+/** The key already durably at rest, and in which form. */
+export interface RetainedKey {
+  readonly key: string;
+  readonly form: "encrypted" | "plaintext";
 }
 
-/**
- * Decide the refinement key's destination. An empty key clears both entries
- * (nothing to encrypt, no residue to keep); keychain ciphertext wins and the
- * plaintext copy is removed; without ciphertext the key falls back to
- * plaintext — a documented, deliberate fallback, never a silent one. The
- * plan itself writes nothing: the settings transaction owns every write.
- */
-export function refinementKeyPlan(apiKey: string, ciphertext: string | null): RefinementKeyPlan {
-  if (apiKey === "") return { plaintext: null, ciphertext: null };
+/** The entries the plan wants written (string), removed (null), or left alone (undefined). */
+interface KeyEntryPlan {
+  /** Value for starling:refine:apiKey: set, remove, or leave untouched. */
+  readonly plaintext: string | null | undefined;
 
-  return ciphertext === null
-    ? { plaintext: apiKey, ciphertext: null }
-    : { plaintext: null, ciphertext };
+  /** Value for starling:refine:apiKeyEnc: set, remove, or leave untouched. */
+  readonly ciphertext: string | null | undefined;
+}
+
+export type RefinementKeyPlan = KeyEntryPlan &
+  (
+    | { readonly outcome: "cleared" }
+    | { readonly outcome: "encrypted" }
+    | { readonly outcome: "plaintext" }
+    | { readonly outcome: "session-only"; readonly status: string }
+    | { readonly outcome: "blocked"; readonly message: string }
+  );
+
+/** Human wording for each protection outcome, reused by every message below. */
+export function secureStorageStatus(secure: SecureKeyStorage | null): string {
+  if (secure === null) return "No OS keychain is available to this app.";
+
+  switch (secure.kind) {
+    case "encrypted":
+      return "The key is stored encrypted via your OS keychain.";
+    case "unprotected":
+      return secure.backend === "basic_text"
+        ? "This Linux desktop's safeStorage backend is basic_text, which guards with a hardcoded password instead of an OS secret store."
+        : "The OS secret store could not be identified on this machine.";
+    case "unavailable":
+      return "No encrypted storage is available on this machine right now.";
+    case "failed":
+      return "The OS keychain refused to encrypt the key.";
+  }
+}
+
+const SESSION_ONLY_FIRST_TIME =
+  'Settings saved, but your API key was not: it is kept for this session only and was not written to disk, so it will be gone after a restart. Tick "Store API key unencrypted" to persist it, or re-enter it next time.';
+
+/**
+ * Decide the refinement key's destination (B10). An empty key clears both
+ * entries; keychain ciphertext wins and migrates any plaintext copy away;
+ * without usable encryption, plaintext is written ONLY on the explicit
+ * opt-in — never as an automatic fallback. Otherwise the key stays
+ * session-only: if it is unchanged from a copy already at rest, both stored
+ * entries are left untouched (a transient keychain failure must not delete
+ * the last valid encrypted key, and an unchanged key cannot mismatch the
+ * saved endpoint); if it is a NEW key, the save is blocked — silently
+ * swapping or dropping the stored key next to a freshly saved endpoint
+ * would activate a mismatched endpoint/key pair.
+ */
+export function refinementKeyPlan(input: {
+  readonly apiKey: string;
+  readonly secure: SecureKeyStorage | null;
+  readonly plaintextOptIn: boolean;
+  readonly retained?: RetainedKey | undefined;
+}): RefinementKeyPlan {
+  const { apiKey, secure, plaintextOptIn, retained } = input;
+
+  if (apiKey === "") return { outcome: "cleared", plaintext: null, ciphertext: null };
+
+  if (secure?.kind === "encrypted")
+    return { outcome: "encrypted", plaintext: null, ciphertext: secure.ciphertext };
+
+  if (plaintextOptIn) return { outcome: "plaintext", plaintext: apiKey, ciphertext: null };
+
+  const status = secureStorageStatus(secure);
+
+  if (retained === undefined || retained.key === apiKey) {
+    if (retained === undefined) {
+      return {
+        outcome: "session-only",
+        plaintext: undefined,
+        ciphertext: undefined,
+        status: `${status} ${SESSION_ONLY_FIRST_TIME}`,
+      };
+    }
+
+    const detail =
+      retained.form === "encrypted"
+        ? "The previously encrypted copy is untouched, so the key stays available after a restart."
+        : 'Your API key was already stored unencrypted by an earlier version and was left untouched. Tick "Store API key unencrypted" to keep it deliberately, or clear the field to remove it.';
+
+    return {
+      outcome: "session-only",
+      plaintext: undefined,
+      ciphertext: undefined,
+      status: `Settings saved. ${status} ${detail}`,
+    };
+  }
+
+  return {
+    outcome: "blocked",
+    plaintext: undefined,
+    ciphertext: undefined,
+    message: `Your API key could not be stored securely — ${status.charAt(0).toLowerCase()}${status.slice(1)} The settings were not saved and nothing was changed. Unlock the keychain and try again, tick "Store API key unencrypted" to persist it as plaintext, or clear the key field.`,
+  };
 }
 
 export type SettingsPersistResult = { ok: true } | { ok: false; message: string };
@@ -116,6 +214,16 @@ export function persistSettings(
   keyPlan: RefinementKeyPlan,
   storage: SettingsStorage,
 ): SettingsPersistResult {
+  if (keyPlan.outcome === "blocked") {
+    // Defense in depth: the caller surfaces the message before ever starting
+    // a transaction; if one arrives here anyway, nothing may be written
+    // around a key decision that was never made (B10).
+    return { ok: false, message: keyPlan.message };
+  }
+
+  // A session-only plan leaves both key entries untouched (undefined skips
+  // the write), so a failed secure save cannot delete the last valid
+  // encrypted key or strand a half-applied key form (B10).
   const writes: ReadonlyArray<readonly [string, string | null]> = [
     [KEYS.endpoint, settings.endpoint],
     [KEYS.protocol, settings.protocol],
@@ -125,8 +233,11 @@ export function persistSettings(
     [KEYS.refineBaseUrl, settings.refineBaseUrl],
     [KEYS.refineModel, settings.refineModel],
     [KEYS.refineInstruction, settings.refineInstruction],
-    [KEYS.refineApiKey, keyPlan.plaintext],
-    [KEYS.refineApiKeyEnc, keyPlan.ciphertext],
+    [KEYS.refineKeyPlaintextOptIn, settings.refineKeyPlaintextOptIn ? "1" : null],
+    ...(keyPlan.plaintext === undefined ? [] : ([[KEYS.refineApiKey, keyPlan.plaintext]] as const)),
+    ...(keyPlan.ciphertext === undefined
+      ? []
+      : ([[KEYS.refineApiKeyEnc, keyPlan.ciphertext]] as const)),
   ];
 
   let before: ReadonlyArray<readonly [string, string | null]>;
@@ -181,5 +292,6 @@ export function readCommittedSettings(
     refineModel: storage.getItem(KEYS.refineModel) ?? "",
     refineApiKey: storage.getItem(KEYS.refineApiKey) ?? "",
     refineInstruction: storage.getItem(KEYS.refineInstruction) ?? "",
+    refineKeyPlaintextOptIn: storage.getItem(KEYS.refineKeyPlaintextOptIn) === "1",
   };
 }
