@@ -65,6 +65,7 @@
 //!   R21 semantics) stay dead — recovery never resurrects a confirmed
 //!   deletion, and an interrupted delete is completed, not half-kept.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -303,9 +304,11 @@ pub struct AttemptRecord {
     pub status: String,
     pub timing_json: Option<String>,
     pub extra_json: Option<String>,
-    /// When the attempt was inserted (`now_iso`), the real updated-at
-    /// source for summaries. `None` only on rows written before the v2
-    /// schema added the column.
+    /// When the attempt was inserted, the real updated-at source for
+    /// summaries. On insert, `None` means "stamp with now_iso()"
+    /// ([`StoreV2::insert_attempt`] applies the default — a caller cannot
+    /// write an explicit NULL); readers see `None` only on rows written
+    /// before the v2 schema added the column.
     pub created_utc: Option<String>,
 }
 
@@ -317,7 +320,11 @@ impl AttemptRecord {
 
     /// The v1-shaped transcript this attempt carries, when it has one: the
     /// verbatim result a writer preserved in `extra_json` (the shape both
-    /// the app writes).
+    /// the app writes). `None` when the row has no `extra_json` **or when
+    /// that JSON is not a transcript** — a failed attempt's
+    /// `{"error": ...}` blob, or a corrupted one, deserializes to `None`
+    /// just like an absent column (the parse failure is not
+    /// distinguishable to the caller).
     pub fn transcript(&self) -> Option<crate::storage::TranscriptionResult> {
         self.extra_json
             .as_deref()
@@ -839,14 +846,10 @@ impl StoreV2 {
     pub fn attempts_grouped_by_capture(
         &self,
         capture_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<AttemptRecord>>, StoreV2Error> {
-        let mut grouped: std::collections::HashMap<String, Vec<AttemptRecord>> =
-            std::collections::HashMap::new();
+    ) -> Result<HashMap<String, Vec<AttemptRecord>>, StoreV2Error> {
+        let mut grouped: HashMap<String, Vec<AttemptRecord>> = HashMap::new();
         // Stay well under SQLite's default 999 host-parameter limit.
         for chunk in capture_ids.chunks(500) {
-            if chunk.is_empty() {
-                continue;
-            }
             let placeholders = std::iter::repeat("?")
                 .take(chunk.len())
                 .collect::<Vec<_>>()
@@ -1310,9 +1313,20 @@ impl StoreV2 {
     /// verified first; a torn tail is sealed to its verified prefix (the
     /// discarded bytes become a gap note, never a silent join); only then
     /// is the file renamed into `audio/` (fsyncing both directories) and
-    /// the `captures` row committed. The source is only ever read and
-    /// moved — if any step fails before the rename it stays exactly where
-    /// it was. The capture id is the journal's file stem, so an adopted
+    /// the `captures` row committed.
+    ///
+    /// # What can happen to the source
+    ///
+    /// The source is read, verified, and **sealed in place when its tail is
+    /// torn or it never finalized** — the pre-adoption byte layout is *not*
+    /// preserved. A failure after the seal but before the rename leaves a
+    /// sealed-but-unadopted source at its original path: its verified
+    /// samples are intact, and callers treat any adoption failure as "no
+    /// adoption happened" (the app stores the take from its encoded WAV
+    /// instead). A failure after the rename but before the commit leaves
+    /// the journal in `audio/` with no `captures` row — repaired by the
+    /// next [`Self::reconcile`] (an orphan session), not by restoring the
+    /// source. The capture id is the journal's file stem, so an adopted
     /// take stays traceable to its origin.
     pub fn adopt_journal(
         &mut self,
@@ -1381,7 +1395,8 @@ impl StoreV2 {
         let note = [note.map(str::to_string), recovery_note]
             .into_iter()
             .flatten()
-            .reduce(|joined, next| format!("{joined} {next}"));
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let count = parsed.samples.len() as u64;
         let record = CaptureRecord {
@@ -1400,7 +1415,7 @@ impl StoreV2 {
                 CaptureStatus::Complete
             },
             retention_class: "standard".to_string(),
-            extra_json: note.map(|note| merge_extra_note(None, &note)),
+            extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
         };
         self.commit_capture(&record)?;
         Ok(record)

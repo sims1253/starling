@@ -386,7 +386,11 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
             });
         }
         offset += PAGE;
-        if offset >= total || listed == 0 {
+        // The whole listing runs under one guard, so the pages see a
+        // single snapshot in-process; the short-page bound is belt and
+        // braces for if that ever changes — and it avoids the one extra
+        // empty query an exact-multiple history would otherwise cost.
+        if listed < PAGE || offset >= total {
             break;
         }
     }
@@ -490,9 +494,17 @@ mod tests {
     use super::*;
 
     /// A fresh scratch directory under the system temp dir, removed first
-    /// so reruns start clean. Each test uses its own tag.
+    /// so reruns start clean. Unique per call, not just per tag + process:
+    /// two helper invocations sharing a tag inside one test would otherwise
+    /// wipe each other's state (the remove-first is the hazard), so a
+    /// counter makes collisions impossible.
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("starling-e02-{tag}-{}", std::process::id()));
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "starling-e02-{tag}-{}-{}",
+            std::process::id(),
+            CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir

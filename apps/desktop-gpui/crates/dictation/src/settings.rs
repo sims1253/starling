@@ -3,6 +3,17 @@
 //! `starling:model`, `starling:terms`) with a JSON file. See
 //! `apps/desktop-gpui/PORT.md`.
 
+//! # The dropped `storageBackend` key (D14, deliberate)
+//!
+//! The cutover-era build persisted a `storageBackend` choice
+//! (`"v1"`/`"v2"`). Since D14 (storage v2 is THE store — no backwards
+//! compatibility of any kind) this build runs v2 unconditionally: the key
+//! is unknown, ignored on load, and dropped on the next save. That drop is
+//! intended, not an oversight — pinned by
+//! `a_legacy_storage_backend_choice_is_ignored_since_d14` below. The same
+//! posture applies to the v1 `sessions/`/`journals/` histories: they stay
+//! on disk, untouched and no longer read anywhere.
+
 use std::io;
 use std::path::{Path, PathBuf};
 
