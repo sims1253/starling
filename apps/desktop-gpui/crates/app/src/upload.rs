@@ -18,22 +18,15 @@ impl StarlingApp {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
             let duration_ms = handle.elapsed().as_secs_f64() * 1000.0;
+            // G03: clipping is measured on the raw captured samples (before
+            // the attenuation-only auto gain), so an already-clipped source
+            // stays visible even when its attenuated copy peaks below
+            // full scale.
+            let source_clip_ratio = handle.source_clip_ratio();
             match handle.stop() {
                 Ok(pcm) => {
                     self.levels = vec![0.06; 52];
-                    let clipped = pcm
-                        .samples
-                        .iter()
-                        .filter(|sample| sample.abs() >= 0.999)
-                        .count();
-                    let ratio = clipped as f64 / pcm.samples.len().max(1) as f64;
-                    if ratio > 0.02 {
-                        self.capture_warning = Some(format!(
-                            "That recording was heavily clipped ({ratio:.0}% of samples at full \
-                             scale). The microphone input level is too high — lower it in your \
-                             sound settings and record again for a cleaner take."
-                        ));
-                    }
+                    self.capture_warning = recorder::clipping_warning(source_clip_ratio);
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx

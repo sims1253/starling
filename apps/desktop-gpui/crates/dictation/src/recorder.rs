@@ -48,6 +48,67 @@ const AUTO_GAIN_ATTACK: f32 = 0.9;
 /// Fraction of the distance back to unity per block when input cools down.
 const AUTO_GAIN_RELEASE: f32 = 0.06;
 
+/// |sample| at or above this counts as clipped source evidence. i16 full
+/// scale converts to 0.99997, so 0.999 catches integer full-scale input
+/// while ignoring ±1-LSB flutter below it.
+pub const CLIP_THRESHOLD: f32 = 0.999;
+
+/// Clipped-sample fraction above which the UI warns about the source.
+pub const CLIP_WARNING_RATIO: f64 = 0.02;
+
+/// Incremental clipping evidence measured on the raw captured samples,
+/// before the capture auto-gain touches them (G03): attenuation can pull
+/// an already-clipped source below any peak threshold, so the warning must
+/// be driven by pre-DSP counts, not by the attenuated copy that is kept.
+#[derive(Debug, Default)]
+pub struct ClipCounters {
+    total: u64,
+    clipped: u64,
+}
+
+impl ClipCounters {
+    /// Counts full-scale samples against [`CLIP_THRESHOLD`]. A NaN sample is
+    /// not evidence of clipping (the comparison is false), matching how the
+    /// encoder treats non-finite input.
+    pub fn observe(&mut self, samples: &[f32]) {
+        for &sample in samples {
+            if sample.abs() >= CLIP_THRESHOLD {
+                self.clipped += 1;
+            }
+        }
+        self.total += samples.len() as u64;
+    }
+
+    /// Clipped fraction in 0..=1, or 0.0 when nothing was observed (also the
+    /// empty-recording case, so no warning can be fabricated).
+    pub fn ratio(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.clipped as f64 / self.total as f64
+        }
+    }
+}
+
+/// The capture warning for a source clip `ratio` in 0..=1: `Some(message)`
+/// only above [`CLIP_WARNING_RATIO`], with the percentage honestly scaled
+/// to 0-100 (G03: the old `{ratio:.0}%` rendered a 3% ratio as 0%). The
+/// message describes the unprocessed source and states that attenuation
+/// cannot repair it — post-ADC gain is never presented as a fix.
+pub fn clipping_warning(ratio: f64) -> Option<String> {
+    if !(ratio > CLIP_WARNING_RATIO) {
+        return None;
+    }
+
+    let percent = (ratio * 100.0).round();
+    Some(format!(
+        "The microphone input itself was heavily clipped ({percent:.0}% of source samples at \
+         full scale, measured before any processing). Lower the input level in your sound \
+         settings and record again for a cleaner take — the app's auto-attenuation cannot \
+         repair samples that were already clipped at the source."
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecorderError {
     #[error("{0}")]
@@ -112,6 +173,9 @@ struct Shared {
     ring: Mutex<VecDeque<f32>>,
     /// Capture auto-gain, driven inside the audio callback.
     attenuator: Mutex<Attenuator>,
+    /// Pre-DSP clipping evidence, observed inside the audio callback before
+    /// the attenuator runs (G03).
+    clip: Mutex<ClipCounters>,
 }
 
 /// Average interleaved frames down to mono. Frames shorter than `channels`
@@ -181,6 +245,17 @@ impl RecorderHandle {
     /// natively, otherwise the device default).
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Fraction of raw (pre-attenuation) samples at full scale for this
+    /// capture so far — evidence about the microphone source rather than
+    /// the attenuated copy `stop` returns. Read before calling `stop`,
+    /// which consumes the handle.
+    pub fn source_clip_ratio(&self) -> f64 {
+        match self.shared.clip.lock() {
+            Ok(clip) => clip.ratio(),
+            Err(_) => 0.0,
+        }
     }
 
     /// Wall-clock time since `start_recording`, like
@@ -256,6 +331,7 @@ pub fn start_recording() -> Result<RecorderHandle, RecorderError> {
         chunk_rx: Mutex::new(chunk_rx),
         ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
         attenuator: Mutex::new(Attenuator::default()),
+        clip: Mutex::new(ClipCounters::default()),
     });
 
     let stream = open_stream(&device, sample_format, &stream_config, &shared)?;
@@ -347,6 +423,12 @@ where
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let interleaved: Vec<f32> = data.iter().map(|&sample| sample_to_f32(sample)).collect();
             let mut mono = downmix_to_mono(&interleaved, channels);
+            // G03: clipping evidence is observed on the raw samples, before
+            // the attenuation-only auto gain can hide an already-clipped
+            // source below the full-scale threshold.
+            if let Ok(mut clip) = shared.clip.lock() {
+                clip.observe(&mono);
+            }
             if let Ok(mut attenuator) = shared.attenuator.lock() {
                 attenuator.process(&mut mono);
             }
@@ -486,6 +568,96 @@ mod tests {
             (0.6..=0.95).contains(&tail_peak),
             "steady hot input should settle near the target, tail peak {tail_peak}"
         );
+    }
+
+    #[test]
+    fn clip_counters_count_full_scale_boundary() {
+        let mut counters = ClipCounters::default();
+        counters.observe(&[
+            CLIP_THRESHOLD,
+            CLIP_THRESHOLD - 0.0001,
+            -1.0,
+            f32::NAN,
+            0.5,
+        ]);
+        // Exactly at the threshold counts; just under does not; -1.0 counts;
+        // NaN is not evidence of clipping; every observed sample is totaled.
+        assert_eq!(counters.ratio(), 0.4);
+    }
+
+    #[test]
+    fn clip_counters_accumulate_across_chunks() {
+        let mut counters = ClipCounters::default();
+        assert_eq!(counters.ratio(), 0.0, "empty capture has no clip evidence");
+        counters.observe(&[]);
+        assert_eq!(counters.ratio(), 0.0, "empty chunks fabricate nothing");
+
+        counters.observe(&[1.0, 1.0, -1.0, 0.1, 0.2, 0.3]);
+        counters.observe(&[0.0; 94]);
+        assert_eq!(counters.ratio(), 0.03, "3 of 100 across two chunks");
+    }
+
+    #[test]
+    fn clipping_warning_scales_percentages_and_tests_boundaries() {
+        assert!(clipping_warning(0.0).is_none());
+        assert!(clipping_warning(f64::NAN).is_none());
+        assert!(clipping_warning(-0.5).is_none());
+        // Exactly at the threshold stays silent; just past it warns.
+        assert!(clipping_warning(CLIP_WARNING_RATIO).is_none());
+        let just_over = clipping_warning(0.020001).expect("warns just over the threshold");
+        assert!(just_over.contains("2%"), "{just_over}");
+
+        // 0.03 displays as 3%, not the 0% the old `{ratio:.0}%` produced.
+        let three_percent = clipping_warning(0.03).expect("warns at 3%");
+        assert!(three_percent.contains("3%"), "{three_percent}");
+        assert!(!three_percent.contains("0%"), "{three_percent}");
+
+        let everything = clipping_warning(1.0).expect("warns at 100%");
+        assert!(everything.contains("100%"), "{everything}");
+    }
+
+    #[test]
+    fn clipped_source_still_warns_after_attenuation() {
+        // G03 acceptance: synthetic full-scale blocks keep a source-clipped
+        // warning even when the processed peaks fall below 0.999. The order
+        // here mirrors the audio callback: observe raw, then attenuate.
+        let mut counters = ClipCounters::default();
+        let mut attenuator = Attenuator::default();
+        let mut post_dsp_full_scale = 0usize;
+        let mut post_dsp_total = 0usize;
+
+        for block in 0..100 {
+            let raw: Vec<f32> = (0..AUTO_GAIN_BLOCK)
+                .map(|index| {
+                    if (block + index) % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
+                .collect();
+            counters.observe(&raw);
+
+            let mut processed = raw;
+            attenuator.process(&mut processed);
+            post_dsp_total += processed.len();
+            post_dsp_full_scale += processed
+                .iter()
+                .filter(|sample| sample.abs() >= CLIP_THRESHOLD)
+                .count();
+        }
+
+        // The old post-DSP measurement would sit below the warning threshold
+        // (only the first block's head passes at unity gain) …
+        let post_ratio = post_dsp_full_scale as f64 / post_dsp_total as f64;
+        assert!(
+            post_ratio <= CLIP_WARNING_RATIO,
+            "fixture must hide clipping from post-DSP counting: {post_ratio}"
+        );
+
+        // … while the pre-DSP evidence reports the whole capture.
+        let warning = clipping_warning(counters.ratio()).expect("source-clipped warning");
+        assert!(warning.contains("100%"), "{warning}");
     }
 
     /// Live round-trip against the real microphone. Skips itself (rather than
