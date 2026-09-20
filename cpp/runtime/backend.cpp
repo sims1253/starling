@@ -724,6 +724,14 @@ const void* ReplayGraph::input_host(size_t i) const {
     return (i < input_hosts_.size()) ? input_hosts_[i] : nullptr;
 }
 
+size_t ReplayGraph::device_alloc_bytes() const {
+    // Private gallocr buffer, buffer slot 0 (single buffer type). This is the
+    // exact device allocation ReplayGraph::~ReplayGraph frees via
+    // ggml_gallocr_free, so cache budgets accounting it measure what eviction
+    // actually reclaims.
+    return galloc_ ? ggml_gallocr_get_buffer_size(galloc_, 0) : 0;
+}
+
 void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
                                            ggml_tensor* out_t,
                                            std::vector<float>& out) {

@@ -213,6 +213,16 @@ public:
         return i < persistent_.size() && persistent_[i];
     }
 
+    // Tracked-bytes figure for byte-aware cache budgets (S02 / issue #177):
+    // the size of this graph's PRIVATE gallocr buffer — exactly the device
+    // memory freeing this ReplayGraph reclaims. Covers the graph's input
+    // tensors + intermediates; loader weights are counted once by their owner,
+    // never here. 0 when the graph was scheduled through ggml_backend_sched
+    // (no private buffer to account — the entry then tracks as zero bytes;
+    // CUDA-graph exec/driver allocations are not exposed by ggml and stay
+    // deliberately untracked).
+    size_t device_alloc_bytes() const;
+
 private:
     Backend& backend_;
     ggml_context* ctx_ = nullptr;
