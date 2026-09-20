@@ -1,0 +1,148 @@
+{
+  "machine": "capture",
+  "description": "Two takes through the full happy path: Idle -> Acquiring -> Recording -> Draining -> Persisted, including a transient (non-fatal) capture.error, a capture.gap and drain-phase progress. take_77 continues the stream opened by mode.routeFrozen in context-freeze.json (route frozen before the first frame leaves the runtime).",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_001",
+      "ts": "2026-09-20T10:01:00Z",
+      "corr": "take_77",
+      "seq": 410,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_001",
+      "ts": "2026-09-20T10:01:00Z",
+      "corr": "take_77",
+      "seq": 411,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_002",
+      "ts": "2026-09-20T10:01:02Z",
+      "corr": "take_77",
+      "seq": 412,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 48000, "clipRatio": 0.0, "level": 0.21 }
+    },
+    {
+      "v": 1,
+      "id": "evt_003",
+      "ts": "2026-09-20T10:01:03Z",
+      "corr": "take_77",
+      "seq": 413,
+      "type": "capture.gap",
+      "payload": { "startSample": 52000, "endSample": 53500 }
+    },
+    {
+      "v": 1,
+      "id": "evt_004",
+      "ts": "2026-09-20T10:01:05Z",
+      "corr": "take_77",
+      "seq": 414,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 101500, "clipRatio": 0.001, "level": 0.34 }
+    },
+    {
+      "v": 1,
+      "id": "evt_005",
+      "ts": "2026-09-20T10:01:06Z",
+      "corr": "take_77",
+      "seq": 415,
+      "type": "capture.error",
+      "payload": { "code": "device_overrun", "fatal": false }
+    },
+    {
+      "v": 1,
+      "id": "cmd_002",
+      "ts": "2026-09-20T10:01:08Z",
+      "corr": "take_77",
+      "seq": 416,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    },
+    {
+      "v": 1,
+      "id": "evt_006",
+      "ts": "2026-09-20T10:01:08Z",
+      "corr": "take_77",
+      "seq": 417,
+      "type": "capture.progress",
+      "payload": { "ackSamples": 128000, "clipRatio": 0.001, "level": 0.0 }
+    },
+    {
+      "v": 1,
+      "id": "evt_007",
+      "ts": "2026-09-20T10:01:09Z",
+      "corr": "take_77",
+      "seq": 418,
+      "type": "capture.stopped",
+      "payload": {
+        "finalSampleIndex": 128512,
+        "acknowledgedSamples": 128000,
+        "gaps": [{ "startSample": 52000, "endSample": 53500 }],
+        "journalId": "j_02ab",
+        "sampleDurationMs": 8032.0,
+        "wallClockMs": 8410.0
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_003",
+      "ts": "2026-09-20T10:01:20Z",
+      "corr": "take_78",
+      "seq": 420,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_008",
+      "ts": "2026-09-20T10:01:20Z",
+      "corr": "take_78",
+      "seq": 421,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_004",
+      "ts": "2026-09-20T10:01:24Z",
+      "corr": "take_78",
+      "seq": 422,
+      "type": "capture.stop",
+      "payload": {}
+    },
+    {
+      "v": 1,
+      "id": "evt_009",
+      "ts": "2026-09-20T10:01:24Z",
+      "corr": "take_78",
+      "seq": 423,
+      "type": "capture.stopped",
+      "payload": {
+        "finalSampleIndex": 192100,
+        "acknowledgedSamples": 192100,
+        "gaps": [],
+        "journalId": "j_02ac",
+        "sampleDurationMs": 4002.0,
+        "wallClockMs": 4180.0
+      }
+    }
+  ]
+}

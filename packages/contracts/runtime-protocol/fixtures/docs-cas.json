@@ -1,0 +1,106 @@
+{
+  "machine": "docs",
+  "description": "Compare-and-swap head updates: docs.get, an updateHead whose expectedBase mismatches (headConflict with the candidate revision retained), a retry against the actual base that commits, and docs.appendTurn resolving via docs.turnAppended. Committed -> Steady is runtime-internal ($advance).",
+  "initial": "Steady",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_300",
+      "ts": "2026-09-20T10:06:00Z",
+      "corr": "q-1",
+      "seq": 1,
+      "type": "docs.get",
+      "payload": { "docId": "notes", "page": 0 }
+    },
+    {
+      "v": 1,
+      "id": "cmd_301",
+      "ts": "2026-09-20T10:06:02Z",
+      "corr": "up-1",
+      "seq": 1,
+      "type": "docs.updateHead",
+      "payload": {
+        "docId": "notes",
+        "expectedBase": 5,
+        "newRevision": {
+          "revId": "rev-41",
+          "baseRevision": 5,
+          "sourceAttemptIds": ["att-1"],
+          "instructionTemplateId": "tpl-none",
+          "text": "Hello world.",
+          "status": "candidate",
+          "provenance": "recognition"
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_300",
+      "ts": "2026-09-20T10:06:02Z",
+      "corr": "up-1",
+      "seq": 2,
+      "type": "docs.headConflict",
+      "payload": { "expected": 5, "actual": 7, "candidatePreserved": true }
+    },
+    {
+      "v": 1,
+      "id": "cmd_302",
+      "ts": "2026-09-20T10:06:04Z",
+      "corr": "q-2",
+      "seq": 1,
+      "type": "docs.get",
+      "payload": { "docId": "notes", "page": 0 }
+    },
+    {
+      "v": 1,
+      "id": "cmd_303",
+      "ts": "2026-09-20T10:06:05Z",
+      "corr": "up-2",
+      "seq": 1,
+      "type": "docs.updateHead",
+      "payload": {
+        "docId": "notes",
+        "expectedBase": 7,
+        "newRevision": {
+          "revId": "rev-42",
+          "baseRevision": 7,
+          "sourceAttemptIds": ["att-2"],
+          "instructionTemplateId": "tpl-none",
+          "text": "Hello, world.",
+          "status": "candidate",
+          "provenance": "recognition"
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_301",
+      "ts": "2026-09-20T10:06:05Z",
+      "corr": "up-2",
+      "seq": 2,
+      "type": "docs.headUpdated",
+      "payload": { "docId": "notes", "headRevision": 8 }
+    },
+    { "$advance": "Steady" },
+    {
+      "v": 1,
+      "id": "cmd_304",
+      "ts": "2026-09-20T10:06:08Z",
+      "corr": "turn-1",
+      "seq": 1,
+      "type": "docs.appendTurn",
+      "payload": { "docId": "notes", "takeRef": "take_77" }
+    },
+    {
+      "v": 1,
+      "id": "evt_302",
+      "ts": "2026-09-20T10:06:08Z",
+      "corr": "turn-1",
+      "seq": 2,
+      "type": "docs.turnAppended",
+      "payload": { "turnSeq": 12 }
+    }
+  ]
+}

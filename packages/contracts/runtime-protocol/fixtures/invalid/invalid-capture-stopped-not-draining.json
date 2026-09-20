@@ -1,0 +1,47 @@
+{
+  "machine": "capture",
+  "description": "Event illegal in the current state: capture.stopped emitted from Recording. A declared final sample index exists only once Draining has begun (or during Recovering replay); a stopped straight from Recording fabricates a durable boundary that was never established.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "illegal_event",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_911",
+      "ts": "2026-09-20T10:09:11Z",
+      "corr": "take_9b",
+      "seq": 1,
+      "type": "capture.start",
+      "payload": { "policy": "dictation" }
+    },
+    {
+      "v": 1,
+      "id": "evt_911",
+      "ts": "2026-09-20T10:09:11Z",
+      "corr": "take_9b",
+      "seq": 2,
+      "type": "capture.started",
+      "payload": {
+        "device": "USB PnP Sound Device",
+        "actualRate": 16000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_912",
+      "ts": "2026-09-20T10:09:12Z",
+      "corr": "take_9b",
+      "seq": 3,
+      "type": "capture.stopped",
+      "payload": {
+        "finalSampleIndex": 16000,
+        "acknowledgedSamples": 16000,
+        "gaps": [],
+        "journalId": "j_9b01",
+        "sampleDurationMs": 1000.0,
+        "wallClockMs": 1010.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:runtime-protocol:commands:v1",
+  "$comment": [
+    "Starling runtime protocol commands, v1 (E17 design note section 2).",
+    "Exactly the v1 command set of the five machines: capture.*, jobs.*,",
+    "context.* / mode.*, docs.*, delivery.*. Every branch is a full envelope",
+    "(envelope.schema.json) whose payload is discriminated by type.",
+    "additionalProperties is false on every branch and every payload, so an",
+    "unknown command or an unknown payload field is a validation failure,",
+    "never a silently ignored extra. Unknown envelope v -> runtime.nack",
+    "(see events.schema.json and envelope.schema.json)."
+  ],
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "capture.start" },
+        "payload": { "$ref": "#/$defs/payloads/capture.start" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "capture.stop" },
+        "payload": { "$ref": "#/$defs/payloads/capture.stop" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "capture.abort" },
+        "payload": { "$ref": "#/$defs/payloads/capture.abort" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "jobs.submit" },
+        "payload": { "$ref": "#/$defs/payloads/jobs.submit" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "jobs.cancel" },
+        "payload": { "$ref": "#/$defs/payloads/jobs.cancel" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "jobs.setLimits" },
+        "payload": { "$ref": "#/$defs/payloads/jobs.setLimits" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "context.snapshot" },
+        "payload": { "$ref": "#/$defs/payloads/context.snapshot" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "mode.set" },
+        "payload": { "$ref": "#/$defs/payloads/mode.set" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "context.expire" },
+        "payload": { "$ref": "#/$defs/payloads/context.expire" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "docs.updateHead" },
+        "payload": { "$ref": "#/$defs/payloads/docs.updateHead" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "docs.appendTurn" },
+        "payload": { "$ref": "#/$defs/payloads/docs.appendTurn" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "docs.get" },
+        "payload": { "$ref": "#/$defs/payloads/docs.get" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "delivery.prepare" },
+        "payload": { "$ref": "#/$defs/payloads/delivery.prepare" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "delivery.apply" },
+        "payload": { "$ref": "#/$defs/payloads/delivery.apply" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "delivery.cancel" },
+        "payload": { "$ref": "#/$defs/payloads/delivery.cancel" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "id": { "$ref": "#/$defs/msgId" },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "corr": { "$ref": "#/$defs/msgId" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "type": { "const": "delivery.copyFallback" },
+        "payload": { "$ref": "#/$defs/payloads/delivery.copyFallback" }
+      },
+      "required": ["v", "id", "ts", "type", "payload"]
+    }
+  ],
+  "$defs": {
+    "version": { "type": "integer", "const": 1 },
+    "msgId": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "seq": { "type": "integer", "minimum": 0 },
+    "safeToken": { "type": "string", "pattern": "^[A-Za-z0-9_.:+-]{1,128}$" },
+    "payloads": {
+      "capture.start": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "policy": { "$ref": "#/$defs/safeToken" }
+        },
+        "required": ["policy"]
+      },
+      "capture.stop": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "drain": { "type": "boolean" }
+        }
+      },
+      "capture.abort": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "jobs.submit": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "captureRef": { "$ref": "#/$defs/msgId" },
+          "route": { "$ref": "#/$defs/safeToken" },
+          "budget": { "$ref": "#/$defs/safeToken" }
+        },
+        "required": ["captureRef", "route", "budget"]
+      },
+      "jobs.cancel": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jobId": { "$ref": "#/$defs/msgId" }
+        },
+        "required": ["jobId"]
+      },
+      "jobs.setLimits": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "maxQueued": { "type": "integer", "minimum": 0 },
+          "maxConcurrent": { "type": "integer", "minimum": 0 },
+          "perRoute": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "route": { "$ref": "#/$defs/safeToken" },
+                "maxConcurrent": { "type": "integer", "minimum": 0 }
+              },
+              "required": ["route", "maxConcurrent"]
+            }
+          }
+        },
+        "required": ["maxQueued", "maxConcurrent"]
+      },
+      "context.snapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "source": { "$ref": "#/$defs/safeToken" }
+        },
+        "required": ["source"]
+      },
+      "mode.set": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": { "$ref": "#/$defs/safeToken" },
+          "source": { "const": "manual" }
+        },
+        "required": ["mode", "source"]
+      },
+      "context.expire": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "docs.updateHead": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "docId": { "$ref": "#/$defs/safeToken" },
+          "expectedBase": { "type": "integer", "minimum": 0 },
+          "newRevision": { "$ref": "#/$defs/payloads/revision" }
+        },
+        "required": ["docId", "expectedBase", "newRevision"]
+      },
+      "docs.appendTurn": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "docId": { "$ref": "#/$defs/safeToken" },
+          "takeRef": { "$ref": "#/$defs/msgId" }
+        },
+        "required": ["docId", "takeRef"]
+      },
+      "docs.get": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "docId": { "$ref": "#/$defs/safeToken" },
+          "page": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["docId", "page"]
+      },
+      "delivery.prepare": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revisionId": { "$ref": "#/$defs/msgId" },
+          "targetRef": { "$ref": "#/$defs/safeToken" }
+        },
+        "required": ["revisionId", "targetRef"]
+      },
+      "delivery.apply": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "deliveryId": { "$ref": "#/$defs/msgId" }
+        },
+        "required": ["deliveryId"]
+      },
+      "delivery.cancel": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "deliveryId": { "$ref": "#/$defs/msgId" }
+        }
+      },
+      "delivery.copyFallback": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "deliveryId": { "$ref": "#/$defs/msgId" }
+        },
+        "required": ["deliveryId"]
+      },
+      "revision": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revId": { "$ref": "#/$defs/msgId" },
+          "baseRevision": { "type": "integer", "minimum": 0 },
+          "sourceAttemptIds": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/msgId" }
+          },
+          "instructionTemplateId": { "$ref": "#/$defs/safeToken" },
+          "text": { "type": "string" },
+          "status": { "$ref": "#/$defs/safeToken" },
+          "provenance": { "$ref": "#/$defs/safeToken" }
+        },
+        "required": [
+          "revId",
+          "baseRevision",
+          "sourceAttemptIds",
+          "instructionTemplateId",
+          "text",
+          "status",
+          "provenance"
+        ]
+      }
+    }
+  }
+}
