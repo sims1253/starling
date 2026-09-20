@@ -1178,11 +1178,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-26",
    "branch": "gpui/fixes-wave-a8",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 133/133 + 35/35 (8a21cf8, pushed); per-session spinner ids, per-call-site dot ids, selection-stable protocol ids"
    ],
    "notes": "shared per-element state corruption"
   },
@@ -1194,13 +1195,14 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-26",
    "branch": "gpui/fixes-wave-a8",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: 35/35; save_race_decision classifies NotFound as delete-race (SessionDeleted): WAV stashed to recovery + surfaced, never a job failure; disk-full stays Local failure"
    ],
-   "notes": "upload.rs"
+   "notes": "judgment call: delete-mid-transcribe keeps audio for explicit discard - aligns with never-orphan-data"
   },
   {
    "id": "R06",
@@ -1226,11 +1228,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-26",
    "branch": "gpui/fixes-wave-a8",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: all 13 editing bindings scoped to TextField context; global toggle unaffected"
    ],
    "notes": "input.rs"
   },
@@ -1242,11 +1245,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-26",
    "branch": "gpui/fixes-wave-a8",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "coordinator rerun: error banners never show reassurance footer; dismiss always available with an error; unsaved-only keeps download/discard exits"
    ],
    "notes": "capture.rs"
   },
@@ -1436,13 +1440,29 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-28",
+   "branch": "program/s02-tdt-budget",
    "evidence": [
     "PR #198 OCR run 35507119114, 2026-09-20 11:15Z (12 findings)"
    ],
    "notes": "dispatch into starling-s01 worktree when coordinator next fills the engine slot; budget parse = strtoll+clamp; trim = single-pass back-iteration"
+  },
+  {
+   "id": "R21",
+   "title": "Confirmed deletion must also remove the linked journal (B05 warning contract vs never-drop recovery policy)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": "impl-agent-29",
+   "branch": "gpui/fixes-wave-a9",
+   "evidence": [
+    "flagged by impl-26 during R05: remove_session leaves journal on disk; startup recovery resurrects it as an interrupted take, contradicting B05 deletionWarning (\"audio ... will be gone\")"
+   ],
+   "notes": "fix in gpui worktree: confirmed delete removes or quarantines the journal linked via journal_id; recovery skips deliberately-deleted ids (needs a tombstone list or rename convention); dispatch next gpui slot"
   }
  ],
  "active_assignments": [
