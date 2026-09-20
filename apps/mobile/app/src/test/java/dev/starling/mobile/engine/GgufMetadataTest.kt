@@ -92,6 +92,21 @@ class GgufMetadataTest {
     }
 
     @Test
+    fun retainsOnlyTheArchitectureString() {
+        val out = header(kvs = 2)
+        stringKv(out, "general.name", "some-chat-model")
+        stringKv(out, "general.architecture", "parakeet")
+
+        val parsed = GgufMetadata.parse(fileOf(out.toByteArray()))
+
+        assertNotNull(parsed)
+        // Tokenizer/chat-template-scale strings are dropped: only the one
+        // consumed value is retained, but every key stays (family check).
+        assertEquals(mapOf("general.architecture" to "parakeet"), parsed!!.strings)
+        assertEquals(setOf("general.name", "general.architecture"), parsed.keys.toSet())
+    }
+
+    @Test
     fun rejectsWrongMagicVersionsAndCounts() {
         val badMagic = header(kvs = 0).toByteArray().also { it[0] = 'X'.code.toByte() }
         assertNull(GgufMetadata.parse(fileOf(badMagic)))

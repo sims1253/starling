@@ -22,7 +22,10 @@ import java.io.IOException
  * - a truncated section (claims more pairs than the file holds) is malformed.
  *
  * Only the value types needed for metadata inspection are decoded (strings);
- * everything else is skipped under the same budget.
+ * everything else is skipped under the same budget. Of the decoded strings
+ * only [ARCHITECTURE_KEY] is retained — the sole value any consumer reads;
+ * tokenizer/chat-template blobs can fill the whole budget and must not be
+ * held in memory for the lifetime of the parse result.
  */
 object GgufMetadata {
     /** GGUF metadata is a few hundred KB at most (tokenizer pieces); 4 MiB bounds crafted files. */
@@ -31,9 +34,11 @@ object GgufMetadata {
     /** Bounds pathological KV counts before any per-pair work. */
     const val MAX_KV_COUNT = 1_000_000L
 
-    private const val TYPE_UINT8 = 0
-    private const val TYPE_STRING = 8
-    private const val TYPE_ARRAY = 9
+    private const val TYPE_STRING = 8L
+    private const val TYPE_ARRAY = 9L
+
+    /** The one string value retained from the KV section (the rejection message's model family). */
+    private const val ARCHITECTURE_KEY = "general.architecture"
 
     private val SCALAR_SIZES = longArrayOf(1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8)
 
@@ -42,7 +47,7 @@ object GgufMetadata {
         val tensorCount: Long,
         /** All metadata keys, in file order. */
         val keys: List<String>,
-        /** Top-level string-valued metadata (e.g. general.architecture). */
+        /** The retained string value: [ARCHITECTURE_KEY], when present. */
         val strings: Map<String, String>,
     )
 
@@ -67,32 +72,41 @@ object GgufMetadata {
                 val key = reader.readUtf8String(scratch)
                 scratch = key.first
                 if (key.second.isEmpty() || !keys.add(key.second)) return null
-                when (val type = reader.readU32().toInt()) {
+                // Types are compared as the unsigned u32 Long before any
+                // toInt() narrowing: values >= 0x80000000 narrow to negative
+                // Ints, and the range check below must catch them.
+                when (val type = reader.readU32()) {
                     TYPE_STRING -> {
                         val value = reader.readUtf8String(scratch)
                         scratch = value.first
-                        strings[key.second] = value.second
+                        if (key.second == ARCHITECTURE_KEY) strings[key.second] = value.second
                     }
                     TYPE_ARRAY -> {
-                        val elementType = reader.readU32().toInt()
-                        if (elementType < 0 || elementType >= SCALAR_SIZES.size || elementType == TYPE_ARRAY) return null
+                        val elementType = reader.readU32()
+                        if (elementType >= SCALAR_SIZES.size || elementType == TYPE_ARRAY) return null
                         val count = reader.readU64()
                         if (count < 0) return null
                         if (elementType == TYPE_STRING) {
-                            // Each element costs at least its u64 length field, so
-                            // the budget rejects padded huge counts; the Int bound
-                            // closes the wraparound hole before repeat().
-                            if (count > Int.MAX_VALUE) return null
-                            repeat(count.toInt()) { reader.readUtf8String(scratch) }
+                            // Each element costs at least its u64 length field:
+                            // reject padded huge counts in O(1) instead of
+                            // skipping them one by one (the Int bound closes
+                            // the wraparound hole before repeat()).
+                            if (count > Int.MAX_VALUE || count > reader.remaining() / 8) return null
+                            repeat(count.toInt()) {
+                                val element = reader.readUtf8String(scratch)
+                                // Reuse the largest buffer seen so a crafted
+                                // token array churns at most one allocation.
+                                scratch = element.first
+                            }
                         } else {
-                            val size = SCALAR_SIZES[elementType].toDouble() * count.toDouble()
-                            if (size > reader.remaining()) return null
-                            reader.skipFully(size.toLong())
+                            val elementSize = SCALAR_SIZES[elementType.toInt()]
+                            if (count > reader.remaining() / elementSize) return null
+                            reader.skipFully(elementSize * count)
                         }
                     }
                     else -> {
-                        if (type < 0 || type >= SCALAR_SIZES.size) return null
-                        reader.skipFully(SCALAR_SIZES[type])
+                        if (type >= SCALAR_SIZES.size) return null
+                        reader.skipFully(SCALAR_SIZES[type.toInt()])
                     }
                 }
             }
@@ -107,10 +121,14 @@ object GgufMetadata {
     /**
      * Little-endian reader with a hard byte budget: any read that would
      * exceed [remaining] bytes fails as truncated instead of trusting the
-     * file's self-described sizes.
+     * file's self-described sizes. Scratch buffers are per-reader fields —
+     * the KV loop runs up to [MAX_KV_COUNT] iterations and must not allocate
+     * per read.
      */
     private class BudgetedReader(private val input: DataInputStream, budget: Long) {
         private var remainingBytes = budget
+        private val scratch4 = ByteArray(4)
+        private val scratch8 = ByteArray(8)
 
         fun remaining(): Long = remainingBytes
 
@@ -125,23 +143,27 @@ object GgufMetadata {
         }
 
         fun readU32(): Long {
-            val scratch = ByteArray(4)
-            readFully(scratch)
-            return (scratch[0].toLong() and 0xff) or
-                ((scratch[1].toLong() and 0xff) shl 8) or
-                ((scratch[2].toLong() and 0xff) shl 16) or
-                ((scratch[3].toLong() and 0xff) shl 24)
+            readFully(scratch4)
+            return (scratch4[0].toLong() and 0xff) or
+                ((scratch4[1].toLong() and 0xff) shl 8) or
+                ((scratch4[2].toLong() and 0xff) shl 16) or
+                ((scratch4[3].toLong() and 0xff) shl 24)
         }
 
         fun readU64(): Long {
-            val scratch = ByteArray(8)
-            readFully(scratch)
+            readFully(scratch8)
             var value = 0L
-            for (i in 7 downTo 0) value = (value shl 8) or (scratch[i].toLong() and 0xff)
+            for (i in 7 downTo 0) value = (value shl 8) or (scratch8[i].toLong() and 0xff)
             return value
         }
 
-        /** Reads a GGUF string (u64 length + UTF-8 bytes); returns the (possibly grown) scratch buffer and the value. */
+        /**
+         * Reads a GGUF string (u64 length + UTF-8 bytes); returns the
+         * (possibly grown) scratch buffer and the value. The length is
+         * checked against the budget BEFORE the buffer allocation on
+         * purpose: an adversarial length must fail without first
+         * materializing a ByteArray of that size.
+         */
         fun readUtf8String(scratch: ByteArray): Pair<ByteArray, String> {
             val length = readU64()
             if (length < 0 || length > remainingBytes) throw EOFException("string length exceeds budget")
