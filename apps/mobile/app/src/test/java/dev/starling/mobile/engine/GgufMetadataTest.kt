@@ -55,8 +55,7 @@ class GgufMetadataTest {
             val parsed = GgufMetadata.parse(fileOf(out.toByteArray()))
 
             assertNotNull("version $version must parse", parsed)
-            assertEquals(version, parsed!!.version)
-            assertEquals(setOf("general.architecture", "parakeet.preprocessor.normalize"), parsed.keys.toSet())
+            assertEquals(setOf("general.architecture", "parakeet.preprocessor.normalize"), parsed!!.keys.toSet())
             assertEquals("parakeet", parsed.strings["general.architecture"])
         }
     }
@@ -160,5 +159,200 @@ class GgufMetadataTest {
         hugeArray.write(u64(1)); hugeArray.write("k".toByteArray())
         hugeArray.write(u32(9)); hugeArray.write(u32(0)); hugeArray.write(u64(GgufMetadata.MAX_METADATA_BYTES))
         assertNull(GgufMetadata.parse(fileOf(hugeArray.toByteArray())))
+    }
+
+    // ---- tensor-info section (the engine's gguf_init_from_file rules) ----
+
+    private fun tensorInfo(out: ByteArrayOutputStream, name: String, type: Long, offset: Long, vararg dims: Long) {
+        out.write(u64(name.length.toLong()))
+        out.write(name.toByteArray(Charsets.UTF_8))
+        out.write(u32(dims.size.toLong()))
+        for (dim in dims) out.write(u64(dim))
+        out.write(u32(type))
+        out.write(u64(offset))
+    }
+
+    /** A minimal parakeet header + one architecture KV + two F32 [100] tensors at engine-true offsets. */
+    private fun twoTensorMetadata(): ByteArrayOutputStream {
+        val out = header(tensors = 2, kvs = 1)
+        stringKv(out, "general.architecture", "parakeet")
+        // F32 x100 = 400 bytes; pad(400, 32) = 416 is the second offset.
+        tensorInfo(out, "a", type = 0, offset = 0, dims = longArrayOf(100))
+        tensorInfo(out, "b", type = 0, offset = 416, dims = longArrayOf(100))
+        return out
+    }
+
+    private fun sparseFileOf(bytes: ByteArray, length: Long): File {
+        val file = Files.createTempDirectory("starling-gguf-meta").resolve("model.gguf").toFile()
+        java.io.RandomAccessFile(file, "rw").use { out ->
+            out.write(bytes)
+            out.setLength(length)
+        }
+        return file
+    }
+
+    @Test
+    fun parsesTensorInfosWhenTheDataSectionIsFullyPresent() {
+        val metadata = twoTensorMetadata().toByteArray()
+        val dataStart = ((metadata.size + 31) / 32) * 32 // GGUF pad to default alignment 32
+        // The engine's data section pads EVERY tensor, the last one included:
+        // pad(400, 32) + pad(400, 32) = 416 + 416.
+        val required = dataStart + 832L
+
+        assertNotNull(GgufMetadata.parse(sparseFileOf(metadata, required)))
+        assertNull(
+            "a data section truncated by one byte is the interrupted-download shape",
+            GgufMetadata.parse(sparseFileOf(metadata, required - 1)),
+        )
+        assertNull(
+            "a file ending right after the tensor infos has no data section",
+            GgufMetadata.parse(sparseFileOf(metadata, metadata.size.toLong())),
+        )
+    }
+
+    @Test
+    fun honorsTheAlignmentKVWhenSizingTheDataSection() {
+        val out = header(tensors = 2, kvs = 2)
+        stringKv(out, "general.architecture", "parakeet")
+        // u32-typed general.alignment = 64 (non-default power of two).
+        out.write(u64("general.alignment".length.toLong())); out.write("general.alignment".toByteArray())
+        out.write(u32(4)); out.write(u32(64))
+        // With alignment 64: pad(400, 64) = 448 per tensor, last included.
+        tensorInfo(out, "a", type = 0, offset = 0, dims = longArrayOf(100))
+        tensorInfo(out, "b", type = 0, offset = 448, dims = longArrayOf(100))
+        val metadata = out.toByteArray()
+        val dataStart = ((metadata.size + 63) / 64) * 64
+        val required = dataStart.toLong() + 448 + 448
+
+        assertNotNull(GgufMetadata.parse(sparseFileOf(metadata, required)))
+        assertNull(GgufMetadata.parse(sparseFileOf(metadata, required - 1)))
+    }
+
+    @Test
+    fun rejectsBadAlignmentKeyValue() {
+        // Non-power-of-two alignment.
+        val notPow2 = header(tensors = 0, kvs = 1)
+        notPow2.write(u64("general.alignment".length.toLong())); notPow2.write("general.alignment".toByteArray())
+        notPow2.write(u32(4)); notPow2.write(u32(3))
+        assertNull(GgufMetadata.parse(fileOf(notPow2.toByteArray())))
+
+        // Wrongly typed alignment (string instead of u32).
+        val wrongType = header(tensors = 0, kvs = 1)
+        stringKv(wrongType, "general.alignment", "32")
+        assertNull(GgufMetadata.parse(fileOf(wrongType.toByteArray())))
+    }
+
+    @Test
+    fun rejectsMalformedTensorInfos() {
+        fun withTensors(build: (ByteArrayOutputStream) -> Unit): ByteArray {
+            val out = header(tensors = 2, kvs = 1)
+            stringKv(out, "general.architecture", "parakeet")
+            build(out)
+            return out.toByteArray()
+        }
+
+        assertNull(
+            "duplicate tensor names",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(100))
+                        tensorInfo(it, "a", type = 0, offset = 416, dims = longArrayOf(100))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "tensor name at ggml's GGML_MAX_NAME",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(100))
+                        tensorInfo(it, "x".repeat(64), type = 0, offset = 416, dims = longArrayOf(100))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "more dimensions than ggml's GGML_MAX_DIMS",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(1, 2, 3, 4, 5))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "negative dimension (u64 with the sign bit set)",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(-1L))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "type outside [0, GGML_TYPE_COUNT)",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 43, offset = 0, dims = longArrayOf(100))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "removed ggml type (block size 0)",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 31, offset = 0, dims = longArrayOf(100))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "row size not a multiple of the type's block size (Q4_0, 7 elements)",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 2, offset = 0, dims = longArrayOf(7))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "offset not equal to the running padded total",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(100))
+                        tensorInfo(it, "b", type = 0, offset = 417, dims = longArrayOf(100))
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
+        assertNull(
+            "tensor-info section truncated mid-record",
+            GgufMetadata.parse(
+                sparseFileOf(
+                    withTensors {
+                        tensorInfo(it, "a", type = 0, offset = 0, dims = longArrayOf(100))
+                        it.write(u64(1)) // second record cut off right after its name length
+                    },
+                    1 shl 20,
+                ),
+            ),
+        )
     }
 }

@@ -139,6 +139,58 @@ class OnDeviceEngineImportTest {
         }
     }
 
+    /**
+     * The interrupted-download shape past the metadata: a parakeet-family
+     * GGUF whose tensor records claim a data section the file does not hold.
+     * The engine's own load would refuse it, so the import must refuse it
+     * first — at VALIDATE, before the last usable model is replaced.
+     */
+    @Test
+    fun dataSectionTruncationIsRejectedBeforeReplacingTheActiveModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val parakeet = sparseModelFile(directory, "parakeet.gguf.source", parakeetPayload())
+            engine.importModel(parakeet.inputStream())
+            val before = prefix(File(directory, "parakeet.gguf"), 256)
+
+            // One F32 tensor of 50M elements claims a 200 MB data section in
+            // a 50 MB file.
+            val lying = ByteArrayOutputStream()
+            lying.write("GGUF".toByteArray(Charsets.US_ASCII))
+            lying.write(u32(2))
+            lying.write(u64(1)) // one tensor
+            lying.write(u64(1)) // one KV
+            lying.write(u64("general.architecture".length.toLong()))
+            lying.write("general.architecture".toByteArray(Charsets.UTF_8))
+            lying.write(u32(8))
+            lying.write(u64("parakeet".length.toLong()))
+            lying.write("parakeet".toByteArray(Charsets.UTF_8))
+            lying.write(u64("encoder.weight".length.toLong()))
+            lying.write("encoder.weight".toByteArray(Charsets.UTF_8))
+            lying.write(u32(1)) // n_dims
+            lying.write(u64(50_000_000))
+            lying.write(u32(0)) // F32
+            lying.write(u64(0)) // offset
+            val truncated = sparseModelFile(directory, "lying.gguf.source", lying.toByteArray())
+
+            val result = engine.importModel(truncated.inputStream())
+
+            val rejected = result as OnDeviceEngine.ImportResult.Rejected
+            assertEquals(OnDeviceEngine.ImportStage.VALIDATE, rejected.stage)
+            val model = File(directory, "parakeet.gguf")
+            assertTrue("the previous model must survive", model.isFile)
+            assertTrue("the previous model must be byte-identical", before.contentEquals(prefix(model, before.size)))
+            assertEquals(
+                "no staging files may remain",
+                emptyList<File>(),
+                directory.listFiles { f -> f.name.endsWith(".importing") }!!.toList(),
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun failedImportSweepsStaleStagingFiles() {
         val directory = tempDir()

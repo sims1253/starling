@@ -9,9 +9,15 @@ object ModelFiles {
 
     const val GGUF_MAGIC_SIZE = 4
 
+    /** Longest architecture tag echoed into the user-facing rejection message. */
+    private const val MAX_ARCHITECTURE_DISPLAY_CHARS = 40
+
     /**
      * Null when [sizeBytes] and the first [header.size] bytes look like a
      * GGUF the engine can attempt; otherwise a short user-facing reason.
+     * The shallow header-sniff contract for callers that already hold the
+     * first bytes; the staged-import path uses [validateStaged]'s deep
+     * single-open check instead.
      */
     fun validate(sizeBytes: Long, header: ByteArray): String? {
         if (sizeBytes < MIN_MODEL_BYTES) {
@@ -26,9 +32,11 @@ object ModelFiles {
 
     /**
      * Deep pre-promotion check of a fully staged model [file] (B08): size,
-     * magic, a bounded parse of the GGUF metadata section, and the model
-     * family. Null when the file may be promoted; otherwise a short
-     * user-facing reason.
+     * a bounded parse of the GGUF metadata and tensor-info sections, and
+     * the model family. Null when the file may be promoted; otherwise a
+     * short user-facing reason. One open: [GgufMetadata.parse] reads and
+     * checks the magic and version itself, so no separate header pre-read
+     * (two opens could observe different file states).
      *
      * Family rule: every GGUF dialect the native engine loads (native
      * parakeet.*, parakeet.cpp/CrispASR, and transcribe.cpp stt.parakeet.* —
@@ -41,18 +49,15 @@ object ModelFiles {
      * than after replacing the last usable model.
      */
     fun validateStaged(file: File): String? {
-        val header = runCatching {
-            java.io.DataInputStream(file.inputStream().buffered()).use { stream ->
-                // A single read may legally return short; readFully cannot.
-                ByteArray(GGUF_MAGIC_SIZE).also { stream.readFully(it) }
-            }
-        }.getOrNull() ?: return "This model file could not be read."
-        val shallow = validate(file.length(), header)
-        if (shallow != null) return shallow
+        if (file.length() < MIN_MODEL_BYTES) {
+            return "This file is too small to be a Parakeet model."
+        }
         val metadata = GgufMetadata.parse(file) ?: return "This model file is corrupt or truncated."
         val parakeetFamily = metadata.keys.any { it.startsWith("parakeet.") || it.startsWith("stt.parakeet.") }
         if (!parakeetFamily) {
-            val architecture = metadata.strings["general.architecture"]
+            // Corruption-controlled up to the 4 MiB parse budget; cap what
+            // reaches the user-facing message.
+            val architecture = metadata.strings["general.architecture"]?.take(MAX_ARCHITECTURE_DISPLAY_CHARS)
             return "This GGUF (${architecture ?: "no architecture tag"}) is not a Parakeet model."
         }
         return null

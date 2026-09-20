@@ -63,8 +63,9 @@ class OnDeviceEngine(modelDir: File) {
      * 2. the payload is copied into a unique staging file (a failed or
      *    interrupted import can never corrupt another import's staging) and
      *    fsynced, so a later promotion can never publish a half-written file;
-     * 3. the staged file is validated (magic, size, bounded GGUF metadata
-     *    parse, Parakeet model family) BEFORE the active model is touched;
+     * 3. the staged file is validated (magic, size, bounded GGUF metadata +
+     *    tensor-info parse including the data-section size, Parakeet model
+     *    family) BEFORE the active model is touched;
      * 4. promotion is a single atomic rename over the target — the previous
      *    model is never deleted first, so any failure at any earlier stage
      *    (or the rename itself) leaves the last usable model in place.
