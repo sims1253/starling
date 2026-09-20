@@ -1284,10 +1284,11 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::st
 }
 
 // Run one K-step replay from `past` (the slot the first step writes). Appends
-// up to K tokens, stopping at EOS / max_new_tokens. `prev` in=out (token
-// entering / last emitted); `past` advances by the steps actually consumed.
+// up to K tokens, stopping on the shared termination predicate
+// (generation_stops_on) / max_new_tokens. `prev` in/out (token entering /
+// last emitted); `past` advances by the steps actually consumed.
 bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
-               int32_t eos, int32_t eos2, int max_new_tokens,
+               const GenerateParams& op,
                std::vector<int32_t>& ids, bool& hit_eos, std::string& e) {
     // Bucketed width for this block: every step's keys [0, past+j] and write
     // slot (past+j) must land inside [0, W) (asserted per step below).
@@ -1334,12 +1335,12 @@ bool run_kstep(const QwenDecodeCtx& m, int32_t& prev, int64_t& past, int K,
 
     hit_eos = false;
     for (int j = 0; j < K; ++j) {
-        if ((int)ids.size() >= max_new_tokens) break;
+        if ((int)ids.size() >= op.max_new_tokens) break;
         int32_t tok = (int32_t)kg->cap_tokens[(size_t)j];
         ids.push_back(tok);
         prev = tok;
         past += 1;
-        if (tok == eos || tok == eos2) { hit_eos = true; break; }
+        if (generation_stops_on(tok, op)) { hit_eos = true; break; }
     }
     return true;
 }
@@ -1391,6 +1392,9 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         e = std::string(m.spec.label) + " generation exceeds cache";
         return false;
     }
+    // Termination contract (S03): a reused result must not carry a stale
+    // completion claim — every successful path below re-derives the reason.
+    o.stop_reason = GenStopReason::kBudgetExhausted;
     const bool dbg = debug_probe_active(m.spec);
     const bool timing = env(m.spec, "_TIMING") != nullptr;
     if (!dbg) {
@@ -1409,18 +1413,21 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
         int32_t prev = spec_argmax_impl(m.spec, o.prefill_logits);
         o.ids.push_back(prev);
-        // Engines whose reference stops on a SECONDARY token as well
-        // (eos2_token_id: higgs <|im_end|>, s1's dual stop) also stop when
-        // the PREFILL argmax itself is a stop token (near-silence input) —
-        // the single-stop engines (moss/ark/granite/qwen3) never did, so the
-        // gate is eos2 != -1 to keep their decode behavior byte-identical.
-        const bool prefill_stop = op.eos2_token_id != -1 &&
-                                  (prev == op.eos_token_id || prev == op.eos2_token_id);
+        // S03 termination contract: a prefill argmax that IS a stop token
+        // (near-silence input) ends generation for EVERY engine — the primary
+        // EOS no less than a configured secondary. The historical gate (stop
+        // only when eos2_token_id != -1, which kept the single-stop engines
+        // moss/ark/granite/qwen3 decoding past a first-token EOS) is
+        // deliberately retired: stopping because EOS was generated is a
+        // truthful completion, not something to fold away for parity.
+        // Non-stop inputs are unaffected — a non-stop first token never
+        // enters this branch, so their decode sequence is byte-identical.
+        const bool prefill_stop = generation_stops_on(prev, op);
         const bool use_kstep = global_backend().is_gpu() &&
                                !env(m.spec, "_NOKSTEP");
         double dec_sum = 0.0; int dec_n = 0;
         if (prefill_stop) {
-            o.hit_eos = true;
+            o.stop_reason = GenStopReason::kEos;
         } else if (use_kstep) {
             const int K = kstep_K(m.spec);
             for (int n = 1; n < op.max_new_tokens;) {
@@ -1449,15 +1456,14 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 const int remaining = op.max_new_tokens - (int)o.ids.size();
                 const int Kk = std::min(K, remaining);
                 double s0 = timing ? (double)std::chrono::steady_clock::now().time_since_epoch().count() : 0.0;
-                if (!run_kstep(m, prev, state.length, Kk, op.eos_token_id,
-                               op.eos2_token_id, op.max_new_tokens, o.ids, hit, e))
+                if (!run_kstep(m, prev, state.length, Kk, op, o.ids, hit, e))
                     return false;
                 if (timing) {
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
                     int produced = (int)(o.ids.size() - before);
                     dec_sum += (s1 - s0) * 1e-6; dec_n += produced;
                 }
-                if (hit) { o.hit_eos = true; break; }
+                if (hit) { o.stop_reason = GenStopReason::kEos; break; }
                 n = (int)o.ids.size();
             }
         } else {
@@ -1471,8 +1477,8 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                     double s1 = (double)std::chrono::steady_clock::now().time_since_epoch().count();
                     dec_sum += (s1 - s0) * 1e-6; ++dec_n;
                 }
-                if (prev == op.eos_token_id || prev == op.eos2_token_id) {
-                    o.hit_eos = true; break;
+                if (generation_stops_on(prev, op)) {
+                    o.stop_reason = GenStopReason::kEos; break;
                 }
             }
         }
@@ -1489,25 +1495,32 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         o.prefill_logits = p.logits;
         o.ids.push_back(p.first_token);
         int32_t prev = p.first_token;
-        for (int n = 1; n < op.max_new_tokens; ++n) {
-            InputsEmbeds one;
-            one.n_tokens = 1;
-            one.width = m.dims.hidden;
-            std::vector<int32_t> id = {prev};
-            bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
-                int64_t ne[1] = {1};
-                ggml_tensor* t = graph_input_tensor(c, GGML_TYPE_I32, 1, ne,
-                                                    id.data(), sizeof(int32_t));
-                return ff(c, ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), t));
-            }, one.data);
-            if (!ok) { e = "decode embedding lookup failed"; return false; }
+        // Same termination contract as the release path (S03): a stop-token
+        // prefill argmax ends generation here too — the probe path must not
+        // decode past an EOS the hot path would have stopped on.
+        if (generation_stops_on(prev, op)) {
+            o.stop_reason = GenStopReason::kEos;
+        } else {
+            for (int n = 1; n < op.max_new_tokens; ++n) {
+                InputsEmbeds one;
+                one.n_tokens = 1;
+                one.width = m.dims.hidden;
+                std::vector<int32_t> id = {prev};
+                bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+                    int64_t ne[1] = {1};
+                    ggml_tensor* t = graph_input_tensor(c, GGML_TYPE_I32, 1, ne,
+                                                        id.data(), sizeof(int32_t));
+                    return ff(c, ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), t));
+                }, one.data);
+                if (!ok) { e = "decode embedding lookup failed"; return false; }
 
-            std::vector<float> logits;
-            if (!forward_legacy(m, one.data, 1, p.state, logits, e)) return false;
-            prev = spec_argmax_impl(m.spec, logits);
-            o.ids.push_back(prev);
-            if (prev == op.eos_token_id || prev == op.eos2_token_id) {
-                o.hit_eos = true; break;
+                std::vector<float> logits;
+                if (!forward_legacy(m, one.data, 1, p.state, logits, e)) return false;
+                prev = spec_argmax_impl(m.spec, logits);
+                o.ids.push_back(prev);
+                if (generation_stops_on(prev, op)) {
+                    o.stop_reason = GenStopReason::kEos; break;
+                }
             }
         }
     }
