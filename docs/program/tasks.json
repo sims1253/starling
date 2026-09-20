@@ -1665,6 +1665,22 @@
     "coordinator rerun: 269/269 workspace (fe510da pushed to #201); interrupted-state derives from salvage path (2 regression tests); typed NoVerifiedSamples; grouped attempts query (no N+1); last_error joins recovery note; real created_utc w/ guarded in-place upgrade; obsolete findings grep-verified gone"
    ],
    "notes": "RESHAPED by D14 (no backwards compatibility): the persisted-choice/env-flag/migration-flow findings become moot with v2-only simplification; REAL findings to keep: quiesce-salvage interrupted-state on v2, store facade perf x2, last_error, updated_at"
+  },
+  {
+   "id": "R35",
+   "title": "PR #201 re-review after D14 rework: perf-HIGH mutex-across-blocking + 6 mediums (facade error collapse, adoption/save paths, reconcile/startup short-circuits) + 10 lows",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "PR #201 OCR re-review run 35537380843 (17 findings on fe510da)"
+   ],
+   "notes": "fetch full bodies; mutex-across-blocking is the priority (UI jank class); several mediums cluster around the v2 facade error paths"
   }
  ],
  "active_assignments": [
