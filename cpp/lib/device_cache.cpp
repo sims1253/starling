@@ -4,6 +4,13 @@
 #include <cmath>
 #include <memory>
 
+// ggml-backend-impl.h (under third_party/ggml/src/, on the core target's
+// include path) declares the buffer iface so zero() can probe for
+// memset_tensor support and keep the host-upload fallback for buffers that
+// lack it (none of the backends Starling builds: CPU, CUDA/HIP, Metal,
+// Vulkan — all register one).
+#include "ggml-backend-impl.h"
+
 namespace starling::ggml::lib {
 
 bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
@@ -58,10 +65,31 @@ bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
 }
 
 void DeviceCache::zero() {
-    std::vector<ggml_bf16_t> z((size_t) D * max_cache * KV, ggml_bf16_t{0});
+    // [S01] Clear on-device instead of uploading host BF16 zeros. A bf16 +0.0
+    // is the all-zero byte pattern, so ggml_backend_tensor_memset(t, 0, ...)
+    // yields byte-identical contents to the old host-vector upload while
+    // skipping the staging allocation and the whole H2D payload (default MOSS
+    // geometry: 224 MiB across 56 tensor-sets -> 56 device-side fills, 0 host
+    // bytes). Ordering semantics are unchanged: every backend that implements
+    // memset_tensor completes it synchronously with the same visibility the
+    // tensor_set path had (CPU: host memset; CUDA/HIP: cudaMemsetAsync +
+    // cudaStreamSynchronize on the stream tensor_set uses; Vulkan: fillBuffer
+    // submit + fence wait). Each K/V tensor is cleared individually — the
+    // buffer also owns the RoPE tables, so a whole-buffer clear is never safe.
+    // Buffers without memset support fall back to the original upload.
+    const size_t n_elems = (size_t) D * max_cache * KV;
+    const size_t nbytes  = n_elems * sizeof(ggml_bf16_t);
+    std::vector<ggml_bf16_t> z;  // fallback staging, built only if needed
     for (int i = 0; i < n_layers; ++i) {
-        ggml_backend_tensor_set(k[i], z.data(), 0, z.size() * sizeof(ggml_bf16_t));
-        ggml_backend_tensor_set(v[i], z.data(), 0, z.size() * sizeof(ggml_bf16_t));
+        for (ggml_tensor* t : {k[i], v[i]}) {
+            ggml_backend_buffer_t tb = t->view_src ? t->view_src->buffer : t->buffer;
+            if (tb != nullptr && tb->iface.memset_tensor != nullptr) {
+                ggml_backend_tensor_memset(t, 0, 0, nbytes);
+            } else {
+                if (z.empty()) z.assign(n_elems, ggml_bf16_t{0});
+                ggml_backend_tensor_set(t, z.data(), 0, nbytes);
+            }
+        }
     }
 }
 
