@@ -1533,11 +1533,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
+   "branch": "program/s02-tdt-budget",
    "evidence": [
-    "PR #198 OCR run 35513994099 (post-R23; bot also CONFIRMED R23 fixes addressed)"
+    "coordinator rerun: tdt PASS + stream 235/235 (8a158eb pushed); ERANGE-first ordering w/ negative-overflow test proven failing pre-fix; to_string dangling-temporary fix; release_after null-check"
    ],
    "notes": "check ERANGE before the <=0 branch so huge-magnitude negatives get the clamp message; rest are message/doc/test nits"
   },
@@ -1549,11 +1549,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
+   "branch": "program/s11-tail-reuse",
    "evidence": [
-    "PR #199 OCR run 35513991972 (post-R24)"
+    "coordinator rerun after branch rebuild: stream_session_test 373/373 (8d416f8 pushed); generation snapshotted beside the callback (mid-step swap test); reset() bumps audio_rev_ (enforced, not comment-only)"
    ],
    "notes": "MEDIUM: capture inner AND tx_gen_ together atomically (the R24 keying has a creation/invocation gap); verify+enforce the reset safety argument in code not just comments"
   }
