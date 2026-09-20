@@ -7,6 +7,7 @@ use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
     client::{ClientError, StarlingClient},
+    journal,
     recorder,
     storage::{self, FileSessionStore},
 };
@@ -98,6 +99,17 @@ fn joined_failure(failure: &str, history_err: &str) -> String {
     format!("{trimmed}. Local history update also failed: {history_err}")
 }
 
+/// The note recorded on a quiesce-timeout salvage (I1 phase 2, R17): the
+/// salvaged take is persisted as interrupted rather than dropped, and the
+/// note states exactly what was kept.
+pub(crate) fn quiesce_salvage_note(samples: u64, sample_rate: u32) -> String {
+    format!(
+        "The microphone did not stop cleanly within the quiesce timeout; all {samples} \
+         captured samples were salvaged and kept as this interrupted recording (device rate \
+         {sample_rate} Hz). You can retry transcription on it."
+    )
+}
+
 impl StarlingApp {
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         self.error = None;
@@ -108,19 +120,93 @@ impl StarlingApp {
             // stays visible even when its attenuated copy peaks below
             // full scale.
             let source_clip_ratio = handle.source_clip_ratio();
+            // Storage-fault honesty (I1 phase 2): read the capture-path
+            // error before `stop` consumes the handle — a successful take
+            // must not swallow a journal fault that froze acknowledgment.
+            let capture_fault = handle.capture_error();
             match handle.stop() {
-                Ok(pcm) => {
+                Ok(take) => {
                     self.levels = vec![0.06; 52];
                     self.capture_warning = recorder::clipping_warning(source_clip_ratio);
+                    if let Some(fault) = capture_fault {
+                        self.error = Some(fault);
+                    }
+                    // The journal→session linkage is additive metadata on
+                    // the manifest; the audio goes through the existing
+                    // storage path as before.
+                    let journal_id = take
+                        .journal
+                        .as_ref()
+                        .map(|report| report.id.clone());
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
-                            .background_spawn(async move { audio::encode_wav_16k(&pcm) })
+                            .background_spawn(async move { audio::encode_wav_16k(&take.audio) })
                             .await;
                         match encoded {
                             Ok(wav) => {
                                 this.update(cx, |app, cx| {
-                                    app.save_and_transcribe(Arc::new(wav), Some(duration_ms), cx);
+                                    app.save_and_transcribe(
+                                        Arc::new(wav),
+                                        Some(duration_ms),
+                                        journal_id,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            }
+                            Err(err) => {
+                                this.update(cx, |app, cx| {
+                                    app.error = Some(err.to_string());
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        }
+                    })
+                    .detach();
+                }
+                Err(recorder::RecorderError::QuiesceTimeout {
+                    acknowledged_samples,
+                    audio,
+                    journal,
+                }) => {
+                    // R17 / I1 phase 2: a device hiccup must not silently
+                    // discard acknowledged audio. The salvaged samples are
+                    // persisted as an interrupted-but-usable take, linked
+                    // to its (already finalized) journal; the quiesce gap
+                    // is recorded in the session note.
+                    let journal_id = journal.as_ref().map(|report| report.id.clone());
+                    let note = quiesce_salvage_note(acknowledged_samples, audio.sample_rate);
+                    self.levels = vec![0.06; 52];
+                    self.capture_warning = recorder::clipping_warning(source_clip_ratio);
+                    self.error = Some(format!(
+                        "The microphone did not stop cleanly within the quiesce timeout; \
+                         {acknowledged_samples} captured samples were preserved and not \
+                         lost. It was saved to your history as an interrupted recording."
+                    ));
+                    cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        // Duration from the salvaged sample count at the
+                        // device rate — not the wall clock, which includes
+                        // the drain wait.
+                        let duration_ms = audio.samples.len() as f64 * 1000.0
+                            / audio.sample_rate as f64;
+                        let encoded = cx
+                            .background_spawn(async move {
+                                audio::encode_wav_16k(&audio)
+                            })
+                            .await;
+                        match encoded {
+                            Ok(wav) => {
+                                this.update(cx, |app, cx| {
+                                    app.save_interrupted_take(
+                                        Arc::new(wav),
+                                        duration_ms,
+                                        journal_id,
+                                        note,
+                                        cx,
+                                    );
                                 })
                                 .ok();
                             }
@@ -141,7 +227,10 @@ impl StarlingApp {
                 }
             }
         } else {
-            match recorder::start_recording() {
+            // I1 phase 2: production captures journal to the durable
+            // per-take file; only fsynced-boundary samples are
+            // acknowledged (see recorder::start_recording_with_journal).
+            match recorder::start_recording_with_journal(&journal::default_journals_root()) {
                 Ok(handle) => {
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
@@ -161,20 +250,20 @@ impl StarlingApp {
         &mut self,
         wav: Arc<Vec<u8>>,
         duration_ms: Option<f64>,
+        journal_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.error = None;
+        // Deliberately no `self.error = None` here: every caller clears the
+        // slot at its own start, and a capture-path fault (e.g. a journal
+        // fsync failure that froze acknowledgment) must survive until
+        // something replaces it — a clean save is not a reason to un-say
+        // it (I1 phase 2 storage-fault honesty).
         let Some(store) = self.store.clone() else {
             let reason = self
                 .store_error
                 .clone()
                 .unwrap_or_else(|| "session store unavailable".to_string());
-            self.unsaved.push(UnsavedWav {
-                id: format!("unsaved-{}", storage::now_iso()),
-                wav,
-                created_at: storage::now_iso(),
-            });
-            self.error = Some(format!(
+            self.stash_unsaved(wav, &format!(
                 "Local storage failed: {reason} Keep this window open and download the unsaved WAV to recover it."
             ));
             cx.notify();
@@ -184,7 +273,9 @@ impl StarlingApp {
             let bytes = (*wav).clone();
             let create_store = store.clone();
             let created = cx
-                .background_spawn(async move { create_store.create(bytes, duration_ms) })
+                .background_spawn(async move {
+                    create_store.create_with_journal(bytes, duration_ms, journal_id.as_deref())
+                })
                 .await;
             match created {
                 Ok(session) => {
@@ -196,12 +287,7 @@ impl StarlingApp {
                 }
                 Err(err) => {
                     this.update(cx, |app, cx| {
-                        app.unsaved.push(UnsavedWav {
-                            id: format!("unsaved-{}", storage::now_iso()),
-                            wav,
-                            created_at: storage::now_iso(),
-                        });
-                        app.error = Some(format!(
+                        app.stash_unsaved(wav, &format!(
                             "Local storage failed: {err} Keep this window open and download the unsaved WAV to recover it."
                         ));
                         cx.notify();
@@ -211,6 +297,71 @@ impl StarlingApp {
             }
         })
         .detach();
+    }
+
+    /// Persists a salvaged or recovered take as interrupted-but-usable (I1
+    /// phase 2): the audio goes through the same storage path, then the
+    /// session is marked interrupted with `note` stating exactly what
+    /// survived. No transcription is started — the user decides to retry.
+    pub fn save_interrupted_take(
+        &mut self,
+        wav: Arc<Vec<u8>>,
+        duration_ms: f64,
+        journal_id: Option<String>,
+        note: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = self.store.clone() else {
+            let reason = self
+                .store_error
+                .clone()
+                .unwrap_or_else(|| "session store unavailable".to_string());
+            self.stash_unsaved(wav, &format!(
+                "Local storage failed: {reason} Keep this window open and download the unsaved WAV to recover it."
+            ));
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let bytes = (*wav).clone();
+            let note_store = store.clone();
+            let created = cx
+                .background_spawn(async move {
+                    let session = note_store
+                        .create_with_journal(bytes, Some(duration_ms), journal_id.as_deref())?;
+                    note_store.mark_interrupted(&session.id, &note)?;
+                    Ok::<_, storage::StorageError>(session)
+                })
+                .await;
+            match created {
+                Ok(_session) => {
+                    refresh_sessions(&this, &store, cx).await;
+                }
+                Err(err) => {
+                    this.update(cx, |app, cx| {
+                        app.stash_unsaved(wav, &format!(
+                            "Local storage failed: {err} Keep this window open and download the unsaved WAV to recover it."
+                        ));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The never-drop-audio fallback shared by every persist path (I1
+    /// phase 2 folds the salvage paths into it too): when the session
+    /// store cannot take the WAV, it lands in the unsaved list with
+    /// `message` surfaced, so the only copy is never discarded.
+    fn stash_unsaved(&mut self, wav: Arc<Vec<u8>>, message: &str) {
+        self.unsaved.push(UnsavedWav {
+            id: format!("unsaved-{}", storage::now_iso()),
+            wav,
+            created_at: storage::now_iso(),
+        });
+        self.error = Some(message.to_string());
     }
 
     pub fn transcribe(&mut self, id: String, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
@@ -380,6 +531,7 @@ impl StarlingApp {
                                 app.save_and_transcribe(
                                     Arc::new(prepared.wav),
                                     Some(prepared.duration_ms),
+                                    None,
                                     cx,
                                 );
                             })
@@ -561,5 +713,19 @@ mod tests {
             joined_failure("Request timed out after 180000 ms.", "disk full"),
             "Request timed out after 180000 ms. Local history update also failed: disk full"
         );
+    }
+
+    #[test]
+    fn the_quiesce_salvage_note_states_exactly_what_was_kept() {
+        // R17 / I1 phase 2: the note must say the audio was kept (not lost,
+        // not silently trimmed), carry the exact sample count and device
+        // rate, and point at retry.
+        let note = quiesce_salvage_note(12_345, 48_000);
+        assert!(note.contains("12345"), "{note}");
+        assert!(note.contains("48000"), "{note}");
+        assert!(note.contains("salvaged and kept"), "{note}");
+        assert!(note.contains("interrupted recording"), "{note}");
+        assert!(note.contains("retry"), "{note}");
+        assert!(!note.contains("lost"), "{note}");
     }
 }

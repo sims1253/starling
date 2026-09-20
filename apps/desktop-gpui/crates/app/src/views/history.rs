@@ -105,6 +105,10 @@ fn row_data(app: &StarlingApp, session: &DictationSession) -> RowData {
         .unwrap_or_else(|| {
             if session.status == SessionStatus::Failed {
                 "Saved. Retry available".to_string()
+            } else if session.status == SessionStatus::Interrupted {
+                // I1 phase 2: recovered from a journal / salvaged after a
+                // quiesce timeout — the audio is here and retryable.
+                "Recovered. Retry available".to_string()
             } else {
                 "Sending to server…".to_string()
             }
@@ -151,6 +155,11 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
                 .size(px(6.))
                 .rounded_full()
                 .bg(theme::CORAL)
+                .into_any_element(),
+            SessionStatus::Interrupted => div()
+                .size(px(6.))
+                .rounded_full()
+                .bg(theme::AMBER)
                 .into_any_element(),
             SessionStatus::Captured => div()
                 .size(px(6.))

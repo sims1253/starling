@@ -40,14 +40,24 @@ fn main() {
         }
     }
 
-    // The stop handshake (R09): Ok carries the pending samples; a wedged
-    // callback degrades to QuiesceTimeout with everything acknowledged
-    // still intact inside the error, so even that path keeps the take.
+    // The stop handshake (R09): Ok carries the pending samples plus the
+    // durable journal report; a wedged callback degrades to QuiesceTimeout
+    // with everything acknowledged still intact inside the error, so even
+    // that path keeps the take.
     let audio = match handle.stop() {
-        Ok(audio) => audio,
+        Ok(take) => {
+            if let Some(report) = &take.journal {
+                eprintln!(
+                    "journal: id={} acknowledged={} finalized={}",
+                    report.id, report.acknowledged_samples, report.finalized
+                );
+            }
+            take.audio
+        }
         Err(RecorderError::QuiesceTimeout {
             acknowledged_samples,
             audio,
+            ..
         }) => {
             eprintln!(
                 "quiesce timeout: the callback never quiesced; {acknowledged_samples} \

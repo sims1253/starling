@@ -337,6 +337,44 @@ impl StarlingApp {
                             });
                             fix.await;
                         }
+
+                        // I1 phase 2 (§4 recovery, journal-only): scan the
+                        // journals directory for takes the previous run
+                        // never saved — a journal without a trailer (or
+                        // without a linked session) is recovered to its
+                        // last valid boundary and becomes an interrupted
+                        // session. Source journals are left in place.
+                        let journals_root = starling_dictation::journal::default_journals_root();
+                        let recovered = {
+                            let store = store.clone();
+                            cx.background_spawn(async move {
+                                starling_dictation::journal::recover_interrupted_takes(
+                                    store.as_ref(),
+                                    &journals_root,
+                                )
+                            })
+                            .await
+                        };
+                        match recovered {
+                            Ok(report) if report.has_findings() => {
+                                this.update(cx, |app, cx| {
+                                    app.error = Some(report.summary());
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                this.update(cx, |app, cx| {
+                                    app.error = Some(format!(
+                                        "Could not recover interrupted recordings: {err}"
+                                    ));
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        }
+
                         refresh_sessions(&this, &store, cx).await;
                     }
                     Err(err) => {

@@ -8,6 +8,7 @@ pub mod audio;
 pub mod client;
 pub mod fft;
 pub mod fidelity;
+pub mod journal;
 pub mod player;
 pub mod recorder;
 pub mod settings;
