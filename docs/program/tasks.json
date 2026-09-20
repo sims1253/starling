@@ -1581,11 +1581,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": "coordinator",
    "branch": null,
    "evidence": [
-    "PR #197 rerun finding 4057347666: R18 wiring exists only on program/wave-a; engine branches build explicit target lists without device_cache_clear/greedy_termination/tdt_graph_budget tests"
+    "conditional wiring landed on all four engine branches (583ee45/9ee03d1/0c44626/d9a9e25)"
    ],
    "notes": "cherry-pick 6f64d8f (conditional version) onto s01/s02/s03/s11 branches + push"
   },

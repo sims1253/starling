@@ -173,3 +173,14 @@ builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
   tracked test was nearly lost to a staging copy - restored, gates re-run).
 - I3 runtime crate integrated (161+42+50). Lint-cleanup agent final state:
   0 warnings 0 errors.
+
+## Update 2026-09-20 (final) — MERGES
+
+Per user authorization: #194 -> gpui-port, #195 -> master, #193 -> master
+(after resolving a stale-local-ref near-miss and one audio.test.ts conflict
+caused by an accidental fmt sweep of master's copy; merged tree verified
+161+42+50 before push). Master now carries the full GPUI port + program
+wave A. Engine PRs #196/#197/#198/#199 deliberately held for the user's
+5090 agent (CUDA gate + merge authority): program/gpu-validation refreshed
+with AGENT-5090.md + VALIDATION.md. R28 landed on all four engine branches
+(conditional CI wiring).
