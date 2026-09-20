@@ -14,7 +14,13 @@
   4056919733,
   4056919736,
   4056919739,
-  4056919742
+  4056919742,
+  4056994667,
+  4056994669,
+  4056994672,
+  4056994674,
+  4056998637,
+  4056998640
  ],
  "known_issue_comment_ids": [
   5749428749,
@@ -97,6 +103,36 @@
    "id": 4056919736,
    "severity": "doc-low",
    "summary": "comment overclaims WHOLE-list behavior"
+  },
+  {
+   "id": 4056998637,
+   "severity": "other-low",
+   "summary": "8MiB floor \"never under-counts\" claim false at T<=4096 (bytes scale w/ T); count cap is the real bound - soften comment or shape-aware floor"
+  },
+  {
+   "id": 4056998640,
+   "severity": "test-low",
+   "summary": "rollback test misses the floored branch (400-byte entries only)"
+  },
+  {
+   "id": 4056994667,
+   "severity": "style-low",
+   "summary": "rejection message lumps negatives"
+  },
+  {
+   "id": 4056994669,
+   "severity": "maint-low",
+   "summary": "budget_ member note"
+  },
+  {
+   "id": 4056994672,
+   "severity": "maint-low",
+   "summary": "eviction event note"
+  },
+  {
+   "id": 4056994674,
+   "severity": "perf-low",
+   "summary": "enforce_floored_cap rescans when avoidable"
   }
  ]
 }

@@ -1,0 +1,46 @@
+{
+ "known_review_comment_ids": [
+  4056955042,
+  4056955044,
+  4056955045,
+  4056955047,
+  4056955050,
+  4056955052
+ ],
+ "known_issue_comment_ids": [
+  5749833414,
+  5749851339
+ ],
+ "findings": [
+  {
+   "id": 4056955042,
+   "severity": "bug-medium",
+   "summary": "set_transcribe_fn swaps callback without invalidating retained tail entry - stale replay on byte-identical audio"
+  },
+  {
+   "id": 4056955044,
+   "severity": "maint-low",
+   "summary": "single-entry retention doc note"
+  },
+  {
+   "id": 4056955045,
+   "severity": "test-low",
+   "summary": "13 tests repeat setup - shared fixture"
+  },
+  {
+   "id": 4056955047,
+   "severity": "test-low",
+   "summary": "priming return discarded"
+  },
+  {
+   "id": 4056955050,
+   "severity": "test-low",
+   "summary": "exact == on doubles"
+  },
+  {
+   "id": 4056955052,
+   "severity": "style-low",
+   "summary": "double blank line"
+  }
+ ]
+}

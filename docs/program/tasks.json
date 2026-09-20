@@ -1486,6 +1486,38 @@
     "coordinator-completed after agent rate-limit death: 3 new tests (floor+warn-once+bounded, floored count cap, fault-hook rollback restoration); tdt_graph_budget_test PASS + stream_session 235/235; 8MiB floor + count cap + stored-iterator rollback (8dc7b36, pushed to #198)"
    ],
    "notes": "P1: the zero-byte case silently voids S02s entire guarantee. Fix directions: nonzero accounting for sched-path graphs (sched memory estimate or declared minimum) OR separate entry-count bound for zero-byte entries + one-time diagnostic; NEVER silently unbounded. Rollback: restore bytes_ in catch. Queue AFTER S11 completes (same worktree)."
+  },
+  {
+   "id": "R23",
+   "title": "PR #198 third-pass review: floor comment overclaims at T<=4096; rollback test misses floored branch; 4 lows",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #198 OCR run 35511919623 (post-R22)"
+   ],
+   "notes": "soften floor comment to observed-range + count-cap-is-the-bound (or shape-aware floor); extend rollback test w/ floored entry; queue engine slot"
+  },
+  {
+   "id": "R24",
+   "title": "PR #199 review: callback swap must invalidate/join the tail-reuse key; 5 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "PR #199 OCR run 35511055827"
+   ],
+   "notes": "MEDIUM: set_transcribe_fn swaps custom_tx_ w/o clearing retained entry -> stale replay; callback identity joins the key or swap clears; add test; queue engine slot behind R23"
   }
  ],
  "active_assignments": [
