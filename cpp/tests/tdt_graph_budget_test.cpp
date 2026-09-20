@@ -98,25 +98,42 @@ struct FakeEntry {
 
 int g_fake_builds = 0;
 
-// Acquire (fetch-or-build) then release immediately -> at-rest cache state.
-FakeEntry* acquire_and_release(ByteBudgetLruCache<int, FakeEntry>& c, int key,
-                               size_t bytes, int payload) {
-    FakeEntry* e = c.get_or_init_pinned(key, [bytes, payload](FakeEntry& v) {
-        v.payload = payload;
-        v.bytes = bytes;
-        ++g_fake_builds;
-        return bytes;
-    });
-    c.release(key);
-    return e;
-}
+// Leased acquire (RAII): the entry stays PINNED for the handle's lifetime,
+// so a test cannot dangle its entry pointer by construction — the raw
+// pointer the old acquire_and_release helper returned belonged to an entry
+// it had already made evictable. Destroy the handle (end its scope) to
+// release the lease; at-rest assertions after the scope see the post-trim
+// state, exactly as the old immediate release did.
+class FakeLease {
+public:
+    FakeLease(ByteBudgetLruCache<int, FakeEntry>& c, int key,
+              size_t bytes, int payload)
+        : cache_(&c), key_(key) {
+        entry_ = c.get_or_init_pinned(key, [bytes, payload](FakeEntry& v) {
+            v.payload = payload;
+            v.bytes = bytes;
+            ++g_fake_builds;
+            return bytes;
+        });
+    }
+    ~FakeLease() { cache_->release(key_); }
+    FakeLease(const FakeLease&) = delete;
+    FakeLease& operator=(const FakeLease&) = delete;
+    FakeEntry* get() const { return entry_; }
+
+private:
+    ByteBudgetLruCache<int, FakeEntry>* cache_;
+    int key_;
+    FakeEntry* entry_ = nullptr;
+};
 
 void test_logic_budget_lru_accounting() {
     std::printf("[A] budget / LRU order / byte accounting\n");
     // 100-byte entries, budget 1000 -> 10 resident at rest.
     ByteBudgetLruCache<int, FakeEntry> cache(1000);
-    for (int i = 1; i <= 12; ++i)
-        acquire_and_release(cache, i, 100, 1000 + i);
+    for (int i = 1; i <= 12; ++i) {
+        FakeLease leased(cache, i, 100, 1000 + i);   // released at iteration end
+    }
 
     check(cache.size() == 10, "A2: steady-state entry count saturates at 10 (got " +
           std::to_string(cache.size()) + ")");
@@ -136,7 +153,9 @@ void test_logic_budget_lru_accounting() {
     // then one more distinct insert must evict key 4 (now the LRU), not 3.
     FakeEntry* e3 = cache.get(3);
     check(e3 != nullptr && e3->payload == 1003, "A3: key 3 hit with intact payload");
-    acquire_and_release(cache, 13, 100, 1013);
+    {
+        FakeLease leased(cache, 13, 100, 1013);
+    }
     check(cache.get(3) != nullptr, "A3: re-used key survives (LRU is by last use)");
     check(cache.get(4) == nullptr, "A3: untouched older key evicted instead (4)");
     check(cache.size() == 10 && cache.bytes_in_use() == 1000,
@@ -148,7 +167,7 @@ void test_logic_budget_lru_accounting() {
     for (int round = 0; round < 10; ++round)
         for (int k = 3; k <= 13; ++k) {
             if (k == 4) continue;  // evicted above; rebuilding it would be a miss
-            acquire_and_release(cache, k, 100, 1000 + k);
+            FakeLease leased(cache, k, 100, 1000 + k);
         }
     check(g_fake_builds == builds_before, "A7: fixed-shape steady state builds nothing");
     check(cache.size() == 10 && cache.bytes_in_use() == 1000,
@@ -171,8 +190,9 @@ void test_logic_pin_stability_and_oversize() {
     // 5 x 300-byte inserts under a 1000 budget with 600 pinned: every insert
     // past the second must evict an UNPINNED entry (the leased key IS the LRU
     // entry and would be the victim without pin protection).
-    for (int i = 1; i <= 5; ++i)
-        acquire_and_release(cache, i, 300, 2000 + i);
+    for (int i = 1; i <= 5; ++i) {
+        FakeLease churn(cache, i, 300, 2000 + i);
+    }
 
     check(cache.pinned_size() == 1, "A4: lease still held after churn");
     check(cache.get(100) == leased, "A4: leased entry's address is stable across evictions");
@@ -185,7 +205,9 @@ void test_logic_pin_stability_and_oversize() {
     // Oversized: 250 bytes against a 100 budget. Admitted while pinned (all
     // unpinned entries evicted), trimmed at release.
     ByteBudgetLruCache<int, FakeEntry> small(100);
-    acquire_and_release(small, 1, 50, 1);   // resident filler
+    {
+        FakeLease filler(small, 1, 50, 1);   // resident filler once released
+    }
     FakeEntry* big = small.get_or_init_pinned(2, [](FakeEntry& v) {
         v.bytes = 250;
         v.payload = 7;
@@ -202,7 +224,9 @@ void test_logic_pin_stability_and_oversize() {
 void test_logic_build_failure() {
     std::printf("[A] construction failure rollback\n");
     ByteBudgetLruCache<int, FakeEntry> cache(1000);
-    acquire_and_release(cache, 1, 100, 11);
+    {
+        FakeLease seeded(cache, 1, 100, 11);
+    }
     const size_t bytes_before = cache.bytes_in_use();
     const size_t size_before = cache.size();
 
@@ -221,10 +245,12 @@ void test_logic_build_failure() {
     check(cache.pinned_size() == 0, "A6: failed entry left no pin");
 
     // The cache must still work afterwards.
-    FakeEntry* e = acquire_and_release(cache, 2, 100, 22);
-    check(e != nullptr && cache.bytes_in_use() == 200,
+    FakeLease e(cache, 2, 100, 22);
+    check(e.get() != nullptr && cache.bytes_in_use() == 200,
           "A6: later acquires work and account correctly");
-    for (int i = 3; i < 6; ++i) acquire_and_release(cache, i, 100, i);
+    for (int i = 3; i < 6; ++i) {
+        FakeLease refill(cache, i, 100, i);
+    }
     check(cache.size() == 5 && cache.bytes_in_use() == 500,
           "A6: LRU/list consistent after a failed insert");
 }
@@ -322,7 +348,9 @@ void test_logic_mass_eviction_skips_pins() {
         v.bytes = 100; v.payload = 9002; return (size_t)100;
     });
     // Six unpinned fillers between the pins and the incoming entry.
-    for (int i = 3; i <= 8; ++i) acquire_and_release(cache, i, 100, i);
+    for (int i = 3; i <= 8; ++i) {
+        FakeLease filler(cache, i, 100, i);
+    }
     check(cache.size() == 8 && cache.bytes_in_use() == 800,
           "MASS: pre-churn state (8 entries, 800 bytes)");
 
@@ -436,6 +464,12 @@ void test_real_graphs() {
         check(replay_and_check(probe, 1.0f),
               "B8: probe graph computes x*scale+bias exactly");
     }
+    if (entry_bytes == 0) {
+        // Guard the budget-sizing step at init: B8 above already recorded
+        // the failure, and a zero budget is a construction error — bail out
+        // of Part B instead of failing every later assertion.
+        return;
+    }
     const size_t budget = entry_bytes * 4 + entry_bytes / 2;   // ~4.5 entries
     std::printf("[B] entry_bytes=%zu budget=%zu\n", entry_bytes, budget);
 
@@ -502,6 +536,15 @@ void test_real_graphs() {
     const size_t size_before = cache.size();
     const ShapeKey rep1{ 1000 + kShapes - 2, (kShapes - 2) % 3 + 1 };
     const ShapeKey rep2{ 1000 + kShapes - 1, (kShapes - 1) % 3 + 1 };
+    // Guard B11's steady-state assumption BEFORE relying on it: the budget
+    // (~4.5 entries) must be holding the two most recent churn keys plus the
+    // re-released `held` key resident after the churn. If that ever fails,
+    // the repeat loop below would legitimately REBUILD (a miss, not a
+    // steady-state violation) and the no-build assertion would misreport the
+    // cause — this check names it.
+    check(cache.get(rep1) != nullptr && cache.get(rep2) != nullptr &&
+              cache.get(held) != nullptr,
+          "B11 precondition: repeat keys resident after churn");
     for (int round = 0; round < 10; ++round) {
         for (const ShapeKey& k : { rep1, rep2, held }) {
             cache.get_or_init_pinned(k, [&](GraphEntry&) -> size_t {

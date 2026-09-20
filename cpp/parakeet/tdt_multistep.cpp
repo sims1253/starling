@@ -777,8 +777,17 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     } catch (const std::exception& ex) {
         if (dbg) std::fprintf(stderr, "[tdt_multistep] K-step graph build failed: %s\n", ex.what());
         return std::nullopt;       // caller falls back to the serial loop
+    } catch (...) {
+        // Non-std exceptions take the same fallback. The cache's rollback is
+        // NOT limited to std::exception — get_or_init_pinned's catch(...)
+        // has already erased the half-built entry (no bytes retained), and
+        // the KStepLease destructor above released the pin on the way out —
+        // so there is no entry state left to clean up here either.
+        if (dbg) std::fprintf(stderr, "[tdt_multistep] K-step graph build failed: non-standard exception\n");
+        return std::nullopt;       // caller falls back to the serial loop
     }
-    if (!kg) return std::nullopt;       // unreachable (acquire throws or returns)
+    // (acquire_kstep either throws — handled above, with the cache rolling
+    // the entry back — or returns a pinned graph; no null-return path exists.)
     if (dbg) std::fprintf(stderr, "[tdt_multistep] K=%d T=%d d1=%d (graph built)\n", K, T, (int)d1);
     // Seed enc_proj once (persists across replays in the input tensor).
     kg->rg->set_input(kg->in_enc_proj, enc_proj.data(), (size_t)T * Hj * sizeof(float));

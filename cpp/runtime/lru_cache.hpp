@@ -213,7 +213,9 @@ private:
 //
 // As above: callers serialize cache access; `label` names the cache in the
 // STARLING_TRACE "cache" records (size/capacity are BYTES here, evicted is an
-// entry count).
+// entry count). get() and the lease paths trace the same hit/miss event
+// kinds; lease-path events carry an extra "pin":1 marker so a leased hit is
+// distinguishable from a plain-LRU hit in the records.
 template <typename Key, typename Value,
           typename Hash = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>>
@@ -233,11 +235,15 @@ public:
     size_t pinned_size() const { return pinned_; }
 
     // Plain LRU lookup (touch, no pin). Stable until a non-const operation
-    // evicts THIS key. Nullptr on miss.
+    // evicts THIS key. Nullptr on miss (the get_or_init that follows reports
+    // the miss — same rule as LruCache::get). Traces the same "hit" event
+    // kind the lease paths emit; the records stay distinguishable by the pin
+    // marker (present only on lease-path events).
     Value* get(const Key& key) {
         auto it = map_.find(key);
         if (it == map_.end()) return nullptr;
         touch(it);
+        trace("hit", 0);
         return &entry(it).value;
     }
 
@@ -249,7 +255,7 @@ public:
         if (it == map_.end()) return nullptr;
         touch(it);
         pin(it);
-        trace("hit", 0);
+        trace("hit", 0, /*pins=*/true);
         return &entry(it).value;
     }
 
@@ -265,7 +271,7 @@ public:
         if (it != map_.end()) {
             touch(it);
             pin(it);
-            trace("hit", 0);
+            trace("hit", 0, /*pins=*/true);
             return &entry(it).value;
         }
         // try_emplace default-constructs the value IN PLACE (no move): the
@@ -280,7 +286,7 @@ public:
             entry(inserted).bytes = init(entry(inserted).value);
             bytes_ += entry(inserted).bytes;
             const size_t evicted = trim_over_budget();
-            trace("miss", evicted);
+            trace("miss", evicted, /*pins=*/true);
             return &entry(inserted).value;
         } catch (...) {
             if (inserted != map_.end()) {
@@ -365,9 +371,14 @@ private:
         return victims.size();
     }
 
-    void trace(const char* op, size_t evicted) const {
+    // Field mapping into the shared cache_event schema: size=bytes_ and
+    // cap=budget_ are BYTES here (not entries — see the class comment), and
+    // `evicted` is an ENTRY count. `pins` marks hit/miss events from the
+    // lease paths (rendered "pin":1) so they are distinguishable from the
+    // plain-LRU get()'s unmarked "hit" of the same kind.
+    void trace(const char* op, size_t evicted, bool pins = false) const {
         if (label_)
-            trace::cache_event(label_, op, evicted, bytes_, budget_, -1);
+            trace::cache_event(label_, op, evicted, bytes_, budget_, -1, pins);
     }
 
     size_t budget_;

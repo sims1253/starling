@@ -2,8 +2,10 @@
 // (issue #180). Runs with the gate latched ON from main() before any trace
 // call: record shape, common fields, correlation scopes (RequestScope /
 // ChunkScope set + restore), per-kind required fields, cache events from a
-// labeled LruCache (and silence from an unlabeled one), the no-contents rule
-// (cache keys never appear in records), JSON escaping, and ts monotonicity.
+// labeled LruCache (and silence from an unlabeled one), ByteBudgetLruCache
+// hit/miss events with the lease pin marker (plain get() hits unmarked), the
+// no-contents rule (cache keys never appear in records), JSON escaping, and
+// ts monotonicity.
 // The gate-off behavior lives in trace_off_test (separate binary — the gate
 // latches once per process).
 //
@@ -211,6 +213,34 @@ int main() {
         }
         check(log.find(secret) == std::string::npos,
               "cache: key contents never appear in records (no-contents rule)");
+    }
+
+    // --- ByteBudgetLruCache: same hit/miss kinds, pin marker on lease paths -
+    {
+        const std::string log = capture_stderr([] {
+            ByteBudgetLruCache<int, int> labeled(1000, "test.bytecache");
+            labeled.get_or_init_pinned(7, [](int&) { return (size_t)100; });  // miss (leased)
+            labeled.release(7);                                               // under budget: no evict record
+            labeled.get_or_init_pinned(7, [](int&) { return (size_t)100; });  // hit (leased)
+            labeled.release(7);
+            labeled.get(7);                                                   // hit (plain: no pin field)
+            labeled.get(8);                                                   // miss: silent (get_or_init reports)
+        });
+        const auto lines = trace_lines(log);
+        check(lines.size() == 3, "bytecache: miss + leased hit + plain hit",
+              std::to_string(lines.size()));
+        if (lines.size() == 3) {
+            check(ev_of(lines[0]) == "cache" && json_str(lines[0], "op") == "miss" &&
+                      json_num(lines[0], "evicted") == 0.0 &&
+                      json_num(lines[0], "size") == 100.0 &&
+                      json_num(lines[0], "cap") == 1000.0 &&
+                      has_field(lines[0], "pin"),
+                  "bytecache: miss reports BYTES in size/cap + pin marker");
+            check(json_str(lines[1], "op") == "hit" && has_field(lines[1], "pin"),
+                  "bytecache: leased hit carries the pin marker");
+            check(json_str(lines[2], "op") == "hit" && !has_field(lines[2], "pin"),
+                  "bytecache: plain get() hit has no pin marker (distinguishable)");
+        }
     }
 
     // --- escaping + ts monotonicity ----------------------------------------
