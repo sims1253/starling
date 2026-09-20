@@ -476,11 +476,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-13",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "mode-routing contract committed 5192b01; coordinator rerun 133/133; precedence frozen: secure-field policy > locked manual > literal escape > longest unambiguous alias > specificity rules > default; conflicts surfaced not hidden"
+   ],
+   "notes": "contract level; Mode Studio UI = E30; runtime wiring = I3"
   },
   {
    "id": "E19",
@@ -493,11 +495,13 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-13",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "context-snapshot schema: activation-frozen, capabilities, range+offset_encoding, expiry; secure-field branch structurally excludes selected_text"
+   ],
+   "notes": "same as E18"
   },
   {
    "id": "E20",
@@ -611,11 +615,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-10",
    "branch": "gpui/fixes-wave-a4",
-   "evidence": [],
-   "notes": "I1 phase 1: RT SPSC ring + atomics + bounded handoff + quiesce stop per design \u00a73; journal/fsync = phase 2"
+   "evidence": [
+    "I1 PHASE 1 complete: coordinator rerun 106/106 + 17/17 on gpui/fixes-wave-a4 8be559c, pushed to PR #194; RT callback = atomics only (R01 structurally fixed), SPSC ring + 25ms writer thread, gap spans surfaced, quiesce-stop handshake with typed QuiesceTimeout carrying intact samples (R09)"
+   ],
+   "notes": "PHASE 2 open: journal/fsync/durable boundary ack, sampleDurationMs vs wallClockMs split, Interrupted transitions; accumulation Vec still unbounded until journal lands"
   },
   {
    "id": "G02",
@@ -722,11 +728,13 @@
     "E18"
    ],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-13",
    "branch": "program/wave-a",
-   "evidence": [],
-   "notes": ""
+   "evidence": [
+    "leading-phrase routing oracle: 25 reference cases byte-faithful + 8 variants incl. locked-manual-beats-escape, policy-beats-locked-manual; payload view preserves raw, removes prefix only from derived view"
+   ],
+   "notes": "same as E18"
   },
   {
    "id": "E27",
@@ -838,11 +846,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-12",
    "branch": "program/s03-eos-contract",
-   "evidence": [],
-   "notes": "engine worktree starling-s01, branched from master; sole heavy-build slot"
+   "evidence": [
+    "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction"
+   ],
+   "notes": "model-gated gaps: real MOSS GGUF E2E, GPU K-step branch, real-audio acceptance evals; serve/Python wiring of completion status deferred"
   },
   {
    "id": "S04",
@@ -1288,13 +1298,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": "program/wave-a",
+   "status": "in_progress",
+   "owner": "impl-agent-19",
+   "branch": "gpui/fixes-wave-a5",
    "evidence": [
     "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
    ],
-   "notes": "queue behind impl-10; recorder.rs finding absorbed by I1 rewrite"
+   "notes": "dispatched after I1-phase1; recorder finding absorbed by ring rewrite - verify"
   },
   {
    "id": "R14",
@@ -1374,32 +1384,6 @@
   },
   {
    "ids": [
-    "G01"
-   ],
-   "agent": "impl-agent-10",
-   "branch": "gpui/fixes-wave-a4",
-   "scope": "recorder.rs RT ring (light cargo)"
-  },
-  {
-   "ids": [
-    "S03"
-   ],
-   "agent": "impl-agent-12",
-   "branch": "program/s03-eos-contract",
-   "scope": "engine worktree (heavy slot, -j3)"
-  },
-  {
-   "ids": [
-    "E18",
-    "E19",
-    "E26"
-   ],
-   "agent": "impl-agent-13",
-   "branch": "program/wave-a",
-   "scope": "packages/contracts/mode-routing + tests (light)"
-  },
-  {
-   "ids": [
     "B04",
     "B05"
    ],
@@ -1414,6 +1398,14 @@
    "agent": "impl-agent-18",
    "branch": "program/wave-a",
    "scope": "root build files + docs + workflows (light)"
+  },
+  {
+   "ids": [
+    "R13"
+   ],
+   "agent": "impl-agent-19",
+   "branch": "gpui/fixes-wave-a5",
+   "scope": "gpui worktree Rust (light)"
   }
  ],
  "prs": {
