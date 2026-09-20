@@ -269,8 +269,14 @@ impl<S: JournalSink> JournalWriter<S> {
 
     /// Whether the §3 cadence says a boundary is due.
     pub fn boundary_due(&self) -> bool {
+        // The time arm only applies when there are unsynced samples to
+        // acknowledge: an idle journal (nothing appended since the last
+        // boundary) is never due, however much clock passes — otherwise a
+        // slow runner between writer creation and the first append would
+        // report due-on-time with zero bytes to confirm.
         self.bytes_since_boundary >= JOURNAL_BOUNDARY_BYTES
-            || self.last_boundary.elapsed() >= JOURNAL_BOUNDARY_INTERVAL
+            || (self.bytes_since_boundary > 0
+                && self.last_boundary.elapsed() >= JOURNAL_BOUNDARY_INTERVAL)
     }
 
     /// Writes a boundary record covering everything appended so far and
@@ -1012,12 +1018,25 @@ mod tests {
         writer.write_boundary().expect("boundary");
         assert!(!writer.boundary_due(), "reset after the boundary");
 
-        // Time trigger: the interval passes with no new bytes.
+        // Time trigger: the interval passes while samples are pending (the
+        // cadence bounds the acknowledgment latency of UNSYNCED samples —
+        // an idle journal with nothing to confirm is never due, however
+        // much clock passes; that invariant is what keeps a fresh or silent
+        // writer from flapping on timer noise).
+        writer
+            .append_frames(&ramp(1, 0))
+            .expect("append one pending sample");
+        assert!(
+            !writer.boundary_due(),
+            "one sample is under both thresholds"
+        );
         std::thread::sleep(JOURNAL_BOUNDARY_INTERVAL + Duration::from_millis(20));
-        assert!(writer.boundary_due(), "time threshold triggers");
-        // …but a boundary with nothing new is a clock-resetting no-op.
+        assert!(writer.boundary_due(), "time threshold triggers on pending samples");
+        writer.write_boundary().expect("boundary after the interval");
+        assert!(!writer.boundary_due(), "boundary acks the pending sample");
+        // …and a boundary with nothing new stays a clock-resetting no-op.
         writer.write_boundary().expect("empty boundary");
-        assert!(!writer.boundary_due(), "empty boundary resets the clock");
+        assert!(!writer.boundary_due(), "empty boundary is still a no-op");
     }
 
     #[test]
