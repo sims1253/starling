@@ -459,9 +459,10 @@
    "owner": "design-agent + coordinator",
    "branch": "program/wave-a",
    "evidence": [
-    "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded"
+    "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded",
+    "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)"
    ],
-   "notes": "I0 (envelope contracts) dispatched; I1 capture hardening next; open Qs 2-6 deferred to their increments (I2/I4/I5)"
+   "notes": "I0 done; I1-phase1 in progress (impl-10); I2/I3 next after I1 lands"
   },
   {
    "id": "E18",
@@ -471,9 +472,9 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -488,9 +489,9 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -715,9 +716,9 @@
     "E18"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-13",
+   "branch": "program/wave-a",
    "evidence": [],
    "notes": ""
   },
@@ -1308,14 +1309,6 @@
   },
   {
    "ids": [
-    "E17-I0"
-   ],
-   "agent": "impl-agent-7",
-   "branch": "program/wave-a",
-   "scope": "packages/contracts/runtime-protocol + tests (light)"
-  },
-  {
-   "ids": [
     "G01"
    ],
    "agent": "impl-agent-10",
@@ -1338,6 +1331,16 @@
    "agent": "impl-agent-12",
    "branch": "program/s03-eos-contract",
    "scope": "engine worktree (heavy slot, -j3)"
+  },
+  {
+   "ids": [
+    "E18",
+    "E19",
+    "E26"
+   ],
+   "agent": "impl-agent-13",
+   "branch": "program/wave-a",
+   "scope": "packages/contracts/mode-routing + tests (light)"
   }
  ],
  "prs": {
