@@ -150,10 +150,18 @@ fn rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-fn user_set_model_flag() -> bool {
-    std::fs::read_to_string(Settings::default_path())
-        .map(|text| text.contains("\"model\""))
-        .unwrap_or(false)
+/// The persisted `user_set_model` flag after an explicit settings save (R02).
+///
+/// The flag is set when this save actually changed the model, and sticky once
+/// set: a later save that leaves the model untouched (the user only edited
+/// the endpoint or terms) must not re-enable syncing the model from the
+/// server's health response.
+pub(crate) fn user_set_model_after_save(
+    previous: bool,
+    model_before: &str,
+    model_saved: &str,
+) -> bool {
+    previous || model_before != model_saved
 }
 
 /// Highest `-N` suffix attempted when dodging an existing download name.
@@ -243,7 +251,7 @@ impl StarlingApp {
             protocol,
             model,
             expected_terms_input: terms_input,
-            user_set_model: user_set_model_flag(),
+            user_set_model: settings.user_set_model,
             settings_open: false,
             settings_protocol: settings.protocol,
             draft_endpoint,
@@ -415,15 +423,20 @@ impl StarlingApp {
         }
         self.endpoint = clean.clone();
         self.protocol = self.settings_protocol;
-        self.model = self.draft_model.read(cx).value();
+        // R02: only a save that changes the model marks it user-set, so an
+        // endpoint-only edit keeps the server's health auto-sync alive.
+        let draft_model = self.draft_model.read(cx).value();
+        self.user_set_model =
+            user_set_model_after_save(self.user_set_model, &self.model, &draft_model);
+        self.model = draft_model;
         self.expected_terms_input = self.draft_terms.read(cx).value();
-        self.user_set_model = true;
 
         let mut settings = Settings {
             endpoint: self.endpoint.clone(),
             protocol: self.protocol,
             model: self.model.clone(),
             expected_terms: Vec::new(),
+            user_set_model: self.user_set_model,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
 
@@ -853,6 +866,38 @@ mod tests {
             PlaybackWatch::Cancelled
         );
         assert_eq!(playback_watch(7, 7, false, None), PlaybackWatch::Cancelled);
+    }
+
+    #[test]
+    fn a_save_that_leaves_the_model_untouched_keeps_auto_sync() {
+        // R02: editing only the endpoint (or terms) must not mark the model
+        // user-set, or one unrelated save would permanently disable the
+        // health auto-sync.
+        assert!(!user_set_model_after_save(
+            false,
+            "whisper-large-v3",
+            "whisper-large-v3"
+        ));
+    }
+
+    #[test]
+    fn a_save_that_changes_the_model_marks_it_user_set() {
+        assert!(user_set_model_after_save(
+            false,
+            "parakeet",
+            "whisper-large-v3"
+        ));
+    }
+
+    #[test]
+    fn the_user_set_model_flag_is_sticky_across_later_saves() {
+        // Once the user chose a model, an endpoint-only save must not
+        // silently hand the choice back to the server.
+        assert!(user_set_model_after_save(
+            true,
+            "whisper-large-v3",
+            "whisper-large-v3"
+        ));
     }
 
     #[test]

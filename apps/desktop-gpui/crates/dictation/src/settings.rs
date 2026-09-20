@@ -20,6 +20,12 @@ pub struct Settings {
     pub protocol: Protocol,
     pub model: String,
     pub expected_terms: Vec<String>,
+    /// Whether the user explicitly chose the model (R02). While false, the
+    /// app may sync `model` from the server's health response. Files written
+    /// before this field existed deserialize it as `false` (`serde(default)`),
+    /// which re-enables that sync instead of guessing from the file's text.
+    #[serde(default)]
+    pub user_set_model: bool,
 }
 
 impl Settings {
@@ -31,6 +37,7 @@ impl Settings {
             protocol: Protocol::Starling,
             model: "parakeet".to_string(),
             expected_terms: vec!["auth".to_string()],
+            user_set_model: false,
         }
     }
 
@@ -117,6 +124,7 @@ mod tests {
         assert_eq!(settings.model, "parakeet");
         assert_eq!(settings.expected_terms, vec!["auth".to_string()]);
         assert_eq!(settings.expected_terms_input(), "auth");
+        assert!(!settings.user_set_model);
     }
 
     #[test]
@@ -146,6 +154,7 @@ mod tests {
             protocol: Protocol::OpenAI,
             model: "whisper-large-v3".to_string(),
             expected_terms: vec!["auth".to_string(), "Starling".to_string()],
+            user_set_model: true,
         };
 
         settings.save(&path).expect("save");
@@ -161,6 +170,27 @@ mod tests {
             value["expectedTerms"],
             serde_json::json!(["auth", "Starling"])
         );
+        assert_eq!(value["userSetModel"], true);
+    }
+
+    #[test]
+    fn legacy_files_without_the_flag_load_as_not_user_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+
+        // A file written before `userSetModel` existed: every legacy save
+        // contains a `model` key, but that never meant the user chose it, so
+        // the missing flag must not be sniffed out of the text.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","protocol":"openai","model":"whisper-large-v3","expectedTerms":["auth"]}"#,
+        )
+        .expect("write legacy settings");
+
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.model, "whisper-large-v3");
+        assert!(!settings.user_set_model, "no recorded choice: auto-sync stays enabled");
     }
 
     #[test]
