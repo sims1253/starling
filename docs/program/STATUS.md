@@ -136,3 +136,21 @@ builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
 - I1 COMPLETE (ring + journal): 133/133 + 23/23, PR #194 @ 9343bb1.
 - B01: first agent died on API rate limit; continuation agent dispatched.
 - program/gpu-validation branch = S01+S02+S03 merged + runbook.
+
+## Update 2026-09-20 (night) — review debt fully cleared; E29 + I2 landed
+
+- ALL engine review batches resolved: R20-R24 integrated and pushed (#198:
+  R20/R22/R23 lineage; #199: S11 + R24). Every bot finding to date is either
+  fixed with tests or evidence-rebutted; none outstanding.
+- I2 storage-v2 core integrated (06a80bb -> #194): SQLite/WAL schema, 4-step
+  crash protocol w/ per-step fault injection, reconciliation matrix, sample-
+  domain-verified dry-run migration + rollback. Cutover UI remains.
+- E29 Insights phase 1 integrated (369e806 -> #195): 287/287 desktop tests;
+  E28 oracle semantics as TS + emitter + usage/quality views.
+- Serving first wave S01/S02/S03/S11: implemented, CPU+Vulkan(iGPU)-verified,
+  real-model smoke (parakeet q8/q4, moss q4) recorded. 5090 evidence run
+  pending (user).
+- Rate limiter: 4 agent deaths today, each recovered by coordinator takeover;
+  dispatch concurrency held at 1-2.
+- Next: I3 runtime crate (dispatched), then Android B07/B08 (gradle window),
+  E02 cutover UI, E15/E12 packaging parity, S13/S14 quant track.

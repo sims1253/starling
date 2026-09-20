@@ -1499,11 +1499,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-35",
-   "branch": "program/s02-review-fixes3",
+   "branch": "program/s02-tdt-budget",
    "evidence": [
-    "PR #198 OCR run 35511919623 (post-R22)"
+    "coordinator rerun: tdt PASS + stream 235/235 (5d63153, pushed to #198); floor comment now states observed-range + count-cap-is-the-bound; floored-branch rollback test; split rejection diagnostics; loop-invariant cap predicate"
    ],
    "notes": "soften floor comment to observed-range + count-cap-is-the-bound (or shape-aware floor); extend rollback test w/ floored entry; queue engine slot"
   },
@@ -1515,11 +1515,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-35",
-   "branch": "program/s11-review-fixes",
+   "branch": "program/s11-tail-reuse",
    "evidence": [
-    "PR #199 OCR run 35511055827"
+    "coordinator rerun after branch-correct rebuild: stream_session_test 363/363 (1aa3a08, pushed to #199); tx_gen_ joins StreamTailKey (in-flight-write immune by construction); callback-swap recompute test; TailFixture dedupe; CHECK_NEAR"
    ],
    "notes": "MEDIUM: set_transcribe_fn swaps custom_tx_ w/o clearing retained entry -> stale replay; callback identity joins the key or swap clears; add test; queue engine slot behind R23"
   }
