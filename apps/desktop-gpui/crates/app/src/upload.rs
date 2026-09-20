@@ -44,6 +44,54 @@ pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
     }
 }
 
+/// What a transcript-job store write does when its session may have been
+/// deleted mid-flight (R05).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SaveRaceDecision {
+    /// The session is present and the write went through.
+    Written,
+    /// The session is gone — the user's delete landed while the job was in
+    /// flight. Never resurrect it: keep the job's in-memory audio
+    /// recoverable and surface what happened.
+    SessionDeleted,
+    /// A genuine storage failure (think a full disk): the write failed for
+    /// reasons that have nothing to do with deletion.
+    Failed(String),
+}
+
+/// Decide a store write's outcome in the delete race (R05).
+///
+/// `session_found` is what the pre-write re-check saw; `write_error` is the
+/// write's own error, if the write was attempted. A `NotFound` from either
+/// side is a delete that landed in the check→write gap and gets the same
+/// `SessionDeleted` decision as a failed re-check — the app can never tell
+/// the two orderings apart, and must not treat either as a job failure.
+pub(crate) fn save_race_decision(
+    session_found: bool,
+    write_error: Option<&storage::StorageError>,
+) -> SaveRaceDecision {
+    if !session_found {
+        return SaveRaceDecision::SessionDeleted;
+    }
+    match write_error {
+        None => SaveRaceDecision::Written,
+        Some(err) if matches!(err, storage::StorageError::NotFound(_)) => {
+            SaveRaceDecision::SessionDeleted
+        }
+        Some(err) => SaveRaceDecision::Failed(err.to_string()),
+    }
+}
+
+/// What the surfaced error says when a recording is deleted while it is
+/// being transcribed (R05): the transcript could not land anywhere, the
+/// audio is kept recoverable, and nothing is dropped silently.
+pub(crate) fn session_deleted_message() -> String {
+    "This recording was deleted while it was being transcribed, so the transcript could not \
+     be saved to history. The audio is kept in the recovery banner — download it if you still \
+     want it, or discard it if the delete was on purpose."
+        .to_string()
+}
+
 /// What a finished transcription job may apply to global app state (R03,
 /// revised by R13).
 ///
@@ -385,6 +433,10 @@ impl StarlingApp {
             enum Outcome {
                 Success,
                 Failure { message: String, class: FailureClass },
+                /// The session was deleted while this job was in flight
+                /// (R05): not a failure — nothing to probe, nothing to
+                /// record in history, just keep the audio and surface.
+                SessionGone,
             }
             let mut outcome = Outcome::Success;
 
@@ -408,21 +460,60 @@ impl StarlingApp {
                     };
                     match attempt {
                         Ok(result) => {
+                            // R05: re-check that the session still exists
+                            // before writing the transcript.
+                            // `remove_session` refuses to run while the id
+                            // is in `active_ids`, but that guard cannot
+                            // cover a DictationSession created before
+                            // `transcribe` ran (the create→transcribe
+                            // window) — so the user's delete can land
+                            // while the request is in flight. A NotFound
+                            // from either the re-check or the write itself
+                            // is that delete race: never a job failure,
+                            // never a resurrection.
                             let saved = {
                                 let id = id.clone();
                                 let store = store_for_job.clone();
-                                cx.background_spawn(
-                                    async move { store.save_transcript(&id, result) },
-                                )
+                                cx.background_spawn(async move {
+                                    let session_found = store.get(&id)?.is_some();
+                                    let write_error = if session_found {
+                                        store.save_transcript(&id, result).err()
+                                    } else {
+                                        None
+                                    };
+                                    Ok::<_, storage::StorageError>((session_found, write_error))
+                                })
                                 .await
                             };
-                            if let Err(err) = saved {
-                                // A local storage failure says nothing
-                                // about reachability (R13).
-                                outcome = Outcome::Failure {
-                                    message: err.to_string(),
-                                    class: FailureClass::Local,
-                                };
+                            match saved {
+                                Ok((session_found, write_error)) => {
+                                    match save_race_decision(
+                                        session_found,
+                                        write_error.as_ref(),
+                                    ) {
+                                        SaveRaceDecision::Written => {}
+                                        SaveRaceDecision::SessionDeleted => {
+                                            outcome = Outcome::SessionGone;
+                                        }
+                                        SaveRaceDecision::Failed(message) => {
+                                            // A local storage failure says
+                                            // nothing about reachability
+                                            // (R13).
+                                            outcome = Outcome::Failure {
+                                                message,
+                                                class: FailureClass::Local,
+                                            };
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    // The re-check itself failed — an I/O
+                                    // error, not a delete.
+                                    outcome = Outcome::Failure {
+                                        message: err.to_string(),
+                                        class: FailureClass::Local,
+                                    };
+                                }
                             }
                         }
                         Err(err) => {
@@ -437,15 +528,26 @@ impl StarlingApp {
                     }
                 }
                 Err(err) => {
-                    outcome = Outcome::Failure {
-                        message: err.to_string(),
-                        class: FailureClass::Local,
+                    // The delete may have landed before the first write
+                    // too (R05): a session that existed when the job
+                    // started but is gone by `mark_attempt` is the same
+                    // race, not a storage fault. (`Written` is unreachable
+                    // here — the decision was handed an error.)
+                    outcome = match save_race_decision(true, Some(&err)) {
+                        SaveRaceDecision::Failed(message) => Outcome::Failure {
+                            message,
+                            class: FailureClass::Local,
+                        },
+                        SaveRaceDecision::SessionDeleted | SaveRaceDecision::Written => {
+                            Outcome::SessionGone
+                        }
                     };
                 }
             }
 
+            let session_gone = matches!(outcome, Outcome::SessionGone);
             let job_failure = match outcome {
-                Outcome::Success => None,
+                Outcome::Success | Outcome::SessionGone => None,
                 Outcome::Failure { message, class } => Some((message, class)),
             };
 
@@ -495,6 +597,21 @@ impl StarlingApp {
                 // be a local storage error rather than a dead server; only
                 // health probes (`check_health`) write connection state.
                 FinishedJob::Saved => {}
+            }
+
+            if session_gone {
+                // R05: the transcript had nowhere to land because its
+                // session was deleted mid-flight. Keep the job's audio
+                // recoverable in the unsaved list and surface what
+                // happened — never drop it silently. The capture journal
+                // (which `remove_session` never deletes) also stays on
+                // disk as source evidence.
+                let message = session_deleted_message();
+                this.update(cx, |app, cx| {
+                    app.stash_unsaved(wav, &message);
+                    cx.notify();
+                })
+                .ok();
             }
 
             this.update(cx, |app, cx| {
@@ -727,5 +844,59 @@ mod tests {
         assert!(note.contains("interrupted recording"), "{note}");
         assert!(note.contains("retry"), "{note}");
         assert!(!note.contains("lost"), "{note}");
+    }
+
+    #[test]
+    fn a_missing_session_at_the_recheck_is_the_delete_race_not_a_failure() {
+        // R05: the pre-write re-check came back empty — the delete won, so
+        // no write is attempted. The decision is SessionDeleted (keep the
+        // audio, surface), never a job failure with a raw NotFound.
+        assert_eq!(save_race_decision(false, None), SaveRaceDecision::SessionDeleted);
+    }
+
+    #[test]
+    fn a_not_found_from_the_write_itself_is_the_same_delete_race() {
+        // The delete landed between the re-check and the write, or before
+        // the job's first `mark_attempt` write (which hands the decision an
+        // error for a session it expects to exist). Same decision.
+        assert_eq!(
+            save_race_decision(
+                true,
+                Some(&storage::StorageError::NotFound("session-id".to_string()))
+            ),
+            SaveRaceDecision::SessionDeleted
+        );
+    }
+
+    #[test]
+    fn a_present_session_with_a_clean_write_is_written() {
+        assert_eq!(save_race_decision(true, None), SaveRaceDecision::Written);
+    }
+
+    #[test]
+    fn a_genuine_storage_failure_is_still_a_failure_not_a_delete() {
+        // A full disk is not a delete: the job must fail (Local class), not
+        // claim the session vanished.
+        let disk_full = storage::StorageError::Io(std::io::Error::other(
+            "No space left on device (os error 28)",
+        ));
+        match save_race_decision(true, Some(&disk_full)) {
+            SaveRaceDecision::Failed(message) => {
+                assert!(message.contains("No space left on device"), "{message}");
+            }
+            other => panic!("a storage fault must fail the job, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_session_deleted_message_keeps_the_audio_and_surfaces_it() {
+        // R05: never orphan data silently — the message must say the
+        // session was deleted mid-transcription, that the audio is kept,
+        // and offer the discard path for a deliberate delete.
+        let message = session_deleted_message();
+        assert!(message.contains("deleted while it was being transcribed"), "{message}");
+        assert!(message.contains("transcript could not be saved"), "{message}");
+        assert!(message.contains("audio is kept"), "{message}");
+        assert!(message.contains("discard"), "{message}");
     }
 }
