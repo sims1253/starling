@@ -202,6 +202,7 @@ pub(crate) fn user_set_model_after_save(
 /// relevant for the session it describes, while a rename notice is a
 /// one-off that clears itself. The two live in separate fields precisely
 /// so neither can overwrite the other's content.
+#[cfg(test)]
 pub(crate) fn banner_notice<'a>(
     capture_warning: Option<&'a str>,
     export_notice: Option<&'a str>,

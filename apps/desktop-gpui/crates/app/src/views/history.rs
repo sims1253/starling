@@ -13,12 +13,14 @@ pub fn render_history(
     _window: &mut Window,
     cx: &mut Context<StarlingApp>,
 ) -> impl IntoElement {
+    // R10: one pass — build each row's data and render it immediately,
+    // instead of collecting a RowData vec and then re-walking it with
+    // fresh clones for the elements.
     let rows: Vec<_> = app
         .sessions
         .iter()
-        .map(|session| row_data(app, session))
+        .map(|session| render_row(row_data(app, session), cx))
         .collect();
-    let rows: Vec<_> = rows.iter().map(|data| render_row(data, cx)).collect();
     // G02: quarantined records stay visible with their reason, sorted after
     // every readable take.
     let damaged_rows: Vec<_> = app
@@ -141,9 +143,17 @@ fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
     }
 }
 
-fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<Div> {
-    let id = data.id.clone();
-    let active = data.active;
+/// R10: takes the row data by value — the strings move straight into the
+/// element instead of being cloned a second time.
+fn render_row(data: RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<Div> {
+    let RowData {
+        id,
+        active,
+        title,
+        meta,
+        status,
+    } = data;
+    let click_id = id.clone();
 
     let state = div()
         .size(px(16.))
@@ -151,11 +161,11 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
         .items_center()
         .justify_center()
         .flex_none()
-        .child(match data.status {
+        .child(match status {
             SessionStatus::Transcribing => {
                 // R04: one id per transcribing row, not a shared
                 // "history-spinner" shared by all of them.
-                spinner(history_spinner_id(&data.id), 14., theme::DIM).into_any_element()
+                spinner(history_spinner_id(&id), 14., theme::DIM).into_any_element()
             }
             SessionStatus::Transcribed => div()
                 .size(px(6.))
@@ -180,7 +190,7 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
         });
 
     div()
-        .id(SharedString::from(format!("history-row-{}", data.id)))
+        .id(SharedString::from(format!("history-row-{id}")))
         .relative()
         .flex()
         .flex_row()
@@ -196,7 +206,7 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
         .hover(|style| style.bg(theme::HOVER_BG))
         .when(active, |row| row.bg(theme::ACTIVE_ROW_BG))
         .on_click(cx.listener(move |this, _, _window, cx| {
-            this.select_session(id.clone(), cx);
+            this.select_session(click_id.clone(), cx);
         }))
         .when(active, |row| {
             row.child(
@@ -223,14 +233,14 @@ fn render_row(data: &RowData, cx: &mut Context<StarlingApp>) -> gpui::Stateful<D
                         .text_size(px(11.))
                         .text_color(theme::TAKE_TITLE)
                         .truncate()
-                        .child(data.title.clone()),
+                        .child(title),
                 )
                 .child(
                     div()
                         .font(theme::mono_font())
                         .text_size(px(9.))
                         .text_color(theme::DIM)
-                        .child(data.meta.clone()),
+                        .child(meta),
                 ),
         )
         .child(icon(
