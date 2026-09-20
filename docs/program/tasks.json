@@ -480,9 +480,10 @@
    "branch": "program/wave-a",
    "evidence": [
     "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded",
-    "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)"
+    "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)",
+    "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)"
    ],
-   "notes": "I0 done; I1-phase1 in progress (impl-10); I2/I3 next after I1 lands"
+   "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain"
   },
   {
    "id": "E18",
@@ -1439,7 +1440,8 @@
    "owner": "coordinator",
    "branch": "gpui/fixes-wave-a7",
    "evidence": [
-    "boundary parser replaces type assertion (lint+fmt verified via main-checkout toolchain, 0/0); libasound2-dev install step added; pushed 80aa4a1 -> PR #194 re-runs checks"
+    "boundary parser replaces type assertion (lint+fmt verified via main-checkout toolchain, 0/0); libasound2-dev install step added; pushed 80aa4a1 -> PR #194 re-runs checks",
+    "follow-up: X11/Wayland link libs + player-test headless guards + audio.test.ts Schema-parse + fmt (e016826, 90d5f8a); pipeline-exit-code false-green in coordinator verification found and eliminated"
    ],
    "notes": "audio.test.ts authored in gpui worktree which lacks node_modules - JS gates never ran there; fixing + verifying via main-checkout lint. code-review bot workflow itself failed on #196/#197 at open time (bot-side exit 1; later runs on other PRs succeeded) - no action possible from agents; re-triggers on next push."
   },
