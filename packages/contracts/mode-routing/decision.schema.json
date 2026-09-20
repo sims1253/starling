@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:decision:v1",
+  "$comment": [
+    "Starling mode-routing decision output contract, v1 (E18/E19/E26).",
+    "One decision record per take: which typed versioned mode the raw",
+    "recognition attempt routed to, why (source), what leading prefix was",
+    "removed, and the payload view the authoring stage consumes.",
+    "Raw preservation: the routed payload is a VIEW, never a mutation. The",
+    "raw attempt (raw_attempt_id) keeps the complete recognition text and",
+    "audio; payload_view records raw_preserved=true, the view text and the",
+    "removed_prefix_span. v1 spans are Unicode code-point offsets starting",
+    "at 0 (span_encoding const), explicitly not native UTF-16 ranges, and",
+    "reconstruct as raw == raw[:span[0]] + view_text + raw[span[1]:] with",
+    "span[0] == 0, i.e. view_text == raw[span[1]:].",
+    "Permission boundary (frozen): this document is INCAPABLE of expressing",
+    "a provider, route, grant or permission change. A leading phrase",
+    "recognized after audio capture cannot retroactively protect uploaded",
+    "audio or authorize additional context/providers; the ASR route and",
+    "consent freeze at activation (see context-snapshot.schema.json and the",
+    "runtime protocol's mode.routeFrozen, which precedes any audio leaving",
+    "the runtime). tests/test_mode_routing.py asserts structurally that no",
+    "field name in this schema can carry such a change and that",
+    "additionalProperties is false everywhere, so the vocabulary of this",
+    "record is exactly the whitelisted set below.",
+    "Conflicts: ambiguous equal-rank rule or phrase matches produce",
+    "status needs_resolution with a conflicts entry listing the tied",
+    "candidates (mode_id plus the rule id or alias phrase it came via).",
+    "Conflicts are surfaced for user resolution; they are never resolved by",
+    "a guess. mode_id/mode_version are null exactly when no mode was chosen",
+    "(blocked or needs_resolution).",
+    "explanation is the human-visible route reason for overlay/history. It",
+    "names modes, rules and configured aliases only; it must not persist",
+    "sensitive selection contents in ordinary logs.",
+    "source enum: manual (locked or unlocked explicit choice), phrase",
+    "(registered leading alias), escape (leading literal), project_rule /",
+    "site_rule / app_rule (frozen scoped rule, by specificity), default,",
+    "policy (secure-field block), conflict (needs_resolution).",
+    "Keyword subset: only keywords the repo's minischema.py fallback",
+    "understands are used, so jsonschema and minischema agree. The exact",
+    "2-element span shape is enforced by the executable oracle",
+    "tests/mode_routing.py (minischema cannot express maxItems)."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision_id",
+    "capture_id",
+    "raw_attempt_id",
+    "mode_id",
+    "mode_version",
+    "source",
+    "status",
+    "matched_prefix_span",
+    "span_encoding",
+    "explanation",
+    "payload_view",
+    "conflicts",
+    "context_snapshot_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "decision_id": {
+      "$ref": "#/$defs/token"
+    },
+    "capture_id": {
+      "$ref": "#/$defs/token"
+    },
+    "raw_attempt_id": {
+      "$ref": "#/$defs/token"
+    },
+    "mode_id": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "mode_version": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "source": {
+      "enum": [
+        "manual",
+        "phrase",
+        "escape",
+        "project_rule",
+        "site_rule",
+        "app_rule",
+        "default",
+        "policy",
+        "conflict"
+      ]
+    },
+    "status": {
+      "enum": ["ready", "needs_input", "blocked", "needs_resolution"]
+    },
+    "matched_prefix_span": {
+      "$ref": "#/$defs/span"
+    },
+    "span_encoding": {
+      "const": "unicode_codepoints"
+    },
+    "explanation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload_view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_preserved", "text", "removed_prefix_span"],
+      "properties": {
+        "raw_preserved": {
+          "const": true
+        },
+        "text": {
+          "type": "string"
+        },
+        "removed_prefix_span": {
+          "$ref": "#/$defs/span"
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "candidates"],
+        "properties": {
+          "kind": {
+            "enum": ["rule", "phrase"]
+          },
+          "candidates": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode_id", "via"],
+              "properties": {
+                "mode_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.-]+$",
+                  "minLength": 1
+                },
+                "via": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "context_snapshot_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "span": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      ]
+    }
+  }
+}

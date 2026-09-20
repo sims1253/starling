@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:context-snapshot:v1",
+  "$comment": [
+    "Starling context snapshot, v1 (E19): the authorized-at-activation",
+    "context a mode decision may consume. Superwhisper's documented failure",
+    "mode is app context arriving from a LATER active window after",
+    "recognition; Starling therefore freezes the relevant target/context at",
+    "activation (before audio leaves on the frozen ASR route), revalidates",
+    "against this exact snapshot at delivery, and never re-resolves against",
+    "whatever window is active after ASR.",
+    "Data-only: this document cannot encode permission elevation. It is a",
+    "frozen RECORD of what an adapter already provided and which bounded",
+    "source kinds were already granted (granted_sources is an enum of",
+    "kinds, not free-form strings, so it cannot name or add new grant",
+    "targets). It contains no field that can add context sources, providers,",
+    "routes or scopes; preauthorization happens in runtime/user policy",
+    "before capture, never inside a snapshot. A grant revoked while",
+    "inference is pending must be honored before any further transmission.",
+    "Expiry: expires_at bounds the snapshot's validity. Target identity and",
+    "selected content must refer to the same activation snapshot; a take",
+    "that outlives expires_at re-snapshots rather than reusing it.",
+    "Capabilities: adapters declare what they can actually provide",
+    "(selection, document versioning, content digest, conditional apply).",
+    "An unavailable capability is declared false, never pretended - an",
+    "adapter that cannot provide a reliable compare/apply must not",
+    "advertise atomic replacement (delivery falls back to preview).",
+    "Selection ranges carry a declared offset encoding (utf16, utf8_bytes or",
+    "unicode_codepoints); consumers must not assume one unit system.",
+    "Secure fields: when secure_field is true the snapshot must NOT carry",
+    "selected_text (and typically no target). This exclusion is structural:",
+    "the document is a oneOf of a secure snapshot (const true, no",
+    "selected_text property at all) and an open snapshot (const false), so a",
+    "secure snapshot with selection contents is schema-invalid under both",
+    "jsonschema and the repo's minischema fallback.",
+    "Keyword subset: only keywords minischema.py understands are used (the",
+    "candidate's if/then/not exclusion was rewritten as the equivalent",
+    "oneOf; format: date-time and prefixItems/maxItems were replaced by",
+    "patterns and minItems). The exact 2-element range shape and the 8000-",
+    "character selected_text bound are additionally enforced by the",
+    "executable oracle tests/mode_routing.py."
+  ],
+  "oneOf": [
+    {"$ref": "#/$defs/secureSnapshot"},
+    {"$ref": "#/$defs/openSnapshot"}
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "grantedSources": {
+      "type": "array",
+      "items": {
+        "enum": ["app_identity", "selection", "clipboard", "project_terms"]
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selection",
+        "document_version",
+        "content_digest",
+        "conditional_apply"
+      ],
+      "properties": {
+        "selection": {"type": "boolean"},
+        "document_version": {"type": "boolean"},
+        "content_digest": {"type": "boolean"},
+        "conditional_apply": {"type": "boolean"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_id",
+        "window_id",
+        "document_id",
+        "document_version",
+        "range",
+        "offset_encoding",
+        "content_sha256",
+        "conditional_apply_supported"
+      ],
+      "properties": {
+        "app_id": {"type": "string", "minLength": 1},
+        "window_id": {"type": "string", "minLength": 1},
+        "document_id": {"type": ["string", "null"]},
+        "document_version": {"type": ["integer", "null"], "minimum": 0},
+        "range": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"type": "integer", "minimum": 0}
+        },
+        "offset_encoding": {
+          "enum": ["utf16", "utf8_bytes", "unicode_codepoints"]
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "conditional_apply_supported": {"type": "boolean"}
+      }
+    },
+    "secureSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "snapshot_id",
+        "capture_id",
+        "adapter_id",
+        "captured_at",
+        "expires_at",
+        "secure_field",
+        "granted_sources",
+        "capabilities"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/schemaVersion"},
+        "snapshot_id": {"$ref": "#/$defs/token"},
+        "capture_id": {"$ref": "#/$defs/token"},
+        "adapter_id": {"$ref": "#/$defs/token"},
+        "captured_at": {"$ref": "#/$defs/timestamp"},
+        "expires_at": {"$ref": "#/$defs/timestamp"},
+        "secure_field": {"const": true},
+        "granted_sources": {"$ref": "#/$defs/grantedSources"},
+        "capabilities": {"$ref": "#/$defs/capabilities"},
+        "target": {"$ref": "#/$defs/target"}
+      }
+    },
+    "openSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "snapshot_id",
+        "capture_id",
+        "adapter_id",
+        "captured_at",
+        "expires_at",
+        "secure_field",
+        "granted_sources",
+        "capabilities"
+      ],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/schemaVersion"},
+        "snapshot_id": {"$ref": "#/$defs/token"},
+        "capture_id": {"$ref": "#/$defs/token"},
+        "adapter_id": {"$ref": "#/$defs/token"},
+        "captured_at": {"$ref": "#/$defs/timestamp"},
+        "expires_at": {"$ref": "#/$defs/timestamp"},
+        "secure_field": {"const": false},
+        "granted_sources": {"$ref": "#/$defs/grantedSources"},
+        "capabilities": {"$ref": "#/$defs/capabilities"},
+        "target": {"$ref": "#/$defs/target"},
+        "selected_text": {
+          "type": "string",
+          "pattern": "^[\\s\\S]{0,8000}$"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,288 @@
+[
+  {
+    "schema_version": 1,
+    "decision_id": "decision-1",
+    "capture_id": "take-1",
+    "raw_attempt_id": "attempt-1",
+    "mode_id": "code-guidance",
+    "mode_version": 1,
+    "source": "phrase",
+    "status": "ready",
+    "matched_prefix_span": [
+      0,
+      11
+    ],
+    "span_encoding": "unicode_codepoints",
+    "explanation": "leading phrase \"code this\" selected mode code-guidance",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "add a retry button, but never send Enter.",
+      "removed_prefix_span": [
+        0,
+        11
+      ]
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-2",
+    "capture_id": "take-2",
+    "raw_attempt_id": "attempt-2",
+    "mode_id": "code-guidance",
+    "mode_version": 1,
+    "source": "app_rule",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "app rule vscode-guidance selected mode code-guidance",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "Add a retry button.",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-3",
+    "capture_id": "take-3",
+    "raw_attempt_id": "attempt-3",
+    "mode_id": "code-guidance",
+    "mode_version": 1,
+    "source": "site_rule",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "site rule github-guidance selected mode code-guidance",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "Keep auth unchanged.",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-4",
+    "capture_id": "take-4",
+    "raw_attempt_id": "attempt-4",
+    "mode_id": "faithful",
+    "mode_version": 1,
+    "source": "default",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "no rule or leading phrase matched; default mode faithful",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "Keep the word never.",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-5",
+    "capture_id": "take-5",
+    "raw_attempt_id": "attempt-5",
+    "mode_id": "verbatim",
+    "mode_version": 1,
+    "source": "escape",
+    "status": "ready",
+    "matched_prefix_span": [
+      0,
+      8
+    ],
+    "span_encoding": "unicode_codepoints",
+    "explanation": "leading literal escape; payload handled verbatim",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "code this is an example",
+      "removed_prefix_span": [
+        0,
+        8
+      ]
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-6",
+    "capture_id": "take-6",
+    "raw_attempt_id": "attempt-6",
+    "mode_id": "verbatim",
+    "mode_version": 1,
+    "source": "manual",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "manual mode verbatim for this take; text not parsed for other modes",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "code this: keep the phrase",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-7",
+    "capture_id": "take-7",
+    "raw_attempt_id": "attempt-7",
+    "mode_id": "edit-selection",
+    "mode_version": 1,
+    "source": "phrase",
+    "status": "ready",
+    "matched_prefix_span": [
+      0,
+      11
+    ],
+    "span_encoding": "unicode_codepoints",
+    "explanation": "leading phrase \"edit this\" selected mode edit-selection",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "shorten it",
+      "removed_prefix_span": [
+        0,
+        11
+      ]
+    },
+    "conflicts": [],
+    "context_snapshot_id": "snapshot-1"
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-8",
+    "capture_id": "take-8",
+    "raw_attempt_id": "attempt-8",
+    "mode_id": null,
+    "mode_version": null,
+    "source": "policy",
+    "status": "blocked",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "secure field: routing suppressed by policy",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "hello",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-9",
+    "capture_id": "take-9",
+    "raw_attempt_id": "attempt-9",
+    "mode_id": "verbatim",
+    "mode_version": 1,
+    "source": "app_rule",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "app rule notes-verbatim selected mode verbatim",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "code this: keep these words",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-10",
+    "capture_id": "take-10",
+    "raw_attempt_id": "attempt-10",
+    "mode_id": "verbatim",
+    "mode_version": 1,
+    "source": "manual",
+    "status": "ready",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "manual mode verbatim for this take; text not parsed for other modes",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "edit this: not a command",
+      "removed_prefix_span": null
+    },
+    "conflicts": [],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-11",
+    "capture_id": "take-11",
+    "raw_attempt_id": "attempt-11",
+    "mode_id": null,
+    "mode_version": null,
+    "source": "conflict",
+    "status": "needs_resolution",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "equal-rank leading phrases conflict; resolution required",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "code this: now",
+      "removed_prefix_span": null
+    },
+    "conflicts": [
+      {
+        "kind": "phrase",
+        "candidates": [
+          {
+            "mode_id": "code-guidance",
+            "via": "code this"
+          },
+          {
+            "mode_id": "faithful",
+            "via": "code this"
+          }
+        ]
+      }
+    ],
+    "context_snapshot_id": null
+  },
+  {
+    "schema_version": 1,
+    "decision_id": "decision-12",
+    "capture_id": "take-12",
+    "raw_attempt_id": "attempt-12",
+    "mode_id": null,
+    "mode_version": null,
+    "source": "conflict",
+    "status": "needs_resolution",
+    "matched_prefix_span": null,
+    "span_encoding": "unicode_codepoints",
+    "explanation": "equal-rank rules conflict; resolution required",
+    "payload_view": {
+      "raw_preserved": true,
+      "text": "hello",
+      "removed_prefix_span": null
+    },
+    "conflicts": [
+      {
+        "kind": "rule",
+        "candidates": [
+          {
+            "mode_id": "faithful",
+            "via": "conflict"
+          },
+          {
+            "mode_id": "code-guidance",
+            "via": "vscode-guidance"
+          }
+        ]
+      }
+    ],
+    "context_snapshot_id": null
+  }
+]

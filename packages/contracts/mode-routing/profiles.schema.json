@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:profiles:v1",
+  "$comment": [
+    "Starling mode-routing resolution document, v1 (E18/E19/E26).",
+    "Starter/editable policy: schema_version, the global default profile, the",
+    "typed versioned mode entries (identical shape to mode.schema.json) and",
+    "the scoped routing rules consumed at activation.",
+    "Frozen deterministic precedence, encoded by the executable oracle",
+    "tests/mode_routing.py resolve() (ported line-faithful from the review",
+    "package reference router):",
+    "1. secure-field policy blocks every path (status blocked);",
+    "2. a locked explicit manual mode wins and its text stays unparsed for",
+    "   other modes (request manual_mode + manual_locked, default locked);",
+    "3. in an alias-enabled session (take not locked, profile",
+    "   allow_spoken_overrides true, session_allows_aliases true) a leading",
+    "   literal escape selects verbatim payload handling;",
+    "4. an unambiguous registered leading alias selects its mode: longest",
+    "   token count, then character length; ties across different modes are",
+    "   phrase_conflict/needs_resolution, never a guess;",
+    "5. otherwise the frozen project/site/app rule wins by scope specificity",
+    "   (project > site > app), then explicit priority; equal-rank rules",
+    "   targeting different profiles are rule_conflict/needs_resolution;",
+    "   equal-rank same-profile ties break by rule id;",
+    "6. otherwise the global default profile.",
+    "Rules are frozen at activation together with the context snapshot",
+    "(context-snapshot.schema.json); a leading phrase recognized later cannot",
+    "broaden providers, permissions or the ASR route.",
+    "Keyword subset: only keywords the repo's minischema.py fallback",
+    "understands are used (the candidate's anyOf/required/pattern constructs",
+    "are kept; uniqueItems/maximum were dropped because minischema cannot",
+    "check them - the bounds live in the oracle)."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "default_profile",
+    "profiles",
+    "rules"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "default_profile": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "version",
+          "name",
+          "description",
+          "intent",
+          "behavior",
+          "prompt_file",
+          "aliases",
+          "allow_spoken_overrides",
+          "vocabulary",
+          "snippets",
+          "asr_route",
+          "authoring_route",
+          "local_only",
+          "selected_text",
+          "selection_required",
+          "clipboard",
+          "max_context_characters",
+          "delivery",
+          "automatic_delivery"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "minLength": 1
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Version of this mode definition; decisions record it as mode_version."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "intent": {
+            "enum": [
+              "dictate",
+              "edit",
+              "ask",
+              "capture"
+            ]
+          },
+          "behavior": {
+            "enum": [
+              "faithful",
+              "verbatim",
+              "code_guidance",
+              "edit_selection",
+              "ask_selection",
+              "capture"
+            ]
+          },
+          "prompt_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Enabled leading spoken phrases (code this, edit this). Leading-position, whole-token matches only."
+          },
+          "allow_spoken_overrides": {
+            "type": "boolean",
+            "description": "Verbatim flag: false disables this mode's aliases and keeps leading phrases literal. Verbatim modes ship false by default."
+          },
+          "vocabulary": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Scoped recognition-bias terms for this mode; never a provider or permission."
+          },
+          "snippets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "spoken",
+                "expansion"
+              ],
+              "properties": {
+                "spoken": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "expansion": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "description": "Scoped spoken-to-text expansions applied in this mode only."
+          },
+          "asr_route": {
+            "type": "string"
+          },
+          "authoring_route": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "local_only": {
+            "type": "boolean"
+          },
+          "selected_text": {
+            "enum": [
+              "off",
+              "reference",
+              "edit_target"
+            ]
+          },
+          "selection_required": {
+            "type": "boolean"
+          },
+          "clipboard": {
+            "type": "boolean"
+          },
+          "max_context_characters": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "delivery": {
+            "enum": [
+              "insert",
+              "replace_selection",
+              "preview",
+              "save_note"
+            ]
+          },
+          "automatic_delivery": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "minLength": 1
+          },
+          "profile_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "minLength": 1
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "app_id": {
+            "type": "string"
+          },
+          "site": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "profile_id",
+          "priority"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "app_id"
+            ]
+          },
+          {
+            "required": [
+              "site"
+            ]
+          },
+          {
+            "required": [
+              "project_id"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,114 @@
+[
+  {
+    "name": "same_target",
+    "snapshot": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "current": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "role": "edit_target",
+    "conditional_apply": true,
+    "expected": "apply"
+  },
+  {
+    "name": "new_version",
+    "snapshot": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "current": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 4,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "role": "edit_target",
+    "conditional_apply": true,
+    "expected": "conflict"
+  },
+  {
+    "name": "reference_only",
+    "snapshot": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "current": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "role": "reference",
+    "conditional_apply": true,
+    "expected": "preview"
+  },
+  {
+    "name": "unverified_adapter",
+    "snapshot": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "current": {
+      "app": "vscode",
+      "document": "doc1",
+      "version": 3,
+      "range": [
+        0,
+        5
+      ],
+      "digest": "abc",
+      "offset_encoding": "utf16"
+    },
+    "role": "edit_target",
+    "conditional_apply": false,
+    "expected": "preview"
+  }
+]
