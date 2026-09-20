@@ -37,12 +37,22 @@ export interface StreamingFinalizeDeps {
   readonly setConnectionReady: () => void;
   readonly transcribe: (session: DictationSession) => Promise<void>;
   /**
-   * Invoked once the drained journal is durably owned by its session, before
-   * any transcript work runs (B03): the caller ends the capture transition
-   * here, so a new take can start while transcription is still in flight.
-   * Never invoked for a discarded take or a failed durable save.
+   * Invoked once the journal is durably owned by its session, before the
+   * transcript work (B03): the caller ends the capture transition here, so a
+   * new take can start while transcription is still in flight. Never invoked
+   * for a discarded take or a failed durable save.
    */
   readonly onDurableSave?: () => void;
+  /**
+   * Invoked after a streamed transcript settles durably on its session (E29
+   * insight wiring), while the finalize still owns the take: receives the
+   * settled session and the streamed transcript. Optional and additive, like
+   * onDurableSave; never invoked for a discarded take.
+   */
+  readonly onStreamedSettled?: (
+    session: DictationSession,
+    transcript: TranscriptionResult,
+  ) => void;
 }
 
 function messageFrom(cause: unknown): string {
@@ -163,6 +173,7 @@ export async function finishStreamingTake(
       return { streamed: false, discarded: true, batchFallback: false };
     }
 
+    deps.onStreamedSettled?.(result.session, result.transcript);
     deps.setSelectedId(result.session.id);
     deps.setConnectionReady();
     await deps.refresh();

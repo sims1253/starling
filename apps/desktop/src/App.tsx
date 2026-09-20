@@ -15,6 +15,7 @@ import {
   type TranscriptionResult,
 } from "@starling/dictation";
 import {
+  BarChart3,
   Check,
   ChevronRight,
   CircleAlert,
@@ -66,6 +67,9 @@ import {
   type SettingsSnapshot,
 } from "./settingsTransaction";
 import type { PendingAudioState } from "../electron/ipc.js";
+import { InsightsView } from "./insights/InsightsView";
+import { InsightRecorder, wavCaptureStats } from "./insights/insightEmitter";
+import { IndexedDbInsightEventStore, type InsightEvent } from "./insights/insightEvents";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
@@ -92,6 +96,15 @@ const THREAD_REFINE_BUSY_MESSAGE =
   "Another turn in this thread is already refining. Wait for it to finish, then refine this turn again.";
 
 const store = new IndexedDbSessionStore();
+
+/**
+ * Local insight events (E29): a dedicated IndexedDB log, separate from
+ * session audio and transcripts. Events carry counts and constrained tokens
+ * only — never text, selections, paths or secrets — and recording one must
+ * never break the action it describes: every emit below is fire-and-forget
+ * with failures surfaced as an Insights notice instead of a take error.
+ */
+const insights = new InsightRecorder(new IndexedDbInsightEventStore());
 
 function formatDuration(ms?: number) {
   if (!ms) return "0:00";
@@ -221,6 +234,25 @@ export default function App() {
   const [error, setError] = useState<string>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // The Insights surface (E29): a view toggle over the same app — no router,
+  // the events the surface aggregates, and the one storage/recording notice
+  // it can show. Events refresh after each emit, so opening the view later
+  // always reads the current population.
+  const [view, setView] = useState<"capture" | "insights">("capture");
+
+  const [insightEvents, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
+
+  const [insightsIssue, setInsightsIssue] = useState<string>();
+
+  // Post-Stop timestamps for takes whose first transcript has not settled
+  // yet, keyed by session id and consumed by that first recognition: the
+  // measured Stop-press-to-ready wait. A "Transcribe again" press finds no
+  // entry, and its wait is honestly unknown (null) instead of guessed.
+  const stopWaitStartsRef = useRef(new Map<string, number>());
+  // A streamed take's session id exists only once the durable save hands it
+  // over; the Stop timestamp waits here until onDurableSave names the session.
+  const pendingStreamStopAtRef = useRef<number | null>(null);
 
   const [expectedTerms, setExpectedTerms] = useState(initialSettings.expectedTerms);
 
@@ -523,6 +555,91 @@ export default function App() {
 
   const busy = activeIds.size > 0;
 
+  // The insight event log loads once, best-effort: a damaged log becomes an
+  // Insights notice, never a startup failure (dictation works without it).
+  useEffect(() => {
+    void insights
+      .load()
+      .then(() => setInsightEvents(insights.snapshot()))
+      .catch((caught) =>
+        setInsightsIssue(
+          `Insights could not open the local event log: ${messageFrom(caught)}`,
+        ),
+      );
+  }, []);
+
+  /**
+   * Record one insight event without ever blocking the action it describes
+   * (E29): the emit is fire-and-forget, load() inside is idempotent so the
+   * mirror exists before sequence numbers are derived, a failure lands in
+   * the Insights notice instead of the take's flow, and the mirror refreshes
+   * on success so the Insights view reads the new event without a reopen.
+   */
+  const recordInsight = useCallback((action: () => Promise<void>) => {
+    void insights
+      .load()
+      .then(action)
+      .then(() => setInsightEvents(insights.snapshot()))
+      .catch((caught) =>
+        setInsightsIssue(`Insights could not record an event: ${messageFrom(caught)}`),
+      );
+  }, []);
+
+  /**
+   * Emit recognition_selected for a settled transcript (E29): word counts
+   * only, with the measured post-Stop wait when this is the take's first
+   * transcript and null when it is not (a retranscription happens at
+   * leisure; its wait is unknown, which suppresses the typing-time proxy
+   * rather than fabricating one).
+   */
+  const recordRecognitionSelected = useCallback(
+    (sessionId: string, transcriptText: string) => {
+      const startedAt = stopWaitStartsRef.current.get(sessionId);
+
+      stopWaitStartsRef.current.delete(sessionId);
+      recordInsight(() =>
+        insights.recognitionSelected({
+          captureId: sessionId,
+          transcriptText,
+          postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
+        }),
+      );
+    },
+    [recordInsight],
+  );
+
+  /**
+   * Emit capture_finalized once a take's audio is durably owned by a session
+   * (E29): sample frames are read from the canonical WAV itself, and
+   * complete_audio is true on every path that reaches here — a take with
+   * incomplete audio is parked or discarded before a session owns it.
+   */
+  const recordCaptureFinalized = useCallback(
+    (session: DictationSession) => {
+      recordInsight(async () => {
+        const stats = await wavCaptureStats(session.wav);
+
+        await insights.captureFinalized({
+          captureId: session.id,
+          sampleCount: stats.sampleCount,
+          sampleRate: stats.sampleRate,
+          completeAudio: true,
+        });
+      });
+    },
+    [recordInsight],
+  );
+
+  /** Reset the insight event log; the surface starts over empty. */
+  const resetInsights = useCallback(() => {
+    void insights
+      .reset()
+      .then(() => setInsightEvents(insights.snapshot()))
+      .catch((caught) =>
+        setInsightsIssue(`Insights could not reset the event log: ${messageFrom(caught)}`),
+      );
+  }, []);
+
   // The dialog's status line (B06): the probe's own outcome while one is
   // running or has settled, else the committed endpoint's live status.
   const settingsCallout = settingsCalloutView(probe, connection, endpoint);
@@ -812,6 +929,7 @@ export default function App() {
           model: model.trim() || undefined,
           protocol,
         });
+        recordRecognitionSelected(session.id, result.text);
         setConnection("ready");
       } catch (caught) {
         let failure = messageFrom(caught);
@@ -835,7 +953,7 @@ export default function App() {
         }
       }
     },
-    [endpoint, model, protocol, refresh],
+    [endpoint, model, protocol, recordRecognitionSelected, refresh],
   );
 
   /**
@@ -847,7 +965,13 @@ export default function App() {
   const saveTake = useCallback(
     async (wav: Blob, durationMs?: number): Promise<DictationSession> => {
       try {
-        return await store.create({ wav, durationMs });
+        const created = await store.create({ wav, durationMs });
+
+        // A durable take now exists for Insights (E29); the emit is
+        // fire-and-forget so insights can never break the capture path.
+        recordCaptureFinalized(created);
+
+        return created;
       } catch (caught) {
         setUnsavedWavs((current) => [
           ...current,
@@ -858,7 +982,7 @@ export default function App() {
         );
       }
     },
-    [],
+    [recordCaptureFinalized],
   );
 
   const saveAndTranscribe = useCallback(
@@ -1030,6 +1154,16 @@ export default function App() {
 
         await store.saveRefinedTranscript(session.id, refined);
         await refresh();
+        // One authored revision exists now (E29): change counts come from
+        // the word-level diff between raw and refined text, and are never
+        // labeled corrected errors.
+        recordInsight(() =>
+          insights.transformationCompleted({
+            captureId: session.id,
+            rawText: transcript.text,
+            revisedText: text,
+          }),
+        );
       } catch (caught) {
         // A refine failure after a fresh join must not read as though the
         // join failed: the take IS threaded now, and only the refinement
@@ -1064,6 +1198,7 @@ export default function App() {
     [
       activeThread,
       applyThreadHint,
+      recordInsight,
       refresh,
       refineApiKey,
       refineBaseUrl,
@@ -1259,9 +1394,18 @@ export default function App() {
             setConnectionReady: () => setConnection("ready"),
             transcribe,
             onDurableSave: releaseCapture,
+            onStreamedSettled: (session, transcript) =>
+              recordRecognitionSelected(session.id, transcript.text),
           },
           store,
         );
+
+        // A streamed take's journal became its session (E29): the take now
+        // exists for Insights. A discarded or batch-fallback take never
+        // reaches here — the batch path's own save emits instead.
+        if (finalized.session !== undefined) {
+          recordCaptureFinalized(finalized.session);
+        }
 
         if (finalized.discarded) return true;
 
@@ -1276,7 +1420,7 @@ export default function App() {
         }
       }
     },
-    [parkUnsavedWav, refresh, transcribe],
+    [parkUnsavedWav, recordCaptureFinalized, recordRecognitionSelected, refresh, transcribe],
   );
 
   const toggleRecording = useCallback(async () => {
@@ -1300,6 +1444,14 @@ export default function App() {
       // await: Stop must finalize the take that was recorded (#143).
       const stream = streamRef.current;
 
+      // When this Stop was pressed (E29): the origin of the post-Stop wait
+      // the first recognition for this take measures. A streamed take knows
+      // its journal's session id up front; the batch path registers the id
+      // once the session exists.
+      const stopPressedAt = Date.now();
+
+      if (stream !== undefined) pendingStreamStopAtRef.current = stopPressedAt;
+
       setTakePhase("stopping");
 
       // From Stop until the capture is durably stored (or parked in
@@ -1317,8 +1469,13 @@ export default function App() {
       // transition from its finally.
       let released = false;
 
-      const releaseCapture = () => {
+      const releaseCapture = (session?: DictationSession) => {
         if (released) return;
+
+        if (session && pendingStreamStopAtRef.current !== null) {
+          stopWaitStartsRef.current.set(session.id, pendingStreamStopAtRef.current);
+          pendingStreamStopAtRef.current = null;
+        }
 
         released = true;
         lifecycle.endStop();
@@ -1353,6 +1510,7 @@ export default function App() {
 
         const prepared = await prepareWav16k(capture.audio);
         const created = await saveTake(prepared.blob, capture.durationMs);
+        stopWaitStartsRef.current.set(created.id, stopPressedAt);
         await refresh();
 
         // Durable: the session store owns the WAV. Release the capture
