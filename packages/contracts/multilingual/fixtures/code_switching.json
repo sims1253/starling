@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "name": "starling-multilingual-code-switching-fixtures",
+  "provenance_policy": "Synthetic only: utterances and segmentations are hand-authored text. Real consented multilingual speech requires its own provenance record and a schema version bump.",
+  "span_encoding": "unicode_codepoints",
+  "fixtures": [
+    {
+      "id": "ml-en-de-01",
+      "kind": "code-switching",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "de",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German"
+        },
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        }
+      ],
+      "utterance": "der Server läuft auf Kubernetes, but the ingress uses Traefik.",
+      "segments": [
+        {
+          "language": "de",
+          "span": [
+            0,
+            33
+          ],
+          "text": "der Server läuft auf Kubernetes, "
+        },
+        {
+          "language": "en",
+          "span": [
+            33,
+            62
+          ],
+          "text": "but the ingress uses Traefik."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity"
+      },
+      "notes": "Echoes fidelity-corpus fx-multi-01 vocabulary (server, läuft, ingress) so the two corpora stay comparable."
+    },
+    {
+      "id": "ml-es-en-01",
+      "kind": "code-switching",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "es",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "Spanish"
+        },
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        }
+      ],
+      "utterance": "Necesitamos desplegar el servicio en producción, then run the smoke tests on the gateway.",
+      "segments": [
+        {
+          "language": "es",
+          "span": [
+            0,
+            49
+          ],
+          "text": "Necesitamos desplegar el servicio en producción, "
+        },
+        {
+          "language": "en",
+          "span": [
+            49,
+            89
+          ],
+          "text": "then run the smoke tests on the gateway."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity"
+      }
+    },
+    {
+      "id": "ml-en-zh-01",
+      "kind": "code-switching",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        },
+        {
+          "tag": "zh-Hans",
+          "script": "Hani",
+          "direction": "ltr",
+          "display_name": "Chinese (Simplified)"
+        }
+      ],
+      "utterance": "Deploy the model 然后 check the logs.",
+      "segments": [
+        {
+          "language": "en",
+          "span": [
+            0,
+            17
+          ],
+          "text": "Deploy the model "
+        },
+        {
+          "language": "zh-Hans",
+          "span": [
+            17,
+            19
+          ],
+          "text": "然后"
+        },
+        {
+          "language": "en",
+          "span": [
+            19,
+            35
+          ],
+          "text": " check the logs."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity"
+      }
+    },
+    {
+      "id": "ml-script-mix-01",
+      "kind": "script-mixing",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        },
+        {
+          "tag": "zh-Hans",
+          "script": "Hani",
+          "direction": "ltr",
+          "display_name": "Chinese (Simplified)"
+        }
+      ],
+      "utterance": "Update the 解析器 before Friday, then add 回归 tests.",
+      "segments": [
+        {
+          "language": "en",
+          "span": [
+            0,
+            11
+          ],
+          "text": "Update the "
+        },
+        {
+          "language": "zh-Hans",
+          "span": [
+            11,
+            14
+          ],
+          "text": "解析器"
+        },
+        {
+          "language": "en",
+          "span": [
+            14,
+            39
+          ],
+          "text": " before Friday, then add "
+        },
+        {
+          "language": "zh-Hans",
+          "span": [
+            39,
+            41
+          ],
+          "text": "回归"
+        },
+        {
+          "language": "en",
+          "span": [
+            41,
+            48
+          ],
+          "text": " tests."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity"
+      },
+      "notes": "Latin script segments alternate with Han script segments."
+    },
+    {
+      "id": "ml-rtl-in-ltr-01",
+      "kind": "rtl-in-ltr",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        },
+        {
+          "tag": "he",
+          "script": "Hebr",
+          "direction": "rtl",
+          "display_name": "Hebrew"
+        }
+      ],
+      "utterance": "The build status is תקין and all tests passed.",
+      "segments": [
+        {
+          "language": "en",
+          "span": [
+            0,
+            20
+          ],
+          "text": "The build status is "
+        },
+        {
+          "language": "he",
+          "span": [
+            20,
+            24
+          ],
+          "text": "תקין"
+        },
+        {
+          "language": "en",
+          "span": [
+            24,
+            46
+          ],
+          "text": " and all tests passed."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity"
+      },
+      "notes": "A Hebrew (rtl) run embedded in an English (ltr) utterance. Spans are logical-order code points; bidi display reordering must never change stored offsets."
+    },
+    {
+      "id": "ml-astral-01",
+      "kind": "code-switching",
+      "provenance": "synthetic",
+      "languages": [
+        {
+          "tag": "en",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "English"
+        },
+        {
+          "tag": "und",
+          "script": "Zyyy",
+          "direction": "ltr",
+          "display_name": "Undetermined"
+        },
+        {
+          "tag": "de",
+          "script": "Latn",
+          "direction": "ltr",
+          "display_name": "German"
+        }
+      ],
+      "utterance": "Roll out 🚀 jetzt, alles läuft.",
+      "segments": [
+        {
+          "language": "en",
+          "span": [
+            0,
+            9
+          ],
+          "text": "Roll out "
+        },
+        {
+          "language": "und",
+          "span": [
+            9,
+            10
+          ],
+          "text": "🚀"
+        },
+        {
+          "language": "de",
+          "span": [
+            10,
+            30
+          ],
+          "text": " jetzt, alles läuft."
+        }
+      ],
+      "expectations": {
+        "reconstruction": "identity",
+        "astral_codepoints": [
+          "🚀"
+        ]
+      },
+      "notes": "U+1F680 ROCKET is one code point but two UTF-16 units; spans are code-point offsets, not UTF-16 ranges."
+    }
+  ]
+}

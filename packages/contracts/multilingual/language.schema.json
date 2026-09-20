@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:multilingual:language:v1",
+  "$comment": [
+    "Starling multilingual / code-switching text contract, v1 (issue draft E24).",
+    "Text-level correctness only: versioned language/locale descriptors, a",
+    "code-switching segment model over utterances, and frozen locale-aware",
+    "text transforms (number separators and grouping, quotation marks,",
+    "Turkish casing). It is NOT a recognition-quality contract.",
+    "Span convention: shared with mode-routing decision.schema.json -",
+    "span_encoding is unicode_codepoints, offsets are Unicode code-point",
+    "indices starting at 0, explicitly not native UTF-16 ranges. Segment",
+    "spans partition the utterance: sorted, non-overlapping, gap-free",
+    "cover from 0 to the code-point length, and reconstructing the",
+    "utterance by concatenating segment texts is the identity. The exact",
+    "2-element span shape and start <= end are enforced by the executable",
+    "oracle tests/multilingual_contracts.py (minischema cannot express",
+    "maxItems), mirroring the mode-routing approach.",
+    "Provenance is frozen to 'synthetic' (const, like the fidelity corpus):",
+    "real consented multilingual speech must not be smuggled in.",
+    "Keyword subset: only keywords tests/minischema.py understands are",
+    "used, so jsonschema and the minischema fallback agree."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "provenance_policy",
+    "span_encoding",
+    "fixtures"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provenance_policy": {
+      "type": "string",
+      "minLength": 1
+    },
+    "span_encoding": {
+      "const": "unicode_codepoints"
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    }
+  },
+  "$defs": {
+    "languageTag": {
+      "$comment": "BCP-47 shaped tag; same pattern as fidelity-corpus fixture languages. Canonical casing is enforced by the oracle: lowercase primary, Titlecase 4-letter script subtags, uppercase 2-letter region subtags.",
+      "type": "string",
+      "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$"
+    },
+    "language": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "script", "direction", "display_name"],
+      "properties": {
+        "tag": {
+          "$ref": "#/$defs/languageTag"
+        },
+        "script": {
+          "$comment": "ISO 15924 four-letter code (Latn, Hebr, Hani, Arab, Cyrl, Jpan, Zyyy ...).",
+          "type": "string",
+          "pattern": "^[A-Z][a-z]{3}$"
+        },
+        "direction": {
+          "enum": ["ltr", "rtl"]
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "span": {
+      "$comment": "Half-open [start, end) over code points, matching mode-routing's span shape. Exactly 2 elements is oracle-enforced (minischema cannot express maxItems).",
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "span", "text"],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/languageTag"
+        },
+        "span": {
+          "$ref": "#/$defs/span"
+        },
+        "text": {
+          "$comment": "Must equal utterance[span[0]:span[1]] exactly (code-point slice).",
+          "type": "string"
+        }
+      }
+    },
+    "textExpectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reconstruction"],
+      "properties": {
+        "reconstruction": {
+          "const": "identity"
+        },
+        "astral_codepoints": {
+          "$comment": "Astral characters (> U+FFFF) deliberately present in the utterance; one code point each, two UTF-16 units each.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "textFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "provenance",
+        "languages",
+        "utterance",
+        "segments",
+        "expectations"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ml-[a-z0-9-]{2,60}$"
+        },
+        "kind": {
+          "enum": ["code-switching", "script-mixing", "rtl-in-ltr"]
+        },
+        "provenance": {
+          "const": "synthetic"
+        },
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
+        },
+        "utterance": {
+          "type": "string",
+          "minLength": 1
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/segment"
+          }
+        },
+        "expectations": {
+          "$ref": "#/$defs/textExpectations"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "numberCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locale", "expected", "rule"],
+      "properties": {
+        "locale": {
+          "$ref": "#/$defs/languageTag"
+        },
+        "expected": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule": {
+          "$comment": "Frozen rule id; must match the oracle's NUMBER_RULES table.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "numberFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "provenance",
+        "languages",
+        "input",
+        "source_locale",
+        "cases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ml-[a-z0-9-]{2,60}$"
+        },
+        "kind": {
+          "const": "number-locale"
+        },
+        "provenance": {
+          "const": "synthetic"
+        },
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
+        },
+        "input": {
+          "$comment": "Canonical formatted number in source_locale (non-negative plain decimal).",
+          "type": "string",
+          "minLength": 1
+        },
+        "source_locale": {
+          "$ref": "#/$defs/languageTag"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/numberCase"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "quoteCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locale", "quoted", "rule"],
+      "properties": {
+        "locale": {
+          "$ref": "#/$defs/languageTag"
+        },
+        "quoted": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule": {
+          "$comment": "Frozen rule id; must match the oracle's QUOTE_RULES table.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "quoteFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "provenance",
+        "languages",
+        "text",
+        "cases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ml-[a-z0-9-]{2,60}$"
+        },
+        "kind": {
+          "const": "quotation-locale"
+        },
+        "provenance": {
+          "const": "synthetic"
+        },
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
+        },
+        "text": {
+          "$comment": "Unquoted inner text, identical across locales.",
+          "type": "string",
+          "minLength": 1
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/quoteCase"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "casingCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "operation", "expected"],
+      "properties": {
+        "input": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "enum": ["upper", "lower"]
+        },
+        "expected": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "casingFixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "provenance",
+        "languages",
+        "locale",
+        "rule",
+        "cases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^ml-[a-z0-9-]{2,60}$"
+        },
+        "kind": {
+          "const": "casing-locale"
+        },
+        "provenance": {
+          "const": "synthetic"
+        },
+        "languages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/language"
+          }
+        },
+        "locale": {
+          "$comment": "Locale whose casing rules apply (tr-TR in v1).",
+          "$ref": "#/$defs/languageTag"
+        },
+        "rule": {
+          "$comment": "Frozen rule id; must match the oracle's CASING_RULES table.",
+          "type": "string",
+          "minLength": 1
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/casingCase"
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "fixture": {
+      "oneOf": [
+        { "$ref": "#/$defs/textFixture" },
+        { "$ref": "#/$defs/numberFixture" },
+        { "$ref": "#/$defs/quoteFixture" },
+        { "$ref": "#/$defs/casingFixture" }
+      ]
+    }
+  }
+}
