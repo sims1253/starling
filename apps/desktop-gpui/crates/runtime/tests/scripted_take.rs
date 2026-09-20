@@ -665,7 +665,20 @@ fn quiesce_timeout_salvages_samples_as_interrupted_take() {
             "salvage recorded: {takes:?}"
         );
     }
-    assert_eq!(client.snapshot().capture.state, "Persisted");
+    // The snapshot is a projection that can lag the collected events on a
+    // loaded runner: poll for the terminal state instead of racing it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.snapshot().capture.state == "Persisted" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture projection never reached Persisted: {:?}",
+            client.snapshot().capture.state
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     runtime.shutdown();
 }
 
