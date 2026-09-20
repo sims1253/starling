@@ -38,6 +38,7 @@ import { REFINEMENT_DEFAULT_INSTRUCTION, refineEffect, type RefinementSettings }
 import { StreamingDictation, type StreamingState } from "./streamingDictation";
 import { finishStreamingTake as finalizeStreamingTake } from "./streamingFinalize";
 import { TakeLifecycle, type TakePhase } from "./takeLifecycle";
+import { SessionDeleteDialog, deletionWarning } from "./sessionDeletion";
 import {
   attemptProvenanceLabel,
   canTranscribeAgain,
@@ -239,6 +240,23 @@ export default function App() {
   // issued mid-transition cannot interleave with it (#143).
   const [lifecycle] = useState(() => new TakeLifecycle());
   const [takePhase, setTakePhase] = useState<TakePhase>("idle");
+
+  // Deletion confirmation state (B05): the dialog is the only path to
+  // store.delete() for a saved recording. The guard instance sequences
+  // request/confirm/cancel; deletePendingId is its render mirror, so the
+  // modal appears and disappears with the guard's own truth.
+  const [deleteDialog] = useState(() => new SessionDeleteDialog());
+  const [deletePendingId, setDeletePendingId] = useState<string | undefined>(undefined);
+  const deleteCancelRef = useRef<HTMLButtonElement>(null);
+  const deleteDialogRef = useRef<HTMLElement>(null);
+  const trashButtonRef = useRef<HTMLButtonElement>(null);
+
+  /** Close the confirmation without deleting anything (Cancel or Escape). */
+  const cancelDeleteSession = useCallback(() => {
+    deleteDialog.cancel();
+    setDeletePendingId(undefined);
+  }, [deleteDialog]);
+
   // Identity of the take being started, captured before any await; bumped
   // whenever the current take is invalidated so late work disposes itself.
   const takeSeqRef = useRef(0);
@@ -248,6 +266,15 @@ export default function App() {
   const discardedTakesRef = useRef(new Set<number>());
 
   const selected = sessions.find((session) => session.id === selectedId);
+
+  // The take the deletion confirmation targets, while its dialog is open. A
+  // take removed from another window mid-dialog makes this undefined and the
+  // dialog simply closes: nothing is left to confirm (B05).
+  const deleteTarget =
+    deletePendingId === undefined
+      ? undefined
+      : sessions.find((session) => session.id === deletePendingId);
+
   const [audioUrl, setAudioUrl] = useState<string>();
 
   const [unsavedWavs, setUnsavedWavs] = useState<
@@ -593,6 +620,52 @@ export default function App() {
       gear?.focus();
     };
   }, [closeSettings, settingsOpen]);
+
+  // The deletion confirmation (B05): focus lands on Cancel, never on the
+  // destructive button, so keyboard activation of the trash button cannot
+  // roll straight into a confirmed delete — Enter alone opens and then
+  // cancels. Escape closes, Tab stays inside the dialog, and focus returns
+  // to the trash button that opened it.
+  useEffect(() => {
+    if (deletePendingId === undefined) return;
+
+    deleteCancelRef.current?.focus();
+    const trash = trashButtonRef.current;
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        cancelDeleteSession();
+
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const items = Array.from(
+        deleteDialogRef.current?.querySelectorAll<HTMLElement>(SETTINGS_FOCUSABLE) ?? [],
+      );
+
+      if (items.length === 0) return;
+
+      const active = items.findIndex((item) => item === document.activeElement);
+      const last = items.length - 1;
+
+      const next = event.shiftKey
+        ? items[active <= 0 ? last : active - 1]
+        : items[active === -1 || active === last ? 0 : active + 1];
+
+      if (!next) return;
+      event.preventDefault();
+      next.focus();
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      trash?.focus();
+    };
+  }, [cancelDeleteSession, deletePendingId]);
 
   const transcribe = useCallback(
     async (session: DictationSession) => {
@@ -1386,6 +1459,45 @@ export default function App() {
     }
   }
 
+  /**
+   * Open the deletion confirmation (B05) — the trash button never deletes
+   * straight away. A take whose transcription or refinement is still in
+   * flight is refused with the reason; anything else waits for the dialog's
+   * explicit confirm.
+   */
+  function requestDeleteSession(session: DictationSession) {
+    const intent = deleteDialog.request(session.id, {
+      transcribing: activeUploadsRef.current.has(session.id),
+      refining: refiningIdsRef.current.has(session.id),
+    });
+
+    if (intent.kind === "blocked") {
+      setError(intent.message);
+
+      return;
+    }
+
+    setDeletePendingId(intent.id);
+  }
+
+  /**
+   * The one path from the confirmation to the destructive write: the id
+   * handoff is exactly-once, so a double activation cannot re-delete, and
+   * the dialog is dismissed before the first await.
+   */
+  async function confirmDeleteSession() {
+    const id = deleteDialog.confirm();
+
+    setDeletePendingId(undefined);
+
+    if (id !== undefined) await removeSession(id);
+  }
+
+  /**
+   * Delete one saved recording. Reached only through the confirmation
+   * dialog's explicit confirm (B05); a failed delete leaves the recording
+   * and its versions intact and surfaces the error instead.
+   */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
@@ -1740,9 +1852,10 @@ export default function App() {
                 <Download size={16} /> Export
               </button>
               <button
+                ref={trashButtonRef}
                 className="danger"
                 disabled={activeIds.has(selected.id)}
-                onClick={() => void removeSession(selected.id)}
+                onClick={() => requestDeleteSession(selected)}
                 aria-label="Delete saved recording"
               >
                 <Trash2 size={16} />
@@ -1884,6 +1997,42 @@ export default function App() {
             </div>
           ) : null}
         </section>
+      )}
+
+      {deleteTarget && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => event.target === event.currentTarget && cancelDeleteSession()}
+        >
+          <section
+            ref={deleteDialogRef}
+            className="settings-card confirm-card"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-confirm-title"
+            aria-describedby="delete-confirm-warning"
+          >
+            <div className="settings-head">
+              <p className="eyebrow">DELETE RECORDING</p>
+              <h2 id="delete-confirm-title">Delete this saved recording?</h2>
+            </div>
+            <div className="settings-body">
+              <p id="delete-confirm-warning" className="confirm-warning">
+                {deletionWarning(deleteTarget)}
+              </p>
+            </div>
+            <div className="settings-footer">
+              {/* Focus starts on Cancel (the effect above), so the
+                  destructive button is never the default action. */}
+              <button className="secondary" ref={deleteCancelRef} onClick={cancelDeleteSession}>
+                Cancel
+              </button>
+              <button className="danger" onClick={() => void confirmDeleteSession()}>
+                Delete permanently
+              </button>
+            </div>
+          </section>
+        </div>
       )}
 
       {settingsOpen && (

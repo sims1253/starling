@@ -1007,6 +1007,13 @@ kbd {
 .settings-footer .secondary {
   background: transparent;
 }
+.confirm-card {
+  width: min(400px, 100%);
+}
+.settings-footer button.danger {
+  color: #a04435;
+  border-color: #a04435;
+}
 .settings-footer .primary {
   background: #25261f;
   color: #eeebdf;
