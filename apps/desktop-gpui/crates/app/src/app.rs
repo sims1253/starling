@@ -3,7 +3,8 @@
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -106,6 +107,63 @@ fn user_set_model_flag() -> bool {
     std::fs::read_to_string(Settings::default_path())
         .map(|text| text.contains("\"model\""))
         .unwrap_or(false)
+}
+
+/// Highest `-N` suffix attempted when dodging an existing download name.
+const MAX_DOWNLOAD_NAME_ATTEMPTS: u32 = 1_000;
+
+/// The `attempt`-th candidate name for a download: the first attempt is the
+/// requested name itself, later ones insert `-N` before the extension
+/// (`"starling-a.wav"` → `"starling-a-2.wav"`). A leading dot belongs to the
+/// stem (`.zshrc`), and extension-less names take the suffix at the end.
+fn download_name_candidate(name: &str, attempt: u32) -> String {
+    if attempt <= 1 {
+        return name.to_string();
+    }
+
+    let suffix = format!("-{attempt}");
+    match name.rfind('.') {
+        None | Some(0) => format!("{name}{suffix}"),
+        Some(dot) => format!("{}{suffix}{}", &name[..dot], &name[dot..]),
+    }
+}
+
+/// Write `bytes` into `dir` without ever overwriting an existing file (G05).
+///
+/// Every candidate name is opened with `create_new`, so an existing file —
+/// or a symlink planted at that name — fails the open with `AlreadyExists`
+/// instead of being replaced or followed, and the next `-N` candidate is
+/// tried. A failed body write removes the partial file, so a full disk or
+/// permission error never leaves a truncated export behind. Exclusive
+/// creation is what makes this collision-safe: there is deliberately no
+/// overwrite path to race with.
+fn write_download_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    for attempt in 1..=MAX_DOWNLOAD_NAME_ATTEMPTS {
+        let candidate = download_name_candidate(name, attempt);
+        let path = dir.join(&candidate);
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    // Never leave a truncated export behind on disk.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free filename for {name:?} in the downloads directory"),
+    ))
 }
 
 impl StarlingApp {
@@ -449,14 +507,29 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
+            let requested = name.clone();
             let result = cx
                 .background_spawn(async move {
                     let dir = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
-                    std::fs::write(dir.join(&name), bytes.as_slice())
+                    write_download_exclusive(&dir, &requested, bytes.as_slice())
+                        .map(|path| (dir, path))
                 })
                 .await;
             this.update(cx, |app, cx| match result {
-                Ok(()) => {
+                Ok((dir, path)) => {
+                    // G05: an export that had to change names is surfaced,
+                    // never silently written next to the file it dodged.
+                    if path.file_name().and_then(|file| file.to_str()) != Some(name.as_str()) {
+                        let landed = path
+                            .file_name()
+                            .and_then(|file| file.to_str())
+                            .unwrap_or_default();
+                        app.capture_warning = Some(format!(
+                            "Exported as {landed} — {name} already existed in {} and was left \
+                             untouched.",
+                            dir.display()
+                        ));
+                    }
                     if mark_saved {
                         app.wav_saved = true;
                         app.schedule_flag_reset(false, true, cx);
@@ -624,5 +697,127 @@ impl Render for StarlingApp {
             .when(self.settings_open, |root| {
                 root.child(views::render_settings_modal(self, window, cx))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh scratch directory under the system temp dir, removed first so
+    /// reruns start clean. Each test uses its own tag.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("starling-g05-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn candidate_names_suffix_before_the_extension() {
+        assert_eq!(download_name_candidate("starling-a.txt", 1), "starling-a.txt");
+        assert_eq!(
+            download_name_candidate("starling-2026-a.wav", 2),
+            "starling-2026-a-2.wav"
+        );
+        assert_eq!(download_name_candidate("starling-a.wav", 10), "starling-a-10.wav");
+        // Extension-less names take the suffix at the end.
+        assert_eq!(download_name_candidate("readme", 3), "readme-3");
+        // A leading dot is the stem, not an extension.
+        assert_eq!(download_name_candidate(".zshrc", 2), ".zshrc-2");
+    }
+
+    #[test]
+    fn exclusive_write_errors_without_overwriting_when_all_names_are_taken() {
+        let dir = scratch_dir("exhausted");
+        // Seed every candidate the policy would try: the name plus -2..-1000.
+        for attempt in 1..=MAX_DOWNLOAD_NAME_ATTEMPTS {
+            let candidate = download_name_candidate("starling-t.txt", attempt);
+            std::fs::write(dir.join(&candidate), format!("seed {attempt}"))
+                .expect("seed candidate");
+        }
+
+        let result = write_download_exclusive(&dir, "starling-t.txt", b"NEW");
+        assert!(result.is_err(), "exhausted candidates error out");
+
+        // The very first file is still the original seed, byte for byte.
+        assert_eq!(
+            std::fs::read(dir.join("starling-t.txt")).expect("read original"),
+            b"seed 1"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclusive_write_lands_on_a_free_name() {
+        let dir = scratch_dir("free");
+        let path = write_download_exclusive(&dir, "starling-t.wav", b"NEW")
+            .expect("write succeeds");
+        assert_eq!(path, dir.join("starling-t.wav"));
+        assert_eq!(std::fs::read(&path).expect("read back"), b"NEW");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclusive_write_never_overwrites_existing_content() {
+        let dir = scratch_dir("keep-old");
+        std::fs::write(dir.join("starling-t.txt"), b"OLD TRANSCRIPT")
+            .expect("seed the existing export");
+
+        let path = write_download_exclusive(&dir, "starling-t.txt", b"NEW TRANSCRIPT")
+            .expect("dodges instead of failing");
+
+        // The user's existing file is byte-for-byte untouched.
+        assert_eq!(
+            std::fs::read(dir.join("starling-t.txt")).expect("read original"),
+            b"OLD TRANSCRIPT"
+        );
+        assert_eq!(path, dir.join("starling-t-2.txt"));
+        assert_eq!(
+            std::fs::read(&path).expect("read new export"),
+            b"NEW TRANSCRIPT"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclusive_write_walks_past_a_chain_of_collisions() {
+        let dir = scratch_dir("chain");
+        std::fs::write(dir.join("starling-t.txt"), b"1").expect("seed");
+        std::fs::write(dir.join("starling-t-2.txt"), b"2").expect("seed");
+
+        let path = write_download_exclusive(&dir, "starling-t.txt", b"3").expect("third name");
+        assert_eq!(path, dir.join("starling-t-3.txt"));
+        assert_eq!(std::fs::read(dir.join("starling-t.txt")).expect("original"), b"1");
+        assert_eq!(std::fs::read(dir.join("starling-t-2.txt")).expect("second"), b"2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exclusive_write_surfaces_unwritable_targets_as_errors() {
+        let missing = std::env::temp_dir().join("starling-g05-no-such-dir");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(
+            write_download_exclusive(&missing, "starling-t.txt", b"x").is_err(),
+            "a missing directory must surface an error, not create files elsewhere"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_write_does_not_follow_a_symlink_planted_at_the_name() {
+        let dir = scratch_dir("symlink");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"PRECIOUS").expect("seed symlink target");
+        std::os::unix::fs::symlink(&target, dir.join("starling-t.txt")).expect("plant symlink");
+
+        let path =
+            write_download_exclusive(&dir, "starling-t.txt", b"EXPORT").expect("dodges symlink");
+
+        // The symlink and its target are untouched; the export landed beside it.
+        assert_eq!(std::fs::read(&target).expect("target content"), b"PRECIOUS");
+        assert_eq!(path, dir.join("starling-t-2.txt"));
+        assert_eq!(std::fs::read(&path).expect("export content"), b"EXPORT");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
