@@ -1642,11 +1642,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
    "branch": "program/wave-b",
    "evidence": [
-    "PR #200 OCR three passes (30 findings)"
+    "coordinator rerun (clean --rerun-tasks): 106/106 (was 94); Files.move(ATOMIC_MOVE)+aside fallback; import lock narrowed to promote; full tensor-section validation mirroring pinned ggml (43-type table probe-compiled); parse perf fixes; ONE bot finding factually rebutted (readU32<0 checks ARE needed for crafted >=0x80000000) and fixed via the findings own alternative"
    ],
    "notes": "re-prioritized per bot meta-feedback: File.renameTo atomicity + staged-file handling + parse perf FIRST; arch-length cap is rejection-path only (lower); then the lows; 3rd-pass lows (4) forwarded to the running agent via SendMessage"
   },
