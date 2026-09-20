@@ -279,16 +279,19 @@ struct KKeyHash { size_t operator()(const KKey& k) const noexcept {
 // distinct encoder lengths at steady state — the same order as the encoder
 // LRU's 16 entries at its worst-case shape — while bounding what was
 // previously unbounded growth across distinct lengths. Override with
-// STARLING_TDT_GRAPH_BUDGET_MB (>= 1 MiB); read lazily at first cache
-// construction so tests can set the env first (replay_cache_size pattern).
+// STARLING_TDT_GRAPH_BUDGET_MB (a whole number of MiB >= 1); read lazily at
+// first cache construction so tests can set the env first (replay_cache_size
+// pattern). The override is STRICTLY validated by env_budget_bytes
+// (runtime/lru_cache.hpp): garbage, trailing junk, zero, or plain negative
+// values are rejected with a stderr diagnostic (default applies), and a
+// value whose magnitude overflows the parser (ERANGE, either sign) or whose
+// << 20 would wrap is loudly clamped — never silently truncated (the old
+// atol parse) and never wrapped.
 constexpr size_t kDefaultTdtGraphBudgetBytes = size_t(128) << 20;
 
 size_t tdt_graph_byte_budget() {
-    if (const char* e = std::getenv("STARLING_TDT_GRAPH_BUDGET_MB")) {
-        long v = std::atol(e);
-        if (v >= 1) return (size_t)v << 20;
-    }
-    return kDefaultTdtGraphBudgetBytes;
+    return env_budget_bytes("STARLING_TDT_GRAPH_BUDGET_MB",
+                            kDefaultTdtGraphBudgetBytes);
 }
 
 using KStepCache = ByteBudgetLruCache<KKey, KStepGraph, KKeyHash>;
@@ -775,8 +778,17 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     } catch (const std::exception& ex) {
         if (dbg) std::fprintf(stderr, "[tdt_multistep] K-step graph build failed: %s\n", ex.what());
         return std::nullopt;       // caller falls back to the serial loop
+    } catch (...) {
+        // Non-std exceptions take the same fallback. The cache's rollback is
+        // NOT limited to std::exception — get_or_init_pinned's catch(...)
+        // has already erased the half-built entry (no bytes retained), and
+        // the KStepLease destructor above released the pin on the way out —
+        // so there is no entry state left to clean up here either.
+        if (dbg) std::fprintf(stderr, "[tdt_multistep] K-step graph build failed: non-standard exception\n");
+        return std::nullopt;       // caller falls back to the serial loop
     }
-    if (!kg) return std::nullopt;       // unreachable (acquire throws or returns)
+    // (acquire_kstep either throws — handled above, with the cache rolling
+    // the entry back — or returns a pinned graph; no null-return path exists.)
     if (dbg) std::fprintf(stderr, "[tdt_multistep] K=%d T=%d d1=%d (graph built)\n", K, T, (int)d1);
     // Seed enc_proj once (persists across replays in the input tensor).
     kg->rg->set_input(kg->in_enc_proj, enc_proj.data(), (size_t)T * Hj * sizeof(float));
