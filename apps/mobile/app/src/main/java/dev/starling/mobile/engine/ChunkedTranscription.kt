@@ -89,8 +89,8 @@ object ChunkedTranscription {
         // cpp/serve/stream_session.cpp). The sentinels are unique per side
         // and position and cannot collide with a real key — normalizeWord
         // strips \u0000 along with other non-word characters.
-        val tailKeys = tail.map(::normalizeWord).mapIndexed { index, key -> key.ifEmpty { "\u0000tail-$index" } }
-        val headKeys = head.map(::normalizeWord).mapIndexed { index, key -> key.ifEmpty { "\u0000head-$index" } }
+        val tailKeys = tail.mapIndexed { index, word -> normalizeWord(word).ifEmpty { "\u0000tail-$index" } }
+        val headKeys = head.mapIndexed { index, word -> normalizeWord(word).ifEmpty { "\u0000head-$index" } }
         val run = longestCommonRun(tailKeys, headKeys)
             ?: return committedWords + newWords
         if (run.length < minMatch) return committedWords + newWords
