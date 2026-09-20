@@ -123,3 +123,16 @@ Review loop: OCR bots re-review pushed branches; harvest/triage is automated
 Validation gaps (unchanged + new): no GPU timing/quality runs (S01 acceptance
 2-3 open), no real-model A/B, no packaged-app/device runs, no Android/iOS
 builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
+
+## Update 2026-09-20 (evening) — local iGPU validation + hardware split
+
+- AMD Cezanne iGPU (Vulkan 1.4/RADV) discovered on this notebook: all four
+  engine suites pass on the VULKAN device backend (program/gpu-validation,
+  build-vk): device_cache_clear (backend=Vulkan0), greedy_termination,
+  tdt_graph_budget (graphs + pointer stability on-device), stream_session
+  235/235. S01/S02/S03 "source-read only" device gaps are CLOSED for Vulkan;
+  CUDA timing/quality remains for the user's RTX 5090 (runbook:
+  VALIDATION.md on program/gpu-validation, pushed).
+- I1 COMPLETE (ring + journal): 133/133 + 23/23, PR #194 @ 9343bb1.
+- B01: first agent died on API rate limit; continuation agent dispatched.
+- program/gpu-validation branch = S01+S02+S03 merged + runbook.

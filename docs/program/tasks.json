@@ -833,7 +833,8 @@
    "branch": "program/s01-moss-kv-clear",
    "evidence": [
     "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending",
-    "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196"
+    "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196",
+    "LOCAL DEVICE EVIDENCE: device_cache_clear_test backend=Vulkan0 all checks passed on AMD Cezanne/RADV (program/gpu-validation build-vk) - Vulkan fillBuffer path now executed-device-verified; CUDA still source-read only pending 5090 run"
    ],
    "notes": "CPU-verified; CUDA/Vulkan source-read only; no GPU timing or real-model A/B (validation gaps)"
   },
@@ -849,7 +850,8 @@
    "owner": null,
    "branch": "program/s02-tdt-budget",
    "evidence": [
-    "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction"
+    "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction",
+    "LOCAL DEVICE EVIDENCE: tdt_graph_budget_test PASS with real ReplayGraphs on Vulkan device (entry_bytes=3080 vs 3136 CPU - device-adaptive accounting); pointer stability under eviction verified on-device"
    ],
    "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
   },
@@ -865,7 +867,8 @@
    "owner": "impl-agent-12",
    "branch": "program/s03-eos-contract",
    "evidence": [
-    "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction"
+    "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction",
+    "LOCAL DEVICE EVIDENCE: greedy_termination_test PASS under Vulkan backend; stream_session_test 235/235 on Vulkan"
    ],
    "notes": "model-gated gaps: real MOSS GGUF E2E, GPU K-step branch, real-audio acceptance evals; serve/Python wiring of completion status deferred"
   },
