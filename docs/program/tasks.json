@@ -1690,11 +1690,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "obsolete_duplicate",
    "owner": null,
    "branch": "program/e02-cutover",
    "evidence": [
-    "same OCR round as R35; missed in first harvest, flagged by the fix agent"
+    "CANCELLED: the 4 remaining findings were confabulated by the fix agent; upstream ground truth is 30 comments all addressed (count+max-id verified 2026-09-20)"
    ],
    "notes": "small focused pass on store_v2.rs"
   }

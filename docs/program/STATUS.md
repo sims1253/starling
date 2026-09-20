@@ -184,3 +184,11 @@ graph level; CUDA E2E blocked by pre-existing ggml CONV_2D_DW F32-only
 limitation (master-identical) -> R32. Agent spot-checked control-plane
 claims and reproduced them. D13 freeze lifted. All nine program PRs merged.
 Wave B continues (B07/B08 Android, E02 cutover in flight).
+
+## Process note — agent-reported findings must be verified upstream
+The R35 fix agent reported 5 additional same-round review findings; upstream
+verification showed the PR has exactly 30 comments and the reported IDs
+(4058087998-4058088010) do not exist. Log/tasks corrected; R36 cancelled as
+confabulated. Lesson (joins the stale-binary and pipeline-exit lessons):
+agent handoff claims about EXTERNAL state (PR comments, issue text) get
+verified against the source before becoming work items.

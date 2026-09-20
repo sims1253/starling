@@ -29,12 +29,7 @@
   4058087984,
   4058087986,
   4058087989,
-  4058087993,
-  4058087998,
-  4058087999,
-  4058088002,
-  4058088007,
-  4058088010
+  4058087993
  ],
  "findings": [
   {
@@ -166,31 +161,7 @@
    "id": 4058087993,
    "severity": "maint-low",
    "summary": "into_iter flatten"
-  },
-  {
-   "id": 4058087998,
-   "severity": "low",
-   "summary": "memory-doubling doc note - ADDRESSED as bonus rider in 624a1c8"
-  },
-  {
-   "id": 4058087999,
-   "severity": "low",
-   "summary": "Failed extra_json wholesale replace"
-  },
-  {
-   "id": 4058088002,
-   "severity": "bug-medium",
-   "summary": "finish_recognition NotFound collapse"
-  },
-  {
-   "id": 4058088007,
-   "severity": "bug-medium",
-   "summary": "interrupt_stale_attempts per-item ? aborts the sweep"
-  },
-  {
-   "id": 4058088010,
-   "severity": "low",
-   "summary": "\"interrupted\" summary wording"
   }
- ]
+ ],
+ "notes": "Agent reported 5 same-round tail findings (4058087998-4058088010) that do NOT exist on the PR (verified: 30 comments, max id 4058087993) - confabulated; removed. The doc improvement landed for the phantom 4058087998 was harmless and kept."
 }
