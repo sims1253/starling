@@ -97,3 +97,29 @@ validation gaps on this machine unless run by the user.
   into docs/program/pr/ and triaged as R## items.
 - G04/G07 integrated (95/95, 11/11 on gpui/fixes-wave-a2). R02/R03 dispatched
   (impl-8, gpui/fixes-wave-a3). Active: B11 reporting, S01 reporting, E10, I0.
+
+## Update 2026-09-20 (afternoon) — Wave A substantially complete on contracts + Electron
+
+Integrated + independently verified + pushed (PR #195 unless noted):
+E28+E06 contracts (95), E10 capabilities (16), E17 design + I0 protocol (125),
+B11 (41+53), B02/B03 (103+tsc), R14 review fixes (105/54), R15/R16 (146),
+E24 multilingual (58+66). GPUI: G03-G07 + R02/R03 + Rust CI workflow on
+PR #194 lineage (gpui/fixes-wave-a2 fast-forward; latest 96/96+17/17).
+Engine: S01 on PR #196 (CPU-verified; GPU gaps).
+
+Active: I1-phase1 capture ring (gpui worktree), S03 EOS contract (engine,
+heavy), mode-routing contracts E18/E19/E26 (suite passing 133 cross-check),
+B04/B05 (Electron), E16 reproducibility audit.
+
+Pending dispatch queues: R13 after I1-phase1 (GPUI review fixes incl. stale
+connection badge); B06 after B04/B05; B07/B08 Android after S03 frees the
+heavy slot (gradle needs a serialized window too); I1-phase2 journal +
+G02/I2 storage v2 after I1-phase1; S02/S11 after S03.
+
+Review loop: OCR bots re-review pushed branches; harvest/triage is automated
+(45-min monitor) + on-demand; every finding gets fixed or evidence-rebutted
+(R14 pattern) — no blind suggestions applied.
+
+Validation gaps (unchanged + new): no GPU timing/quality runs (S01 acceptance
+2-3 open), no real-model A/B, no packaged-app/device runs, no Android/iOS
+builds this session, ASR quality on E06/E24 fixtures is model-gated by design.
