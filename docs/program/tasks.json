@@ -1646,9 +1646,9 @@
    "owner": null,
    "branch": "program/wave-b",
    "evidence": [
-    "PR #200 OCR first review (15) + second pass (11) = 26 findings"
+    "PR #200 OCR three passes (30 findings)"
    ],
-   "notes": "re-prioritized per bot meta-feedback: File.renameTo atomicity + staged-file handling + parse perf FIRST; arch-length cap is rejection-path only (lower); then the lows"
+   "notes": "re-prioritized per bot meta-feedback: File.renameTo atomicity + staged-file handling + parse perf FIRST; arch-length cap is rejection-path only (lower); then the lows; 3rd-pass lows (4) forwarded to the running agent via SendMessage"
   },
   {
    "id": "R34",
