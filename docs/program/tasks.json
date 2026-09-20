@@ -174,11 +174,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "in_progress",
    "owner": null,
-   "branch": null,
+   "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "impl-agent-4, failing-test-first"
   },
   {
    "id": "E01",
@@ -451,11 +451,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "in_progress",
    "owner": null,
-   "branch": null,
+   "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "design note by design-agent; doc only"
   },
   {
    "id": "E18",
@@ -626,11 +626,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-1",
    "branch": "gpui/fixes-wave-a",
-   "evidence": [],
-   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92"
+   "evidence": [
+    "impl-agent-1 + coordinator rerun: cargo test -p starling-dictation 94/94, -p starling-gpui 7/7 on gpui/fixes-wave-a ba2abd3"
+   ],
+   "notes": "live-mic capture test ran on real hardware; no full-app 44.1/48k E2E run yet"
   },
   {
    "id": "G04",
@@ -640,11 +642,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "in_progress",
    "owner": null,
-   "branch": null,
+   "branch": "gpui/fixes-wave-a2",
    "evidence": [],
-   "notes": ""
+   "notes": "impl-agent-3, stacked branch"
   },
   {
    "id": "G05",
@@ -654,11 +656,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-1",
    "branch": "gpui/fixes-wave-a",
-   "evidence": [],
-   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92"
+   "evidence": [
+    "coordinator rerun: 7/7 app-crate tests; create_new semantics incl. symlink dodge; a889f89"
+   ],
+   "notes": "Windows/macOS path behavior untested; no reveal action"
   },
   {
    "id": "G06",
@@ -668,11 +672,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": "impl-agent-1",
    "branch": "gpui/fixes-wave-a",
-   "evidence": [],
-   "notes": "single-agent bundle; recon-confirmed locations: upload.rs L24-36, app.rs L455, audio.rs L90-92; TS behavioral reference = packages/dictation resample (issue #122 acceptance)"
+   "evidence": [
+    "coordinator rerun: 94/94 dictation tests; 12kHz@48k alias <= -40dB with seeded linear control that fails; d47b1d0"
+   ],
+   "notes": "PORT.md update deferred to next agent (gpui/fixes-wave-a2); real hardware capture path unverified"
   },
   {
    "id": "G07",
@@ -682,11 +688,11 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "in_progress",
    "owner": null,
-   "branch": null,
+   "branch": "gpui/fixes-wave-a2",
    "evidence": [],
-   "notes": ""
+   "notes": "impl-agent-3, shared PCM fixture"
   },
   {
    "id": "E26",
@@ -782,11 +788,11 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "in_progress",
    "owner": null,
-   "branch": null,
+   "branch": "program/s01-moss-kv-clear",
    "evidence": [],
-   "notes": ""
+   "notes": "impl-agent-5 in starling-s01 worktree; -j3 cap; GPU timing = validation gap"
   },
   {
    "id": "S02",
@@ -1245,12 +1251,45 @@
  "active_assignments": [
   {
    "ids": [
-    "G03",
-    "G05",
-    "G06"
+    "E06",
+    "E28"
    ],
-   "agent": "impl-agent-1",
-   "branch": "gpui/fixes-wave-a"
+   "agent": "impl-agent-2",
+   "branch": "program/wave-a",
+   "scope": "packages/contracts + tests (light)"
+  },
+  {
+   "ids": [
+    "G04",
+    "G07"
+   ],
+   "agent": "impl-agent-3",
+   "branch": "gpui/fixes-wave-a2",
+   "scope": "gpui worktree Rust (light)"
+  },
+  {
+   "ids": [
+    "B11"
+   ],
+   "agent": "impl-agent-4",
+   "branch": "program/wave-a",
+   "scope": "apps/desktop TS (light)"
+  },
+  {
+   "ids": [
+    "E17"
+   ],
+   "agent": "design-agent",
+   "branch": "program/wave-a",
+   "scope": "docs/program/design only"
+  },
+  {
+   "ids": [
+    "S01"
+   ],
+   "agent": "impl-agent-5",
+   "branch": "program/s01-moss-kv-clear",
+   "scope": "starling-s01 worktree; sole heavy-build slot (-j3)"
   }
  ]
 }
