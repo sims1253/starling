@@ -5,5 +5,7 @@
   5748729598
  ],
  "notes": "pullfrog checkout + coderabbit skip-review only; OCR bot had not run as of first harvest",
- "harvested_at": "2026-09-20T08:46:28+00:00"
+ "harvested_at": "2026-09-20T08:46:28+00:00",
+ "last_review_comment_at": null,
+ "last_issue_comment_at": null
 }

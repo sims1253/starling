@@ -969,10 +969,7 @@
    "deps": [
     "S02"
    ],
-   "existing_issue": [
-    178,
-    174
-   ],
+   "existing_issue": 178,
    "status": "pending",
    "owner": null,
    "branch": null,
@@ -1028,11 +1025,7 @@
    "kind": "experiment",
    "area": "serving",
    "deps": [],
-   "existing_issue": [
-    171,
-    176,
-    168
-   ],
+   "existing_issue": 171,
    "status": "pending",
    "owner": null,
    "branch": null,
@@ -1280,6 +1273,70 @@
     "all 4 code fixes + 3 regression tests; 98+0 passed (test_fidelity_corpus+insight_events), server_routing 21 unregressed"
    ],
    "notes": "trailing newline (pr193-log.json, already fixed in harvest); LE-safe WAV bytes (fidelity_audio.py); overlap clamp (fidelity_scorers.py L203); bool/int type-aware const/enum equality + empty-combiner guard (minischema.py L78/L121). Execute in coordinator session; tests/ is agent-shared."
+  },
+  {
+   "id": "R13",
+   "title": "Address PR #194 OCR review on GPUI fixes (6 findings; 1 medium: stale connection badge after mid-session transport failure)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+   ],
+   "notes": "queue behind impl-10; recorder.rs finding absorbed by I1 rewrite"
+  },
+  {
+   "id": "R14",
+   "title": "Address PR #195 OCR review on Electron/dictation code (2 medium: legacy threadJoinedAt stamp/ordering regressions; RefinedDraft duplication; threadContext pass-through; durationMs dead weight)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "pending",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+   ],
+   "notes": "queue behind impl-11; verify durationMs against B03 outcome first"
+  },
+  {
+   "id": "R15",
+   "title": "Address PR #195 OCR review on capabilities contract (2 medium: fixtures envelope unexercised, adoption scan misses .tsx; plus (fixed) cli_flag doc)",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+   ],
+   "notes": "files owned by completed E10 agent; dispatchable now"
+  },
+  {
+   "id": "R16",
+   "title": "Contract-test hardening from PR #195 review (5 findings: read_wav rate assert, assert-under-O, nonnegative NaN, $ref siblings+escapes, losslessness compares values)",
+   "priority": "P3",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": null,
+   "branch": "program/wave-a",
+   "evidence": [
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+   ],
+   "notes": "dispatching now; resolved-by-R12: bool/enum equality, empty combiner, overlap clamp (bots reviewed pre-R12 state)"
   }
  ],
  "active_assignments": [
