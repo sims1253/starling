@@ -1401,6 +1401,22 @@
     "both engine test targets added to ci-starling-serve.yml build+run lists with comment; yaml validated"
    ],
    "notes": "explicit --target list + run list in ci-starling-serve.yml; device_cache_clear_test likely same gap - verify"
+  },
+  {
+   "id": "R19",
+   "title": "Fix PR #194 CI: rust workflow needs libasound2-dev; G07 TS test fails lint gate",
+   "priority": "P1",
+   "kind": "ci",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "in_progress",
+   "owner": "coordinator",
+   "branch": "gpui/fixes-wave-a7",
+   "evidence": [
+    "PR #194 checks 2026-09-20: alsa-sys build script fails (no ALSA headers on runner); Desktop matrix red on packages/dictation/test/audio.test.ts 4 lint errors (type assertion without SAFETY, typeof narrowing, 2 blank-line)"
+   ],
+   "notes": "audio.test.ts authored in gpui worktree which lacks node_modules - JS gates never ran there; fixing + verifying via main-checkout lint. code-review bot workflow itself failed on #196/#197 at open time (bot-side exit 1; later runs on other PRs succeeded) - no action possible from agents; re-triggers on next push."
   }
  ],
  "active_assignments": [

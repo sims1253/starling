@@ -14,5 +14,6 @@
    "severity": "other-medium",
    "summary": "test binary not in ci-starling-serve.yml explicit target/run lists"
   }
- ]
+ ],
+ "notes": "same code-review failure at open"
 }
