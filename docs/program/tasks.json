@@ -577,11 +577,11 @@
     "E10"
    ],
    "existing_issue": null,
-   "status": "pending",
-   "owner": null,
-   "branch": null,
+   "status": "in_progress",
+   "owner": "impl-agent-16",
+   "branch": "program/wave-a",
    "evidence": [],
-   "notes": ""
+   "notes": "contract-level: multilingual/code-switching fixtures + locale contracts building on E06 corpus + E10 capabilities"
   },
   {
    "id": "E25",
@@ -1318,11 +1318,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": null,
    "branch": "program/wave-a",
    "evidence": [
-    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215",
+    "coordinator rerun: 146/146 across capabilities+fidelity+insight+runtime-protocol suites (4f1bdd2, 4eb5286); NaN finding premise stale (already guarded by isfinite), pinned with new test"
    ],
    "notes": "files owned by completed E10 agent; dispatchable now"
   },
@@ -1334,11 +1335,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "in_progress",
+   "status": "integrated",
    "owner": null,
    "branch": "program/wave-a",
    "evidence": [
-    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215"
+    "PR #194/#195 OCR runs 35500208623/35500581225/35500796247/35501270215",
+    "coordinator rerun: 146/146 across capabilities+fidelity+insight+runtime-protocol suites (4f1bdd2, 4eb5286); NaN finding premise stale (already guarded by isfinite), pinned with new test"
    ],
    "notes": "dispatching now; resolved-by-R12: bool/enum equality, empty combiner, overlap clamp (bots reviewed pre-R12 state)"
   }
@@ -1401,6 +1403,14 @@
    "agent": "impl-agent-15",
    "branch": "program/wave-a",
    "scope": "apps/desktop + packages/dictation (light)"
+  },
+  {
+   "ids": [
+    "E24"
+   ],
+   "agent": "impl-agent-16",
+   "branch": "program/wave-a",
+   "scope": "packages/contracts/multilingual + tests (light)"
   }
  ],
  "prs": {
