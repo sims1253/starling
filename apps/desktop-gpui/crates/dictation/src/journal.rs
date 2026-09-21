@@ -668,8 +668,13 @@ pub fn delete_session_and_journal(
         // The #215 fallback: a journal file sharing the session directory's
         // name belongs to this take by construction (journal ids are unique
         // per take, and only a journal-linked take names its session after
-        // the journal). Only a safe path component is ever probed.
+        // the journal) — but ONLY when that directory is actually the
+        // crash-window shape (no valid manifest of its own). A uuid-named
+        // session from before #215 that happens to collide with a journal
+        // id is a healthy record, not an orphan: deleting it must leave the
+        // unrelated live journal alone (#247 review).
         (crate::storage::is_safe_path_component(session_id)
+            && store.is_unmanifested_session_dir(session_id)
             && journals_root.join(format!("{session_id}.{JOURNAL_EXT}")).exists())
             .then(|| session_id.to_string())
     });
@@ -689,7 +694,13 @@ pub struct RecoveryReport {
     pub repaired: Vec<String>,
     /// Journals with zero verified samples: kept in place, no session made.
     pub empty_journals: Vec<String>,
-    /// Files that could not be parsed: `(name, reason)`. Kept in place.
+    /// Journals that could not be recovered, and why: `(name, reason)`.
+    /// Kept in place and retried on the next startup. Beyond parse
+    /// failures this also carries deliberately-not-recovered cases — an
+    /// id that is not a safe path component, a session name already
+    /// occupied by a valid record, and per-session repair/save failures
+    /// (#247 review) — so render it as "left in place, needs attention",
+    /// not strictly as corrupt-file diagnostics.
     pub unreadable: Vec<(String, String)>,
 }
 
@@ -721,7 +732,7 @@ impl RecoveryReport {
         }
         if !self.unreadable.is_empty() {
             parts.push(format!(
-                "{} journal file{} could not be read and were left in place",
+                "{} journal file{} could not be recovered and were left in place",
                 self.unreadable.len(),
                 if self.unreadable.len() == 1 { "" } else { "s" }
             ));
@@ -811,9 +822,11 @@ fn repair_note(parsed: &ParsedJournal) -> String {
 /// `journals/` (a restored backup, a copied disk) must not resurrect into an
 /// interrupted take that contradicts the deletion the user watched.
 ///
-/// A storage failure while saving a recovery aborts the scan with the error
-/// (the remaining journals simply stay unlinked and are retried on the next
-/// startup) rather than pretending the recovery succeeded.
+/// A per-session or per-journal failure — a repair or save that errors, a
+/// name that is occupied, an id that is not path-safe — is reported into
+/// [`RecoveryReport::unreadable`] and the scan continues: one broken
+/// record must not block recovery of the rest (#247 review). The affected
+/// journals stay in place and are retried on the next startup.
 pub fn recover_interrupted_takes(
     store: &FileSessionStore,
     journals_dir: &Path,
@@ -887,11 +900,24 @@ pub fn recover_interrupted_takes(
                 if parsed.samples.is_empty() || parsed.sample_rate == 0 {
                     // Nothing verified to rebuild from: the damaged record
                     // stays flagged by the listing, the journal stays as
-                    // evidence.
+                    // evidence — but the permanently unrecoverable take
+                    // must still surface as a startup finding, like every
+                    // other dead end here (#247 review).
+                    report.unreadable.push((
+                        id,
+                        "linked session needs audio repair but the journal holds no \
+                         verified samples"
+                            .to_string(),
+                    ));
                     continue;
                 }
                 let torn = parsed.torn_tail_bytes > 0 || !parsed.finalized;
                 let note = torn.then(|| repair_note(&parsed));
+                // The rebuilt audio's own duration: a torn journal restores
+                // only a verified prefix, so the manifest's original
+                // duration would describe audio that is no longer there.
+                let rebuilt_duration_ms =
+                    parsed.samples.len() as f64 * 1000.0 / parsed.sample_rate as f64;
                 let rate = parsed.sample_rate;
                 let wav = match encode_wav_16k(&PcmAudio {
                     samples: parsed.samples,
@@ -908,13 +934,20 @@ pub fn recover_interrupted_takes(
                     }
                 };
                 for session_id in session_ids {
-                    store.repair_session_audio(&session_id, &wav)?;
-                    if let Some(note) = note.as_deref() {
-                        // A torn journal rebuilt only a verified prefix:
-                        // say so on the session (idempotent on rerun only
-                        // while the WAV stays damaged; the note is
-                        // best-effort after the audio itself is durable).
-                        store.mark_interrupted(&session_id, note)?;
+                    // One broken session must not abort the whole startup
+                    // scan: report it and keep repairing the rest (#247
+                    // review — every sibling failure path reports and
+                    // continues).
+                    if let Err(err) = store.repair_session_audio(
+                        &session_id,
+                        &wav,
+                        Some(rebuilt_duration_ms),
+                        note.as_deref(),
+                    ) {
+                        report
+                            .unreadable
+                            .push((id.clone(), format!("repair {session_id}: {err}")));
+                        continue;
                     }
                     report.repaired.push(session_id);
                 }
@@ -962,11 +995,17 @@ pub fn recover_interrupted_takes(
             }
         };
 
-        match store.save_journal_recovery(&id, wav, Some(duration_ms), &note)? {
-            RecoverySave::Created(session) | RecoverySave::Healed(session) => {
+        // One journal's save failure must not abort the whole startup scan
+        // (#247 review): report it and keep recovering the rest — the
+        // journal stays in place and is retried on the next startup.
+        match store.save_journal_recovery(&id, wav, Some(duration_ms), &note) {
+            Ok(RecoverySave::Created(session)) | Ok(RecoverySave::Healed(session)) => {
                 report.recovered.push(session);
             }
-            RecoverySave::Occupied(reason) => report.unreadable.push((id, reason)),
+            Ok(RecoverySave::Occupied(reason)) => report.unreadable.push((id, reason)),
+            Err(err) => report
+                .unreadable
+                .push((id, format!("could not save the recovered session: {err}"))),
         }
     }
 
@@ -1986,6 +2025,130 @@ mod tests {
             restored.wav.as_slice(),
             expected.as_slice(),
             "the rebuilt audio is exactly the verified prefix"
+        );
+        assert_eq!(
+            restored.duration_ms,
+            Some(100.0),
+            "the manifest describes the rebuilt prefix (1600 samples @ 16 kHz), \
+             not the full take it used to describe"
+        );
+    }
+
+    /// #247 review: one broken session must not abort the whole startup
+    /// scan — a repair failure is reported and the remaining damaged
+    /// sessions are still repaired.
+    #[test]
+    fn one_broken_damaged_session_does_not_abort_the_scan() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let mut damaged = Vec::new();
+        for offset in [0u32, 9_000] {
+            let samples = ramp(2_400, offset); // 100 ms at 24 kHz
+            let mut writer = writer_in(&journals_dir, 24_000);
+            let journal_id = writer.id().to_string();
+            writer.append_frames(&samples).expect("append");
+            writer.finalize().expect("finalize");
+            drop(writer);
+            let wav = encode_wav_16k(&PcmAudio {
+                samples,
+                sample_rate: 24_000,
+                channels: 1,
+            })
+            .expect("encode");
+            let session = store
+                .create_with_journal(wav, Some(100.0), Some(&journal_id))
+                .expect("create linked session");
+            // The power loss tears this session's WAV.
+            std::fs::write(
+                store_dir.path().join(&session.id).join("recording.wav"),
+                b"torn by the disk",
+            )
+            .expect("tear the wav");
+            damaged.push((journal_id, session.id));
+        }
+
+        // The first session's WAV turns read-only between the linkage scan
+        // and its repair (locked elsewhere): the scan's header read still
+        // works, but the repair's rewrite of the file fails. Reported, not
+        // propagated. (Locking the directory would not do it — rewriting an
+        // existing file needs no directory-write permission.)
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked_wav = store_dir.path().join(&damaged[0].1).join("recording.wav");
+        std::fs::set_permissions(&locked_wav, std::fs::Permissions::from_mode(0o444))
+            .expect("lock the wav");
+
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        std::fs::set_permissions(&locked_wav, std::fs::Permissions::from_mode(0o644))
+            .expect("unlock for cleanup");
+        assert_eq!(
+            report.repaired,
+            [damaged[1].1.as_str()],
+            "the intact damaged session is still repaired"
+        );
+        assert_eq!(report.unreadable.len(), 1, "the broken one is reported");
+        assert!(
+            report.unreadable[0].0 == damaged[0].0,
+            "the report names the failed journal: {:?}",
+            report.unreadable
+        );
+        assert!(
+            report.unreadable[0].1.contains("repair"),
+            "the reason is the failed repair: {:?}",
+            report.unreadable
+        );
+    }
+
+    /// #247 review: the journal-name fallback in the confirmed-delete flow
+    /// is scoped to the crash-window shape — a healthy (manifested)
+    /// session whose uuid happens to collide with a journal id never gets
+    /// that unrelated journal tombstoned by its deletion.
+    #[test]
+    fn deleting_a_valid_session_never_tombstones_a_same_named_journal() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        // A healthy uuid-named session with no journal linkage.
+        let samples = ramp(2_400, 0);
+        let wav = encode_wav_16k(&PcmAudio {
+            samples,
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        let session = store.create(wav, Some(100.0)).expect("create session");
+
+        // An unrelated live journal whose file shares the session's name
+        // (written under its own id, then renamed into the collision).
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let real_id = writer.id().to_string();
+        writer.append_frames(&ramp(2_400, 0)).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+        let collided = journals_dir
+            .path()
+            .join(format!("{real_id}.{JOURNAL_EXT}"));
+        let aliased = journals_dir
+            .path()
+            .join(format!("{}.${JOURNAL_EXT}", session.id));
+        std::fs::rename(&collided, &aliased).expect("alias the journal");
+
+        delete_session_and_journal(&store, journals_dir.path(), &session.id)
+            .expect("delete the session");
+
+        assert!(
+            aliased.exists(),
+            "the unrelated journal is NOT tombstoned by a healthy session's deletion"
+        );
+        assert!(
+            !journals_dir.path().join("deleted").exists(),
+            "nothing was quarantined"
+        );
+        assert!(
+            store.get(&session.id).expect("get").is_none(),
+            "the session itself is gone"
         );
     }
 
