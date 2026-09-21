@@ -10,8 +10,9 @@ description = "Rust port of @starling/dictation: audio prep, transcription clien
 [dependencies]
 # `Bytes::from_owner` wraps the caller's shared recording buffer without
 # copying it, so the transcription upload adds no second WAV in memory
-# (issue #235). Already in the tree via reqwest/hyper.
-bytes = "1"
+# (issue #235). Already in the tree via reqwest/hyper. `from_owner` needs
+# bytes >= 1.10.
+bytes = "1.10"
 cpal = "0.15"
 dirs = "6"
 regex = "1"

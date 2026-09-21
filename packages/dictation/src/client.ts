@@ -45,6 +45,11 @@ export interface TranscribeOptions extends TranscribeEffectOptions {
 
 const NonNegativeFinite = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0));
 
+// The response-cap limit is strictly positive: 0 bytes would refuse every
+// response, so unlike NonNegativeFinite (which lets a timeout be 0 =
+// disabled) there is no zero case to admit.
+const PositiveFinite = Schema.Finite.check(Schema.isGreaterThan(0));
+
 export const TranscriptionSegmentSchema = Schema.Struct({
   text: Schema.String,
   startSeconds: NonNegativeFinite,
@@ -155,9 +160,17 @@ const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 export class DictationResponseTooLargeError extends Schema.TaggedError<DictationResponseTooLargeError>()(
   "DictationResponseTooLargeError",
-  { message: Schema.String, limitBytes: NonNegativeFinite },
+  { message: Schema.String, limitBytes: PositiveFinite },
 ) {
   constructor(limitBytes: number) {
+    // Mirrors the Rust client's `with_max_response_bytes(0)` refusal: a
+    // cap of zero (or a non-finite one) is a caller bug, never a state a
+    // real client can produce — `maxResponseBytes` is validated the same
+    // way at construction.
+    if (!Number.isFinite(limitBytes) || limitBytes <= 0) {
+      throw new TypeError("limitBytes must be a finite positive number");
+    }
+
     super({ message: `dictation response body exceeded the ${limitBytes} byte limit`, limitBytes });
   }
 }
@@ -327,13 +340,15 @@ function protocolError(label: string): DictationProtocolError {
   return new DictationProtocolError(`dictation server returned invalid ${label} JSON`);
 }
 
-/** Reads a response body under a hard cap (issue #235). The stream is
- * consumed incrementally and cancelled the moment the cap is crossed, so
- * the client never buffers more than the limit plus one chunk — a broken
- * or hostile server cannot balloon memory — and the failure is the
- * distinct `DictationResponseTooLargeError`, never a silent truncation.
- * The decoder runs in streaming mode, so multi-byte UTF-8 sequences
- * split across chunks survive.
+/** Reads a response body under a hard cap (issue #235). A declared
+ * content-length already past the cap is refused before a byte is read
+ * (parity with the Rust client); otherwise the stream is consumed
+ * incrementally and cancelled the moment the cap is crossed, so the
+ * client never buffers more than the limit plus one chunk — a broken or
+ * hostile server cannot balloon memory — and the failure is the distinct
+ * `DictationResponseTooLargeError`, never a silent truncation. The
+ * decoder runs in streaming mode, so multi-byte UTF-8 sequences split
+ * across chunks survive.
  */
 async function readBodyCapped(response: Response, limitBytes: number): Promise<string> {
   const body = response.body;
@@ -341,6 +356,16 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
   if (body === null) return "";
 
   const reader = body.getReader();
+
+  const declared = response.headers.get("Content-Length");
+  const declaredBytes = declared === null ? Number.NaN : Number(declared);
+
+  if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
+    await reader.cancel();
+
+    throw new DictationResponseTooLargeError(limitBytes);
+  }
+
   const decoder = new TextDecoder();
   let received = 0;
   let text = "";
@@ -354,6 +379,7 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
 
     if (received > limitBytes) {
       await reader.cancel();
+
       throw new DictationResponseTooLargeError(limitBytes);
     }
 

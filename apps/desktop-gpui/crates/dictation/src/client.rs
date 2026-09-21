@@ -461,7 +461,13 @@ async fn read_body_capped(
     {
         return Err(ClientError::ResponseTooLarge(limit));
     }
-    let mut bytes = Vec::new();
+    // The declared length — already pre-checked against the limit — sizes
+    // the buffer up front, so a content-length-framed body is read without
+    // reallocation; an undeclared (chunked) body starts empty and grows.
+    let capacity = response
+        .content_length()
+        .map_or(0, |length| length.min(limit as u64) as usize);
+    let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response
         .chunk()
         .await

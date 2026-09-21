@@ -820,7 +820,8 @@ mod tests {
     fn answered_or_purely_local_failures_do_not_prompt_a_probe() {
         // An HTTP error status or a blocked redirect proves something
         // answered on the endpoint; Input/Protocol failures never left
-        // this machine.
+        // this machine. An oversized response (issue #235) proves the
+        // server answered — deterministically wrong.
         assert_eq!(
             failure_class(&ClientError::Input("Invalid server endpoint.".to_string())),
             FailureClass::Local
@@ -835,6 +836,10 @@ mod tests {
         );
         assert_eq!(
             failure_class(&ClientError::Protocol("transcription")),
+            FailureClass::Local
+        );
+        assert_eq!(
+            failure_class(&ClientError::ResponseTooLarge(64)),
             FailureClass::Local
         );
     }

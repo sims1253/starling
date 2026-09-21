@@ -485,6 +485,34 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(health.status, "réady");
   });
 
+  it("refuses a response whose declared content-length already exceeds the cap", async () => {
+    let cancelled = false;
+
+    // 64 bytes queued — at, not over, the 64-byte cap — while the header
+    // declares 65: the pre-check must refuse before a single chunk is
+    // read (parity with the Rust client's content-length pre-check).
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64).fill(0x61));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+    assert.equal(cancelled, true, "the reader must be cancelled without reading");
+  });
+
   it("rejects a non-positive or non-finite maxResponseBytes", () => {
     for (const maxResponseBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
       assert.throws(
@@ -496,6 +524,15 @@ describe("StarlingClient protocol compatibility", () => {
           }),
         TypeError,
       );
+    }
+  });
+
+  it("refuses to build a response-too-large error with a non-positive limit", () => {
+    // The error's own limit must be strictly positive — the same rule the
+    // client constructor applies to maxResponseBytes and the Rust client
+    // applies to with_max_response_bytes.
+    for (const limitBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      assert.throws(() => new DictationResponseTooLargeError(limitBytes), TypeError);
     }
   });
 });
