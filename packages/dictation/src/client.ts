@@ -344,20 +344,29 @@ function protocolError(label: string): DictationProtocolError {
 /** Reads a response body under a hard cap (issue #235). A declared
  * content-length already past the cap is refused before a byte is read
  * (parity with the Rust client); otherwise the stream is consumed
- * incrementally and cancelled the moment the cap is crossed, so the
- * client never buffers more than the limit plus one chunk — a broken or
- * hostile server cannot balloon memory — and the failure is the distinct
- * `DictationResponseTooLargeError`, never a silent truncation. The
- * decoder runs in streaming mode, so multi-byte UTF-8 sequences split
- * across chunks survive.
+ * incrementally and cancelled the moment the cap is crossed, so a broken
+ * or hostile server cannot balloon memory: the accumulated chunks stay
+ * under the limit, and the final join transiently adds one more copy —
+ * the peak is bounded at roughly twice the limit. The failure is the
+ * distinct `DictationResponseTooLargeError`, never a silent truncation.
+ * The decoder runs in streaming mode, so multi-byte UTF-8 sequences
+ * split across chunks survive.
  */
-async function readBodyCapped(response: Response, limitBytes: number): Promise<string> {
+async function readBodyCapped(
+  response: Response,
+  limitBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
   // The cap bounds what the client holds in memory, so it counts
   // DECOMPRESSED bytes: fetch transparently inflates gzip/br responses,
   // meaning a declared Content-Length (the compressed wire size) can sit
   // under the cap while the decoded body does not — the streaming check
   // below is what enforces the real bound; this pre-check is the fast
-  // path for uncompressed bodies. The header parse is deliberately
+  // path for uncompressed bodies. (Deliberate asymmetry with the Rust
+  // client, whose transport does not decompress: its pre-check refuses
+  // an oversized declaration outright, while here the streaming counter
+  // catches a compressed-undersized declaration — both clients bound the
+  // decoded stream regardless.) The header parse is deliberately
   // lenient: a malformed value ("12abc") parses to NaN and simply skips
   // the fast path, and runtimes that expose Content-Length as the
   // decompressed size — or strip it — skip it the same way. The
@@ -367,10 +376,9 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
 
   // Checked before anything else — including the null-body return — so
   // an oversized declaration is refused no matter what the body looks
-  // like (parity with the Rust client's pre-check). The cancel is
-  // fire-and-forget: a rejecting cancel against an already-dead
-  // connection must not mask the cap error (and flip downstream retry
-  // classification) with a transport failure.
+  // like. The cancel is fire-and-forget: a rejecting cancel against an
+  // already-dead connection must not mask the cap error (and flip
+  // downstream retry classification) with a transport failure.
   if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
     void response.body?.cancel().catch(() => {});
 
@@ -385,26 +393,48 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
   const decoder = new TextDecoder();
   let received = 0;
   const chunks: Array<string> = [];
+  let completed = false;
 
-  for (;;) {
-    const { done, value } = await reader.read();
+  // When the deadline (or a fiber interrupt) aborts the request, a
+  // pending read on an injected fetcher's stream may never settle on its
+  // own — nothing else is wired to the signal. Cancel from the abort so
+  // the connection is released promptly instead of at GC; the effect has
+  // already failed by then, so whatever this loop resolves with is
+  // discarded.
+  signal.addEventListener(
+    "abort",
+    () => {
+      if (!completed) void reader.cancel().catch(() => {});
+    },
+    { once: true },
+  );
 
-    if (done) return chunks.join("") + decoder.decode();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
 
-    // Decompressed bytes — see the pre-check note above.
-    received += value.byteLength;
+      if (done) {
+        completed = true;
 
-    if (received > limitBytes) {
-      // Fire-and-forget for the same reason as the pre-check: the cap
-      // error, not a failed cancel, is the outcome.
-      void reader.cancel().catch(() => {});
+        return chunks.join("") + decoder.decode();
+      }
 
-      throw responseTooLarge(limitBytes);
+      // Decompressed bytes — see the pre-check note above.
+      received += value.byteLength;
+
+      if (received > limitBytes) throw responseTooLarge(limitBytes);
+
+      // Joined once at the end: `+=` on a growing string is quadratic in
+      // the body size, which matters near the 10 MiB default cap.
+      chunks.push(decoder.decode(value, { stream: true }));
     }
-
-    // Joined once at the end: `+=` on a growing string is quadratic in
-    // the body size, which matters near the 10 MiB default cap.
-    chunks.push(decoder.decode(value, { stream: true }));
+  } finally {
+    // Every non-clean exit — the cap refusal, a failed read, or the
+    // abort above racing a slow chunk — releases the reader. The cancel
+    // stays fire-and-forget: a rejecting cancel must not mask the cap
+    // error with a transport failure. The clean return above is the only
+    // path that leaves the stream alone.
+    if (!completed) void reader.cancel().catch(() => {});
   }
 }
 
@@ -698,7 +728,7 @@ export class StarlingClient {
         // and the iOS client: audio and credentials must never silently
         // follow a server redirect to an origin the user did not configure.
         const response = await this.fetcher(url, { ...init, signal, redirect: "manual" });
-        const body = await readBodyCapped(response, this.maxResponseBytes);
+        const body = await readBodyCapped(response, this.maxResponseBytes, signal);
 
         return {
           body,

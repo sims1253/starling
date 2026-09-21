@@ -467,12 +467,18 @@ async fn read_body_capped(
     {
         return Err(ClientError::ResponseTooLarge(limit));
     }
-    // The declared length — already pre-checked against the limit — sizes
-    // the buffer up front, so a content-length-framed body is read without
-    // reallocation; an undeclared (chunked) body starts empty and grows.
-    let capacity = response
-        .content_length()
-        .map_or(0, |length| length.min(limit as u64) as usize);
+    // The declared length — already pre-checked against the limit —
+    // reserves capacity up front so a content-length-framed body is read
+    // without reallocation, but the reservation is capped small: a lying
+    // content-length near the limit must not force a full-limit
+    // allocation before any body arrives. The Vec grows as chunks
+    // actually arrive; an undeclared (chunked) body starts empty.
+    const MAX_INITIAL_RESERVATION: usize = 64 * 1024;
+    let capacity = response.content_length().map_or(0, |length| {
+        length
+            .min(MAX_INITIAL_RESERVATION as u64)
+            .min(limit as u64) as usize
+    });
     let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response
         .chunk()

@@ -317,6 +317,28 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(bodyWasAborted, true);
   });
 
+  it("cancels a stalled body reader when the deadline fires", async () => {
+    let cancelled = false;
+
+    // A passive stream: it never enqueues and reacts to nothing — unlike
+    // the test above, nothing errors the controller on abort, so only
+    // the client's own deadline machinery can release the connection.
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      timeoutMs: 10,
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(client.health(), DictationTimeoutError);
+    assert.equal(cancelled, true, "the stalled reader must be cancelled at the deadline");
+  });
+
   it("aborts fetch when an Effect fiber is interrupted", async () => {
     let requestSignal: AbortSignal | undefined;
 
