@@ -829,7 +829,11 @@ pub struct CaptureActor {
     /// Corrs of persist workers in flight. Empty is the actor's
     /// idle-and-exitable condition; `Shutdown` waits for these to report,
     /// bounded by [`CaptureConfig::persist_drain_timeout`].
-    pending_persists: Vec<String>,
+    /// Persists in flight, keyed by `(take_epoch, corr)` — the corr alone
+    /// is client-supplied and not unique across takes (two takes sharing
+    /// a reused corr, or both defaulting to `take-anon`, must not share
+    /// one pending entry; the epoch disambiguates) (review on #252).
+    pending_persists: Vec<(u64, String)>,
     /// When `Shutdown` was first seen. The exit condition of the run loop
     /// is this flag (plus the drain state), never `RecvError::Closed`:
     /// the actor owns a sender clone of its own inbox for persist reports,
@@ -1012,10 +1016,6 @@ impl CaptureActor {
     }
 
     fn start_take(&mut self, corr: String, policy: String) {
-        // A new take invalidates every persist still in flight for older
-        // ones: their reports will land stale (registry-only), never
-        // against this take's machine state (review on #252).
-        self.take_epoch += 1;
         // The audio route freezes before the first frame can leave the
         // runtime: ask the context service to freeze now (it emits
         // mode.routeFrozen only from ModeDecided). A context that cannot
@@ -1025,6 +1025,16 @@ impl CaptureActor {
 
         match self.source.start(&self.config.journals_dir, &policy) {
             Ok(session) => {
+                // A successfully opened take invalidates every persist
+                // still in flight for older ones: their reports will land
+                // stale (registry-only), never against this take's
+                // machine state (review on #252). The bump sits in this
+                // arm only — a failed start (device_open_failed, back to
+                // Idle) leaves no new take running, and bumping there
+                // would strand the previous take's in-flight persist as
+                // silently stale, losing its durable ack for nobody's
+                // protection (review round on #252).
+                self.take_epoch += 1;
                 let device = "default-input".to_string();
                 let rate = session.sample_rate();
                 self.emit(
@@ -1374,7 +1384,7 @@ impl CaptureActor {
                 );
             });
         match spawned {
-            Ok(_) => self.pending_persists.push(corr),
+            Ok(_) => self.pending_persists.push((epoch, corr)),
             Err(_) => {
                 let result = match &intent {
                     PersistIntent::Commit => self.store.commit_take(&record),
@@ -1430,7 +1440,8 @@ impl CaptureActor {
             follow,
             epoch,
         } = report;
-        self.pending_persists.retain(|pending| pending != &corr);
+        self.pending_persists
+            .retain(|pending| pending != &(epoch, corr.clone()));
         // A failed clean-stop commit is not persisted: the record the
         // registry keeps says Interrupted (source preserved), stale or
         // not — the flip is record data, not an emission, so it happens
@@ -1472,6 +1483,15 @@ impl CaptureActor {
             self.core.state(),
             "Acquiring" | "Recording" | "Draining" | "Recovering"
         );
+        // TODO(#249, review): when `capture.abort` lands while a stop's
+        // persist is in flight (epoch unchanged, machine taken to Idle),
+        // both gates are false and every emission for the STOP's corr is
+        // suppressed — the client that issued capture.stop never gets its
+        // durable ack (capture.stopped or the storage_commit_failed
+        // degradation) and can only discover the outcome by timeout. The
+        // store write itself succeeds and the take is durable; only its
+        // announcement is lost. A stop-correlated terminal event for this
+        // interleaving is a protocol-level decision to make separately.
         match follow {
             PersistFollow::CleanStop => match result {
                 Ok(()) => {
