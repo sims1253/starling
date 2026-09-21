@@ -805,6 +805,15 @@ impl RecordingStore {
             .find(|(status, record, _)| *status == TakeStatus::Interrupted && record.id == id)
             .map(|(_, record, _)| record.clone())
     }
+
+    fn completed(&self, id: &str) -> Option<TakeRecord> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(status, record, _)| *status == TakeStatus::Complete && record.id == id)
+            .map(|(_, record, _)| record.clone())
+    }
 }
 
 impl CaptureStore for RecordingStore {
@@ -829,15 +838,33 @@ impl CaptureStore for RecordingStore {
 
 /// Polls until the capture projection shows `state`, or panics.
 fn wait_for_capture_state(client: &RuntimeClient, state: &str, deadline: Duration) {
+    wait_for_machine_state(client, "capture", state, deadline);
+}
+
+/// Polls until the context projection shows `state`, or panics.
+fn wait_for_context_state(client: &RuntimeClient, state: &str, deadline: Duration) {
+    wait_for_machine_state(client, "context", state, deadline);
+}
+
+fn wait_for_machine_state(
+    client: &RuntimeClient,
+    machine: &str,
+    state: &str,
+    deadline: Duration,
+) {
     let start = Instant::now();
     loop {
-        let current = client.snapshot().capture.state.clone();
+        let current = match machine {
+            "capture" => client.snapshot().capture.state.clone(),
+            "context" => client.snapshot().context.state.clone(),
+            other => panic!("unknown machine {other:?}"),
+        };
         if current == state {
             return;
         }
         assert!(
             start.elapsed() < deadline,
-            "capture never reached {state:?} (now {current:?})"
+            "{machine} never reached {state:?} (now {current:?})"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -953,6 +980,8 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
     let (runtime, client) = Runtime::start(config);
     let events = client.subscribe();
 
+    freeze_route(&client, &events);
+
     client
         .send(Some("take_d"), Command::CaptureStart { policy: "dictation".into() })
         .expect("start accepted");
@@ -1007,6 +1036,11 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
     // fixture): the fatal error entered Interrupted and no stopped event
     // follows.
     wait_for_capture_state(&client, "Interrupted", Duration::from_secs(5));
+    // The route freeze died with the take, not with the machine: the
+    // context cycle is free to run again (review follow-up on #212: the
+    // device-error salvage used to leak the freeze — the #211 wedge one
+    // layer down).
+    wait_for_context_state(&client, "Released", Duration::from_secs(5));
     runtime.shutdown();
 }
 
@@ -1029,6 +1063,7 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
             stop: FakeStop::DeviceError("DeviceUnavailable".into()),
             ..FakeTakeScript::clean()
         },
+        FakeTakeScript::clean(),
     ]);
     let store = RecordingStore::new();
     let config = test_config(
@@ -1043,6 +1078,8 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
     );
     let (runtime, client) = Runtime::start(config);
     let events = client.subscribe();
+
+    freeze_route(&client, &events);
 
     // take_a: abort whose stop times out — the preserved samples ride in
     // the error and must still be salvaged.
@@ -1075,8 +1112,10 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
         "gap evidence kept: {:?}",
         salvaged.gaps
     );
-    // abort returned the machine to Idle, so the second take can run.
+    // abort returned the machine to Idle, and the route freeze went with
+    // the take: the context cycle can run again.
     wait_for_capture_state(&client, "Idle", Duration::from_secs(5));
+    wait_for_context_state(&client, "Released", Duration::from_secs(5));
 
     // take_b: abort whose stop fails device-side — metadata-only, still
     // registered.
@@ -1097,6 +1136,29 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
     };
     assert!(metadata_only.samples.is_empty());
     assert!(metadata_only.acknowledged_samples > 0);
+
+    // The context cycle really is free: a fresh snapshot/mode decision
+    // completes (from RouteFrozen, context.snapshot would be rejected as
+    // IllegalInState — the wedge this regression pins down), and the next
+    // take runs end to end.
+    freeze_route(&client, &events);
+    client
+        .send(Some("take_c"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start after aborted takes accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(40));
+    client
+        .send(Some("take_c"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_c"), Duration::from_secs(5));
+    let completed = loop {
+        if let Some(record) = store.completed("take_c") {
+            break record;
+        }
+        assert!(Instant::now() < deadline, "take_c never committed");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(!completed.samples.is_empty());
     runtime.shutdown();
 }
 
