@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use starling_dictation::audio::{encode_wav_16k, PcmAudio};
+use starling_dictation::audio::encode_wav_16k_parts;
 use starling_dictation::recorder::{
-    CaptureGap, CapturedTake, JournalReport, RecorderError, RecorderHandle,
+    CaptureGap, CapturedTake, JournalReport, RecorderError, RecorderFault, RecorderHandle,
 };
 use starling_dictation::storage::FileSessionStore;
 use starling_dictation::store_v2::{CaptureRecord, CaptureStatus, StoreV2, TakeMeta};
@@ -103,14 +103,12 @@ impl TakeRecord {
         format!("{hash:016x}")
     }
 
-    /// The upload WAV for transcription jobs (16 kHz mono).
+    /// The upload WAV for transcription jobs (16 kHz mono), encoded
+    /// straight off the borrowed samples (a multi-minute take must not be
+    /// cloned just to build the encoder's owned-struct parameter; issue
+    /// #216).
     pub fn to_wav(&self) -> Result<Vec<u8>, String> {
-        encode_wav_16k(&PcmAudio {
-            samples: self.samples.clone(),
-            sample_rate: self.sample_rate,
-            channels: 1,
-        })
-        .map_err(|err| err.to_string())
+        encode_wav_16k_parts(&self.samples, self.sample_rate, 1).map_err(|err| err.to_string())
     }
 }
 
@@ -141,9 +139,11 @@ pub trait CaptureSession: Send {
     fn source_clip_ratio(&self) -> f64;
     /// Gap spans surfaced so far, in capture order.
     fn gaps(&self) -> Vec<CaptureGap>;
-    /// The first capture-path error: the device-side error wins over the
-    /// journal fault (the recorder's `capture_error`).
-    fn capture_error(&self) -> Option<String>;
+    /// The first capture-path fault, typed by origin (the recorder's
+    /// `capture_fault`): the device-side error wins over the journal
+    /// fault. Fatality is decided from the variant — never from the
+    /// message text, which carries no reliable marker (issue #216).
+    fn capture_fault(&self) -> Option<RecorderFault>;
     /// A recent window for level metering.
     fn latest_window(&self, n: usize) -> Vec<f32>;
     /// The §3 R09 stop handshake.
@@ -186,8 +186,8 @@ impl CaptureSession for RecorderSession {
     fn gaps(&self) -> Vec<CaptureGap> {
         self.handle.gaps()
     }
-    fn capture_error(&self) -> Option<String> {
-        self.handle.capture_error()
+    fn capture_fault(&self) -> Option<RecorderFault> {
+        self.handle.capture_fault()
     }
     fn latest_window(&self, n: usize) -> Vec<f32> {
         self.handle.latest_window(n)
@@ -211,11 +211,18 @@ impl CaptureSource for DeviceCaptureSource {
     }
 }
 
-/// Classifies a surfaced capture error: journal/storage faults are
+/// Classifies a surfaced capture fault: journal/storage faults are
 /// non-fatal (the recorder keeps capturing in memory and honestly freezes
-/// acknowledgment), device-side errors are fatal (→ `Interrupted).
-fn error_is_fatal(message: &str) -> bool {
-    !message.to_ascii_lowercase().contains("journal")
+/// acknowledgment), device-side errors are fatal (→ `Interrupted`).
+///
+/// The decision comes from [`RecorderFault`]'s variant — the fault's
+/// *origin* — not from its message text. The old substring test (any
+/// message containing "journal" counts as a journal fault) misclassified
+/// device errors whose text happened to mention the journal, letting a
+/// take continue from a dead device until the stop handshake failed into
+/// the audio-dropping path (issue #216).
+fn error_is_fatal(fault: &RecorderFault) -> bool {
+    fault.is_fatal()
 }
 
 // ---------------------------------------------------------------------------
@@ -916,9 +923,9 @@ impl CaptureActor {
                     end_sample: gap.end_sample,
                 }));
             }
-            if let Some(message) = take.session.capture_error() {
-                if error_is_fatal(&message) {
-                    actions.push(Action::FatalFault(message));
+            if let Some(fault) = take.session.capture_fault() {
+                if error_is_fatal(&fault) {
+                    actions.push(Action::FatalFault(fault.message().to_string()));
                 } else if !take.journal_fault_surfaced {
                     // Journal fault: surfaced once as a non-fatal error
                     // (capture continues in memory, acknowledgment frozen —
@@ -1392,9 +1399,18 @@ mod tests {
 
     #[test]
     fn error_classification_separates_journal_faults_from_device_faults() {
-        assert!(!error_is_fatal(
-            "The capture journal failed: disk full. Recording continues."
-        ));
-        assert!(error_is_fatal("DeviceUnavailable"));
+        use starling_dictation::recorder::RecorderFault;
+        // Fatality is decided by variant (origin), never by message text:
+        // a device error whose text happens to mention the journal is
+        // still fatal, and a journal fault is not (issue #216).
+        assert!(!error_is_fatal(&RecorderFault::Journal(
+            "The capture journal failed: disk full. Recording continues.".into()
+        )));
+        assert!(error_is_fatal(&RecorderFault::Device(
+            "DeviceUnavailable".into()
+        )));
+        assert!(error_is_fatal(&RecorderFault::Device(
+            "stream error while flushing the journal buffer".into()
+        )));
     }
 }
