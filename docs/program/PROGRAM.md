@@ -75,7 +75,7 @@ executed evidence; missing hardware is a recorded validation gap.
 ## Control plane files
 
 - `tasks.json` — all 67 items (48 app + 19 serving), status vocabulary:
-  pending / in_progress / implemented / integrated / verified_on_target /
+  pending / filed / in_progress / implemented / integrated / verified_on_target /
   review_ready / blocked / no_go / inconclusive / obsolete_duplicate / done.
 - `DECISIONS.md` — consequential choices and rejected alternatives.
 - `STATUS.md` — resumable state: integrated commits, active assignments,
