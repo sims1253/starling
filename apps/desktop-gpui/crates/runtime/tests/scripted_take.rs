@@ -2487,6 +2487,67 @@ fn an_aborts_route_release_does_not_wait_for_its_persist() {
     runtime.shutdown();
 }
 
+/// pullfrog on #252 (reproduced): an abort arriving while a STOP's persist
+/// is in flight finds the take already consumed — the abort's decision-point
+/// release must still run there, or the context stays RouteFrozen for the
+/// whole persist window.
+#[test]
+fn an_abort_during_a_stops_persist_still_releases_the_route_at_the_decision_point() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(600),
+        failing: Vec::new(),
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    // A clean take that STOPs — the machine enters Draining while the
+    // slow persist encodes.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_s"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_s)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_s"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_s"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // The abort lands inside the stop's persist window (table-legal from
+    // Draining): the take is already consumed, but the route must release
+    // at the decision point — long before the slow store lands anything.
+    client
+        .send(Some("take_s"), Command::CaptureAbort)
+        .expect("abort accepted during the stop's persist");
+    wait_for_context_state(&client, "Released", Duration::from_secs(2));
+    assert!(
+        store.landed.lock().unwrap().is_empty(),
+        "the route released only after the persist landed — the freeze outlived \
+         the aborted stop for the whole persist window"
+    );
+
+    runtime.shutdown();
+}
+
 /// Part 4: fatality follows the typed fault origin, never the message
 /// text. A device fault whose message happens to mention the journal is
 /// fatal (the old substring heuristic let such a take continue from a

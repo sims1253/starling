@@ -987,10 +987,10 @@ impl CaptureActor {
                 }
             }
             Command::CaptureAbort => {
-                match self.core.commit_command("capture.abort", Some(corr)) {
+                match self.core.commit_command("capture.abort", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
-                        self.abort_take();
+                        self.abort_take(&corr);
                     }
                     Err(violation) => {
                         self.core.record_violation(violation.clone());
@@ -1453,11 +1453,13 @@ impl CaptureActor {
         // report arriving after its job was cancelled.
         if epoch != self.take_epoch {
             self.register(record);
-            if follow != PersistFollow::Abort {
-                // The abort path released its route at the decision
-                // point; the stop/salvage paths release here.
-                let _ = self.freezer.take_completed(&corr);
-            }
+            // No route release here (pullfrog on #252): with the abort's
+            // decision-point release covering the no-live-take arm, every
+            // stale take's route already released at its abort — and
+            // `ContextActor`'s `TakeCompleted` is corr-blind, so this call
+            // could only release a *newer* take's freeze (reachable when a
+            // fresh context mode-cycle re-froze `RouteFrozen` between the
+            // abort and the new take).
             self.publish_view();
             return;
         }
@@ -1593,8 +1595,21 @@ impl CaptureActor {
     /// handshake that itself fails is no exception (issue #212): the
     /// quiesce timeout's preserved samples ride in the error, and a
     /// device-side stop error still registers the metadata-only record.
-    fn abort_take(&mut self) {
+    fn abort_take(&mut self, corr: &str) {
+        // The route releases at the abort DECISION point, not with the
+        // persist report (review on #252): the store commit is precisely
+        // the slow encode, and letting the freeze outlive the take by its
+        // full duration wedges `context.snapshot` out of `RouteFrozen`
+        // for the whole window. This runs BEFORE the live-take guard so
+        // the no-live-take arm — an abort arriving while a stop's persist
+        // is in flight (`stop_take` consumes the take before the
+        // handoff) — releases too; otherwise the freeze would hold for
+        // the whole persist, exactly the window this module makes
+        // seconds long (pullfrog, reproduced). Idempotent on the context
+        // side (RouteFrozen → Released is the only edge it takes).
+        let _ = self.freezer.take_completed(corr);
         let Some(live) = self.take.take() else {
+            self.publish_view();
             return;
         };
         let corr = live.corr.clone();
@@ -1624,14 +1639,6 @@ impl CaptureActor {
                 PersistFollow::Abort,
             );
         }
-        // The route releases at the abort DECISION point, not with the
-        // persist report (review on #252): the store commit is precisely
-        // the slow encode, and letting the freeze outlive the take by its
-        // full duration wedges `context.snapshot` out of `RouteFrozen`
-        // for the whole window. The salvage registration above is what
-        // stays deferred; the freeze must not be. Idempotent on the
-        // context side (RouteFrozen → Released is the only edge it takes).
-        let _ = self.freezer.take_completed(&corr);
         self.publish_view();
     }
 
