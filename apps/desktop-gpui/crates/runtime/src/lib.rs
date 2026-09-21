@@ -211,8 +211,9 @@ pub struct RuntimeSnapshot {
 }
 
 /// A running runtime. Dropping it shuts the machines down (threads join;
-/// in-flight provider workers finish on their own and report into a
-/// closed inbox).
+/// in-flight provider workers finish on their own and report into a now
+/// closed inbox — surfaced on stderr, since no scheduler remains to
+/// receive them).
 pub struct Runtime {
     router: channel::Sender<RouterMsg>,
     handles: Vec<JoinHandle<()>>,
