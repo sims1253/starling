@@ -15,6 +15,12 @@
 //! talks to it through the [`CaptureSource`] seam;
 //! [`FakeCaptureSource`] (test twin, `testing` module) scripts devices,
 //! gaps, faults and quiesce timeouts without hardware.
+//!
+//! One recovery rule completes the picture: a failed device open is fatal
+//! to the take *attempt*, not the machine — after `capture.error{
+//! device_open_failed}` the actor takes the runtime-internal settle edge
+//! `Interrupted → Idle` so the next `capture.start` can retry (issue
+//! #211).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -616,7 +622,15 @@ impl CaptureActor {
             }
             Err(_message) => {
                 // Fatal open failure from Acquiring -> Interrupted (fixture
-                // take_9's device_open_failed).
+                // take_9's device_open_failed), then the runtime-internal
+                // settle edge back to Idle: the failure killed the take
+                // *attempt*, not the machine — no session was created, so
+                // there is nothing to salvage and no journal to replay, and
+                // `Interrupted`'s only other exit (the `Recovering` replay)
+                // requires a registered take. Staying there would reject
+                // every later `capture.start` for the process lifetime
+                // (issue #211). The fatal error event above is what the UI
+                // sees; the next `capture.start` retries the device.
                 self.emit(
                     Event::CaptureError {
                         code: "device_open_failed".into(),
@@ -624,6 +638,14 @@ impl CaptureActor {
                     },
                     &corr,
                 );
+                if let Err(violation) = self.core.advance_internal("Idle") {
+                    self.core.record_violation(violation);
+                }
+                // The freeze taken above for this corr is no longer backed
+                // by any take; release the audio route (RouteFrozen ->
+                // Released, runtime-internal) so the context cycle can run
+                // again for the retry.
+                let _ = self.freezer.take_completed(&corr);
             }
         }
         self.publish_view();

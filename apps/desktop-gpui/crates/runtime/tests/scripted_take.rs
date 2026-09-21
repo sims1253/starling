@@ -9,7 +9,9 @@
 //! rejection (`queue_full`, `duplicate_submission`), per-stream `seq`
 //! monotonicity, the NACK path for unknown envelope versions, the
 //! route-freeze-before-submit invariant, quiesce-timeout salvage, and the
-//! fatal device-error interruption path.
+//! fatal device-error interruption path — plus the capture-machine
+//! recovery regression (issue #211): a failed device open settles back to
+//! Idle so a retry can succeed.
 
 use std::time::{Duration, Instant};
 
@@ -767,6 +769,108 @@ fn jobs_failure_from_provider_error_is_retryable_and_isolated() {
     }
     // Capture and history untouched: capture stayed Persisted.
     assert_eq!(client.snapshot().capture.state, "Persisted");
+    runtime.shutdown();
+}
+
+// ------------------------------------------------------------------------- //
+// Capture-machine recovery (issue #211)
+// ------------------------------------------------------------------------- //
+
+/// Polls until the capture projection shows `state`, or panics.
+fn wait_for_capture_state(client: &RuntimeClient, state: &str, deadline: Duration) {
+    let start = Instant::now();
+    loop {
+        let current = client.snapshot().capture.state.clone();
+        if current == state {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "capture never reached {state:?} (now {current:?})"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Issue #211: a failed device open must not wedge the capture machine in
+/// `Interrupted` for the process lifetime — the fatal error settles back
+/// to Idle and the next `capture.start` retries the device.
+#[test]
+fn failed_device_open_returns_to_idle_and_a_retry_succeeds() {
+    // No script queued: the fake source's first start fails the device
+    // open (its honest "no microphone" error).
+    let source = FakeCaptureSource::new(vec![]);
+    let store = InMemoryCaptureStore::new();
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+
+    client
+        .send(Some("take_9"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("start itself is accepted; the failure surfaces as an event");
+    let collected = until(
+        &events,
+        "capture.error",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
+    match &collected.last().unwrap().event {
+        Event::CaptureError { code, fatal } => {
+            assert_eq!(code, "device_open_failed");
+            assert!(*fatal, "the open failure is fatal to the take");
+        }
+        other => panic!("expected CaptureError, got {other:?}"),
+    }
+
+    // The machine settled back to Idle (a runtime-internal edge the UI
+    // sees via the snapshot, not the wire), and the route freeze the
+    // failed take took was released.
+    wait_for_capture_state(&client, "Idle", Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let context = client.snapshot().context.state.clone();
+        if context == "Released" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed take never released its route freeze (context {context:?})"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The retry: a device appears (a script is queued) and the next take
+    // runs end to end. With the #211 wedge this start was rejected
+    // IllegalInState{Interrupted}.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_10"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("retry start accepted — the machine left Interrupted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    client
+        .send(Some("take_10"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped", Duration::from_secs(5));
+    {
+        let takes = store.takes.lock().unwrap();
+        assert!(
+            takes
+                .iter()
+                .any(|(status, id, _)| *status == TakeStatus::Complete && id == "take_10"),
+            "take_10 committed: {takes:?}"
+        );
+    }
     runtime.shutdown();
 }
 

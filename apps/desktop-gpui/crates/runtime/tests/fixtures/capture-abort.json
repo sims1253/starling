@@ -1,6 +1,6 @@
 {
   "machine": "capture",
-  "description": "capture.abort from every state that accepts it (Recording, Draining mid-drain, Acquiring) plus a fatal open failure from Acquiring. abort returns the machine to Idle without a capture.* event (v1 defines none; the UI projection updates via snapshot). take_9's fatal error shows Acquiring -> Interrupted.",
+  "description": "capture.abort from every state that accepts it (Recording, Draining mid-drain, Acquiring) plus a fatal open failure from Acquiring. abort returns the machine to Idle without a capture.* event (v1 defines none; the UI projection updates via snapshot). take_9's fatal error shows Acquiring -> Interrupted; the failure killed the take attempt, not the machine (nothing was created to salvage or replay), so the runtime-internal settle edge returns to Idle and take_10 shows the retry succeeding.",
   "initial": "Idle",
   "schema_valid": true,
   "replay": "ok",
@@ -129,6 +129,54 @@
       "seq": 131,
       "type": "capture.error",
       "payload": { "code": "device_open_failed", "fatal": true }
+    },
+    { "$advance": "Idle" },
+    {
+      "v": 1,
+      "id": "cmd_038",
+      "ts": "2026-09-20T10:03:12Z",
+      "corr": "take_10",
+      "seq": 140,
+      "type": "capture.start",
+      "payload": { "policy": "push-to-talk" }
+    },
+    {
+      "v": 1,
+      "id": "evt_036",
+      "ts": "2026-09-20T10:03:12Z",
+      "corr": "take_10",
+      "seq": 141,
+      "type": "capture.started",
+      "payload": {
+        "device": "MacBook Pro Microphone",
+        "actualRate": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_039",
+      "ts": "2026-09-20T10:03:13Z",
+      "corr": "take_10",
+      "seq": 142,
+      "type": "capture.stop",
+      "payload": { "drain": true }
+    },
+    {
+      "v": 1,
+      "id": "evt_037",
+      "ts": "2026-09-20T10:03:13Z",
+      "corr": "take_10",
+      "seq": 143,
+      "type": "capture.stopped",
+      "payload": {
+        "finalSampleIndex": 48000,
+        "acknowledgedSamples": 48000,
+        "gaps": [],
+        "journalId": "j_03b2",
+        "sampleDurationMs": 1000.0,
+        "wallClockMs": 1000.0
+      }
     }
   ]
 }

@@ -15,9 +15,9 @@
 //!   (`capture.error` with `fatal: true` → `Interrupted`).
 //!
 //! `internal` edges carry no wire message (scheduler dispatch, expiry
-//! timers, journal recovery); fixtures step over them with
-//! `{"$advance": "<state>"}` directives, and the live actors take them
-//! themselves at the equivalent points.
+//! timers, journal recovery, interrupted-take settlement); fixtures step
+//! over them with `{"$advance": "<state>"}` directives, and the live
+//! actors take them themselves at the equivalent points.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -206,7 +206,14 @@ pub static CAPTURE: MachineSpec = MachineSpec {
             event!(from ["Draining", "Recovering"], to Some("Persisted")),
         ),
     ],
-    internal: &[("Interrupted", "Recovering")],
+    // Runtime-internal edges out of `Interrupted` (no wire message): a
+    // salvaged take replays its durable boundary through `Recovering`,
+    // while a failure that killed only the *take attempt* — the device
+    // never opened, so there is nothing to salvage or replay — settles
+    // straight back to `Idle` so the machine can accept the next
+    // `capture.start` (issue #211: without this edge, `Interrupted` has no
+    // reachable exit in the live actor).
+    internal: &[("Interrupted", "Recovering"), ("Interrupted", "Idle")],
 };
 
 /// jobs (scheduler; supervised workers) — §2.2 / `MACHINES["jobs"]`. The
