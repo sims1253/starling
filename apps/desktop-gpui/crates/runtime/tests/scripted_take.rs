@@ -104,7 +104,10 @@ fn freeze_route(client: &RuntimeClient, events: &EventSub) -> Vec<EventMessage> 
 }
 
 /// Runs one scripted take end to end; returns when `capture.stopped` was
-/// seen for it.
+/// seen for it. Sample accumulation is proven, not assumed: the take waits
+/// for its first `capture.progress` (emitted by the capture actor's poll
+/// tick once the fake's acknowledged count is nonzero) instead of sleeping
+/// a fixed window a loaded runner may not fit inside (#217).
 fn run_take(
     source: &std::sync::Arc<FakeCaptureSource>,
     client: &RuntimeClient,
@@ -118,7 +121,12 @@ fn run_take(
         .send(Some(take), Command::CaptureStart { policy: "push-to-talk".into() })
         .expect("start accepted");
     log.extend(until(events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5)));
-    std::thread::sleep(Duration::from_millis(30));
+    log.extend(until(
+        events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some(take),
+        Duration::from_secs(5),
+    ));
     client
         .send(Some(take), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
@@ -145,6 +153,33 @@ fn wait_for_state(client: &RuntimeClient, state: &str, deadline: Duration) {
         if start.elapsed() >= deadline {
             panic!("state {state} not reached; snapshot: {current:?}");
         }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Polls the runtime projection until `predicate` holds, or panics with
+/// `what` after `deadline`. The projection is a non-consuming observation:
+/// unlike the event subscription, polling it never drains (and so never
+/// unparks) anything — which is what makes it safe to use as a gate in
+/// backpressure scenarios (#210, #217).
+fn wait_for_projection(
+    client: &RuntimeClient,
+    what: &str,
+    predicate: impl Fn(&starling_runtime::RuntimeSnapshot) -> bool,
+    deadline: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        let snapshot = client.snapshot();
+        if predicate(&snapshot) {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "{what}; capture {}, jobs {:?}",
+            snapshot.capture.state,
+            snapshot.jobs.jobs,
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -618,7 +653,15 @@ fn submit_against_an_unfrozen_route_is_rejected_before_admission() {
         .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
         .expect("start accepted");
     until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
-    std::thread::sleep(Duration::from_millis(20));
+    // Let the take accumulate samples via an event-based wait rather than
+    // a fixed sleep (#217): the first capture.progress proves the fake's
+    // acknowledged count went nonzero before the stop.
+    until(
+        &events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_a"),
+        Duration::from_secs(5),
+    );
     client
         .send(Some("take_a"), Command::CaptureStop { drain: None })
         .expect("stop accepted");
@@ -667,7 +710,15 @@ fn quiesce_timeout_salvages_samples_as_interrupted_take() {
         .send(Some("take_q"), Command::CaptureStart { policy: "dictation".into() })
         .expect("start accepted");
     until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
-    std::thread::sleep(Duration::from_millis(30));
+    // The salvage below keeps whatever the fake accumulated: prove samples
+    // exist via the first capture.progress instead of a fixed sleep a
+    // loaded runner may not fit inside (#217).
+    until(
+        &events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_q"),
+        Duration::from_secs(5),
+    );
     client
         .send(Some("take_q"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
@@ -827,6 +878,12 @@ fn drain(events: &EventSub) {
 /// inbox instead of dropping — every report, the `Done` included, lands
 /// as soon as the subscriber resumes, and the slot is provably released
 /// (a second job dispatches after it).
+///
+/// Verification is timing-independent (#217): the stall window is gated on
+/// the (non-consuming) projection showing the storm in flight, and the
+/// outcome is asserted by exact counts — all 2 000 partials must precede
+/// the `Done` on the FIFO path, so a single dropped report anywhere fails
+/// the test; a wedged `Done` fails the completion wait loudly.
 #[test]
 fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
     let source = FakeCaptureSource::new(vec![]);
@@ -874,8 +931,17 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
     freeze_route(&client, &events);
     run_take(&source, &client, &events, "take_s", FakeTakeScript::clean());
     // Settle trailing capture events, then leave the queue empty so the
-    // submit below cannot park the scheduler before its worker runs.
-    std::thread::sleep(Duration::from_millis(100));
+    // submit below cannot park the scheduler before its worker runs. The
+    // settle is gated on the capture projection reaching its terminal
+    // state — once it has, the capture poll ticker (the only late emitter)
+    // has stopped, so a single drain leaves the queue genuinely empty. No
+    // fixed sleep to mis-time on a loaded runner (#217).
+    wait_for_projection(
+        &client,
+        "capture projection never settled after take_s",
+        |s| s.capture.state == "Persisted",
+        Duration::from_secs(5),
+    );
     drain(&events);
 
     client
@@ -886,10 +952,34 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
         })
         .expect("submit accepted");
 
+    // Gate the stall on the storm provably being in flight: the projection
+    // shows the worker dispatched and job-1's core in Recognizing (it
+    // advances there at dispatch, before the worker spawns). Sleeping a
+    // fixed window straight after the submit — the old shape — could
+    // elapse before a loaded runner had even scheduled the submit chain.
+    wait_for_projection(
+        &client,
+        "job-1 never dispatched onto its worker",
+        |s| {
+            s.jobs.active == 1
+                && s.jobs
+                    .jobs
+                    .iter()
+                    .any(|job| job.job == "job-1" && job.state == "Recognizing")
+        },
+        Duration::from_secs(5),
+    );
+
     // The stall: nobody drains the subscriber, so the scheduler parks in
-    // bus.emit while the worker's 2 000 partial reports fill the inbox
-    // (bound 64) — exactly the window in which a best-effort try_send
-    // drops the Done. (With the fix the worker parks here instead.)
+    // bus.emit (the bus's own backpressure contract) once 8 events queue
+    // up, while the worker's 2 000 partial reports — fired back-to-back
+    // after the fake's single 5 ms work delay — fill the inbox (bound 64)
+    // and park in send_blocking. Exactly the window in which a best-effort
+    // try_send drops the Done. The hold only needs to cover the thread
+    // wake-ups for those bounded-queue pushes (microseconds of work once
+    // Recognizing is observable); 250 ms is three orders of magnitude of
+    // margin, and the assertions below verify the fix independently of
+    // this window being hit (see the count assertion).
     std::thread::sleep(Duration::from_millis(250));
 
     // Resume draining: the parked system must unwind and the Done must
@@ -900,15 +990,21 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
         |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-1"),
         Duration::from_secs(10),
     );
-    // The storm really did exceed the inbox bound, so under drop-on-Full
-    // semantics the Done could not have survived.
+    // Deterministic delivery proof: every one of the 2 000 partials must
+    // reach this subscriber before the Done — they share the worker →
+    // bounded inbox → scheduler → bus → subscriber FIFO path, and
+    // jobs.progress is legal throughout (the core sits in Recognizing from
+    // dispatch until the Done). A single report lost anywhere — the exact
+    // #210 failure mode — fails this count. This replaces the old
+    // `progress > 64` bound, which only showed the storm was large and
+    // could not vouch that any report ever faced a Full inbox.
     let progress = collected
         .iter()
         .filter(|m| m.type_name() == "jobs.progress" && m.corr.as_deref() == Some("job-1"))
         .count();
-    assert!(
-        progress > 64,
-        "the partial storm must exceed the inbox bound (saw {progress} of 2 000)"
+    assert_eq!(
+        progress, 2_000,
+        "every partial report must survive the bounded inbox and land before the Done"
     );
     let completed = collected
         .iter()
