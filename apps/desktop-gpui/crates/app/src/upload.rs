@@ -465,9 +465,9 @@ impl StarlingApp {
                         let id = id.clone();
                         cx.background_spawn(async move {
                             let client = StarlingClient::new(&endpoint, protocol, &model)?;
-                            // The Arc clone is the upload buffer itself:
-                            // the client sends it zero-copy (issue #235),
-                            // so no second WAV exists for this request.
+                            // Shares the upload buffer with the client by
+                            // reference count (issue #235): the WAV bytes
+                            // are never duplicated for this request.
                             client.transcribe(wav, &id)
                         })
                         .await

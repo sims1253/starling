@@ -455,6 +455,12 @@ async fn read_body_capped(
     limit: usize,
     timeout_ms: u64,
 ) -> Result<String, ClientError> {
+    // The cap bounds what the client holds in memory, so it counts
+    // DECOMPRESSED bytes: with transparent gzip/br decompression,
+    // `content_length()` is the compressed wire size while the chunk
+    // loop below sees the decoded stream — the loop is what enforces the
+    // real bound; this pre-check is the fast path for uncompressed
+    // bodies.
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)

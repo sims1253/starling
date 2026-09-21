@@ -352,14 +352,23 @@ function protocolError(label: string): DictationProtocolError {
  * across chunks survive.
  */
 async function readBodyCapped(response: Response, limitBytes: number): Promise<string> {
+  // The cap bounds what the client holds in memory, so it counts
+  // DECOMPRESSED bytes: fetch transparently inflates gzip/br responses,
+  // meaning a declared Content-Length (the compressed wire size) can sit
+  // under the cap while the decoded body does not — the streaming check
+  // below is what enforces the real bound; this pre-check is the fast
+  // path for uncompressed bodies.
   const declared = response.headers.get("Content-Length");
   const declaredBytes = declared === null ? Number.NaN : Number(declared);
 
   // Checked before anything else — including the null-body return — so
   // an oversized declaration is refused no matter what the body looks
-  // like (parity with the Rust client's pre-check).
+  // like (parity with the Rust client's pre-check). The cancel is
+  // fire-and-forget: a rejecting cancel against an already-dead
+  // connection must not mask the cap error (and flip downstream retry
+  // classification) with a transport failure.
   if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
-    await response.body?.cancel();
+    void response.body?.cancel().catch(() => {});
 
     throw responseTooLarge(limitBytes);
   }
@@ -378,10 +387,13 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
 
     if (done) return chunks.join("") + decoder.decode();
 
+    // Decompressed bytes — see the pre-check note above.
     received += value.byteLength;
 
     if (received > limitBytes) {
-      await reader.cancel();
+      // Fire-and-forget for the same reason as the pre-check: the cap
+      // error, not a failed cancel, is the outcome.
+      void reader.cancel().catch(() => {});
 
       throw responseTooLarge(limitBytes);
     }
