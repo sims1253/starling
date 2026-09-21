@@ -192,3 +192,12 @@ verification showed the PR has exactly 30 comments and the reported IDs
 confabulated. Lesson (joins the stale-binary and pipeline-exit lessons):
 agent handoff claims about EXTERNAL state (PR comments, issue text) get
 verified against the source before becoming work items.
+
+## Update 2026-09-21 — wave B merged; program PR queue EMPTY
+
+#200 (B07+B08 Android P1s + R33, 106/106) and #201 (E02 v2-only + D14
+rework + R34/R35, 277/277) merged. Zero open PRs. Cumulative: 11 program
+PRs merged across the two waves; every P1 closed; all device evidence
+tiers (CPU/iGPU-Vulkan/5090-CUDA) recorded. Remaining backlog is P2/P3:
+R32 (parakeet CUDA capture), E02 tails (leases/retention/bounded reads),
+E15/E12 packaging, S13/S14 quant, E29 p2, I4 IPC host, R27/R29 nits.
