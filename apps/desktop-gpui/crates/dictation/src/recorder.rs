@@ -251,6 +251,51 @@ pub enum RecorderError {
     },
 }
 
+/// The first capture-path fault, classified by origin (E01/G01 + I1 phase
+/// 2 storage-fault honesty): the device-side error posted by the CPAL
+/// error callback wins over the first journal write/fsync failure.
+///
+/// The class is a property of *where* the fault happened, never of its
+/// message text — a device error whose text happens to mention the
+/// journal is still a dead device (issue #216: the old substring
+/// heuristic let such a take continue from a dead microphone until the
+/// stop handshake failed). [`RecorderFault::is_fatal`] is the decision
+/// the capture UI and the runtime actor both need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecorderFault {
+    /// The audio device or stream failed: capture is no longer live.
+    /// Fatal to the take.
+    Device(String),
+    /// A journal write/fsync failed: capture keeps running in memory with
+    /// acknowledgment honestly frozen. Non-fatal.
+    Journal(String),
+}
+
+impl RecorderFault {
+    /// Whether a take survives this fault. A dead device ends the take
+    /// (the callback will not produce more audio); a journal fault does
+    /// not (the recorder degrades to in-memory capture).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, RecorderFault::Device(_))
+    }
+
+    /// The fault's message text (either variant's payload).
+    pub fn message(&self) -> &str {
+        match self {
+            RecorderFault::Device(message) | RecorderFault::Journal(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for RecorderFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecorderFault::Device(message) => write!(f, "{message}"),
+            RecorderFault::Journal(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 /// Attenuation-only auto gain for the capture path.
 ///
 /// Raw sources can run hot enough to saturate the WAV clamp (a 100% route
@@ -899,11 +944,22 @@ impl RecorderHandle {
     /// failure is reported. The UI can stop pretending capture is durable
     /// (or live) once this is set.
     pub fn capture_error(&self) -> Option<String> {
+        Some(self.capture_fault()?.to_string())
+    }
+
+    /// [`Self::capture_error`] with the fault's origin attached: `Device`
+    /// for the stream error, `Journal` for the journal fault. Callers that
+    /// need to decide whether the take survives (the runtime's capture
+    /// actor) must classify on this variant, not on message text — the
+    /// strings are device/journal library messages and carry no reliable
+    /// marker (issue #216).
+    pub fn capture_fault(&self) -> Option<RecorderFault> {
         let guard = self.shared.lock_consumer();
         guard
             .stream_error
             .clone()
-            .or_else(|| guard.journal_fault.clone())
+            .map(RecorderFault::Device)
+            .or_else(|| guard.journal_fault.clone().map(RecorderFault::Journal))
     }
 
     /// Drains the mono f32 samples accumulated since the last call, in
