@@ -191,6 +191,7 @@ public:
     void set_transcribe_fn(TranscribeFn fn) {
         custom_tx_ = std::move(fn);
         ++tx_gen_;
+        wrapped_tx_ = nullptr;  // else the cached wrapper pairs stale inputs
     }
 
     // ---- exact streaming-tail result reuse (S11) ----------------------------
@@ -243,7 +244,16 @@ private:
     };
 
     // The transcribe callback actually used by stream_step/stream_flush: the
-    // custom (test) or server callback wrapped with exact-tail reuse.
+    // custom (test) or server callback wrapped with exact-tail reuse. Built
+    // once and cached in wrapped_tx_ (R29, issue #236): stream_step and
+    // stream_flush call it per step, and rebuilding the wrapper each time
+    // re-constructed the server callback and allocated a fresh closure even
+    // when the call was about to be answered from the retained entry. The
+    // wrapper's only inputs are custom_tx_, tx_gen_ and engine_id_, whose
+    // sole mutators (set_transcribe_fn, set_engine_identity) drop the cache —
+    // a cached wrapper always pairs current inputs. Returned BY VALUE: an
+    // engine callback may swap the fn mid-step, clearing this slot while the
+    // in-flight copy keeps its snapshot.
     TranscribeFn active_tx();
 
     // Drop the retained exact-tail entry (any event that could change the
@@ -260,6 +270,7 @@ private:
     bool take_invalid_ = false;   // set by an append rejection (issue #145)
     std::string invalid_reason_;  // machine-readable code for the rejection
     TranscribeFn custom_tx_;  // when set, used instead of the server callback
+    TranscribeFn wrapped_tx_;  // cached active_tx() wrapper (see active_tx)
     std::unique_ptr<ChunkStreamer> chunker_;
 
     // ---- exact streaming-tail result reuse (S11) ----------------------------

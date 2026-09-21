@@ -1618,13 +1618,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "filed",
+   "status": "implemented",
    "owner": null,
-   "branch": null,
+   "branch": "fix/engine-236-test-hygiene",
    "evidence": [
-    "PR #198 OCR run 35518206319 (2 findings)"
+    "PR #198 OCR run 35518206319 (2 findings)",
+    "detail::TrimFaultHookGuard added beside the hook (lru_cache.hpp), both rollback-test arm sites converted; manual null-reset gone; tdt_graph_budget_test PASS on native-cpu"
    ],
-   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch",
+   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); fault-hook RAII guard implemented with R29 (issue #236)",
    "github_issue": 236
   },
   {
@@ -1652,13 +1653,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "filed",
+   "status": "implemented",
    "owner": null,
-   "branch": null,
+   "branch": "fix/engine-236-test-hygiene",
    "evidence": [
-    "PR #199 OCR rerun 35518232105-2"
+    "PR #199 OCR rerun 35518232105-2",
+    "all 4 lows verified still present on master then fixed: wrapped_tx_ cached (dropped by set_transcribe_fn/set_engine_identity), per-window key-cost note at key.engine_id, TailFixture moves deleted, cancel test fake engine keyed by window length (n==12800 latch); stream_session_test 382/382 on native-cpu"
    ],
-   "notes": "verify-then-fix; fold into next engine touch with R27",
+   "notes": "verify-then-fix; folded into issue #236 branch with R27",
    "github_issue": 236
   },
   {

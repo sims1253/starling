@@ -649,9 +649,14 @@ struct TailFixture {
     // The session's fake engine captures `this`: a copied fixture would
     // silently count its engine calls into the ORIGINAL (and read the
     // original's text/busy/hook), so copies are deleted rather than trusted
-    // to be noticed.
+    // to be noticed. The moves are deleted too (R29, issue #236): deleted
+    // copies already SUPPRESS implicit move generation, but stating the
+    // rule-of-five in full keeps a future member change from silently
+    // re-enabling moves on a this-capturing type.
     TailFixture(const TailFixture&) = delete;
     TailFixture& operator=(const TailFixture&) = delete;
+    TailFixture(TailFixture&&) = delete;
+    TailFixture& operator=(TailFixture&&) = delete;
 
     TailFixture() : server(test_cfg()), session(&server) {
         session.set_transcribe_fn([this](const float*, int64_t n)
@@ -892,11 +897,19 @@ static void test_tail_reuse_cancel_after_success_not_reused() {
     // paced session) and the next preview is cancelled/busy: the stale
     // success must not answer the grown commit window.
     TailFixture fx;
-    // Window-keyed fake engine: the 11200-sample window succeeds, the grown
-    // 12800-sample window is busy once, then succeeds with overlapping text.
+    // Window-keyed fake engine: the 11200-sample window succeeds; the grown
+    // 12800-sample window is busy ONCE — keyed by window length (like
+    // test_tail_reuse_survives_overlap_rebasing), not by call order (R29,
+    // issue #236): an overlap-policy change that shifts how many windows the
+    // chunker emits must not silently move WHICH call is treated as
+    // cancelled — then succeeds with overlapping text.
+    bool cancelled_grown_window = false;
     fx.hook = [&](int64_t n) -> std::optional<std::string> {
         if (n == 11200) return "alpha beta";
-        if (fx.engine_calls == 2) return std::nullopt;  // cancelled preview
+        if (n == 12800 && !cancelled_grown_window) {
+            cancelled_grown_window = true;
+            return std::nullopt;  // cancelled preview of the grown tail
+        }
         return "alpha beta gamma";
     };
 

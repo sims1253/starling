@@ -295,8 +295,22 @@ namespace detail {
 // Process-global and unfiltered: it fires for EVERY cache instance, not just
 // the one under test, and there is deliberately no locking (callers
 // serialize cache access) — a test must restore it to nullptr before
-// returning. MUST remain null in production.
+// returning (arm it through TrimFaultHookGuard so the restore cannot be
+// skipped). MUST remain null in production.
 inline void (*trim_fault_hook)() = nullptr;
+
+// RAII helper for tests (R27, issue #236): arms the hook for the enclosing
+// scope and restores it to null on EVERY exit path — including an exception
+// a failed check lets escape, or an early return added between the old
+// manual arm and reset — so a throwing hook cannot leak past the test that
+// armed it and fire inside every later cache in the process. Unused in
+// production, like the hook itself.
+struct TrimFaultHookGuard {
+    explicit TrimFaultHookGuard(void (*fault)()) { trim_fault_hook = fault; }
+    ~TrimFaultHookGuard() { trim_fault_hook = nullptr; }
+    TrimFaultHookGuard(const TrimFaultHookGuard&) = delete;
+    TrimFaultHookGuard& operator=(const TrimFaultHookGuard&) = delete;
+};
 }  // namespace detail
 
 template <typename Key, typename Value,

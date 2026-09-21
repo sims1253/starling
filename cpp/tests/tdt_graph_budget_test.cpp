@@ -650,14 +650,19 @@ void test_rollback_restores_accounting() {
     const size_t bytes_before = cache.bytes_in_use();
     const size_t size_before = cache.size();
 
-    starling::ggml::detail::trim_fault_hook = [] { throw std::bad_alloc(); };
     bool threw = false;
-    try {
-        cache.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(400); });
-    } catch (const std::bad_alloc&) {
-        threw = true;
+    {
+        // R27: the guard restores the process-global hook on every exit
+        // path, so a check failure or an escaping exception between the old
+        // manual arm and reset cannot leave the throwing hook armed for
+        // every later cache in this process.
+        detail::TrimFaultHookGuard arm_fault([] { throw std::bad_alloc(); });
+        try {
+            cache.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(400); });
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
     }
-    starling::ggml::detail::trim_fault_hook = nullptr;
 
     check(threw, "ROLLBACK: the fault propagates");
     check(cache.bytes_in_use() == bytes_before,
@@ -683,14 +688,15 @@ void test_rollback_restores_accounting() {
     check(floored.floored_size() == 1,
           "ROLLBACK: floored baseline is one floored entry");
 
-    starling::ggml::detail::trim_fault_hook = [] { throw std::bad_alloc(); };
     threw = false;
-    try {
-        floored.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(0); });
-    } catch (const std::bad_alloc&) {
-        threw = true;
+    {
+        detail::TrimFaultHookGuard arm_fault([] { throw std::bad_alloc(); });
+        try {
+            floored.get_or_init_pinned(2, [](FakeEntry& v) { v.payload = 2; return size_t(0); });
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
     }
-    starling::ggml::detail::trim_fault_hook = nullptr;
 
     check(threw, "ROLLBACK: floored fault propagates");
     check(floored.bytes_in_use() == f_bytes_before,
