@@ -365,52 +365,70 @@ pub(crate) struct ParsedJournal {
 /// The read is **streaming, not whole-file**: the parser walks the file
 /// through one fixed-size buffer ([`JOURNAL_READ_CHUNK`]), so peak memory is
 /// the verified samples plus one chunk, never the samples plus the entire
-/// file. Semantics are byte-identical to the old whole-file parse, with one
-/// documented difference: a file that shrinks *while* being read surfaces as
-/// a torn tail (the stream ends early) instead of a snapshot of whatever
-/// `read` happened to return.
+/// file. Semantics match the old whole-file parse with two documented
+/// differences, both consequences of the length being pinned to the
+/// `metadata()` snapshot taken at open: a file that shrinks *while* being
+/// read surfaces as a torn tail (the stream ends early), and a file that
+/// *grows* is parsed only up to the snapshot length. A read that fails
+/// mid-parse (`EIO`-class) propagates as [`JournalReadError::Io`] exactly
+/// like the old whole-file read — never as a torn tail — so a transient
+/// I/O failure is retried/reported instead of silently truncating audio.
 pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadError> {
-    use std::io::{BufReader, Read};
-
-    /// Read exactly `buf.len()` bytes or `None` (stream ended early).
-    fn read_exact_or(
-        reader: &mut impl Read,
-        buf: &mut [u8],
-    ) -> Option<()> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match reader.read(&mut buf[filled..]) {
-                Ok(0) => return None,
-                Ok(n) => filled += n,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return None,
-            }
-        }
-        Some(())
-    }
-
+    use std::io::BufReader;
     let file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(JOURNAL_READ_CHUNK, file);
+    parse_journal_from(&mut reader, file_len)
+}
 
+/// What one bounded read learned: the bytes were filled, the stream ended
+/// before they were (`Ok(false)` — torn tail), or the read genuinely
+/// failed (`Err` — propagated, never collapsed into end-of-stream).
+type Filled = bool;
+
+/// Read exactly `buf.len()` bytes from `reader`.
+///
+/// `Ok(true)` — filled. `Ok(false)` — the stream ended first (only
+/// `Ok(0)` counts as end-of-stream); the caller treats whatever it was
+/// building as torn. `Err` — a non-`Interrupted` I/O error, retried on
+/// `Interrupted` and propagated otherwise so real failures surface as
+/// [`JournalReadError::Io`] like the old whole-file read.
+fn read_exact(reader: &mut impl std::io::Read, buf: &mut [u8]) -> io::Result<Filled> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(true)
+}
+
+/// The streaming parser over any reader, pinned to `file_len` (the
+/// `metadata()` snapshot the file-reading wrapper takes; tests drive this
+/// half directly with scripted readers). See [`read_journal`] for the
+/// semantics, including the two snapshot-pin divergences.
+fn parse_journal_from(
+    reader: &mut impl std::io::Read,
+    file_len: u64,
+) -> Result<ParsedJournal, JournalReadError> {
     if file_len < HEADER_LEN as u64 {
-        return Err(JournalReadError::NotAJournal(format!(
-            "{} does not start with the v1 header",
-            path.display()
-        )));
+        return Err(JournalReadError::NotAJournal(
+            "journal is shorter than the v1 header".to_string(),
+        ));
     }
     let mut header = [0u8; HEADER_LEN];
-    if read_exact_or(&mut reader, &mut header).is_none() {
-        return Err(JournalReadError::NotAJournal(format!(
-            "{} does not start with the v1 header",
-            path.display()
-        )));
+    if !read_exact(reader, &mut header)? {
+        return Err(JournalReadError::NotAJournal(
+            "journal ended inside the v1 header".to_string(),
+        ));
     }
     if &header[..MAGIC.len()] != MAGIC {
-        return Err(JournalReadError::NotAJournal(format!(
-            "{} does not start with the v1 header",
-            path.display()
-        )));
+        return Err(JournalReadError::NotAJournal(
+            "journal does not start with the v1 header".to_string(),
+        ));
     }
     if header[MAGIC.len()] != FORMAT_VERSION {
         return Err(JournalReadError::NotAJournal(format!(
@@ -418,9 +436,7 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
             header[MAGIC.len()]
         )));
     }
-    let sample_rate = u32::from_le_bytes([
-        header[9], header[10], header[11], header[12],
-    ]);
+    let sample_rate = u32::from_le_bytes([header[9], header[10], header[11], header[12]]);
 
     let mut samples: Vec<f32> = Vec::new();
     let mut hash = FNV_OFFSET;
@@ -436,17 +452,16 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
     'parse: while pos < file_len {
         let remaining = file_len - pos;
         let mut tag = [0u8; 1];
-        if read_exact_or(&mut reader, &mut tag).is_none() {
+        if !read_exact(reader, &mut tag)? {
             break 'parse; // stream ended early: torn
         }
         match tag[0] {
             TAG_FRAME => {
                 let mut count_buf = [0u8; 4];
-                if read_exact_or(&mut reader, &mut count_buf).is_none() {
+                if !read_exact(reader, &mut count_buf)? {
                     break 'parse;
                 }
-                let count =
-                    u32::from_le_bytes(count_buf) as usize;
+                let count = u32::from_le_bytes(count_buf) as usize;
                 let payload_len = count.saturating_mul(4);
                 // Also guards absurd counts from garbage: a record larger
                 // than the bytes actually present is a torn write.
@@ -454,12 +469,22 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
                     break 'parse;
                 }
                 samples.reserve(count);
+                // A frame record is atomic for verification purposes: if
+                // the stream ends inside its payload, the bytes already
+                // streamed in were hashed and pushed but belong to no
+                // verification point — roll the sample vector back to the
+                // frame's start so `samples` only ever holds
+                // boundary-verified audio (the whole-file parser's guard
+                // guaranteed the same by never entering a short record).
+                let frame_start_len = samples.len();
+                let mut complete = true;
                 let mut left = payload_len;
                 while left > 0 {
                     let take = left.min(io_buf.len());
                     let (chunk, _) = io_buf.split_at_mut(take);
-                    if read_exact_or(&mut reader, chunk).is_none() {
-                        break 'parse;
+                    if !read_exact(reader, chunk)? {
+                        complete = false;
+                        break;
                     }
                     hash = fnv1a(hash, chunk);
                     for bytes in chunk.chunks_exact(4) {
@@ -468,6 +493,10 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
                     }
                     left -= take;
                 }
+                if !complete {
+                    samples.truncate(frame_start_len);
+                    break 'parse;
+                }
                 pos += 5 + payload_len as u64;
             }
             TAG_BOUNDARY | TAG_TRAILER => {
@@ -475,7 +504,7 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
                     break 'parse;
                 }
                 let mut record = [0u8; 16];
-                if read_exact_or(&mut reader, &mut record).is_none() {
+                if !read_exact(reader, &mut record)? {
                     break 'parse;
                 }
                 let count = u64::from_le_bytes(
@@ -832,6 +861,102 @@ mod tests {
             parsed.torn_tail_bytes,
             file_len - boundary_end as u64,
             "the discarded tail is exactly the torn record"
+        );
+    }
+
+    /// A reader that serves a fixed byte slice and then fails with a
+    /// chosen error kind — the test double for a disk failing mid-read.
+    struct FailingAfter {
+        bytes: std::io::Cursor<Vec<u8>>,
+        exhausted: bool,
+        error: io::ErrorKind,
+    }
+
+    impl FailingAfter {
+        fn new(bytes: Vec<u8>, error: io::ErrorKind) -> Self {
+            Self {
+                bytes: std::io::Cursor::new(bytes),
+                exhausted: false,
+                error,
+            }
+        }
+    }
+
+    impl std::io::Read for FailingAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.bytes.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            self.exhausted = true;
+            Err(io::Error::new(self.error, "injected mid-read failure"))
+        }
+    }
+
+    /// A mid-read I/O failure must surface as `JournalReadError::Io` —
+    /// the old whole-file contract — never as a torn tail: reconcile
+    /// would otherwise seal (physically truncate) and adopt a journal
+    /// whose only defect was a transient disk error.
+    #[test]
+    fn a_mid_read_io_error_surfaces_as_an_error_not_a_torn_tail() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut writer = writer_in(&dir, 16_000);
+        let verified = ramp(3_000, 0);
+        writer.append_frames(&verified).expect("append");
+        writer.write_boundary().expect("boundary");
+        // A second frame the stream will die inside.
+        writer.append_frames(&ramp(3_000, 3_000)).expect("append");
+        let full = std::fs::read(writer.path()).expect("read journal bytes");
+        drop(writer);
+
+        // The reader serves the first half of the file, then errors. The
+        // file length stays pinned to the full snapshot, so the parser
+        // believes more records exist — exactly the shape an EIO after a
+        // successful open + metadata produces.
+        let cut = full.len() / 2;
+        let mut failing = FailingAfter::new(full[..cut].to_vec(), io::ErrorKind::Other);
+        match parse_journal_from(&mut failing, full.len() as u64) {
+            Err(JournalReadError::Io(err)) => {
+                assert!(err.to_string().contains("injected mid-read failure"))
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        assert!(failing.exhausted);
+    }
+
+    /// A stream that ends inside a frame payload (the documented
+    /// shrink-mid-read shape): the samples already streamed in belong to
+    /// no verification point and must be rolled back —
+    /// `ParsedJournal.samples` only ever holds boundary-verified audio.
+    #[test]
+    fn a_stream_ending_mid_payload_never_leaks_unverified_samples() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut writer = writer_in(&dir, 16_000);
+        let verified = ramp(500, 0);
+        writer.append_frames(&verified).expect("append");
+        writer.write_boundary().expect("boundary");
+        // An unverified frame follows the boundary; the stream will cut
+        // inside its payload.
+        writer.append_frames(&ramp(2_000, 500)).expect("append");
+        let full = std::fs::read(writer.path()).expect("read journal bytes");
+        drop(writer);
+
+        // Cut the byte stream inside the second frame's payload while the
+        // length snapshot still covers the whole file.
+        let boundary_end = first_boundary_end(&full);
+        let cut = boundary_end + 5 + 400; // inside the frame's payload
+        let mut truncated = std::io::Cursor::new(full[..cut].to_vec());
+        let parsed =
+            parse_journal_from(&mut truncated, full.len() as u64).expect("parse truncates");
+        assert!(!parsed.finalized);
+        assert_eq!(
+            parsed.samples, verified,
+            "only the boundary-verified prefix survives"
+        );
+        assert_eq!(
+            parsed.torn_tail_bytes,
+            (full.len() - boundary_end) as u64,
+            "everything past the last valid boundary is the torn tail"
         );
     }
 
