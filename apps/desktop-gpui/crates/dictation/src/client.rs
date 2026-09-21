@@ -4,12 +4,15 @@
 // See `apps/desktop-gpui/PORT.md` ("Transcription client") for the contract.
 
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::blocking::{multipart, Client, RequestBuilder};
+use reqwest::multipart;
 use reqwest::redirect::Policy;
-use reqwest::Url;
+use reqwest::{Client, RequestBuilder, Url};
 use serde_json::{Map, Value};
+use tokio::runtime::Runtime;
 
 use crate::storage::{TranscriptionResult, TranscriptionSegment};
 
@@ -52,15 +55,90 @@ pub enum ClientError {
     Http { status: u16, message: String },
     #[error("The server returned invalid {0} JSON.")]
     Protocol(&'static str),
+    /// The caller cancelled the request while it was in flight (issue
+    /// #251): the connection was aborted, not timed out — distinct from
+    /// [`ClientError::Timeout`], which is the server being slow.
+    #[error("The request was cancelled before it completed.")]
+    Cancelled,
+}
+
+/// A cooperative cancellation signal for in-flight requests (issue #251).
+///
+/// One side calls [`CancelToken::cancel`] — from any thread; the signal
+/// is monotonic, so extra trips are harmless — and every request
+/// carrying this token aborts. The wakeup is a *broadcast*: any number
+/// of concurrent waiters each observe the change, so a token shared by
+/// several in-flight requests cancels all of them (the durable flag
+/// covers the before-send fast path; a `watch` channel reaches every
+/// waiter). Clone shares the signal.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    state: Arc<CancelState>,
+}
+
+struct CancelState {
+    flag: AtomicBool,
+    /// The broadcast side of the signal. Every waiter subscribes its
+    /// own receiver — unlike `Notify`'s single stored permit, which
+    /// would wake exactly one of several concurrent waiters.
+    cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for CancelState {
+    fn default() -> Self {
+        let (cancelled, _) = tokio::sync::watch::channel(false);
+        CancelState {
+            flag: AtomicBool::new(false),
+            cancelled,
+        }
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trips the signal (idempotently) and wakes every request waiting
+    /// on this token.
+    pub fn cancel(&self) {
+        self.state.flag.store(true, Ordering::Release);
+        // `send` fails only when no receiver is alive — then there is
+        // nothing to wake; the flag above is the durable half of the
+        // signal for anyone who checks later.
+        let _ = self.state.cancelled.send(true);
+    }
+
+    /// Whether [`CancelToken::cancel`] has been called.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.flag.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the token is cancelled — for *every* concurrent
+    /// caller: each waiter watches its own receiver, and `wait_for`
+    /// consults the current value first, so a cancel that landed before
+    /// the subscription is seen immediately (no registration race, no
+    /// permit to win).
+    async fn notified(&self) {
+        let mut receiver = self.state.cancelled.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
 }
 
 /// Blocking HTTP client mirroring the Electron native request programs.
+///
+/// The façade stays blocking (callers are worker threads); inside, the
+/// async reqwest client runs on a dedicated current-thread runtime — the
+/// async future is what makes an in-flight request abortable at all
+/// (issue #251): dropping it in [`tokio::select!`] closes the connection,
+/// something the blocking API cannot do.
 pub struct StarlingClient {
     base_url: String,
     protocol: Protocol,
     model: String,
     timeout_ms: u64,
     http: Client,
+    runtime: Runtime,
 }
 
 struct ApiResponse {
@@ -102,6 +180,7 @@ impl StarlingClient {
             model: model.trim().to_string(),
             timeout_ms,
             http: build_http_client(timeout_ms)?,
+            runtime: build_runtime()?,
         })
     }
 
@@ -112,19 +191,32 @@ impl StarlingClient {
             Protocol::OpenAi => "/v1/models",
             Protocol::Starling => "/health",
         };
-        let response = self.execute(self.http.get(format!("{}{route}", self.base_url)))?;
+        let response = self.execute(self.http.get(format!("{}{route}", self.base_url)), None)?;
         match self.protocol {
             Protocol::OpenAi => parse_models_health(&response.body),
             Protocol::Starling => parse_starling_health(&response.body),
         }
     }
 
-    /// `transcribeProgram`: POST the prepared WAV raw (`{base}/transcribe`)
-    /// or as multipart (`{base}/v1/audio/transcriptions`).
+    /// `transcribeProgram` without cancellation: runs to the timeout.
     pub fn transcribe(
         &self,
         wav: &[u8],
         request_id: &str,
+    ) -> Result<TranscriptionResult, ClientError> {
+        self.transcribe_with_cancel(wav, request_id, None)
+    }
+
+    /// `transcribeProgram` with an abort signal (issue #251): when the
+    /// token fires, the in-flight HTTP request is aborted (the connection
+    /// closed) and the call returns [`ClientError::Cancelled`] promptly —
+    /// instead of holding the worker and the connection for the rest of
+    /// the whole-recognition timeout.
+    pub fn transcribe_with_cancel(
+        &self,
+        wav: &[u8],
+        request_id: &str,
+        cancel: Option<&CancelToken>,
     ) -> Result<TranscriptionResult, ClientError> {
         let sent_request_id = validate_request_id(request_id)?;
         if wav.len() < MIN_AUDIO_BYTES || wav.len() > MAX_AUDIO_BYTES {
@@ -142,7 +234,7 @@ impl StarlingClient {
                     .header("x-request-id", sent_request_id.as_str())
                     .header("content-type", "audio/wav")
                     .body(wav.to_vec());
-                self.execute(request)?
+                self.execute(request, cancel)?
             }
             Protocol::OpenAi => {
                 let url = format!("{}/v1/audio/transcriptions", self.base_url);
@@ -164,7 +256,7 @@ impl StarlingClient {
                     .post(&url)
                     .header("x-request-id", sent_request_id.as_str())
                     .multipart(form);
-                self.execute(request)?
+                self.execute(request, cancel)?
             }
         };
 
@@ -177,30 +269,54 @@ impl StarlingClient {
 
     /// Sends one request and buffers the response, mirroring `requestBody` in
     /// `main.ts`: 3xx -> Redirect, non-2xx -> Http with the best detail.
-    fn execute(&self, request: RequestBuilder) -> Result<ApiResponse, ClientError> {
-        let response = request
-            .send()
-            .map_err(|error| transport_error(&error, self.timeout_ms))?;
-        let status = response.status().as_u16();
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = response
-            .text()
-            .map_err(|error| transport_error(&error, self.timeout_ms))?;
+    ///
+    /// With `cancel`, the request future races the token in
+    /// [`tokio::select!`]: a cancellation aborts the in-flight request —
+    /// dropping the future closes the socket — and reports
+    /// [`ClientError::Cancelled`]. A token already cancelled returns
+    /// before any connection is attempted.
+    fn execute(
+        &self,
+        request: RequestBuilder,
+        cancel: Option<&CancelToken>,
+    ) -> Result<ApiResponse, ClientError> {
+        let perform = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|error| transport_error(&error, self.timeout_ms))?;
+            let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = response
+                .text()
+                .await
+                .map_err(|error| transport_error(&error, self.timeout_ms))?;
 
-        if (300..400).contains(&status) {
-            return Err(ClientError::Redirect(status));
+            if (300..400).contains(&status) {
+                return Err(ClientError::Redirect(status));
+            }
+            if !(200..300).contains(&status) {
+                return Err(ClientError::Http {
+                    status,
+                    message: http_error_message(status, &body),
+                });
+            }
+            Ok(ApiResponse { body, request_id })
+        };
+        match cancel {
+            None => self.runtime.block_on(perform),
+            Some(cancel) if !cancel.is_cancelled() => self.runtime.block_on(async {
+                tokio::select! {
+                    result = perform => result,
+                    _ = cancel.notified() => Err(ClientError::Cancelled),
+                }
+            }),
+            Some(_) => Err(ClientError::Cancelled),
         }
-        if !(200..300).contains(&status) {
-            return Err(ClientError::Http {
-                status,
-                message: http_error_message(status, &body),
-            });
-        }
-        Ok(ApiResponse { body, request_id })
     }
 }
 
@@ -208,6 +324,23 @@ fn build_http_client(timeout_ms: u64) -> Result<Client, ClientError> {
     Client::builder()
         .redirect(Policy::none())
         .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|error| ClientError::Transport(error_chain(&error)))
+}
+
+/// The runtime behind the blocking façade: current-thread (no extra
+/// threads — requests run on the caller's thread inside `block_on`) with
+/// the I/O and time drivers reqwest needs.
+///
+/// A build failure here is environmental (thread/resource limits on
+/// this machine), not a request condition. `ClientError` has no
+/// config/setup variant — the taxonomy is the request lifecycle — so it
+/// maps to `Transport`, the local-unavailability bucket; either way the
+/// client could not be constructed, which every caller treats as a
+/// hard setup failure rather than something to classify finer.
+fn build_runtime() -> Result<Runtime, ClientError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .map_err(|error| ClientError::Transport(error_chain(&error)))
 }
@@ -890,5 +1023,115 @@ mod tests {
             Err(ClientError::Timeout(50)) => {}
             other => panic!("expected Timeout(50), got {other:?}"),
         }
+    }
+
+    /// Issue #251, client half: a cancelled request must abort the
+    /// in-flight HTTP call — the blocking `transcribe_with_cancel` returns
+    /// promptly with `Cancelled` while the server sits on its response,
+    /// instead of holding the caller for the rest of the request timeout.
+    #[test]
+    fn cancelled_request_aborts_the_in_flight_transcription() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            // Exactly one connection is expected; accepting it and
+            // dropping the listener lets this thread exit instead of
+            // parking on `incoming()` for the rest of the suite.
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = read_request(&mut stream);
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Hold the connection open (never answer) until the client's
+            // abort closes it — read EOF here. The read timeout is only
+            // an escape hatch so a misbehaving client cannot pin this
+            // thread; the abort path is what ends it, promptly.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut sink = [0u8; 1024];
+            loop {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let client = StarlingClient::new(&format!("http://{addr}"), Protocol::Starling, "")
+            .expect("valid client")
+            .with_timeout_ms(30_000)
+            .expect("valid timeout");
+        let token = CancelToken::new();
+        let wav = fake_wav();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let caller_token = token.clone();
+        let caller = std::thread::spawn(move || {
+            let result = client.transcribe_with_cancel(&wav, "req-cancel", Some(&caller_token));
+            let _ = done_tx.send(());
+            result
+        });
+
+        // Gate the cancellation on the request provably being in flight:
+        // the server has read it. A fixed sleep could cancel before the
+        // connection was even established (#217).
+        let start = std::time::Instant::now();
+        while seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "test server never saw the transcription request"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        token.cancel();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("transcribe must return promptly after cancellation");
+        match caller.join().expect("caller thread") {
+            Err(ClientError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// The precancelled case needs no server cooperation: the early
+    /// flag check returns before any connection is attempted, so nothing
+    /// is ever sent.
+    #[test]
+    fn precancelled_transcribe_returns_without_sending() {
+        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"too late"}"#)]);
+        let token = CancelToken::new();
+        token.cancel();
+        let client = client_at(addr, Protocol::Starling);
+        match client.transcribe_with_cancel(&fake_wav(), "req-precancel", Some(&token)) {
+            Err(ClientError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        let recorded = recorded.lock().expect("recorded lock");
+        assert_eq!(
+            recorded.len(),
+            0,
+            "a precancelled request must not reach the server"
+        );
+    }
+
+    /// Review on #253: the token's wakeup is a broadcast, not a single
+    /// `Notify` permit — two waiters registered *before* the cancel must
+    /// both wake on one trip (the shape that would leave exactly one of
+    /// them parked forever under `notify_one`).
+    #[tokio::test]
+    async fn one_cancel_wakes_every_registered_waiter() {
+        let token = CancelToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                // A trigger, not a gate: both waiters below are polled
+                // (registered) before this fires.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                token.cancel();
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let ((), ()) = tokio::join!(token.notified(), token.notified());
+        })
+        .await
+        .expect("both concurrent waiters must wake on a single cancel");
+        canceller.await.expect("canceller task");
     }
 }

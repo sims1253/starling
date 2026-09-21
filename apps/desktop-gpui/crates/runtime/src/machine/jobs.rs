@@ -23,7 +23,6 @@
 //! `Failed{worker_crash, retryable}` without touching capture or history.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bus::EventBus;
@@ -33,7 +32,7 @@ use crate::protocol::tables::JOBS;
 use crate::protocol::{Command, CompletionData, Event, JobLimits, RejectReason};
 
 use super::context::FrozenRoutes;
-use crate::provider::{Partial, ProviderOutcome, TranscriptionProvider};
+use crate::provider::{CancelToken, Partial, ProviderOutcome, TranscriptionProvider};
 
 /// Messages the scheduler receives.
 pub enum JobsMsg {
@@ -61,7 +60,11 @@ struct Job {
     #[allow(dead_code)]
     budget: String,
     core: MachineCore,
-    cancel: Arc<AtomicBool>,
+    /// The job's cancellation signal (issue #251): `jobs.cancel` trips
+    /// it and the worker's provider call watches it, so cancellation
+    /// aborts the in-flight recognition — not just the scheduler's
+    /// bookkeeping.
+    cancel: CancelToken,
 }
 
 /// The scheduler's projection for [`crate::RuntimeSnapshot`].
@@ -291,7 +294,7 @@ impl JobsActor {
             route,
             budget,
             core,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: CancelToken::new(),
         };
         self.jobs.insert(job_id.clone(), job);
         self.latest = Some(job_id.clone());
@@ -357,7 +360,12 @@ impl JobsActor {
         match result {
             Ok(_) => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    job.cancel.store(true, Ordering::Release);
+                    // Trip the job's cancellation signal (issue #251):
+                    // the in-flight worker watches it through its
+                    // provider call and unwinds, instead of running the
+                    // recognition to completion for a result nobody
+                    // will keep.
+                    job.cancel.cancel();
                 }
                 self.waiting.retain(|id| id != &job_id);
                 self.active.remove(&job_id);
@@ -480,7 +488,7 @@ impl JobsActor {
         let cancel = self
             .jobs
             .get(&job_id)
-            .map(|job| Arc::clone(&job.cancel))
+            .map(|job| job.cancel.clone())
             .unwrap_or_default();
         let worker_job = job_id.clone();
         // Supervised worker: a panic is caught here and demoted to
@@ -494,7 +502,17 @@ impl JobsActor {
                     // closed inbox); the worker can do nothing further.
                     let _ = deliver_worker_report(&inbox, &worker_job, report);
                 };
+                // `Ok(None)` is the cancelled early-out (issue #251): the
+                // job is already `Cancelled` and retired, so the worker
+                // reports nothing — neither a Done (its result lands
+                // nowhere by design) nor a failure.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Cancelled between dispatch and spawn: don't even
+                    // start — the WAV encode is whole-take CPU work
+                    // nobody asked for.
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
                     // The upload WAV is encoded here, on the worker
                     // (issue #216): the encode is the take's whole audio
                     // — tens of MB of WAV for a multi-minute take — and
@@ -513,15 +531,33 @@ impl JobsActor {
                         Ok(wav) => wav,
                         Err(reason) => return Err(reason),
                     };
+                    // Cancelled during the encode: the recognition —
+                    // and its in-flight HTTP request — never starts.
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
                     let mut on_partial = |partial: Partial| {
-                        if !cancel.load(Ordering::Acquire) {
+                        if !cancel.is_cancelled() {
                             report(WorkerReport::Partial(partial));
                         }
                     };
-                    Ok(provider.recognize(wav, &worker_job, &mut on_partial))
+                    // The provider watches the same token (issue #251):
+                    // `jobs.cancel` aborts the in-flight request inside
+                    // the client instead of letting the worker — and the
+                    // connection — run to the recognition's end.
+                    let result = provider.recognize(wav, &worker_job, &mut on_partial, &cancel);
+                    // Cancelled while the provider ran: the outcome is
+                    // void (the job is retired and its state must stay
+                    // `Cancelled`), so stop here rather than delivering
+                    // a Completed the scheduler would only drop.
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    Ok(Some(result))
                 }));
                 match outcome {
-                    Ok(Ok(result)) => report(WorkerReport::Done(result)),
+                    Ok(Ok(Some(result))) => report(WorkerReport::Done(result)),
+                    Ok(Ok(None)) => {}
                     Ok(Err(reason)) => report(WorkerReport::LoadFailed(reason)),
                     Err(_) => report(WorkerReport::Done(ProviderOutcome::Failed {
                         reason: "worker_crash".to_string(),
@@ -546,7 +582,7 @@ impl JobsActor {
         let cancelled = self
             .jobs
             .get(&job_id)
-            .map(|job| job.cancel.load(Ordering::Acquire))
+            .map(|job| job.cancel.is_cancelled())
             .unwrap_or(true);
         match report {
             WorkerReport::Partial(partial) => {

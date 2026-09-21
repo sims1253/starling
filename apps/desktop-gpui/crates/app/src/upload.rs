@@ -34,11 +34,14 @@ pub(crate) enum FailureClass {
 /// refused, network unreachable, DNS and socket failures) and
 /// [`ClientError::Timeout`] qualify: an HTTP error status or a blocked
 /// redirect proves something answered on the endpoint, and
-/// `Input`/`Protocol` failures never left this machine.
+/// `Input`/`Protocol` failures never left this machine. `Cancelled` (the
+/// abort signal of issue #251) is local by construction — this upload
+/// path never passes a cancel token, so it cannot occur here.
 pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
     match err {
         ClientError::Transport(_) | ClientError::Timeout(_) => FailureClass::Transport,
         ClientError::Input(_)
+        | ClientError::Cancelled
         | ClientError::Redirect(_)
         | ClientError::Http { .. }
         | ClientError::Protocol(_) => FailureClass::Local,
