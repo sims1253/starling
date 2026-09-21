@@ -541,6 +541,38 @@ fn nack_path_answers_unsupported_version() {
 }
 
 #[test]
+fn multi_byte_utf8_ts_is_rejected_not_fatal() {
+    // Issue #202: a multi-byte UTF-8 `ts` used to panic inside the router
+    // thread (non-char-boundary slice in `is_rfc3339`), wedging every
+    // later command on the bounded(1) reply channel. It must come back as
+    // a plain envelope rejection, and the router must keep serving.
+    let (runtime, client) = Runtime::start(RuntimeConfig::default());
+    let bad = serde_json::json!({
+        "v": 1, "id": "x", "ts": "日日日日日日日",
+        "type": "capture.abort", "payload": {}
+    });
+    match client.send_raw(bad) {
+        Err(starling_runtime::machine::Rejection::InvalidEnvelope(detail)) => {
+            assert!(detail.contains("ts"), "{detail}");
+        }
+        other => panic!("expected InvalidEnvelope, got {other:?}"),
+    }
+    // The router thread survived: a subsequent command still completes
+    // (this call would never be answered if the panicking router had died).
+    client
+        .send(
+            Some("take_alive"),
+            Command::JobsSetLimits(JobLimits {
+                max_queued: 1,
+                max_concurrent: 1,
+                per_route: Vec::new(),
+            }),
+        )
+        .expect("router must still answer after rejecting a malformed envelope");
+    runtime.shutdown();
+}
+
+#[test]
 fn command_seq_must_be_strictly_monotonic_per_stream() {
     let (runtime, client) = Runtime::start(RuntimeConfig::default());
     // First command on the stream (its machine-level fate is irrelevant).
