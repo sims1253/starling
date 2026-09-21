@@ -158,21 +158,22 @@ export class DictationProtocolError extends Schema.TaggedError<DictationProtocol
  */
 const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
+// The error keeps the standard fields-object signature so schema-driven
+// instantiation (decode, Effect serialization) constructs it exactly like
+// the other tagged errors; `limitBytes: PositiveFinite` is what refuses a
+// non-positive cap at the type level. Runtime caps are validated once, at
+// StarlingClient construction (`maxResponseBytes`).
 export class DictationResponseTooLargeError extends Schema.TaggedError<DictationResponseTooLargeError>()(
   "DictationResponseTooLargeError",
   { message: Schema.String, limitBytes: PositiveFinite },
-) {
-  constructor(limitBytes: number) {
-    // Mirrors the Rust client's `with_max_response_bytes(0)` refusal: a
-    // cap of zero (or a non-finite one) is a caller bug, never a state a
-    // real client can produce — `maxResponseBytes` is validated the same
-    // way at construction.
-    if (!Number.isFinite(limitBytes) || limitBytes <= 0) {
-      throw new TypeError("limitBytes must be a finite positive number");
-    }
+) {}
 
-    super({ message: `dictation response body exceeded the ${limitBytes} byte limit`, limitBytes });
-  }
+/** The cap refusal at every throw site: one message shape, one place. */
+function responseTooLarge(limitBytes: number): DictationResponseTooLargeError {
+  return new DictationResponseTooLargeError({
+    message: `dictation response body exceeded the ${limitBytes} byte limit`,
+    limitBytes,
+  });
 }
 
 export class DictationTimeoutError extends Schema.TaggedError<DictationTimeoutError>()(
@@ -351,39 +352,43 @@ function protocolError(label: string): DictationProtocolError {
  * across chunks survive.
  */
 async function readBodyCapped(response: Response, limitBytes: number): Promise<string> {
+  const declared = response.headers.get("Content-Length");
+  const declaredBytes = declared === null ? Number.NaN : Number(declared);
+
+  // Checked before anything else — including the null-body return — so
+  // an oversized declaration is refused no matter what the body looks
+  // like (parity with the Rust client's pre-check).
+  if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
+    await response.body?.cancel();
+
+    throw responseTooLarge(limitBytes);
+  }
+
   const body = response.body;
 
   if (body === null) return "";
 
   const reader = body.getReader();
-
-  const declared = response.headers.get("Content-Length");
-  const declaredBytes = declared === null ? Number.NaN : Number(declared);
-
-  if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
-    await reader.cancel();
-
-    throw new DictationResponseTooLargeError(limitBytes);
-  }
-
   const decoder = new TextDecoder();
   let received = 0;
-  let text = "";
+  const chunks: Array<string> = [];
 
   for (;;) {
     const { done, value } = await reader.read();
 
-    if (done) return text + decoder.decode();
+    if (done) return chunks.join("") + decoder.decode();
 
     received += value.byteLength;
 
     if (received > limitBytes) {
       await reader.cancel();
 
-      throw new DictationResponseTooLargeError(limitBytes);
+      throw responseTooLarge(limitBytes);
     }
 
-    text += decoder.decode(value, { stream: true });
+    // Joined once at the end: `+=` on a growing string is quadratic in
+    // the body size, which matters near the 10 MiB default cap.
+    chunks.push(decoder.decode(value, { stream: true }));
   }
 }
 

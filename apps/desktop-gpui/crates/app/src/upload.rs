@@ -15,30 +15,36 @@ use starling_dictation::{
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::store::Store;
 
-/// What a failed job says about server reachability (R13).
+/// What a failed job says about retrying it (R13).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FailureClass {
     /// A transport-level failure — connection refused, timeout, network
-    /// unreachable. The server may be down, so the connection badge needs
-    /// a fresh health probe.
+    /// unreachable. The server may merely be down or slow, so a retry can
+    /// still get through and the connection badge needs a fresh health
+    /// probe.
     Transport,
-    /// Everything else: local storage failures (full disk), input
-    /// validation, blocked redirects, HTTP error statuses, and
-    /// protocol/parse errors. None of them says the server is
-    /// unreachable, so none of them may prompt a probe.
+    /// A deterministic failure: retrying the same request cannot change
+    /// the outcome, so no probe may be prompted. This covers failures
+    /// that never left this machine (local storage errors, input
+    /// validation, `Cancelled`) and ones where the server provably
+    /// answered and would answer the same way again — blocked redirects,
+    /// HTTP error statuses, protocol/parse errors, and oversized
+    /// responses (issue #235). "Local" here means "retry is pointless",
+    /// not "nothing left this machine".
     Local,
 }
 
-/// Classify a transcription-client failure by what it says about server
-/// reachability (R13). Only [`ClientError::Transport`] (connection
+/// Classify a transcription-client failure by whether a retry could
+/// still succeed (R13). Only [`ClientError::Transport`] (connection
 /// refused, network unreachable, DNS and socket failures) and
-/// [`ClientError::Timeout`] qualify: an HTTP error status or a blocked
-/// redirect proves something answered on the endpoint, and
-/// `Input`/`Protocol` failures never left this machine. `Cancelled` (the
-/// abort signal of issue #251) is local by construction — this upload
-/// path never passes a cancel token, so it cannot occur here. An
-/// oversized response (issue #235) likewise proves the server answered —
-/// deterministically wrong — so it never prompts a probe.
+/// [`ClientError::Timeout`] are nondeterministic — the server may be
+/// reachable on a later attempt. Everything else lands in
+/// [`FailureClass::Local`]: `Input`/`Protocol` failures never left this
+/// machine, while an HTTP error status, a blocked redirect, or an
+/// oversized response (issue #235) proves the server answered and would
+/// answer the same way again — deterministic, so no probe. `Cancelled`
+/// (the abort signal of issue #251) is moot here: this upload path never
+/// passes a cancel token, so it cannot occur.
 pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
     match err {
         ClientError::Transport(_) | ClientError::Timeout(_) => FailureClass::Transport,

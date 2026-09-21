@@ -513,6 +513,21 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(cancelled, true, "the reader must be cancelled without reading");
   });
 
+  it("refuses an oversized declared length even when the body is null", async () => {
+    // The declaration alone is grounds for refusal: a null body must not
+    // slip past the pre-check through the empty-body early return.
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(null, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
   it("rejects a non-positive or non-finite maxResponseBytes", () => {
     for (const maxResponseBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
       assert.throws(
@@ -527,12 +542,22 @@ describe("StarlingClient protocol compatibility", () => {
     }
   });
 
-  it("refuses to build a response-too-large error with a non-positive limit", () => {
-    // The error's own limit must be strictly positive — the same rule the
-    // client constructor applies to maxResponseBytes and the Rust client
-    // applies to with_max_response_bytes.
+  it("rejects a non-positive limit at the schema level", () => {
+    // The error keeps the standard fields-object signature (schema-driven
+    // instantiation constructs it like every other tagged error); the
+    // strictly positive `limitBytes` field is the enforcement, so the
+    // schema machinery itself refuses a non-positive cap. Runtime caps
+    // are validated once, at StarlingClient construction.
+    const good = new DictationResponseTooLargeError({
+      message: "dictation response body exceeded the 64 byte limit",
+      limitBytes: 64,
+    });
+
+    assert.ok(good instanceof DictationResponseTooLargeError);
+    assert.equal(good.limitBytes, 64);
+
     for (const limitBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
-      assert.throws(() => new DictationResponseTooLargeError(limitBytes), TypeError);
+      assert.throws(() => new DictationResponseTooLargeError({ message: "x", limitBytes }));
     }
   });
 });

@@ -11,8 +11,8 @@ description = "Rust port of @starling/dictation: audio prep, transcription clien
 # `Bytes::from_owner` wraps the caller's shared recording buffer without
 # copying it, so the transcription upload adds no second WAV in memory
 # (issue #235). Already in the tree via reqwest/hyper. `from_owner` needs
-# bytes >= 1.10.
-bytes = "1.10"
+# bytes >= 1.9.
+bytes = "1.9"
 cpal = "0.15"
 dirs = "6"
 regex = "1"
