@@ -16,6 +16,15 @@ pub const DICTATION_SESSION_SCHEMA_VERSION: u32 = 1;
 const AUDIO_FILE: &str = "recording.wav";
 const MANIFEST_FILE: &str = "manifest.json";
 
+/// Trash tree under the store root (#206): the destination of
+/// [`FileSessionStore::delete`]'s commit rename, mirroring the journal
+/// root's `deleted/` (R21). A session mid-deletion sits here between the
+/// rename and the removal; no records-root scan ever reads this tree, and
+/// [`FileSessionStore::open`] sweeps whatever a crash left behind. Because
+/// session ids *are* directory names, the name is reserved
+/// ([`is_valid_session_dir_name`]) so a take can never collide with it.
+pub(crate) const DELETED_DIR: &str = "deleted";
+
 const RFC3339_MILLIS: &[FormatItem] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
@@ -266,6 +275,14 @@ impl FileSessionStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        // Reap trash a crashed delete left behind (#206): a session sits
+        // under `deleted/` between the commit rename and the removal, and
+        // nothing ever reads that tree — sweeping here is what keeps the
+        // crash window from leaking the bytes forever. Best-effort: a
+        // failed sweep leaves only trash, which the next open retries
+        // (two app instances on one data dir are outside the store's
+        // contract, the #213 stance the sweep shares).
+        let _ = std::fs::remove_dir_all(root.join(DELETED_DIR));
         Ok(Self { root })
     }
 
@@ -311,10 +328,10 @@ impl FileSessionStore {
 
         let id = match journal_id {
             Some(journal_id) => {
-                if !is_safe_path_component(journal_id) {
+                if !is_valid_session_dir_name(journal_id) {
                     return Err(StorageError::Invalid(format!(
-                        "journal id {journal_id:?} must be non-empty and contain no path \
-                         separators"
+                        "journal id {journal_id:?} must be non-empty, contain no path \
+                         separators, and not be the reserved trash name {DELETED_DIR:?}"
                     )));
                 }
                 journal_id.to_string()
@@ -416,6 +433,13 @@ impl FileSessionStore {
             }
 
             let id = entry.file_name().to_string_lossy().into_owned();
+
+            // The trash tree (#206): a session mid-deletion lives here
+            // between the commit rename and the removal. Never a record,
+            // never classified, never listed.
+            if id == DELETED_DIR {
+                continue;
+            }
 
             let record = match self.classify_record(&id) {
                 RecordState::Manifest(manifest) => {
@@ -553,6 +577,11 @@ impl FileSessionStore {
             if !path.is_dir() {
                 continue;
             }
+            // The trash tree (#206) is not a record: never scanned for
+            // linkage, only ever swept.
+            if entry.file_name().to_str() == Some(DELETED_DIR) {
+                continue;
+            }
             let Ok(bytes) = std::fs::read(path.join(MANIFEST_FILE)) else {
                 continue;
             };
@@ -617,6 +646,11 @@ impl FileSessionStore {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
+            // The trash tree (#206) is not a record: never scanned for
+            // damaged-audio linkage, only ever swept.
+            if id == DELETED_DIR {
+                continue;
+            }
             let Ok(bytes) = read_manifest_bounded(&path.join(MANIFEST_FILE)) else {
                 continue;
             };
@@ -763,9 +797,10 @@ impl FileSessionStore {
     ) -> Result<RecoverySave, StorageError> {
         validate_wav(&wav)?;
         validate_duration_ms(duration_ms)?;
-        if !is_safe_path_component(journal_id) {
+        if !is_valid_session_dir_name(journal_id) {
             return Err(StorageError::Invalid(format!(
-                "journal id {journal_id:?} must be non-empty and contain no path separators"
+                "journal id {journal_id:?} must be non-empty, contain no path separators, \
+                 and not be the reserved trash name {DELETED_DIR:?}"
             )));
         }
 
@@ -843,14 +878,68 @@ impl FileSessionStore {
         })
     }
 
+    /// Confirmed deletion, made crash-safe (#206). The old
+    /// `remove_dir_all` unlinked `manifest.json` and `recording.wav` as
+    /// separate syscalls, so a crash between them left a WAV-only
+    /// directory that the next startup classified as a recoverable orphan
+    /// — the take the user just deleted reappeared in history as
+    /// `interrupted`, the exact resurrection R21's tombstone exists to
+    /// prevent, via a path it does not cover (it protects the linked
+    /// journal, not the session's own audio). A plain delete has no
+    /// tombstone at all, so any half-done removal resurrected the same
+    /// way.
+    ///
+    /// Instead, mirroring [`crate::journal::quarantine_journal`]: one
+    /// atomic rename moves the directory out of the records root into
+    /// `<root>/deleted/` — the commit point, after which no scan
+    /// (`list_records`, `journal_ids`, `damaged_audio_journal_links`,
+    /// classification) can ever see the session again, whatever happens
+    /// next — both directories are fsynced, and only then is the renamed
+    /// directory removed. The crash matrix collapses to: before the
+    /// rename, the session is fully intact (the delete simply did not
+    /// happen); after it, only trash remains, which no code reads and the
+    /// next [`Self::open`] sweeps. There is no interleaving that leaves a
+    /// WAV-only directory in the records root.
+    ///
+    /// Idempotent, matching the old contract: deleting a missing session
+    /// is `Ok(())` — an earlier delete, or a retry after a crash past the
+    /// commit point. Failures before the rename propagate with the
+    /// session still in place; the post-rename removal is best-effort for
+    /// the same reason the open sweep is (its failure modes can neither
+    /// resurrect anything nor surface as a delete that did not happen).
     pub fn delete(&self, id: &str) -> Result<(), StorageError> {
         validate_session_id(id)?;
 
-        match std::fs::remove_dir_all(self.session_dir(id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        let dir = self.session_dir(id);
+        match std::fs::symlink_metadata(&dir) {
+            // Already gone — a retried delete after any crash point, or
+            // the plain "never existed" case.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
         }
+
+        let trash = self.root.join(DELETED_DIR);
+        std::fs::create_dir_all(&trash)?;
+        let destination = trash.join(id);
+        // Trash left under the same id by a delete that crashed between
+        // its rename and its removal (and a backup then restored the
+        // session) is replaced: `rename` refuses a non-empty destination
+        // on Unix and any existing destination on Windows. Removing it is
+        // safe by construction — it is already deleted data.
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination)?;
+        }
+        std::fs::rename(&dir, &destination)?;
+        sync_dir(&self.root)?;
+        sync_dir(&trash)?;
+
+        // Past the commit point: the session is gone from every scan. A
+        // failure removing the trashed bytes cannot resurrect or hide
+        // anything, so it is left to the open sweep rather than surfaced
+        // as a failed delete.
+        let _ = std::fs::remove_dir_all(&destination);
+        Ok(())
     }
 
     fn session_dir(&self, id: &str) -> PathBuf {
@@ -984,10 +1073,10 @@ impl MemorySessionStore {
 
         let id = match journal_id {
             Some(journal_id) => {
-                if !is_safe_path_component(journal_id) {
+                if !is_valid_session_dir_name(journal_id) {
                     return Err(StorageError::Invalid(format!(
-                        "journal id {journal_id:?} must be non-empty and contain no path \
-                         separators"
+                        "journal id {journal_id:?} must be non-empty, contain no path \
+                         separators, and not be the reserved trash name {DELETED_DIR:?}"
                     )));
                 }
                 journal_id.to_string()
@@ -1144,8 +1233,21 @@ fn validate_session_id(id: &str) -> Result<(), StorageError> {
             "session id {id:?} must be non-empty and contain no path separators"
         )));
     }
+    if id == DELETED_DIR {
+        return Err(StorageError::Invalid(format!(
+            "session id {id:?} is reserved for the deletion trash directory"
+        )));
+    }
 
     Ok(())
+}
+
+/// Whether `id` may name a session directory under the store root: a safe
+/// path component that is not [`DELETED_DIR`] (#206). Session ids *are*
+/// directory names, so the trash tree's own name must stay unassignable —
+/// a take named `deleted` would collide with the deletion commit point.
+fn is_valid_session_dir_name(id: &str) -> bool {
+    is_safe_path_component(id) && id != DELETED_DIR
 }
 
 fn validate_wav(wav: &[u8]) -> Result<(), StorageError> {
@@ -1875,6 +1977,143 @@ mod tests {
         let store = FileSessionStore::open(temp.path()).expect("open");
 
         delete_is_idempotent(&store);
+    }
+
+    /// #206: a completing delete removes the session's bytes and the trash
+    /// it created, and stays idempotent on a real session — the retried
+    /// delete after any crash point is `Ok`. Stale trash under the same id
+    /// (a delete that crashed past its rename, then a backup restored the
+    /// session) is replaced by the commit rename, not fatal.
+    #[test]
+    fn file_store_delete_removes_bytes_and_stays_idempotent() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+        let created = store.create(sample_wav(), Some(25.0)).expect("create");
+        let session_dir = temp.path().join(&created.id);
+
+        let trash = temp.path().join(DELETED_DIR);
+        std::fs::create_dir_all(trash.join(&created.id)).expect("stale trash under the id");
+
+        store.delete(&created.id).expect("delete");
+        assert!(!session_dir.exists(), "session directory removed");
+        assert!(store.get(&created.id).expect("get").is_none());
+        assert!(
+            !trash.join(&created.id).exists(),
+            "no bytes linger in the trash, stale or fresh"
+        );
+        assert!(
+            store.list_records().expect("list").is_empty(),
+            "the trash directory itself must not be listed as a record"
+        );
+
+        store.delete(&created.id).expect("delete again is Ok");
+    }
+
+    /// #206, crash point (a): the delete committed its rename into the
+    /// trash tree but died before the removal. Even the still-open instance
+    /// — which never runs the open sweep — must not see the take anywhere:
+    /// the trash tree is outside every scan.
+    #[test]
+    fn crash_after_trash_rename_leaves_no_session_or_orphan() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+        let created = store.create(sample_wav(), Some(25.0)).expect("create");
+
+        // The crash midpoint: the directory is in the trash, the removal
+        // never ran.
+        let trash = temp.path().join(DELETED_DIR);
+        std::fs::create_dir_all(&trash).expect("trash dir");
+        std::fs::rename(temp.path().join(&created.id), trash.join(&created.id))
+            .expect("rename to trash");
+
+        assert!(store.get(&created.id).expect("get").is_none());
+        assert!(
+            store.list_records().expect("list").is_empty(),
+            "a session sitting in the trash must not be listed"
+        );
+        assert!(
+            store.journal_ids().expect("journal ids").is_empty(),
+            "the trash tree holds no linkage either"
+        );
+
+        // The next startup sweeps the leftover bytes entirely.
+        let reopened = FileSessionStore::open(temp.path()).expect("reopen");
+        assert!(reopened.get(&created.id).expect("get").is_none());
+        assert!(reopened.list_records().expect("list").is_empty());
+        assert!(!trash.exists(), "the open sweep reaped the trash");
+    }
+
+    /// #206, crash point (b) — the resurrection scenario itself: a plain
+    /// delete (no journal, no tombstone) interrupted mid-removal must not
+    /// leave a WAV-only directory for the next startup to classify as a
+    /// recoverable orphan. The control half first proves that shape really
+    /// does come back as `interrupted` today.
+    #[test]
+    fn crash_mid_delete_of_unlinked_session_does_not_resurrect() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+        let created = store.create(sample_wav(), Some(25.0)).expect("create");
+
+        // Control: the old failure shape — manifest unlinked, WAV left —
+        // is exactly what a half-done `remove_dir_all` produced, and
+        // classification recovers it.
+        std::fs::remove_file(temp.path().join(&created.id).join(MANIFEST_FILE))
+            .expect("unlink manifest");
+        let records = store.list_records().expect("list");
+        let summary = match records.as_slice() {
+            [ListedRecord::Session(summary)] => summary,
+            other => panic!("expected one recovered orphan session, got {other:?}"),
+        };
+        assert_eq!(summary.id, created.id);
+        assert_eq!(summary.status, SessionStatus::Interrupted);
+        assert!(
+            summary
+                .last_error
+                .as_deref()
+                .is_some_and(|note| note.contains("Recovered")),
+            "the orphan carries the recovery note: {:?}",
+            summary.last_error
+        );
+
+        // The new delete's crash midpoint instead: renamed into the trash,
+        // removal not yet done. The take must stay deleted.
+        let trash = temp.path().join(DELETED_DIR);
+        std::fs::create_dir_all(&trash).expect("trash dir");
+        std::fs::rename(temp.path().join(&created.id), trash.join(&created.id))
+            .expect("rename to trash");
+
+        let reopened = FileSessionStore::open(temp.path()).expect("reopen");
+        assert!(reopened.get(&created.id).expect("get").is_none());
+        assert!(
+            reopened.list_records().expect("list").is_empty(),
+            "the deleted take must not come back as a recovered orphan"
+        );
+    }
+
+    /// #206: the trash tree's name cannot be assigned as a session id —
+    /// the deletion commit point must never collide with a take's
+    /// directory.
+    #[test]
+    fn trash_directory_name_is_reserved() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = FileSessionStore::open(temp.path()).expect("open");
+
+        assert!(matches!(
+            store.create_with_journal(sample_wav(), Some(1.0), Some(DELETED_DIR)),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.save_journal_recovery(DELETED_DIR, sample_wav(), Some(1.0), "note"),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.get(DELETED_DIR),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.delete(DELETED_DIR),
+            Err(StorageError::Invalid(_))
+        ));
     }
 
     #[test]

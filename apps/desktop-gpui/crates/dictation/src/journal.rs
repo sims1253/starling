@@ -645,14 +645,23 @@ fn tombstoned_journal_ids(journals_root: &Path) -> HashSet<String> {
 ///    landed; without it, deleting the orphan would leave a live unlinked
 ///    journal for the next startup recovery to resurrect the take from.
 /// 2. [`quarantine_journal`] renames the journal into `journals/deleted/`
-///    and fsyncs. This is the commit point.
-/// 3. Only then does [`FileSessionStore::delete`] remove the row + audio.
+///    and fsyncs. This is the journal's commit point.
+/// 3. Only then does [`FileSessionStore::delete`] remove the row + audio —
+///    itself crash-safe (#206): one atomic rename of the session directory
+///    into `sessions/deleted/` (the session's commit point, after which no
+///    scan can see it), then the removal of the renamed directory. The old
+///    `remove_dir_all` unlinked the manifest and the WAV as separate
+///    syscalls, and a crash between them left a WAV-only directory the next
+///    startup classified as a recoverable orphan — the deleted take
+///    resurrected through a path the tombstone does not cover.
 ///
 /// Crash matrix: a crash before step 2 leaves everything in place (the
 /// journal stays linked — no resurrection); a crash between 2 and 3 leaves a
 /// live row whose journal is quarantined (recovery sees a linked id with no
 /// journal file — nothing to recover; the retry delete tolerates the missing
-/// source); a crash after 3 is complete. A failure in step 2 aborts before
+/// source); a crash inside step 3, past its rename, leaves the directory
+/// under the session trash, which no scan reads and the next store open
+/// sweeps — no orphan, no resurrection. A failure in step 2 aborts before
 /// the row removal, so the deletion surfaces as an error with the session
 /// intact rather than leaving a live journal that recovery would resurrect.
 ///
@@ -1637,6 +1646,45 @@ mod tests {
             "the deleted take must stay deleted: {}",
             report.summary()
         );
+    }
+
+    /// #206: a crash inside the session-removal leg of a confirmed delete —
+    /// past the journal tombstone and past the session's trash rename,
+    /// before the trash was removed — leaves nothing recoverable and
+    /// nothing listed on the next startup; the store's open sweep reaps the
+    /// leftover bytes. The old `remove_dir_all` deletion had an
+    /// interleaving (manifest unlinked, WAV left) that came back as a
+    /// recovered orphan instead.
+    #[test]
+    fn crash_mid_session_removal_after_tombstone_leaves_nothing_recoverable() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+        let (session_id, journal_id) =
+            linked_session_with_journal(&store, &journals_dir, 1_200);
+
+        // Steps 1-2 of the confirmed delete, plus the session-delete
+        // commit rename; the crash lands before the trash removal.
+        quarantine_journal(journals_dir.path(), &journal_id).expect("tombstone commit");
+        let trash = store_dir.path().join(crate::storage::DELETED_DIR);
+        std::fs::create_dir_all(&trash).expect("trash dir");
+        std::fs::rename(store_dir.path().join(&session_id), trash.join(&session_id))
+            .expect("rename to trash");
+
+        // Next startup: fresh instances over both roots.
+        let store = FileSessionStore::open(store_dir.path()).expect("reopen store");
+        assert!(store.get(&session_id).expect("get").is_none());
+        assert!(
+            store.list_records().expect("list").is_empty(),
+            "the half-deleted take must not appear in history"
+        );
+        let report = recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(
+            !report.has_findings(),
+            "the deleted take must stay deleted: {}",
+            report.summary()
+        );
+        assert!(!trash.exists(), "the open sweep reaped the leftover trash");
     }
 
     /// R21 crash-safety of the ordering. (a) A crash after the tombstone
