@@ -214,7 +214,12 @@ fn build_http_client(timeout_ms: u64) -> Result<Client, ClientError> {
 
 /// `cleanEndpoint`: http(s) only, no embedded credentials, one trailing `/`
 /// trimmed from the WHATWG `href` serialization.
-fn clean_endpoint(value: &str) -> Result<String, ClientError> {
+///
+/// Public (#213) so the settings save path can validate a draft with
+/// exactly the rules the client itself applies — whatever passes here is
+/// an endpoint a saved configuration can honor, and whatever fails carries
+/// the message the settings dialog should refuse the save with.
+pub fn clean_endpoint(value: &str) -> Result<String, ClientError> {
     let url = Url::parse(value)
         .map_err(|_| ClientError::Input("Invalid server endpoint.".to_string()))?;
     if url.scheme() != "http" && url.scheme() != "https" {
