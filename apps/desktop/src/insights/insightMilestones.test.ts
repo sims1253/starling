@@ -59,6 +59,17 @@ function flat(groups: readonly (readonly InsightEvent[])[]): readonly InsightEve
   return groups.flat();
 }
 
+/** A deletion tombstone for `captureId` — the deletion guarantee under test. */
+function deleted(captureId: string, occurredAt: string): CaptureDeletedEvent {
+  return {
+    schema_version: 1,
+    event_id: `cd-${captureId}`,
+    capture_id: captureId,
+    occurred_at: occurredAt,
+    type: "capture_deleted",
+  };
+}
+
 describe("dayTotals", () => {
   it("buckets by local day and applies the contract's replace-on-retry rule", () => {
     const retry: RecognitionSelectedEvent = {
@@ -137,6 +148,20 @@ describe("milestones", () => {
     expect(reached[0]?.achievedOnDay).toBe("2026-09-01");
     expect(reached[1]?.achievedOnDay).toBe("2026-09-07");
     expect(reached[1]?.evidence).toBe("The seventh distinct day with at least one take.");
+  });
+
+  it("does not count a day whose only takes were deleted toward the seventh distinct day", () => {
+    // Seven distinct days, then every take on the seventh is deleted: only
+    // six live days remain, so the first-week milestone must not fire.
+    const days = ["01", "02", "03", "04", "05", "06", "07"];
+    const events = flat([
+      ...days.map((day, index) => take(`t${index}`, `2026-09-${day}T10:00:00Z`, 5)),
+      deleted("t6", "2026-09-08T10:00:00Z"),
+    ]);
+
+    const reached = milestones(events, { timezone: "Europe/Berlin" });
+
+    expect(reached.map((milestone) => milestone.id)).toEqual(["first-take"]);
   });
 
   it("crosses word and minute totals on the day they cross", () => {
@@ -229,6 +254,22 @@ describe("streaks", () => {
 
     expect(view.longestDays).toBe(2);
     expect(view.currentDays).toBe(1);
+  });
+
+  it("drops a day whose only takes were deleted from the run", () => {
+    // The deletion guarantee these surfaces rest on: a day with no live
+    // takes must not keep a streak alive. Here today's only take is
+    // deleted, so the run ends yesterday — the deleted day never counted.
+    const events = flat([
+      take("t1", "2026-09-20T10:00:00Z", 5),
+      take("t2", "2026-09-21T07:00:00Z", 5), // 09:00 Berlin, today
+      deleted("t2", "2026-09-21T09:00:00Z"),
+    ]);
+
+    const view = streaks(events, { timezone: TZ, now: Date.parse("2026-09-21T12:00:00Z") });
+
+    expect(view.currentDays).toBe(1); // only the 20th survives
+    expect(view.longestDays).toBe(1);
   });
 });
 

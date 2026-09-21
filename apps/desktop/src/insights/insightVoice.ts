@@ -66,6 +66,11 @@ interface WindowedTotals {
  * a label once per take no matter how often it repeats inside that take, so
  * "3 of 8 takes" stays a statement about takes, and the occurrence total is
  * carried separately and never presented as takes.
+ *
+ * The `takes` denominator is per-kind: only records that actually retained
+ * aggregates of THIS kind count as analyzed. A take recorded under a
+ * narrower grant — or emptied by a withdrawal purge — is an unknown for
+ * these cards, not a negative, so it must not inflate the denominator.
  */
 function windowTotals(
   records: readonly InsightTermRecord[],
@@ -81,9 +86,11 @@ function windowTotals(
   for (const record of records) {
     if (parseInsightTimestamp(record.occurred_at) < since) continue;
 
-    takes += 1;
+    const labels = labelsOf(record);
 
-    for (const entry of labelsOf(record)) {
+    if (labels.length > 0) takes += 1;
+
+    for (const entry of labels) {
       const tally = byLabel.get(entry.text) ?? { takes: 0, occurrences: 0 };
 
       tally.takes += 1;
@@ -196,11 +203,12 @@ function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
  * Two denominators, both stated: `windowTakes` is the distinct captures
  * with a selected recognition inside the window (a retranscription is the
  * same take, never counted twice), and `analyzedTakes` is how many of those
- * have retained aggregates — takes recorded while a grant was off have
- * none. Cards cite `analyzedTakes` ("appeared in 3 of 5 analyzed takes")
- * because a take with no aggregates is an unknown, not a negative: claiming
- * "3 of 8 takes" would assert the phrase is absent from takes nobody
- * analyzed. The UI shows both numbers so the coverage is visible.
+ * have retained aggregates of any kind. Cards cite their own per-kind
+ * analyzed count ("appeared in 3 of 5 analyzed takes" where 5 counts only
+ * takes that retained aggregates of that card's kind) because a take with
+ * no aggregates for the kind is an unknown, not a negative: claiming "3 of
+ * 8 takes" would assert the phrase is absent from takes nobody analyzed.
+ * The UI shows both numbers so the coverage is visible.
  */
 export interface VoicePanel {
   readonly phraseCards: readonly VoicePatternCard[];

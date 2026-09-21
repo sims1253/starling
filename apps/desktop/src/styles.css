@@ -1128,3 +1128,339 @@ kbd {
   align-items: center;
   gap: 6px;
 }
+
+/* ── Insights (E29 phase 2) ───────────────────────────────────────────
+   The insights workspace replaces the capture grid with one scrollable
+   column; every surface below is locally computed and consent-gated. */
+
+.insights-workspace {
+  display: block;
+  overflow-y: auto;
+  color-scheme: dark;
+}
+
+.insights-shell {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: clamp(25px, 4vh, 55px) 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.insights-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.insights-head h2 {
+  margin: 2px 0 4px;
+}
+
+.insights-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.insights-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.insights-issue,
+.insights-failure {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 116, 91, 0.4);
+  border-radius: 10px;
+  background: rgba(255, 116, 91, 0.08);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.insights-issue {
+  align-items: center;
+}
+
+.insights-issue button {
+  margin-left: auto;
+  padding: 2px 6px;
+}
+
+.insights-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 34px 28px;
+  border: 1px dashed var(--line);
+  border-radius: 14px;
+  text-align: center;
+  align-items: center;
+}
+
+.insights-example-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.insights-example-card small {
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  color: var(--dim);
+}
+
+.insights-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 22px 24px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.insights-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.insights-panel-head h3 {
+  margin: 2px 0 0;
+}
+
+.insight-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+.insight-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(232, 229, 220, 0.03);
+}
+
+.insight-tile strong {
+  color: var(--lime);
+  font-size: 19px;
+  font-weight: 600;
+}
+
+.insight-tile span,
+.insight-tile.missing span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.insight-tile.missing strong {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.insights-recap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recap-text {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.insights-milestones {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.insights-milestones ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.insights-milestones li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.insights-milestones li span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.goal-line,
+.streak-line {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.insights-calendar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-x: auto;
+}
+
+.calendar-table,
+.changes-table {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.calendar-table th,
+.calendar-table td,
+.changes-table th,
+.changes-table td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: right;
+}
+
+.calendar-table th[scope="row"],
+.changes-table th[scope="row"] {
+  text-align: left;
+  color: var(--muted);
+}
+
+.insights-proxy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.proxy-head {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.proxy-value {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.proxy-assumptions {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.insights-consent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.insights-consent > p {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.insights-consent label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.insights-definitions {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.voice-coverage {
+  margin: 0;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.share-card-preview {
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(232, 229, 220, 0.03);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.share-card-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+}
+
+.share-card-fields label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.share-copy-failure {
+  margin: 0;
+  color: var(--coral);
+  font-size: 12.5px;
+}
+
+.insights-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.changes-summary {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  .insights-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

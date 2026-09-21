@@ -77,6 +77,26 @@ describe("recurringPhraseCards", () => {
     );
   });
 
+  it("counts only takes that retained this kind's aggregates in the denominator", () => {
+    // take-3 kept terms but no phrases (recorded under a narrower grant, or
+    // emptied by a withdrawal purge): it is an unknown for phrase cards,
+    // not a negative — the denominator must not count it.
+    const records = [
+      recordOf("take-1", "deploy the server and deploy the server again"),
+      recordOf("take-2", "please deploy the server once more"),
+      { ...recordOf("take-3", "unrelated solitary vocabulary"), phrases: [] },
+    ];
+
+    const card = recurringPhraseCards(records, { now: NOW }).find(
+      (candidate) => candidate.label === "deploy the server",
+    );
+
+    expect(card?.windowTakes).toBe(2);
+    expect(card?.description).toBe(
+      `"deploy the server" appeared in 2 of 2 analyzed takes, 3 times in the last 14 days`,
+    );
+  });
+
   it("requires the phrase to recur across takes, not within one", () => {
     const records = [recordOf("take-1", "very unique phrase very unique phrase")];
 

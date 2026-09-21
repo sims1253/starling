@@ -1878,15 +1878,19 @@ export default function App() {
    * deleted — the UI's promise is that turning a kind off deletes what it
    * retained, not merely hides it — and only then does the committed state
    * swap. A purge failure is a notice, never a reason to keep the old
-   * consent.
+   * consent. The prior grants are read from storage at call time, not from
+   * the rendered state: two changes applied before a re-render must each
+   * diff against the actual previous grants, or a kind withdrawn by the
+   * first could be missed by the second.
    */
   const applyInsightConsent = useCallback(
     (next: InsightConsent) => {
+      const previous = readInsightConsent(localStorage);
       const withdrawn = new Set<"terms" | "phrases">();
 
-      if (insightConsent.recurringPhrases && !next.recurringPhrases) withdrawn.add("phrases");
+      if (previous.recurringPhrases && !next.recurringPhrases) withdrawn.add("phrases");
 
-      if (insightConsent.vocabularyPatterns && !next.vocabularyPatterns) withdrawn.add("terms");
+      if (previous.vocabularyPatterns && !next.vocabularyPatterns) withdrawn.add("terms");
 
       writeInsightConsent(localStorage, next);
       setInsightConsent(next);
@@ -1895,7 +1899,7 @@ export default function App() {
         recordInsightTerms(() => insightTerms.withdrawKinds(withdrawn));
       }
     },
-    [insightConsent, recordInsightTerms],
+    [recordInsightTerms],
   );
 
   /**
