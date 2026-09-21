@@ -1658,8 +1658,13 @@ fn terminal_jobs_retire_from_the_map_while_the_wire_view_and_duplicate_guard_hol
 /// cancel's receipt must come back from an idle scheduler, not queue
 /// behind the whole encode (the pre-#216 shape stalled every `jobs.*`
 /// command for the encode's duration). The functional outcome pins the
-/// rest: the job settles Cancelled, the late completion lands nowhere,
-/// and the worker really did encode and ship the full-sized WAV.
+/// rest: the job settles Cancelled and the late completion lands
+/// nowhere. Since #251 the cancelled worker also *stops*: whichever side
+/// of the encode the cancel lands on, the provider ends up with no live
+/// recognition for the job — either the post-encode cancel check never
+/// hands it one, or (when the encode had already finished and the
+/// recognition was entered) the fake unwinds it at the cancel flag,
+/// with the full-sized WAV as the proof the encode really ran (#216).
 #[test]
 fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
     let source = FakeCaptureSource::new(vec![]);
@@ -1733,24 +1738,176 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
         drained.iter().map(|m| m.type_name()).collect::<Vec<_>>()
     );
 
-    // The encode really ran at this scale — the worker shipped the
-    // full-sized WAV to the provider before its report was dropped.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Since #251 the cancelled worker stops instead of running the
+    // recognition out for a result nobody will keep. The cancel races
+    // the ~60 MB encode, so exactly one of two shapes holds — poll for
+    // the decision to settle, then hold the line either way:
+    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let requests = provider_handle.requests();
-        if requests
-            .iter()
-            .any(|(id, size)| id == "job-big" && *size > 40_000_000)
-        {
+        if requests.iter().any(|(id, _)| id == "job-big") {
+            // The cancel lost the race to the encode: the recognition
+            // was entered, so it must unwind at the cancel flag —
+            // promptly, not after the scripted work. The full-sized WAV
+            // also proves the encode itself really ran at this scale
+            // (#216's original point).
+            let entry = requests
+                .iter()
+                .find(|(id, _)| id == "job-big")
+                .expect("just checked");
+            assert!(
+                entry.1 > 40_000_000,
+                "the worker never encoded the full-sized WAV: {entry:?}"
+            );
+            let unwind_by = Instant::now() + Duration::from_secs(2);
+            while !provider_handle.recognize_returned("job-big") {
+                assert!(
+                    Instant::now() < unwind_by,
+                    "the entered recognition must unwind at the cancel flag"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the worker never encoded the full-sized WAV: {:?}",
-            requests
-        );
+        if Instant::now() >= deadline {
+            // The cancel won: no recognition was ever handed to the
+            // provider for the cancelled job, and none may appear after
+            // the settle (the post-encode check refuses it whenever the
+            // encode ends).
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
+
+    runtime.shutdown();
+}
+
+/// Regression for issue #251: the scheduler's cancel flag was never
+/// consulted by the provider — `jobs.cancel` freed the scheduler's slot
+/// but the worker thread (and, under the production client, its HTTP
+/// request) ran the recognition to completion for a result discarded on
+/// arrival. The provider now watches the job's token, so a cancelled
+/// recognition unwinds promptly, nothing is delivered for it, and the
+/// queued job behind the freed slot proceeds normally.
+///
+/// Timing-independent (#217): the cancel is gated on the (non-consuming)
+/// projection showing job-1 in-flight in `Recognizing`, the unwind is
+/// gated on the fake's recorded `recognize` return (a positive
+/// observation, not a sleep), and the no-delivery proof leans on the
+/// inbox's FIFO order — job-1's would-be report was enqueued (or
+/// provably never sent) before job-2's `Done` was processed.
+#[test]
+fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = starling_runtime::provider::FakeProvider::new(vec![
+        // The fake pops its script LIFO, so job-2's entry comes first.
+        FakeJob::completes_with("next up"),
+        // Job-1: a 30 s recognition — far beyond anything a cancelled
+        // worker may take to stop.
+        FakeJob {
+            work_ms: 30_000,
+            ..FakeJob::completes_with("too late")
+        },
+    ]);
+    let provider_handle = std::sync::Arc::clone(&provider);
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    run_take(&source, &client, &events, "take_ca", FakeTakeScript::clean());
+    run_take(&source, &client, &events, "take_cb", FakeTakeScript::clean());
+
+    // Job-1 occupies the only worker slot with its 30 s recognition;
+    // job-2 queues behind it.
+    client
+        .send(Some("job-1"), Command::JobsSubmit {
+            capture_ref: "take_ca".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("submit accepted");
+    wait_for_projection(
+        &client,
+        "job-1 never dispatched onto its worker",
+        |s| {
+            s.jobs.active == 1
+                && s.jobs
+                    .jobs
+                    .iter()
+                    .any(|job| job.job == "job-1" && job.state == "Recognizing")
+        },
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("job-2"), Command::JobsSubmit {
+            capture_ref: "take_cb".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("submit accepted");
+    until(
+        &events,
+        "jobs.queued(job-2)",
+        |m| m.type_name() == "jobs.queued" && m.corr.as_deref() == Some("job-2"),
+        Duration::from_secs(5),
+    );
+
+    // Cancel mid-recognition.
+    client
+        .send(Some("job-1"), Command::JobsCancel { job_id: "job-1".into() })
+        .expect("cancel accepted");
+
+    // The worker stops early: the provider's `recognize` for job-1
+    // returns within seconds of the cancel — not after its 30 s work.
+    // (Pre-#251 this poll runs the full deadline and fails loudly.)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !provider_handle.recognize_returned("job-1") {
+        assert!(
+            Instant::now() < deadline,
+            "job-1's recognition must return promptly after cancellation, not after its 30 s work"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The freed slot serves the queued job.
+    let mut seen = until(
+        &events,
+        "jobs.completed(job-2)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-2"),
+        Duration::from_secs(5),
+    );
+
+    // Nothing was delivered for the cancelled job: not before job-2's
+    // completion (the inbox is FIFO, and job-1's report — had the worker
+    // sent one — predates job-2's `Done`), and not after (both workers
+    // are finished, the projection shows no active jobs, and the queue
+    // is drained dry).
+    wait_for_projection(
+        &client,
+        "jobs never settled after job-2",
+        |s| s.jobs.active == 0,
+        Duration::from_secs(5),
+    );
+    while let Ok(message) = events.try_recv() {
+        seen.push(message);
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-1")),
+        "a cancelled job must never complete: {:?}",
+        seen.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
 
     runtime.shutdown();
 }

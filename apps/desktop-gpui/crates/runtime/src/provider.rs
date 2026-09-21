@@ -5,9 +5,16 @@
 //! double the integration tests drive.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use starling_dictation::client::{ClientError, Protocol, StarlingClient};
+
+/// The cancellation signal the jobs scheduler hands a provider (issue
+/// #251): [`crate::machine::jobs`] creates one per job, `jobs.cancel`
+/// trips it, and the production client aborts its in-flight HTTP request
+/// on it. Re-exported from the dictation client, which owns the
+/// request-abort machinery.
+pub use starling_dictation::client::CancelToken;
 
 /// One partial-transcript observation streamed by a provider
 /// (`jobs.progress{partial, stabilityHint}` — stability is reported
@@ -46,6 +53,9 @@ pub fn failure_from_client_error(error: &ClientError) -> (String, bool) {
             (format!("http_{status}"), *status >= 500)
         }
         ClientError::Protocol(_) => ("protocol_error".to_string(), false),
+        // A cancelled call is not a server condition: non-retryable, and
+        // the scheduler drops it anyway (the job is already Cancelled).
+        ClientError::Cancelled => ("cancelled".to_string(), false),
     }
 }
 
@@ -55,11 +65,20 @@ pub fn failure_from_client_error(error: &ClientError) -> (String, bool) {
 pub trait TranscriptionProvider: Send + Sync {
     /// Streams partials (when the provider can) and returns the final
     /// outcome. `request_id` is the job's correlation id.
+    ///
+    /// `cancel` is the job's cancellation flag (issue #251): the
+    /// scheduler trips it on `jobs.cancel`, and a well-behaved provider
+    /// watches it, aborts its in-flight work and returns early instead of
+    /// running to completion. [`ProviderOutcome::Failed`] with the
+    /// `cancelled` reason is the conventional early return; the scheduler
+    /// never delivers it (a cancelled job is already retired), so the
+    /// value only matters to direct callers.
     fn recognize(
         &self,
         wav: Vec<u8>,
         request_id: &str,
         on_partial: &mut dyn FnMut(Partial),
+        cancel: &CancelToken,
     ) -> ProviderOutcome;
 }
 
@@ -84,9 +103,13 @@ impl TranscriptionProvider for StarlingProvider {
         wav: Vec<u8>,
         request_id: &str,
         _on_partial: &mut dyn FnMut(Partial),
+        cancel: &CancelToken,
     ) -> ProviderOutcome {
         let started = Instant::now();
-        match self.client.transcribe(&wav, request_id) {
+        match self
+            .client
+            .transcribe_with_cancel(&wav, request_id, Some(cancel))
+        {
             Ok(result) => ProviderOutcome::Completed {
                 text: result.text,
                 backend: "starling-server".to_string(),
@@ -115,6 +138,7 @@ impl TranscriptionProvider for UnconfiguredProvider {
         _wav: Vec<u8>,
         _request_id: &str,
         _on_partial: &mut dyn FnMut(Partial),
+        _cancel: &CancelToken,
     ) -> ProviderOutcome {
         ProviderOutcome::Failed {
             reason: "no_provider_configured".to_string(),
@@ -178,13 +202,19 @@ impl FakeJob {
     }
 }
 
-/// The scripted test double: `recognize` pops the next [`FakeJob`]
-/// (blocking briefly for `work_ms`), streams its partials through
+/// The scripted test double: `recognize` pops the next [`FakeJob`],
+/// waits out its `work_ms` **while polling the cancel token** (issue
+/// #251 — a cancelled job's provider call returns promptly instead of
+/// sleeping out the whole simulated work), streams its partials through
 /// `on_partial`, and returns its outcome. It also records every request
-/// for assertions.
+/// for assertions, and every `recognize` *return* — the observable the
+/// cancellation tests gate on when proving a worker stopped early.
 pub struct FakeProvider {
     script: Mutex<Vec<FakeJob>>,
     requests: Mutex<Vec<(String, usize)>>,
+    /// Request ids whose `recognize` call returned (entry recorded just
+    /// before the return).
+    returned: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -192,12 +222,24 @@ impl FakeProvider {
         Arc::new(FakeProvider {
             script: Mutex::new(script),
             requests: Mutex::new(Vec::new()),
+            returned: Mutex::new(Vec::new()),
         })
     }
 
     /// The (request_id, wav size) pairs the provider saw.
     pub fn requests(&self) -> Vec<(String, usize)> {
         self.requests.lock().expect("fake provider lock").clone()
+    }
+
+    /// Whether the `recognize` call for `request_id` has returned — the
+    /// provider-side proof that a worker stopped (or finished) rather
+    /// than still being parked inside the provider.
+    pub fn recognize_returned(&self, request_id: &str) -> bool {
+        self.returned
+            .lock()
+            .expect("fake provider lock")
+            .iter()
+            .any(|id| id == request_id)
     }
 }
 
@@ -207,21 +249,119 @@ impl TranscriptionProvider for FakeProvider {
         wav: Vec<u8>,
         request_id: &str,
         on_partial: &mut dyn FnMut(Partial),
+        cancel: &CancelToken,
     ) -> ProviderOutcome {
         self.requests
             .lock()
             .expect("fake provider lock")
             .push((request_id.to_string(), wav.len()));
-        std::thread::sleep(std::time::Duration::from_millis(5));
         let job = self
             .script
             .lock()
             .expect("fake provider lock")
             .pop()
             .unwrap_or(FakeJob::fails("script_exhausted", false));
+        // Simulated work that honors cancellation: the wait polls the
+        // token in small slices instead of sleeping blind, so cancelling
+        // mid-recognition unwinds the provider promptly — exactly what
+        // the scheduler's workers need to stop early (issue #251).
+        let deadline = Instant::now() + Duration::from_millis(job.work_ms);
+        while Instant::now() < deadline {
+            if cancel.is_cancelled() {
+                self.returned
+                    .lock()
+                    .expect("fake provider lock")
+                    .push(request_id.to_string());
+                return ProviderOutcome::Failed {
+                    reason: "cancelled".to_string(),
+                    retryable: false,
+                };
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for partial in job.partials {
             on_partial(partial);
         }
+        self.returned
+            .lock()
+            .expect("fake provider lock")
+            .push(request_id.to_string());
         job.outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #251, fake half: a recognition cancelled mid-work returns
+    /// promptly with the conventional `cancelled` failure — not after
+    /// the job's full simulated work.
+    #[test]
+    fn fake_provider_unwinds_promptly_when_cancelled_mid_work() {
+        let provider = FakeProvider::new(vec![FakeJob {
+            work_ms: 30_000,
+            ..FakeJob::completes_with("too late")
+        }]);
+        let token = CancelToken::new();
+        let canceller = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                token.cancel();
+            })
+        };
+        let started = Instant::now();
+        let outcome = provider.recognize(
+            vec![0u8; 64],
+            "job-x",
+            &mut |_partial: Partial| {},
+            &token,
+        );
+        let elapsed = started.elapsed();
+        canceller.join().expect("canceller thread");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancelled recognition took {elapsed:?}; it must unwind long before its 30 s work"
+        );
+        match outcome {
+            ProviderOutcome::Failed { reason, retryable } => {
+                assert_eq!(reason, "cancelled");
+                assert!(!retryable);
+            }
+            ProviderOutcome::Completed { .. } => {
+                panic!("expected the cancelled failure, got a completion")
+            }
+        }
+        assert!(provider.recognize_returned("job-x"));
+    }
+
+    /// The already-cancelled case returns before any simulated work.
+    #[test]
+    fn fake_provider_returns_immediately_when_precancelled() {
+        let provider = FakeProvider::new(vec![FakeJob {
+            work_ms: 30_000,
+            ..FakeJob::completes_with("never")
+        }]);
+        let token = CancelToken::new();
+        token.cancel();
+        let started = Instant::now();
+        let outcome = provider.recognize(
+            vec![0u8; 64],
+            "job-y",
+            &mut |_partial: Partial| {},
+            &token,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a precancelled recognition must not run its 30 s work"
+        );
+        assert!(matches!(
+            outcome,
+            ProviderOutcome::Failed {
+                ref reason,
+                retryable: false
+            } if reason == "cancelled"
+        ));
     }
 }
