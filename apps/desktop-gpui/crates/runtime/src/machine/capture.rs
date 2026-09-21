@@ -29,6 +29,27 @@
 //! persist failure on a salvage path surfaces as a non-fatal
 //! `capture.error{persist_interrupted_failed}` while the machine is
 //! still in a state that admits the event.
+//!
+//! **The persist runs off the actor loop** (issue #249, the capture-side
+//! twin of #216's jobs fix). The v1-file store's `commit_take` encodes
+//! the take's whole audio into a WAV before its fsync'd write — tens of
+//! MB of CPU and I/O for a multi-minute take — and running that inline
+//! on the stop handshake stalled every `capture.*` command behind it. The
+//! actor therefore hands each take's persist to a dedicated worker thread
+//! (one per take, like the jobs scheduler's encode workers) and defers
+//! only the emissions that the durable commit gates: `capture.stopped`
+//! still follows the successful commit (§4, the watermark-agreement ack
+//! of #204 — the recorder-side handshake itself never leaves the actor),
+//! a failed commit still degrades to `storage_commit_failed` before the
+//! take's close-out, and the registry still receives the take only once
+//! its store outcome is known. While the worker runs, the machine
+//! honestly sits in the state the stop path left it in (`Draining` for a
+//! stop, `Recording` for a fatal mid-take salvage, `Idle` for an abort),
+//! answering commands the whole time; the one new interleaving the table
+//! always allowed but the inline stall hid — `capture.abort` landing
+//! during a stop's persist — takes the machine to `Idle`, where no
+//! `capture.*` event is legal, so the persist lands silently (registry +
+//! route release, no wire event; see [`PersistReport`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -232,6 +253,12 @@ fn error_is_fatal(fault: &RecorderFault) -> bool {
 /// Where finished/salvaged takes are persisted. The `capture.stopped`
 /// event is emitted only after [`CaptureStore::commit_take`] returns `Ok`
 /// (§4: the durable ack follows the metadata commit).
+///
+/// Implementations run on the **persist worker**, not the capture actor
+/// loop (issue #249): the actor hands each take off to a dedicated thread
+/// and resumes the take's close-out when the commit's result comes back,
+/// so a whole-audio encode inside an implementation (the v1-file store's
+/// WAV path) cannot stall `capture.*` commands.
 pub trait CaptureStore: Send + Sync {
     /// Persists a cleanly stopped take.
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String>;
@@ -278,6 +305,10 @@ impl CaptureStore for InMemoryCaptureStore {
 
 /// The landed v1 store (`FileSessionStore`): audio as WAV sessions with
 /// the additive journal linkage, interrupted takes marked on the session.
+/// Its commits are the slow ones this actor's persist workers exist for
+/// (issue #249): `to_wav` encodes the take's whole audio and the store's
+/// write is the fsync'd WAV-before-manifest layout — both run on the
+/// worker thread the actor hands the take to, never on the actor loop.
 pub struct V1FileCaptureStore {
     store: FileSessionStore,
 }
@@ -411,7 +442,58 @@ pub enum CaptureMsg {
     /// (`Interrupted → Recovering → Persisted`); used by recovery wiring
     /// and tests. No v1 command exists for this edge.
     Recover(String),
+    /// A persist worker's report: a take's store commit finished off the
+    /// actor loop (issue #249) and the close-out deferred to it resumes.
+    Persist(PersistReport),
     Shutdown,
+}
+
+/// What a persist worker was asked to do with the take. `Clone` because
+/// the spawn-failure fallback keeps a copy when the worker takes one (the
+/// interrupted note is a short string — the take's audio is never
+/// duplicated).
+#[derive(Clone)]
+enum PersistIntent {
+    /// [`CaptureStore::commit_take`] — a cleanly stopped take.
+    Commit,
+    /// [`CaptureStore::mark_interrupted`] — a salvaged take, with its
+    /// persisted note.
+    Interrupted(String),
+}
+
+/// Which take-ending path handed the persist off — and therefore which
+/// emissions are gated on the commit's result when the report lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistFollow {
+    /// `capture.stop`'s clean arm: `capture.stopped` on success, the fatal
+    /// `storage_commit_failed` degradation on failure.
+    CleanStop,
+    /// The quiesce-timeout arm: the non-fatal `capture.error` and the tail
+    /// gap already went out at stop time; `capture.stopped` follows the
+    /// persist regardless of its result (the salvage is the outcome).
+    QuiesceStop,
+    /// A device error on the stop handshake: an optional
+    /// `persist_interrupted_failed`, then the fatal
+    /// `device_error_on_stop` that enters `Interrupted`.
+    DeviceStopFatal,
+    /// `capture.abort`: the machine is already `Idle`, where no `capture.*`
+    /// event is legal — the report only registers the take and releases
+    /// the route (the abort's documented no-wire-surface limit).
+    Abort,
+    /// The fatal mid-take salvage: an optional
+    /// `persist_interrupted_failed`, then the fatal
+    /// `device_stream_lost` that enters `Interrupted`.
+    FatalSalvage,
+}
+
+/// A persist worker's report back to the actor: the take (back by handle,
+/// for the registry), the store commit's result, and the close-out to
+/// resume.
+pub struct PersistReport {
+    corr: String,
+    record: Arc<TakeRecord>,
+    result: Result<(), String>,
+    follow: PersistFollow,
 }
 
 /// One live take: the session plus everything the stop path needs once the
@@ -701,6 +783,10 @@ impl Default for CaptureConfig {
 /// The capture actor. Spawned by [`crate::Runtime`]; single-owned.
 pub struct CaptureActor {
     inbox: crate::channel::Receiver<CaptureMsg>,
+    /// Persist workers post their reports here (a sender clone of the
+    /// inbox — the same self-addressed-report shape the jobs scheduler
+    /// uses for its workers).
+    persist_inbox: crate::channel::Sender<CaptureMsg>,
     bus: Arc<EventBus>,
     view: super::ViewSlot,
     core: MachineCore,
@@ -710,12 +796,18 @@ pub struct CaptureActor {
     config: CaptureConfig,
     freezer: RouteFreezer,
     take: Option<LiveTake>,
+    /// Persist workers in flight. Zero is the actor's idle-and-exitable
+    /// condition: `Shutdown` waits for these to report (the old inline
+    /// shape could not even see `Shutdown` until an in-flight encode
+    /// returned, and the durability contract keeps that wait).
+    pending_persists: usize,
 }
 
 impl CaptureActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         inbox: crate::channel::Receiver<CaptureMsg>,
+        persist_inbox: crate::channel::Sender<CaptureMsg>,
         bus: Arc<EventBus>,
         view: super::ViewSlot,
         source: Arc<dyn CaptureSource>,
@@ -726,6 +818,7 @@ impl CaptureActor {
     ) -> CaptureActor {
         CaptureActor {
             inbox,
+            persist_inbox,
             bus,
             view,
             core: MachineCore::new(&CAPTURE),
@@ -735,6 +828,7 @@ impl CaptureActor {
             config,
             freezer,
             take: None,
+            pending_persists: 0,
         }
     }
 
@@ -748,7 +842,19 @@ impl CaptureActor {
             match self.inbox.recv_timeout(timeout) {
                 Ok(CaptureMsg::Command(inbound)) => self.handle_command(inbound),
                 Ok(CaptureMsg::Recover(take_id)) => self.handle_recover(&take_id),
-                Ok(CaptureMsg::Shutdown) | Err(crate::channel::RecvError::Closed) => break,
+                Ok(CaptureMsg::Persist(report)) => self.handle_persist(report),
+                Ok(CaptureMsg::Shutdown) | Err(crate::channel::RecvError::Closed) => {
+                    // Shutdown drains in-flight persists before exiting:
+                    // the old inline shape finished them before `Shutdown`
+                    // was even visible, and a graceful shutdown must not
+                    // regress that (the take's durable ack, §4). The loop
+                    // keeps receiving, so a worker parked on a full inbox
+                    // always makes progress — no join, no deadlock; each
+                    // worker posts exactly one report, so this terminates.
+                    if self.pending_persists == 0 {
+                        break;
+                    }
+                }
                 Err(crate::channel::RecvError::Timeout) => {
                     if self.core.state() == "Recording" {
                         self.poll_recording();
@@ -1037,41 +1143,12 @@ impl CaptureActor {
                     wall_clock_ms: facts.wall_clock_ms,
                     capture_id,
                 };
-                match self.store.commit_take(&record) {
-                    Ok(()) => {
-                        self.emit(
-                            Event::CaptureStopped {
-                                final_sample_index: record.final_sample_index,
-                                acknowledged_samples: record.acknowledged_samples,
-                                gaps: record.gaps.clone(),
-                                journal_id: record.capture_id.clone(),
-                                sample_duration_ms: record.sample_duration_ms,
-                                wall_clock_ms: record.wall_clock_ms,
-                            },
-                            &corr,
-                        );
-                        self.register(record);
-                        let _ = self.freezer.take_completed(&corr);
-                    }
-                    Err(_message) => {
-                        // Storage fault: the take is not persisted —
-                        // Interrupted, source preserved in the registry.
-                        self.emit(
-                            Event::CaptureError {
-                                code: "storage_commit_failed".into(),
-                                fatal: true,
-                            },
-                            &corr,
-                        );
-                        let mut record = record;
-                        record.status = TakeStatus::Interrupted;
-                        self.register(record);
-                        // The take is over even though its store write
-                        // failed; release the audio route so the context
-                        // cycle is not wedged behind it.
-                        let _ = self.freezer.take_completed(&corr);
-                    }
-                }
+                // The durable commit runs on a persist worker (issue #249):
+                // the v1-file store encodes the whole take here, and that
+                // must not stall the actor loop. `capture.stopped` (the
+                // §4 durable ack) and the storage-fault degradation are
+                // gated on the report in `handle_persist`.
+                self.hand_off_persist(record, corr, PersistIntent::Commit, PersistFollow::CleanStop);
             }
             Err(err @ RecorderError::QuiesceTimeout { .. }) => {
                 // R09/I1 phase 2 semantics: never a silent empty result —
@@ -1101,27 +1178,20 @@ impl CaptureActor {
                 }
                 let record = salvaged.record;
                 let salvaged_count = record.acknowledged_samples;
-                let _ = self.store.mark_interrupted(
-                    &record,
-                    &format!(
+                // The interrupted persist runs on a worker (issue #249);
+                // `capture.stopped` follows its report regardless of the
+                // commit's result (the salvage is the outcome — the
+                // pre-persist events above already told the story).
+                self.hand_off_persist(
+                    record,
+                    corr,
+                    PersistIntent::Interrupted(format!(
                         "The microphone did not stop cleanly within the quiesce timeout; \
                          {salvaged_count} captured samples were salvaged and kept as this \
                          interrupted recording."
-                    ),
+                    )),
+                    PersistFollow::QuiesceStop,
                 );
-                self.emit(
-                    Event::CaptureStopped {
-                        final_sample_index: record.final_sample_index,
-                        acknowledged_samples: record.acknowledged_samples,
-                        gaps: record.gaps.clone(),
-                        journal_id: record.capture_id.clone(),
-                        sample_duration_ms: record.sample_duration_ms,
-                        wall_clock_ms: record.wall_clock_ms,
-                    },
-                    &corr,
-                );
-                self.register(record);
-                let _ = self.freezer.take_completed(&corr);
             }
             Err(RecorderError::Empty) => {
                 self.emit(
@@ -1151,48 +1221,247 @@ impl CaptureActor {
                 // persisted *before* the fatal error: while still in
                 // Draining a persist failure can surface on the wire —
                 // after the fatal error, Interrupted admits no capture.*
-                // event at all.
+                // event at all. The persist itself runs on a worker
+                // (issue #249); the fatal close-out is gated on its
+                // report, preserving that ordering.
                 let salvaged = salvage_outcome(facts, Err(err))
                     .expect("a device stop error always keeps the metadata-only record");
                 let acknowledged = salvaged.record.acknowledged_samples;
-                if let Err(_e) = self.store.mark_interrupted(
-                    &salvaged.record,
-                    &device_stop_note(
+                self.hand_off_persist(
+                    salvaged.record,
+                    corr,
+                    PersistIntent::Interrupted(device_stop_note(
                         "The microphone failed during the stop handshake",
                         acknowledged,
-                    ),
-                ) {
-                    // Surface, don't swallow: the take must not vanish
-                    // without a trace (issue #212's rule).
+                    )),
+                    PersistFollow::DeviceStopFatal,
+                );
+            }
+        }
+        self.publish_view();
+    }
+
+    /// Hands a take's store persist to a dedicated worker thread and
+    /// returns immediately — the encode-and-fsync a v1-file commit performs
+    /// over a multi-minute take's whole audio must never run on the actor
+    /// loop, where it stalled every `capture.*` command behind the stop
+    /// handshake (issue #249; the same move #216 made for the jobs
+    /// scheduler's workers). The worker shares the record by handle (the
+    /// registry's own `Arc<TakeRecord>` shape — no sample clone; the store
+    /// borrows it), posts exactly one report into the actor's inbox, and
+    /// the close-out that the durable commit gates — `capture.stopped` and
+    /// friends, the registry registration, the route release — resumes in
+    /// [`Self::handle_persist`].
+    ///
+    /// A worker that panics is demoted to a persist failure (the same
+    /// `Err` the store would have returned; the old inline shape would
+    /// have taken the whole actor down with it). A thread that cannot
+    /// spawn at all falls back to the inline persist: a stall is the
+    /// lesser failure next to dropping the durability contract.
+    fn hand_off_persist(
+        &mut self,
+        record: TakeRecord,
+        corr: String,
+        intent: PersistIntent,
+        follow: PersistFollow,
+    ) {
+        let record = Arc::new(record);
+        let worker_record = Arc::clone(&record);
+        let worker_intent = intent.clone();
+        let store = Arc::clone(&self.store);
+        let inbox = self.persist_inbox.clone();
+        let worker_corr = corr.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("starling-capture-persist-{worker_corr}"))
+            .spawn(move || {
+                let run = || match &worker_intent {
+                    PersistIntent::Commit => store.commit_take(&worker_record),
+                    PersistIntent::Interrupted(note) => {
+                        store.mark_interrupted(&worker_record, note)
+                    }
+                };
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    Ok(result) => result,
+                    Err(_) => Err("persist worker panicked".to_string()),
+                };
+                // The Result is already surfaced inside (stderr on a
+                // closed inbox); the worker can do nothing further.
+                let _ = deliver_persist_report(
+                    &inbox,
+                    PersistReport {
+                        corr: worker_corr,
+                        record: worker_record,
+                        result,
+                        follow,
+                    },
+                );
+            });
+        match spawned {
+            Ok(_) => self.pending_persists += 1,
+            Err(_) => {
+                let result = match &intent {
+                    PersistIntent::Commit => self.store.commit_take(&record),
+                    PersistIntent::Interrupted(note) => self.store.mark_interrupted(&record, note),
+                };
+                // The worker never existed, so this handle is the only one.
+                self.handle_persist(PersistReport {
+                    corr,
+                    record,
+                    result,
+                    follow,
+                });
+            }
+        }
+    }
+
+    /// Resumes a take's close-out from its persist worker's report. Every
+    /// emission here was, before issue #249, emitted inline after the
+    /// store call returned — the ordering contracts are unchanged:
+    /// `capture.stopped` still follows the successful commit (§4's durable
+    /// ack), a failed commit still degrades before the take's fatal
+    /// close-out, the registry still receives the take only once its store
+    /// outcome is known (and before the `capture.stopped` a jobs submit
+    /// could be gated on), and the route release still brings up the rear.
+    ///
+    /// The one genuinely new interleaving is `capture.abort` landing while
+    /// a stop's persist runs: the table has always allowed abort from
+    /// `Draining`, but the inline stall meant no abort could ever arrive
+    /// there. It takes the machine to `Idle`, where no `capture.*` event
+    /// is legal — so the persist lands silently (registry + release, no
+    /// wire event) instead of being forced through `emit`, which would
+    /// record a table violation for a sequence the table itself permits.
+    /// The store write still completes; only its announcement is skipped,
+    /// because the abort already announced the take's end.
+    fn handle_persist(&mut self, report: PersistReport) {
+        self.pending_persists = self.pending_persists.saturating_sub(1);
+        let PersistReport {
+            corr,
+            record,
+            result,
+            follow,
+        } = report;
+        // The states each follow's emissions are still legal from. A state
+        // outside them means a command moved the machine while the persist
+        // ran (only abort can, on the stop paths; the abort and
+        // fatal-salvage paths spell out their own corners below).
+        let stopped_legal = matches!(self.core.state(), "Draining" | "Recovering");
+        let error_legal = matches!(
+            self.core.state(),
+            "Acquiring" | "Recording" | "Draining" | "Recovering"
+        );
+        match follow {
+            PersistFollow::CleanStop => match result {
+                Ok(()) => {
+                    let stopped = stopped_event(&record);
+                    self.register(record);
+                    if stopped_legal {
+                        self.emit(stopped, &corr);
+                    }
+                    let _ = self.freezer.take_completed(&corr);
+                }
+                Err(_message) => {
+                    // Storage fault: the take is not persisted —
+                    // Interrupted, source preserved in the registry.
+                    if error_legal {
+                        self.emit(
+                            Event::CaptureError {
+                                code: "storage_commit_failed".into(),
+                                fatal: true,
+                            },
+                            &corr,
+                        );
+                    }
+                    let mut owned = Arc::try_unwrap(record)
+                        .expect("the persist report's record is singly-owned by the actor");
+                    owned.status = TakeStatus::Interrupted;
+                    self.register(Arc::new(owned));
+                    // The take is over even though its store write
+                    // failed; release the audio route so the context
+                    // cycle is not wedged behind it.
+                    let _ = self.freezer.take_completed(&corr);
+                }
+            },
+            PersistFollow::QuiesceStop => {
+                // The quiesce arm emits `capture.stopped` regardless of
+                // the persist's result (the salvage is the outcome).
+                let stopped = stopped_event(&record);
+                self.register(record);
+                if stopped_legal {
+                    self.emit(stopped, &corr);
+                }
+                let _ = self.freezer.take_completed(&corr);
+            }
+            PersistFollow::DeviceStopFatal => {
+                if error_legal {
+                    if result.is_err() {
+                        // Surface, don't swallow: the take must not vanish
+                        // without a trace (issue #212's rule).
+                        self.emit(
+                            Event::CaptureError {
+                                code: "persist_interrupted_failed".into(),
+                                fatal: false,
+                            },
+                            &corr,
+                        );
+                    }
+                    // The handshake consumed the session and the error
+                    // carries no audio — the take still must not vanish
+                    // with it. The metadata-only record is registered
+                    // (gap evidence included); the acknowledged samples
+                    // remain in the on-disk journal for the
+                    // orphan-recovery scan. The fatal error below enters
+                    // `Interrupted`, the contract's terminal state for a
+                    // lost device (the fixture capture-interrupted.json),
+                    // so no `capture.stopped` follows.
                     self.emit(
                         Event::CaptureError {
-                            code: "persist_interrupted_failed".into(),
-                            fatal: false,
+                            code: "device_error_on_stop".into(),
+                            fatal: true,
                         },
                         &corr,
                     );
                 }
-                // The handshake consumed the session and the error carries
-                // no audio — the take still must not vanish with it. The
-                // metadata-only record is registered (gap evidence
-                // included); the acknowledged samples remain in the
-                // on-disk journal for the orphan-recovery scan. The fatal
-                // error below already enters `Interrupted`, the
-                // contract's terminal state for a lost device (the fixture
-                // capture-interrupted.json), so no `capture.stopped`
-                // follows.
-                self.emit(
-                    Event::CaptureError {
-                        code: "device_error_on_stop".into(),
-                        fatal: true,
-                    },
-                    &corr,
-                );
-                self.register(salvaged.record);
+                self.register(record);
                 // The machine is Interrupted, but the audio route is not
                 // the device's to keep: release the freeze so the context
                 // cycle can run again once recovery replays this take
                 // (the same wedge class issue #211 fixed, one layer down).
+                let _ = self.freezer.take_completed(&corr);
+            }
+            PersistFollow::Abort => {
+                // No `capture.*` event is legal from Idle after the abort
+                // (and a whole new take may already be running): land the
+                // take and release the route, wire-silent.
+                self.register(record);
+                let _ = self.freezer.take_completed(&corr);
+            }
+            PersistFollow::FatalSalvage => {
+                if error_legal {
+                    if result.is_err() {
+                        // Surface, don't swallow: the take must not vanish
+                        // without a trace (legal from Recording/Draining;
+                        // after the fatal error below it would not be).
+                        self.emit(
+                            Event::CaptureError {
+                                code: "persist_interrupted_failed".into(),
+                                fatal: false,
+                            },
+                            &corr,
+                        );
+                    }
+                    self.emit(
+                        Event::CaptureError {
+                            code: "device_stream_lost".into(),
+                            fatal: true,
+                        },
+                        &corr,
+                    );
+                }
+                self.register(record);
+                // The machine is Interrupted, but the audio route is not
+                // the device's to keep: release the freeze so the context
+                // cycle can run again for whatever follows (recovery or a
+                // restart).
                 let _ = self.freezer.take_completed(&corr);
             }
         }
@@ -1220,23 +1489,26 @@ impl CaptureActor {
                     salvaged.record.acknowledged_samples,
                 )
             };
-            if let Err(_e) = self.store.mark_interrupted(&salvaged.record, &note) {
-                // v1 defines no event for abort and no capture.* event is
-                // legal from Idle — the machine committed capture.abort
-                // before the salvage runs — so this failure has no legal
-                // wire surface here (a documented limit, not an
-                // oversight; the paths still in Draining/Recording emit
-                // `persist_interrupted_failed`). The registry
-                // registration below keeps the take itself visible to the
-                // jobs loader; only the store's interrupted row is lost.
-            }
-            self.register(salvaged.record);
+            // The interrupted persist runs on a worker (issue #249); the
+            // report's [`PersistFollow::Abort`] close-out registers the
+            // take and releases the route. A persist failure here has no
+            // legal wire surface (v1 defines no event for abort and no
+            // capture.* event is legal from Idle — the machine committed
+            // capture.abort before the salvage runs), so this failure is a
+            // documented limit, not an oversight; the registry
+            // registration keeps the take itself visible to the jobs
+            // loader, and only the store's interrupted row is lost.
+            self.hand_off_persist(
+                salvaged.record,
+                corr.clone(),
+                PersistIntent::Interrupted(note),
+                PersistFollow::Abort,
+            );
+        } else {
+            // Nothing salvageable (`RecorderError::Empty`): the take is
+            // resolved, and its route freeze must not outlive it.
+            let _ = self.freezer.take_completed(&corr);
         }
-        // The take is over whatever the handshake said — release the
-        // audio route so the context cycle can run again (an aborted take
-        // whose stop failed device-side used to leak its freeze, wedging
-        // `context.snapshot` out of `RouteFrozen`).
-        let _ = self.freezer.take_completed(&corr);
         self.publish_view();
     }
 
@@ -1244,7 +1516,11 @@ impl CaptureActor {
     /// machine is still `Recording`, a persist failure can surface on the
     /// wire — then the fatal `capture.error`, which is the transition into
     /// `Interrupted`. The wire keeps its contract shape: the fatal event is
-    /// the last emission, and nothing follows it.
+    /// the last emission, and nothing follows it. The persist runs on a
+    /// worker (issue #249), so the machine honestly sits in `Recording`
+    /// with no live take while it runs; the report's
+    /// [`PersistFollow::FatalSalvage`] close-out performs the gated
+    /// emissions in the same order.
     fn salvage_interrupted(&mut self, note: String) {
         let Some(live) = self.take.take() else {
             return;
@@ -1253,43 +1529,37 @@ impl CaptureActor {
         let facts = live.salvage_facts();
         let outcome = live.session.stop();
         let salvaged = salvage_outcome(facts, outcome);
-        if let Some(salvaged) = &salvaged {
-            // Whatever the recorder acknowledged is salvaged, and the gap
-            // spans already surfaced as `capture.gap` events travel with
-            // the persisted record (issue #212: they used to be dropped on
-            // this path).
-            let persisted_note = if salvaged.audio_preserved {
-                note
-            } else {
-                device_stop_note(&note, salvaged.record.acknowledged_samples)
-            };
-            if let Err(_e) = self.store.mark_interrupted(&salvaged.record, &persisted_note) {
-                // Surface, don't swallow: the take must not vanish without
-                // a trace (still legal from Recording; after the fatal
-                // error below it would not be).
+        match salvaged {
+            Some(salvaged) => {
+                // Whatever the recorder acknowledged is salvaged, and the
+                // gap spans already surfaced as `capture.gap` events travel
+                // with the persisted record (issue #212: they used to be
+                // dropped on this path).
+                let persisted_note = if salvaged.audio_preserved {
+                    note
+                } else {
+                    device_stop_note(&note, salvaged.record.acknowledged_samples)
+                };
+                self.hand_off_persist(
+                    salvaged.record,
+                    corr,
+                    PersistIntent::Interrupted(persisted_note),
+                    PersistFollow::FatalSalvage,
+                );
+            }
+            None => {
+                // Nothing salvageable: the fatal error is the whole story,
+                // and the take's route freeze must not outlive it.
                 self.emit(
                     Event::CaptureError {
-                        code: "persist_interrupted_failed".into(),
-                        fatal: false,
+                        code: "device_stream_lost".into(),
+                        fatal: true,
                     },
                     &corr,
                 );
+                let _ = self.freezer.take_completed(&corr);
             }
         }
-        self.emit(
-            Event::CaptureError {
-                code: "device_stream_lost".into(),
-                fatal: true,
-            },
-            &corr,
-        );
-        if let Some(salvaged) = salvaged {
-            self.register(salvaged.record);
-        }
-        // The machine is Interrupted, but the audio route is not the
-        // device's to keep: release the freeze so the context cycle can
-        // run again for whatever follows (recovery or a restart).
-        let _ = self.freezer.take_completed(&corr);
         self.publish_view();
     }
 
@@ -1347,12 +1617,59 @@ impl CaptureActor {
         );
     }
 
-    fn register(&self, record: TakeRecord) {
+    fn register(&self, record: Arc<TakeRecord>) {
+        let id = record.id.clone();
         self.registry
             .lock()
             .expect("take registry lock")
-            .insert(record.id.clone(), Arc::new(record));
+            .insert(id, record);
     }
+}
+
+/// The `capture.stopped` event for a finished take — one shape shared by
+/// every close-out that emits it, so the persisted record and the wire
+/// announcement cannot drift.
+fn stopped_event(record: &TakeRecord) -> Event {
+    Event::CaptureStopped {
+        final_sample_index: record.final_sample_index,
+        acknowledged_samples: record.acknowledged_samples,
+        gaps: record.gaps.clone(),
+        journal_id: record.capture_id.clone(),
+        sample_duration_ms: record.sample_duration_ms,
+        wall_clock_ms: record.wall_clock_ms,
+    }
+}
+
+/// Posts a persist worker's report into the capture actor's inbox with a
+/// delivery guarantee instead of a best-effort `try_send` — the same
+/// contract the jobs scheduler's `deliver_worker_report` holds for its
+/// workers. The inbox is the bounded queue that carries every `capture.*`
+/// command, and a report dropped on a full queue would silently strand
+/// the take's close-out (no `capture.stopped`, no registry entry, no
+/// route release) while its worker exits; delivery therefore parks on
+/// [`Sender::send_blocking`] while the actor drains, which applies
+/// backpressure to the worker's own thread and never the actor loop.
+///
+/// `Closed` means the actor is gone (runtime shutdown that did not wait
+/// — by construction it does, but a crashed actor cannot be unwedged by
+/// a worker): the report is surfaced on stderr and dropped rather than
+/// vanishing silently.
+fn deliver_persist_report(
+    inbox: &crate::channel::Sender<CaptureMsg>,
+    report: PersistReport,
+) -> Result<(), crate::channel::RecvError> {
+    let corr = report.corr.clone();
+    let sent = match inbox.try_send(CaptureMsg::Persist(report)) {
+        Ok(()) => Ok(()),
+        Err(crate::channel::TrySendError::Full(message)) => inbox.send_blocking(message),
+        Err(crate::channel::TrySendError::Closed(_)) => Err(crate::channel::RecvError::Closed),
+    };
+    if sent.is_err() {
+        eprintln!(
+            "starling-runtime: capture actor gone before take {corr} persist reported; report dropped"
+        );
+    }
+    sent
 }
 
 fn rejection_for(command: &str, state: &str, violation: crate::protocol::replay::Violation) -> Rejection {
