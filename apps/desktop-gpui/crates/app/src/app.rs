@@ -35,6 +35,269 @@ pub enum Connection {
     Offline,
 }
 
+/// Why a draft cannot be probed or saved at all: there is no endpoint to
+/// connect to (`EMPTY_ENDPOINT_REASON` in `settingsTransaction.ts`).
+pub(crate) const EMPTY_ENDPOINT_REASON: &str = "Enter a server endpoint before saving.";
+
+/// Latest-wins sequencing for asynchronous connection checks (#207,
+/// ported from `connectionProbe.ts`'s `CheckSequencer`): every check
+/// claims a token before awaiting anything and may report its outcome
+/// only while its token is still the newest. A slower, older check —
+/// against an endpoint or protocol that has since been replaced —
+/// resolves after a newer one and is dropped instead of overwriting its
+/// result. `cancel_all` retires every in-flight token at once, so
+/// closing the settings dialog leaves a stray probe with nothing to land
+/// in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CheckSequencer {
+    latest: u64,
+}
+
+impl CheckSequencer {
+    pub(crate) fn new() -> Self {
+        Self { latest: 0 }
+    }
+
+    /// Claim the right to report; the returned token is current until the
+    /// next `begin`.
+    pub(crate) fn begin(&mut self) -> u64 {
+        self.latest = self.latest.wrapping_add(1);
+        self.latest
+    }
+
+    pub(crate) fn is_current(&self, token: u64) -> bool {
+        token == self.latest
+    }
+
+    /// Retire every in-flight token.
+    pub(crate) fn cancel_all(&mut self) {
+        self.latest = self.latest.wrapping_add(1);
+    }
+}
+
+impl Default for CheckSequencer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The isolated outcome of one Test Connection press (#207, B06): it
+/// belongs to the settings dialog alone — the live connection status, the
+/// server model, and the global error banner are never written from a
+/// probe. Transport-failure messages carry the URL that was actually
+/// tried, so a failed probe names the draft endpoint, not the committed
+/// one (the port's `connectionFailureMessage` is already built in).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Ok {
+        model: String,
+        busy: bool,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// One Test Connection press: in flight against `endpoint`, or settled
+/// with its own outcome for that endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionProbe {
+    Testing {
+        endpoint: String,
+    },
+    Done {
+        endpoint: String,
+        outcome: ProbeOutcome,
+    },
+}
+
+/// Why a live health check is running, and therefore what it may write
+/// (#207). The probe behind Test Connection never routes through here:
+/// it owns its own outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HealthCheckPurpose {
+    /// Startup and settings-save checks against the committed pair: they
+    /// own the badge, the server model, the model auto-sync (R02), and
+    /// the global error banner.
+    Live,
+    /// The R13 re-check after a transport-class job failure: it owns the
+    /// badge and the server model only — never the banner, which still
+    /// carries the job's explanation for the missing transcript.
+    Diagnostic,
+}
+
+/// The probe outcome for a health snapshot (`probeOutcomeFromHealth`).
+pub(crate) fn probe_outcome_from_health(health: &client::ServerHealth) -> ProbeOutcome {
+    ProbeOutcome::Ok {
+        model: health.model.as_deref().unwrap_or("server").to_string(),
+        busy: health_is_busy(health),
+    }
+}
+
+/// Whether a health snapshot describes a busy server (#207): the busy
+/// flag or a queued request. Shared by the live-check writes and the
+/// probe outcome so the two derivations cannot drift.
+pub(crate) fn health_is_busy(health: &client::ServerHealth) -> bool {
+    health.busy.unwrap_or(false) || health.queue_depth.unwrap_or(0.0) > 0.0
+}
+
+/// What the settings dialog's status line shows (#207, B06): a probe that
+/// ran owns the line — testing, its own outcome, its own endpoint — and
+/// only without one does the line fall back to the live status of the
+/// committed endpoint. A failed draft probe therefore never paints the
+/// committed connection as offline.
+pub(crate) struct SettingsCalloutView {
+    /// The status dot's connection state: the probe's when one ran, the
+    /// live one otherwise.
+    pub dot: Connection,
+    pub title: String,
+    /// The endpoint probed, or the probe's failure message — never the
+    /// live endpoint mixed in.
+    pub detail: String,
+}
+
+pub(crate) fn settings_callout_view(
+    probe: Option<&ConnectionProbe>,
+    live: Connection,
+    live_endpoint: &str,
+) -> SettingsCalloutView {
+    match probe {
+        None => SettingsCalloutView {
+            dot: live,
+            title: match live {
+                Connection::Ready => "Server connected".to_string(),
+                // A live check is still in flight (startup, or the
+                // re-check a save just triggered): pending, not failing —
+                // the callout must not read "needs attention" the moment
+                // the dialog opens on a fresh launch (#207 review).
+                Connection::Checking => "Checking server…".to_string(),
+                Connection::Busy | Connection::Offline => {
+                    "Server needs attention".to_string()
+                }
+            },
+            detail: live_endpoint.to_string(),
+        },
+        Some(ConnectionProbe::Testing { endpoint }) => SettingsCalloutView {
+            dot: Connection::Checking,
+            title: "Testing connection…".to_string(),
+            detail: endpoint.clone(),
+        },
+        Some(ConnectionProbe::Done {
+            outcome: ProbeOutcome::Failed { message },
+            ..
+        }) => SettingsCalloutView {
+            dot: Connection::Offline,
+            title: "Probe failed".to_string(),
+            detail: message.clone(),
+        },
+        Some(ConnectionProbe::Done {
+            endpoint,
+            outcome: ProbeOutcome::Ok { model, busy },
+        }) => SettingsCalloutView {
+            dot: if *busy {
+                Connection::Busy
+            } else {
+                Connection::Ready
+            },
+            title: if *busy {
+                format!("{model} is working")
+            } else {
+                format!("{model} responded")
+            },
+            detail: endpoint.clone(),
+        },
+    }
+}
+
+/// What a settled live health check may write back to app state (#207):
+/// pure, so the banner/ownership contract stays testable without a
+/// window. Every field except `connection` is optional — `None` leaves
+/// the current value untouched.
+pub(crate) struct LiveCheckWrites {
+    /// The badge always follows the check's outcome.
+    pub connection: Connection,
+    /// `Some(model)` on success (with the `server` fallback), `None` on
+    /// failure: a failed check leaves the previous model label alone.
+    pub server_model: Option<String>,
+    /// The R02 model auto-sync: `Some(model)` only for a Live OpenAI
+    /// check that reported a non-empty model while the model is not
+    /// user-set.
+    pub model_sync: Option<String>,
+    /// The global banner slot: `Some(None)` clears it (a Live success),
+    /// `Some(Some(message))` replaces it (a Live failure), `None` leaves
+    /// whatever is already there — Diagnostic checks, whose R13 probe
+    /// must not wipe the job's failure explanation.
+    pub error_slot: Option<Option<String>>,
+}
+
+pub(crate) fn live_check_writes(
+    purpose: HealthCheckPurpose,
+    protocol: client::Protocol,
+    user_set_model: bool,
+    result: &Result<client::ServerHealth, String>,
+) -> LiveCheckWrites {
+    match result {
+        Ok(health) => LiveCheckWrites {
+            connection: if health_is_busy(health) {
+                Connection::Busy
+            } else {
+                Connection::Ready
+            },
+            server_model: Some(health.model.as_deref().unwrap_or("server").to_string()),
+            // The guard and the value are one expression: the model is
+            // resolved once, with no dead fallback for the case the
+            // filter already excluded (#207 review).
+            model_sync: if purpose == HealthCheckPurpose::Live
+                && protocol == client::Protocol::OpenAi
+                && !user_set_model
+            {
+                health
+                    .model
+                    .as_deref()
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            },
+            error_slot: (purpose == HealthCheckPurpose::Live).then_some(None),
+        },
+        Err(message) => LiveCheckWrites {
+            connection: Connection::Offline,
+            server_model: None,
+            model_sync: None,
+            error_slot: (purpose == HealthCheckPurpose::Live)
+                .then(|| Some(message.clone())),
+        },
+    }
+}
+
+/// The endpoint a draft would commit (#207): trimmed with trailing
+/// slashes removed — the same normalization `save_settings` applies, so
+/// the probe targets what saving this draft would commit.
+pub(crate) fn normalize_draft_endpoint(draft: &str) -> String {
+    draft.trim().trim_end_matches('/').to_string()
+}
+
+/// Decide one Test Connection press (#207 review) before any request
+/// fires: dropped while the newest probe is still Testing (the disabled
+/// button, enforced at the state layer as well — and a dropped press
+/// retires nothing); otherwise it runs, claiming the sequencer token —
+/// which retires any in-flight probe — and normalizing the draft
+/// endpoint exactly like a save. An empty endpoint comes back as-is for
+/// the caller to settle as the probe's own failure under the claimed
+/// token, so the probe this press interrupted still has nowhere to land.
+pub(crate) fn probe_press(
+    sequencer: &mut CheckSequencer,
+    current: Option<&ConnectionProbe>,
+    draft_endpoint: &str,
+) -> Option<(u64, String)> {
+    if matches!(current, Some(ConnectionProbe::Testing { .. })) {
+        return None;
+    }
+    let token = sequencer.begin();
+    Some((token, normalize_draft_endpoint(draft_endpoint)))
+}
+
 pub struct UnsavedWav {
     pub id: String,
     pub wav: Arc<Vec<u8>>,
@@ -66,6 +329,19 @@ pub struct StarlingApp {
 
     pub connection: Connection,
     pub server_model: String,
+    /// The settings dialog's own Test Connection probe (#207, B06): the
+    /// newest press's isolated state, or `None` when no probe has run —
+    /// the callout then falls back to the live status of the committed
+    /// endpoint. Live connection state is never written from here.
+    pub(crate) probe: Option<ConnectionProbe>,
+    /// Latest-wins sequencing for live health checks (#207): startup,
+    /// settings-save, and R13 diagnostic re-checks compete here; only the
+    /// newest may write connection state.
+    pub(crate) health_sequencer: CheckSequencer,
+    /// Latest-wins sequencing for the dialog's Test Connection probes
+    /// (#207): a probe may never be silenced by a live check or vice
+    /// versa, but within the family only the newest may report.
+    pub(crate) probe_sequencer: CheckSequencer,
 
     /// History as metadata-only summaries (G02): the listing never loads
     /// audio; play/export/retry fetch one recording's WAV on demand.
@@ -338,6 +614,9 @@ impl StarlingApp {
             draft_terms,
             connection: Connection::Checking,
             server_model: "server".to_string(),
+            probe: None,
+            health_sequencer: CheckSequencer::new(),
+            probe_sequencer: CheckSequencer::new(),
             sessions: Vec::new(),
             damaged: Vec::new(),
             selected_id: None,
@@ -392,7 +671,12 @@ impl StarlingApp {
             })
             .detach();
         }
-        self.check_health(self.endpoint.clone(), cx);
+        self.check_health(
+            HealthCheckPurpose::Live,
+            self.endpoint.clone(),
+            self.protocol,
+            cx,
+        );
     }
 
     pub fn busy(&self) -> bool {
@@ -435,11 +719,26 @@ impl StarlingApp {
         }
     }
 
-    pub fn check_health(&mut self, endpoint: String, cx: &mut Context<Self>) {
+    /// Check the health of the COMMITTED endpoint and protocol (#207,
+    /// B06). The pair is passed in explicitly — never captured from
+    /// drafts — so a caller cannot hand the live-state writer a
+    /// configuration the user has not saved. The probe behind Test
+    /// Connection never routes through here: it owns its own outcome, so
+    /// a draft endpoint's failure cannot paint the live connection
+    /// offline. Each check claims a sequence token before awaiting
+    /// anything, so a slower check against an endpoint that has since
+    /// been replaced is dropped instead of overwriting the newer status.
+    pub fn check_health(
+        &mut self,
+        purpose: HealthCheckPurpose,
+        endpoint: String,
+        protocol: settings::Protocol,
+        cx: &mut Context<Self>,
+    ) {
         // R11: one Protocol enum — the persisted setting is the client's
         // wire protocol; no conversion layer.
-        let protocol = self.protocol;
         let model = self.model.clone();
+        let token = self.health_sequencer.begin();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -450,30 +749,22 @@ impl StarlingApp {
                 })
                 .await;
             this.update(cx, |app, cx| {
-                match result {
-                    Ok(health) => {
-                        app.server_model =
-                            health.model.clone().unwrap_or_else(|| "server".to_string());
-                        if protocol == client::Protocol::OpenAi
-                            && let Some(server_model) = &health.model
-                            && !app.user_set_model
-                            && !server_model.is_empty()
-                        {
-                            app.model = server_model.clone();
-                        }
-                        app.connection = if health.busy.unwrap_or(false)
-                            || health.queue_depth.unwrap_or(0.0) > 0.0
-                        {
-                            Connection::Busy
-                        } else {
-                            Connection::Ready
-                        };
-                        app.error = None;
-                    }
-                    Err(message) => {
-                        app.connection = Connection::Offline;
-                        app.error = Some(message);
-                    }
+                if !app.health_sequencer.is_current(token) {
+                    // A newer live check already landed (a saved endpoint
+                    // replaced this one): this result is against a pair
+                    // that is no longer current and must not overwrite it.
+                    return;
+                }
+                let writes = live_check_writes(purpose, protocol, app.user_set_model, &result);
+                app.connection = writes.connection;
+                if let Some(server_model) = writes.server_model {
+                    app.server_model = server_model;
+                }
+                if let Some(model) = writes.model_sync {
+                    app.model = model;
+                }
+                if let Some(error) = writes.error_slot {
+                    app.error = error;
                 }
                 cx.notify();
             })
@@ -484,6 +775,12 @@ impl StarlingApp {
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = true;
+        // A fresh dialog starts with no probe (#207): retire anything
+        // still in flight from a previous dialog and clear its settled
+        // outcome, so the callout shows the committed status until the
+        // user tests again.
+        self.probe_sequencer.cancel_all();
+        self.probe = None;
         self.settings_protocol = self.protocol;
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
@@ -502,17 +799,88 @@ impl StarlingApp {
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // B06 (#207): in-flight probes are retired with the dialog — a
+        // stray probe has nothing to land in, and the settled outcome
+        // dies with the draft it tested. Live state was never theirs to
+        // change, so there is nothing to re-probe on close.
+        self.probe_sequencer.cancel_all();
+        self.probe = None;
         cx.notify();
     }
 
+    /// Test the DRAFT configuration without touching committed state
+    /// (#207, B06). The probe runs against the draft endpoint AND the
+    /// draft protocol — the combination about to be saved — and its
+    /// outcome lands in the dialog's own probe state: the live connection
+    /// status, the server model, the committed model, and the global
+    /// error banner are never written from here. Only the newest probe
+    /// may report, so a slow earlier probe cannot overwrite a newer
+    /// result.
     pub fn test_connection(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
-        self.check_health(draft, cx);
+        let Some((token, clean)) = probe_press(&mut self.probe_sequencer, self.probe.as_ref(), &draft)
+        else {
+            // The newest press is still in flight: drop this one, the
+            // state-layer twin of the disabled button (#207 review).
+            return;
+        };
+        let protocol = self.settings_protocol;
+        let model = self.draft_model.read(cx).value();
+
+        if clean.is_empty() {
+            // The draft has no endpoint to connect to: settle the save's
+            // reason as the probe's own failure — under `token`, which
+            // has already retired the in-flight probe, so its late
+            // landing cannot overwrite this newer outcome (#207 review).
+            self.probe = Some(ConnectionProbe::Done {
+                endpoint: clean,
+                outcome: ProbeOutcome::Failed {
+                    message: EMPTY_ENDPOINT_REASON.to_string(),
+                },
+            });
+            cx.notify();
+            return;
+        }
+
+        self.probe = Some(ConnectionProbe::Testing {
+            endpoint: clean.clone(),
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // The request consumes its own copy; `clean` stays for the
+            // landing, which records the endpoint it probed.
+            let request_endpoint = clean.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let client = StarlingClient::new(&request_endpoint, protocol, &model)
+                        .and_then(|client| client.with_timeout_ms(5_000))
+                        .map_err(|err| err.to_string())?;
+                    client.health().map_err(|err| err.to_string())
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                if !app.probe_sequencer.is_current(token) {
+                    // The dialog closed or a newer probe began: this
+                    // outcome has nowhere to land.
+                    return;
+                }
+                app.probe = Some(ConnectionProbe::Done {
+                    endpoint: clean,
+                    outcome: match result {
+                        Ok(health) => probe_outcome_from_health(&health),
+                        Err(message) => ProbeOutcome::Failed { message },
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn save_settings(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
-        let clean = draft.trim().trim_end_matches('/').to_string();
+        let clean = normalize_draft_endpoint(&draft);
         if clean.is_empty() {
             return;
         }
@@ -559,8 +927,19 @@ impl StarlingApp {
         })
         .detach();
 
-        self.settings_open = false;
-        self.check_health(clean, cx);
+        // Close through the same path as Cancel and the scrim: retire any
+        // in-flight probe with the dialog it belonged to (#207).
+        self.close_settings(cx);
+        // Re-check health from the saved configuration, as saves always
+        // did — now explicitly against the committed pair, and sequenced
+        // so a check against an endpoint an earlier save committed is
+        // dropped when this one supersedes it (#207).
+        self.check_health(
+            HealthCheckPurpose::Live,
+            self.endpoint.clone(),
+            self.protocol,
+            cx,
+        );
     }
 
     pub fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1283,5 +1662,379 @@ mod tests {
     fn no_sessions_leaves_no_selection() {
         assert_eq!(next_selection(Some("gone"), &[]), None);
         assert_eq!(next_selection(None, &[]), None);
+    }
+
+    // --- #207: the health-probe subsystem ---
+
+    fn health(
+        model: Option<&str>,
+        busy: Option<bool>,
+        queue_depth: Option<f64>,
+    ) -> client::ServerHealth {
+        client::ServerHealth {
+            status: "ok".to_string(),
+            phase: None,
+            model: model.map(str::to_string),
+            loaded: None,
+            busy,
+            queue_depth,
+        }
+    }
+
+    #[test]
+    fn only_the_newest_sequencer_token_may_report() {
+        // #207 defect 3: save endpoint A (slow probe), then B (fast) — B
+        // lands first, and A's late result must be dropped, not layered on
+        // top. The token a check claims on begin is retired by the next
+        // begin, so the older landing compares unequal.
+        let mut sequencer = CheckSequencer::new();
+        let slow = sequencer.begin();
+        let fast = sequencer.begin();
+        assert!(sequencer.is_current(fast));
+        assert!(
+            !sequencer.is_current(slow),
+            "an older check must be retired by a newer one"
+        );
+    }
+
+    #[test]
+    fn cancel_all_retires_every_in_flight_token() {
+        let mut sequencer = CheckSequencer::new();
+        let first = sequencer.begin();
+        let second = sequencer.begin();
+        sequencer.cancel_all();
+        assert!(!sequencer.is_current(first));
+        assert!(
+            !sequencer.is_current(second),
+            "closing the dialog retires even the newest probe"
+        );
+        // A later check still works and is current.
+        let third = sequencer.begin();
+        assert!(sequencer.is_current(third));
+    }
+
+    #[test]
+    fn live_checks_and_probes_sequence_independent_families() {
+        // B06: a live check and a dialog probe may be in flight at once;
+        // beginning one must never silence the other, but each family's
+        // own begin retires that family's older tokens.
+        let mut health = CheckSequencer::new();
+        let mut probe = CheckSequencer::new();
+        let live_token = health.begin();
+        let probe_token = probe.begin();
+        assert!(health.is_current(live_token));
+        assert!(probe.is_current(probe_token));
+        let newer_live = health.begin();
+        assert!(!health.is_current(live_token));
+        assert!(probe.is_current(probe_token), "a live check never silences a probe");
+        assert!(health.is_current(newer_live));
+    }
+
+    #[test]
+    fn a_press_while_the_newest_probe_is_testing_is_dropped() {
+        // #207 review: the disabled button, enforced at the state layer —
+        // and a dropped press must not disturb the in-flight probe's
+        // token, or it would retire the very probe it is deferring to.
+        let mut sequencer = CheckSequencer::new();
+        let in_flight = sequencer.begin();
+        let testing = ConnectionProbe::Testing {
+            endpoint: "http://draft:9000".to_string(),
+        };
+        assert_eq!(
+            probe_press(&mut sequencer, Some(&testing), "http://other:1"),
+            None,
+            "a press during Testing is dropped, not run"
+        );
+        assert!(
+            sequencer.is_current(in_flight),
+            "a dropped press retires nothing"
+        );
+    }
+
+    #[test]
+    fn a_settled_or_absent_probe_lets_the_press_claim_the_next_token() {
+        let mut sequencer = CheckSequencer::new();
+        let previous = sequencer.begin();
+        let settled = ConnectionProbe::Done {
+            endpoint: "http://draft:9000".to_string(),
+            outcome: ProbeOutcome::Ok {
+                model: "parakeet".to_string(),
+                busy: false,
+            },
+        };
+        match probe_press(&mut sequencer, Some(&settled), "  http://next:9000/ ") {
+            Some((token, endpoint)) => {
+                assert!(sequencer.is_current(token));
+                assert_eq!(
+                    endpoint, "http://next:9000",
+                    "the press normalizes the draft like a save"
+                );
+            }
+            other => panic!("a settled probe must not block a new press, got {other:?}"),
+        }
+        assert!(!sequencer.is_current(previous));
+    }
+
+    #[test]
+    fn an_empty_draft_press_claims_the_token_that_retires_the_in_flight_probe() {
+        // #207 review: the immediate failure an empty draft settles is
+        // owned by a freshly claimed token, so the slower probe it
+        // interrupted cannot land afterwards and overwrite the newer
+        // outcome — the empty path goes through the sequencer like every
+        // other outcome.
+        let mut sequencer = CheckSequencer::new();
+        let in_flight = sequencer.begin();
+        match probe_press(&mut sequencer, None, "   ") {
+            Some((token, endpoint)) => {
+                assert_eq!(endpoint, "");
+                assert!(sequencer.is_current(token));
+                assert!(
+                    !sequencer.is_current(in_flight),
+                    "the stale Testing probe has nowhere to land"
+                );
+            }
+            other => panic!("an empty draft still settles a probe outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_a_probe_the_callout_shows_the_live_committed_status() {
+        let ready =
+            settings_callout_view(None, Connection::Ready, "http://committed:8181");
+        assert_eq!(ready.dot, Connection::Ready);
+        assert_eq!(ready.title, "Server connected");
+        assert_eq!(ready.detail, "http://committed:8181");
+
+        let offline =
+            settings_callout_view(None, Connection::Offline, "http://committed:8181");
+        assert_eq!(offline.dot, Connection::Offline);
+        assert_eq!(offline.title, "Server needs attention");
+    }
+
+    #[test]
+    fn a_pending_live_check_shows_a_neutral_callout_not_a_failure() {
+        // #207 review: right after launch, or while the re-check a save
+        // just triggered is in flight, the live connection is Checking —
+        // the no-probe fallback must read as pending, not as a server
+        // that "needs attention".
+        let view = settings_callout_view(None, Connection::Checking, "http://committed:8181");
+        assert_eq!(view.dot, Connection::Checking);
+        assert_eq!(view.title, "Checking server…");
+        assert_eq!(view.detail, "http://committed:8181");
+    }
+
+    #[test]
+    fn a_testing_probe_owns_the_callout_with_its_own_endpoint() {
+        let view = settings_callout_view(
+            Some(&ConnectionProbe::Testing {
+                endpoint: "http://draft:9000".to_string(),
+            }),
+            Connection::Offline,
+            "http://committed:8181",
+        );
+        assert_eq!(view.dot, Connection::Checking);
+        assert_eq!(view.title, "Testing connection…");
+        assert_eq!(view.detail, "http://draft:9000");
+    }
+
+    #[test]
+    fn a_failed_probe_reports_its_own_failure_not_the_live_status() {
+        // #207 defect 2, at the pure boundary: the callout shows the
+        // probe's own outcome and endpoint. The live state handed in is
+        // only the no-probe fallback — a mistyped draft can never paint
+        // the committed connection offline.
+        let view = settings_callout_view(
+            Some(&ConnectionProbe::Done {
+                endpoint: "http://draft:9000".to_string(),
+                outcome: ProbeOutcome::Failed {
+                    message:
+                        "error sending request for url (http://draft:9000/health)".to_string(),
+                },
+            }),
+            Connection::Ready,
+            "http://committed:8181",
+        );
+        assert_eq!(view.dot, Connection::Offline);
+        assert_eq!(view.title, "Probe failed");
+        assert_eq!(
+            view.detail,
+            "error sending request for url (http://draft:9000/health)"
+        );
+    }
+
+    #[test]
+    fn a_settled_probe_reports_the_probed_model_and_busyness() {
+        let idle = settings_callout_view(
+            Some(&ConnectionProbe::Done {
+                endpoint: "http://draft:9000".to_string(),
+                outcome: ProbeOutcome::Ok {
+                    model: "whisper-large-v3".to_string(),
+                    busy: false,
+                },
+            }),
+            Connection::Offline,
+            "http://committed:8181",
+        );
+        assert_eq!(idle.dot, Connection::Ready);
+        assert_eq!(idle.title, "whisper-large-v3 responded");
+        assert_eq!(idle.detail, "http://draft:9000");
+
+        let busy = settings_callout_view(
+            Some(&ConnectionProbe::Done {
+                endpoint: "http://draft:9000".to_string(),
+                outcome: ProbeOutcome::Ok {
+                    model: "whisper-large-v3".to_string(),
+                    busy: true,
+                },
+            }),
+            Connection::Ready,
+            "http://committed:8181",
+        );
+        assert_eq!(busy.dot, Connection::Busy);
+        assert_eq!(busy.title, "whisper-large-v3 is working");
+        assert_eq!(busy.detail, "http://draft:9000");
+    }
+
+    #[test]
+    fn a_probe_outcome_defaults_the_model_and_derives_busyness() {
+        // A health snapshot without a model still names the server
+        // "server"; a queued job means busy even when the flag is absent.
+        assert_eq!(
+            probe_outcome_from_health(&health(None, Some(false), Some(1.0))),
+            ProbeOutcome::Ok {
+                model: "server".to_string(),
+                busy: true
+            }
+        );
+        assert_eq!(
+            probe_outcome_from_health(&health(Some("parakeet"), None, None)),
+            ProbeOutcome::Ok {
+                model: "parakeet".to_string(),
+                busy: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_check_success_clears_the_banner_and_syncs_an_openai_model() {
+        let writes = live_check_writes(
+            HealthCheckPurpose::Live,
+            client::Protocol::OpenAi,
+            false,
+            &Ok(health(Some("parakeet"), Some(false), None)),
+        );
+        assert_eq!(writes.connection, Connection::Ready);
+        assert_eq!(writes.server_model.as_deref(), Some("parakeet"));
+        assert_eq!(writes.model_sync.as_deref(), Some("parakeet"));
+        assert_eq!(
+            writes.error_slot,
+            Some(None),
+            "a live success clears the banner"
+        );
+    }
+
+    #[test]
+    fn a_live_check_failure_owns_the_banner_with_the_failure() {
+        let writes = live_check_writes(
+            HealthCheckPurpose::Live,
+            client::Protocol::Starling,
+            false,
+            &Err("connection refused".to_string()),
+        );
+        assert_eq!(writes.connection, Connection::Offline);
+        assert_eq!(
+            writes.error_slot,
+            Some(Some("connection refused".to_string()))
+        );
+        assert_eq!(writes.model_sync, None);
+        assert_eq!(
+            writes.server_model, None,
+            "a failed check leaves the model label alone"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_check_never_touches_the_banner() {
+        // #207 defect 4: the R13 probe after a transport-class job failure
+        // may correct the badge, but the job's explanation for the missing
+        // transcript must survive both a successful and a failed probe.
+        let success = live_check_writes(
+            HealthCheckPurpose::Diagnostic,
+            client::Protocol::Starling,
+            false,
+            &Ok(health(None, Some(false), None)),
+        );
+        assert_eq!(success.connection, Connection::Ready);
+        assert_eq!(success.error_slot, None);
+        assert_eq!(
+            success.model_sync, None,
+            "only Live checks auto-sync the model"
+        );
+
+        let failure = live_check_writes(
+            HealthCheckPurpose::Diagnostic,
+            client::Protocol::Starling,
+            false,
+            &Err("connection refused".to_string()),
+        );
+        assert_eq!(failure.connection, Connection::Offline);
+        assert_eq!(failure.error_slot, None);
+    }
+
+    #[test]
+    fn the_model_auto_sync_needs_openai_a_reported_model_and_no_user_choice() {
+        // R02: a user-set model, a Starling server, or a health response
+        // without a model all leave the committed model alone.
+        let cases = [
+            (client::Protocol::Starling, false, Some("parakeet")),
+            (client::Protocol::OpenAi, true, Some("parakeet")),
+            (client::Protocol::OpenAi, false, None),
+        ];
+        for (protocol, user_set, model) in cases {
+            let writes = live_check_writes(
+                HealthCheckPurpose::Live,
+                protocol,
+                user_set,
+                &Ok(health(model, None, None)),
+            );
+            assert_eq!(
+                writes.model_sync,
+                None,
+                "no auto-sync for {protocol:?} user_set={user_set} model={model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn busyness_comes_from_the_flag_or_a_queue_depth() {
+        let flagged = live_check_writes(
+            HealthCheckPurpose::Live,
+            client::Protocol::Starling,
+            false,
+            &Ok(health(None, Some(true), None)),
+        );
+        assert_eq!(flagged.connection, Connection::Busy);
+        let queued = live_check_writes(
+            HealthCheckPurpose::Live,
+            client::Protocol::Starling,
+            false,
+            &Ok(health(None, None, Some(2.0))),
+        );
+        assert_eq!(queued.connection, Connection::Busy);
+    }
+
+    #[test]
+    fn a_draft_endpoint_normalizes_like_a_save() {
+        // #207 defect 1: the probe must target exactly what saving the
+        // draft would commit — same trim, same trailing-slash removal.
+        assert_eq!(
+            normalize_draft_endpoint("  http://127.0.0.1:8181/ "),
+            "http://127.0.0.1:8181"
+        );
+        assert_eq!(
+            normalize_draft_endpoint("http://host:8181///"),
+            "http://host:8181"
+        );
+        assert_eq!(normalize_draft_endpoint(""), "");
     }
 }
