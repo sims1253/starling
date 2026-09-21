@@ -1241,6 +1241,19 @@ impl StoreV2 {
                     .push((name, "not a .sj journal".to_string()));
                 continue;
             }
+            if !path.is_file() {
+                // A directory (or anything unlink cannot remove as a
+                // file) named like a journal must never be stamped swept:
+                // the tombstone would permanently deaden that id —
+                // reconcile's dead set would suppress recovery and
+                // adoption under it forever — while the entry itself
+                // survives every later sweep. Retain it unstamped for a
+                // human to look at.
+                report
+                    .retained
+                    .push((name, "not a regular file".to_string()));
+                continue;
+            }
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
             let id = path
                 .file_stem()
@@ -3178,8 +3191,30 @@ struct LeaseSentinel {
 }
 
 impl LeaseSentinel {
-    /// Take the sentinel (blocking flock on unix; no-op elsewhere).
+    /// The production wait: long enough for a healthy concurrent
+    /// acquisition (a few fsync'd writes) to finish, short enough that a
+    /// wedged holder cannot stall startup behind it.
+    const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Take the sentinel with the production timeout (see
+    /// [`Self::acquire_with_timeout`]).
     fn acquire(leases_dir: &Path) -> Result<Self, StoreV2Error> {
+        Self::acquire_with_timeout(leases_dir, Self::ACQUIRE_TIMEOUT)
+    }
+
+    /// Take the sentinel: a non-blocking flock retried under a BOUNDED
+    /// wait (flock(2) on unix; no-op elsewhere). The sentinel coordinates
+    /// probe-and-publish only — it is not a liveness primitive — so a
+    /// holder wedged mid-acquisition (hung fsync, stuck disk) must not be
+    /// able to block every other process's lease acquisition, and
+    /// therefore startup, indefinitely: past the bound the acquisition
+    /// fails with a distinct error the caller can surface or retry,
+    /// instead of blocking forever. Contention with a healthy sibling
+    /// acquisition resolves in milliseconds and never sees the bound.
+    fn acquire_with_timeout(
+        leases_dir: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, StoreV2Error> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -3189,16 +3224,37 @@ impl LeaseSentinel {
                 .create(true)
                 .truncate(false)
                 .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
-            // SAFETY: flock(2) on an fd this guard owns and keeps open
-            // until dropped; no close or hand-off happens here.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(io::Error::last_os_error().into());
+            let deadline = std::time::Instant::now() + timeout;
+
+            loop {
+                // SAFETY: flock(2) on an fd this guard owns and keeps open
+                // until dropped; no close or hand-off happens here.
+                let taken =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+
+                if taken == 0 {
+                    return Ok(Self { file: Some(file) });
+                }
+
+                let err = io::Error::last_os_error();
+
+                if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                    return Err(err.into());
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(StoreV2Error::Invalid(format!(
+                        "the lease sentinel stayed busy for more than {timeout:?} — another \
+                         lease acquisition appears wedged; retrying may help"
+                    )));
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Ok(Self { file: Some(file) })
         }
         #[cfg(not(unix))]
         {
-            let _ = leases_dir;
+            let _ = (leases_dir, timeout);
             Ok(Self { file: None })
         }
     }
@@ -5208,6 +5264,48 @@ mod tests {
     }
 
     #[test]
+    fn sweep_never_stamps_a_directory_named_like_a_journal() {
+        // A directory under quarantine/ named <id>.sj cannot be unlinked
+        // as a file; stamping it swept would deaden that id forever —
+        // reconcile's dead set would suppress recovery and adoption under
+        // it — while the entry itself survives every later sweep. It must
+        // be retained, unstamped.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let stray = store.root().join("quarantine").join("stray.sj");
+
+        std::fs::create_dir_all(&stray).expect("stray directory");
+        std::fs::write(stray.join("junk"), b"x").expect("content");
+
+        let report = store.sweep_retention().expect("sweep");
+
+        assert!(report.swept.is_empty());
+        assert!(stray.exists(), "the directory itself is untouched");
+        let retained_reason = report
+            .retained
+            .iter()
+            .find(|(name, _)| name == "stray.sj")
+            .map(|(_, reason)| reason.clone())
+            .expect("retained entry");
+        assert!(
+            retained_reason.contains("not a regular file"),
+            "{retained_reason}"
+        );
+        let stamped: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT retention FROM tombstones WHERE id = 'stray'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            stamped.is_none(),
+            "no tombstone may exist for the stray directory's id"
+        );
+    }
+
+    #[test]
     fn sweep_also_empties_the_legacy_v1_deleted_tree() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
@@ -5437,6 +5535,32 @@ mod tests {
             .join("leases")
             .join(format!("{owner_id}.lease"))
             .exists());
+    }
+
+    #[test]
+    fn a_wedged_sentinel_holder_fails_the_acquisition_after_a_bounded_wait() {
+        // The sentinel is coordination, not liveness: a holder stuck
+        // across its critical section must not block another acquisition
+        // (and therefore startup) forever — past the bound the
+        // acquisition fails with a distinct error instead of hanging.
+        // Probed with a short injected deadline while the sentinel is
+        // genuinely held.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        let _held = LeaseSentinel::acquire(&root.join("leases")).expect("sentinel");
+
+        let taken = LeaseSentinel::acquire_with_timeout(
+            &root.join("leases"),
+            std::time::Duration::from_millis(60),
+        );
+
+        let err = match taken {
+            Ok(_) => panic!("must not block past the deadline"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("wedged"), "{err}");
     }
 
     #[test]
