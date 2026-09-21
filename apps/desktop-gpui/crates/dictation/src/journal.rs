@@ -29,12 +29,25 @@
 //!   fsynced and the parent directory fsynced (POSIX; best-effort elsewhere).
 //!   The take then hands its audio to the existing session-store path as
 //!   today, with the manifest recording the additive `journal_id` linkage.
+//!   That path is durable in the same order (#205: the WAV — and its
+//!   directory entry — are fsynced *before* the manifest is published) and
+//!   names the session directory after the journal (#215), so every crash
+//!   window in it is identifiable or healable by recovery.
 //! - Startup recovery: a journal without a valid trailer is an interrupted
 //!   take. It is recovered to its last checksum-valid boundary — the torn
 //!   tail is discarded *logically* (the verified prefix is what becomes the
 //!   recovered session's audio) and the gap is recorded in the session note.
 //!   The journal file itself is never modified or deleted: it stays in place
-//!   as source evidence.
+//!   as source evidence. Two rules refine the plain linkage check:
+//!   - a journal linked to a session whose WAV failed verification (the #205
+//!     power-loss shape — the manifest outlived the audio blocks) rebuilds
+//!     that session's WAV from its verified samples instead of being
+//!     skipped; and
+//!   - an unlinked journal whose session directory already exists as a
+//!     WAV-only orphan (the #215 crash window between the WAV write and the
+//!     manifest publish — or damaged past classification, the same window
+//!     with the power loss tearing the WAV as well) heals that directory in
+//!     place rather than creating a second session for the same take.
 //!
 //! RETENTION POLICY (frozen for I1 phase 2, revised by R21): journal files
 //! are never deleted by the crash-recovery path — not after the session is
@@ -61,7 +74,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::audio::{PcmAudio, encode_wav_16k};
-use crate::storage::{DictationSession, FileSessionStore, StorageError};
+use crate::storage::{
+    DictationSession, FileSessionStore, RecoverySave, StorageError,
+};
 
 /// Extension of journal files under the journals root.
 const JOURNAL_EXT: &str = "sj";
@@ -550,21 +565,11 @@ fn validate_journal_id(id: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// fsync a directory's own entry (POSIX; best-effort no-op elsewhere) so a
-/// rename inside it survives a crash. Same contract as
-/// [`JournalSink::sync_parent_dir`], standalone for the quarantine path and
-/// the storage-v2 staging→audio promotion (I2).
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
-}
+/// fsync a directory's own entry so a rename inside it survives a crash.
+/// Shared with the session store's durable writes (#205) — defined in
+/// [`crate::storage`] (the lower layer) and re-exported here for the
+/// quarantine path and the storage-v2 staging→audio promotion (I2).
+pub(crate) use crate::storage::sync_dir;
 
 /// Quarantine (tombstone) one journal (R21): rename
 /// `<journals_root>/<id>.sj` into `<journals_root>/deleted/<id>.sj`, fsyncing
@@ -632,9 +637,15 @@ fn tombstoned_journal_ids(journals_root: &Path) -> HashSet<String> {
 /// audio, and take the manifest-linked journal along with it.
 ///
 /// Ordering — tombstone strictly before row removal:
-/// 1. Read the session's `journal_id` (metadata-only; never loads the WAV).
-/// 2. If the manifest carries a linkage, [`quarantine_journal`] renames the
-///    journal into `journals/deleted/` and fsyncs. This is the commit point.
+/// 1. Resolve the take's journal: the manifest linkage when there is one,
+///    else — a journal-linked take's session id *is* its journal id
+///    (#215) — the journal file named after the session directory itself.
+///    That fallback covers an unhealed crash-window orphan, whose WAV is
+///    on disk but whose manifest (the only place the linkage lives) never
+///    landed; without it, deleting the orphan would leave a live unlinked
+///    journal for the next startup recovery to resurrect the take from.
+/// 2. [`quarantine_journal`] renames the journal into `journals/deleted/`
+///    and fsyncs. This is the commit point.
 /// 3. Only then does [`FileSessionStore::delete`] remove the row + audio.
 ///
 /// Crash matrix: a crash before step 2 leaves everything in place (the
@@ -653,7 +664,16 @@ pub fn delete_session_and_journal(
     journals_root: &Path,
     session_id: &str,
 ) -> Result<(), StorageError> {
-    if let Some(journal_id) = store.journal_id_of(session_id)? {
+    let journal_id = store.journal_id_of(session_id)?.or_else(|| {
+        // The #215 fallback: a journal file sharing the session directory's
+        // name belongs to this take by construction (journal ids are unique
+        // per take, and only a journal-linked take names its session after
+        // the journal). Only a safe path component is ever probed.
+        (crate::storage::is_safe_path_component(session_id)
+            && journals_root.join(format!("{session_id}.{JOURNAL_EXT}")).exists())
+            .then(|| session_id.to_string())
+    });
+    if let Some(journal_id) = journal_id {
         quarantine_journal(journals_root, &journal_id)?;
     }
     store.delete(session_id)
@@ -664,6 +684,9 @@ pub fn delete_session_and_journal(
 pub struct RecoveryReport {
     /// Sessions created from unlinked journals (status `interrupted`).
     pub recovered: Vec<DictationSession>,
+    /// Sessions whose damaged audio was rebuilt from their linked journal
+    /// (#205): the manifest survived the power loss, the WAV did not.
+    pub repaired: Vec<String>,
     /// Journals with zero verified samples: kept in place, no session made.
     pub empty_journals: Vec<String>,
     /// Files that could not be parsed: `(name, reason)`. Kept in place.
@@ -671,10 +694,12 @@ pub struct RecoveryReport {
 }
 
 impl RecoveryReport {
-    /// Whether anything user-facing happened (sessions recovered or files
-    /// that could not be read).
+    /// Whether anything user-facing happened (sessions recovered, damaged
+    /// audio rebuilt, or files that could not be read).
     pub fn has_findings(&self) -> bool {
-        !self.recovered.is_empty() || !self.unreadable.is_empty()
+        !self.recovered.is_empty()
+            || !self.repaired.is_empty()
+            || !self.unreadable.is_empty()
     }
 
     /// One-line summary for the app's error banner.
@@ -685,6 +710,13 @@ impl RecoveryReport {
                 "recovered {} interrupted recording{} into history",
                 self.recovered.len(),
                 if self.recovered.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.repaired.is_empty() {
+            parts.push(format!(
+                "rebuilt the audio of {} damaged recording{} from their capture journals",
+                self.repaired.len(),
+                if self.repaired.len() == 1 { "" } else { "s" }
             ));
         }
         if !self.unreadable.is_empty() {
@@ -722,13 +754,57 @@ fn recovery_note(parsed: &ParsedJournal) -> String {
     }
 }
 
+/// The note a #205 repair leaves on a session whose rebuilt audio is not
+/// the whole take (the journal itself was torn or never finalized); a
+/// fully finalized journal rebuilds byte-equivalent audio and repairs
+/// silently.
+fn repair_note(parsed: &ParsedJournal) -> String {
+    let seconds = parsed.samples.len() as f64 / parsed.sample_rate as f64;
+    let gap = if parsed.torn_tail_bytes > 0 {
+        format!(
+            ", discarding an unfinished journal tail of {} bytes",
+            parsed.torn_tail_bytes
+        )
+    } else {
+        ", up to the journal's last verified boundary".to_string()
+    };
+    format!(
+        "The stored recording was damaged and was rebuilt from the capture journal: \
+         {seconds:.1}s of checksum-verified audio were restored{gap}."
+    )
+}
+
 /// Startup scan (§4 recovery, journal-only): every `*.sj` under
 /// `journals_dir` that is not already linked to a saved session (manifest
 /// `journal_id`) and not tombstoned under `journals/deleted/` is recovered —
-/// its verified samples become a new session with status `interrupted`,
+/// its verified samples become a session with status `interrupted`,
 /// duration computed from the verified sample count at the device rate, and
 /// the journal linkage recorded. Journal files are never modified or deleted
 /// by recovery; they remain as source evidence.
+///
+/// Two dedup/repair rules beyond the plain linkage check:
+///
+/// - **Damaged-audio repair (#205).** A journal whose linked session's
+///   manifest parses while its WAV fails verification is the power-loss
+///   shape: the manifest rename outlived the audio blocks. The linkage is
+///   consulted *backwards* — the journal's verified samples rebuild that
+///   session's WAV in place ([`FileSessionStore::repair_session_audio`])
+///   instead of the audio being declared gone. This is repair of the saved
+///   take, not a second recovery: no new session is created, and the
+///   manifest's own metadata survives untouched. A torn journal repairs to
+///   its verified prefix and marks the session interrupted with the gap
+///   note; a finalized journal rebuilds byte-equivalent audio silently.
+///
+/// - **Orphan healing (#215).** A crash inside
+///   [`FileSessionStore::create_with_journal`] between the WAV write and
+///   the manifest publish leaves a WAV-only orphan directory named after
+///   the journal (the session id of a journal-linked take is its journal
+///   id). An unlinked journal with such a directory is healed *into* it —
+///   audio rebuilt from the verified samples, manifest published with the
+///   linkage — so the take appears once, not as an orphan session plus a
+///   recovered session. A directory the same power loss damaged past
+///   classification (the WAV torn before its fsync completed) is healed
+///   the same way: the name is the linkage, the journal the bytes.
 ///
 /// A tombstoned id is skipped permanently (R21): the user confirmed its
 /// deletion once, so even a journal file that later reappears live under
@@ -758,6 +834,9 @@ pub fn recover_interrupted_takes(
     // Metadata-only linkage scan: reads manifests, never loads audio (the
     // G02 direction; `list()` would eagerly load every WAV).
     let linked = store.journal_ids()?;
+    // The #205 shape, metadata-only apart from bounded header reads:
+    // journal id -> session ids whose WAV failed verification.
+    let mut damaged_audio = store.damaged_audio_journal_links()?;
     // Deliberately-deleted ids outrank everything: check the tombstones
     // before deciding a journal is an interrupted take.
     let tombstoned = tombstoned_journal_ids(journals_dir);
@@ -779,8 +858,67 @@ pub fn recover_interrupted_takes(
             // file itself. Never resurrect a confirmed deletion.
             continue;
         }
+        // The id becomes a session-directory name (#215), so it must obey
+        // the same path-safety rules before anything recovers into it.
+        if !crate::storage::is_safe_path_component(&id) {
+            report.unreadable.push((
+                id,
+                "journal id is not a safe path component".to_string(),
+            ));
+            continue;
+        }
         if linked.contains(&id) {
-            // Already saved once — never recover a take twice.
+            // Already saved once — never recover a take twice. The one
+            // exception is #205: the linked session's audio is damaged
+            // while this journal still holds the take's verified samples.
+            // Rebuilding that audio is repair of the saved take, not a
+            // second recovery.
+            if let Some(session_ids) = damaged_audio.remove(&id) {
+                let parsed = match read_journal(&path) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        report.unreadable.push((
+                            id,
+                            format!("linked session needs audio repair, journal: {err}"),
+                        ));
+                        continue;
+                    }
+                };
+                if parsed.samples.is_empty() || parsed.sample_rate == 0 {
+                    // Nothing verified to rebuild from: the damaged record
+                    // stays flagged by the listing, the journal stays as
+                    // evidence.
+                    continue;
+                }
+                let torn = parsed.torn_tail_bytes > 0 || !parsed.finalized;
+                let note = torn.then(|| repair_note(&parsed));
+                let rate = parsed.sample_rate;
+                let wav = match encode_wav_16k(&PcmAudio {
+                    samples: parsed.samples,
+                    sample_rate: rate,
+                    channels: 1,
+                }) {
+                    Ok(wav) => wav,
+                    Err(err) => {
+                        report.unreadable.push((
+                            id,
+                            format!("could not encode the repair audio: {err}"),
+                        ));
+                        continue;
+                    }
+                };
+                for session_id in session_ids {
+                    store.repair_session_audio(&session_id, &wav)?;
+                    if let Some(note) = note.as_deref() {
+                        // A torn journal rebuilt only a verified prefix:
+                        // say so on the session (idempotent on rerun only
+                        // while the WAV stays damaged; the note is
+                        // best-effort after the audio itself is durable).
+                        store.mark_interrupted(&session_id, note)?;
+                    }
+                    report.repaired.push(session_id);
+                }
+            }
             continue;
         }
 
@@ -808,12 +946,12 @@ pub fn recover_interrupted_takes(
         // from the resampled WAV length, not from wall clock.
         let duration_ms = parsed.samples.len() as f64 * 1000.0 / parsed.sample_rate as f64;
         let note = recovery_note(&parsed);
-        let pcm = PcmAudio {
+        let rate = parsed.sample_rate;
+        let wav = match encode_wav_16k(&PcmAudio {
             samples: parsed.samples,
-            sample_rate: parsed.sample_rate,
+            sample_rate: rate,
             channels: 1,
-        };
-        let wav = match encode_wav_16k(&pcm) {
+        }) {
             Ok(wav) => wav,
             Err(err) => {
                 report.unreadable.push((
@@ -824,9 +962,12 @@ pub fn recover_interrupted_takes(
             }
         };
 
-        let session = store.create_with_journal(wav, Some(duration_ms), Some(&id))?;
-        let session = store.mark_interrupted(&session.id, note)?;
-        report.recovered.push(session);
+        match store.save_journal_recovery(&id, wav, Some(duration_ms), &note)? {
+            RecoverySave::Created(session) | RecoverySave::Healed(session) => {
+                report.recovered.push(session);
+            }
+            RecoverySave::Occupied(reason) => report.unreadable.push((id, reason)),
+        }
     }
 
     Ok(report)
@@ -1688,6 +1829,464 @@ mod tests {
         assert!(
             !journals_dir.path().join(DELETED_DIR).exists(),
             "nothing under the journals root was touched"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #205 / #215: damaged-audio repair and crash-window dedup.
+    // -----------------------------------------------------------------
+
+    /// #205: a session whose manifest survived a power loss while its WAV
+    /// did not is repaired from its linked journal — the audio rebuilt in
+    /// place, the metadata untouched, no second session created. A
+    /// finalized journal rebuilds byte-equivalent audio and repairs
+    /// silently (status and transcript survive as they were).
+    #[test]
+    fn recovery_rebuilds_a_damaged_sessions_wav_from_its_linked_journal() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let samples = ramp(2_400, 0); // 100 ms at 24 kHz
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        let wav = encode_wav_16k(&PcmAudio {
+            samples: samples.clone(),
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        let session = store
+            .create_with_journal(wav.clone(), Some(100.0), Some(&journal_id))
+            .expect("create linked session");
+        store.mark_attempt(&session.id).expect("mark attempt");
+        store
+            .save_transcript(
+                &session.id,
+                crate::storage::TranscriptionResult {
+                    text: "the transcript lives in the manifest".to_string(),
+                    segments: Vec::new(),
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .expect("save transcript");
+
+        // The power loss: the manifest rename proved durable, the WAV's
+        // data blocks did not.
+        std::fs::remove_file(store_dir.path().join(&session.id).join("recording.wav"))
+            .expect("wav lost");
+        let listed = store.list_records().expect("listing");
+        assert!(
+            listed.iter().any(|record| matches!(
+                record,
+                crate::storage::ListedRecord::Damaged(_)
+            )),
+            "the record classifies as damaged before recovery"
+        );
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert_eq!(report.repaired, [session.id.as_str()], "repaired, not recovered");
+        assert!(report.recovered.is_empty(), "no second session for the take");
+        assert!(report.has_findings());
+        assert!(
+            report.summary().contains("rebuilt the audio of 1 damaged recording"),
+            "{}",
+            report.summary()
+        );
+
+        // The session is whole again: byte-equivalent audio, and the
+        // manifest's own metadata untouched by the repair.
+        let restored = store.get(&session.id).expect("get").expect("present");
+        assert_eq!(restored.wav.as_slice(), wav.as_slice());
+        assert_eq!(restored.status, crate::storage::SessionStatus::Transcribed);
+        assert_eq!(
+            restored.transcript.as_ref().expect("transcript").text,
+            "the transcript lives in the manifest"
+        );
+        assert!(restored.last_error.is_none(), "a finalized journal repairs silently");
+        let listed = store.list_records().expect("listing");
+        assert!(
+            !listed.iter().any(|record| matches!(
+                record,
+                crate::storage::ListedRecord::Damaged(_)
+            )),
+            "the record is readable again"
+        );
+
+        // Idempotent: the WAV now verifies, so nothing is flagged or done.
+        let rerun = recover_interrupted_takes(&store, journals_dir.path()).expect("rerun");
+        assert!(rerun.repaired.is_empty() && rerun.recovered.is_empty());
+        assert!(!rerun.has_findings());
+    }
+
+    /// #205 with a torn journal: the repair restores the verified prefix
+    /// and marks the session interrupted with a note saying exactly what
+    /// was rebuilt — never a silent truncation.
+    #[test]
+    fn a_torn_linked_journal_repairs_to_the_verified_prefix_and_notes_the_gap() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let confirmed = ramp(1_600, 0); // verified by the boundary
+        let mut writer = writer_in(&journals_dir, 16_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&confirmed).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer
+            .append_frames(&ramp(400, 1_600)) // never boundary-confirmed
+            .expect("append tail");
+        drop(writer); // no trailer
+
+        let full = [confirmed.clone(), ramp(400, 1_600)].concat();
+        let wav = encode_wav_16k(&PcmAudio {
+            samples: full,
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .expect("encode the whole take");
+        let session = store
+            .create_with_journal(wav, Some(125.0), Some(&journal_id))
+            .expect("create linked session");
+
+        // The WAV is torn past recovery by the same crash.
+        std::fs::write(
+            store_dir.path().join(&session.id).join("recording.wav"),
+            b"torn beyond the header",
+        )
+        .expect("tear the wav");
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert_eq!(report.repaired, [session.id.as_str()]);
+        assert!(report.recovered.is_empty());
+
+        let restored = store.get(&session.id).expect("get").expect("present");
+        assert_eq!(
+            restored.status,
+            crate::storage::SessionStatus::Interrupted,
+            "a torn repair never rests as a healthy session"
+        );
+        let note = restored.last_error.as_deref().expect("repair note");
+        assert!(note.contains("rebuilt"), "{note}");
+        assert!(note.contains("verified"), "{note}");
+        let expected = encode_wav_16k(&PcmAudio {
+            samples: confirmed,
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .expect("encode verified prefix");
+        assert_eq!(
+            restored.wav.as_slice(),
+            expected.as_slice(),
+            "the rebuilt audio is exactly the verified prefix"
+        );
+    }
+
+    /// #215 part 2: a crash between the WAV write and the manifest
+    /// publish leaves a WAV-only orphan directory named after the journal
+    /// AND a live unlinked journal. Recovery heals the orphan — one
+    /// session, not an orphan plus a recovered duplicate.
+    #[test]
+    fn a_journal_crashing_before_the_manifest_heals_the_orphan_not_a_duplicate() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let samples = ramp(2_400, 0); // 100 ms at 24 kHz
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        // Simulate the crash window: the session directory (named after
+        // the journal, as create_with_journal now does) holds the WAV, the
+        // manifest was never written.
+        let wav = encode_wav_16k(&PcmAudio {
+            samples: samples.clone(),
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        let orphan_dir = store_dir.path().join(&journal_id);
+        std::fs::create_dir_all(&orphan_dir).expect("session dir");
+        std::fs::write(orphan_dir.join("recording.wav"), &wav).expect("wav written");
+        assert!(
+            !orphan_dir.join("manifest.json").exists(),
+            "the crash landed between the two writes"
+        );
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert_eq!(report.recovered.len(), 1, "the take appears exactly once");
+        assert!(report.repaired.is_empty());
+        let session = &report.recovered[0];
+        assert_eq!(session.id, journal_id, "the orphan itself is the session");
+        assert_eq!(session.journal_id.as_deref(), Some(journal_id.as_str()));
+        assert_eq!(session.status, crate::storage::SessionStatus::Interrupted);
+        assert!(session.last_error.as_deref().expect("note").contains("recovered"));
+
+        // Exactly one session directory exists — no uuid-named twin.
+        let session_dirs: Vec<String> = std::fs::read_dir(store_dir.path())
+            .expect("read store root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(session_dirs, [journal_id.as_str()]);
+
+        // The healed record is a first-class linked session from here on.
+        let healed = store.get(&journal_id).expect("get").expect("present");
+        assert_eq!(healed.status, crate::storage::SessionStatus::Interrupted);
+        assert_eq!(healed.wav.as_slice(), wav.as_slice());
+
+        // Idempotent: linked now.
+        let rerun = recover_interrupted_takes(&store, journals_dir.path()).expect("rerun");
+        assert!(rerun.recovered.is_empty() && rerun.repaired.is_empty());
+    }
+
+    /// #215 part 2 with a torn orphan WAV (the crash tore the audio
+    /// write): healing rebuilds the full verified prefix, not the torn
+    /// bytes the orphan scan would have clamped to.
+    #[test]
+    fn healing_rebuilds_a_torn_orphan_wav_from_the_full_verified_prefix() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let samples = ramp(2_400, 0);
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        let full = encode_wav_16k(&PcmAudio {
+            samples,
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        // The torn write: half the samples reached the disk.
+        let mut torn = full.clone();
+        torn.truncate(44 + (torn.len() - 44) / 2);
+
+        let orphan_dir = store_dir.path().join(&journal_id);
+        std::fs::create_dir_all(&orphan_dir).expect("session dir");
+        std::fs::write(orphan_dir.join("recording.wav"), &torn).expect("torn wav");
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert_eq!(report.recovered.len(), 1);
+
+        assert_eq!(
+            std::fs::read(orphan_dir.join("recording.wav")).expect("wav"),
+            full,
+            "the heal rewrites the torn audio with the journal's full verified bytes"
+        );
+    }
+
+    /// #215 part 2 with the WAV torn past verification (the power loss
+    /// struck before the audio fsync completed, so the manifest was never
+    /// attempted): the orphan directory classifies as Damaged, and the
+    /// journal still heals it — one session, not a damaged record plus a
+    /// recovered duplicate.
+    #[test]
+    fn a_journal_heals_a_directory_damaged_past_classification() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let samples = ramp(2_400, 0);
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        let full = encode_wav_16k(&PcmAudio {
+            samples,
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+
+        // The directory exists but nothing in it verifies: no manifest,
+        // and a WAV with no header at all.
+        let orphan_dir = store_dir.path().join(&journal_id);
+        std::fs::create_dir_all(&orphan_dir).expect("session dir");
+        std::fs::write(orphan_dir.join("recording.wav"), b"garbage").expect("torn wav");
+        let listed = store.list_records().expect("listing");
+        assert!(
+            listed.iter().any(|record| matches!(
+                record,
+                crate::storage::ListedRecord::Damaged(_)
+            )),
+            "the record classifies as damaged before recovery"
+        );
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert_eq!(report.recovered.len(), 1, "the take appears exactly once");
+        assert!(report.unreadable.is_empty(), "{}", report.summary());
+        let session = &report.recovered[0];
+        assert_eq!(session.id, journal_id, "the damaged directory is the session");
+
+        assert_eq!(
+            std::fs::read(orphan_dir.join("recording.wav")).expect("wav"),
+            full,
+            "the heal rebuilds the destroyed audio from the journal bytes"
+        );
+        // And the record reads back as a first-class session.
+        let healed = store.get(&journal_id).expect("get").expect("present");
+        assert_eq!(healed.wav.as_slice(), full.as_slice());
+        assert_eq!(healed.journal_id.as_deref(), Some(journal_id.as_str()));
+
+        // Idempotent: linked now, audio whole.
+        let rerun = recover_interrupted_takes(&store, journals_dir.path()).expect("rerun");
+        assert!(rerun.recovered.is_empty() && rerun.repaired.is_empty());
+    }
+
+    /// #215: a session directory already occupying the journal's name is
+    /// reported and the journal kept in place — never a second session
+    /// beside whatever holds the name.
+    #[test]
+    fn an_occupied_session_name_is_reported_not_duplicated() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        // The journal whose session name is taken.
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&ramp(1_200, 0)).expect("append");
+        writer.finalize().expect("finalize");
+        drop(writer);
+
+        // A hand-crafted occupant: a valid manifest linking a *different*
+        // journal, under this journal's name.
+        let occupant_wav = encode_wav_16k(&PcmAudio {
+            samples: ramp(500, 9_000),
+            sample_rate: 24_000,
+            channels: 1,
+        })
+        .expect("encode");
+        let dir = store_dir.path().join(&journal_id);
+        std::fs::create_dir_all(&dir).expect("occupant dir");
+        std::fs::write(dir.join("recording.wav"), &occupant_wav).expect("wav");
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"schemaVersion":1,"id":"{id}","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z","status":"captured","audioFile":"recording.wav","attemptCount":0,"transcriptHistory":[],"journalId":"j_someone_else"}}"#,
+                id = journal_id
+            ),
+        )
+        .expect("manifest");
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(report.recovered.is_empty(), "no duplicate session");
+        assert_eq!(report.unreadable.len(), 1);
+        let (id, reason) = &report.unreadable[0];
+        assert_eq!(id, &journal_id);
+        assert!(reason.contains("already exists"), "{reason}");
+
+        // The journal is kept as evidence and the occupant untouched.
+        assert!(
+            journals_dir.path().join(format!("{journal_id}.sj")).exists(),
+            "the journal stays in place"
+        );
+        let occupant = store.get(&journal_id).expect("get").expect("occupant intact");
+        assert_eq!(occupant.status, crate::storage::SessionStatus::Captured);
+        assert_eq!(occupant.journal_id.as_deref(), Some("j_someone_else"));
+    }
+
+    /// #215: a journal whose id is not a safe path component would name a
+    /// session directory outside the store; it is reported and skipped
+    /// instead of recovered.
+    #[test]
+    fn unsafe_journal_stems_are_reported_and_skipped() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        std::fs::write(journals_dir.path().join("bad\\name.sj"), b"anything")
+            .expect("journal with an unsafe stem");
+
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(report.recovered.is_empty());
+        assert_eq!(report.unreadable.len(), 1);
+        let (id, reason) = &report.unreadable[0];
+        assert_eq!(id, "bad\\name");
+        assert!(reason.contains("safe path component"), "{reason}");
+        assert!(
+            std::fs::read_dir(store_dir.path())
+                .expect("store root")
+                .filter_map(|entry| entry.ok())
+                .count()
+                == 0,
+            "nothing was created in the store"
+        );
+    }
+
+    /// #215: deleting an unhealed crash-window orphan (WAV but no
+    /// manifest, so no linkage to read) still tombstones the journal
+    /// named after it — the directory name *is* the linkage — so the next
+    /// startup cannot resurrect the take the user watched being deleted.
+    #[test]
+    fn deleting_an_unhealed_orphan_tombstones_its_journal_by_name() {
+        let store_dir = TempDir::new().expect("store tempdir");
+        let store = FileSessionStore::open(store_dir.path()).expect("open store");
+        let journals_dir = TempDir::new().expect("journals tempdir");
+
+        let mut writer = writer_in(&journals_dir, 24_000);
+        let journal_id = writer.id().to_string();
+        writer.append_frames(&ramp(1_200, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        drop(writer);
+
+        let orphan_dir = store_dir.path().join(&journal_id);
+        std::fs::create_dir_all(&orphan_dir).expect("session dir");
+        std::fs::write(
+            orphan_dir.join("recording.wav"),
+            encode_wav_16k(&PcmAudio {
+                samples: ramp(1_200, 0),
+                sample_rate: 24_000,
+                channels: 1,
+            })
+            .expect("encode"),
+        )
+        .expect("orphan wav");
+
+        delete_session_and_journal(&store, journals_dir.path(), &journal_id)
+            .expect("confirmed delete");
+
+        assert!(!orphan_dir.exists(), "the orphan is gone");
+        assert!(
+            !journals_dir.path().join(format!("{journal_id}.sj")).exists(),
+            "the journal is no longer live"
+        );
+        assert!(
+            journals_dir
+                .path()
+                .join(DELETED_DIR)
+                .join(format!("{journal_id}.sj"))
+                .exists(),
+            "the journal was tombstoned by name"
+        );
+        let report =
+            recover_interrupted_takes(&store, journals_dir.path()).expect("recovery");
+        assert!(
+            !report.has_findings(),
+            "the deleted take must stay deleted: {}",
+            report.summary()
         );
     }
 }
