@@ -828,13 +828,14 @@
     "E28"
    ],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "implemented",
    "owner": "impl-agent-34",
-   "branch": "program/wave-a",
+   "branch": "feat/insights-225-phase2",
    "evidence": [
-    "coordinator-completed after agent rate-limit death: 287/287 (19 files incl. 3 insight suites, 58 tests), lint 0/0, tsc+fmt clean; oracle-semantics TS port + emitter wiring + usage/quality views"
+    "coordinator-completed after agent rate-limit death: 287/287 (19 files incl. 3 insight suites, 58 tests), lint 0/0, tsc+fmt clean; oracle-semantics TS port + emitter wiring + usage/quality views",
+    "phase 2 (issue #225, branch feat/insights-225-phase2): consent-gated recurring-phrase and vocabulary cards from a separate bounded content-derived term store (replaces per capture, tombstones on delete, purges on withdrawal, transcripts structurally unrepresentable), locally previewed redacted-by-default share cards with no network path, opt-in milestones/goal/streak, matched-period weekly recap; session deletion now emits the phase-1 capture_deleted tombstone and deletes term aggregates; vp desktop 342/342, full vp run -r test 515/515, lint 0/0, fmt+tsc clean"
    ],
-   "notes": "phase 1; Your Voice patterns (E29 part 2) + share cards + weekly recap polish remain; model-free (metrics from local events only); lint gate satisfied 4ffe6fd (56 errors -> 0)"
+   "notes": "phase 1 integrated via #195; phase 2 (E29-p2, issue #225) on feat/insights-225-phase2; model-free (metrics from local events only); INSIGHTS.md remainder: mounting the Insights view in the app shell, commonly-used-modes/time-of-day cards, optional local-model narrative"
   },
   {
    "id": "E30",
