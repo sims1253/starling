@@ -31,6 +31,7 @@ export interface StarlingClientOptions {
   readonly auth?: BearerAuth | (() => BearerAuth | Promise<BearerAuth>);
   readonly headers?: StringHeaders;
   readonly timeoutMs?: number;
+  readonly maxResponseBytes?: number;
   readonly fetch?: typeof globalThis.fetch;
 }
 
@@ -144,6 +145,23 @@ export class DictationProtocolError extends Schema.TaggedError<DictationProtocol
   }
 }
 
+/** Response bodies are refused past this size (issue #235). Health and
+ * transcription payloads are small JSON documents (a transcript is text),
+ * so 10 MiB is orders of magnitude above anything a real backend returns
+ * while still bounding what a broken or hostile server can make the
+ * client buffer. Override per client with `maxResponseBytes`.
+ */
+const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+export class DictationResponseTooLargeError extends Schema.TaggedError<DictationResponseTooLargeError>()(
+  "DictationResponseTooLargeError",
+  { message: Schema.String, limitBytes: NonNegativeFinite },
+) {
+  constructor(limitBytes: number) {
+    super({ message: `dictation response body exceeded the ${limitBytes} byte limit`, limitBytes });
+  }
+}
+
 export class DictationTimeoutError extends Schema.TaggedError<DictationTimeoutError>()(
   "DictationTimeoutError",
   { message: Schema.String, timeoutMs: NonNegativeFinite },
@@ -176,6 +194,7 @@ export type DictationClientError =
   | DictationHttpError
   | DictationInputError
   | DictationProtocolError
+  | DictationResponseTooLargeError
   | DictationTimeoutError
   | DictationTransportError;
 
@@ -308,6 +327,40 @@ function protocolError(label: string): DictationProtocolError {
   return new DictationProtocolError(`dictation server returned invalid ${label} JSON`);
 }
 
+/** Reads a response body under a hard cap (issue #235). The stream is
+ * consumed incrementally and cancelled the moment the cap is crossed, so
+ * the client never buffers more than the limit plus one chunk — a broken
+ * or hostile server cannot balloon memory — and the failure is the
+ * distinct `DictationResponseTooLargeError`, never a silent truncation.
+ * The decoder runs in streaming mode, so multi-byte UTF-8 sequences
+ * split across chunks survive.
+ */
+async function readBodyCapped(response: Response, limitBytes: number): Promise<string> {
+  const body = response.body;
+
+  if (body === null) return "";
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+
+    if (done) return text + decoder.decode();
+
+    received += value.byteLength;
+
+    if (received > limitBytes) {
+      await reader.cancel();
+      throw new DictationResponseTooLargeError(limitBytes);
+    }
+
+    text += decoder.decode(value, { stream: true });
+  }
+}
+
 const decodeTranscriptionResponse = Schema.decodeEffect(
   Schema.fromJsonString(TranscriptionResponseSchema),
 );
@@ -426,6 +479,7 @@ export class StarlingClient {
   private readonly endpoint: string;
   private readonly fetcher: typeof globalThis.fetch;
   private readonly headers: StringHeaders;
+  private readonly maxResponseBytes: number;
   private readonly model: string;
   private readonly timeoutMs: number;
 
@@ -439,9 +493,14 @@ export class StarlingClient {
     this.auth = options.auth;
     this.headers = options.headers ?? {};
     this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
 
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs < 0) {
       throw new TypeError("timeoutMs must be a finite non-negative number");
+    }
+
+    if (!Number.isFinite(this.maxResponseBytes) || this.maxResponseBytes <= 0) {
+      throw new TypeError("maxResponseBytes must be a finite positive number");
     }
 
     const fetcher = options.fetch ?? globalThis.fetch;
@@ -470,6 +529,9 @@ export class StarlingClient {
         );
       }
 
+      // The prepared Blob is appended by reference (issue #235): the
+      // client never copies the WAV into a second buffer — the platform
+      // serializes the multipart body incrementally while sending.
       const form = new FormData();
       form.append("file", prepared.blob, "recording.wav");
 
@@ -589,7 +651,7 @@ export class StarlingClient {
         // and the iOS client: audio and credentials must never silently
         // follow a server redirect to an origin the user did not configure.
         const response = await this.fetcher(url, { ...init, signal, redirect: "manual" });
-        const body = await response.text();
+        const body = await readBodyCapped(response, this.maxResponseBytes);
 
         return {
           body,
@@ -600,7 +662,12 @@ export class StarlingClient {
           statusText: response.statusText,
         } satisfies BufferedResponse;
       },
-      catch: (cause) => new DictationTransportError(describeCause(cause)),
+      catch: (cause) =>
+        // The size cap is a first-class failure, not a transport fault:
+        // keep it distinct on its way out of the promise boundary.
+        cause instanceof DictationResponseTooLargeError
+          ? cause
+          : new DictationTransportError(describeCause(cause)),
     }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
 
     return withTimeout(request, this.timeoutMs);

@@ -65,6 +65,11 @@ trimmed. Timeouts: default 180s, allowed 1ms..=600s. Redirects are blocked
   `Protocol` errors.
 - request id rules: non-empty, no `\r`/`\n`, must not start with `#`.
 - audio payload limits: >= 44 bytes and <= 256 MiB (`Input` error otherwise).
+- memory bounds (issue #235): `transcribe` takes the WAV as the caller's shared
+  `Arc<Vec<u8>>` and uploads it zero-copy (content-length framing kept, multipart
+  via `Part::stream_with_length`); response bodies are capped at 10 MiB by default
+  (`with_max_response_bytes`), and a body past the cap is a distinct
+  `ResponseTooLarge(limit)` error, never a truncation.
 - HTTP error body detail extraction order: `{detail}` → `{error: string}` →
   `{error: {message}}` → `{message}`; else `Server returned {status}: {first 500 chars}`.
 

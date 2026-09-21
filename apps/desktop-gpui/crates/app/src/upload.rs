@@ -36,7 +36,9 @@ pub(crate) enum FailureClass {
 /// redirect proves something answered on the endpoint, and
 /// `Input`/`Protocol` failures never left this machine. `Cancelled` (the
 /// abort signal of issue #251) is local by construction — this upload
-/// path never passes a cancel token, so it cannot occur here.
+/// path never passes a cancel token, so it cannot occur here. An
+/// oversized response (issue #235) likewise proves the server answered —
+/// deterministically wrong — so it never prompts a probe.
 pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
     match err {
         ClientError::Transport(_) | ClientError::Timeout(_) => FailureClass::Transport,
@@ -44,7 +46,8 @@ pub(crate) fn failure_class(err: &ClientError) -> FailureClass {
         | ClientError::Cancelled
         | ClientError::Redirect(_)
         | ClientError::Http { .. }
-        | ClientError::Protocol(_) => FailureClass::Local,
+        | ClientError::Protocol(_)
+        | ClientError::ResponseTooLarge(_) => FailureClass::Local,
     }
 }
 
@@ -456,7 +459,10 @@ impl StarlingApp {
                         let id = id.clone();
                         cx.background_spawn(async move {
                             let client = StarlingClient::new(&endpoint, protocol, &model)?;
-                            client.transcribe(wav.as_slice(), &id)
+                            // The Arc clone is the upload buffer itself:
+                            // the client sends it zero-copy (issue #235),
+                            // so no second WAV exists for this request.
+                            client.transcribe(wav, &id)
                         })
                         .await
                     };
