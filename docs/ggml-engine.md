@@ -357,6 +357,19 @@ GPU/IGPU or a device named by `STARLING_GGML_DEVICE` (`CUDA0`, `Vulkan0`,
 Build from the repository root with `-DSTARLING_GGML_CUDA=ON`. Verified byte-exact and benchmarked
 on RTX 5090 (Blackwell, sm_120). See [performance](#performance-rtx-5090-bf16-b1-model-load-excluded).
 
+`ggml_backend_cuda_device_supports_op` rejects `GGML_OP_UNARY` whose `src0` is
+not fully contiguous (`ggml-cuda.cu`, UNARY case: `ggml_is_contiguous(op->src[0])`;
+the plain unary kernel is flat-indexed and asserts the same). The check is
+architecture-independent — a layout gate, not an sm_120 kernel-coverage gap —
+so graph builders must materialize strided views with `ggml_cont` before a
+unary op (the conformer GLU gate half and the TDT LSTM gates do; MUL consumes
+row-strided operands fine). A captured `ReplayGraph` whose primary accelerator
+rejects any node fails at graph build with an engine error enumerating every
+rejected node (`STARLING_SCHED_DEBUG=1` echoes them to stderr): captured
+replays upload inputs through the primary backend, which cannot address
+sched-allocated buffers. One-shot graphs fall back to `ggml_backend_sched`
+safely and are unaffected.
+
 ### CPU
 
 `STARLING_GGML_DEVICE=cpu` forces the CPU backend, which is compiled into every
