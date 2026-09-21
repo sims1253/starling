@@ -22,7 +22,9 @@
 //!   ([`crate::journal`]) with fsynced boundaries: the journal is the
 //!   authoritative retained audio, the in-memory accumulation a
 //!   convenience. Only samples covered by an fsynced boundary count as
-//!   acknowledged — see [`RecorderHandle::acknowledged_samples`].
+//!   acknowledged — see [`RecorderHandle::acknowledged_samples`]. The
+//!   journal append and its fsync run with the consumer lock released, so
+//!   accessor polls and the device error callback never wait on storage.
 //! - `stop` is an explicit handshake (R09): declare
 //!   `finalSampleIndex = written_seq`, drop the CPAL stream, wait (bounded)
 //!   for `callback_alive == false`, join the writer, then drain what is
@@ -556,21 +558,37 @@ fn panic_message(join_err: Box<dyn std::any::Any + Send>) -> String {
 /// journal with fsynced boundaries (I1 phase 2), and exits within one
 /// interval of `stopping`, finalizing the journal (trailer + fsyncs) on the
 /// way out.
+///
+/// Locking (#203): the consumer lock is held only for in-memory work — the
+/// ring drain, the unjournaled-span snapshot, the watermark advance, the
+/// fault/state commits. The journal append and its fsync run with the lock
+/// released, so accessors ([`RecorderHandle::latest_window`], polled by the
+/// render thread every animation frame) and the CPAL error callback
+/// ([`Shared::record_stream_error`]) never wait on storage. The journal
+/// writer is owned solely by this task, so unlocking around its I/O
+/// introduces no journal-side race.
 fn writer_loop<S: JournalSink>(shared: Arc<Shared>, mut journal: Option<JournalWriter<S>>) {
-    let mut guard = shared.lock_consumer();
     loop {
-        shared.drain_ring(&mut guard);
-        journal_boundary_step(&shared, &mut guard, &mut journal);
-        if shared.stopping.load(Ordering::Acquire) {
+        {
+            let mut guard = shared.lock_consumer();
             shared.drain_ring(&mut guard);
-            journal_finalize_step(&shared, &mut guard, &mut journal);
+        }
+        journal_boundary_step(&shared, &mut journal);
+        if shared.stopping.load(Ordering::Acquire) {
+            {
+                let mut guard = shared.lock_consumer();
+                shared.drain_ring(&mut guard);
+            }
+            journal_finalize_step(&shared, &mut journal);
             return;
         }
-        guard = shared
+        // Sleep one poll interval (or until `stop` wakes us for the final
+        // drain), holding no lock while waiting.
+        let (guard, _timed_out) = shared
             .wake
-            .wait_timeout(guard, WRITER_POLL_INTERVAL)
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .0;
+            .wait_timeout(shared.lock_consumer(), WRITER_POLL_INTERVAL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(guard);
     }
 }
 
@@ -583,24 +601,59 @@ fn writer_loop<S: JournalSink>(shared: Arc<Shared>, mut journal: Option<JournalW
 /// whole take; only the durability claim stops advancing). What remains for
 /// a full degrade-and-recover: re-attaching journaling after the fault and
 /// bounding the memory accumulation when it never comes back (I2/I3).
+///
+/// Locking (#203): the unjournaled span is copied out under the consumer
+/// lock, the append and the boundary fsync run with the lock released, and
+/// the lock is re-acquired only to advance the watermark — by exactly the
+/// snapshot's span, never to the (possibly larger) current accumulation,
+/// so samples produced while the lock was released cannot be skipped: they
+/// simply form the next tick's unjournaled span. `durable_ack` is published
+/// only by this task, only after a boundary fsync returned, so it stays
+/// monotonic; on a fault it is never stored again (frozen at the last good
+/// boundary).
 fn journal_boundary_step<S: JournalSink>(
     shared: &Shared,
-    guard: &mut ConsumerState,
     journal: &mut Option<JournalWriter<S>>,
 ) {
+    if journal.is_none() {
+        return;
+    }
+
+    // Snapshot of the unjournaled span: `(start index, samples)`. Immutable
+    // once copied — the append and fsync below work on this copy, so a
+    // concurrent accessor draining more ring samples into `state.samples`
+    // cannot change what this append writes or what the watermark advance
+    // covers.
+    let snapshot: Option<(usize, Vec<f32>)> = {
+        let guard = shared.lock_consumer();
+        (guard.journaled < guard.samples.len()).then(|| {
+            let from = guard.journaled;
+            (from, guard.samples[from..].to_vec())
+        })
+    };
+
     let mut fault: Option<std::io::Error> = None;
     let mut acknowledged: Option<u64> = None;
 
-    if let Some(writer) = journal.as_mut() {
-        let unjournaled = guard.samples.len().saturating_sub(guard.journaled);
-        if unjournaled > 0 {
-            let journaled_from = guard.journaled;
-            match writer.append_frames(&guard.samples[journaled_from..]) {
-                Ok(()) => guard.journaled = guard.samples.len(),
-                Err(err) => fault = Some(err),
+    if let Some((journaled_from, samples)) = snapshot {
+        let writer = journal.as_mut().expect("journal presence checked above");
+        match writer.append_frames(&samples) {
+            Ok(()) => {
+                // Re-acquire and advance the watermark by exactly the
+                // snapshot's span. `journaled` is written only by this task,
+                // so it is still `journaled_from`; `samples.len()` at
+                // snapshot time is ≤ the current accumulation, keeping
+                // `journaled <= samples.len()` invariant.
+                let mut guard = shared.lock_consumer();
+                guard.journaled = journaled_from + samples.len();
             }
+            Err(err) => fault = Some(err),
         }
-        if fault.is_none() && writer.boundary_due() {
+    }
+
+    if fault.is_none() {
+        let writer = journal.as_mut().expect("journal presence checked above");
+        if writer.boundary_due() {
             match writer.write_boundary() {
                 Ok(acknowledged_samples) => acknowledged = Some(acknowledged_samples),
                 Err(err) => fault = Some(err),
@@ -609,14 +662,18 @@ fn journal_boundary_step<S: JournalSink>(
     }
 
     if let Some(acknowledged_samples) = acknowledged {
+        // Monotonic: only this task stores, and only with the journal
+        // writer's cumulative count after a successful fsync.
         shared.durable_ack.store(acknowledged_samples, Ordering::Release);
     }
     if let Some(err) = fault {
         let frozen = shared.durable_ack.load(Ordering::Acquire);
+        let mut guard = shared.lock_consumer();
         guard.journal_fault = Some(format!(
             "The capture journal failed: {err}. Recording continues, but acknowledged \
              samples are frozen at {frozen} — newly captured audio is not being made durable."
         ));
+        drop(guard);
         *journal = None;
     }
 }
@@ -627,34 +684,45 @@ fn journal_boundary_step<S: JournalSink>(
 /// the journal trailer-less — startup recovery then treats it as an
 /// interrupted take at its last valid boundary, so no acknowledged audio is
 /// lost; the fault is surfaced through the capture-error slot.
+///
+/// Locking (#203): like the boundary step, the final append and the
+/// trailer's fsyncs run with the consumer lock released; the watermark and
+/// `journal_finalized` commits re-acquire it.
 fn journal_finalize_step<S: JournalSink>(
     shared: &Shared,
-    guard: &mut ConsumerState,
     journal: &mut Option<JournalWriter<S>>,
 ) {
     let Some(mut writer) = journal.take() else {
         return;
     };
-    let unjournaled = guard.samples.len().saturating_sub(guard.journaled);
-    if unjournaled > 0 {
-        let journaled_from = guard.journaled;
-        if let Err(err) = writer.append_frames(&guard.samples[journaled_from..]) {
-            guard.journal_fault = Some(format!(
-                "The capture journal failed while writing the final samples: {err}. The take \
-                 is intact in memory; the journal stays as an interrupted source."
-            ));
-            return;
-        }
-        guard.journaled = guard.samples.len();
+    // Snapshot under the lock; append + fsync outside it.
+    let (journaled_from, tail) = {
+        let guard = shared.lock_consumer();
+        (guard.journaled, guard.samples[guard.journaled..].to_vec())
+    };
+
+    if let Err(err) = writer.append_frames(&tail) {
+        let mut guard = shared.lock_consumer();
+        guard.journal_fault = Some(format!(
+            "The capture journal failed while writing the final samples: {err}. The take \
+             is intact in memory; the journal stays as an interrupted source."
+        ));
+        return;
+    }
+    {
+        let mut guard = shared.lock_consumer();
+        guard.journaled = journaled_from + tail.len();
     }
     match writer.finalize() {
         Ok(acknowledged_samples) => {
             shared
                 .durable_ack
                 .store(acknowledged_samples, Ordering::Release);
+            let mut guard = shared.lock_consumer();
             guard.journal_finalized = true;
         }
         Err(err) => {
+            let mut guard = shared.lock_consumer();
             guard.journal_fault = Some(format!(
                 "The capture journal could not be finalized: {err}. The take is intact in \
                  memory; the journal stays as an interrupted source and will be recovered to \
@@ -2075,6 +2143,114 @@ mod tests {
         assert!(parsed.finalized);
         assert_eq!(parsed.samples, expected, "journal round-trips byte-exact");
         assert_eq!(parsed.torn_tail_bytes, 0);
+    }
+
+    /// A journal sink whose `sync` parks on a test-held gate: the writer
+    /// enters the fsync and cannot leave until the test (or a watchdog)
+    /// opens the gate. Appends succeed, so the boundary itself is written.
+    struct GatedSink {
+        in_sync: Arc<AtomicBool>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl JournalSink for GatedSink {
+        fn append(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            self.in_sync.store(true, Ordering::Release);
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().expect("gate lock");
+            while !*open {
+                open = cv.wait(open).expect("gate wait");
+            }
+            self.in_sync.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn sync_parent_dir(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn journal_fsync_in_flight_does_not_stall_the_metering_path() {
+        // #203: `latest_window` is polled by the UI render thread every
+        // animation frame while recording, and journal boundaries fsync at
+        // least every 250 ms — on slow storage, hundreds of ms. With the
+        // boundary fsync parked here mid-flight, the accessor must complete
+        // without waiting on the consumer lock; the old writer loop held
+        // that lock across append + fsync, janking the render thread every
+        // boundary.
+        let in_sync = Arc::new(AtomicBool::new(false));
+        // The gate starts open so `over_sink`'s header fsync can pass; it is
+        // closed before any capture data exists.
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let writer = JournalWriter::over_sink(
+            GatedSink {
+                in_sync: Arc::clone(&in_sync),
+                gate: Arc::clone(&gate),
+            },
+            "j_gated".to_string(),
+            PathBuf::from("gated-sink-has-no-file.sj"),
+            16_000,
+        )
+        .expect("writer over the gated sink");
+
+        // 32 768-slot ring: 16 385 samples fit without overflowing.
+        let shared = test_shared(32_768);
+        let handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        let mut callback = CallbackState::new(1);
+        // 16 385 samples = 65 540 payload bytes > the 64 KiB boundary
+        // cadence: the writer's tick must append and fsync a boundary.
+        let expected: Vec<f32> = (0..16_385u32).map(|i| i as f32 * 0.00001).collect();
+        for block in expected.chunks(2_000) {
+            callback.process(block, &shared);
+        }
+
+        // Close the gate (no boundary can be due yet — nothing has been
+        // appended), then wait until the writer is parked inside the
+        // boundary fsync.
+        *gate.0.lock().expect("close the gate") = false;
+        wait_until(
+            || in_sync.load(Ordering::Acquire),
+            |parked| *parked,
+        );
+
+        // Watchdog: if `latest_window` does block on the consumer lock,
+        // release the fsync anyway so the failure below is a latency
+        // assertion instead of a hung suite.
+        {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                *gate.0.lock().expect("watchdog gate") = true;
+                gate.1.notify_all();
+            });
+        }
+
+        let started = Instant::now();
+        let window = handle.latest_window(64);
+        let metering_latency = started.elapsed();
+        assert_eq!(window.len(), 64, "the accessor still reads fresh samples");
+        assert!(
+            metering_latency < Duration::from_millis(500),
+            "latest_window waited {metering_latency:?} behind an in-flight journal fsync"
+        );
+        // The error-callback path takes the same lock (E01/G01): it must
+        // not stall behind the fsync either.
+        handle.capture_error();
+
+        // Release the fsync and stop; the memory sink still finalizes, so
+        // the watermark agreement over the whole take holds.
+        *gate.0.lock().expect("open the gate") = true;
+        gate.1.notify_all();
+        let take = handle.stop().expect("clean stop after the gate opened");
+        assert_eq!(take.audio.samples, expected, "the take itself is intact");
+        let report = take.journal.expect("journal report");
+        assert!(report.finalized);
+        assert_eq!(report.acknowledged_samples, 16_385);
     }
 
     #[test]
