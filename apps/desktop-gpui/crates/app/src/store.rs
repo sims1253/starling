@@ -512,7 +512,14 @@ mod tests {
 
     fn v2_store(tag: &str) -> Store {
         let root = scratch_dir(tag);
-        let store = StoreV2::open(root.join("v2")).expect("open v2");
+        reopen_v2(&root)
+    }
+
+    /// The facade over an existing scratch root — the "previous run
+    /// crashed" shape (#213): a fresh open of the same directory holds no
+    /// in-memory attempt ownership, exactly like a new process.
+    fn reopen_v2(root: &std::path::Path) -> Store {
+        let store = StoreV2::open(root.join("v2")).expect("reopen v2");
         Store(Arc::new(Mutex::new(store)))
     }
 
@@ -868,20 +875,58 @@ mod tests {
 
     #[test]
     fn startup_recovery_reports_and_repairs_on_v2() {
-        let store = v2_store("recovery");
-        let id = store
+        let root = scratch_dir("recovery");
+        let owner = reopen_v2(&root);
+        let id = owner
             .save_capture(tiny_wav(80), None)
             .expect("save")
             .id;
-        // A recognition attempt left "started" by a previous run.
-        store.mark_attempt(&id, "starling:parakeet").expect("begin");
+        // A recognition attempt left "started" by a previous run — #213:
+        // that run's attempt markers died with its process, so the owner
+        // store is dropped to simulate the crash.
+        owner
+            .mark_attempt(&id, "starling:parakeet")
+            .expect("begin");
+        drop(owner);
 
+        let store = reopen_v2(&root);
         let summary = store.startup_recovery().expect("recovery");
         assert!(summary.is_empty(), "a healthy store has nothing to say");
 
         // After the pass the stale attempt is failed, ready to retry.
         assert_eq!(session_status(&store, &id), SessionStatus::Failed);
         assert!(transcript_text(&store, &id).is_none());
+    }
+
+    #[test]
+    fn startup_recovery_spares_an_attempt_a_live_instance_still_owns() {
+        // #213: two instances, one transcribing. The second instance's
+        // startup sweep must not flip the first instance's in-flight
+        // attempt to Failed — the phantom-failure defect.
+        let root = scratch_dir("recovery-live-owner");
+        let owner = reopen_v2(&root);
+        let id = owner
+            .save_capture(tiny_wav(80), None)
+            .expect("save")
+            .id;
+        owner
+            .mark_attempt(&id, "starling:parakeet")
+            .expect("begin");
+
+        let sweeper = reopen_v2(&root);
+        let summary = sweeper.startup_recovery().expect("recovery");
+        assert!(summary.is_empty(), "nothing to report while the owner lives");
+        assert_eq!(
+            session_status(&sweeper, &id),
+            SessionStatus::Transcribing,
+            "the live owner's attempt is not stale"
+        );
+
+        // The owner still settles its attempt afterwards.
+        owner
+            .save_transcript(&id, transcript("owned"))
+            .expect("the owner finishes");
+        assert_eq!(session_status(&sweeper, &id), SessionStatus::Transcribed);
     }
 
     #[test]
@@ -991,22 +1036,28 @@ mod tests {
         // must not leave records stuck in "Transcribing" from a previous
         // run — the stale-attempt repair runs anyway and the reconcile
         // error still surfaces.
-        let store = v2_store("reconcile-fail");
-        let stuck = store
+        let root = scratch_dir("reconcile-fail");
+        let owner = reopen_v2(&root);
+        let stuck = owner
             .save_capture(tiny_wav(70), None)
             .expect("save")
             .id;
-        store.mark_attempt(&stuck, "starling:parakeet").expect("begin");
+        owner
+            .mark_attempt(&stuck, "starling:parakeet")
+            .expect("begin");
 
         // Sabotage reconciliation only: a tombstoned capture whose journal
         // was resurrected under audio/ while its quarantine destination is
         // a directory — the tombstone-completion rename cannot succeed, so
         // reconcile errors while the rest of the store stays healthy.
-        let doomed = store
+        let doomed = owner
             .save_capture(tiny_wav(30), None)
             .expect("save")
             .id;
-        store.delete(&doomed).expect("delete");
+        owner.delete(&doomed).expect("delete");
+        drop(owner); // the previous run crashed with the attempt in flight
+
+        let store = reopen_v2(&root);
         {
             let inner = lock_v2(&store.0);
             let audio = inner.root().join("audio").join(format!("{doomed}.sj"));

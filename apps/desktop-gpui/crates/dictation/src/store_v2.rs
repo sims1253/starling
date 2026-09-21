@@ -10,6 +10,7 @@
 //! <root>/audio/        <captureId>.sj finalized sample journals
 //! <root>/staging/      <captureId>.sj in-flight journals (§4 step 1)
 //! <root>/quarantine/   deliberately-deleted journals (R21 tombstones)
+//! <root>/attempt-locks/ <attemptId>.lock in-flight recognition markers (#213)
 //! ```
 //!
 //! # Schema
@@ -66,6 +67,7 @@
 //!   deletion, and an interrupted delete is completed, not half-kept.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -94,6 +96,11 @@ pub const WAL_CHECKPOINT_EVERY_COMMITS: u32 = 64;
 const AUDIO_DIR: &str = "audio";
 const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
+/// Per-attempt in-flight markers (#213): one `<attemptId>.lock` file per
+/// live recognition attempt, flocked by the owning process for the
+/// attempt's lifetime. The startup sweep reads them to decide whether a
+/// `started` row still has a live owner.
+const ATTEMPT_LOCKS_DIR: &str = "attempt-locks";
 const DB_FILE: &str = "starling.db";
 
 /// Environment variable the runtime state machine's capture store uses to
@@ -397,6 +404,13 @@ pub struct StoreV2 {
     conn: Connection,
     commits_since_checkpoint: u32,
     checkpoint_every: u32,
+    /// In-flight attempt markers this process holds (#213): attempt id →
+    /// the flocked marker file. The flock is the cross-process ownership
+    /// signal the startup sweep consults — the file-store analog of the
+    /// Electron reference's per-attempt Web Lock. Dropping the handle
+    /// (settle, delete, or process exit — crash included) releases the
+    /// lock, so a dead owner's marker can never block a later sweep.
+    attempt_locks: HashMap<String, File>,
 }
 
 /// An in-flight take (§4 step 1): owns the staging journal.
@@ -419,6 +433,7 @@ impl StoreV2 {
         std::fs::create_dir_all(root.join(AUDIO_DIR))?;
         std::fs::create_dir_all(root.join(STAGING_DIR))?;
         std::fs::create_dir_all(root.join(QUARANTINE_DIR))?;
+        std::fs::create_dir_all(root.join(ATTEMPT_LOCKS_DIR))?;
 
         let mut conn = Connection::open(root.join(DB_FILE))?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
@@ -494,6 +509,7 @@ impl StoreV2 {
             conn,
             commits_since_checkpoint: 0,
             checkpoint_every: WAL_CHECKPOINT_EVERY_COMMITS,
+            attempt_locks: HashMap::new(),
         })
     }
 
@@ -1018,6 +1034,17 @@ impl StoreV2 {
         }
 
         // 2. Row removal in the same transaction as the tombstone insert.
+        // The capture's attempt ids are collected first: the DELETE
+        // cascades the rows away, and their in-flight markers (#213) must
+        // go with them (released only after the commit took, so a failed
+        // delete leaves a live attempt fully owned).
+        let attempt_ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM recognition_attempts WHERE capture_id = ?1")?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO tombstones(id, kind, deleted_utc, retention)
@@ -1026,6 +1053,9 @@ impl StoreV2 {
         )?;
         tx.execute("DELETE FROM captures WHERE id = ?1", params![id])?;
         tx.commit()?;
+        for attempt_id in &attempt_ids {
+            self.release_attempt_lock(attempt_id);
+        }
         Ok(())
     }
 
@@ -1455,8 +1485,12 @@ impl StoreV2 {
 
     /// Marks the start of one recognition attempt on a capture: a
     /// `recognition_attempts` row with status `started` (v2's analog of the
-    /// v1 `mark_attempt` status bump). Returns the attempt id. Recognizing
-    /// an unknown capture is [`StoreV2Error::NotFound`].
+    /// v1 `mark_attempt` status bump), plus the cross-process in-flight
+    /// marker the startup sweep consults (#213) — held *before* the row
+    /// becomes visible, so a `started` row is always either owned by a
+    /// live process or orphaned by a dead one; the sweep can never observe
+    /// the in-between. Returns the attempt id. Recognizing an unknown
+    /// capture is [`StoreV2Error::NotFound`].
     pub fn begin_recognition(
         &mut self,
         capture_id: &str,
@@ -1467,7 +1501,8 @@ impl StoreV2 {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         }
         let id = format!("a_{}", uuid::Uuid::new_v4().simple());
-        self.insert_attempt(&AttemptRecord {
+        self.hold_attempt_lock(&id)?;
+        match self.insert_attempt(&AttemptRecord {
             id: id.clone(),
             capture_id: capture_id.to_string(),
             backend: backend.to_string(),
@@ -1480,8 +1515,15 @@ impl StoreV2 {
             timing_json: None,
             extra_json: None,
             created_utc: None,
-        })?;
-        Ok(id)
+        }) {
+            Ok(()) => Ok(id),
+            Err(err) => {
+                // The row never became visible: the marker must not
+                // outlive the attempt it was taken for.
+                self.release_attempt_lock(&id);
+                Err(err)
+            }
+        }
     }
 
     /// How one recognition attempt ended. Applies to the capture's most
@@ -1531,9 +1573,14 @@ impl StoreV2 {
         };
         if changed == 0 {
             // A second finisher lost the race to the first: never re-write
-            // a terminal row.
+            // a terminal row. The attempt is settled either way, so its
+            // marker must not outlive it (#213).
+            self.release_attempt_lock(&attempt_id);
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         }
+        // The attempt is settled: its in-flight marker (#213) must not
+        // outlive the row that gave it meaning.
+        self.release_attempt_lock(&attempt_id);
         Ok(())
     }
 
@@ -1557,27 +1604,144 @@ impl StoreV2 {
         )
     }
 
-    /// Finishes every `started` attempt left behind by a previous run
-    /// (v2's analog of the v1 "stuck in Transcribing" startup fix): each is
+    /// Finishes `started` attempts left behind by a previous run (v2's
+    /// analog of the v1 "stuck in Transcribing" startup fix): each is
     /// marked failed with `note`, because the process that started it is
-    /// gone. Returns the affected capture ids. Completed attempts are
-    /// untouched.
+    /// gone — *confirmed* against the attempt's cross-process marker
+    /// (#213): an attempt a live instance still owns (its flock is held)
+    /// is left alone, the file-store analog of the Electron reference's
+    /// `transcriptionInFlight` guard (#144); only an owner whose signal is
+    /// gone is treated as interrupted, so one instance's startup can never
+    /// phantom-fail another instance's in-flight attempt. The sweep's
+    /// marker probe stays a read-only hint; the enforcement is one
+    /// conditional write keyed by the exact attempt row, so a settle (or
+    /// delete) that commits between the probe and the write cannot
+    /// last-writer-lose its outcome to a failure (#162 semantics).
+    /// Returns the affected capture ids. Completed attempts are untouched.
     pub fn interrupt_stale_attempts(&mut self, note: &str) -> Result<Vec<String>, StoreV2Error> {
-        let mut stale = Vec::new();
+        let mut started: Vec<(String, String)> = Vec::new();
         {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT capture_id FROM recognition_attempts
-                 WHERE status = 'started' ORDER BY capture_id",
+                "SELECT capture_id, id FROM recognition_attempts
+                 WHERE status = 'started' ORDER BY capture_id, rowid",
             )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             for row in rows {
-                stale.push(row?);
+                started.push(row?);
             }
         }
-        for capture_id in &stale {
-            self.finish_recognition(capture_id, RecognitionOutcome::Failed { message: note })?;
+        let extra = serde_json::json!({ "error": note }).to_string();
+        let mut swept = Vec::new();
+        for (capture_id, attempt_id) in started {
+            if self.attempt_is_owned(&attempt_id) {
+                // Another window may still own this attempt (#144, #213):
+                // only an owner whose signal is gone is treated as
+                // interrupted.
+                continue;
+            }
+            let changed = self.conn.execute(
+                "UPDATE recognition_attempts
+                 SET status = 'failed', extra_json = ?1
+                 WHERE id = ?2 AND status = 'started'",
+                params![extra, attempt_id],
+            )?;
+            if changed > 0 {
+                swept.push(capture_id);
+            }
+            // changed == 0: the owner settled (or a delete cascaded)
+            // between the probe and the write — nothing stale remains.
+            // Either way the attempt is settled now, and a marker for a
+            // settled row is disk garbage: take it with the sweep.
+            self.release_attempt_lock(&attempt_id);
         }
-        Ok(stale)
+        Ok(swept)
+    }
+
+    /// The marker file one in-flight recognition attempt owns (#213):
+    /// `<root>/attempt-locks/<attemptId>.lock`. Like the Electron
+    /// reference's per-attempt Web Lock
+    /// (`starling:dictation:<db>:transcribe:<id>:<signal>`), the name is
+    /// unique per attempt, so a contender that outlives the first settler
+    /// keeps its own signal.
+    fn attempt_lock_path(&self, attempt_id: &str) -> PathBuf {
+        self.root
+            .join(ATTEMPT_LOCKS_DIR)
+            .join(format!("{attempt_id}.lock"))
+    }
+
+    /// Hold one attempt's cross-process marker (#213): create the lock
+    /// file and flock it. The handle lives in [`Self::attempt_locks`] —
+    /// keeping the file open is what holds the lock — until the attempt
+    /// settles, the capture is deleted, or the process exits.
+    fn hold_attempt_lock(&mut self, attempt_id: &str) -> Result<(), StoreV2Error> {
+        std::fs::create_dir_all(self.root.join(ATTEMPT_LOCKS_DIR))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.attempt_lock_path(attempt_id))?;
+        if !try_flock_exclusive(&file)? {
+            // Unique-per-attempt ids make this unreachable short of
+            // external tampering with the locks directory.
+            return Err(StoreV2Error::Io(io::Error::other(format!(
+                "attempt marker {attempt_id} is already held"
+            ))));
+        }
+        self.attempt_locks.insert(attempt_id.to_string(), file);
+        Ok(())
+    }
+
+    /// Release one attempt's marker (#213): drop the held flock and remove
+    /// the file. Idempotent, and safe for attempts this process never held
+    /// (the sweep calls it for markers it found unowned).
+    fn release_attempt_lock(&mut self, attempt_id: &str) {
+        if !is_safe_path_component(attempt_id) {
+            // A row whose id is not a safe file name can never have one of
+            // our markers; never follow an id that escaped the locks
+            // directory.
+            return;
+        }
+        self.attempt_locks.remove(attempt_id);
+        let _ = std::fs::remove_file(self.attempt_lock_path(attempt_id));
+    }
+
+    /// Whether a live owner holds the attempt's marker (#213): this
+    /// process's own registry first (the within-process signal that also
+    /// covers flock-less platforms), then the flock itself. A missing
+    /// marker means no owner — a `started` row from a pre-marker build
+    /// stays sweepable; marker *presence* alone is never the signal, so a
+    /// stale file left by a crash cannot block the sweep (the OS released
+    /// its flock when the owner died). A marker that cannot be probed
+    /// (permissions, I/O trouble) is treated as owned: an unreadable
+    /// liveness signal must not manufacture an interruption — the same
+    /// rule the Electron reference applies when the lock manager cannot
+    /// answer.
+    fn attempt_is_owned(&self, attempt_id: &str) -> bool {
+        if self.attempt_locks.contains_key(attempt_id) {
+            return true;
+        }
+        if !is_safe_path_component(attempt_id) {
+            return false;
+        }
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.attempt_lock_path(attempt_id))
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        match try_flock_exclusive(&file) {
+            // The probe acquired the lock and released it again on drop:
+            // no live owner anywhere.
+            Ok(true) => false,
+            Ok(false) => true,
+            Err(_) => true,
+        }
     }
 }
 
@@ -1880,6 +2044,37 @@ fn validate_capture_id(id: &str) -> Result<(), StoreV2Error> {
         )));
     }
     Ok(())
+}
+
+/// Take a non-blocking exclusive advisory lock on an open file (#213).
+/// `Ok(true)` — acquired, held until the file is dropped; `Ok(false)` — a
+/// live owner holds it. Because the lock lives on the open file
+/// description, the OS releases it when the owning process dies, which is
+/// what makes a leftover marker file after a crash harmless.
+#[cfg(unix)]
+fn try_flock_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock(2) on an fd this caller owns and keeps open for the
+    // lock's lifetime; no close or hand-off happens here.
+    let acquired =
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if acquired {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+/// Without flock there is no cross-process signal (#213): the call reports
+/// acquired so attempts stay visible only within the one store that holds
+/// them — the same degradation the Electron reference applies on hosts
+/// without `navigator.locks`.
+#[cfg(not(unix))]
+fn try_flock_exclusive(_file: &File) -> io::Result<bool> {
+    Ok(true)
 }
 
 fn int64(value: u64) -> Result<i64, StoreV2Error> {
@@ -2977,22 +3172,32 @@ mod tests {
     #[test]
     fn interrupt_stale_attempts_fails_only_started_rows() {
         let dir = TempDir::new().expect("tempdir");
+        // The previous run: one attempt left "started" when the process
+        // died, one settled before it did.
+        let (live, done) = {
+            let mut owner = store_in(&dir);
+            let live = committed_take(&mut owner, &ramp(30, 0)).record.id.clone();
+            let done = committed_take(&mut owner, &ramp(30, 1)).record.id.clone();
+            owner
+                .begin_recognition(&live, "starling", None)
+                .expect("begin live");
+            owner
+                .begin_recognition(&done, "starling", None)
+                .expect("begin done");
+            owner
+                .finish_recognition(
+                    &done,
+                    RecognitionOutcome::Completed {
+                        text: "kept",
+                        extra_json: None,
+                    },
+                )
+                .expect("finish done");
+            drop(owner); // the process is gone; its flocks died with it (#213)
+            (live, done)
+        };
+
         let mut store = store_in(&dir);
-        let live = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
-        let done = committed_take(&mut store, &ramp(30, 1)).record.id.clone();
-
-        store.begin_recognition(&live, "starling", None).expect("begin live");
-        store.begin_recognition(&done, "starling", None).expect("begin done");
-        store
-            .finish_recognition(
-                &done,
-                RecognitionOutcome::Completed {
-                    text: "kept",
-                    extra_json: None,
-                },
-            )
-            .expect("finish done");
-
         let stale = store
             .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
             .expect("interrupt");
@@ -3015,6 +3220,171 @@ mod tests {
             .interrupt_stale_attempts("again")
             .expect("rerun")
             .is_empty());
+    }
+
+    // ---- cross-instance attempt ownership (#213) -----------------------
+
+    #[test]
+    fn a_live_owner_blocks_another_instances_startup_sweep() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut owner = store_in(&dir);
+        let id = committed_take(&mut owner, &ramp(30, 0)).record.id.clone();
+        owner
+            .begin_recognition(&id, "starling:parakeet", None)
+            .expect("begin");
+
+        // A second instance sweeps at ITS startup: the owner's flock is
+        // held, so the attempt is not stale — the file-store analog of the
+        // Electron reference's `transcriptionInFlight` guard (#144, #213).
+        // Instance B must not phantom-fail instance A's in-flight attempt.
+        let mut sweeper = store_in(&dir);
+        let swept = sweeper
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("sweep");
+        assert!(swept.is_empty(), "a live owner's attempt is skipped: {swept:?}");
+        let attempts = sweeper.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts[0].status, "started", "no phantom failure");
+
+        // The owner still settles its own attempt after the other
+        // instance's sweep ran.
+        owner
+            .finish_recognition(
+                &id,
+                RecognitionOutcome::Completed {
+                    text: "late",
+                    extra_json: None,
+                },
+            )
+            .expect("the owner finishes");
+        let attempts = sweeper.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts[0].status, "completed");
+    }
+
+    #[test]
+    fn a_sweep_fails_the_dead_attempts_and_spares_the_live_ones() {
+        let dir = TempDir::new().expect("tempdir");
+        // One attempt whose owner crashed, one whose owner is live: the
+        // sweep must tell them apart by the flock, not the marker file —
+        // both markers exist on disk.
+        let dead = {
+            let mut crashed = store_in(&dir);
+            let dead = committed_take(&mut crashed, &ramp(30, 1)).record.id.clone();
+            crashed
+                .begin_recognition(&dead, "starling", None)
+                .expect("begin dead");
+            drop(crashed); // crashed: the OS released its flock
+            dead
+        };
+        let mut owner = store_in(&dir);
+        let owned = committed_take(&mut owner, &ramp(30, 0)).record.id.clone();
+        owner
+            .begin_recognition(&owned, "starling", None)
+            .expect("begin owned");
+
+        let mut sweeper = store_in(&dir);
+        let swept = sweeper
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("sweep");
+        assert_eq!(swept, vec![dead.clone()], "only the dead owner's attempt");
+        assert_eq!(
+            sweeper.attempts_for(&dead).expect("attempts")[0].status,
+            "failed"
+        );
+        assert_eq!(
+            sweeper.attempts_for(&owned).expect("attempts")[0].status,
+            "started"
+        );
+    }
+
+    #[test]
+    fn a_started_row_without_a_marker_is_swept() {
+        // A row left 'started' by a pre-marker build (or written by hand):
+        // marker presence is never the signal — the absence of a live
+        // owner is, so a missing marker sweeps.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
+        store
+            .insert_attempt(&AttemptRecord {
+                id: "a_handmade".to_string(),
+                capture_id: id.clone(),
+                backend: "starling".to_string(),
+                model_hash: None,
+                language: None,
+                options_json: None,
+                text: String::new(),
+                partial_or_final: "partial".to_string(),
+                status: "started".to_string(),
+                timing_json: None,
+                extra_json: None,
+                created_utc: None,
+            })
+            .expect("insert started row");
+
+        let swept = store
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("sweep");
+        assert_eq!(swept, vec![id.clone()]);
+        assert_eq!(store.attempts_for(&id).expect("attempts")[0].status, "failed");
+    }
+
+    #[test]
+    fn the_owning_process_sweep_spares_its_own_live_attempts() {
+        // Within one process the held-marker registry is the signal (also
+        // the only signal on flock-less platforms): a sweep racing its own
+        // store's live attempt must not fail it.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(20, 0)).record.id.clone();
+        store
+            .begin_recognition(&id, "starling", None)
+            .expect("begin");
+
+        let swept = store.interrupt_stale_attempts("note").expect("sweep");
+        assert!(swept.is_empty(), "own live attempt: {swept:?}");
+        assert_eq!(store.attempts_for(&id).expect("attempts")[0].status, "started");
+    }
+
+    #[test]
+    fn a_settling_attempt_takes_its_marker_with_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(20, 0)).record.id.clone();
+        let attempt = store
+            .begin_recognition(&id, "starling", None)
+            .expect("begin");
+        let marker = dir
+            .path()
+            .join("v2")
+            .join(ATTEMPT_LOCKS_DIR)
+            .join(format!("{attempt}.lock"));
+        assert!(marker.exists(), "held while the attempt is in flight");
+
+        store
+            .finish_recognition(&id, RecognitionOutcome::Failed { message: "x" })
+            .expect("finish");
+        assert!(!marker.exists(), "released with the settle");
+    }
+
+    #[test]
+    fn deleting_a_capture_releases_its_attempt_markers() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(20, 0)).record.id.clone();
+        let attempt = store
+            .begin_recognition(&id, "starling", None)
+            .expect("begin");
+        let marker = dir
+            .path()
+            .join("v2")
+            .join(ATTEMPT_LOCKS_DIR)
+            .join(format!("{attempt}.lock"));
+        assert!(marker.exists());
+
+        // The user's delete wins the race (R21); the cascaded attempt's
+        // marker must not linger as disk garbage.
+        store.delete_capture(&id).expect("delete");
+        assert!(!marker.exists(), "the marker went with the rows");
     }
 
     #[test]

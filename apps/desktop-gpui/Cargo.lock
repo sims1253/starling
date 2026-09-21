@@ -5570,6 +5570,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "dirs 6.0.0",
+ "libc",
  "regex",
  "reqwest",
  "rodio",
