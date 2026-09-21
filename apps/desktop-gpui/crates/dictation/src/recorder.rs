@@ -1734,11 +1734,15 @@ mod tests {
         for block in data.chunks(128) {
             callback.process(block, &shared);
         }
-        // The writer — not the accessor — must have drained the ring by now.
-        std::thread::sleep(WRITER_POLL_INTERVAL * 4);
+        // The writer — not the accessor — must have drained the ring. Poll
+        // for the writer's own progress instead of sleeping a fixed
+        // multiple of the tick: a loaded runner can miss several 25 ms
+        // ticks inside any fixed sleep (#217), while the poll only fails
+        // if the writer genuinely stops draining.
+        let drained = wait_until(|| shared.lock_consumer().read_pos, |pos| *pos >= 2_000);
         assert!(
-            shared.lock_consumer().read_pos >= 2_000,
-            "writer task should have drained the ring within a few polls"
+            drained >= 2_000,
+            "writer task should have drained the ring within a few polls, read_pos {drained}"
         );
 
         assert_eq!(handle.latest_window(64), data[2_000 - 64..]);
@@ -1778,7 +1782,18 @@ mod tests {
             callback.process(&interleaved, &shared);
         }
 
-        std::thread::sleep(Duration::from_millis(60)); // let the writer tick
+        // Let the writer participate in the drain via its own ticks (the
+        // point of the handshake test) — polled, not sleep-raced, so a
+        // loaded runner that misses ticks still waits for exactly this
+        // precondition (#217). The counts asserted below read the
+        // callback-side frontier (`written_seq`), so they are exact the
+        // moment the pushes finish; only the "writer drained" wait is
+        // scheduler-dependent.
+        let drained = wait_until(|| shared.lock_consumer().read_pos, |pos| *pos >= 5_120);
+        assert!(
+            drained >= 5_120,
+            "writer should have ticked at least once, read_pos {drained}"
+        );
         assert_eq!(handle.captured_sample_count(), 5_120);
         assert!(handle.gaps().is_empty(), "no overflow happened");
 
@@ -1802,6 +1817,13 @@ mod tests {
         shared.callback_alive.store(true, Ordering::Release);
 
         let writer = spawn_writer(Arc::clone(&shared));
+        // The tight 40 ms timeout is the path under test (R09), not a race:
+        // `callback_alive` is wedged true before `stop` is entered and
+        // nothing ever clears it, so the quiesce wait deterministically
+        // times out no matter how the runner schedules threads. The salvage
+        // below is equally deterministic — `stop` joins the writer (whose
+        // exit drain accumulates the ring) before the error branch reads
+        // the accumulation, so a slow writer cannot shrink the take.
         let handle = RecorderHandle {
             shared,
             stream: None,
@@ -1850,10 +1872,16 @@ mod tests {
             callback.process(block, &shared);
         }
         let writer = spawn_writer(Arc::clone(&shared));
-        // Give the writer a tick, then wedge the quiesce flag. Even without
-        // the tick, the writer's exit drain inside stop() salvages the ring
-        // before the timeout branch reads the accumulation.
-        std::thread::sleep(Duration::from_millis(60));
+        // Let the writer drain during live capture — polled rather than
+        // sleep-raced (#217). (Even without this, the writer's exit drain
+        // inside `stop` salvages the ring before the timeout branch reads
+        // the accumulation, so the assertion below never depends on the
+        // writer having ticked.)
+        let drained = wait_until(|| shared.lock_consumer().read_pos, |pos| *pos >= 600);
+        assert!(
+            drained >= 600,
+            "writer should have drained the head, read_pos {drained}"
+        );
         shared.callback_alive.store(true, Ordering::Release);
 
         let handle = RecorderHandle {
@@ -1864,6 +1892,11 @@ mod tests {
             writer: Some(writer),
             sample_rate: 16_000,
             started_at: Instant::now(),
+            // Tight on purpose: the timeout path is what this test
+            // exercises. It cannot race — `callback_alive` is wedged true
+            // before `stop` and never cleared, so the bounded wait always
+            // gives up, and the salvaged take is ordered behind the writer
+            // join inside `stop`.
             quiesce_timeout: Duration::from_millis(30),
             journal: None,
         };
@@ -2070,7 +2103,9 @@ mod tests {
         }
         let writer = spawn_writer(Arc::clone(&shared));
         let handle = RecorderHandle {
-            shared,
+            // The test keeps its own Arc so it can poll the writer's drain
+            // progress below (the handle exposes no such accessor).
+            shared: Arc::clone(&shared),
             stream: None,
             writer: Some(writer),
             sample_rate: 16_000,
@@ -2078,7 +2113,15 @@ mod tests {
             quiesce_timeout: Duration::from_millis(200),
             journal: None,
         };
-        std::thread::sleep(Duration::from_millis(60)); // let the writer drain
+        // Poll for the writer's drain instead of sleeping past a couple of
+        // ticks (#217): the honest-acknowledgment claim below must hold
+        // with the writer demonstrably active, not merely after a fixed
+        // window in which it may not have been scheduled at all.
+        let drained = wait_until(|| shared.lock_consumer().read_pos, |pos| *pos >= 1_000);
+        assert!(
+            drained >= 1_000,
+            "writer should have drained the take, read_pos {drained}"
+        );
         assert_eq!(handle.captured_sample_count(), 1_000);
         assert_eq!(handle.acknowledged_samples(), 0);
         let take = handle.stop().expect("stop");
@@ -2117,19 +2160,29 @@ mod tests {
 
         // The disk starts failing. Capture keeps producing; the journal
         // drops; acknowledgment must freeze at the last good boundary.
+        // Wait for the writer to have actually ticked against the faulted
+        // sink (the fault surfaces through the capture-error slot) instead
+        // of sleeping "past the time cadence" (#217): once the append
+        // fails, the writer drops the journal, and `durable_ack` is only
+        // ever stored after a successful fsync — so the frozen value holds
+        // on every later tick too, no matter how many cadence windows pass.
         fail.store(true, Ordering::Release);
         let more: Vec<f32> = (20_000u32..28_000).map(|i| i as f32 * 0.00001).collect();
         for block in more.chunks(128) {
             callback.process(block, &shared);
         }
-        std::thread::sleep(Duration::from_millis(350)); // past the time cadence
-        assert_eq!(handle.captured_sample_count(), 28_000, "capture is still live");
+        let fault = wait_until(|| handle.capture_error(), |fault| fault.is_some())
+            .unwrap_or_else(|| panic!("the storage fault must surface through the capture-error slot"));
+        assert!(
+            handle.captured_sample_count() == 28_000,
+            "capture is still live: {}",
+            handle.captured_sample_count()
+        );
         assert_eq!(
             handle.acknowledged_samples(),
             20_000,
             "acknowledgment frozen at the last fsynced boundary"
         );
-        let fault = handle.capture_error().expect("fault surfaced");
         assert!(fault.contains("journal"), "{fault}");
         assert!(fault.contains("20 000") || fault.contains("20000"), "{fault}");
 
@@ -2309,7 +2362,15 @@ mod tests {
         for block in head.chunks(125) {
             callback.process(block, &shared);
         }
-        let handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        let mut handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        // Generous quiesce timeout: this test exercises the *success* path
+        // of the handshake (the producer completes at ~120 ms). With the
+        // default test timeout (500 ms) a starved producer thread could
+        // oversleep its window and turn the run into the timeout path,
+        // where `stopping` is legitimately stored and the producer's
+        // in-flight assert would flake (#217). Five seconds makes the
+        // timeout branch unreachable short of total starvation.
+        handle.quiesce_timeout = Duration::from_secs(5);
 
         // The producer thread simulates one long in-flight callback
         // invocation straddling the stop call: `callback_alive` is held true
@@ -2320,9 +2381,16 @@ mod tests {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 shared.callback_alive.store(true, Ordering::Release);
-                // Give `stop` time to reach its quiesce wait — and, under
-                // the old ordering, to have stored `stopping` where the
-                // writer's 25 ms poll would already have acted on it.
+                // Hold the invocation open long enough for `stop` to reach
+                // its quiesce wait — and, under the old ordering, to have
+                // stored `stopping` where the writer's 25 ms poll would
+                // already have acted on it (120 ms ≈ 5 polls; by design,
+                // this is the regression-catching window, not a race on
+                // the correct code). The handle's generous quiesce timeout
+                // (set just above) means the timeout branch can never beat
+                // this window even on a starved runner: `stopping` is only
+                // stored once the producer clears `callback_alive`, which
+                // happens strictly after the assert below.
                 std::thread::sleep(Duration::from_millis(120));
                 assert!(
                     !shared.stopping.load(Ordering::Acquire),
@@ -2385,10 +2453,18 @@ mod tests {
         for block in expected.chunks(128) {
             callback.process(block, &shared);
         }
-        std::thread::sleep(Duration::from_millis(60)); // let the writer drain
-        shared.callback_alive.store(true, Ordering::Release); // wedge
+        // Wedge the callback before any stop-path machinery runs. No wait
+        // is needed between the pushes and the wedge (the old 60 ms sleep
+        // predated the writer even existing): the samples sit in the ring,
+        // and the writer spawned below accumulates and finalizes them in
+        // its exit path, which `stop` joins before building the report —
+        // the join is the synchronization point, not a sleep (#217).
+        shared.callback_alive.store(true, Ordering::Release);
 
         let mut wedged = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        // Tight on purpose: the quiesce-timeout salvage path is the subject
+        // of the test, and it cannot race — `callback_alive` is wedged true
+        // before `stop` is entered and nothing clears it.
         wedged.quiesce_timeout = Duration::from_millis(30);
 
         match wedged.stop() {
