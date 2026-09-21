@@ -63,6 +63,12 @@ object ChunkedTranscription {
      * taken from the earlier window. Without a run of at least [minMatch]
      * words the two are simply concatenated — a duplicated word reads better
      * than a dropped one for dictation.
+     *
+     * Word-only alignment limitation, same as the serving layer: matching
+     * uses decoded words without timestamps, so disagreeing window
+     * boundaries can still miss or duplicate a word. The empty-key guard
+     * below removes one systematic dropper; it does not make stitching
+     * omission-free.
      */
     fun stitchWords(
         committedWords: List<String>,
@@ -74,7 +80,18 @@ object ChunkedTranscription {
         if (newWords.isEmpty()) return committedWords
         val tail = committedWords.takeLast(maxOverlap)
         val head = newWords.take(maxOverlap)
-        val run = longestCommonRun(tail.map(::normalizeWord), head.map(::normalizeWord))
+        // Empty keys (words that normalize to "", e.g. pure punctuation)
+        // never participate in a match: runs of empty keys would satisfy
+        // minMatch with no shared lexical word and splice unrelated halves
+        // together, dropping words on both sides (issue #118 defense in
+        // depth; port of the Python sentinels in src/starling/stream_chunk.py,
+        // kept in lockstep with the C++ empty-skip in
+        // cpp/serve/stream_session.cpp). The sentinels are unique per side
+        // and position and cannot collide with a real key — normalizeWord
+        // strips \u0000 along with other non-word characters.
+        val tailKeys = tail.mapIndexed { index, word -> normalizeWord(word).ifEmpty { "\u0000tail-$index" } }
+        val headKeys = head.mapIndexed { index, word -> normalizeWord(word).ifEmpty { "\u0000head-$index" } }
+        val run = longestCommonRun(tailKeys, headKeys)
             ?: return committedWords + newWords
         if (run.length < minMatch) return committedWords + newWords
         // Keep committed up to the end of the shared run; take new after it.

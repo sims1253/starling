@@ -79,3 +79,21 @@ WAL checkpoint policy stays tunable per the design's slow-disk caveat.
 as of gpui/fixes-wave-a10 (8153a35): G01 (I1 ring+journal), G02 (per-record
 isolation + orphan recovery), G03-G07, R01-R21. Remaining GPUI-port work is
 product scope (E15 parity items, streaming transport parity), not review debt.
+
+## D13 — 2026-09-20 — Engine branches frozen pending the 5090 CUDA gate
+#196-#199 and program/gpu-validation are frozen at 4623e4c / 22e7d1b /
+adb0893 / 7340eb6 / 52f393d until the user's 5090 agent validates and
+merges. R27/R29 (P3 nits) deliberately NOT landed now so the validation
+branch the agent tests is exactly the PR heads. New work continues from
+master (program/wave-b).
+
+## D14 — 2026-09-20 — No backwards compatibility of any kind
+User directive: the product is pre-release; there is no user data to be
+compatible with. Consequences: (1) storage-v2 becomes THE store — the v1
+migration flow (dry-run/apply/rollback UI), the dual-store facade, the
+STARLING_STORAGE_V2 flag, and the persisted-choice machinery are unnecessary
+complexity to be removed, not maintained; (2) legacy-field fallback paths
+(e.g. the Electron threadJoinedAt createdAt-ordering fallback) may be
+deleted rather than preserved; (3) no schema coexistence: bump/replace
+freely. Source evidence survives as raw journals where the crash-recovery
+policy demands it — that is durability, not compatibility.

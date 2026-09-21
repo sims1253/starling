@@ -130,11 +130,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/wave-b",
+   "evidence": [
+    "coordinator rerun (clean --rerun-tasks): 94/94 unit tests; sentinel port of the landed Python fix; byte-mirror parity fixtures w/ Python suite 7/7; negation-drop repro red-first"
+   ],
+   "notes": "algorithm+parity verified; on-device streaming E2E remains device-gated"
   },
   {
    "id": "B08",
@@ -144,11 +146,13 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
-   "branch": null,
-   "evidence": [],
-   "notes": ""
+   "branch": "program/wave-b",
+   "evidence": [
+    "coordinator rerun 94/94; import fully under lock w/ unique staging + fsync + atomic rename promotion (old model never deleted first); GGUF metadata validator w/ accept/reject matrix; concurrent-import race test"
+   ],
+   "notes": "host-JVM verified; SAF/f2fs/engine-reload paths remain device-gated"
   },
   {
    "id": "B09",
@@ -228,9 +232,10 @@
    "owner": "impl-agent-33",
    "branch": "gpui/fixes-wave-a11",
    "evidence": [
-    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal"
+    "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
+    "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
    ],
-   "notes": "cutover remains: app wiring behind STARLING_STORAGE_V2, user-reviewed dry-run->apply->accept UI, leases, retention sweep, bounded reads, E02 crash-injection docs"
+   "notes": "v2-ONLY per D14: migration flow + dual store + flag deleted (net -1987 lines); remaining: leases, retention sweep, bounded reads, runtime-side store integration; v1 FileSessionStore kept only because crates/runtime references it (delete on I3 integration)"
   },
   {
    "id": "E03",
@@ -837,14 +842,16 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": null,
    "branch": "program/s01-moss-kv-clear",
    "evidence": [
     "committed f84e2a7 on program/s01-moss-kv-clear; PR #196 open for automated review; agent report pending",
     "coordinator rerun: device_cache_clear_test all checks passed, stream_session_test 235/235 (CPU) on f84e2a7; PR #196",
     "LOCAL DEVICE EVIDENCE: device_cache_clear_test backend=Vulkan0 all checks passed on AMD Cezanne/RADV (program/gpu-validation build-vk) - Vulkan fillBuffer path now executed-device-verified; CUDA still source-read only pending 5090 run",
-    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)",
+    "5090 VERIFIED_ON_TARGET: 0 KV-clear host bytes/request (LD_PRELOAD byte counter; master carried ~224MiB/request as 56x4MiB H2D memcpys; branch does 56 device-side cudaMemsetAsync, host upload only once at startup); 18/18 byte-identical transcripts; latency not-worse (cold -84..-139ms, warm short/medium -26/-28ms, long +2.9% median within master +/-7% noise, lower mean); VRAM identical 8906MiB",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "CPU-verified; CUDA/Vulkan source-read only; no GPU timing or real-model A/B (validation gaps)"
   },
@@ -856,14 +863,16 @@
    "area": "serving",
    "deps": [],
    "existing_issue": 177,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": null,
    "branch": "program/s02-tdt-budget",
    "evidence": [
     "coordinator rerun: tdt_graph_budget_test PASS + replay_graph_support all + stream_session 235/235 (4821bc9); byte-aware LRU with pin/lease; budget<=cap at rest invariant; pointer stability under eviction",
     "LOCAL DEVICE EVIDENCE: tdt_graph_budget_test PASS with real ReplayGraphs on Vulkan device (entry_bytes=3080 vs 3136 CPU - device-adaptive accounting); pointer stability under eviction verified on-device",
     "REAL-MODEL iGPU run: parakeet q8_0 720M loaded 1.5s, request 0.77s, {\"text\":\"\"} for tone input (correct no-speech behavior); MOSS tone produced a hallucination (expected for non-speech input) - pipeline-level evidence only, not quality",
-    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)"
+    "iGPU follow-up: parakeet q4_0 460M loaded 1.0s, request 0.72s, {\"text\":\"\"} on Vulkan0 - q4 tensor-type kernels exercised in TDT graphs on-device (distinct kernel paths from q8 run)",
+    "5090 VERIFIED: budget/LRU/pin/rollback/pointer-stability on real CUDA graphs (entry_bytes=3328, CUDA graph warmup+replay); CPU E2E transcripts identical across 12 lengths x 3 budgets; CUDA E2E BLOCKED by pre-existing master-identical ggml CONV_2D_DW F32-only vs parakeet F16 layout - NOT an S02 regression",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "GPU validation + real-length traces + VRAM/hit-rate reporting = recorded gaps; mel multi-entry deferred per card trace-gate; PR open"
   },
@@ -875,13 +884,15 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": "impl-agent-12",
    "branch": "program/s03-eos-contract",
    "evidence": [
     "coordinator rerun: greedy_termination_test 13/13 + stream_session_test 235/235 on 0fd13db; PR open; pure predicate drives all stop sites; debug/release parity by construction",
     "LOCAL DEVICE EVIDENCE: greedy_termination_test PASS under Vulkan backend; stream_session_test 235/235 on Vulkan",
-    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)"
+    "REAL-MODEL iGPU run: starling-serve (Vulkan0, AMD Cezanne/RADV) MOSS q4-fullimx 1.8G loaded 4.0s, 3s tone WAV transcribed 2.7s wall, completed without crash - S01 KV-clear + S03 termination exercised with real weights on-device (program/gpu-validation build-vk, 2026-09-20)",
+    "5090 VERIFIED_ON_TARGET: 66 real-MOSS transcript pairs (18 Gate-B + 48 real-corpus), 0 diffs, 0 instabilities; no over-generation after early EOS; predicate engine cases green on CUDA0",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "model-gated gaps: real MOSS GGUF E2E, GPU K-step branch, real-audio acceptance evals; serve/Python wiring of completion status deferred"
   },
@@ -1001,11 +1012,13 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "verified_on_target",
    "owner": "impl-agent-31",
    "branch": "program/s11-tail-reuse",
    "evidence": [
-    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open"
+    "coordinator rerun: stream_session_test 342/342 (84351bc); 17 new fake-engine cases incl. one-sample sensitivity + A/B/A isolation + trim-stable absolute keys; integration fixture suite byte-identical to baseline; PR open",
+    "5090 VERIFIED_ON_TARGET: serve-level reuse contract by engine-call signature: unchanged-audio commit = 1 call, one-appended-sample = 2, duplicate preview coalesce = 1; stream_session_test 382/382 on CUDA",
+    "docs/program/evidence/gpu-validation-5090-2026-09-20.md (program/gpu-validation @ 637e9f9)"
    ],
    "notes": "no real-model/GPU timing claims; reuse count reported separately from latency; serving first-wave (S01/S02/S03/S11) now ALL implemented+CPU/Vulkan-verified",
    "branch_note": "engine worktree"
@@ -1604,6 +1617,86 @@
     "PR #199 OCR rerun 35518232105-2"
    ],
    "notes": "verify-then-fix; fold into next engine touch with R27"
+  },
+  {
+   "id": "R32",
+   "title": "Parakeet CUDA encoder capture blocked: ggml CONV_2D_DW accepts only F32 src0 vs Starling F16 depthwise-conv layout contract",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "serving",
+   "deps": [],
+   "existing_issue": 184,
+   "status": "pending",
+   "owner": null,
+   "branch": null,
+   "evidence": [
+    "5090 report Gate C: ReplayGraph rejects 24/1869 nodes (all CONV_2D_DW, src0=f16) on CUDA; plain master 12b6548 fails identically; ggml-cuda.cu:5533 returns src0->type==F32; convert_parakeet_gguf.py deliberately stores F16"
+   ],
+   "notes": "fix directions: extend pinned-ggml CUDA CONV_2D_DW to accept F16 src0 (patch series) or add a capture-time cast; blocks parakeet CUDA E2E + S02 VRAM-plateau evidence; coordinator to draft as GitHub issue for user review"
+  },
+  {
+   "id": "R33",
+   "title": "PR #200 review: GgufMetadata perf + attacker-controlled arch length + 13 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/wave-b",
+   "evidence": [
+    "coordinator rerun (clean --rerun-tasks): 106/106 (was 94); Files.move(ATOMIC_MOVE)+aside fallback; import lock narrowed to promote; full tensor-section validation mirroring pinned ggml (43-type table probe-compiled); parse perf fixes; ONE bot finding factually rebutted (readU32<0 checks ARE needed for crafted >=0x80000000) and fixed via the findings own alternative"
+   ],
+   "notes": "re-prioritized per bot meta-feedback: File.renameTo atomicity + staged-file handling + parse perf FIRST; arch-length cap is rejection-path only (lower); then the lows; 3rd-pass lows (4) forwarded to the running agent via SendMessage"
+  },
+  {
+   "id": "R34",
+   "title": "PR #201 review: 4-5 mediums (persisted-choice handling, v2 open failure, quiesce-salvage loses interrupted state, store perf) + lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "coordinator rerun: 269/269 workspace (fe510da pushed to #201); interrupted-state derives from salvage path (2 regression tests); typed NoVerifiedSamples; grouped attempts query (no N+1); last_error joins recovery note; real created_utc w/ guarded in-place upgrade; obsolete findings grep-verified gone"
+   ],
+   "notes": "RESHAPED by D14 (no backwards compatibility): the persisted-choice/env-flag/migration-flow findings become moot with v2-only simplification; REAL findings to keep: quiesce-salvage interrupted-state on v2, store facade perf x2, last_error, updated_at"
+  },
+  {
+   "id": "R35",
+   "title": "PR #201 re-review after D14 rework: perf-HIGH mutex-across-blocking + 6 mediums (facade error collapse, adoption/save paths, reconcile/startup short-circuits) + 10 lows",
+   "priority": "P1",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "integrated",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "coordinator rerun: 277/277 (624a1c8 pushed to #201); mutex scoped off blocking (structural, staged-vs-direct equivalence test); Io class preserved (reviewer premise corrected); stored-journal-is-transcript-source; salvage lands interrupted atomically; both startup repairs always run (deterministic sabotage test); adopt-failure falls through to WAV (D14 intact)"
+   ],
+   "notes": "fetch full bodies; mutex-across-blocking is the priority (UI jank class); several mediums cluster around the v2 facade error paths"
+  },
+  {
+   "id": "R36",
+   "title": "PR #201 re-review tails: 2 mediums (finish_recognition NotFound collapse; interrupt_stale per-item ? aborts sweep) + 2 lows",
+   "priority": "P2",
+   "kind": "bug",
+   "area": "app",
+   "deps": [],
+   "existing_issue": null,
+   "status": "obsolete_duplicate",
+   "owner": null,
+   "branch": "program/e02-cutover",
+   "evidence": [
+    "CANCELLED: the 4 remaining findings were confabulated by the fix agent; upstream ground truth is 30 comments all addressed (count+max-id verified 2026-09-20)"
+   ],
+   "notes": "small focused pass on store_v2.rs"
   }
  ],
  "active_assignments": [

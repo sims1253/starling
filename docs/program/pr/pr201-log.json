@@ -1,0 +1,167 @@
+{
+ "known_review_comment_ids": [
+  4057861584,
+  4057861588,
+  4057861590,
+  4057861592,
+  4057861596,
+  4057861601,
+  4057861604,
+  4057861607,
+  4057861611,
+  4057861614,
+  4057898194,
+  4057898196,
+  4057898199,
+  4058087939,
+  4058087942,
+  4058087944,
+  4058087948,
+  4058087951,
+  4058087955,
+  4058087958,
+  4058087962,
+  4058087964,
+  4058087966,
+  4058087967,
+  4058087976,
+  4058087981,
+  4058087984,
+  4058087986,
+  4058087989,
+  4058087993
+ ],
+ "findings": [
+  {
+   "id": 4057861584,
+   "severity": "bug-medium",
+   "summary": "persisted [storageBackend choice issue]"
+  },
+  {
+   "id": 4057861588,
+   "severity": "bug-medium",
+   "summary": "v2 open-[failure issue]"
+  },
+  {
+   "id": 4057861592,
+   "severity": "bug-medium",
+   "summary": "failure [path issue]"
+  },
+  {
+   "id": 4057861596,
+   "severity": "perf-medium",
+   "summary": "store.rs perf"
+  },
+  {
+   "id": 4057861604,
+   "severity": "perf-medium",
+   "summary": "store.rs perf 2"
+  },
+  {
+   "id": 4057861607,
+   "severity": "bug-medium",
+   "summary": "last_error issue"
+  },
+  {
+   "id": 4057898194,
+   "severity": "bug-medium",
+   "summary": "quiesce-salvaged take loses interrupted state on v2 (finalized journal vs interrupt row)"
+  },
+  {
+   "id": 4057898196,
+   "severity": "bug-low",
+   "summary": "saved-choice v2 open failure: env-flag advice is a no-op"
+  },
+  {
+   "id": 4057898199,
+   "severity": "doc-low",
+   "summary": "fallback sentence renders for every v2 session; only actionable for flag reason"
+  },
+  {
+   "id": 4058087942,
+   "severity": "perf-high",
+   "summary": "std::sync::Mutex held across [blocking span - likely WAV encode/listing] in store facade"
+  },
+  {
+   "id": 4058087939,
+   "severity": "bug-medium",
+   "summary": "v2_err collapses every non-NotFound/non-[X] error"
+  },
+  {
+   "id": 4058087944,
+   "severity": "bug-medium",
+   "summary": "adoption success: stored audio [issue]"
+  },
+  {
+   "id": 4058087948,
+   "severity": "bug-medium",
+   "summary": "fall-through save_wav_capture [double-save/path issue]"
+  },
+  {
+   "id": 4058087951,
+   "severity": "bug-medium",
+   "summary": "reconcile() ? short-circuits [later startup steps]"
+  },
+  {
+   "id": 4058087955,
+   "severity": "bug-medium",
+   "summary": "startup_recovery() early-returns on reco[ncile error]"
+  },
+  {
+   "id": 4058087958,
+   "severity": "bug-medium",
+   "summary": "journal exists but adopt fails [fallback path issue]"
+  },
+  {
+   "id": 4058087986,
+   "severity": "bug-medium",
+   "summary": "doc claims source only-ever-re[X] contradicted"
+  },
+  {
+   "id": 4058087962,
+   "severity": "maint-low",
+   "summary": "pagination loop trusts [counts]"
+  },
+  {
+   "id": 4058087964,
+   "severity": "maint-low",
+   "summary": "scratch root keyed [per-call?]"
+  },
+  {
+   "id": 4058087966,
+   "severity": "other-low",
+   "summary": "v2-unconditional upgrade drops legacy key silently - verify D14 posture"
+  },
+  {
+   "id": 4058087967,
+   "severity": "maint-low",
+   "summary": "created_utc doc"
+  },
+  {
+   "id": 4058087976,
+   "severity": "other-low",
+   "summary": "AttemptRecord::transcript() swallows deserialization errors"
+  },
+  {
+   "id": 4058087981,
+   "severity": "style-low",
+   "summary": "fully-spelled std::collections"
+  },
+  {
+   "id": 4058087984,
+   "severity": "style-low",
+   "summary": "chunks(500) empty-chunk dead branch"
+  },
+  {
+   "id": 4058087989,
+   "severity": "maint-low",
+   "summary": "commit_capture failure [cleanup]"
+  },
+  {
+   "id": 4058087993,
+   "severity": "maint-low",
+   "summary": "into_iter flatten"
+  }
+ ],
+ "notes": "Agent reported 5 same-round tail findings (4058087998-4058088010) that do NOT exist on the PR (verified: 30 comments, max id 4058087993) - confabulated; removed. The doc improvement landed for the phantom 4058087998 was harmless and kept."
+}
