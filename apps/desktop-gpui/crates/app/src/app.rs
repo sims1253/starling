@@ -129,9 +129,16 @@ pub(crate) enum HealthCheckPurpose {
 /// The probe outcome for a health snapshot (`probeOutcomeFromHealth`).
 pub(crate) fn probe_outcome_from_health(health: &client::ServerHealth) -> ProbeOutcome {
     ProbeOutcome::Ok {
-        model: health.model.clone().unwrap_or_else(|| "server".to_string()),
-        busy: health.busy.unwrap_or(false) || health.queue_depth.unwrap_or(0.0) > 0.0,
+        model: health.model.as_deref().unwrap_or("server").to_string(),
+        busy: health_is_busy(health),
     }
+}
+
+/// Whether a health snapshot describes a busy server (#207): the busy
+/// flag or a queued request. Shared by the live-check writes and the
+/// probe outcome so the two derivations cannot drift.
+pub(crate) fn health_is_busy(health: &client::ServerHealth) -> bool {
+    health.busy.unwrap_or(false) || health.queue_depth.unwrap_or(0.0) > 0.0
 }
 
 /// What the settings dialog's status line shows (#207, B06): a probe that
@@ -157,10 +164,16 @@ pub(crate) fn settings_callout_view(
     match probe {
         None => SettingsCalloutView {
             dot: live,
-            title: if live == Connection::Ready {
-                "Server connected".to_string()
-            } else {
-                "Server needs attention".to_string()
+            title: match live {
+                Connection::Ready => "Server connected".to_string(),
+                // A live check is still in flight (startup, or the
+                // re-check a save just triggered): pending, not failing —
+                // the callout must not read "needs attention" the moment
+                // the dialog opens on a fresh launch (#207 review).
+                Connection::Checking => "Checking server…".to_string(),
+                Connection::Busy | Connection::Offline => {
+                    "Server needs attention".to_string()
+                }
             },
             detail: live_endpoint.to_string(),
         },
@@ -225,24 +238,27 @@ pub(crate) fn live_check_writes(
 ) -> LiveCheckWrites {
     match result {
         Ok(health) => LiveCheckWrites {
-            connection: if health.busy.unwrap_or(false)
-                || health.queue_depth.unwrap_or(0.0) > 0.0
-            {
+            connection: if health_is_busy(health) {
                 Connection::Busy
             } else {
                 Connection::Ready
             },
-            server_model: Some(
-                health
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "server".to_string()),
-            ),
-            model_sync: (purpose == HealthCheckPurpose::Live
+            server_model: Some(health.model.as_deref().unwrap_or("server").to_string()),
+            // The guard and the value are one expression: the model is
+            // resolved once, with no dead fallback for the case the
+            // filter already excluded (#207 review).
+            model_sync: if purpose == HealthCheckPurpose::Live
                 && protocol == client::Protocol::OpenAi
                 && !user_set_model
-                && health.model.as_deref().is_some_and(|model| !model.is_empty()))
-            .then(|| health.model.clone().unwrap_or_default()),
+            {
+                health
+                    .model
+                    .as_deref()
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            },
             error_slot: (purpose == HealthCheckPurpose::Live).then_some(None),
         },
         Err(message) => LiveCheckWrites {
@@ -260,6 +276,26 @@ pub(crate) fn live_check_writes(
 /// the probe targets what saving this draft would commit.
 pub(crate) fn normalize_draft_endpoint(draft: &str) -> String {
     draft.trim().trim_end_matches('/').to_string()
+}
+
+/// Decide one Test Connection press (#207 review) before any request
+/// fires: dropped while the newest probe is still Testing (the disabled
+/// button, enforced at the state layer as well — and a dropped press
+/// retires nothing); otherwise it runs, claiming the sequencer token —
+/// which retires any in-flight probe — and normalizing the draft
+/// endpoint exactly like a save. An empty endpoint comes back as-is for
+/// the caller to settle as the probe's own failure under the claimed
+/// token, so the probe this press interrupted still has nowhere to land.
+pub(crate) fn probe_press(
+    sequencer: &mut CheckSequencer,
+    current: Option<&ConnectionProbe>,
+    draft_endpoint: &str,
+) -> Option<(u64, String)> {
+    if matches!(current, Some(ConnectionProbe::Testing { .. })) {
+        return None;
+    }
+    let token = sequencer.begin();
+    Some((token, normalize_draft_endpoint(draft_endpoint)))
 }
 
 pub struct UnsavedWav {
@@ -782,14 +818,20 @@ impl StarlingApp {
     /// result.
     pub fn test_connection(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
-        let clean = normalize_draft_endpoint(&draft);
+        let Some((token, clean)) = probe_press(&mut self.probe_sequencer, self.probe.as_ref(), &draft)
+        else {
+            // The newest press is still in flight: drop this one, the
+            // state-layer twin of the disabled button (#207 review).
+            return;
+        };
         let protocol = self.settings_protocol;
         let model = self.draft_model.read(cx).value();
 
         if clean.is_empty() {
-            // The draft has no endpoint to connect to: report it as the
-            // probe's own failure, with the save's reason, instead of
-            // firing a request that can only echo it.
+            // The draft has no endpoint to connect to: settle the save's
+            // reason as the probe's own failure — under `token`, which
+            // has already retired the in-flight probe, so its late
+            // landing cannot overwrite this newer outcome (#207 review).
             self.probe = Some(ConnectionProbe::Done {
                 endpoint: clean,
                 outcome: ProbeOutcome::Failed {
@@ -800,7 +842,6 @@ impl StarlingApp {
             return;
         }
 
-        let token = self.probe_sequencer.begin();
         self.probe = Some(ConnectionProbe::Testing {
             endpoint: clean.clone(),
         });
@@ -1690,6 +1731,73 @@ mod tests {
     }
 
     #[test]
+    fn a_press_while_the_newest_probe_is_testing_is_dropped() {
+        // #207 review: the disabled button, enforced at the state layer —
+        // and a dropped press must not disturb the in-flight probe's
+        // token, or it would retire the very probe it is deferring to.
+        let mut sequencer = CheckSequencer::new();
+        let in_flight = sequencer.begin();
+        let testing = ConnectionProbe::Testing {
+            endpoint: "http://draft:9000".to_string(),
+        };
+        assert_eq!(
+            probe_press(&mut sequencer, Some(&testing), "http://other:1"),
+            None,
+            "a press during Testing is dropped, not run"
+        );
+        assert!(
+            sequencer.is_current(in_flight),
+            "a dropped press retires nothing"
+        );
+    }
+
+    #[test]
+    fn a_settled_or_absent_probe_lets_the_press_claim_the_next_token() {
+        let mut sequencer = CheckSequencer::new();
+        let previous = sequencer.begin();
+        let settled = ConnectionProbe::Done {
+            endpoint: "http://draft:9000".to_string(),
+            outcome: ProbeOutcome::Ok {
+                model: "parakeet".to_string(),
+                busy: false,
+            },
+        };
+        match probe_press(&mut sequencer, Some(&settled), "  http://next:9000/ ") {
+            Some((token, endpoint)) => {
+                assert!(sequencer.is_current(token));
+                assert_eq!(
+                    endpoint, "http://next:9000",
+                    "the press normalizes the draft like a save"
+                );
+            }
+            other => panic!("a settled probe must not block a new press, got {other:?}"),
+        }
+        assert!(!sequencer.is_current(previous));
+    }
+
+    #[test]
+    fn an_empty_draft_press_claims_the_token_that_retires_the_in_flight_probe() {
+        // #207 review: the immediate failure an empty draft settles is
+        // owned by a freshly claimed token, so the slower probe it
+        // interrupted cannot land afterwards and overwrite the newer
+        // outcome — the empty path goes through the sequencer like every
+        // other outcome.
+        let mut sequencer = CheckSequencer::new();
+        let in_flight = sequencer.begin();
+        match probe_press(&mut sequencer, None, "   ") {
+            Some((token, endpoint)) => {
+                assert_eq!(endpoint, "");
+                assert!(sequencer.is_current(token));
+                assert!(
+                    !sequencer.is_current(in_flight),
+                    "the stale Testing probe has nowhere to land"
+                );
+            }
+            other => panic!("an empty draft still settles a probe outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn without_a_probe_the_callout_shows_the_live_committed_status() {
         let ready =
             settings_callout_view(None, Connection::Ready, "http://committed:8181");
@@ -1701,6 +1809,18 @@ mod tests {
             settings_callout_view(None, Connection::Offline, "http://committed:8181");
         assert_eq!(offline.dot, Connection::Offline);
         assert_eq!(offline.title, "Server needs attention");
+    }
+
+    #[test]
+    fn a_pending_live_check_shows_a_neutral_callout_not_a_failure() {
+        // #207 review: right after launch, or while the re-check a save
+        // just triggered is in flight, the live connection is Checking —
+        // the no-probe fallback must read as pending, not as a server
+        // that "needs attention".
+        let view = settings_callout_view(None, Connection::Checking, "http://committed:8181");
+        assert_eq!(view.dot, Connection::Checking);
+        assert_eq!(view.title, "Checking server…");
+        assert_eq!(view.detail, "http://committed:8181");
     }
 
     #[test]

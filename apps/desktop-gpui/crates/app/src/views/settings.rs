@@ -168,16 +168,19 @@ pub fn render_settings_modal(
                         .border_1()
                         .border_color(theme::SETTINGS_FOOT_LINE)
                         .text_size(px(10.))
-                        // B06 (#207): one probe at a time — the button is
-                        // inert while the newest press is still in flight.
+                        // B06 (#207): one probe at a time — while the
+                        // newest press is in flight the button carries no
+                        // click handler at all (and `test_connection`
+                        // drops re-entrant presses as the state-layer
+                        // twin of the same guard).
                         .when(!probing, |button| {
                             button
                                 .cursor_pointer()
                                 .hover(|style| style.bg(theme::PAPER_HOVER))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.test_connection(cx);
+                                }))
                         })
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.test_connection(cx);
-                        }))
                         .child(if probing {
                             "Testing…"
                         } else {
