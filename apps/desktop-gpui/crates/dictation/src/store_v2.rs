@@ -1722,7 +1722,15 @@ impl StoreV2 {
                     "attempt marker {attempt_id} is already held"
                 ))));
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                // A flock that errored (I/O trouble, not contention) must
+                // not leave the freshly created marker behind either — the
+                // id is minted, so nothing legitimate is unlinked (#213
+                // review, second round).
+                drop(file);
+                let _ = std::fs::remove_file(self.attempt_lock_path(attempt_id));
+                return Err(err.into());
+            }
         };
         // Best-effort: on flock platforms the lock decides ownership and
         // the PID is observability; where flock cannot answer, a PID that
@@ -2215,9 +2223,10 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
 /// Without flock there is no lock to ask (#213 review): the probe answers
 /// [`FlockEvidence::Unknown`] and the marker's recorded PID decides
 /// ownership instead (see [`attempt_owned_from`]). Every desktop target
-/// this port builds today is unix; this arm keeps the crate honest
-/// wherever it compiles without one, degrading to PID-liveness rather
-/// than to "no owner".
+/// this port builds today is unix; on flock-less platforms foreign PIDs
+/// read as dead so crash-orphaned attempts stay sweepable — the
+/// multi-instance spare is then unix-only, matching what the reference
+/// can guarantee without a lock manager.
 #[cfg(not(unix))]
 fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
     Ok(FlockEvidence::Unknown)
@@ -2237,13 +2246,18 @@ fn process_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Without a std primitive to ask the OS about a PID (#213 review), the
-/// recorded owner is presumed alive and the marker reads as held (see
-/// [`attempt_owned_from`]) — the safe direction, at the cost of sweeping
-/// marker-bearing attempts only on platforms where liveness can be asked.
+/// Without a std primitive to ask the OS about a foreign PID (#213
+/// review), it is presumed dead: this process's OWN attempts are spared
+/// by the in-process registry before any marker is probed, so the only
+/// markers read here belong to other processes — unknowable liveness
+/// must not turn every crash-orphaned attempt into a permanently stuck
+/// `started` row. The cost is that a second live instance on a flock-less
+/// platform can have its attempt interrupted, the same degradation the
+/// Electron reference accepts without a lock manager; unix keeps the
+/// full cross-process guarantee via flock.
 #[cfg(not(unix))]
 fn process_is_alive(_pid: u32) -> bool {
-    true
+    false
 }
 
 fn int64(value: u64) -> Result<i64, StoreV2Error> {
