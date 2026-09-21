@@ -60,14 +60,16 @@ function flat(groups: readonly (readonly InsightEvent[])[]): readonly InsightEve
 }
 
 /** A deletion tombstone for `captureId` — the deletion guarantee under test. */
-function deleted(captureId: string, occurredAt: string): CaptureDeletedEvent {
-  return {
-    schema_version: 1,
-    event_id: `cd-${captureId}`,
-    capture_id: captureId,
-    occurred_at: occurredAt,
-    type: "capture_deleted",
-  };
+function deleted(captureId: string, occurredAt: string): readonly CaptureDeletedEvent[] {
+  return [
+    {
+      schema_version: 1,
+      event_id: `cd-${captureId}`,
+      capture_id: captureId,
+      occurred_at: occurredAt,
+      type: "capture_deleted",
+    },
+  ];
 }
 
 describe("dayTotals", () => {
