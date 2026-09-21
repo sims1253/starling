@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use starling_dictation::recorder::{CaptureGap, CapturedTake, RecorderError};
+use starling_dictation::recorder::{CaptureGap, CapturedTake, RecorderError, RecorderFault};
 
 use crate::machine::capture::{CaptureSession, CaptureSource};
 use crate::provider::FakeJob;
@@ -21,13 +21,21 @@ pub struct FakeTakeScript {
     pub samples_per_second: u64,
     /// Gap spans to surface, with the delay before each appears.
     pub gaps: Vec<(Duration, CaptureGap)>,
-    /// A capture error to surface after the delay; journal-flavored
-    /// strings are non-fatal, everything else is a device fault.
-    pub error_after: Option<(Duration, String)>,
+    /// A capture fault to surface after the delay, typed by origin:
+    /// [`RecorderFault::Journal`] is non-fatal (one `capture.error{
+    /// journal_fault}` event, capture continues),
+    /// [`RecorderFault::Device`] is fatal (the take is interrupted).
+    /// Fatality follows the variant, never the message text (issue #216).
+    pub error_after: Option<(Duration, RecorderFault)>,
     /// What `stop()` returns.
     pub stop: FakeStop,
     /// Amplitude of the synthesized audio (level metering input).
     pub amplitude: f32,
+    /// Cap on how many samples the fake synthesizes for a take's audio:
+    /// the default keeps every test fast, while a test that needs a
+    /// genuinely long WAV encode (one the scheduler must not stall on,
+    /// issue #216) raises it to synthesize a multi-minute take.
+    pub sample_cap: u64,
 }
 
 /// What a scripted session's stop handshake does.
@@ -56,6 +64,7 @@ impl Default for FakeTakeScript {
                 ack_fraction: 1.0,
             },
             amplitude: 0.25,
+            sample_cap: 64_000,
         }
     }
 }
@@ -93,11 +102,11 @@ impl CaptureSession for FakeSession {
             .map(|(_, gap)| *gap)
             .collect()
     }
-    fn capture_error(&self) -> Option<String> {
-        // The fake keeps the error surfaced once its delay elapses; the
+    fn capture_fault(&self) -> Option<RecorderFault> {
+        // The fake keeps the fault surfaced once its delay elapses; the
         // recorder's actor-side classification handles first-error-wins.
         match &self.script.error_after {
-            Some((delay, message)) if self.started.elapsed() >= *delay => Some(message.clone()),
+            Some((delay, fault)) if self.started.elapsed() >= *delay => Some(fault.clone()),
             _ => None,
         }
     }
@@ -112,7 +121,7 @@ impl CaptureSession for FakeSession {
                 ack_fraction,
             } => {
                 let count = produced.max(1);
-                let samples = fake_samples(count, self.script.amplitude);
+                let samples = fake_samples(&self.script, count);
                 let ack = ((count as f64) * ack_fraction).floor() as u64;
                 Ok(CapturedTake {
                     audio: starling_dictation::audio::PcmAudio {
@@ -132,7 +141,7 @@ impl CaptureSession for FakeSession {
             }
             FakeStop::QuiesceTimeout { journal_id } => {
                 let salvaged = produced;
-                let samples = fake_samples(salvaged, self.script.amplitude);
+                let samples = fake_samples(&self.script, salvaged);
                 Err(RecorderError::QuiesceTimeout {
                     acknowledged_samples: salvaged,
                     audio: starling_dictation::audio::PcmAudio {
@@ -169,14 +178,13 @@ fn captured_ack(script: &FakeTakeScript, started: Instant) -> u64 {
     }
 }
 
-fn fake_samples(count: u64, amplitude: f32) -> Vec<f32> {
+fn fake_samples(script: &FakeTakeScript, count: u64) -> Vec<f32> {
     // A slow sine so the level meter sees motion and the WAV encoder sees
-    // variety; bounded so tests stay fast regardless of count.
-    let count = count.min(64_000) as usize;
+    // variety; bounded by the script's cap so tests stay fast regardless
+    // of count (a test that needs a multi-minute take opts in).
+    let count = count.min(script.sample_cap) as usize;
     (0..count)
-        .map(|index| {
-            amplitude * (index as f32 * 0.05).sin()
-        })
+        .map(|index| script.amplitude * (index as f32 * 0.05).sin())
         .collect()
 }
 

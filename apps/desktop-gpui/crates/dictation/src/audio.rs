@@ -51,21 +51,31 @@ fn error(message: &str) -> AudioFormatError {
 /// `u32`/`u16` types make unrepresentable). Returns the effective channel
 /// count. Validation order matches the TS source.
 fn assert_pcm(audio: &PcmAudio) -> Result<usize, AudioFormatError> {
-    if audio.sample_rate == 0 {
+    assert_pcm_parts(&audio.samples, audio.sample_rate, audio.channels)
+}
+
+/// [`assert_pcm`] over borrowed parts (see [`encode_wav_16k_parts`] for
+/// why the borrowed form exists).
+fn assert_pcm_parts(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<usize, AudioFormatError> {
+    if sample_rate == 0 {
         return Err(error("sampleRate must be a positive integer"));
     }
 
-    let channels = audio.channels as usize;
+    let channels = channels as usize;
 
     if channels < 1 || channels > 64 {
         return Err(error("channels must be an integer between 1 and 64"));
     }
 
-    if audio.samples.is_empty() {
+    if samples.is_empty() {
         return Err(error("audio contains no samples"));
     }
 
-    if audio.samples.len() % channels != 0 {
+    if samples.len() % channels != 0 {
         return Err(error(
             "interleaved sample count is not divisible by channels",
         ));
@@ -77,12 +87,18 @@ fn assert_pcm(audio: &PcmAudio) -> Result<usize, AudioFormatError> {
 /// Mix interleaved PCM to mono without modifying the source.
 pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     let channels = assert_pcm(audio)?;
+    Ok(mix_samples_to_mono(&audio.samples, channels))
+}
 
+/// [`mix_to_mono`]'s arithmetic over a borrowed buffer (mono input is
+/// copied only because the return is owned; the encode fast path avoids
+/// even that).
+fn mix_samples_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
-        return Ok(audio.samples.clone());
+        return samples.to_vec();
     }
 
-    let frames = audio.samples.len() / channels;
+    let frames = samples.len() / channels;
     let mut mono = Vec::with_capacity(frames);
 
     for frame in 0..frames {
@@ -90,12 +106,12 @@ pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
         // Summed in f64 like JS, then rounded once on the f32 store.
         let mut sum = 0.0f64;
         for channel in 0..channels {
-            sum += audio.samples[base + channel] as f64;
+            sum += samples[base + channel] as f64;
         }
         mono.push((sum / channels as f64) as f32);
     }
 
-    Ok(mono)
+    mono
 }
 
 /// Resample interleaved floating-point PCM to mono 16 kHz.
@@ -119,22 +135,32 @@ pub fn mix_to_mono(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
 /// no inter-chunk filter state to carry; streaming/stateful resampling
 /// belongs to a capture-pipeline redesign, not to this function.
 pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
-    let mono = mix_to_mono(audio)?;
+    resample_to_16k_parts(&audio.samples, audio.sample_rate, audio.channels)
+}
 
-    if audio.sample_rate == STARLING_SAMPLE_RATE {
+/// [`resample_to_16k`]'s pipeline over borrowed parts.
+fn resample_to_16k_parts(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<f32>, AudioFormatError> {
+    let channels = assert_pcm_parts(samples, sample_rate, channels)?;
+    let mono = mix_samples_to_mono(samples, channels);
+
+    if sample_rate == STARLING_SAMPLE_RATE {
         return Ok(mono);
     }
 
     // R15: reject rates no real device produces instead of letting the
     // kernel width grow with them (~8.9 taps per 16 kHz of input rate).
-    if audio.sample_rate > MAX_RESAMPLE_INPUT_RATE {
+    if sample_rate > MAX_RESAMPLE_INPUT_RATE {
         return Err(error(&format!(
             "sampleRate must not exceed {MAX_RESAMPLE_INPUT_RATE} Hz"
         )));
     }
 
     let output_length = ((mono.len() as f64 * f64::from(STARLING_SAMPLE_RATE))
-        / f64::from(audio.sample_rate))
+        / f64::from(sample_rate))
     .round()
     .max(1.0) as usize;
 
@@ -146,7 +172,7 @@ pub fn resample_to_16k(audio: &PcmAudio) -> Result<Vec<f32>, AudioFormatError> {
     // inputs); tapCount covers upsampling too (ratio < 1 keeps the full
     // input band). With [`MAX_RESAMPLE_INPUT_RATE`] enforced above,
     // `half_taps` is bounded at 214.
-    let ratio = f64::from(audio.sample_rate) / f64::from(STARLING_SAMPLE_RATE);
+    let ratio = f64::from(sample_rate) / f64::from(STARLING_SAMPLE_RATE);
     let cutoff = 0.45 * f64::min(1.0, 1.0 / ratio);
     let half_taps = (4.0 / cutoff).ceil() as i64;
 
@@ -249,7 +275,38 @@ fn pcm16(sample: f32) -> i16 {
 
 /// Encode arbitrary floating-point PCM as mono 16 kHz PCM16 WAV.
 pub fn encode_wav_16k(audio: &PcmAudio) -> Result<Vec<u8>, AudioFormatError> {
-    let samples = resample_to_16k(audio)?;
+    encode_wav_16k_parts(&audio.samples, audio.sample_rate, audio.channels)
+}
+
+/// Encode borrowed floating-point PCM parts as mono 16 kHz PCM16 WAV —
+/// byte-for-byte what [`encode_wav_16k`] produces, without demanding an
+/// owned [`PcmAudio`].
+///
+/// The borrowed entry exists for callers that hold their samples behind a
+/// shared record (the runtime's take registry hands workers an
+/// `Arc<TakeRecord>`): a multi-minute take is tens of MB of f32 samples,
+/// and cloning them just to satisfy the owned-struct parameter — plus the
+/// mono-mix copy even mono input paid — is exactly the needless copying
+/// the WAV-encode-off-the-scheduler move must not add to (issue #216).
+/// The common upload shape (mono at the target rate) validates and
+/// encodes straight off the borrow; every other shape resamples through
+/// the same owned pipeline as before.
+pub fn encode_wav_16k_parts(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<u8>, AudioFormatError> {
+    if channels == 1 && sample_rate == STARLING_SAMPLE_RATE {
+        assert_pcm_parts(samples, sample_rate, channels)?;
+        return write_pcm16_wav(samples);
+    }
+    let samples = resample_to_16k_parts(samples, sample_rate, channels)?;
+    write_pcm16_wav(&samples)
+}
+
+/// Writes the mono 16 kHz PCM16 WAV image (44-byte RIFF header plus
+/// `pcm16`-encoded samples).
+fn write_pcm16_wav(samples: &[f32]) -> Result<Vec<u8>, AudioFormatError> {
     let data_size = samples.len() as u64 * 2;
 
     if data_size > u64::from(0xffff_ffffu32 - 36) {
@@ -271,7 +328,7 @@ pub fn encode_wav_16k(audio: &PcmAudio) -> Result<Vec<u8>, AudioFormatError> {
     bytes.extend_from_slice(b"data");
     bytes.extend_from_slice(&(data_size as u32).to_le_bytes());
 
-    for &sample in &samples {
+    for &sample in samples {
         bytes.extend_from_slice(&pcm16(sample).to_le_bytes());
     }
 

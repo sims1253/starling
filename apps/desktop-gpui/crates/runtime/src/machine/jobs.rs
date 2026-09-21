@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bus::EventBus;
-use crate::machine::capture::TakeRegistry;
+use crate::machine::capture::{TakeRecord, TakeRegistry};
 use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
 use crate::protocol::tables::JOBS;
 use crate::protocol::{Command, CompletionData, Event, JobLimits, RejectReason};
@@ -47,6 +47,12 @@ pub enum JobsMsg {
 pub enum WorkerReport {
     Partial(Partial),
     Done(ProviderOutcome),
+    /// The take's audio could not be prepared for recognition: the WAV
+    /// encode failed on the worker (the `Loading` failure, which used to
+    /// run synchronously on the scheduler loop — issue #216 moved it onto
+    /// the worker so a multi-minute encode cannot stall submits, cancels
+    /// and limit changes). A non-retryable job failure.
+    LoadFailed(String),
 }
 
 struct Job {
@@ -90,10 +96,23 @@ pub struct JobsActor {
     frozen_routes: FrozenRoutes,
     limits: JobLimits,
     waiting: VecDeque<String>,
+    /// Live and in-flight jobs only: an entry is removed when its job
+    /// reaches a terminal outcome (issue #216 — the map used to grow one
+    /// `MachineCore` per submit for the process lifetime, and
+    /// `duplicate_submission`'s scan paid for all of them). The guard
+    /// only ever compares *active* states, so terminal removal is safe;
+    /// `jobs.cancel` on a retired job answers `UnknownJob` instead of
+    /// `IllegalInState` (a documented consequence: the job is gone, not
+    /// merely finished).
     jobs: HashMap<String, Job>,
     active: HashSet<String>,
     /// Most recent job id (drives the snapshot's wire view).
     latest: Option<String>,
+    /// The wire view of the most recent job, retained after its entry is
+    /// retired on a terminal outcome: the projection keeps reporting
+    /// `Completed`/`Failed`/... instead of snapping back to `Idle`.
+    retired_state: String,
+    retired_violations: Vec<String>,
 }
 
 impl JobsActor {
@@ -121,6 +140,8 @@ impl JobsActor {
             jobs: HashMap::new(),
             active: HashSet::new(),
             latest: None,
+            retired_state: "Idle".to_string(),
+            retired_violations: Vec::new(),
         }
     }
 
@@ -140,12 +161,13 @@ impl JobsActor {
 
     fn publish_view(&self) {
         let latest_job = self.latest.as_ref().and_then(|id| self.jobs.get(id));
-        let state = latest_job
-            .map(|job| job.core.state().to_string())
-            .unwrap_or_else(|| "Idle".to_string());
-        let violations = latest_job
-            .map(|job| job.core.view().violations)
-            .unwrap_or_default();
+        // A retired job keeps its wire view in the snapshot: the entry is
+        // gone from the map (bounded, issue #216), but the projection
+        // still reports the terminal state it reached.
+        let (state, violations) = match latest_job {
+            Some(job) => (job.core.state().to_string(), job.core.view().violations),
+            None => (self.retired_state.clone(), self.retired_violations.clone()),
+        };
         let jobs = self
             .jobs
             .iter()
@@ -287,15 +309,29 @@ impl JobsActor {
                     .ok()
             })
             .is_some();
+        // Reply *before* emitting the outcome — the ordering every other
+        // actor already follows (issue #216). `bus.emit` applies bounded
+        // backpressure: it parks while any subscriber queue is full, so
+        // emitting first can park the actor with the submit's receipt
+        // still unsent. A caller that drains events and sends commands on
+        // the same thread (the natural GPUI pattern) then deadlocks on
+        // its own submit: the emit waits for a drain only that caller
+        // will ever perform, while the caller waits for the receipt.
+        // Receipt first breaks the cycle — the submit resolves, and any
+        // parking that follows is ordinary backpressure the caller
+        // unwinds by draining.
+        let _ = reply.try_send(Ok(Receipt::Accepted));
         if resolved {
             let _ = self.bus.emit(outcome_event, Some(&job_id));
         }
         if rejection.is_none() {
             self.waiting.push_back(job_id);
-            let _ = reply.try_send(Ok(Receipt::Accepted));
             self.try_dispatch();
         } else {
-            let _ = reply.try_send(Ok(Receipt::Accepted));
+            // Rejected at admission: `Rejected` is terminal, so the
+            // entry (created so the outcome could resolve on its own
+            // core) retires immediately instead of lingering in the map.
+            self.retire(&job_id);
         }
     }
 
@@ -326,6 +362,11 @@ impl JobsActor {
                 self.waiting.retain(|id| id != &job_id);
                 self.active.remove(&job_id);
                 let _ = reply.try_send(Ok(Receipt::Accepted));
+                // `jobs.cancel` entered `Cancelled` at commit — a
+                // terminal state, so the entry retires (issue #216). A
+                // worker still running for it reports into the void: its
+                // job is gone, so the report lands nowhere by design.
+                self.retire(&job_id);
                 self.try_dispatch();
             }
             Err(rejection) => {
@@ -379,44 +420,61 @@ impl JobsActor {
             if advanced.is_none() {
                 continue;
             }
-            match self.load_audio(&job_id) {
-                Ok(wav) => {
-                    if let Some(job) = self.jobs.get_mut(&job_id) {
-                        let _ = job.core.advance_internal("Recognizing");
-                    }
-                    self.active.insert(job_id.clone());
-                    self.spawn_worker(job_id, wav);
-                }
-                Err(reason) => {
-                    // Loading failed: the take's audio could not be
-                    // prepared — a non-retryable job failure.
-                    self.emit(
-                        &job_id,
-                        Event::JobsFailed {
-                            reason,
-                            retryable: false,
-                        },
-                    );
-                }
+            // The take's audio is fetched by handle (a registry lock and
+            // an `Arc` clone — microseconds); the WAV encode itself runs
+            // on the worker (issue #216): encoding a multi-minute take is
+            // whole-take CPU work producing tens of MB of WAV, and doing
+            // it on this loop stalled every `jobs.*` command behind it
+            // and deferred queued worker reports. The per-job core
+            // advances to `Recognizing` now, at dispatch (the projection
+            // observably sits there while the worker runs — the shape the
+            // #210 storm test gates on), and a load failure comes back as
+            // `WorkerReport::LoadFailed`.
+            let record = {
+                let registry = self.registry.lock().expect("take registry lock");
+                self.jobs
+                    .get(&job_id)
+                    .map(|job| job.capture_ref.clone())
+                    .and_then(|capture_ref| registry.get(&capture_ref).cloned())
+            };
+            // Per-job core advances to `Recognizing` at dispatch, BEFORE
+            // the worker spawns (the projection observably sits there while
+            // the worker runs — the shape the #210 storm test gates on). If
+            // the internal edge were ever refused, the job must NOT run
+            // with a core left behind in `Loading` — that snapshot would
+            // read as in-flight forever once retired (review on #248).
+            let recognized = self
+                .jobs
+                .get_mut(&job_id)
+                .and_then(|job| job.core.advance_internal("Recognizing").ok());
+            if recognized.is_none() {
+                // A refused internal edge is a machine invariant break, not
+                // a transient state: the candidate filter only re-selects
+                // `Queued` jobs, so re-queueing could never pick this one
+                // again — surface the failure and retire the entry instead
+                // of leaking a forever-in-flight snapshot (review on #248).
+                let state = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|job| job.core.state())
+                    .unwrap_or("?")
+                    .to_string();
+                self.emit(
+                    &job_id,
+                    Event::JobsFailed {
+                        reason: format!("internal dispatch refused in state {state}"),
+                        retryable: false,
+                    },
+                );
+                self.retire(&job_id);
+                continue;
             }
+            self.active.insert(job_id.clone());
+            self.spawn_worker(job_id, record);
         }
     }
 
-    fn load_audio(&self, job_id: &str) -> Result<Vec<u8>, String> {
-        let capture_ref = self
-            .jobs
-            .get(job_id)
-            .map(|job| job.capture_ref.clone())
-            .ok_or_else(|| "job vanished".to_string())?;
-        let take = {
-            let registry = self.registry.lock().expect("take registry lock");
-            registry.get(&capture_ref).cloned()
-        };
-        let take = take.ok_or_else(|| "capture audio unavailable".to_string())?;
-        take.to_wav()
-    }
-
-    fn spawn_worker(&mut self, job_id: String, wav: Vec<u8>) {
+    fn spawn_worker(&mut self, job_id: String, record: Option<Arc<TakeRecord>>) {
         let provider = Arc::clone(&self.provider);
         let inbox = self.worker_inbox.clone();
         let cancel = self
@@ -437,15 +495,34 @@ impl JobsActor {
                     let _ = deliver_worker_report(&inbox, &worker_job, report);
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The upload WAV is encoded here, on the worker
+                    // (issue #216): the encode is the take's whole audio
+                    // — tens of MB of WAV for a multi-minute take — and
+                    // running it on the scheduler loop stalled submits,
+                    // cancels and setLimits behind it. Encoding borrows
+                    // the shared record's samples (no clone to build the
+                    // encoder's owned-struct parameter) and the bytes
+                    // move straight into `recognize`; a failure at either
+                    // the lookup or the encode is the `Loading` failure,
+                    // shipped back as a report.
+                    let wav = match record
+                        .as_deref()
+                        .map(TakeRecord::to_wav)
+                        .unwrap_or_else(|| Err("capture audio unavailable".to_string()))
+                    {
+                        Ok(wav) => wav,
+                        Err(reason) => return Err(reason),
+                    };
                     let mut on_partial = |partial: Partial| {
                         if !cancel.load(Ordering::Acquire) {
                             report(WorkerReport::Partial(partial));
                         }
                     };
-                    provider.recognize(wav, &worker_job, &mut on_partial)
+                    Ok(provider.recognize(wav, &worker_job, &mut on_partial))
                 }));
                 match outcome {
-                    Ok(result) => report(WorkerReport::Done(result)),
+                    Ok(Ok(result)) => report(WorkerReport::Done(result)),
+                    Ok(Err(reason)) => report(WorkerReport::LoadFailed(reason)),
                     Err(_) => report(WorkerReport::Done(ProviderOutcome::Failed {
                         reason: "worker_crash".to_string(),
                         retryable: true,
@@ -461,6 +538,7 @@ impl JobsActor {
                 },
             );
             self.active.remove(&job_id);
+            self.retire(&job_id);
         }
     }
 
@@ -518,6 +596,7 @@ impl JobsActor {
                     }),
                 );
                 self.active.remove(&job_id);
+                self.retire(&job_id);
                 self.try_dispatch();
             }
             WorkerReport::Done(ProviderOutcome::Failed { reason, retryable }) => {
@@ -527,7 +606,64 @@ impl JobsActor {
                 }
                 self.emit(&job_id, Event::JobsFailed { reason, retryable });
                 self.active.remove(&job_id);
+                self.retire(&job_id);
                 self.try_dispatch();
+            }
+            WorkerReport::LoadFailed(reason) => {
+                if cancelled {
+                    self.active.remove(&job_id);
+                    return;
+                }
+                // The `Loading` failure, reported from the worker: the
+                // take's audio could not be prepared for recognition —
+                // a non-retryable job failure.
+                self.emit(
+                    &job_id,
+                    Event::JobsFailed {
+                        reason,
+                        retryable: false,
+                    },
+                );
+                self.active.remove(&job_id);
+                self.retire(&job_id);
+                self.try_dispatch();
+            }
+        }
+    }
+
+    /// Removes a job that reached a terminal state (Completed, Failed,
+    /// Cancelled, Rejected), retaining its wire view for the snapshot.
+    ///
+    /// The map holds only in-flight jobs: without this, a long session
+    /// leaked one `MachineCore` per submit and every admission check
+    /// scanned all of them (issue #216). Terminal removal is safe for the
+    /// `duplicate_submission` guard — it compares only active states —
+    /// so no recent-id memory is needed; the one observable change is
+    /// that `jobs.cancel` for an already-finished job answers
+    /// `UnknownJob` rather than `IllegalInState` (the job is gone, not
+    /// merely finished).
+    fn retire(&mut self, job_id: &str) {
+        if let Some(job) = self.jobs.remove(job_id) {
+            let state = job.core.state();
+            // The retained view is permanent — the entry is gone from the
+            // map, so nothing can ever update it again. Only a TERMINAL
+            // state may be frozen into it (review on #248): a retire from
+            // a non-terminal state (a refused emit path) keeps the
+            // previous retained view rather than freezing "in-flight"
+            // forever; the debug_assert fires in testing on the invariant
+            // break itself.
+            debug_assert!(
+                matches!(
+                    state,
+                    "Completed" | "Failed" | "Cancelled" | "Rejected"
+                ),
+                "retiring job {job_id} in non-terminal state {state}"
+            );
+            if matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected")
+                && self.latest.as_deref() == Some(job_id)
+            {
+                self.retired_state = state.to_string();
+                self.retired_violations = job.core.view().violations;
             }
         }
     }
@@ -570,6 +706,7 @@ fn deliver_worker_report(
         WorkerReport::Partial(_) => "partial",
         WorkerReport::Done(ProviderOutcome::Completed { .. }) => "done(completed)",
         WorkerReport::Done(ProviderOutcome::Failed { .. }) => "done(failed)",
+        WorkerReport::LoadFailed(_) => "load_failed",
     };
     let sent = match inbox.try_send(JobsMsg::Worker {
         job: job.to_string(),
@@ -592,6 +729,11 @@ fn deliver_worker_report(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use crate::bus::EventBus;
+    use crate::machine::capture::TakeStatus;
+    use crate::machine::context::FrozenRoutes;
+    use crate::protocol::JobLimits;
 
     fn completed(text: &str) -> ProviderOutcome {
         ProviderOutcome::Completed {
@@ -640,6 +782,124 @@ mod tests {
             deliver_worker_report(&tx, "job-2", WorkerReport::Done(completed("lost"))),
             Err(crate::channel::RecvError::Closed)
         );
+    }
+
+    /// Issue #216 part 1: the submit's receipt is sent *before* the
+    /// `jobs.queued`/`jobs.rejected` emit. `EventBus::emit` applies
+    /// bounded backpressure — it parks while any subscriber queue is
+    /// full — so emitting first could park the actor with the receipt
+    /// still unsent, deadlocking a caller that drains events and sends
+    /// commands on the same thread (the emit waits for a drain only that
+    /// caller will perform, while the caller waits on the receipt).
+    ///
+    /// The proof: with the only subscriber's queue already full, the
+    /// receipt still arrives while the emit is parked behind it, and the
+    /// outcome event only lands once the queue is drained.
+    #[test]
+    fn submit_receipt_precedes_the_outcome_emit_even_under_backpressure() {
+        let bus = Arc::new(EventBus::new(1));
+        let subscription = bus.subscribe();
+        // Occupy the only subscriber slot: the next emit will park.
+        bus.emit(
+            Event::JobsProgress {
+                partial: "prefill".into(),
+                stability_hint: "stable".into(),
+            },
+            None,
+        )
+        .expect("prefill emit");
+
+        let (inbox_tx, inbox) = crate::channel::bounded::<JobsMsg>(4);
+        let worker_inbox = inbox_tx.clone();
+        drop(inbox_tx);
+        let registry: TakeRegistry = Arc::default();
+        registry.lock().unwrap().insert(
+            "take_p".into(),
+            Arc::new(TakeRecord {
+                id: "take_p".into(),
+                device: "default-input".into(),
+                policy: "push-to-talk".into(),
+                samples: vec![0.0, 0.25, -0.25, 0.5],
+                sample_rate: 16_000,
+                gaps: vec![],
+                acknowledged_samples: 4,
+                final_sample_index: 4,
+                journal: None,
+                status: TakeStatus::Complete,
+                sample_duration_ms: 0.25,
+                wall_clock_ms: 1.0,
+                capture_id: "cap_p".into(),
+            }),
+        );
+        let frozen_routes: FrozenRoutes = Arc::default();
+        frozen_routes
+            .lock()
+            .unwrap()
+            .insert("local-default".into(), "code-guidance".into());
+        let limits = JobLimits {
+            max_queued: 2,
+            max_concurrent: 1,
+            per_route: vec![],
+        };
+        let mut actor = JobsActor::new(
+            inbox,
+            worker_inbox,
+            Arc::clone(&bus),
+            Arc::new(Mutex::new(JobsSnapshot {
+                state: "Idle".into(),
+                limits: limits.clone(),
+                waiting: 0,
+                active: 0,
+                jobs: vec![],
+                violations: vec![],
+            })),
+            crate::provider::FakeProvider::new(vec![crate::provider::FakeJob::completes_with(
+                "done",
+            )]),
+            registry,
+            frozen_routes,
+            limits,
+        );
+        let (reply_tx, reply_rx) = crate::channel::bounded(1);
+        let submitter = std::thread::spawn(move || {
+            actor.handle_submit(
+                reply_tx,
+                Some("job-p".into()),
+                "take_p".into(),
+                "local-default".into(),
+                "standard".into(),
+            );
+        });
+
+        // The receipt must arrive while the outcome emit is parked on the
+        // full subscriber queue — this is exactly the ordering the fix
+        // pins, and the deadlock the old emit-first shape could produce.
+        let receipt = reply_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the submit receipt must not queue behind the outcome emit");
+        assert!(receipt.is_ok(), "expected Accepted, got {receipt:?}");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !submitter.is_finished(),
+            "the outcome emit should still be parked on the full subscriber queue"
+        );
+
+        // Draining unparks the actor; the queued outcome then lands.
+        assert_eq!(
+            subscription
+                .recv_timeout(Duration::from_secs(1))
+                .expect("prefill event")
+                .type_name(),
+            "jobs.progress"
+        );
+        assert_eq!(
+            subscription
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued outcome after the drain")
+                .type_name(),
+            "jobs.queued"
+        );
+        submitter.join().expect("submitter thread");
     }
 
     #[test]

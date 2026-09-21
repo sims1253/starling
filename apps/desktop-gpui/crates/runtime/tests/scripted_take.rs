@@ -16,12 +16,13 @@
 
 use std::time::{Duration, Instant};
 
-use starling_dictation::recorder::CaptureGap;
+use starling_dictation::recorder::{CaptureGap, RecorderFault};
 use starling_runtime::bus::{EventMessage, EventSub};
 use starling_runtime::machine::capture::{
     CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
 };
 use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
+use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, Event, JobLimits, Revision};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript, FakeStop};
 use starling_runtime::{
@@ -776,7 +777,10 @@ fn quiesce_timeout_salvages_samples_as_interrupted_take() {
 #[test]
 fn fatal_device_error_mid_take_interrupts() {
     let source = FakeCaptureSource::new(vec![FakeTakeScript {
-        error_after: Some((Duration::from_millis(15), "DeviceUnavailable".into())),
+        error_after: Some((
+            Duration::from_millis(15),
+            RecorderFault::Device("DeviceUnavailable".into()),
+        )),
         stop: FakeStop::Clean {
             journal_id: "j_lost".into(),
             ack_fraction: 1.0,
@@ -1453,7 +1457,10 @@ fn fatal_mid_take_salvage_keeps_gap_evidence() {
             Duration::from_millis(5),
             CaptureGap { start_sample: 160, end_sample: 320 },
         )],
-        error_after: Some((Duration::from_millis(15), "DeviceUnavailable".into())),
+        error_after: Some((
+            Duration::from_millis(15),
+            RecorderFault::Device("DeviceUnavailable".into()),
+        )),
         stop: FakeStop::Clean {
             journal_id: "j_lost2".into(),
             ack_fraction: 1.0,
@@ -1507,5 +1514,359 @@ fn fatal_mid_take_salvage_keeps_gap_evidence() {
         record.journal.as_ref().expect("journal linkage").id,
         "j_lost2"
     );
+    runtime.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #216: runtime actor hygiene
+// ---------------------------------------------------------------------------
+
+/// Part 2: terminal jobs leave the scheduler's map (no one-`MachineCore`
+/// -per-submit leak across a long session) while the wire view keeps
+/// reporting the last terminal state, and the duplicate-submission guard
+/// still catches in-flight duplicates — terminal ones are forgotten, by
+/// design (the guard compares active states only).
+#[test]
+fn terminal_jobs_retire_from_the_map_while_the_wire_view_and_duplicate_guard_hold() {
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = starling_runtime::provider::FakeProvider::new(vec![
+        FakeJob::completes_with("first"),
+        FakeJob::completes_with("second"),
+        FakeJob::completes_with("third"),
+        FakeJob::completes_with("fourth"),
+    ]);
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    run_take(&source, &client, &events, "take_r", FakeTakeScript::clean());
+
+    // Job one completes and is retired: the map empties, the wire view
+    // keeps its terminal state.
+    client
+        .send(Some("job-r1"), Command::JobsSubmit {
+            capture_ref: "take_r".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("job-r1 accepted");
+    until(
+        &events,
+        "jobs.completed(job-r1)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-r1"),
+        Duration::from_secs(5),
+    );
+    wait_for_projection(
+        &client,
+        "job-r1 must be Completed and retired from the map",
+        |s| s.jobs.state == "Completed" && s.jobs.jobs.is_empty(),
+        Duration::from_secs(5),
+    );
+
+    // A retired job is gone, not merely finished: cancel answers
+    // UnknownJob (the documented shape of terminal removal).
+    assert!(matches!(
+        client.send(Some("job-r1"), Command::JobsCancel { job_id: "job-r1".into() }),
+        Err(Rejection::UnknownJob { .. })
+    ));
+
+    // The terminal job is forgotten for admission too: the same
+    // captureRef submits again without a duplicate_submission rejection.
+    client
+        .send(Some("job-r2"), Command::JobsSubmit {
+            capture_ref: "take_r".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("job-r2 accepted");
+    until(
+        &events,
+        "jobs.completed(job-r2)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-r2"),
+        Duration::from_secs(5),
+    );
+    wait_for_projection(
+        &client,
+        "job-r2 must be Completed and retired from the map",
+        |s| s.jobs.state == "Completed" && s.jobs.jobs.is_empty(),
+        Duration::from_secs(5),
+    );
+
+    // The guard still fires while a job is in flight: an active duplicate
+    // is rejected (max_concurrent 1 keeps job-r3 in the machine).
+    client
+        .send(Some("job-r3"), Command::JobsSubmit {
+            capture_ref: "take_r".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("job-r3 accepted");
+    client
+        .send(Some("job-r4"), Command::JobsSubmit {
+            capture_ref: "take_r".into(), // same captureRef while job-r3 runs
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("job-r4 accepted");
+    let collected = until(
+        &events,
+        "jobs.rejected(job-r4)",
+        |m| m.type_name() == "jobs.rejected" && m.corr.as_deref() == Some("job-r4"),
+        Duration::from_secs(5),
+    );
+    let rejection = collected
+        .iter()
+        .rev()
+        .find(|m| m.type_name() == "jobs.rejected")
+        .unwrap();
+    match &rejection.event {
+        Event::JobsRejected { reason } => assert_eq!(reason.as_str(), "duplicate_submission"),
+        other => panic!("expected JobsRejected, got {other:?}"),
+    }
+    until(
+        &events,
+        "jobs.completed(job-r3)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-r3"),
+        Duration::from_secs(5),
+    );
+
+    // Four jobs later the map is as empty as after the first: the map
+    // holds in-flight jobs only.
+    wait_for_projection(
+        &client,
+        "the jobs map must not accumulate terminal entries",
+        |s| s.jobs.jobs.is_empty(),
+        Duration::from_secs(5),
+    );
+
+    runtime.shutdown();
+}
+
+/// Part 3: the WAV encode runs on the worker, not the scheduler loop. A
+/// multi-minute-sized take (30M samples → a ~60 MB WAV, hundreds of
+/// milliseconds of encode) is submitted and cancelled immediately: the
+/// cancel's receipt must come back from an idle scheduler, not queue
+/// behind the whole encode (the pre-#216 shape stalled every `jobs.*`
+/// command for the encode's duration). The functional outcome pins the
+/// rest: the job settles Cancelled, the late completion lands nowhere,
+/// and the worker really did encode and ship the full-sized WAV.
+#[test]
+fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
+    let source = FakeCaptureSource::new(vec![]);
+    let provider =
+        starling_runtime::provider::FakeProvider::new(vec![FakeJob::completes_with("late")]);
+    let provider_handle = std::sync::Arc::clone(&provider);
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    run_take(
+        &source,
+        &client,
+        &events,
+        "take_big",
+        FakeTakeScript {
+            // The fake outruns the cap well before the capture actor's
+            // first 10 ms poll tick, so the take's size is pinned at 30M
+            // samples (a ~60 MB WAV) regardless of runner load.
+            samples_per_second: 4_000_000_000,
+            sample_cap: 30_000_000,
+            ..FakeTakeScript::clean()
+        },
+    );
+
+    client
+        .send(Some("job-big"), Command::JobsSubmit {
+            capture_ref: "take_big".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("submit accepted");
+
+    // The cancel races the worker's encode of the ~60 MB WAV. With the
+    // encode on the scheduler loop the receipt queues behind the entire
+    // encode (hundreds of ms); with the encode on the worker it is
+    // answered in scheduler time. The bound is set well under half the
+    // encode's expected duration.
+    let cancel_started = Instant::now();
+    let cancelled = client.send(Some("job-big"), Command::JobsCancel { job_id: "job-big".into() });
+    let cancel_latency = cancel_started.elapsed();
+    cancelled.expect("cancel is legal while the worker encodes");
+    assert!(
+        cancel_latency < Duration::from_millis(150),
+        "cancel took {cancel_latency:?} — the scheduler appears stalled on the WAV encode"
+    );
+
+    // The job settles Cancelled and the worker's late completion lands
+    // nowhere.
+    wait_for_state(&client, "Cancelled", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(100));
+    let mut drained = Vec::new();
+    while let Ok(message) = events.try_recv() {
+        drained.push(message);
+    }
+    assert!(
+        !drained
+            .iter()
+            .any(|m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-big")),
+        "a cancelled job must not complete: {:?}",
+        drained.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+
+    // The encode really ran at this scale — the worker shipped the
+    // full-sized WAV to the provider before its report was dropped.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let requests = provider_handle.requests();
+        if requests
+            .iter()
+            .any(|(id, size)| id == "job-big" && *size > 40_000_000)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker never encoded the full-sized WAV: {:?}",
+            requests
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    runtime.shutdown();
+}
+
+/// Part 4: fatality follows the typed fault origin, never the message
+/// text. A device fault whose message happens to mention the journal is
+/// fatal (the old substring heuristic let such a take continue from a
+/// dead microphone); a real journal fault is surfaced once, non-fatal,
+/// and the take completes.
+#[test]
+fn a_device_fault_whose_text_mentions_the_journal_is_fatal() {
+    let source = FakeCaptureSource::new(vec![FakeTakeScript {
+        error_after: Some((
+            Duration::from_millis(15),
+            RecorderFault::Device(
+                "device stream error; journal flush pointer invalid".into(),
+            ),
+        )),
+        stop: FakeStop::Clean {
+            journal_id: "j_devj".into(),
+            ack_fraction: 1.0,
+        },
+        ..FakeTakeScript::clean()
+    }]);
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    client
+        .send(Some("take_dj"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("start accepted");
+    let collected = until(
+        &events,
+        "capture.error",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
+    match &collected.last().unwrap().event {
+        Event::CaptureError { code, fatal } => {
+            assert_eq!(code, "device_stream_lost");
+            assert!(*fatal, "a device fault is fatal even when its text says journal");
+        }
+        other => panic!("expected fatal CaptureError, got {other:?}"),
+    }
+    wait_for_state(&client, "Interrupted", Duration::from_secs(2));
+    runtime.shutdown();
+}
+
+#[test]
+fn a_journal_fault_is_surfaced_once_non_fatal_and_the_take_completes() {
+    let source = FakeCaptureSource::new(vec![FakeTakeScript {
+        error_after: Some((
+            Duration::from_millis(15),
+            RecorderFault::Journal("journal write failed: disk full".into()),
+        )),
+        stop: FakeStop::Clean {
+            journal_id: "j_jfault".into(),
+            ack_fraction: 1.0,
+        },
+        ..FakeTakeScript::clean()
+    }]);
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    client
+        .send(Some("take_j"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("start accepted");
+    let collected = until(
+        &events,
+        "capture.error{journal_fault}",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
+    let fault = collected
+        .iter()
+        .find(|m| m.type_name() == "capture.error")
+        .unwrap();
+    match &fault.event {
+        Event::CaptureError { code, fatal } => {
+            assert_eq!(code, "journal_fault");
+            assert!(!*fatal, "a journal fault is non-fatal: capture continues in memory");
+        }
+        other => panic!("expected CaptureError, got {other:?}"),
+    }
+
+    // The take survives the fault: a clean stop still completes it.
+    client
+        .send(Some("take_j"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(
+        &events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped",
+        Duration::from_secs(5),
+    );
+    wait_for_state(&client, "Persisted", Duration::from_secs(2));
     runtime.shutdown();
 }
