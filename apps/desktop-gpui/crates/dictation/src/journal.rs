@@ -2037,6 +2037,8 @@ mod tests {
     /// #247 review: one broken session must not abort the whole startup
     /// scan — a repair failure is reported and the remaining damaged
     /// sessions are still repaired.
+    #[cfg(unix)] // locks the WAV via PermissionsExt; the crate's supported
+    // desktop targets are unix (see sync_dir's platform caveat)
     #[test]
     fn one_broken_damaged_session_does_not_abort_the_scan() {
         let store_dir = TempDir::new().expect("store tempdir");
