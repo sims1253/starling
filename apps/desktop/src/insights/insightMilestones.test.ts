@@ -154,6 +154,7 @@ describe("milestones", () => {
     // Seven distinct days, then every take on the seventh is deleted: only
     // six live days remain, so the first-week milestone must not fire.
     const days = ["01", "02", "03", "04", "05", "06", "07"];
+
     const events = flat([
       ...days.map((day, index) => take(`t${index}`, `2026-09-${day}T10:00:00Z`, 5)),
       deleted("t6", "2026-09-08T10:00:00Z"),
