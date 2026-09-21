@@ -120,32 +120,39 @@ pub fn is_type_name(value: &str) -> bool {
 
 /// `timestamp`: RFC 3339 with optional fraction and `Z` / `±HH:MM` zone
 /// (envelope.schema.json `$defs.timestamp`). ASCII digits only.
+///
+/// The fixed positions are validated on `bytes`, not on `str` slices: a
+/// multi-byte UTF-8 `ts` is out of contract and must be *rejected*, and a
+/// `&value[a..b]` would panic on a non-char-boundary index instead
+/// (issue #202 — that panic took down the router thread).
 pub fn is_rfc3339(value: &str) -> bool {
-    fn digits(slice: &str, count: usize) -> bool {
-        slice.len() == count && slice.bytes().all(|b| b.is_ascii_digit())
+    fn digits(slice: &[u8], count: usize) -> bool {
+        slice.len() == count && slice.iter().all(|b| b.is_ascii_digit())
     }
     let bytes = value.as_bytes();
     if bytes.len() < 20 {
         return false;
     }
-    if !digits(&value[0..4], 4) || bytes[4] != b'-' {
+    if !digits(&bytes[0..4], 4) || bytes[4] != b'-' {
         return false;
     }
-    if !digits(&value[5..7], 2) || bytes[7] != b'-' {
+    if !digits(&bytes[5..7], 2) || bytes[7] != b'-' {
         return false;
     }
-    if !digits(&value[8..10], 2) || bytes[10] != b'T' {
+    if !digits(&bytes[8..10], 2) || bytes[10] != b'T' {
         return false;
     }
-    if !digits(&value[11..13], 2) || bytes[13] != b':' {
+    if !digits(&bytes[11..13], 2) || bytes[13] != b':' {
         return false;
     }
-    if !digits(&value[14..16], 2) || bytes[16] != b':' {
+    if !digits(&bytes[14..16], 2) || bytes[16] != b':' {
         return false;
     }
-    if !digits(&value[17..19], 2) {
+    if !digits(&bytes[17..19], 2) {
         return false;
     }
+    // Byte 19 is a char boundary: bytes 17 and 18 are ASCII digits, so no
+    // multi-byte char can be in flight here.
     let mut rest = &value[19..];
     if let Some(fraction) = rest.strip_prefix('.') {
         let end = fraction
@@ -162,9 +169,9 @@ pub fn is_rfc3339(value: &str) -> bool {
             let bytes = offset.as_bytes();
             bytes.len() == 6
                 && (bytes[0] == b'+' || bytes[0] == b'-')
-                && digits(&offset[1..3], 2)
+                && digits(&bytes[1..3], 2)
                 && bytes[3] == b':'
-                && digits(&offset[4..6], 2)
+                && digits(&bytes[4..6], 2)
         }
     }
 }
@@ -1040,6 +1047,47 @@ mod tests {
             "2026-09-20T10:00:00.",
         ] {
             assert!(!is_rfc3339(bad), "{bad} should not match");
+        }
+    }
+
+    #[test]
+    fn timestamp_pattern_rejects_multi_byte_utf8() {
+        // Issue #202: every multi-byte char here used to hit a
+        // non-char-boundary `&value[a..b]` slice and panic the router
+        // thread. All of them must be plain rejections.
+        for bad in [
+            "日日日日日日日",          // the issue's exact ts (21 bytes)
+            "日",                      // shorter than 20 bytes
+            "日本語",                  // still shorter, 9 bytes
+            "2日26-09-20T10:00:00Z",   // multi-byte inside the year
+            "2026-09-20T10:00:0日Z",   // straddles the seconds/zone boundary
+            "2026-09-20T10:00:00.日Z", // multi-byte as the first fraction digit
+            "2026-09-20T10:00:00+♥é",  // 6-byte zone suffix, index 3 mid-char
+            "2026-09-20T10:00:00Z日",  // trailing garbage after the zone
+        ] {
+            assert!(!is_rfc3339(bad), "{bad:?} must be rejected, not panic");
+        }
+    }
+
+    #[test]
+    fn timestamp_pattern_rejects_a_multi_byte_probe_at_every_position() {
+        // Property-style sweep: splice one multi-byte char (2, 3, and
+        // 4-byte encodings) into every byte position of an otherwise-valid
+        // timestamp. Every mutation must be rejected — whichever check sees
+        // the probe — and none may panic on a non-char-boundary slice.
+        let valid = "2026-09-20T10:00:00Z";
+        for code_point in [0x00A9u32, 0x05D0, 0x2764, 0x4E00, 0x1F600] {
+            let probe = char::from_u32(code_point).expect("valid code point");
+            for position in 0..19 {
+                let mut mutated = String::with_capacity(valid.len() + 4);
+                mutated.push_str(&valid[..position]);
+                mutated.push(probe);
+                mutated.push_str(&valid[position..]);
+                assert!(
+                    !is_rfc3339(&mutated),
+                    "U+{code_point:04X} at byte {position}: {mutated:?} must be rejected"
+                );
+            }
         }
     }
 
