@@ -1,8 +1,8 @@
 //! Storage v2 core (I2, `docs/program/design/e17-native-runtime.md` §4).
 //!
 //! This is THE store (D14: no backwards compatibility of any kind — the
-//! v1 file store remains in the tree only where the runtime state machine
-//! and journal recovery still reference it). The data root —
+//! v1 file store and its opt-in flag are deleted; the runtime state
+//! machine persists through this store as well). The data root —
 //! `<data-root>/starling-gpui/` — holds the v2 layout:
 //!
 //! ```text
@@ -11,7 +11,23 @@
 //! <root>/staging/      <captureId>.sj in-flight journals (§4 step 1)
 //! <root>/quarantine/   deliberately-deleted journals (R21 tombstones)
 //! <root>/attempt-locks/ <attemptId>.lock in-flight recognition markers (#213)
+//! <root>/leases/       <ownerId>.lease runtime ownership leases (§4)
 //! ```
+//!
+//! # Ownership (§4 leases)
+//!
+//! [`StoreV2::acquire_lease`] is the multi-process ownership handshake: a
+//! live lease (`pid` + boot id + heartbeat in `leases/`) makes every other
+//! process a **client** of the data root instead of a competitor — most
+//! visibly, [`StoreV2::reconcile`] run by a client defers the in-flight
+//! halves of recovery (staging salvage, orphan adoption) to the live
+//! owner instead of sealing and promoting journals the owner may still be
+//! writing. A lease dies with its process (the OS releases its flock),
+//! and a lease whose heartbeat expired past [`LEASE_HEARTBEAT_TTL`] —
+//! or whose boot id no longer matches — is stale and breakable
+//! ([`StoreV2::break_stale_leases`], also run inside every acquire).
+//! Lease writes never share a fixed `.tmp` name: every scratch file is a
+//! unique temporary named after its owner (see [`unique_lease_temp`]).
 //!
 //! # Schema
 //!
@@ -92,6 +108,31 @@ pub const V2_SCHEMA_VERSION: u32 = 2;
 /// via [`StoreV2::set_checkpoint_every_commits`].
 pub const WAL_CHECKPOINT_EVERY_COMMITS: u32 = 64;
 
+/// How stale a lease heartbeat may be before the lease is breakable (§4
+/// ownership): on hosts where the flock cannot answer, a lease whose last
+/// heartbeat is older than this reads as stale and
+/// [`StoreV2::break_stale_leases`] may remove it. Where flock answers
+/// (every unix desktop target), the OS-level lock decides outright — a
+/// held flock means the owner lives no matter what the heartbeat says,
+/// and a freed flock means it died no matter how fresh the heartbeat is.
+/// Tunable via [`StoreV2::set_lease_ttl`].
+pub const LEASE_HEARTBEAT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How young an acquisition/heartbeat temporary under `leases/` must be
+/// to be untouchable by the temp sweep: a live writer's temp (between
+/// create and its publish rename) is younger than this by construction,
+/// so gating removal on this age closes the sweep-vs-acquirer race — a
+/// concurrent sweep can never delete a temp the rename is about to
+/// publish. An older temp belongs to a writer that stopped moving.
+pub const LEASE_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on one [`StoreV2::list_records`] page (bounded history
+/// reads): callers ask for any `limit`; the store clamps it here, so a
+/// listing can never make SQLite materialize the whole history in one
+/// query regardless of what a caller passes. The app facade pages at
+/// 200; this is the lower-layer backstop.
+pub const LIST_PAGE_MAX: usize = 500;
+
 /// Directory names under the v2 root.
 const AUDIO_DIR: &str = "audio";
 const STAGING_DIR: &str = "staging";
@@ -101,13 +142,20 @@ const QUARANTINE_DIR: &str = "quarantine";
 /// attempt's lifetime. The startup sweep reads them to decide whether a
 /// `started` row still has a live owner.
 const ATTEMPT_LOCKS_DIR: &str = "attempt-locks";
+/// Runtime ownership leases (§4): one `<ownerId>.lease` identity file and
+/// one `<ownerId>.hb` heartbeat file per process holding the data root,
+/// the identity flocked for the owner's lifetime.
+const LEASES_DIR: &str = "leases";
+/// The fixed-name acquisition sentinel under `leases/` (see
+/// [`LeaseSentinel`]): flocked across probe-and-publish, never renamed,
+/// never carrying content.
+const LEASE_SENTINEL_FILE: &str = ".lock";
+/// The v1 journal tree's tombstone directory (R21), a sibling of the v2
+/// root: `<root>/journals/deleted/`. The v1 store quarantined deleted
+/// journals here pending the retention sweep; the sweep still empties it
+/// (never-delete-until-swept), but nothing writes into it anymore.
+const LEGACY_DELETED_SUBPATH: &str = "journals/deleted";
 const DB_FILE: &str = "starling.db";
-
-/// Environment variable the runtime state machine's capture store uses to
-/// opt its persistence into v2 (I2: v2 ships alongside v1 there, with no
-/// automatic switchover). The desktop app itself runs v2 unconditionally
-/// (D14) and never reads this flag.
-pub const STORAGE_V2_FLAG_ENV: &str = "STARLING_STORAGE_V2";
 
 /// The §4 schema, in one place. `CREATE ... IF NOT EXISTS` throughout so
 /// applying it to an existing same-version database is a no-op.
@@ -411,6 +459,21 @@ pub struct StoreV2 {
     /// (settle, delete, or process exit — crash included) releases the
     /// lock, so a dead owner's marker can never block a later sweep.
     attempt_locks: HashMap<String, File>,
+    /// The runtime lease this instance holds (§4), when it is the owner.
+    lease: Option<LeaseHandle>,
+    /// How stale a foreign lease's heartbeat may be before the lease is
+    /// breakable (D11-style tunable; default [`LEASE_HEARTBEAT_TTL`]).
+    lease_ttl: std::time::Duration,
+}
+
+/// The lease this process holds: the owner id and the flocked lease file
+/// (keeping the file open is what holds the flock, exactly like the
+/// attempt markers). The flock outlives the file's name — acquisition
+/// publishes the record with a rename, and the lock rides the inode.
+#[derive(Debug)]
+struct LeaseHandle {
+    owner_id: String,
+    file: File,
 }
 
 /// An in-flight take (§4 step 1): owns the staging journal.
@@ -434,6 +497,7 @@ impl StoreV2 {
         std::fs::create_dir_all(root.join(STAGING_DIR))?;
         std::fs::create_dir_all(root.join(QUARANTINE_DIR))?;
         std::fs::create_dir_all(root.join(ATTEMPT_LOCKS_DIR))?;
+        std::fs::create_dir_all(root.join(LEASES_DIR))?;
 
         let mut conn = Connection::open(root.join(DB_FILE))?;
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
@@ -444,6 +508,12 @@ impl StoreV2 {
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Multi-process access is a designed state now (§4 leases: a
+        // second process is a client, not an error). A short busy timeout
+        // turns a transient SQLITE_BUSY from a peer's commit into a wait
+        // instead of a hard error — on every write path, including the
+        // sweep's tombstone stamp.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let db_version = Self::read_schema_version(&conn)?;
         match db_version {
@@ -510,12 +580,15 @@ impl StoreV2 {
             commits_since_checkpoint: 0,
             checkpoint_every: WAL_CHECKPOINT_EVERY_COMMITS,
             attempt_locks: HashMap::new(),
+            lease: None,
+            lease_ttl: LEASE_HEARTBEAT_TTL,
         })
     }
 
-    /// `<data-dir>/starling-gpui` — the same root the v1 store uses for
-    /// `sessions/` and `journals/`, so both stores coexist during the
-    /// transition.
+    /// `<data-dir>/starling-gpui` — the single data root. The recorder's
+    /// live journals still scratch under `journals/` beside it (adopted
+    /// here at save time), and the v1 store's tombstone tree
+    /// `journals/deleted/` is swept here (see [`Self::sweep_retention`]).
     pub fn default_root() -> Result<PathBuf, StoreV2Error> {
         Ok(dirs::data_dir()
             .ok_or(crate::storage::StorageError::DataDirUnavailable)?
@@ -697,6 +770,24 @@ impl StoreV2 {
             }
         }
         Ok(swept)
+    }
+
+    /// Discard one in-flight take's staging journal — the explicit
+    /// rollback for a caller driving the §4 steps itself (e.g. the
+    /// runtime's samples path) whose write failed before
+    /// [`FinalizedTake::commit_marked`]: without this, a failed write
+    /// would leave a partial staging journal for reconcile to salvage as
+    /// an *interrupted take* — duplicate audio of whatever the caller
+    /// stored instead. Best-effort and idempotent: a committed row for
+    /// the id is never touched (its audio lives in `audio/`), and a
+    /// missing file is not an error.
+    pub fn discard_staging(&self, id: &str) -> Result<(), StoreV2Error> {
+        validate_capture_id(id)?;
+        let path = self.staging_path(id);
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            sync_dir(&self.root.join(STAGING_DIR))?;
+        }
+        Ok(())
     }
 
     /// Runs a passive WAL checkpoint now, resetting the policy counter.
@@ -899,8 +990,13 @@ impl StoreV2 {
     /// Metadata-only listing: rows come from SQLite; each record gets a
     /// bounded audio check (file presence + the 13-byte journal header —
     /// never PCM). A damaged row or a missing/corrupt journal surfaces its
-    /// reason on that record only; the listing never aborts.
+    /// reason on that record only; the listing never aborts. The page is
+    /// bounded at the store layer too: `limit` is clamped to
+    /// [`LIST_PAGE_MAX`], so no caller can make one query materialize the
+    /// whole history (the app facade pages at 200; paging policy above the
+    /// clamp is the facade's business).
     pub fn list_records(&self, offset: usize, limit: usize) -> Result<CapturePage, StoreV2Error> {
+        let limit = limit.min(LIST_PAGE_MAX);
         let total: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))?;
@@ -1060,14 +1156,178 @@ impl StoreV2 {
     }
 
     // ------------------------------------------------------------------
+    // Retention sweep (R21: never-delete-until-swept).
+    // ------------------------------------------------------------------
+
+    /// The explicit retention sweep — the **only** code path in the store
+    /// that unlinks deliberately-deleted content. Policy (frozen, §4):
+    /// a confirmed delete quarantines the journal and tombstones the row;
+    /// the bytes stay on disk, recoverable, until this sweep is called.
+    /// Nothing here runs automatically: no read path, no reconcile, no
+    /// open ever sweeps (that is the never-delete-until-swept contract).
+    ///
+    /// What it sweeps, per tree:
+    ///
+    /// - `quarantine/` — v2 tombstoned capture journals
+    ///   ([`Self::delete_capture`], interrupted deletes completed by
+    ///   [`Self::reconcile`]);
+    /// - `journals/deleted/` — the v1 journal tree's tombstones (R21),
+    ///   left behind by the deleted v1 store, still awaiting this sweep.
+    ///
+    /// Bookkeeping: per file, the `tombstones` row is stamped
+    /// `retention = 'swept'` **before** the bytes are unlinked (a
+    /// tombstone is created if none exists — the never-resurrect
+    /// guarantee must outlive the bytes, including across a crash inside
+    /// the sweep; both steps are idempotent, so the next sweep re-attempts
+    /// whatever a crash left); the report names every swept file with its
+    /// size, and every entry that was left in place with the reason. Live
+    /// content — `audio/`, `staging/`, anything not under the two
+    /// tombstone trees — is untouched by construction.
+    pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
+        let mut report = SweepReport::default();
+        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", &mut report)?;
+        self.sweep_tree(
+            &self.root.join(LEGACY_DELETED_SUBPATH),
+            "journal",
+            &mut report,
+        )?;
+        Ok(report)
+    }
+
+    /// Sweep one tombstone tree into `report` (`kind` is the tombstone
+    /// kind rows get: `capture` for v2 quarantine, `journal` for the
+    /// legacy v1 tree).
+    ///
+    /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
+    /// UPSERT (retention `'swept'`) is committed before the bytes are
+    /// removed. Both steps are idempotent, so any crash inside the pair
+    /// leaves either file-plus-stamped-row (the next sweep re-attempts the
+    /// unlink) or just the stamped row — never the bytes without their
+    /// tombstone. That ordering is what makes the never-resurrect
+    /// guarantee hold for the two populations that reach the sweep with
+    /// **no** tombstone row of their own: the legacy `journals/deleted/`
+    /// tree (v1 never wrote v2 rows — the sweep is their only stamper)
+    /// and quarantine files from `delete_capture`'s own crash window
+    /// (rename committed, transaction not — the shape `reconcile`'s
+    /// `complete_tombstoned` heals). Reconcile's dead set reads
+    /// `tombstones` rows ∪ quarantine files regardless of the retention
+    /// value, so a stamped-but-not-yet-unlinked id is already dead to it.
+    fn sweep_tree(
+        &mut self,
+        dir: &Path,
+        kind: &str,
+        report: &mut SweepReport,
+    ) -> Result<(), StoreV2Error> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(()); // nothing tombstoned under this tree
+        };
+        // Deterministic order: sweep bookkeeping must be repeatable, not a
+        // directory-listing artifact.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        let mut swept_here = false;
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("sj") {
+                // Not a tombstoned journal (hand-dropped junk, a stray
+                // file): never-delete-until-swept cuts both ways — the
+                // sweep only removes what the tombstone semantics cover.
+                report
+                    .retained
+                    .push((name, "not a .sj journal".to_string()));
+                continue;
+            }
+            if !path.is_file() {
+                // A directory (or anything unlink cannot remove as a
+                // file) named like a journal must never be stamped swept:
+                // the tombstone would permanently deaden that id —
+                // reconcile's dead set would suppress recovery and
+                // adoption under it forever — while the entry itself
+                // survives every later sweep. Retain it unstamped for a
+                // human to look at.
+                report
+                    .retained
+                    .push((name, "not a regular file".to_string()));
+                continue;
+            }
+            let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // 1. Stamp first, transactionally: the tombstone outlives the
+            //    bytes, and a crash after this commit but before the
+            //    unlink leaves a dead id whose file the next sweep
+            //    re-attempts. Created if the delete never wrote one — the
+            //    file under a tombstone tree is itself the
+            //    deliberate-delete evidence.
+            self.conn.execute(
+                "INSERT INTO tombstones(id, kind, deleted_utc, retention)
+                 VALUES (?1, ?2, ?3, 'swept')
+                 ON CONFLICT(id) DO UPDATE SET retention = 'swept'",
+                params![id, kind, now_iso()],
+            )?;
+            // 2. Only now may the bytes go.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    swept_here = true;
+                    report.swept.push(SweptFile {
+                        id: id.clone(),
+                        kind: kind.to_string(),
+                        bytes,
+                    });
+                    report.swept_bytes += bytes;
+                }
+                Err(err) => report.retained.push((name, err.to_string())),
+            }
+        }
+        if swept_here {
+            sync_dir(dir)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Recovery (§4 reconciliation).
     // ------------------------------------------------------------------
 
     /// Reconciles journal files and metadata rows after a crash. Both
     /// sides are inspected independently; everything is idempotent, so a
     /// crash during reconciliation is repaired by the next run.
+    ///
+    /// **Client mode** (§4 ownership): when this instance holds no lease
+    /// and a live foreign owner does, the in-flight halves of recovery —
+    /// staging salvage and orphan-session adoption — are **deferred to the
+    /// owner** (named in [`ReconciliationReport::deferred_to_live_owner`]):
+    /// a staging journal may be a take the owner is writing right now, and
+    /// sealing + promoting it out from under a live writer is exactly the
+    /// competitor behavior leases exist to prevent. The row-side repairs
+    /// (tombstone completion, missing-audio marking) still run — they are
+    /// idempotent and cannot touch an in-flight take, whose row does not
+    /// exist yet. Recognition attempts are guarded separately, per
+    /// attempt, by the #213 markers.
+    ///
+    /// A lease file that exists but cannot be probed at all still reads
+    /// as a live owner (never break what cannot be proven dead) and so
+    /// still defers — but it is surfaced in
+    /// [`ReconciliationReport::unreadable_leases`], because a single
+    /// corrupt lease file must not silently disable crash recovery for
+    /// the whole root without a trace.
     pub fn reconcile(&mut self) -> Result<ReconciliationReport, StoreV2Error> {
         let mut report = ReconciliationReport::default();
+        let ownership = self.live_foreign_lease()?;
+        let foreign_owner = ownership.live;
+        report.unreadable_leases = ownership.unreadable;
+        // An unanswerable lease defers like a live one (it may be a live
+        // owner; sealing its staging would be the competitor behavior),
+        // but — unlike a plain deferral — it is a finding: recovery stays
+        // disabled until the file is removed or repaired.
+        let client_mode = foreign_owner.is_some() || !report.unreadable_leases.is_empty();
 
         // Tombstoned ids outrank everything (R21): the DB row and any file
         // under quarantine/ both mean "deliberately deleted".
@@ -1094,6 +1354,13 @@ impl StoreV2 {
                 // A delete raced with a crash before/after promote: the
                 // tombstone wins, complete the removal.
                 self.complete_tombstoned(&id, &mut report)?;
+                continue;
+            }
+            if client_mode {
+                // Client mode: the live (or unanswerable) owner may be
+                // writing this take right now — its salvage is the
+                // owner's to run.
+                report.deferred_to_live_owner.push(id);
                 continue;
             }
             let path = self.staging_path(&id);
@@ -1202,7 +1469,14 @@ impl StoreV2 {
                 }
                 None => {
                     // Finalized audio with no row → orphan session:
-                    // interrupted status, linked to the audio.
+                    // interrupted status, linked to the audio. In client
+                    // mode this is deferred too — the owner may sit in the
+                    // finalize→commit window, and racing an adoption into
+                    // it would make the owner's own commit fail.
+                    if client_mode {
+                        report.deferred_to_live_owner.push(id);
+                        continue;
+                    }
                     let parsed = match read_journal(&path) {
                         Ok(parsed) => parsed,
                         Err(err) => {
@@ -1345,6 +1619,419 @@ impl StoreV2 {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // Multi-process ownership (§4 leases).
+    // ------------------------------------------------------------------
+
+    /// The lease identity file path for one owner.
+    fn lease_path(&self, owner_id: &str) -> PathBuf {
+        self.root.join(LEASES_DIR).join(format!("{owner_id}.lease"))
+    }
+
+    /// The lease heartbeat file path for one owner.
+    fn heartbeat_path(&self, owner_id: &str) -> PathBuf {
+        self.root.join(LEASES_DIR).join(format!("{owner_id}.hb"))
+    }
+
+    /// Tune the stale-lease heartbeat TTL (takes effect on the next
+    /// liveness probe; the default is [`LEASE_HEARTBEAT_TTL`]).
+    pub fn set_lease_ttl(&mut self, ttl: std::time::Duration) {
+        self.lease_ttl = ttl.max(std::time::Duration::from_secs(1));
+    }
+
+    /// Acquire the data root's runtime lease (§4 ownership). Outcomes:
+    ///
+    /// - [`LeaseAcquisition::Owner`] — this instance now owns the root.
+    ///   Stale leases are broken first ([`Self::break_stale_leases`]); the
+    ///   ids broken in the process ride along. Re-acquiring while already
+    ///   the owner renews the heartbeat and keeps the same owner id.
+    /// - [`LeaseAcquisition::Client`] — a live foreign owner holds the
+    ///   root; this process is a **client, not a competitor**: it must not
+    ///   run the mutating halves of startup recovery against the owner's
+    ///   in-flight state ([`Self::reconcile`] already defers them), and
+    ///   per-attempt recognition ownership stays guarded by the #213
+    ///   markers as before.
+    ///
+    /// The probe-and-publish critical section is serialized by the
+    /// `leases/.lock` sentinel (a blocking flock; never renamed, so it is
+    /// not the fixed-`.tmp` collision this design removes), so two
+    /// concurrent acquirers cannot both observe "no live owner" and both
+    /// publish. On hosts where flock cannot serialize, a post-publish
+    /// tie-break re-check closes the remainder deterministically: if a
+    /// live foreign lease appeared with a **smaller** owner id, this
+    /// instance releases its own and answers `Client` — both racers
+    /// compute the same order, so exactly one stays owner.
+    ///
+    /// The lease is held until [`Self::release_lease`], the store is
+    /// dropped, or the process dies — the flock on the identity file is
+    /// the ownership signal, and the OS releases it when the owner dies,
+    /// so a crashed owner's lease file is harmless and breakable.
+    pub fn acquire_lease(&mut self) -> Result<LeaseAcquisition, StoreV2Error> {
+        if let Some(handle) = &self.lease {
+            // Already the owner: renew and keep the identity.
+            let owner_id = handle.owner_id.clone();
+            self.renew_lease_record()?;
+            return Ok(LeaseAcquisition::Owner {
+                owner_id,
+                broke: Vec::new(),
+            });
+        }
+        let leases_dir = self.root.join(LEASES_DIR);
+        std::fs::create_dir_all(&leases_dir)?;
+        // Serialize probe+publish against concurrent acquirers (the
+        // sentinel is dropped — lock released — when this scope ends).
+        let _sentinel = LeaseSentinel::acquire(&leases_dir)?;
+
+        let broke = self.break_stale_leases()?;
+        if let Some(owner) = self.live_foreign_lease()?.live {
+            return Ok(LeaseAcquisition::Client { owner });
+        }
+
+        let owner_id = format!("l_{}", uuid::Uuid::new_v4().simple());
+        let started_utc = now_iso();
+        let file = self.publish_identity(&leases_dir, &owner_id, &started_utc)?;
+        // The heartbeat is a separate, atomically-replaced file: a crash
+        // before it lands leaves a lease whose heartbeat reads as ancient
+        // — stale after the TTL, which is the correct answer for an owner
+        // that died mid-acquire.
+        self.write_heartbeat(&leases_dir, &owner_id)?;
+        sync_dir(&leases_dir)?;
+        self.lease = Some(LeaseHandle {
+            owner_id: owner_id.clone(),
+            file,
+        });
+        // Post-publish tie-break (see the method doc): yields only to a
+        // live foreign lease with a smaller owner id, so concurrent
+        // publishers elect exactly one owner even without the sentinel.
+        if let Some(owner) = self.younger_live_foreign_lease(&owner_id)?.live {
+            self.release_lease()?;
+            return Ok(LeaseAcquisition::Client { owner });
+        }
+        Ok(LeaseAcquisition::Owner { owner_id, broke })
+    }
+
+    /// Create the identity temp, flock it, write the immutable identity
+    /// record, and publish it by rename. The rename keeps the inode, so
+    /// the flock rides into the published name — the probe any other
+    /// process runs on `leases/<owner>.lease` answers `Held` from the
+    /// first moment the lease is observable. One retry covers a temp
+    /// removed by a race the sentinel could not serialize (flock-less
+    /// hosts); each attempt uses a fresh unique temp.
+    fn publish_identity(
+        &self,
+        leases_dir: &Path,
+        owner_id: &str,
+        started_utc: &str,
+    ) -> Result<File, StoreV2Error> {
+        let mut last_err = None;
+        for _ in 0..2 {
+            // §4: no shared fixed `.tmp` name — the scratch file is unique
+            // per owner, so two processes can never fight over one temp
+            // path.
+            let temp = unique_lease_temp(leases_dir, owner_id);
+            let result = (|| -> Result<File, StoreV2Error> {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)?;
+                // A freshly created file is never contended; a probe that
+                // says otherwise means someone else's temp collided into
+                // this unique name (external tampering) — abort without
+                // leaving the file.
+                match try_flock_exclusive(&file) {
+                    Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
+                    Ok(FlockEvidence::Held) | Err(_) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&temp);
+                        return Err(StoreV2Error::Io(io::Error::other(format!(
+                            "lease temp {temp:?} is already held"
+                        ))));
+                    }
+                }
+                write_lease_identity_content(&mut file, started_utc)?;
+                match std::fs::rename(&temp, self.lease_path(owner_id)) {
+                    Ok(()) => Ok(file),
+                    Err(err) => {
+                        drop(file);
+                        Err(err.into())
+                    }
+                }
+            })();
+            match result {
+                Ok(file) => return Ok(file),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.expect("two attempts always set the error"))
+    }
+
+    /// Renew the held lease's heartbeat (§4). Returns whether this
+    /// instance held a lease to renew — `Ok(false)` means it is not the
+    /// owner (nothing was written).
+    pub fn heartbeat_lease(&mut self) -> Result<bool, StoreV2Error> {
+        if self.lease.is_none() {
+            return Ok(false);
+        }
+        self.renew_lease_record()?;
+        Ok(true)
+    }
+
+    /// Rewrite the heartbeat. The heartbeat file carries no lock (the
+    /// ownership flock lives on the identity file's inode), so it is
+    /// replaced atomically: unique temp, write, fsync, rename. A crash
+    /// mid-renewal leaves the *previous* heartbeat — which then ages out
+    /// past the TTL, the correct staleness answer — and can never tear
+    /// the identity record the pid/boot-id ladder reads.
+    fn renew_lease_record(&mut self) -> Result<(), StoreV2Error> {
+        let owner_id = {
+            let handle = self
+                .lease
+                .as_ref()
+                .ok_or_else(|| StoreV2Error::Invalid("no lease held".to_string()))?;
+            handle.owner_id.clone()
+        };
+        self.write_heartbeat(&self.root.join(LEASES_DIR), &owner_id)
+    }
+
+    fn write_heartbeat(&self, leases_dir: &Path, owner_id: &str) -> Result<(), StoreV2Error> {
+        let beat = LeaseHeartbeat {
+            heartbeat_utc: now_iso(),
+            heartbeat_ms: now_epoch_ms(),
+        };
+        let bytes =
+            serde_json::to_vec(&beat).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+        let temp = unique_lease_temp(leases_dir, owner_id);
+        let result = (|| -> Result<(), StoreV2Error> {
+            use std::io::Write;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, self.heartbeat_path(owner_id))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    /// Release the held lease. The flock goes with the dropped handle and
+    /// both files are removed best-effort; by the time this returns the
+    /// release has happened, so a directory-sync failure is best-effort
+    /// too — it must not read as "release failed" to a retrying caller
+    /// (the retry's no-op path would then answer a misleading `Ok`).
+    pub fn release_lease(&mut self) -> Result<(), StoreV2Error> {
+        if let Some(handle) = self.lease.take() {
+            drop(handle.file); // release the flock before unlinking
+            let _ = std::fs::remove_file(self.lease_path(&handle.owner_id));
+            let _ = std::fs::remove_file(self.heartbeat_path(&handle.owner_id));
+            let _ = sync_dir(&self.root.join(LEASES_DIR));
+        }
+        Ok(())
+    }
+
+    /// Every lease on disk: this instance's own (marked `mine`), plus the
+    /// foreign ones with their liveness probed. Introspection for callers
+    /// deciding whether to repair, warn, or wait.
+    pub fn lease_status(&self) -> Result<Vec<LeaseInfo>, StoreV2Error> {
+        let own = self.lease.as_ref().map(|handle| handle.owner_id.clone());
+        let mut leases = Vec::new();
+        for probed in self.probe_leases()? {
+            let alive = probed.alive(self.lease_ttl);
+            let record = probed.merged_record();
+            leases.push(LeaseInfo {
+                mine: own.as_deref() == Some(probed.owner_id.as_str()),
+                owner_id: probed.owner_id,
+                pid: probed.identity.as_ref().map_or(0, |identity| identity.pid),
+                record,
+                alive,
+            });
+        }
+        Ok(leases)
+    }
+
+    /// Break stale leases (§4): remove every lease whose owner is provably
+    /// gone — its flock is free (the OS released it when the owner died),
+    /// or, where flock cannot answer, its boot id no longer matches, its
+    /// heartbeat expired past the TTL, or its recorded pid is dead. A
+    /// lease that cannot be proven dead is never broken. Crash leftovers
+    /// of the unique acquisition/heartbeat temporaries are swept too, but
+    /// only past [`LEASE_TEMP_GRACE`]: a live writer's temp is younger
+    /// than that by construction, so a concurrent sweep can never delete
+    /// it out from under the rename that publishes it. Returns the broken
+    /// owner ids.
+    pub fn break_stale_leases(&mut self) -> Result<Vec<String>, StoreV2Error> {
+        let own = self.lease.as_ref().map(|handle| handle.owner_id.clone());
+        let mut broken = Vec::new();
+        let mut removed_any = false;
+        for probed in self.probe_leases()? {
+            if Some(&probed.owner_id) == own.as_ref() {
+                continue; // ours by construction
+            }
+            if probed.alive(self.lease_ttl) {
+                continue;
+            }
+            let _ = std::fs::remove_file(self.lease_path(&probed.owner_id));
+            let _ = std::fs::remove_file(self.heartbeat_path(&probed.owner_id));
+            broken.push(probed.owner_id);
+            removed_any = true;
+        }
+        // Temp leftovers: unique names, so nothing legitimate can
+        // collide. A temp younger than the grace period is left alone (it
+        // may belong to a live writer between create and rename); an
+        // older one is removed when its flock is free — or, where flock
+        // cannot answer, when it holds no parseable record (a live
+        // writer's published files are never `*.tmp`). This keeps
+        // flock-less hosts from accumulating crashed writers' temps while
+        // never touching a live acquirer's.
+        for temp in lease_temps_in(&self.root.join(LEASES_DIR)) {
+            let Ok(metadata) = std::fs::metadata(&temp) else {
+                continue;
+            };
+            let young = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < LEASE_TEMP_GRACE);
+            if young {
+                continue;
+            }
+            if let Ok(mut file) = OpenOptions::new().read(true).open(&temp) {
+                match try_flock_exclusive(&file) {
+                    // A live writer holds its flock between create and
+                    // rename — never touched, however old.
+                    Ok(FlockEvidence::Held) => continue,
+                    Ok(FlockEvidence::Free) => {}
+                    // Where flock cannot answer, only a record-less temp
+                    // is provably not a published lease: published files
+                    // never carry the .tmp extension, and an identity or
+                    // heartbeat record in a temp means a writer whose
+                    // rename is still in flight (or wedged mid-retry) —
+                    // leave it for the next sweep after it provably stops
+                    // moving.
+                    Ok(FlockEvidence::Unknown) => {
+                        let holds_record = read_json_file::<LeaseIdentity>(&mut file).is_some()
+                            || read_json_file::<LeaseHeartbeat>(&mut file).is_some();
+                        if holds_record {
+                            continue;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let _ = std::fs::remove_file(&temp);
+            removed_any = true;
+        }
+        if removed_any {
+            sync_dir(&self.root.join(LEASES_DIR))?;
+        }
+        Ok(broken)
+    }
+
+    /// The live foreign lease on this root, when one exists — the store
+    /// this process should treat itself as a client of — plus any lease
+    /// files that could not be probed at all (surfaced by
+    /// [`Self::reconcile`] so a corrupt lease cannot silently disable
+    /// recovery without a trace). Deterministic: with several live
+    /// foreign owners (a race the sentinel usually prevents), the
+    /// smallest owner id answers.
+    fn live_foreign_lease(&self) -> Result<Ownership, StoreV2Error> {
+        let own = self.lease.as_ref().map(|handle| handle.owner_id.clone());
+        let mut ownership = Ownership::default();
+        for probed in self.probe_leases()? {
+            if Some(&probed.owner_id) == own.as_ref() {
+                continue;
+            }
+            if probed.unreadable {
+                ownership.unreadable.push((
+                    probed.owner_id,
+                    "lease file exists but cannot be opened or parsed".to_string(),
+                ));
+                continue;
+            }
+            if probed.alive(self.lease_ttl) && ownership.live.is_none() {
+                let record = probed.merged_record();
+                ownership.live = Some(LeaseInfo {
+                    owner_id: probed.owner_id,
+                    pid: probed.identity.as_ref().map_or(0, |identity| identity.pid),
+                    mine: false,
+                    record,
+                    alive: true,
+                });
+            }
+        }
+        Ok(ownership)
+    }
+
+    /// The post-publish tie-break: a live foreign lease with a **smaller**
+    /// owner id than ours — the peer this instance must yield to if the
+    /// sentinel could not serialize the publishes (see
+    /// [`Self::acquire_lease`]). Order is total (unique ids), so both
+    /// racers reach the same verdict and exactly one stays owner.
+    fn younger_live_foreign_lease(&self, mine: &str) -> Result<Ownership, StoreV2Error> {
+        let mut ownership = self.live_foreign_lease()?;
+        if let Some(live) = &ownership.live {
+            if live.owner_id.as_str() >= mine {
+                ownership.live = None;
+            }
+        }
+        Ok(ownership)
+    }
+
+    /// Every `*.lease` under `leases/`, probed. The probe opens each file
+    /// on its own read-only handle (flock needs no write access — a
+    /// read-only open keeps working where read-write would degrade to
+    /// `Unknown`), so acquiring-then-dropping the flock on a free file
+    /// releases it again.
+    fn probe_leases(&self) -> Result<Vec<ProbedLease>, StoreV2Error> {
+        let leases_dir = self.root.join(LEASES_DIR);
+        let Ok(entries) = std::fs::read_dir(&leases_dir) else {
+            return Ok(Vec::new());
+        };
+        let mut probed = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("lease") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let stem = stem.to_string();
+            if !is_safe_path_component(&stem) {
+                continue;
+            }
+            let mut file = match File::open(&path) {
+                Ok(file) => file,
+                Err(_) => {
+                    // Unreadable, but present: probe as unknown — never
+                    // decide ownership on an I/O failure — and flag it so
+                    // callers can surface the state instead of silently
+                    // deferring to an unanswerable owner forever.
+                    probed.push(ProbedLease::unreadable(stem));
+                    continue;
+                }
+            };
+            let flock = try_flock_exclusive(&file).unwrap_or(FlockEvidence::Unknown);
+            let identity = read_lease_identity(&mut file);
+            let unreadable = identity.is_none();
+            let heartbeat = read_lease_heartbeat(&mut self.heartbeat_path(&stem));
+            probed.push(ProbedLease {
+                owner_id: stem,
+                identity,
+                heartbeat,
+                flock,
+                unreadable,
+            });
+        }
+        probed.sort_by(|left, right| left.owner_id.cmp(&right.owner_id));
+        Ok(probed)
+    }
 
     // ------------------------------------------------------------------
     // Daily-use operations.
@@ -2056,6 +2743,18 @@ pub struct ReconciliationReport {
     pub empty_journals: Vec<String>,
     /// `(id, reason)` for files that could not be parsed: kept in place.
     pub unreadable: Vec<(String, String)>,
+    /// In-flight ids (staging journals, orphan candidates) a live foreign
+    /// lease owner claimed: this run was a client (§4 ownership) and left
+    /// them for the owner's own reconcile. Informational — a deferral is
+    /// normal multi-instance operation, not a repair finding, so it does
+    /// not contribute to [`Self::has_findings`].
+    pub deferred_to_live_owner: Vec<String>,
+    /// `(owner, reason)` for lease files that exist under `leases/` but
+    /// could not be probed. An unanswerable lease still reads as a live
+    /// owner (never break what cannot be proven dead), so recovery
+    /// defers to it — this finding is what makes that visible instead of
+    /// a silently disabled recovery.
+    pub unreadable_leases: Vec<(String, String)>,
 }
 
 impl ReconciliationReport {
@@ -2068,6 +2767,7 @@ impl ReconciliationReport {
             || !self.marked_interrupted.is_empty()
             || !self.completed_deletes.is_empty()
             || !self.unreadable.is_empty()
+            || !self.unreadable_leases.is_empty()
     }
 
     /// One-line summary for the app's error banner, in the voice of the v1
@@ -2087,14 +2787,22 @@ impl ReconciliationReport {
             parts.push(format!(
                 "{} recording{} marked interrupted (audio missing)",
                 self.marked_interrupted.len(),
-                if self.marked_interrupted.len() == 1 { "" } else { "s" }
+                if self.marked_interrupted.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if !self.completed_deletes.is_empty() {
             parts.push(format!(
                 "completed {} pending deletion{}",
                 self.completed_deletes.len(),
-                if self.completed_deletes.len() == 1 { "" } else { "s" }
+                if self.completed_deletes.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if !self.unreadable.is_empty() {
@@ -2102,6 +2810,14 @@ impl ReconciliationReport {
                 "{} journal file{} could not be read and were left in place",
                 self.unreadable.len(),
                 if self.unreadable.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.unreadable_leases.is_empty() {
+            parts.push(format!(
+                "{} ownership lease file{} could not be read; recovery deferred to it \
+                 until the file is removed or repaired",
+                self.unreadable_leases.len(),
+                if self.unreadable_leases.len() == 1 { "" } else { "s" }
             ));
         }
         format!("Startup scan: {}.", parts.join("; "))
@@ -2115,29 +2831,32 @@ pub struct RecoveredTake {
     pub torn_tail_bytes: u64,
 }
 
+/// What one explicit [`StoreV2::sweep_retention`] run removed and kept.
+#[derive(Debug, Default)]
+pub struct SweepReport {
+    /// Tombstoned content unlinked, in sweep order: the id, which tree it
+    /// came from (`capture` = v2 `quarantine/`, `journal` = the legacy
+    /// `journals/deleted/`), and the bytes freed.
+    pub swept: Vec<SweptFile>,
+    /// Total bytes unlinked.
+    pub swept_bytes: u64,
+    /// `(name, reason)` for entries left in place: files that are not
+    /// `.sj` journals, or removals that failed (the next sweep retries).
+    pub retained: Vec<(String, String)>,
+}
+
+/// One swept tombstoned file.
+#[derive(Debug, Clone)]
+pub struct SweptFile {
+    pub id: String,
+    /// `capture` (v2 `quarantine/`) or `journal` (legacy `journals/deleted/`).
+    pub kind: String,
+    pub bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Free helpers.
 // ---------------------------------------------------------------------------
-
-/// Whether the testing flag is on. Only the runtime state machine reads
-/// it (see [`STORAGE_V2_FLAG_ENV`]); the desktop app runs v2
-/// unconditionally (D14).
-pub fn v2_enabled_for_testing() -> bool {
-    v2_enabled_from(std::env::var(STORAGE_V2_FLAG_ENV).ok().as_deref())
-}
-
-/// The flag mapping, pure so it is testable without racing the process
-/// environment: `1`, `true`, `yes`, `on` (case-insensitive) are on;
-/// everything else — including unset — is off.
-pub fn v2_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(text) => matches!(
-            text.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        None => false,
-    }
-}
 
 /// A local UTC-offset label for the `tz` column; `UTC` when the local
 /// offset cannot be determined (multi-threaded sandbox).
@@ -2311,6 +3030,355 @@ fn journal_ids_in(dir: &Path) -> Vec<String> {
     ids
 }
 
+// ---------------------------------------------------------------------------
+// Leases (§4 ownership): free helpers.
+// ---------------------------------------------------------------------------
+
+/// What `acquire_lease` found on the data root.
+#[derive(Debug)]
+pub enum LeaseAcquisition {
+    /// This instance is the owner of the data root. `broke` names the
+    /// stale leases broken on the way in.
+    Owner { owner_id: String, broke: Vec<String> },
+    /// A live foreign owner holds the root: this process is a client, not
+    /// a competitor. `owner` identifies the live lease.
+    Client { owner: LeaseInfo },
+}
+
+/// One lease as `leases/` shows it. `pid`, `boot_id` and the heartbeat
+/// come from the record the owner wrote; `alive` is the probed verdict
+/// (flock first, record fallback — see [`lease_alive_from_probe`]).
+#[derive(Debug, Clone)]
+pub struct LeaseInfo {
+    /// This instance's own lease.
+    pub mine: bool,
+    pub owner_id: String,
+    pub pid: u32,
+    pub record: Option<LeaseRecord>,
+    pub alive: bool,
+}
+
+/// The lease record serialized into `leases/<ownerId>.lease`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseRecord {
+    pub pid: u32,
+    /// The kernel boot id at acquisition ("" where the host has none): a
+    /// pid alone is not identity across a reboot, but pid+boot is.
+    pub boot_id: String,
+    pub started_utc: String,
+    pub heartbeat_utc: String,
+    /// Epoch-milliseconds heartbeat — the machine-readable staleness
+    /// source (ISO strings are for humans; comparing them is not).
+    pub heartbeat_ms: u64,
+}
+
+/// The immutable identity record inside `leases/<ownerId>.lease`.
+/// Written once into the acquisition temp and published by rename;
+/// never rewritten afterwards — heartbeats live in the separate
+/// [`LeaseHeartbeat`] file precisely so a mid-heartbeat crash cannot
+/// tear the record the pid/boot-id fallback ladder depends on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseIdentity {
+    pid: u32,
+    /// The kernel boot id at acquisition ("" where the host has none): a
+    /// pid alone is not identity across a reboot, but pid+boot is.
+    boot_id: String,
+    started_utc: String,
+}
+
+/// The heartbeat record inside `leases/<ownerId>.hb` — replaced
+/// atomically (unique temp + rename) on every renewal. The file carries
+/// no lock, so replacing it never strands the ownership flock that lives
+/// on the identity file's inode.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeaseHeartbeat {
+    heartbeat_utc: String,
+    /// Epoch milliseconds — the machine-readable staleness source (ISO
+    /// strings are for humans; comparing them is not).
+    heartbeat_ms: u64,
+}
+
+/// What one probe of `leases/` concluded about ownership: the live
+/// foreign owner to defer to (if any), and the lease files that could
+/// not be probed at all — an unanswerable lease still reads as alive
+/// (never break what cannot be proven dead), but it is reported so a
+/// corrupt file cannot silently disable recovery without a trace.
+#[derive(Default)]
+struct Ownership {
+    live: Option<LeaseInfo>,
+    unreadable: Vec<(String, String)>,
+}
+
+/// One probed lease: its identity (when the file opens and parses), its
+/// latest heartbeat (when the `.hb` file opens and parses), and the flock
+/// evidence of the identity file.
+struct ProbedLease {
+    owner_id: String,
+    identity: Option<LeaseIdentity>,
+    heartbeat: Option<LeaseHeartbeat>,
+    flock: FlockEvidence,
+    /// The identity file exists but would not open or parse.
+    unreadable: bool,
+}
+
+impl ProbedLease {
+    fn unreadable(owner_id: String) -> Self {
+        Self {
+            owner_id,
+            identity: None,
+            heartbeat: None,
+            flock: FlockEvidence::Unknown,
+            unreadable: true,
+        }
+    }
+
+    /// The probed liveness verdict: the flock decides when it answered
+    /// (the OS is the truth — a held lock means a live owner, a freed
+    /// lock means a dead one, whatever the heartbeat says); the record's
+    /// boot id / heartbeat / pid decide only where the flock cannot
+    /// answer. A missing heartbeat file reads as an ancient heartbeat —
+    /// stale, which is the right answer both for an owner that died
+    /// mid-acquire and for one whose renewal crashed.
+    fn alive(&self, ttl: std::time::Duration) -> bool {
+        match self.flock {
+            FlockEvidence::Held => true,
+            FlockEvidence::Free => false,
+            FlockEvidence::Unknown => match &self.identity {
+                // No record to reason about and no lock to ask: never
+                // break what cannot be proven dead.
+                None => true,
+                Some(identity) => lease_alive_from(
+                    boot_matches(&identity.boot_id),
+                    Some(
+                        self.heartbeat
+                            .as_ref()
+                            .is_some_and(|beat| heartbeat_is_fresh(beat.heartbeat_ms, ttl)),
+                    ),
+                    Some(process_is_alive(identity.pid)),
+                ),
+            },
+        }
+    }
+
+    /// The merged public view of identity + heartbeat.
+    fn merged_record(&self) -> Option<LeaseRecord> {
+        self.identity.as_ref().map(|identity| LeaseRecord {
+            pid: identity.pid,
+            boot_id: identity.boot_id.clone(),
+            started_utc: identity.started_utc.clone(),
+            heartbeat_utc: self
+                .heartbeat
+                .as_ref()
+                .map_or_else(String::new, |beat| beat.heartbeat_utc.clone()),
+            heartbeat_ms: self.heartbeat.as_ref().map_or(0, |beat| beat.heartbeat_ms),
+        })
+    }
+}
+
+/// The acquisition sentinel: `leases/.lock`, a **fixed-name** file (it is
+/// never renamed and never carries per-owner content, so it does not
+/// reintroduce the fixed-`.tmp` collision this design removes) flocked
+/// for the duration of the probe-and-publish critical section in
+/// [`StoreV2::acquire_lease`], making concurrent acquisitions serialize.
+/// Where the platform has no flock the sentinel is a no-op and the
+/// post-publish tie-break re-check covers the window.
+struct LeaseSentinel {
+    #[allow(dead_code)] // the open handle is the lock; nothing reads it
+    file: Option<File>,
+}
+
+impl LeaseSentinel {
+    /// The production wait: long enough for a healthy concurrent
+    /// acquisition (a few fsync'd writes) to finish, short enough that a
+    /// wedged holder cannot stall startup behind it.
+    const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Take the sentinel with the production timeout (see
+    /// [`Self::acquire_with_timeout`]).
+    fn acquire(leases_dir: &Path) -> Result<Self, StoreV2Error> {
+        Self::acquire_with_timeout(leases_dir, Self::ACQUIRE_TIMEOUT)
+    }
+
+    /// Take the sentinel: a non-blocking flock retried under a BOUNDED
+    /// wait (flock(2) on unix; no-op elsewhere). The sentinel coordinates
+    /// probe-and-publish only — it is not a liveness primitive — so a
+    /// holder wedged mid-acquisition (hung fsync, stuck disk) must not be
+    /// able to block every other process's lease acquisition, and
+    /// therefore startup, indefinitely: past the bound the acquisition
+    /// fails with a distinct error the caller can surface or retry,
+    /// instead of blocking forever. Contention with a healthy sibling
+    /// acquisition resolves in milliseconds and never sees the bound.
+    fn acquire_with_timeout(
+        leases_dir: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, StoreV2Error> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
+            let deadline = std::time::Instant::now() + timeout;
+
+            loop {
+                // SAFETY: flock(2) on an fd this guard owns and keeps open
+                // until dropped; no close or hand-off happens here.
+                let taken =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+
+                if taken == 0 {
+                    return Ok(Self { file: Some(file) });
+                }
+
+                let err = io::Error::last_os_error();
+
+                if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                    return Err(err.into());
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(StoreV2Error::Invalid(format!(
+                        "the lease sentinel stayed busy for more than {timeout:?} — another \
+                         lease acquisition appears wedged; retrying may help"
+                    )));
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (leases_dir, timeout);
+            Ok(Self { file: None })
+        }
+    }
+}
+
+/// Write the immutable identity record onto the acquisition temp (the
+/// file is published by rename immediately after; nothing rewrites it).
+fn write_lease_identity_content(file: &mut File, started_utc: &str) -> Result<(), StoreV2Error> {
+    use std::io::Write;
+    let record = LeaseIdentity {
+        pid: std::process::id(),
+        boot_id: boot_id(),
+        started_utc: started_utc.to_string(),
+    };
+    let bytes =
+        serde_json::to_vec(&record).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// The identity inside one lease file, when one parses. A torn or
+/// unparseable file reads as `None` — the flock then decides, and the
+/// probe flags the lease unreadable so the state is surfaced.
+fn read_lease_identity(file: &mut File) -> Option<LeaseIdentity> {
+    read_json_file(file)
+}
+
+/// The heartbeat beside one lease, when one parses. A missing or torn
+/// `.hb` reads as `None` — an ancient heartbeat, stale after the TTL.
+fn read_lease_heartbeat(path: &Path) -> Option<LeaseHeartbeat> {
+    let mut file = File::open(path).ok()?;
+    read_json_file(&mut file)
+}
+
+/// One small JSON file, parsed in full.
+fn read_json_file<T: serde::de::DeserializeOwned>(file: &mut File) -> Option<T> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// A unique temporary under `leases/`, named after its owner (§4: the
+/// fixed shared `.tmp` name is replaced by unique temporaries under the
+/// lease owner — two processes can never collide on it). Used by both the
+/// identity publish and the heartbeat replacement.
+fn unique_lease_temp(leases_dir: &Path, owner_id: &str) -> PathBuf {
+    leases_dir.join(format!("{owner_id}.{}.tmp", uuid::Uuid::new_v4().simple()))
+}
+
+/// Every `*.tmp` scratch file under `leases/` (sorted; missing dir = none).
+fn lease_temps_in(leases_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(leases_dir) else {
+        return Vec::new();
+    };
+    let mut temps: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+        .collect();
+    temps.sort();
+    temps
+}
+
+/// The kernel boot id (Linux), or "" where the host does not expose one.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a recorded boot id matches the current boot. `None` when
+/// either side is unknown — an unknown boot id never proves anything.
+fn boot_matches(recorded: &str) -> Option<bool> {
+    let current = boot_id();
+    if current.is_empty() || recorded.is_empty() {
+        None
+    } else {
+        Some(current == recorded)
+    }
+}
+
+/// Unix epoch milliseconds (0 only if the clock is before 1970).
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether a heartbeat recorded at `heartbeat_ms` is still fresh under
+/// `ttl`. A zero/garbage timestamp reads as ancient — stale.
+fn heartbeat_is_fresh(heartbeat_ms: u64, ttl: std::time::Duration) -> bool {
+    now_epoch_ms().saturating_sub(heartbeat_ms) <= ttl.as_millis() as u64
+}
+
+/// The flock-less liveness ladder, pure so the whole degradation order is
+/// testable on platforms that always have flock:
+///
+/// - a boot mismatch is fatal outright — after a reboot the recorded pid
+///   is not the owner, however alive it looks;
+/// - an expired heartbeat is fatal (§4: stale after heartbeat expiry);
+/// - a dead pid is fatal;
+/// - everything else — fresh heartbeat, no dead evidence, or signals that
+///   could not answer — reads as alive: breaking a lease requires proof
+///   of death, never the absence of proof of life.
+fn lease_alive_from(
+    same_boot: Option<bool>,
+    heartbeat_fresh: Option<bool>,
+    pid_alive: Option<bool>,
+) -> bool {
+    if same_boot == Some(false) {
+        return false;
+    }
+    if heartbeat_fresh == Some(false) {
+        return false;
+    }
+    if pid_alive == Some(false) {
+        return false;
+    }
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -3757,16 +4825,960 @@ mod tests {
         assert!(!quiet.has_findings());
     }
 
-    // ---- testing flag ---------------------------------------------------
+    // ---- leases (§4 ownership) ------------------------------------------
+
+    /// The lease files under a root's `leases/`, as file names.
+    fn lease_files(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join("leases"))
+            .expect("read leases dir")
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Whether a store's staging tree still holds the id's journal.
+    fn store_root_has_staging(store: &StoreV2, id: &str) -> bool {
+        store
+            .root()
+            .join("staging")
+            .join(format!("{id}.sj"))
+            .exists()
+    }
 
     #[test]
-    fn the_v2_flag_maps_values_and_defaults_off() {
-        assert!(!v2_enabled_from(None), "unset = off");
-        for off in ["", "0", "false", "no", "off", "garbage"] {
-            assert!(!v2_enabled_from(Some(off)), "{off:?} must be off");
+    fn a_lease_records_pid_boot_id_and_heartbeat() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+
+        let owner_id = match store.acquire_lease().expect("acquire") {
+            LeaseAcquisition::Owner { owner_id, broke } => {
+                assert!(broke.is_empty(), "a fresh root has nothing to break");
+                owner_id
+            }
+            other => panic!("expected to own a fresh root, got {other:?}"),
+        };
+
+        // One published identity, one heartbeat beside it, no temp left
+        // behind, and the records name this process, this boot, right now.
+        assert!(lease_files(&root).contains(&format!("{owner_id}.lease")));
+        let identity: LeaseIdentity = serde_json::from_str(
+            &std::fs::read_to_string(root.join("leases").join(format!("{owner_id}.lease")))
+                .expect("read lease"),
+        )
+        .expect("lease identity parses");
+        assert_eq!(identity.pid, std::process::id());
+        if cfg!(target_os = "linux") {
+            assert!(!identity.boot_id.is_empty(), "boot id is recorded on linux");
+            assert_eq!(identity.boot_id, boot_id());
         }
-        for on in ["1", "true", "TRUE", "Yes", "on"] {
-            assert!(v2_enabled_from(Some(on)), "{on:?} must be on");
+        assert!(!identity.started_utc.is_empty());
+        let heartbeat: LeaseHeartbeat = serde_json::from_str(
+            &std::fs::read_to_string(root.join("leases").join(format!("{owner_id}.hb")))
+                .expect("read heartbeat"),
+        )
+        .expect("heartbeat parses");
+        assert!(
+            now_epoch_ms().saturating_sub(heartbeat.heartbeat_ms) < 5_000,
+            "the heartbeat is current"
+        );
+        assert!(!heartbeat.heartbeat_utc.is_empty());
+    }
+
+    #[test]
+    fn lease_temporaries_are_unique_and_never_a_fixed_tmp_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let leases = dir.path().join("leases");
+        std::fs::create_dir_all(&leases).expect("create leases dir");
+
+        let first = unique_lease_temp(&leases, "l_owner");
+        let second = unique_lease_temp(&leases, "l_owner");
+        assert_ne!(first, second, "every temporary is unique");
+        for temp in [&first, &second] {
+            let name = temp.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with("l_owner."),
+                "the temp is named after its owner: {name}"
+            );
+            assert!(name.ends_with(".tmp"));
+            assert_ne!(name, ".tmp", "no shared fixed temp name exists");
         }
+        // And the one real acquisition leaves no temporary behind at all.
+        let mut store = StoreV2::open(dir.path().join("v2")).expect("open");
+        store.acquire_lease().expect("acquire");
+        let files = lease_files(store.root());
+        assert!(
+            files.iter().all(|name| !name.ends_with(".tmp")),
+            "no temp leftovers: {files:?}"
+        );
+        assert_eq!(
+            files.iter().filter(|name| name.ends_with(".lease")).count(),
+            1,
+            "exactly one published lease: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_process_is_a_client_not_a_competitor() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut owner = store_in(&dir);
+        let owner_id = match owner.acquire_lease().expect("owner acquires") {
+            LeaseAcquisition::Owner { owner_id, .. } => owner_id,
+            other => panic!("fresh root must be acquirable, got {other:?}"),
+        };
+
+        // The owner has an in-flight take: a staging journal it may still
+        // be writing.
+        let mut take = owner
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin take");
+        take.append_frames(&ramp(20, 0)).expect("append");
+        take.write_boundary().expect("boundary");
+        let take_id = take.id().to_string();
+
+        // The second process on the same root: a client, not a competitor.
+        let mut client = StoreV2::open(owner.root()).expect("second open");
+        match client.acquire_lease().expect("client acquires") {
+            LeaseAcquisition::Client { owner } => {
+                assert_eq!(owner.owner_id, owner_id);
+                assert_eq!(owner.pid, std::process::id());
+                assert!(owner.alive);
+            }
+            other => panic!("a live foreign owner must make this a client, got {other:?}"),
+        }
+
+        // The client's reconcile defers the owner's in-flight state
+        // instead of sealing and promoting a live take out from under it.
+        let report = client.reconcile().expect("client reconcile");
+        assert_eq!(report.deferred_to_live_owner, vec![take_id.clone()]);
+        assert!(
+            store_root_has_staging(&client, &take_id),
+            "staging untouched"
+        );
+        assert!(client.get_capture(&take_id).expect("row").is_none());
+        assert!(
+            !report.has_findings(),
+            "a deferral is not a finding: {report:?}"
+        );
+
+        // The owner finishes its take normally afterwards.
+        take.finalize()
+            .expect("finalize")
+            .commit_marked(&mut owner, CommitMark::Complete)
+            .expect("commit");
+        assert!(owner.get_capture(&take_id).expect("row").is_some());
+
+        // And with the staging drained, a client reconcile has nothing
+        // left to defer.
+        let report = client.reconcile().expect("client reconcile again");
+        assert!(report.deferred_to_live_owner.is_empty());
+
+        // The owner's own lease_status shows itself; the client's view of
+        // the same file agrees it is alive and not the client's.
+        let owner_view = owner.lease_status().expect("owner status");
+        assert_eq!(owner_view.len(), 1);
+        assert!(owner_view[0].mine && owner_view[0].alive);
+        let client_view = client.lease_status().expect("client status");
+        assert_eq!(client_view.len(), 1);
+        assert!(!client_view[0].mine && client_view[0].alive);
+    }
+
+    #[test]
+    fn a_client_reconcile_still_completes_tombstones_and_row_repairs() {
+        // Client mode defers *in-flight* salvage only: idempotent row-side
+        // repairs (tombstone completion, missing-audio marking) still run —
+        // they cannot touch a take whose row does not exist yet.
+        let dir = TempDir::new().expect("tempdir");
+        let mut owner = store_in(&dir);
+        let committed = committed_take(&mut owner, &ramp(30, 0)).record.id.clone();
+        let doomed = committed_take(&mut owner, &ramp(30, 1)).record.id.clone();
+        owner.delete_capture(&doomed).expect("delete");
+
+        // Row without audio: mark-interrupted repair material.
+        std::fs::remove_file(owner.root().join("audio").join(format!("{committed}.sj")))
+            .expect("remove audio");
+
+        owner.acquire_lease().expect("owner");
+        let mut client = StoreV2::open(owner.root()).expect("client");
+        assert!(matches!(
+            client.acquire_lease().expect("client"),
+            LeaseAcquisition::Client { .. }
+        ));
+
+        let report = client.reconcile().expect("client reconcile");
+        assert!(
+            report.marked_interrupted.contains(&committed),
+            "the row-side repair ran: {:?}",
+            report
+        );
+        // The quarantined journal is still waiting for the retention sweep
+        // (never-delete-until-swept — a client changes nothing there).
+        assert!(owner
+            .root()
+            .join("quarantine")
+            .join(format!("{doomed}.sj"))
+            .exists());
+    }
+
+    #[test]
+    fn reacquiring_keeps_the_owner_id_and_renews_the_heartbeat() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let first = match store.acquire_lease().expect("acquire") {
+            LeaseAcquisition::Owner { owner_id, .. } => owner_id,
+            other => panic!("{other:?}"),
+        };
+        let identity_of = |store: &StoreV2| {
+            serde_json::from_str::<LeaseIdentity>(
+                &std::fs::read_to_string(store.lease_path(&first)).expect("lease"),
+            )
+            .expect("identity")
+        };
+        let heartbeat_of = |store: &StoreV2| {
+            serde_json::from_str::<LeaseHeartbeat>(
+                &std::fs::read_to_string(store.heartbeat_path(&first)).expect("heartbeat"),
+            )
+            .expect("heartbeat")
+        };
+        let before_identity = identity_of(&store);
+        let before_heartbeat = heartbeat_of(&store);
+
+        assert!(store.heartbeat_lease().expect("heartbeat"));
+        let second = match store.acquire_lease().expect("re-acquire") {
+            LeaseAcquisition::Owner { owner_id, .. } => owner_id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first, second, "the identity is stable");
+        assert_eq!(
+            identity_of(&store).started_utc,
+            before_identity.started_utc,
+            "the identity file is immutable across renewals"
+        );
+        assert!(
+            heartbeat_of(&store).heartbeat_ms >= before_heartbeat.heartbeat_ms,
+            "the heartbeat moved forward"
+        );
+        // Not holding a lease: nothing to renew.
+        let mut client = StoreV2::open(store.root()).expect("client");
+        assert!(!client.heartbeat_lease().expect("heartbeat without a lease"));
+    }
+
+    #[test]
+    fn release_lease_hands_ownership_to_the_next_process() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut first = store_in(&dir);
+        first.acquire_lease().expect("first acquires");
+
+        let mut second = StoreV2::open(first.root()).expect("second");
+        assert!(matches!(
+            second.acquire_lease().expect("blocked while held"),
+            LeaseAcquisition::Client { .. }
+        ));
+
+        first.release_lease().expect("release");
+        assert!(first.lease_status().expect("status").is_empty());
+        match second.acquire_lease().expect("second takes over") {
+            LeaseAcquisition::Owner { broke, .. } => {
+                assert!(broke.is_empty(), "a clean release leaves nothing to break")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Forge a foreign lease on `root` (identity + heartbeat files) with
+    /// the given fields. Nothing flocks it — the shape a crashed (or
+    /// never-started) owner leaves behind.
+    fn forged_lease(root: &Path, owner_id: &str, pid: u32, heartbeat_ms: u64) {
+        let identity = LeaseIdentity {
+            pid,
+            boot_id: boot_id(),
+            started_utc: "2026-09-01T00:00:00.000Z".to_string(),
+        };
+        std::fs::write(
+            root.join("leases").join(format!("{owner_id}.lease")),
+            serde_json::to_string(&identity).expect("serialize"),
+        )
+        .expect("write forged lease");
+        let heartbeat = LeaseHeartbeat {
+            heartbeat_utc: "2026-09-01T00:00:00.000Z".to_string(),
+            heartbeat_ms,
+        };
+        std::fs::write(
+            root.join("leases").join(format!("{owner_id}.hb")),
+            serde_json::to_string(&heartbeat).expect("serialize"),
+        )
+        .expect("write forged heartbeat");
+    }
+
+    /// Open and flock a lease file the way a live owner would; keep the
+    /// returned handle open to keep the lock.
+    fn hold_lease_flock(path: &Path) -> File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open lease");
+        assert_eq!(
+            try_flock_exclusive(&file).expect("flock"),
+            FlockEvidence::Free,
+            "the test holds the lease like a live owner"
+        );
+        file
+    }
+
+    #[test]
+    fn a_crash_orphaned_lease_is_stale_and_breakable() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        // A lease whose owner died: the OS released its flock when the
+        // process did, so however alive the record claims to be, the
+        // lease is dead weight a new process breaks on its way in.
+        forged_lease(&root, "l_dead", std::process::id(), now_epoch_ms());
+
+        match store.acquire_lease().expect("acquire") {
+            LeaseAcquisition::Owner { broke, .. } => {
+                assert_eq!(broke, vec!["l_dead".to_string()]);
+            }
+            other => panic!("the stale lease must not block, got {other:?}"),
+        }
+        assert_eq!(
+            lease_files(&root)
+                .into_iter()
+                .filter(|name| name.ends_with(".lease"))
+                .count(),
+            1,
+            "only the new owner's lease remains"
+        );
+        assert!(
+            !root.join("leases").join("l_dead.hb").exists(),
+            "the broken lease's heartbeat goes with it"
+        );
+    }
+
+    #[test]
+    fn a_torn_lease_record_from_a_dead_owner_is_breakable() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        // A crash mid-heartbeat left truncated JSON. The flock (free, the
+        // owner is gone) decides; the unparseable record cannot veto it.
+        std::fs::write(root.join("leases").join("l_torn.lease"), b"{\"pid\":12")
+            .expect("write torn lease");
+
+        let broken = store.break_stale_leases().expect("break");
+        assert_eq!(broken, vec!["l_torn".to_string()]);
+    }
+
+    #[test]
+    fn an_flocked_lease_is_never_broken_however_stale_its_record_reads() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        // A live owner that forgot to heartbeat: the held flock is OS
+        // truth, and a timestamp must never outvote it.
+        forged_lease(&root, "l_zombie", 999_999_999, 0);
+        let held = hold_lease_flock(&root.join("leases").join("l_zombie.lease"));
+
+        let broken = store.break_stale_leases().expect("break");
+        assert!(broken.is_empty(), "a held lease is alive: {broken:?}");
+        drop(held);
+
+        // Once the holder is gone the same file is breakable.
+        let broken = store.break_stale_leases().expect("break again");
+        assert_eq!(broken, vec!["l_zombie".to_string()]);
+    }
+
+    #[test]
+    fn the_stale_ladder_requires_proof_of_death() {
+        // Pure ladder (the flock-less degradation order; on unix the flock
+        // decides before this runs, on other hosts this is the whole
+        // rule). Breaking a lease requires proof of death.
+        let alive = |boot: Option<bool>, heartbeat: Option<bool>, pid: Option<bool>| {
+            lease_alive_from(boot, heartbeat, pid)
+        };
+        // Boot mismatch: fatal even with a fresh heartbeat and a live pid
+        // — after a reboot the recorded pid is not the owner.
+        assert!(!alive(Some(false), Some(true), Some(true)));
+        // Expired heartbeat: fatal (§4 stale rule).
+        assert!(!alive(Some(true), Some(false), Some(true)));
+        // Dead pid: fatal.
+        assert!(!alive(Some(true), Some(true), Some(false)));
+        // Every provable signal healthy: alive.
+        assert!(alive(Some(true), Some(true), Some(true)));
+        // Unknown signals are never proof of death.
+        assert!(alive(None, None, None));
+        assert!(alive(None, Some(true), None));
+        assert!(alive(Some(true), None, None));
+    }
+
+    // ---- retention sweep (R21 never-delete-until-swept) ------------------
+
+    #[test]
+    fn sweep_removes_quarantined_journals_and_stamps_tombstones_swept() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(40, 0)).record.id;
+        let quarantine = store.root().join("quarantine").join(format!("{id}.sj"));
+        store.delete_capture(&id).expect("delete");
+        assert!(
+            quarantine.exists(),
+            "never-delete-until-swept holds pre-sweep"
+        );
+        let bytes = std::fs::metadata(&quarantine).map(|m| m.len()).unwrap_or(0);
+        assert!(bytes > 0);
+
+        let report = store.sweep_retention().expect("sweep");
+        assert_eq!(report.swept.len(), 1);
+        assert_eq!(report.swept[0].id, id);
+        assert_eq!(report.swept[0].kind, "capture");
+        assert_eq!(report.swept[0].bytes, bytes);
+        assert_eq!(report.swept_bytes, bytes);
+        assert!(report.retained.is_empty());
+        assert!(!quarantine.exists());
+        assert!(store.get_capture(&id).expect("row").is_none());
+
+        // Bookkeeping: the tombstone outlives the bytes and says swept.
+        let retention: String = store
+            .conn
+            .query_row(
+                "SELECT retention FROM tombstones WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("tombstone row");
+        assert_eq!(retention, "swept");
+
+        // Idempotent: a second sweep has nothing left to do.
+        let report = store.sweep_retention().expect("sweep again");
+        assert!(report.swept.is_empty() && report.retained.is_empty());
+    }
+
+    #[test]
+    fn sweep_never_stamps_a_directory_named_like_a_journal() {
+        // A directory under quarantine/ named <id>.sj cannot be unlinked
+        // as a file; stamping it swept would deaden that id forever —
+        // reconcile's dead set would suppress recovery and adoption under
+        // it — while the entry itself survives every later sweep. It must
+        // be retained, unstamped.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let stray = store.root().join("quarantine").join("stray.sj");
+
+        std::fs::create_dir_all(&stray).expect("stray directory");
+        std::fs::write(stray.join("junk"), b"x").expect("content");
+
+        let report = store.sweep_retention().expect("sweep");
+
+        assert!(report.swept.is_empty());
+        assert!(stray.exists(), "the directory itself is untouched");
+        let retained_reason = report
+            .retained
+            .iter()
+            .find(|(name, _)| name == "stray.sj")
+            .map(|(_, reason)| reason.clone())
+            .expect("retained entry");
+        assert!(
+            retained_reason.contains("not a regular file"),
+            "{retained_reason}"
+        );
+        let stamped: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT retention FROM tombstones WHERE id = 'stray'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            stamped.is_none(),
+            "no tombstone may exist for the stray directory's id"
+        );
+    }
+
+    #[test]
+    fn sweep_also_empties_the_legacy_v1_deleted_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let legacy = store.root().join("journals").join("deleted");
+        std::fs::create_dir_all(&legacy).expect("create legacy tree");
+        std::fs::write(legacy.join("j_old.sj"), b"stale v1 bytes").expect("write");
+        std::fs::write(legacy.join("j_older.sj"), b"older v1 bytes").expect("write");
+
+        let report = store.sweep_retention().expect("sweep");
+        let swept_ids: Vec<&str> = report.swept.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(swept_ids, vec!["j_old", "j_older"], "sweep order is sorted");
+        assert!(report.swept.iter().all(|f| f.kind == "journal"));
+        assert!(!legacy.join("j_old.sj").exists());
+        assert!(!legacy.join("j_older.sj").exists());
+
+        // Each swept legacy journal got a tombstone: never resurrect,
+        // even though no v2 capture row ever named it.
+        let tombstoned: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tombstones WHERE kind = 'journal'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(tombstoned, 2);
+    }
+
+    #[test]
+    fn sweep_touches_nothing_but_the_tombstone_trees() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let live = committed_take(&mut store, &ramp(40, 0)).record.id;
+        let deleted = committed_take(&mut store, &ramp(40, 1)).record.id;
+        store.delete_capture(&deleted).expect("delete");
+
+        // Reconcile (a read-path-adjacent recovery pass) never sweeps.
+        store.reconcile().expect("reconcile");
+        assert!(
+            store
+                .root()
+                .join("quarantine")
+                .join(format!("{deleted}.sj"))
+                .exists(),
+            "reconcile leaves quarantine for the explicit sweep"
+        );
+
+        let report = store.sweep_retention().expect("sweep");
+        assert_eq!(
+            report.swept.len(),
+            1,
+            "only the tombstoned journal: {report:?}"
+        );
+        assert_eq!(report.swept[0].id, deleted);
+        // The live take's audio and row are untouched.
+        assert!(store
+            .root()
+            .join("audio")
+            .join(format!("{live}.sj"))
+            .exists());
+        let loaded = store.load_audio(&live).expect("live audio loads");
+        assert_eq!(loaded.samples.len(), 40);
+    }
+
+    #[test]
+    fn a_swept_tombstone_still_blocks_resurrection() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(30, 0)).record.id;
+        store.delete_capture(&id).expect("delete");
+        store.sweep_retention().expect("sweep");
+
+        // A journal with the swept id reappears under audio/ (restored
+        // backup, copied disk): the tombstone still wins — completed
+        // delete, no resurrection.
+        let audio = store.root().join("audio").join(format!("{id}.sj"));
+        std::fs::write(&audio, b"resurrected bytes").expect("write");
+        let report = store.reconcile().expect("reconcile");
+        assert!(report.completed_deletes.contains(&id), "{report:?}");
+        assert!(!audio.exists());
+        assert!(store.get_capture(&id).expect("row").is_none());
+    }
+
+    #[test]
+    fn non_journal_entries_in_the_tombstone_trees_are_retained() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let quarantine = store.root().join("quarantine");
+        std::fs::write(quarantine.join("notes.txt"), b"hand-dropped junk").expect("write");
+        // A directory squatting on a `.sj` name cannot be unlinked as a
+        // file — the sweep reports it, never blasts it.
+        std::fs::create_dir(quarantine.join("c_dir.sj")).expect("create");
+
+        let report = store.sweep_retention().expect("sweep");
+        assert!(report.swept.is_empty());
+        let retained: Vec<(String, String)> = report.retained.clone();
+        assert_eq!(retained.len(), 2, "{retained:?}");
+        assert!(quarantine.join("notes.txt").exists());
+        assert!(quarantine.join("c_dir.sj").exists());
+    }
+
+    // ---- bounded listing ---------------------------------------------------
+
+    #[test]
+    fn listing_pages_are_clamped_at_the_store_layer() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        // Rows straight into SQLite (the journal files are irrelevant to
+        // the page bound; 550 > LIST_PAGE_MAX).
+        for i in 0..550 {
+            let record = CaptureRecord {
+                id: format!("c_{i:04}"),
+                created_utc: format!("2026-09-20T10:{:02}:{:02}.000Z", i / 60, i % 60),
+                tz: "UTC".to_string(),
+                device: String::new(),
+                actual_rate: 16_000,
+                policy: "default".to_string(),
+                frame_count: 10,
+                ack_sample_index: 10,
+                journal_hash: "00".to_string(),
+                status: CaptureStatus::Complete,
+                retention_class: "standard".to_string(),
+                extra_json: None,
+            };
+            store.commit_capture(&record).expect("insert");
+        }
+
+        // However large a limit a caller asks for, one query never
+        // materializes more than LIST_PAGE_MAX rows.
+        let page = store.list_records(0, 1_000_000).expect("list");
+        assert_eq!(page.records.len(), LIST_PAGE_MAX);
+        assert_eq!(page.total, 550);
+        // Paging continues past the clamp.
+        let page = store.list_records(LIST_PAGE_MAX, 1_000_000).expect("list");
+        assert_eq!(page.records.len(), 50);
+    }
+
+    // ---- review round 1: sweep crash window ------------------------------
+
+    #[test]
+    fn a_crash_between_stamp_and_unlink_still_blocks_resurrection() {
+        // The sweep stamps the tombstone BEFORE unlinking the bytes. This
+        // simulates the crash between the two steps for the population
+        // that has no row of its own (the legacy v1 tree): row stamped,
+        // file still present — the id must already be dead to reconcile,
+        // and the next sweep must complete the unlink.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        let legacy = root.join("journals").join("deleted");
+        std::fs::create_dir_all(&legacy).expect("create legacy tree");
+        std::fs::write(legacy.join("j_old.sj"), b"stale v1 bytes").expect("write");
+
+        // The mid-sweep state: exactly what sweep_tree's step 1 leaves.
+        store
+            .conn
+            .execute(
+                "INSERT INTO tombstones(id, kind, deleted_utc, retention)
+                 VALUES ('j_old', 'journal', ?1, 'swept')",
+                params![now_iso()],
+            )
+            .expect("stamp");
+
+        // A journal with the swept id reappears under audio/ (restored
+        // backup, copied disk): the stamped row already wins — completed
+        // delete, re-quarantined, no resurrection.
+        std::fs::write(root.join("audio").join("j_old.sj"), b"resurrected bytes")
+            .expect("resurrect");
+        let report = store.reconcile().expect("reconcile");
+        assert!(
+            report.completed_deletes.contains(&"j_old".to_string()),
+            "{report:?}"
+        );
+        assert!(!root.join("audio").join("j_old.sj").exists());
+        assert!(
+            root.join("quarantine").join("j_old.sj").exists(),
+            "the resurrected bytes are re-quarantined awaiting the sweep"
+        );
+
+        // The next sweep completes the interrupted one: bytes unlinked,
+        // row already (and still) swept.
+        let report = store.sweep_retention().expect("sweep");
+        assert_eq!(report.swept.len(), 2, "legacy file + re-quarantined bytes");
+        assert!(!legacy.join("j_old.sj").exists());
+        assert!(!root.join("quarantine").join("j_old.sj").exists());
+        let retention: String = store
+            .conn
+            .query_row(
+                "SELECT retention FROM tombstones WHERE id = 'j_old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row");
+        assert_eq!(retention, "swept");
+    }
+
+    // ---- review round 1: lease races and degradation ----------------------
+
+    #[test]
+    fn acquisition_serializes_on_the_leases_sentinel() {
+        // While one process holds the sentinel across its
+        // probe-and-publish section, a concurrent acquire cannot run its
+        // own — it blocks instead of interleaving into the check-then-act
+        // window that let two processes both become owners.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        let sentinel = LeaseSentinel::acquire(&root.join("leases")).expect("sentinel");
+
+        let acquirer_root = root.clone();
+        let acquirer = std::thread::spawn(move || {
+            let mut other = StoreV2::open(&acquirer_root).expect("open");
+            match other.acquire_lease().expect("acquire") {
+                LeaseAcquisition::Owner { owner_id, .. } => owner_id,
+                other => panic!("expected Owner once the sentinel frees, got {other:?}"),
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !acquirer.is_finished(),
+            "acquire must block while the sentinel is held"
+        );
+        drop(sentinel);
+        let owner_id = acquirer.join().expect("acquisition thread");
+        assert!(root
+            .join("leases")
+            .join(format!("{owner_id}.lease"))
+            .exists());
+    }
+
+    #[test]
+    fn a_wedged_sentinel_holder_fails_the_acquisition_after_a_bounded_wait() {
+        // The sentinel is coordination, not liveness: a holder stuck
+        // across its critical section must not block another acquisition
+        // (and therefore startup) forever — past the bound the
+        // acquisition fails with a distinct error instead of hanging.
+        // Probed with a short injected deadline while the sentinel is
+        // genuinely held.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        let _held = LeaseSentinel::acquire(&root.join("leases")).expect("sentinel");
+
+        let taken = LeaseSentinel::acquire_with_timeout(
+            &root.join("leases"),
+            std::time::Duration::from_millis(60),
+        );
+
+        let err = match taken {
+            Ok(_) => panic!("must not block past the deadline"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("wedged"), "{err}");
+    }
+
+    #[test]
+    fn the_post_publish_tie_break_yields_only_to_a_smaller_owner_id() {
+        // The sentinel serializes acquirers on unix; where flock cannot,
+        // the deterministic tie-break closes the rest: both concurrent
+        // publishers compute the same order (yield to the smallest live
+        // owner id), so exactly one stays owner. Probed at the mechanism
+        // level: two live flocked leases, various vantage points.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        forged_lease(&root, "l_aaa", std::process::id(), now_epoch_ms());
+        forged_lease(&root, "l_zzz", std::process::id(), now_epoch_ms());
+        let small = hold_lease_flock(&root.join("leases").join("l_aaa.lease"));
+        let large = hold_lease_flock(&root.join("leases").join("l_zzz.lease"));
+
+        // A late publisher between the two yields to the smaller live id.
+        let ownership = store
+            .younger_live_foreign_lease("l_mmm")
+            .expect("tie-break");
+        assert_eq!(
+            ownership.live.expect("yields to someone").owner_id,
+            "l_aaa",
+            "the smallest live owner wins"
+        );
+        // The smallest live owner itself stays owner (its only peer is
+        // larger), and the largest yields to the smallest.
+        let ownership = store
+            .younger_live_foreign_lease("l_aaa")
+            .expect("tie-break from the smallest");
+        assert!(ownership.live.is_none(), "the smallest stays owner");
+        let ownership = store
+            .younger_live_foreign_lease("l_zzz")
+            .expect("tie-break from the largest");
+        assert_eq!(ownership.live.expect("yields").owner_id, "l_aaa");
+
+        drop(small);
+        drop(large);
+    }
+
+    #[test]
+    fn a_young_acquisition_temp_is_never_swept_but_an_old_one_is() {
+        // The grace period closes the sweep-vs-acquirer race: a temp
+        // younger than LEASE_TEMP_GRACE may belong to a live writer
+        // between create and its publish rename, so the sweep must not
+        // touch it — however flock-free it looks. An older temp with no
+        // holder is a crashed writer's garbage and goes.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        let leases = root.join("leases");
+
+        let young = unique_lease_temp(&leases, "l_young");
+        std::fs::write(&young, b"{}").expect("write young temp");
+        let old = unique_lease_temp(&leases, "l_old");
+        std::fs::write(&old, b"{}").expect("write old temp");
+        // Backdate the old temp past the grace period.
+        let file = File::options().write(true).open(&old).expect("open old");
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - LEASE_TEMP_GRACE - std::time::Duration::from_secs(5),
+        ))
+        .expect("backdate");
+
+        let broken = store.break_stale_leases().expect("break");
+        assert!(broken.is_empty(), "no published leases: {broken:?}");
+        assert!(young.exists(), "a young temp is untouchable");
+        assert!(!old.exists(), "an old orphan temp is swept");
+
+        // And a temp whose flock is held is never swept, however old.
+        let held = unique_lease_temp(&leases, "l_held");
+        std::fs::write(&held, b"{}").expect("write held temp");
+        let holder = hold_lease_flock(&held);
+        let file = File::options().write(true).open(&held).expect("open held");
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - LEASE_TEMP_GRACE - std::time::Duration::from_secs(5),
+        ))
+        .expect("backdate");
+        drop(file);
+        store.break_stale_leases().expect("break again");
+        assert!(held.exists(), "a held temp belongs to a live writer");
+        drop(holder);
+    }
+
+    #[test]
+    fn an_unreadable_lease_defers_recovery_and_is_reported() {
+        // A lease file that cannot be probed at all still reads as an
+        // owner (never break what cannot be proven dead), so recovery
+        // defers — but the state is surfaced, because a single corrupt
+        // lease file must not silently disable crash recovery for the
+        // whole root.
+        let dir = TempDir::new().expect("tempdir");
+        let mut owner = store_in(&dir);
+        let mut take = owner
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin take");
+        take.append_frames(&ramp(20, 0)).expect("append");
+        take.write_boundary().expect("boundary");
+        let take_id = take.id().to_string();
+        drop(take);
+        drop(owner);
+
+        let mut store = StoreV2::open(dir.path().join("v2")).expect("reopen");
+        // A directory squatting on a lease name: present, unopenable.
+        std::fs::create_dir(store.root().join("leases").join("l_weird.lease"))
+            .expect("create unreadable lease");
+
+        let report = store.reconcile().expect("reconcile");
+        assert_eq!(
+            report.deferred_to_live_owner,
+            vec![take_id.clone()],
+            "{report:?}"
+        );
+        assert!(
+            store_root_has_staging(&store, &take_id),
+            "the in-flight take is left for the unanswerable owner"
+        );
+        assert_eq!(report.unreadable_leases.len(), 1, "{report:?}");
+        assert_eq!(report.unreadable_leases[0].0, "l_weird");
+        assert!(report.has_findings(), "the disabled recovery is visible");
+        assert!(report.summary().contains("lease"), "{}", report.summary());
+    }
+
+    #[test]
+    fn a_torn_or_missing_heartbeat_never_creates_an_unbreakable_lease() {
+        // The identity record is immutable and the heartbeat is replaced
+        // atomically, so a crash mid-heartbeat cannot leave a lease whose
+        // record cannot be parsed: a garbage or absent `.hb` reads as an
+        // ancient heartbeat — stale — and once the flock is gone the
+        // lease breaks instead of zombie-ing forever.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+
+        // Garbage heartbeat, identity intact, owner alive (flock held).
+        forged_lease(&root, "l_tornhb", std::process::id(), now_epoch_ms());
+        std::fs::write(root.join("leases").join("l_tornhb.hb"), b"{\"heartbeatM")
+            .expect("write torn heartbeat");
+        let held = hold_lease_flock(&root.join("leases").join("l_tornhb.lease"));
+        let broken = store.break_stale_leases().expect("break");
+        assert!(broken.is_empty(), "the flock is OS truth while held");
+
+        // Owner gone: the unparseable heartbeat reads as ancient — stale
+        // — and the lease breaks rather than surviving forever.
+        drop(held);
+        let broken = store.break_stale_leases().expect("break");
+        assert_eq!(broken, vec!["l_tornhb".to_string()]);
+
+        // A missing heartbeat file (crash between publish and the first
+        // renewal) is the same staleness answer.
+        forged_lease(&root, "l_nohb", std::process::id(), now_epoch_ms());
+        std::fs::remove_file(root.join("leases").join("l_nohb.hb")).expect("drop the heartbeat");
+        let held = hold_lease_flock(&root.join("leases").join("l_nohb.lease"));
+        assert!(
+            store
+                .lease_status()
+                .expect("status")
+                .iter()
+                .any(|lease| lease.owner_id == "l_nohb" && lease.alive),
+            "alive while the flock is held"
+        );
+        drop(held);
+        let broken = store.break_stale_leases().expect("break");
+        assert_eq!(broken, vec!["l_nohb".to_string()]);
+    }
+
+    // ---- review round 1: staging rollback ----------------------------------
+
+    #[test]
+    fn discard_staging_removes_only_the_named_in_flight_journal() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+
+        let mut take = store
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin take");
+        take.append_frames(&ramp(10, 0)).expect("append");
+        let id = take.id().to_string();
+        let mut other = store
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin other take");
+        other.append_frames(&ramp(10, 1)).expect("append");
+        let other_id = other.id().to_string();
+        drop(other);
+
+        store.discard_staging(&id).expect("discard");
+        assert!(
+            !store_root_has_staging(&store, &id),
+            "the failed take's staging is gone"
+        );
+        assert!(
+            store_root_has_staging(&store, &other_id),
+            "an unrelated in-flight take is untouched"
+        );
+        // Idempotent.
+        store.discard_staging(&id).expect("discard again");
+        drop(take);
+
+        // A committed row is never touched: its audio lives in `audio/`,
+        // and a late discard of its id is a no-op.
+        let committed = committed_take(&mut store, &ramp(12, 2));
+        store
+            .discard_staging(&committed.record.id)
+            .expect("discard after commit");
+        assert!(
+            store
+                .root()
+                .join("audio")
+                .join(format!("{}.sj", committed.record.id))
+                .exists(),
+            "committed audio survives a late discard"
+        );
+        assert!(
+            store
+                .get_capture(&committed.record.id)
+                .expect("row")
+                .is_some(),
+            "the committed row survives a late discard"
+        );
     }
 }

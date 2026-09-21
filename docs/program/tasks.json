@@ -231,13 +231,15 @@
    ],
    "existing_issue": null,
    "status": "in_progress",
-   "owner": "impl-agent-33",
-   "branch": "gpui/fixes-wave-a11",
+   "owner": "impl-agent (E02 tails, issue #219)",
+   "branch": "fix/storage-219-v2-completion",
    "evidence": [
     "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
-    "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
+    "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test",
+    "E02 TAILS 1/2: leases + retention sweep + bounded reads on fix/storage-219-v2-completion (c6860b8): leases/<ownerId>.lease w/ pid+boot-id+heartbeat & flock, stale breaking (proof-of-death ladder), client-mode reconcile defers staging salvage + orphan adoption to the live owner, unique per-owner temporaries (no fixed .tmp); explicit sweep_retention unlinks quarantine/ + legacy journals/deleted/ only, stamps tombstones retention=swept, never on read paths; read_journal streams via one 64KiB buffer, list_records clamped at LIST_PAGE_MAX=500; 18 new tests, dictation 209->227 pass",
+    "E02 TAILS 2/2: runtime v2-only + v1 deletion (7362696): default_capture_store = V2CaptureStore at default root (RuntimeConfig::default stays in-memory so config construction never touches the data root), V2CaptureStore commits via adopt-or-samples-through-\u00a74-protocol, salvage forces Interrupted post-adoption (R34); FileSessionStore/MemorySessionStore/v1 recovery machinery deleted (net -4417 lines w/ leases commit), STARLING_STORAGE_V2 flag removed; runtime 32+18+30 pass incl. converted #249 regression on the v2 samples path + 3 new V2CaptureStore tests; gpui 90 pass"
    ],
-   "notes": "v2-ONLY per D14: migration flow + dual store + flag deleted (net -1987 lines); remaining: leases, retention sweep, bounded reads, runtime-side store integration; v1 FileSessionStore kept only because crates/runtime references it (delete on I3 integration)",
+   "notes": "v2-only per D14; PR open (issue #219): all four tails landed at the store/runtime level. Deliberately store-level (follow-ups): acquire_lease/heartbeat handshake not yet wired into an app/runtime startup owner (I4 service host is the designed acquirer; reconcile already honors a live owner), sweep_retention has no UI callsite (explicit + opt-in by policy), cross-machine lease behavior is unix-flock-first w/ pid+boot+heartbeat fallback",
    "github_issue": 219
   },
   {
@@ -500,7 +502,8 @@
    "evidence": [
     "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded",
     "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)",
-    "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)"
+    "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)",
+    "runtime-side store integration (E02 tails, 0940726): capture machine persists through StoreV2 only (V2CaptureStore adopt-or-samples), v1 seam + flag deleted; #249 responsiveness regression re-proven on the v2 samples path"
    ],
    "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain",
    "github_issue": 220

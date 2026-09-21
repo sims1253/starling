@@ -2496,9 +2496,10 @@ mod tests {
         // R17 fix, full chain: a wedged callback must not silently discard
         // acknowledged audio. stop() defers teardown and returns the
         // salvaged samples plus the already-finalized journal; the caller
-        // (here, the same chain the app runs) persists them as an
-        // interrupted session linked to the journal, and the startup scan
-        // then recovers nothing — the linkage prevents a duplicate.
+        // (here, the same chain the app runs) adopts the journal into the
+        // v2 store and forces the take interrupted, and the startup
+        // reconcile then recovers nothing — the committed row prevents a
+        // duplicate.
         let journals_dir = TempDir::new().expect("journals tempdir");
         let writer = JournalWriter::<FileSink>::create(journals_dir.path(), 16_000)
             .expect("create journal");
@@ -2535,34 +2536,47 @@ mod tests {
                 assert!(report.finalized, "writer finalized before returning");
                 assert_eq!(report.acknowledged_samples, 1_000);
 
-                // The app-side salvage: encode, persist, mark interrupted.
-                let wav = crate::audio::encode_wav_16k(&audio).expect("encode salvage");
+                // The app-side salvage on the v2 store: adopt the journal
+                // as the take's evidence, then force interrupted — the
+                // salvage is interrupted no matter how healthy the journal
+                // looks (the app facade's R34 rule).
                 let store_dir = TempDir::new().expect("store tempdir");
-                let store = crate::storage::FileSessionStore::open(store_dir.path())
-                    .expect("open store");
-                let session = store
-                    .create_with_journal(wav, Some(62.5), Some(&report.id))
-                    .expect("persist salvage")
-                    ;
-                let session = store
-                    .mark_interrupted(
-                        &session.id,
-                        "The microphone did not stop cleanly; the salvaged take was kept.",
+                let mut store =
+                    crate::store_v2::StoreV2::open(store_dir.path()).expect("open store");
+                let record = store
+                    .adopt_journal(&report.path, Some("salvaged and kept as interrupted"))
+                    .expect("adopt the salvaged journal");
+                assert_eq!(record.id, report.id, "the row is linked to the journal");
+                store
+                    .update_capture_status(
+                        &record.id,
+                        crate::store_v2::CaptureStatus::Interrupted,
+                        None,
                     )
-                    .expect("mark interrupted");
+                    .expect("force interrupted");
+                let stored = store.get_capture(&record.id).expect("row").expect("committed");
                 assert_eq!(
-                    session.status,
-                    crate::storage::SessionStatus::Interrupted
+                    stored.status,
+                    crate::store_v2::CaptureStatus::Interrupted
                 );
-                assert_eq!(session.journal_id.as_deref(), Some(report.id.as_str()));
+                assert!(!report.path.exists(), "adoption moved the journal");
+                let loaded = store.load_audio(&record.id).expect("stored audio");
+                assert_eq!(loaded.samples, expected, "the stored audio is the salvage");
 
-                // No double recovery: the linked journal is skipped.
-                let rerun = crate::journal::recover_interrupted_takes(
-                    &store,
-                    journals_dir.path(),
-                )
-                .expect("recovery rerun");
-                assert!(rerun.recovered.is_empty(), "linked journals are skipped");
+                // No double recovery: the committed row means reconcile
+                // recovers nothing for this take.
+                let rerun = store.reconcile().expect("reconcile rerun");
+                assert!(
+                    !rerun
+                        .recovered_torn
+                        .iter()
+                        .any(|take| take.id == record.id),
+                    "a committed row is never recovered twice"
+                );
+                assert!(
+                    !rerun.orphan_sessions.contains(&record.id),
+                    "no orphan session for a committed row"
+                );
             }
             other => panic!("expected QuiesceTimeout, got {other:?}"),
         }
