@@ -1,5 +1,6 @@
 import type { InsightEvent } from "./insightEvents";
-import { aggregate, parseInsightTimestamp } from "./insightMetrics";
+import { aggregate, localDayKey, parseInsightTimestamp } from "./insightMetrics";
+import { formatMinutes } from "./insightFormat";
 
 /**
  * The weekly recap (E29 phase 2), derived entirely from the existing
@@ -61,19 +62,6 @@ function weekTotals(events: readonly InsightEvent[], sinceMs: number, untilMs: n
   };
 }
 
-function formatMinutes(seconds: number): string {
-  return `${(seconds / 60).toFixed(1)} min`;
-}
-
-function localDayKey(ms: number, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(ms);
-}
-
 /**
  * Compute the weekly recap. Throws nothing the caller must handle beyond
  * the event contract's own structural errors; a week without takes is the
@@ -103,19 +91,23 @@ export function weeklyRecap(
   const changeWords = previousWeek === null ? null : thisWeek.words - previousWeek.words;
 
   const lines = [
-    `This week: ${thisWeek.words} words recognized from speech · ${thisWeek.takes} takes · ${formatMinutes(thisWeek.capturedSeconds)} captured`,
+    `This week: ${thisWeek.words} words recognized from speech · ${thisWeek.takes} takes · ${formatMinutes(thisWeek.capturedSeconds / 60)} captured`,
   ];
 
   if (previousWeek === null) {
     lines.push("No takes in the week before — this is the first week with takes in range.");
-  } else {
-    const delta = thisWeek.words - previousWeek.words;
-
+  } else if (changeWords !== null) {
+    // changeWords is non-null exactly when previousWeek is; if that
+    // invariant ever broke, the line is omitted rather than stated wrong.
     const direction =
-      delta === 0 ? "the same as" : delta > 0 ? `${delta} more than` : `${-delta} fewer than`;
+      changeWords === 0
+        ? "the same as"
+        : changeWords > 0
+          ? `${changeWords} more than`
+          : `${-changeWords} fewer than`;
 
     lines.push(
-      `Last week: ${previousWeek.words} words · ${previousWeek.takes} takes · ${formatMinutes(previousWeek.capturedSeconds)} captured`,
+      `Last week: ${previousWeek.words} words · ${previousWeek.takes} takes · ${formatMinutes(previousWeek.capturedSeconds / 60)} captured`,
     );
     lines.push(`Words this week were ${direction} last week.`);
   }

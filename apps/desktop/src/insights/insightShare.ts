@@ -1,4 +1,5 @@
 import type { VoicePatternCard } from "./insightVoice";
+import { formatMinutes } from "./insightFormat";
 
 /**
  * Share cards (E29 phase 2): a local artifact the user previews before
@@ -70,16 +71,23 @@ const DEFINITIONS =
 
 export const SHARE_CARD_TITLE = "What voice made possible";
 
-function formatMinutes(minutes: number): string {
-  return `${minutes.toFixed(1)} min`;
+// The redaction default is structural, not conventional: no content-derived
+// field may ever sit in the default include set, and this invariant fires
+// at module load if one is added there — the "explicit opt-in" gate stays
+// meaningful because the default can never grant what only an explicit
+// include can.
+for (const field of DEFAULT_SHARE_INCLUDES) {
+  if (CONTENT_DERIVED_SHARE_FIELDS.has(field)) {
+    throw new Error(`the default share includes must never carry ${field}`);
+  }
 }
 
 /**
  * Build a share card. Redaction is the default and the structure enforces
- * it: every field is copied onto a line only when its name is in the
- * include set, content-derived fields additionally require the explicit
- * opt-in, and nothing else from the input (no take ids, no app data, no
- * free text) has any path into the output at all.
+ * it: a field reaches a line only through the include set, the default
+ * include set is structurally barred from content-derived fields (above),
+ * and nothing else from the input (no take ids, no app data, no free text)
+ * has any path into the output at all.
  */
 export function buildShareCard(input: ShareCardInput, options: ShareCardOptions = {}): ShareCard {
   const include = options.include ?? DEFAULT_SHARE_INCLUDES;
@@ -95,11 +103,7 @@ export function buildShareCard(input: ShareCardInput, options: ShareCardOptions 
     lines.push(`Milestone: ${input.milestone}`);
   }
 
-  if (
-    include.has("topPhrase") &&
-    CONTENT_DERIVED_SHARE_FIELDS.has("topPhrase") &&
-    input.topPhrase !== undefined
-  ) {
+  if (include.has("topPhrase") && input.topPhrase !== undefined) {
     lines.push(`Most repeated phrase: "${input.topPhrase.label}" (${input.topPhrase.takes} takes)`);
   }
 

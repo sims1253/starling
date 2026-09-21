@@ -24,20 +24,35 @@ import { DEFAULT_INSIGHT_CONSENT, consentedTermKinds, type InsightConsent } from
 
 export const INSIGHT_TERM_SCHEMA_VERSION = 1;
 
-/** Per-record safety bound: a pathological transcript must not become a record. */
-export const MAX_TERMS_PER_KIND = 512;
+/**
+ * Per-kind aggregate bound, sized for realistic long takes rather than
+ * erroring on them: a ten-minute dictation at ~150 wpm is ~1500 tokens,
+ * ~3000 distinct two/three-word phrases — comfortably inside. A transcript
+ * beyond the bound (roughly half an hour of continuous distinct speech) is
+ * truncated deterministically, not rejected: the term write must never
+ * fail a take, and truncation keeps the most frequent entries, so cards
+ * built from the record still cite exact counts for what it kept and can
+ * only ever understate recurrence, never overstate it.
+ */
+export const MAX_TERMS_PER_KIND = 4096;
+
+/**
+ * The single source of truth for the token shape: no whitespace, no
+ * control characters, at most 64 code units. The record schema's checks
+ * and the derivation-time bound below are built from this one pattern, so
+ * validation and derivation cannot drift apart.
+ */
+const TOKEN_CORE = "[^\\p{White_Space}\\p{C}]";
+
+const TermBoundPattern = new RegExp(`^${TOKEN_CORE}{1,64}$`, "u");
+
+const PhraseBoundPattern = new RegExp(`^${TOKEN_CORE}{1,64}(?: ${TOKEN_CORE}{1,64}){1,2}$`, "u");
 
 /** A single vocabulary token: no whitespace, no control characters, bounded. */
-const TermTextSchema = Schema.String.pipe(
-  Schema.check(Schema.isPattern(/^[^\p{White_Space}\p{C}]{1,64}$/u)),
-);
+const TermTextSchema = Schema.String.pipe(Schema.check(Schema.isPattern(TermBoundPattern)));
 
 /** A recurring phrase: two or three single-space-joined tokens. */
-const PhraseTextSchema = Schema.String.pipe(
-  Schema.check(
-    Schema.isPattern(/^[^\p{White_Space}\p{C}]{1,64}(?: [^\p{White_Space}\p{C}]{1,64}){1,2}$/u),
-  ),
-);
+const PhraseTextSchema = Schema.String.pipe(Schema.check(Schema.isPattern(PhraseBoundPattern)));
 
 const EventIdSchema = Schema.String.pipe(Schema.check(Schema.isPattern(/^[A-Za-z0-9_.-]{1,128}$/)));
 
@@ -188,8 +203,6 @@ function lexicalTokens(text: string): readonly string[] {
   return tokens;
 }
 
-const TermBoundPattern = /^[^\p{White_Space}\p{C}]{1,64}$/u;
-
 /** Count occurrences of each string in a list, in canonical sorted order. */
 function countAll(items: readonly string[]): readonly TermCount[] {
   const counts = new Map<string, number>();
@@ -201,6 +214,27 @@ function countAll(items: readonly string[]): readonly TermCount[] {
   entries.sort((left, right) => (left.text < right.text ? -1 : left.text > right.text ? 1 : 0));
 
   return entries;
+}
+
+/**
+ * Deterministically bound one kind's entries: keep the most frequent
+ * (ties by label, the card ordering's own rule), then restore the canonical
+ * sorted-by-label order the record schema requires. A truncated record
+ * keeps exact counts for the entries it retained.
+ */
+function boundedEntries(entries: readonly TermCount[]): readonly TermCount[] {
+  if (entries.length <= MAX_TERMS_PER_KIND) return entries;
+
+  const kept = [...entries]
+    .sort(
+      (left, right) =>
+        right.count - left.count || (left.text < right.text ? -1 : left.text > right.text ? 1 : 0),
+    )
+    .slice(0, MAX_TERMS_PER_KIND);
+
+  kept.sort((left, right) => (left.text < right.text ? -1 : left.text > right.text ? 1 : 0));
+
+  return kept;
 }
 
 /** Two- and three-word phrases over consecutive word-like tokens. */
@@ -227,9 +261,12 @@ export interface CaptureTermsOptions {
  * the only place transcript contents meet the term store, and only counts
  * leave: word-like tokens and short phrases with their frequencies. With no
  * kinds granted, the result is empty — consent off means nothing derived is
- * retained, not a record with the text hidden inside. A transcript whose
- * distinct tokens exceed the per-kind bound refuses rather than silently
- * truncating: a partial frequency table would ground cards in wrong counts.
+ * retained, not a record with the text hidden inside. Ordinary long takes
+ * (a multi-minute dictation yields roughly twice as many distinct phrases
+ * as words) fit the bound; a transcript beyond it is truncated
+ * deterministically to its most frequent entries rather than refused, so
+ * deriving aggregates can never fail the take, and the truncation only
+ * ever understates recurrence — the kept counts stay exact.
  */
 export function captureTerms(
   transcriptText: string,
@@ -240,16 +277,8 @@ export function captureTerms(
   const wantsPhrases = kinds.has("phrases");
   const tokens = wantsTerms || wantsPhrases ? lexicalTokens(transcriptText) : [];
 
-  const terms = wantsTerms ? countAll(tokens) : [];
-  const phrases = wantsPhrases ? countAll(phraseTokens(tokens)) : [];
-
-  for (const entries of [terms, phrases]) {
-    if (entries.length > MAX_TERMS_PER_KIND) {
-      throw new InsightTermValidationError(
-        "transcript exceeds the bounded aggregate size for insight terms",
-      );
-    }
-  }
+  const terms = wantsTerms ? boundedEntries(countAll(tokens)) : [];
+  const phrases = wantsPhrases ? boundedEntries(countAll(phraseTokens(tokens))) : [];
 
   return { terms, phrases };
 }

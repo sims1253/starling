@@ -191,15 +191,24 @@ function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
 /**
  * Both card kinds under their independent consents: a kind whose grant is
  * off yields no cards even when its aggregates exist (and after a
- * withdrawal plus purge, none exist to yield). The selected-take count for
- * the window comes from the event log, so a card's denominator can say
- * "takes", not merely "records with term aggregates".
+ * withdrawal plus purge, none exist to yield).
+ *
+ * Two denominators, both stated: `windowTakes` is the distinct captures
+ * with a selected recognition inside the window (a retranscription is the
+ * same take, never counted twice), and `analyzedTakes` is how many of those
+ * have retained aggregates — takes recorded while a grant was off have
+ * none. Cards cite `analyzedTakes` ("appeared in 3 of 5 analyzed takes")
+ * because a take with no aggregates is an unknown, not a negative: claiming
+ * "3 of 8 takes" would assert the phrase is absent from takes nobody
+ * analyzed. The UI shows both numbers so the coverage is visible.
  */
 export interface VoicePanel {
   readonly phraseCards: readonly VoicePatternCard[];
   readonly vocabularyCards: readonly VoicePatternCard[];
-  /** Takes with a selected recognition inside the window (the denominator). */
+  /** Distinct takes with a selected recognition inside the window. */
   readonly windowTakes: number;
+  /** Takes in the window whose aggregates exist under the current grants. */
+  readonly analyzedTakes: number;
 }
 
 export function voicePanel(
@@ -209,15 +218,23 @@ export function voicePanel(
   options: VoiceCardOptions = {},
 ): VoicePanel {
   const resolved = resolveOptions(options);
+
   const since = resolved.now - resolved.windowDays * 24 * 60 * 60 * 1000;
 
-  const windowTakes = events.filter(
-    (event) => isRecognitionSelected(event) && parseInsightTimestamp(event.occurred_at) >= since,
-  ).length;
+  const windowCaptures = new Set<string>();
+
+  for (const event of events) {
+    if (isRecognitionSelected(event) && parseInsightTimestamp(event.occurred_at) >= since) {
+      windowCaptures.add(event.capture_id);
+    }
+  }
+
+  const analyzedTakes = records.filter((record) => windowCaptures.has(record.capture_id)).length;
 
   return {
     phraseCards: consent.recurringPhrases ? recurringPhraseCards(records, resolved) : [],
     vocabularyCards: consent.vocabularyPatterns ? vocabularyPatternCards(records, resolved) : [],
-    windowTakes,
+    windowTakes: windowCaptures.size,
+    analyzedTakes,
   };
 }

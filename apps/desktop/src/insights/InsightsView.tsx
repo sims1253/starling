@@ -22,6 +22,7 @@ import {
 } from "./insightShare";
 import { milestonePanel } from "./insightMilestones";
 import { weeklyRecap } from "./insightRecap";
+import { formatMinutes } from "./insightFormat";
 
 /**
  * The Insights surface (E29): Usage and Quality panels computed from the
@@ -79,8 +80,9 @@ function compute<T>(work: () => T): Computed<T> {
   }
 }
 
-function formatMinutes(seconds: number): string {
-  return `${(seconds / 60).toFixed(1)} min`;
+/** Captured seconds through the one shared minutes rendering. */
+function formatCapturedMinutes(seconds: number): string {
+  return formatMinutes(seconds / 60);
 }
 
 function formatSeconds(seconds: number): string {
@@ -140,6 +142,8 @@ export function InsightsView({
 
   const [shareCopied, setShareCopied] = useState(false);
 
+  const [shareCopyFailed, setShareCopyFailed] = useState<string>();
+
   const parsedBaseline = Number.parseInt(baselineDraft, 10);
   const baseline = Number.isInteger(parsedBaseline) && parsedBaseline > 0 ? parsedBaseline : null;
 
@@ -192,6 +196,7 @@ export function InsightsView({
 
     setShareIncludes(next);
     setShareCopied(false);
+    setShareCopyFailed(undefined);
   }
 
   function exportAggregate() {
@@ -238,7 +243,20 @@ export function InsightsView({
   async function copyShareCard() {
     if (shareCard === undefined || !navigator.clipboard) return;
 
-    await navigator.clipboard.writeText(renderShareCard(shareCard));
+    setShareCopyFailed(undefined);
+
+    try {
+      await navigator.clipboard.writeText(renderShareCard(shareCard));
+    } catch (caught) {
+      // A clipboard can refuse on focus or permission grounds; the user
+      // sees why copying failed and still has the local save path.
+      setShareCopyFailed(
+        `Copy failed (${messageFrom(caught)}) — the previewed text is unchanged; try "Save as text" instead.`,
+      );
+
+      return;
+    }
+
     setShareCopied(true);
     window.setTimeout(() => setShareCopied(false), 2_000);
   }
@@ -365,7 +383,7 @@ export function InsightsView({
               <span>recognized from speech — final selected transcripts only</span>
             </div>
             <div className="insight-tile">
-              <strong>{formatMinutes(usage.value.captured_seconds)}</strong>
+              <strong>{formatCapturedMinutes(usage.value.captured_seconds)}</strong>
               <span>captured audio, silence included</span>
             </div>
             <div className="insight-tile">
@@ -396,29 +414,33 @@ export function InsightsView({
             <p className="recap-text">{recapText(recap)}</p>
           </div>
 
-          {celebrated.ok && celebrated.value.enabled && (
+          {celebrated.ok && (celebrated.value.enabled || celebrated.value.streak !== null) && (
             <div className="insights-milestones">
-              <p className="eyebrow">MILESTONES — OPTIONAL, YOURS TO SWITCH OFF</p>
-              {celebrated.value.milestones.length === 0 ? (
-                <NotEnoughData note="milestones appear as totals cross their thresholds — the first take already earns one" />
-              ) : (
-                <ul>
-                  {celebrated.value.milestones.map((milestone) => (
-                    <li key={milestone.id}>
-                      <strong>{milestone.label}</strong>
-                      <span>
-                        {milestone.achievedOnDay} — {milestone.evidence}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {celebrated.value.goal !== null && (
-                <p className="goal-line">
-                  Goal: {celebrated.value.goal.description}
-                  {celebrated.value.goal.achieved ? " — reached this week." : "."} A quieter week is
-                  never a failure here.
-                </p>
+              {celebrated.value.enabled && (
+                <>
+                  <p className="eyebrow">MILESTONES — OPTIONAL, YOURS TO SWITCH OFF</p>
+                  {celebrated.value.milestones.length === 0 ? (
+                    <NotEnoughData note="milestones appear as totals cross their thresholds — the first take already earns one" />
+                  ) : (
+                    <ul>
+                      {celebrated.value.milestones.map((milestone) => (
+                        <li key={milestone.id}>
+                          <strong>{milestone.label}</strong>
+                          <span>
+                            {milestone.achievedOnDay} — {milestone.evidence}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {celebrated.value.goal !== null && (
+                    <p className="goal-line">
+                      Goal: {celebrated.value.goal.description}
+                      {celebrated.value.goal.achieved ? " — reached this week." : "."} A quieter
+                      week is never a failure here.
+                    </p>
+                  )}
+                </>
               )}
               {celebrated.value.streak !== null && (
                 <p className="streak-line">
@@ -446,7 +468,7 @@ export function InsightsView({
                           aria-label={
                             day.activity === undefined
                               ? `${day.label}: no takes — a rest day, not a failure`
-                              : `${day.label}: ${plural(day.activity.takes, "take")}, ${formatMinutes(day.activity.captured_seconds)}`
+                              : `${day.label}: ${plural(day.activity.takes, "take")}, ${formatCapturedMinutes(day.activity.captured_seconds)}`
                           }
                         >
                           <span aria-hidden="true">{day.label}</span>
@@ -564,6 +586,13 @@ export function InsightsView({
             <NotEnoughData note="no content-derived analysis is enabled — enable one above; nothing is read or retained while both are off" />
           ) : (
             <div className="insight-tiles">
+              {voice.value.analyzedTakes < voice.value.windowTakes && (
+                <p className="voice-coverage" role="status">
+                  Aggregates cover {voice.value.analyzedTakes} of {voice.value.windowTakes} takes
+                  with transcripts in the window — takes recorded while a grant was off have none,
+                  and cards count only the takes they could actually read.
+                </p>
+              )}
               {consent.recurringPhrases &&
                 (voice.value.phraseCards.length > 0 ? (
                   voice.value.phraseCards.map((card) => (
@@ -622,6 +651,11 @@ export function InsightsView({
             </button>
             <button onClick={saveShareCard}>Save as text</button>
           </div>
+          {shareCopyFailed !== undefined && (
+            <p className="share-copy-failure" role="alert">
+              {shareCopyFailed}
+            </p>
+          )}
           <small>
             Copy and save are the only actions — Starling never posts anywhere for you. Aggregate
             fields only, unless you explicitly include the content-derived one.

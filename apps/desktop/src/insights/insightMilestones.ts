@@ -1,5 +1,5 @@
 import { isCaptureFinalized, type InsightEvent } from "./insightEvents";
-import { aggregate, parseInsightTimestamp } from "./insightMetrics";
+import { aggregate, localDayKey, parseInsightTimestamp } from "./insightMetrics";
 import type { InsightConsent } from "./insightConsent";
 
 /**
@@ -74,7 +74,11 @@ interface DayTotals {
  * capture's events — so tombstones, canonical-finalization and
  * highest-sequence selection apply with their frozen semantics instead of a
  * second implementation drifting from the oracle — and the day is the
- * local day of the capture's finalization instant.
+ * local day of the capture's finalization instant. A capture the contract
+ * counts as zero takes (tombstoned — deleted) contributes nothing and,
+ * crucially, never keeps its day alive: a day whose only takes were deleted
+ * drops out entirely, so streaks and milestones stop counting it exactly
+ * like the metric panels do.
  */
 export function dayTotals(events: readonly InsightEvent[], timezone: string): readonly DayTotals[] {
   const byDay = new Map<string, { takes: number; words: number; seconds: number }>();
@@ -86,7 +90,13 @@ export function dayTotals(events: readonly InsightEvent[], timezone: string): re
     if (capture === undefined) continue;
 
     const totals = aggregate(items);
-    const day = localDayOf(parseInsightTimestamp(capture.occurred_at), timezone);
+
+    // A tombstoned capture aggregates to zero takes; it must not create or
+    // extend a day bucket — deletion removes the take's contribution from
+    // these surfaces too, not merely zeroes its numbers.
+    if (totals.unique_takes === 0) continue;
+
+    const day = localDayKey(parseInsightTimestamp(capture.occurred_at), timezone);
     const bucket = byDay.get(day) ?? { takes: 0, words: 0, seconds: 0 };
 
     bucket.takes += totals.unique_takes;
@@ -103,15 +113,6 @@ export function dayTotals(events: readonly InsightEvent[], timezone: string): re
       capturedSeconds: bucket.seconds,
     }))
     .sort((left, right) => (left.day < right.day ? -1 : 1));
-}
-
-function localDayOf(ms: number, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(ms);
 }
 
 /**
@@ -244,7 +245,7 @@ export interface StreakView {
 export function streaks(events: readonly InsightEvent[], options: MilestoneOptions): StreakView {
   const days = new Set(dayTotals(events, options.timezone).map((day) => day.day));
   const now = options.now ?? Date.now();
-  const today = localDayOf(now, options.timezone);
+  const today = localDayKey(now, options.timezone);
 
   // Walk back from today; a take-less today simply does not extend the run.
   let currentDays = 0;
@@ -314,16 +315,20 @@ export interface MilestonePanel {
 
 /**
  * The whole optional celebratory surface under its consents: milestones and
- * the goal exist only when enabled, the streak only with its own opt-in,
- * and the goal additionally requires the user to have chosen one.
+ * the goal exist only when enabled, the streak only with its own opt-in —
+ * the streak is an independent consent, so it renders whenever its toggle
+ * is on, milestones or not — and the goal additionally requires the user
+ * to have chosen one.
  */
 export function milestonePanel(
   events: readonly InsightEvent[],
   consent: InsightConsent,
   options: MilestoneOptions,
 ): MilestonePanel {
+  const streak = consent.streaks ? streaks(events, options) : null;
+
   if (!consent.milestones) {
-    return { enabled: false, milestones: [], goal: null, streak: null };
+    return { enabled: false, milestones: [], goal: null, streak };
   }
 
   return {
@@ -336,6 +341,6 @@ export function milestonePanel(
             now: options.now,
           })
         : null,
-    streak: consent.streaks ? streaks(events, options) : null,
+    streak,
   };
 }

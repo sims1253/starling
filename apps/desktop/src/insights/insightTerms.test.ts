@@ -7,6 +7,7 @@ import {
   IndexedDbInsightTermStore,
   InsightTermRecorder,
   InsightTermValidationError,
+  MAX_TERMS_PER_KIND,
   MemoryInsightTermStore,
   captureTerms,
   insightTermRecordProblems,
@@ -64,10 +65,36 @@ describe("captureTerms", () => {
     expect(derived.phrases).toEqual([]);
   });
 
-  it("refuses transcripts whose aggregates exceed the bounded size", () => {
-    const many = Array.from({ length: 600 }, (_, index) => `token${index}`).join(" ");
+  it("truncates transcripts whose aggregates exceed the bounded size", () => {
+    // 5000 distinct tokens overrun MAX_TERMS_PER_KIND; the most frequent
+    // entry must survive the deterministic truncation and the take must
+    // never fail because of the term write.
+    const many = [
+      ...Array.from({ length: 4_999 }, (_, index) => `token${index}`),
+      ...Array.from({ length: 100 }, () => "repeated"),
+    ].join(" ");
 
-    expect(() => captureTerms(many)).toThrow(InsightTermValidationError);
+    const derived = captureTerms(many);
+
+    expect(derived.terms.length).toBe(MAX_TERMS_PER_KIND);
+    expect(derived.terms.some((entry) => entry.text === "repeated")).toBe(true);
+    expect(derived.terms.some((entry) => entry.text === "token0")).toBe(true);
+    expect(derived.terms.some((entry) => entry.text === "token4998")).toBe(false);
+  });
+
+  it("store put still refuses a non-conforming record", async () => {
+    // Derivation truncates instead of throwing, so the validation error now
+    // guards only the store boundary against records that bypassed it.
+    const store = new MemoryInsightTermStore();
+
+    // SAFETY: deliberately non-conforming record (an unknown field) — the
+    // JSON round-trip cast exists to bypass the type check precisely so
+    // put's boundary validation can be exercised with this shape.
+    const smuggled = JSON.parse(
+      JSON.stringify({ ...recordOf("take-1", "hello world"), extra: "not allowed" }),
+    ) as InsightTermRecord;
+
+    await expect(store.put(smuggled)).rejects.toThrow(InsightTermValidationError);
   });
 });
 
