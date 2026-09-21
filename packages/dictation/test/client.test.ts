@@ -8,6 +8,7 @@ import {
   DictationProtocolError,
   DictationResponseTooLargeError,
   DictationTimeoutError,
+  DictationTransportError,
   StarlingClient,
 } from "../src/client.js";
 import { prepareWav16k } from "../src/audio.js";
@@ -520,6 +521,99 @@ describe("StarlingClient protocol compatibility", () => {
       baseUrl: "http://localhost:8181",
       maxResponseBytes: 64,
       fetch: async () => new Response(null, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("accepts a body exactly at the cap and refuses one byte past it", async () => {
+    // The cap is inclusive: `received === limitBytes` must succeed, only
+    // `>` throws (mirrors the Rust client's at-the-limit test).
+    const clientWith = (fetcher: typeof fetch) =>
+      new StarlingClient({
+        baseUrl: "http://localhost:8181",
+        maxResponseBytes: 64,
+        fetch: fetcher,
+      });
+
+    const atCap = JSON.stringify({ status: "ok" }).padEnd(64);
+
+    assert.equal(atCap.length, 64);
+
+    const health = await clientWith(async () => new Response(atCap, { status: 200 })).health();
+
+    assert.equal(health.status, "ok");
+
+    await assert.rejects(
+      clientWith(async () => new Response("a".repeat(65), { status: 200 })).health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("keeps the cap refusal out of the transport error channel", async () => {
+    // readBodyCapped throws inside Effect.tryPromise: the catch must pass
+    // the tagged error through unchanged, never rewrap it as a transport
+    // failure (which would flip retry classification downstream).
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        new StarlingClient({
+          baseUrl: "http://localhost:8181",
+          maxResponseBytes: 64,
+          fetch: async () => new Response("a".repeat(65), { status: 200 }),
+        }).healthEffect(),
+      ),
+    );
+
+    assert.ok(failure instanceof DictationResponseTooLargeError);
+    assert.equal(failure.limitBytes, 64);
+    assert.equal(failure instanceof DictationTransportError, false);
+  });
+
+  it("still reports the streaming refusal when cancelling the reader rejects", async () => {
+    // The cancel is fire-and-forget: a transport failure while releasing
+    // an already-dead connection must not mask the cap error. Under an
+    // awaited `reader.cancel()` shape this reject would win and surface
+    // as a DictationTransportError — that is what this test pins.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65).fill(0x61));
+      },
+      cancel() {
+        return Promise.reject(new TypeError("cancel failed"));
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("still reports the declared-length refusal when cancelling the body rejects", async () => {
+    // The pre-check's fire-and-forget cancel, same pin: the rejecting
+    // cancel of the underlying source must not displace the cap error.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64).fill(0x61));
+      },
+      cancel() {
+        return Promise.reject(new TypeError("cancel failed"));
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200, headers: { "Content-Length": "65" } }),
     });
 
     await assert.rejects(

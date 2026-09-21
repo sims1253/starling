@@ -357,7 +357,11 @@ async function readBodyCapped(response: Response, limitBytes: number): Promise<s
   // meaning a declared Content-Length (the compressed wire size) can sit
   // under the cap while the decoded body does not — the streaming check
   // below is what enforces the real bound; this pre-check is the fast
-  // path for uncompressed bodies.
+  // path for uncompressed bodies. The header parse is deliberately
+  // lenient: a malformed value ("12abc") parses to NaN and simply skips
+  // the fast path, and runtimes that expose Content-Length as the
+  // decompressed size — or strip it — skip it the same way. The
+  // streaming counter is the real bound either way.
   const declared = response.headers.get("Content-Length");
   const declaredBytes = declared === null ? Number.NaN : Number(declared);
 
