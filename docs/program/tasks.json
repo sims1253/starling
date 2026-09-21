@@ -1822,7 +1822,8 @@
   "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
   "196": "program/s01-moss-kv-clear -> master (S01)",
   "254": "fix/clients-235-bounded-http-bodies -> master (R06: zero-copy WAV upload + capped response bodies)",
-  "258": "feat/insights-225-phase2 -> master (E29-p2 / issue #225: consent-gated voice cards, redacted share cards, milestones/goal/streak, weekly recap)"
+  "258": "feat/insights-225-phase2 -> master (E29-p2 / issue #225: consent-gated voice cards, redacted share cards, milestones/goal/streak, weekly recap)",
+  "260": "fix/insights-259-review-mediums -> master (E29-p2 / issue #259 TS half: deferred PR #258 review mediums \u2014 notice list, mirror deltas + guard, awaited deletions, atomic purge, finalized-at anchoring, share-card range/withheld fixes)"
  },
  "issue_filing": {
   "note": "2026-09-21: 19 consolidated issues filed (#218-#236) covering all open program work; per-item github_issue fields map local IDs to issues. Exception: #225 (Insights phase 2) has no single local task ID \u2014 it is phase-2 product work building on the integrated E28/E29 \u2014 so it carries no per-item mapping."
