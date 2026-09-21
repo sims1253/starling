@@ -1,0 +1,37 @@
+[package]
+name = "starling-runtime-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sims1253/starling"
+description = "Starling runtime service host (E17 I4, Mode B): one process per user session serving the runtime over OS-local authenticated IPC"
+
+[dependencies]
+starling-dictation = { path = "../dictation" }
+starling-runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Windows named-pipe transport (platform::windows). The same crate
+# already reaches windows-sys through cpal on Windows builds; the features
+# listed here are the pipe/ACL surface that module needs. None of this
+# compiles into non-Windows builds.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+starling-runtime = { path = "../runtime", features = ["test-doubles"] }
+tempfile = "3"
