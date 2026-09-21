@@ -72,6 +72,12 @@ import {
 import type { PendingAudioState } from "../electron/ipc.js";
 import { InsightRecorder, wavCaptureStats } from "./insights/insightEmitter";
 import { IndexedDbInsightEventStore, type InsightEvent } from "./insights/insightEvents";
+import { readInsightConsent } from "./insights/insightConsent";
+import {
+  IndexedDbInsightTermStore,
+  InsightTermRecorder,
+  type InsightTermRecord,
+} from "./insights/insightTerms";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
@@ -107,6 +113,22 @@ const store = new IndexedDbSessionStore();
  * with failures surfaced as an Insights notice instead of a take error.
  */
 const insights = new InsightRecorder(new IndexedDbInsightEventStore());
+
+/**
+ * Content-derived term aggregates (E29 phase 2): a second store, separate
+ * from the event log, holding only per-capture term/phrase counts under
+ * its own consent. The consent is read at write time from local settings,
+ * so nothing is derived or retained while a grant is off; deleting a take
+ * tombstones its aggregates with the same dominance the event tombstone
+ * has. Like the event recorder, it must never break the action it
+ * describes — writes are fire-and-forget with failures surfaced as an
+ * Insights notice.
+ */
+const insightTermStore = new IndexedDbInsightTermStore();
+
+const insightTerms = new InsightTermRecorder(insightTermStore, {
+  consent: () => readInsightConsent(localStorage),
+});
 
 function formatDuration(ms?: number) {
   if (!ms) return "0:00";
@@ -242,6 +264,11 @@ export default function App() {
   // refresh after each emit, so opening the view later always reads the
   // current population.
   const [, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
+
+  // The consented content-derived aggregates (E29 phase 2): the population
+  // the "Your voice" cards derive from, refreshed after each write like the
+  // event mirror above.
+  const [, setTermRecords] = useState<readonly InsightTermRecord[]>(() => []);
 
   const [, setInsightsIssue] = useState<string>();
 
@@ -564,20 +591,31 @@ export default function App() {
       .catch((caught) =>
         setInsightsIssue(`Insights could not open the local event log: ${messageFrom(caught)}`),
       );
+
+    void insightTermStore
+      .load()
+      .then((log) => setTermRecords(log.records))
+      .catch((caught) =>
+        setInsightsIssue(
+          `Insights could not open the local term aggregates: ${messageFrom(caught)}`,
+        ),
+      );
   }, []);
 
   /**
    * Record one insight event without ever blocking the action it describes
    * (E29): the emit is fire-and-forget, load() inside is idempotent so the
-   * mirror exists before sequence numbers are derived, a failure lands in
-   * the Insights notice instead of the take's flow, and the mirror refreshes
-   * on success so the Insights view reads the new event without a reopen.
+   * mirror exists before sequence numbers are derived, a failure lands in the
+   * Insights notice instead of the take's flow, and both mirrors refresh on
+   * success so the Insights view reads the new data without a reopen.
    */
   const recordInsight = useCallback((action: () => Promise<void>) => {
     void insights
       .load()
       .then(action)
       .then(() => setInsightEvents(insights.snapshot()))
+      .then(() => insightTermStore.load())
+      .then((log) => setTermRecords(log.records))
       .catch((caught) =>
         setInsightsIssue(`Insights could not record an event: ${messageFrom(caught)}`),
       );
@@ -595,13 +633,19 @@ export default function App() {
       const startedAt = stopWaitStartsRef.current.get(sessionId);
 
       stopWaitStartsRef.current.delete(sessionId);
-      recordInsight(() =>
-        insights.recognitionSelected({
+      recordInsight(async () => {
+        await insights.recognitionSelected({
           captureId: sessionId,
           transcriptText,
           postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
-        }),
-      );
+        });
+
+        // The consented content-derived aggregates (E29 phase 2): only the
+        // term/phrase counts leave this call, only for kinds the current
+        // consent grants, and a failure here is an Insights notice, never a
+        // take error.
+        await insightTerms.recognitionSelected({ captureId: sessionId, transcriptText });
+      });
     },
     [recordInsight],
   );
@@ -1764,13 +1808,21 @@ export default function App() {
   /**
    * Delete one saved recording. Reached only through the confirmation
    * dialog's explicit confirm (B05); a failed delete leaves the recording
-   * and its versions intact and surfaces the error instead.
+   * and its versions intact and surfaces the error instead. Deletion also
+   * removes every derived contribution (E28/E29): the event tombstone
+   * dominates stale replays, and the content-derived term aggregates are
+   * deleted outright, so a deleted take cannot reappear in a number, a
+   * card, a recap or a share preview.
    */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
     try {
       await store.delete(id);
+      recordInsight(async () => {
+        await insights.captureDeleted(id);
+        await insightTerms.captureDeleted(id);
+      });
       await refresh();
     } catch (caught) {
       setError(`Could not delete the recording: ${messageFrom(caught)}`);
