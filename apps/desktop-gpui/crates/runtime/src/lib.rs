@@ -631,6 +631,17 @@ impl RuntimeClient {
         self.bus.subscribe()
     }
 
+    /// Allocates the next `seq` on `corr`'s stream from the same frontier
+    /// [`Self::send`] and the event side use. The I4 service host calls
+    /// this for IPC clients that sent their envelope without a `seq`:
+    /// sequence assignment stays at the point that owns the frontier, so a
+    /// reconnecting client cannot collide with the stream positions a dead
+    /// connection already consumed (host-assigned numbering continues
+    /// monotonically across renderer restarts).
+    pub fn assign_seq(&self, corr: Option<&str>) -> u64 {
+        self.bus.next_seq(corr)
+    }
+
     /// The runtime projection snapshot.
     pub fn snapshot(&self) -> RuntimeSnapshot {
         snapshot_of(&self.views, &self.frozen_routes)
