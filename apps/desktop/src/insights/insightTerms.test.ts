@@ -6,9 +6,11 @@ import { DEFAULT_INSIGHT_CONSENT, type InsightConsent } from "./insightConsent";
 import {
   IndexedDbInsightTermStore,
   InsightTermRecorder,
+  InsightTermTombstoneError,
   InsightTermValidationError,
   MAX_TERMS_PER_KIND,
   MemoryInsightTermStore,
+  applyTermWrite,
   captureTerms,
   insightTermRecordProblems,
   type InsightTermRecord,
@@ -214,6 +216,60 @@ describe("IndexedDbInsightTermStore", () => {
     await expect(second.put(recordOf("take-2", "alpha"))).rejects.toThrow(/deleted/);
   });
 
+  it("rejects a put over a tombstone with the tombstone error, deterministically", async () => {
+    const factory = new IDBFactory();
+    const store = new IndexedDbInsightTermStore({ databaseName: "terms-c", indexedDB: factory });
+
+    await store.tombstone("take-1");
+
+    // The abort the refusal triggers must not race a second, generic
+    // "put was aborted" rejection onto the same promise: the failure reason
+    // is the tombstone, every time.
+    await expect(store.put(recordOf("take-1", "alpha"))).rejects.toBeInstanceOf(
+      InsightTermTombstoneError,
+    );
+  });
+
+  it("purges one transaction atomically and returns the rewritten records", async () => {
+    const factory = new IDBFactory();
+    const store = new IndexedDbInsightTermStore({ databaseName: "terms-d", indexedDB: factory });
+
+    await store.put(recordOf("take-1", "alpha beta gamma"));
+
+    const purged = await store.purgeKinds(new Set(["phrases"]));
+
+    expect(purged).toHaveLength(1);
+    expect(purged[0]?.phrases).toEqual([]);
+    expect(purged[0]?.terms.length).toBe(3);
+
+    const log = await store.load();
+
+    expect(log.records[0]?.phrases).toEqual([]);
+    expect(log.records[0]?.terms.length).toBe(3);
+  });
+
+  it("never reverts a concurrent re-put to the purge's stale snapshot", async () => {
+    const factory = new IDBFactory();
+    const store = new IndexedDbInsightTermStore({ databaseName: "terms-e", indexedDB: factory });
+
+    await store.put(recordOf("take-1", "alpha beta gamma"));
+
+    // The re-put is issued while the purge is in flight, between its read
+    // and its write under the old two-transaction implementation — the
+    // purge then re-persisted the stale pre-purge copy and the re-put's
+    // content was lost. One readwrite cursor transaction cannot see or
+    // clobber a write it never read.
+    const purge = store.purgeKinds(new Set(["phrases"]));
+    const reput = store.put(recordOf("take-1", "delta epsilon zeta"));
+
+    await Promise.all([purge, reput]);
+
+    const log = await store.load();
+
+    expect(log.records[0]?.terms.some((entry) => entry.text === "delta")).toBe(true);
+    expect(log.records[0]?.terms.some((entry) => entry.text === "alpha")).toBe(false);
+  });
+
   it("quarantines damaged records instead of failing the whole log", async () => {
     const factory = new IDBFactory();
     const databaseName = "terms-b";
@@ -236,6 +292,37 @@ describe("IndexedDbInsightTermStore", () => {
     const log = await store.load();
 
     expect(log.records).toHaveLength(1);
+    expect(log.invalidCount).toBe(1);
+  });
+
+  it("leaves damaged records untouched when the cursor purges", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "terms-f";
+    const store = new IndexedDbInsightTermStore({ databaseName, indexedDB: factory });
+
+    await store.put(recordOf("take-1", "alpha beta gamma"));
+
+    const poisoned: PoisonedTermRecord = {
+      schema_version: 1,
+      capture_id: "take-9",
+      occurred_at: new Date(T0).toISOString(),
+      tokenizer: TOKENIZER_ID,
+      terms: [{ text: "a whole transcript cannot fit here because spaces", count: 1 }],
+      phrases: [],
+      transcript: "hello world",
+    };
+
+    await writeRawRecord(factory, databaseName, poisoned);
+
+    const purged = await store.purgeKinds(new Set(["terms"]));
+
+    // The conforming record is purged; the damaged one is quarantined, not
+    // repaired or deleted by the withdrawal.
+    expect(purged).toHaveLength(1);
+    expect(purged[0]?.capture_id).toBe("take-1");
+
+    const log = await store.load();
+
     expect(log.invalidCount).toBe(1);
   });
 });
@@ -293,9 +380,61 @@ describe("InsightTermRecorder", () => {
   it("writes nothing while the content-derived consent is off", async () => {
     const { store, recorder } = recorderWith(() => DEFAULT_INSIGHT_CONSENT);
 
-    await recorder.recognitionSelected({ captureId: "take-1", transcriptText: "alpha beta" });
+    const write = await recorder.recognitionSelected({
+      captureId: "take-1",
+      transcriptText: "alpha beta",
+    });
 
+    // "none" is the honest outcome: no store I/O happened at all, so a
+    // caller's mirror must not re-read on it either.
+    expect(write).toEqual({ kind: "none" });
     expect((await store.load()).records).toHaveLength(0);
+  });
+
+  it("resolves with the written record so the mirror applies the delta", async () => {
+    const { recorder } = recorderWith(() => ({
+      ...DEFAULT_INSIGHT_CONSENT,
+      vocabularyPatterns: true,
+    }));
+
+    const write = await recorder.recognitionSelected({
+      captureId: "take-1",
+      transcriptText: "alpha beta",
+    });
+
+    expect(write.kind).toBe("record");
+
+    if (write.kind !== "record") return;
+
+    expect(write.record.capture_id).toBe("take-1");
+    expect(write.record.terms).toContainEqual({ text: "alpha", count: 1 });
+  });
+
+  it("anchors the record to the capture's finalization instant, not the write clock", async () => {
+    const { store, recorder } = recorderWith(() => ({
+      ...DEFAULT_INSIGHT_CONSENT,
+      vocabularyPatterns: true,
+    }));
+
+    const finalizedAt = new Date(T0 - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+    await recorder.recognitionSelected({
+      captureId: "take-1",
+      transcriptText: "alpha beta",
+      finalizedAt,
+    });
+
+    expect((await store.load()).records[0]?.occurred_at).toBe(finalizedAt);
+
+    // Without a known finalization the write-time clock is the fallback.
+    const fallback = await recorder.recognitionSelected({
+      captureId: "take-2",
+      transcriptText: "alpha",
+    });
+
+    if (fallback.kind !== "record") throw new Error("expected a record write");
+
+    expect(fallback.record.occurred_at).toBe(new Date(T0).toISOString());
   });
 
   it("retains only the granted kind per write", async () => {
@@ -363,11 +502,71 @@ describe("InsightTermRecorder", () => {
     await recorder.recognitionSelected({ captureId: "take-1", transcriptText: "alpha beta gamma" });
 
     consent = { ...consent, recurringPhrases: false };
-    await recorder.withdrawKinds(new Set(["phrases"]));
+    const write = await recorder.withdrawKinds(new Set(["phrases"]));
 
     const log = await store.load();
 
     expect(log.records[0]?.phrases).toEqual([]);
     expect(log.records[0]?.terms.length).toBe(3);
+
+    // The purge write names the records the store rewrote.
+    expect(write.kind).toBe("purge");
+
+    if (write.kind !== "purge") return;
+
+    expect(write.records[0]?.phrases).toEqual([]);
+  });
+
+  it("names the deletion and the reset in their writes", async () => {
+    const { recorder } = recorderWith(() => ({
+      ...DEFAULT_INSIGHT_CONSENT,
+      vocabularyPatterns: true,
+    }));
+
+    await recorder.recognitionSelected({ captureId: "take-1", transcriptText: "alpha" });
+
+    const deleted = await recorder.captureDeleted("take-1");
+    const reset = await recorder.reset();
+
+    expect(deleted).toEqual({ kind: "tombstone", captureId: "take-1" });
+    expect(reset).toEqual({ kind: "clear" });
+  });
+});
+
+describe("applyTermWrite", () => {
+  it("upserts a record in place and appends a new capture", () => {
+    const base = [recordOf("take-1", "alpha"), recordOf("take-2", "beta")];
+    const revised = recordOf("take-1", "delta");
+    const fresh = recordOf("take-3", "epsilon");
+
+    const applied = applyTermWrite(applyTermWrite(base, { kind: "record", record: revised }), {
+      kind: "record",
+      record: fresh,
+    });
+
+    expect(applied.map((record) => record.capture_id)).toEqual(["take-1", "take-2", "take-3"]);
+    expect(applied[0]?.terms).toContainEqual({ text: "delta", count: 1 });
+  });
+
+  it("drops the tombstoned capture, upserts a purge, clears on reset", () => {
+    const base = [recordOf("take-1", "alpha beta gamma"), recordOf("take-2", "beta")];
+    const original = base[0];
+
+    if (original === undefined) throw new Error("fixture record missing");
+
+    const withoutDeleted = applyTermWrite(base, { kind: "tombstone", captureId: "take-2" });
+
+    expect(withoutDeleted.map((record) => record.capture_id)).toEqual(["take-1"]);
+
+    const purged = applyTermWrite(withoutDeleted, {
+      kind: "purge",
+      records: [{ ...original, phrases: [] }],
+    });
+
+    expect(purged[0]?.phrases).toEqual([]);
+    expect(applyTermWrite(purged, { kind: "clear" })).toEqual([]);
+
+    // "none" changes nothing — the consent answer, not an omission.
+    expect(applyTermWrite(purged, { kind: "none" })).toBe(purged);
   });
 });

@@ -290,12 +290,16 @@ export function captureTerms(
  * cannot be resurrected by a stale re-record), and `tombstone` removes the
  * record and remembers the deletion. `purgeKinds` implements consent
  * withdrawal: the withdrawn kind's data is deleted from every record.
+ *
+ * The mutating methods resolve with what they changed — the written record,
+ * the purged records — so a caller holding a mirror of `load()` can apply
+ * the delta without re-reading the store on every write.
  */
 export interface InsightTermStore {
   load(): Promise<InsightTermLog>;
-  put(record: InsightTermRecord): Promise<void>;
+  put(record: InsightTermRecord): Promise<InsightTermRecord>;
   tombstone(captureId: string): Promise<void>;
-  purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<void>;
+  purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]>;
   clear(): Promise<void>;
 }
 
@@ -317,7 +321,7 @@ export class MemoryInsightTermStore implements InsightTermStore {
     });
   }
 
-  async put(record: InsightTermRecord): Promise<void> {
+  async put(record: InsightTermRecord): Promise<InsightTermRecord> {
     assertConforming(record);
 
     if (this.tombstones.has(record.capture_id)) {
@@ -328,6 +332,8 @@ export class MemoryInsightTermStore implements InsightTermStore {
     }
 
     this.records.set(record.capture_id, record);
+
+    return record;
   }
 
   async tombstone(captureId: string): Promise<void> {
@@ -335,14 +341,21 @@ export class MemoryInsightTermStore implements InsightTermStore {
     this.tombstones.add(captureId);
   }
 
-  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<void> {
+  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]> {
+    const updated: InsightTermRecord[] = [];
+
     for (const [captureId, record] of this.records) {
-      this.records.set(captureId, {
+      const purged: InsightTermRecord = {
         ...record,
         terms: kinds.has("terms") ? [] : record.terms,
         phrases: kinds.has("phrases") ? [] : record.phrases,
-      });
+      };
+
+      this.records.set(captureId, purged);
+      updated.push(purged);
     }
+
+    return Object.freeze(updated);
   }
 
   async clear(): Promise<void> {
@@ -419,11 +432,15 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
     });
   }
 
-  async put(record: InsightTermRecord): Promise<void> {
+  async put(record: InsightTermRecord): Promise<InsightTermRecord> {
     assertConforming(record);
     const database = await this.database();
 
     await new Promise<void>((resolve, reject) => {
+      // The tombstone refusal settles the promise itself; onabort must not
+      // race a second, generic rejection onto the same settled promise.
+      let refused: InsightTermTombstoneError | undefined;
+
       const transaction = database.transaction(
         [RECORDS_OBJECT_STORE, TOMBSTONES_OBJECT_STORE],
         "readwrite",
@@ -435,13 +452,13 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
 
       tombstoneRequest.onsuccess = () => {
         if (tombstoneRequest.result !== undefined) {
-          transaction.abort();
-          reject(
-            new InsightTermTombstoneError(
-              record.capture_id,
-              `Capture ${record.capture_id} was deleted; its term aggregates cannot be resurrected`,
-            ),
+          refused = new InsightTermTombstoneError(
+            record.capture_id,
+            `Capture ${record.capture_id} was deleted; its term aggregates cannot be resurrected`,
           );
+
+          reject(refused);
+          transaction.abort();
 
           return;
         }
@@ -452,8 +469,14 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
       transaction.oncomplete = () => resolve();
       transaction.onerror = () =>
         reject(new Error(`an insight term store put failed: ${transaction.error?.message ?? ""}`));
-      transaction.onabort = () => reject(new Error(`an insight term store put was aborted`));
+      transaction.onabort = () => {
+        if (refused !== undefined) return;
+
+        reject(new Error(`an insight term store put was aborted`));
+      };
     });
+
+    return record;
   }
 
   async tombstone(captureId: string): Promise<void> {
@@ -477,23 +500,46 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
     });
   }
 
-  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<void> {
-    const log = await this.load();
+  /**
+   * Withdrawal is one atomic read-modify-write: a single readwrite
+   * transaction walks the records store with a cursor and rewrites each
+   * conforming record in place, so a write that lands mid-purge (a
+   * recognition settlement from the serialized chain, another window) can
+   * never be clobbered by a stale pre-purge snapshot — the deleted kind is
+   * gone from every record the transaction actually saw, and nothing else
+   * changes. Damaged records are quarantined, not repaired: the cursor skips
+   * what does not decode, exactly like `load()` would.
+   */
+  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]> {
     const database = await this.database();
 
-    await new Promise<void>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const transaction = database.transaction(RECORDS_OBJECT_STORE, "readwrite");
-      const store = transaction.objectStore(RECORDS_OBJECT_STORE);
+      const cursorRequest = transaction.objectStore(RECORDS_OBJECT_STORE).openCursor();
+      const updated: InsightTermRecord[] = [];
 
-      for (const record of log.records) {
-        store.put({
-          ...record,
-          terms: kinds.has("terms") ? [] : record.terms,
-          phrases: kinds.has("phrases") ? [] : record.phrases,
-        });
-      }
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
 
-      transaction.oncomplete = () => resolve();
+        if (cursor === null) return;
+
+        const decoded = decodeInsightTermRecord(cursor.value);
+
+        if (Option.isSome(decoded)) {
+          const purged: InsightTermRecord = {
+            ...decoded.value,
+            terms: kinds.has("terms") ? [] : decoded.value.terms,
+            phrases: kinds.has("phrases") ? [] : decoded.value.phrases,
+          };
+
+          cursor.update(purged);
+          updated.push(purged);
+        }
+
+        cursor.continue();
+      };
+
+      transaction.oncomplete = () => resolve(Object.freeze(updated));
       transaction.onerror = () =>
         reject(
           new Error(`an insight term store purge failed: ${transaction.error?.message ?? ""}`),
@@ -557,6 +603,63 @@ export interface RecognitionTermsInput {
   readonly captureId: string;
   /** The selected transcript text; only its aggregates ever leave this call. */
   readonly transcriptText: string;
+  /**
+   * The capture's finalization instant — its E28 capture_finalized event's
+   * occurred_at — when the caller knows it. The record is anchored to the
+   * take's own time so a delayed retranscription cannot move a take across
+   * a card-window boundary; the write-time clock is only the fallback for a
+   * finalization event still in flight. Must be a schema-shaped timestamp:
+   * the store's validation boundary rejects anything else.
+   */
+  readonly finalizedAt?: string;
+}
+
+/**
+ * What one recorder write did to the store, so a caller holding a mirror of
+ * `load()` can apply the change without re-reading everything: the write
+ * already knows exactly what changed. `none` is not an omission — it is the
+ * consent answer "no kinds granted", where nothing was written at all.
+ */
+export type InsightTermWrite =
+  | { readonly kind: "none" }
+  | { readonly kind: "record"; readonly record: InsightTermRecord }
+  | { readonly kind: "tombstone"; readonly captureId: string }
+  | { readonly kind: "purge"; readonly records: readonly InsightTermRecord[] }
+  | { readonly kind: "clear" };
+
+/**
+ * Apply one write's delta to a records mirror: the upserts replace in place
+ * (a capture keeps its position, a new capture appends), a tombstone drops
+ * its capture, a purge upserts the records the store rewrote, and a clear
+ * empties the mirror. Pure — the caller's state update stays functional.
+ */
+export function applyTermWrite(
+  records: readonly InsightTermRecord[],
+  write: InsightTermWrite,
+): readonly InsightTermRecord[] {
+  switch (write.kind) {
+    case "none":
+      return records;
+    case "record":
+      return upsertRecords(records, [write.record]);
+    case "tombstone":
+      return records.filter((record) => record.capture_id !== write.captureId);
+    case "purge":
+      return upsertRecords(records, write.records);
+    case "clear":
+      return [];
+  }
+}
+
+function upsertRecords(
+  records: readonly InsightTermRecord[],
+  updates: readonly InsightTermRecord[],
+): readonly InsightTermRecord[] {
+  const byCapture = new Map(records.map((record) => [record.capture_id, record] as const));
+
+  for (const update of updates) byCapture.set(update.capture_id, update);
+
+  return Object.freeze([...byCapture.values()]);
 }
 
 /**
@@ -572,7 +675,7 @@ export class InsightTermRecorder {
   private readonly store: InsightTermStore;
   private readonly now: () => Date;
   private readonly consent: () => InsightConsent;
-  private writeChain: Promise<void> = Promise.resolve();
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(store: InsightTermStore, options: InsightTermRecorderOptions = {}) {
     this.store = store;
@@ -585,43 +688,52 @@ export class InsightTermRecorder {
    * grants neither kind, nothing is written — withdrawal is handled by
    * withdrawKinds, deletion by captureDeleted, and this path never invents
    * either. Writes serialize on a chain so store order follows emission
-   * order.
+   * order, and the resolved write names exactly what changed so the caller's
+   * mirror can apply it without re-reading the store.
    */
-  async recognitionSelected(input: RecognitionTermsInput): Promise<void> {
+  async recognitionSelected(input: RecognitionTermsInput): Promise<InsightTermWrite> {
     const kinds = consentedTermKinds(this.consent());
 
-    if (kinds.size === 0) return;
+    if (kinds.size === 0) return { kind: "none" };
 
     const derived = captureTerms(input.transcriptText, { kinds });
 
-    await this.enqueue(() =>
-      this.store.put({
-        schema_version: INSIGHT_TERM_SCHEMA_VERSION,
-        capture_id: input.captureId,
-        occurred_at: this.now().toISOString(),
-        tokenizer: TOKENIZER_ID,
-        terms: derived.terms,
-        phrases: derived.phrases,
-      }),
-    );
+    const record: InsightTermRecord = {
+      schema_version: INSIGHT_TERM_SCHEMA_VERSION,
+      capture_id: input.captureId,
+      occurred_at: input.finalizedAt ?? this.now().toISOString(),
+      tokenizer: TOKENIZER_ID,
+      terms: derived.terms,
+      phrases: derived.phrases,
+    };
+
+    await this.enqueue(() => this.store.put(record));
+
+    return { kind: "record", record };
   }
 
   /** The confirmed-delete path: remove the capture's aggregates, forever. */
-  async captureDeleted(captureId: string): Promise<void> {
+  async captureDeleted(captureId: string): Promise<InsightTermWrite> {
     await this.enqueue(() => this.store.tombstone(captureId));
+
+    return { kind: "tombstone", captureId };
   }
 
   /** Consent withdrawal for a kind deletes that kind's retained data. */
-  async withdrawKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<void> {
-    await this.enqueue(() => this.store.purgeKinds(kinds));
+  async withdrawKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<InsightTermWrite> {
+    const records = await this.enqueue(() => this.store.purgeKinds(kinds));
+
+    return { kind: "purge", records };
   }
 
   /** Reset: term aggregation starts over from an empty store. */
-  async reset(): Promise<void> {
+  async reset(): Promise<InsightTermWrite> {
     await this.enqueue(() => this.store.clear());
+
+    return { kind: "clear" };
   }
 
-  private enqueue(work: () => Promise<void>): Promise<void> {
+  private enqueue<T>(work: () => Promise<T>): Promise<T> {
     const run = this.writeChain.then(work, work);
 
     this.writeChain = run.catch(() => {

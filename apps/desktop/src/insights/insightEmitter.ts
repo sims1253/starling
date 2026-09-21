@@ -3,6 +3,7 @@ import {
   InsightEventConflictError,
   InsightEventValidationError,
   insightEventProblems,
+  isCaptureFinalized,
   isRecognitionSelected,
   isTransformationCompleted,
   sameEventPayload,
@@ -404,6 +405,22 @@ export class InsightRecorder {
       await this.store.clear();
       this.eventsById.clear();
     });
+  }
+
+  /**
+   * The capture's finalization instant — its capture_finalized event's
+   * occurred_at — when the mirror knows one, undefined when it does not
+   * (the event has not been emitted or loaded yet). The term-aggregate
+   * records anchor to this so a delayed retranscription cannot move a take
+   * across a card-window boundary; the caller falls back to its own clock
+   * only while the event is still in flight.
+   */
+  captureFinalizedAt(captureId: string): string | undefined {
+    const finalized = this.snapshot().find(
+      (event) => isCaptureFinalized(event) && event.capture_id === captureId,
+    );
+
+    return finalized?.occurred_at;
   }
 
   private tombstoneFor(captureId: string): InsightEvent | undefined {

@@ -45,6 +45,26 @@ const WORD_MILESTONES = [1_000, 10_000] as const;
 const MINUTE_MILESTONES = [60, 600] as const;
 
 /**
+ * Labels for the captured-minute milestones the pluralized form would
+ * mangle; every other threshold reads as its plain minute count.
+ */
+const MINUTE_MILESTONE_LABELS = new Map<number, string>([[60, "An hour of captured audio"]]);
+
+/** "take"/"takes", "day"/"days" — the one pluralizer the strings share. */
+function pluralWord(count: number, singular: string): string {
+  return `${singular}${count === 1 ? "" : "s"}`;
+}
+
+/** The streak's own line: the live run, or the honest absence of one. */
+function streakDescription(currentDays: number, longestDays: number): string {
+  if (currentDays === 0) {
+    return `No consecutive take days right now (longest ever: ${longestDays})`;
+  }
+
+  return `${currentDays} consecutive ${pluralWord(currentDays, "day")} with at least one take (longest: ${longestDays})`;
+}
+
+/**
  * The log's events grouped by capture id — the store dedupes by event_id,
  * and every event kind carries the capture it is attributable to.
  */
@@ -138,7 +158,7 @@ export function milestones(
     id: "first-take",
     label: "First voice note",
     achievedOnDay: first.day,
-    evidence: `The earliest local day with a retained take (${first.takes} take${first.takes === 1 ? "" : "s"}).`,
+    evidence: `The earliest local day with a retained take (${first.takes} ${pluralWord(first.takes, "take")}).`,
   });
 
   // "First week of voice notes": the seventh distinct day with a take.
@@ -182,10 +202,7 @@ export function milestones(
       ) {
         reached.push({
           id: `minutes-${threshold}`,
-          label:
-            threshold === 60
-              ? "An hour of captured audio"
-              : `${threshold} minutes of captured audio`,
+          label: MINUTE_MILESTONE_LABELS.get(threshold) ?? `${threshold} minutes of captured audio`,
           achievedOnDay: day.day,
           evidence: `Cumulative captured seconds (silence included) crossed ${minuteThreshold} on this day.`,
         });
@@ -276,10 +293,7 @@ export function streaks(events: readonly InsightEvent[], options: MilestoneOptio
   return {
     currentDays,
     longestDays,
-    description:
-      currentDays > 0
-        ? `${currentDays} consecutive day${currentDays === 1 ? "" : "s"} with at least one take (longest: ${longestDays})`
-        : `No consecutive take days right now (longest ever: ${longestDays})`,
+    description: streakDescription(currentDays, longestDays),
   };
 }
 

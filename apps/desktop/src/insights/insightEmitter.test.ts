@@ -87,6 +87,27 @@ describe("declared tokenizer", () => {
 });
 
 describe("InsightRecorder", () => {
+  it("answers a capture's finalization instant from the log", async () => {
+    const { recorder: insights } = recorder();
+
+    // Before the event exists there is nothing to anchor to — the caller
+    // falls back to its own clock.
+    expect(insights.captureFinalizedAt("take-1")).toBeUndefined();
+
+    await insights.captureFinalized({
+      captureId: "take-1",
+      sampleCount: 640_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    // The instant the capture_finalized event carries — what term-aggregate
+    // records anchor to so a delayed retranscription cannot move a take
+    // across a card window boundary. The injected clock's first tick is T0.
+    expect(insights.captureFinalizedAt("take-1")).toBe(new Date(T0).toISOString());
+    expect(insights.captureFinalizedAt("take-unknown")).toBeUndefined();
+  });
+
   it("emits schema-valid events for the full lifecycle", async () => {
     const { recorder: insights } = recorder();
 

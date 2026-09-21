@@ -62,6 +62,13 @@ function weekTotals(events: readonly InsightEvent[], sinceMs: number, untilMs: n
   };
 }
 
+/** The word delta's direction wording: a count with its sign, never praise. */
+function wordDeltaDirection(changeWords: number): string {
+  if (changeWords === 0) return "the same as";
+
+  return changeWords > 0 ? `${changeWords} more than` : `${-changeWords} fewer than`;
+}
+
 /**
  * Compute the weekly recap. Throws nothing the caller must handle beyond
  * the event contract's own structural errors; a week without takes is the
@@ -99,12 +106,7 @@ export function weeklyRecap(
   } else if (changeWords !== null) {
     // changeWords is non-null exactly when previousWeek is; if that
     // invariant ever broke, the line is omitted rather than stated wrong.
-    const direction =
-      changeWords === 0
-        ? "the same as"
-        : changeWords > 0
-          ? `${changeWords} more than`
-          : `${-changeWords} fewer than`;
+    const direction = wordDeltaDirection(changeWords);
 
     lines.push(
       `Last week: ${previousWeek.words} words · ${previousWeek.takes} takes · ${formatMinutes(previousWeek.capturedSeconds / 60)} captured`,

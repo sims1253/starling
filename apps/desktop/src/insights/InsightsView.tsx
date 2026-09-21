@@ -1,5 +1,4 @@
 import { useMemo, useState } from "react";
-import { Predicate } from "effect";
 import { CalendarDays, CircleAlert, Download, RotateCcw, X } from "lucide-react";
 import { TRANSFORMATION_KINDS, type InsightEvent } from "./insightEvents";
 import {
@@ -10,13 +9,20 @@ import {
   selectionStats,
   type InsightAggregate,
 } from "./insightMetrics";
-import type { InsightConsent } from "./insightConsent";
+import {
+  WEEKLY_GOAL_MAX,
+  WEEKLY_GOAL_MIN,
+  parseWeeklyGoal,
+  type InsightConsent,
+} from "./insightConsent";
+import { readExclusions, writeExclusions } from "./insightExclusions";
 import type { InsightTermRecord } from "./insightTerms";
 import { voicePanel, type VoicePatternCard } from "./insightVoice";
 import {
   DEFAULT_SHARE_INCLUDES,
   SHARE_CARD_FIELDS,
   buildShareCard,
+  milestoneInRange,
   renderShareCard,
   type ShareCardField,
 } from "./insightShare";
@@ -43,9 +49,6 @@ import { formatMinutes } from "./insightFormat";
 /** localStorage key for the user's typing baseline (words per minute). */
 const TYPING_BASELINE_KEY = "starling:insights:typingWpm";
 
-/** localStorage key for the user's excluded voice-card labels. */
-const EXCLUSIONS_KEY = "starling:insights:exclusions";
-
 const CALENDAR_DAYS = 28;
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -57,9 +60,13 @@ export interface InsightsViewProps {
   readonly consent: InsightConsent;
   /** Applies a whole consent object at once; grants never half-land. */
   readonly onConsentChange: (next: InsightConsent) => void;
-  /** Storage/recording issue notice; dismissed by the user. */
-  readonly issue?: string;
-  readonly onDismissIssue: () => void;
+  /**
+   * Storage/recording issue notices. A list, not a slot: two stores can
+   * fail in the same moment, and every unresolved notice stays visible
+   * until the user dismisses it.
+   */
+  readonly notices: readonly string[];
+  readonly onDismissNotice: (notice: string) => void;
   readonly onReset: () => void;
 }
 
@@ -99,16 +106,6 @@ function plural(count: number, singularWord: string, pluralWord = `${singularWor
   return `${count} ${count === 1 ? singularWord : pluralWord}`;
 }
 
-function readExclusions(): ReadonlySet<string> {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(EXCLUSIONS_KEY) ?? "[]");
-
-    return new Set(Array.isArray(parsed) ? parsed.filter(Predicate.isString) : []);
-  } catch {
-    return new Set();
-  }
-}
-
 /** The one honest placeholder: absence of data, stated as absence. */
 function NotEnoughData({ note }: { readonly note: string }) {
   return (
@@ -124,8 +121,8 @@ export function InsightsView({
   termRecords,
   consent,
   onConsentChange,
-  issue,
-  onDismissIssue,
+  notices,
+  onDismissNotice,
   onReset,
 }: InsightsViewProps) {
   const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
@@ -134,7 +131,12 @@ export function InsightsView({
     () => localStorage.getItem(TYPING_BASELINE_KEY) ?? "",
   );
 
-  const [excluded, setExcluded] = useState<ReadonlySet<string>>(readExclusions);
+  const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => readExclusions(localStorage));
+
+  // Set when local settings refused a save (an exclusion or the typing
+  // baseline): the value still holds for this session, and saying so is the
+  // honest alternative to letting "kept" silently expire with the app.
+  const [settingsRefusalNotice, setSettingsRefusalNotice] = useState<string>();
 
   const [shareIncludes, setShareIncludes] = useState<ReadonlySet<ShareCardField>>(
     () => new Set(DEFAULT_SHARE_INCLUDES),
@@ -143,6 +145,26 @@ export function InsightsView({
   const [shareCopied, setShareCopied] = useState(false);
 
   const [shareCopyFailed, setShareCopyFailed] = useState<string>();
+
+  // The weekly-goal input's draft, committed on blur: parsing per keystroke
+  // would rewrite the field under the cursor (a "-" or "1e" mid-typing
+  // parses to nothing) and silently discard values outside the goal bounds.
+  const [goalDraft, setGoalDraft] = useState(() =>
+    consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords),
+  );
+
+  const [goalIssue, setGoalIssue] = useState<string>();
+
+  // The committed goal this draft was last synced from. When the consent
+  // changes away from this input (Reset, a restored value), the draft
+  // follows during render — the documented adjust-state-on-prop-change
+  // pattern, one render, no effect.
+  const [goalSyncedTo, setGoalSyncedTo] = useState(consent.weeklyGoalWords);
+
+  if (consent.weeklyGoalWords !== goalSyncedTo) {
+    setGoalSyncedTo(consent.weeklyGoalWords);
+    setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
+  }
 
   const parsedBaseline = Number.parseInt(baselineDraft, 10);
   const baseline = Number.isInteger(parsedBaseline) && parsedBaseline > 0 ? parsedBaseline : null;
@@ -173,7 +195,16 @@ export function InsightsView({
 
   function changeBaseline(value: string) {
     setBaselineDraft(value);
-    localStorage.setItem(TYPING_BASELINE_KEY, value);
+
+    try {
+      localStorage.setItem(TYPING_BASELINE_KEY, value);
+    } catch {
+      // Storage refused (quota, privacy mode); the baseline holds for this
+      // session only and the next mount starts from what was last saved.
+      setSettingsRefusalNotice(
+        "Local settings storage refused the save — the typing baseline is kept for this session only.",
+      );
+    }
   }
 
   function excludeLabel(label: string) {
@@ -181,11 +212,39 @@ export function InsightsView({
 
     next.add(label);
     setExcluded(next);
-    localStorage.setItem(EXCLUSIONS_KEY, JSON.stringify([...next]));
+    setSettingsRefusalNotice(
+      writeExclusions(localStorage, next)
+        ? undefined
+        : "Local settings storage refused the save — the exclusion is kept for this session only.",
+    );
   }
 
   function toggleConsent(patch: Partial<InsightConsent>) {
     onConsentChange({ ...consent, ...patch });
+  }
+
+  /** Commit the goal draft: valid values apply, invalid ones say why. */
+  function commitGoalDraft() {
+    if (goalDraft.trim() === "") {
+      setGoalIssue(undefined);
+
+      if (consent.weeklyGoalWords !== null) toggleConsent({ weeklyGoalWords: null });
+
+      return;
+    }
+
+    const parsed = parseWeeklyGoal(goalDraft);
+
+    if (parsed === null) {
+      setGoalIssue(
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString("en-US")}.`,
+      );
+
+      return;
+    }
+
+    setGoalIssue(undefined);
+    toggleConsent({ weeklyGoalWords: parsed });
   }
 
   function toggleShareField(field: ShareCardField, included: boolean) {
@@ -202,38 +261,39 @@ export function InsightsView({
   function exportAggregate() {
     if (!usage.ok) return;
 
-    const url = URL.createObjectURL(
-      new Blob([JSON.stringify(usage.value, null, 2)], { type: "application/json" }),
+    downloadText(
+      JSON.stringify(usage.value, null, 2),
+      `starling-insights-${new Date().toISOString().slice(0, 10)}.json`,
+      "application/json",
     );
-
-    const anchor = document.createElement("a");
-
-    anchor.href = url;
-    anchor.download = `starling-insights-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
   /**
    * The share card, previewed before anything exists to copy or save. The
    * builder itself enforces the redaction default, so this assembly cannot
-   * leak a field the include set does not name.
+   * leak a field the include set does not name. The window is captured from
+   * ONE clock read — two reads could straddle a local-day boundary and
+   * label an inverted range on a card about to be copied — and the
+   * milestone is restricted to ones achieved inside that range: the card
+   * states a week, so a milestone from months ago is not its claim to make.
    */
   const shareCard = useMemo(() => {
     if (!week.ok || week.value.unique_takes === 0) return undefined;
 
+    const nowMs = new Date().getTime();
+    const rangeStartDay = localDayKey(nowMs - WEEK_MS, timezone);
     const milestones = celebrated.ok ? celebrated.value.milestones : [];
-    const latestMilestone = milestones.length > 0 ? milestones[milestones.length - 1] : undefined;
+    const milestone = milestoneInRange(milestones, rangeStartDay);
     const topPhrase = voice.ok ? voice.value.phraseCards[0] : undefined;
 
     return buildShareCard(
       {
-        rangeStartDay: localDayKey(new Date().getTime() - WEEK_MS, timezone),
-        rangeEndDay: localDayKey(new Date().getTime(), timezone),
+        rangeStartDay,
+        rangeEndDay: localDayKey(nowMs, timezone),
         words: week.value.recognized_words,
         minutes: week.value.captured_seconds / 60,
         takes: week.value.unique_takes,
-        milestone: latestMilestone?.label,
+        milestone,
         topPhrase,
       },
       { include: shareIncludes },
@@ -268,14 +328,11 @@ export function InsightsView({
   function saveShareCard() {
     if (shareCard === undefined) return;
 
-    const url = URL.createObjectURL(new Blob([renderShareCard(shareCard)], { type: "text/plain" }));
-
-    const anchor = document.createElement("a");
-
-    anchor.href = url;
-    anchor.download = `starling-share-card-${new Date().toISOString().slice(0, 10)}.txt`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    downloadText(
+      renderShareCard(shareCard),
+      `starling-share-card-${new Date().toISOString().slice(0, 10)}.txt`,
+      "text/plain",
+    );
   }
 
   function resetInsights() {
@@ -307,6 +364,11 @@ export function InsightsView({
 
   const empty = usage.ok && usage.value.unique_takes === 0;
 
+  // Whether a usable top phrase exists at all — the same condition the card
+  // input rests on. The include checkbox mirrors it exactly, so the include
+  // set can never claim a field the card silently drops.
+  const topPhraseAvailable = voice.ok && voice.value.phraseCards.length > 0;
+
   return (
     <div className="insights-shell">
       <header className="insights-head">
@@ -328,13 +390,17 @@ export function InsightsView({
         </div>
       </header>
 
-      {issue && (
-        <div className="insights-issue" role="alert">
-          <CircleAlert size={16} />
-          <span>{issue}</span>
-          <button onClick={onDismissIssue} aria-label="Dismiss insights notice">
-            <X size={14} />
-          </button>
+      {notices.length > 0 && (
+        <div className="insights-issues">
+          {notices.map((notice) => (
+            <div className="insights-issue" role="alert" key={notice}>
+              <CircleAlert size={16} />
+              <span>{notice}</span>
+              <button onClick={() => onDismissNotice(notice)} aria-label="Dismiss insights notice">
+                <X size={14} />
+              </button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -569,18 +635,25 @@ export function InsightsView({
               Weekly word goal (optional)
               <input
                 inputMode="numeric"
-                value={consent.weeklyGoalWords ?? ""}
-                onChange={(event) => {
-                  const parsed = Number.parseInt(event.target.value, 10);
-
-                  toggleConsent({
-                    weeklyGoalWords: Number.isInteger(parsed) && parsed > 0 ? parsed : null,
-                  });
-                }}
+                value={goalDraft}
+                onChange={(event) => setGoalDraft(event.target.value)}
+                onBlur={commitGoalDraft}
                 placeholder="no goal"
+                aria-describedby={goalIssue === undefined ? undefined : "weekly-goal-issue"}
               />
+              {goalIssue !== undefined && (
+                <small id="weekly-goal-issue" className="goal-issue" role="alert">
+                  {goalIssue}
+                </small>
+              )}
             </label>
           </div>
+
+          {settingsRefusalNotice !== undefined && (
+            <p className="storage-issue" role="status">
+              {settingsRefusalNotice}
+            </p>
+          )}
 
           {!consent.recurringPhrases && !consent.vocabularyPatterns ? (
             <NotEnoughData note="no content-derived analysis is enabled — enable one above; nothing is read or retained while both are off" />
@@ -629,15 +702,20 @@ export function InsightsView({
 
           <pre className="share-card-preview">{renderShareCard(shareCard)}</pre>
 
+          {shareCard.withheld.length > 0 && (
+            <p className="share-card-withheld">
+              Withheld by default: {shareCard.withheld.join(", ")} — preview note only; it never
+              travels with the copied or saved text.
+            </p>
+          )}
+
           <div className="share-card-fields">
             {SHARE_CARD_FIELDS.map((field) => (
               <label key={field}>
                 <input
                   type="checkbox"
                   checked={shareIncludes.has(field)}
-                  disabled={
-                    field === "topPhrase" && voice.ok && voice.value.phraseCards.length === 0
-                  }
+                  disabled={field === "topPhrase" && !topPhraseAvailable}
                   onChange={(event) => toggleShareField(field, event.target.checked)}
                 />
                 {field === "topPhrase" ? "top phrase (content-derived)" : field}
@@ -806,6 +884,22 @@ function VoiceCardTile({
       </button>
     </div>
   );
+}
+
+/**
+ * The one download path both exports share: object URL, anchor click,
+ * deferred revoke. One helper, so the aggregate export and the share-card
+ * save cannot drift apart on lifecycle handling.
+ */
+function downloadText(content: string, filename: string, mime: string): void {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+
+  const anchor = document.createElement("a");
+
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 interface CalendarCell {

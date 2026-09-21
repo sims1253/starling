@@ -79,13 +79,18 @@ import {
   type InsightConsent,
 } from "./insights/insightConsent";
 import {
+  applyTermWrite,
   IndexedDbInsightTermStore,
   InsightTermRecorder,
   type InsightTermRecord,
+  type InsightTermWrite,
 } from "./insights/insightTerms";
 import { InsightsView } from "./insights/InsightsView";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
+
+/** Unresolved Insights notices kept at once; more is a failing store, not news. */
+const MAX_INSIGHT_NOTICES = 8;
 
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 
@@ -141,6 +146,11 @@ function formatDuration(ms?: number) {
   const total = Math.round(ms / 1000);
 
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+/** The record button's idle status line; while recording it is the live elapsed time. */
+function recordMetaIdle(busy: boolean): string {
+  return busy ? "Transcribing…" : "Click to record";
 }
 
 function formatWhen(iso: string) {
@@ -268,14 +278,22 @@ export default function App() {
   // The Insights surface (E29): a view toggle over the same app — no
   // router, just the two screens. The event log is the population the
   // surface aggregates, the term records are its consented content-derived
-  // half, and insightsIssue is the one storage/recording notice it shows.
+  // half, and insightNotices are the storage/recording notices it shows —
+  // a list, because two stores can fail in the same moment and every
+  // unresolved notice stays visible until dismissed.
   const [view, setView] = useState<"capture" | "insights">("capture");
 
   const [insightEvents, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
 
   const [termRecords, setTermRecords] = useState<readonly InsightTermRecord[]>(() => []);
 
-  const [insightsIssue, setInsightsIssue] = useState<string>();
+  const [insightNotices, setInsightNotices] = useState<readonly string[]>(() => []);
+
+  // Armed by the first term-aggregate write chain: once any write has
+  // started, the mount-time snapshot may no longer apply to the mirror — a
+  // write that already landed would be overwritten by the stale pre-write
+  // view (the mirror race the guard exists for).
+  const termMirrorWritesRef = useRef(false);
 
   // The Insights consent state (E29 phase 2): read once from local settings
   // and thereafter changed only through applyInsightConsent, which persists
@@ -594,6 +612,28 @@ export default function App() {
 
   const busy = activeIds.size > 0;
 
+  /**
+   * Record one Insights notice. Notices accumulate — deduplicated, newest
+   * last, bounded — so two failures in the same moment (an event-tombstone
+   * write and a term-aggregate delete both failing on removeSession, both
+   * reset chains failing) stay fully visible instead of the second message
+   * silently overwriting the first.
+   */
+  const addInsightNotice = useCallback((notice: string) => {
+    setInsightNotices((current) => {
+      if (current.includes(notice)) return current;
+
+      const next = [...current, notice];
+
+      return next.length > MAX_INSIGHT_NOTICES ? next.slice(-MAX_INSIGHT_NOTICES) : next;
+    });
+  }, []);
+
+  const dismissInsightNotice = useCallback(
+    (notice: string) => setInsightNotices((current) => current.filter((item) => item !== notice)),
+    [],
+  );
+
   // The insight event log loads once, best-effort: a damaged log becomes an
   // Insights notice, never a startup failure (dictation works without it).
   useEffect(() => {
@@ -601,59 +641,77 @@ export default function App() {
       .load()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
-        setInsightsIssue(`Insights could not open the local event log: ${messageFrom(caught)}`),
+        addInsightNotice(`Insights could not open the local event log: ${messageFrom(caught)}`),
       );
 
     void insightTermStore
       .load()
-      .then((log) => setTermRecords(log.records))
+      .then((log) => {
+        // A write chain that already started owns the mirror: applying this
+        // snapshot now would overwrite delta-applied records with the stale
+        // pre-write view. The write chains refresh the mirror themselves.
+        if (termMirrorWritesRef.current) return;
+
+        setTermRecords(log.records);
+      })
       .catch((caught) =>
-        setInsightsIssue(
+        addInsightNotice(
           `Insights could not open the local term aggregates: ${messageFrom(caught)}`,
         ),
       );
-  }, []);
+  }, [addInsightNotice]);
 
   /**
    * Record one insight event without ever blocking the action it describes
    * (E29): the emit is fire-and-forget, load() inside is idempotent so the
    * mirror exists before sequence numbers are derived, and a failure lands
-   * in the Insights notice instead of the take's flow. This chain touches
+   * in the Insights notices instead of the take's flow. This chain touches
    * the event log only — the term aggregates have their own chain below, so
    * neither store's health can stale the other's mirror or misattribute the
-   * notice.
+   * notice. The returned promise never rejects; callers may await it to
+   * keep the recording's own sequencing without handling errors.
    */
-  const recordInsight = useCallback((action: () => Promise<void>) => {
-    void insights
-      .load()
-      .then(action)
-      .then(() => setInsightEvents(insights.snapshot()))
-      .catch((caught) =>
-        setInsightsIssue(`Insights could not record an event: ${messageFrom(caught)}`),
-      );
-  }, []);
+  const recordInsight = useCallback(
+    (action: () => Promise<void>): Promise<void> =>
+      insights
+        .load()
+        .then(action)
+        .then(() => setInsightEvents(insights.snapshot()))
+        .catch((caught) => {
+          addInsightNotice(`Insights could not record an event: ${messageFrom(caught)}`);
+        }),
+    [addInsightNotice],
+  );
 
   /**
    * Record one consented term-aggregate write (E29 phase 2) on a chain of
-   * its own: a refusal or term-store failure refreshes the term mirror and
-   * surfaces under its own name — the recognition event it accompanied has
-   * already been recorded, and its mirror must not be staled by a store it
-   * never touched. The term store is re-read only here, where a write
-   * actually changed it. `what` names the attempted operation so a failed
-   * purge says "delete", never a misattributed "record".
+   * its own: a refusal or term-store failure surfaces under its own name —
+   * the recognition event it accompanied has already been recorded, and its
+   * mirror must not be staled by a store it never touched. The write
+   * resolves with exactly what changed, and the mirror applies that delta
+   * directly: no full store re-read on the recognition hot path, where a
+   * growing O(n) load per transcript would tax every settlement. The chain
+   * also arms the mirror guard, so the mount-time snapshot can never
+   * overwrite it afterwards. `what` names the attempted operation so a
+   * failed purge says "delete", never a misattributed "record". The
+   * returned promise never rejects.
    */
   const recordInsightTerms = useCallback(
-    (what: "record" | "delete" | "reset", action: () => Promise<void>) => {
-      void action()
-        .then(() => insightTermStore.load())
-        .then((log) => setTermRecords(log.records))
-        .catch((caught) =>
-          setInsightsIssue(
+    (
+      what: "record" | "delete" | "reset",
+      action: () => Promise<InsightTermWrite>,
+    ): Promise<void> => {
+      termMirrorWritesRef.current = true;
+
+      return action()
+        .then((write) => setTermRecords((current) => applyTermWrite(current, write)))
+        .catch((caught) => {
+          addInsightNotice(
             `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
-          ),
-        );
+          );
+        });
     },
-    [],
+    [addInsightNotice],
   );
 
   /**
@@ -664,22 +722,27 @@ export default function App() {
    * rather than fabricating one). The consented content-derived aggregates
    * ride their own chain: only term/phrase counts leave that call, only for
    * kinds the current consent grants, and a failure there is its own notice,
-   * never a take error and never a stale event mirror.
+   * never a take error and never a stale event mirror. The term record
+   * anchors to the take's own finalization instant from the event log, so a
+   * delayed retranscription cannot move the take across a card window.
    */
   const recordRecognitionSelected = useCallback(
     (sessionId: string, transcriptText: string) => {
       const startedAt = stopWaitStartsRef.current.get(sessionId);
 
       stopWaitStartsRef.current.delete(sessionId);
-      recordInsight(() =>
+
+      const finalizedAt = insights.captureFinalizedAt(sessionId);
+
+      void recordInsight(() =>
         insights.recognitionSelected({
           captureId: sessionId,
           transcriptText,
           postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
         }),
       );
-      recordInsightTerms("record", () =>
-        insightTerms.recognitionSelected({ captureId: sessionId, transcriptText }),
+      void recordInsightTerms("record", () =>
+        insightTerms.recognitionSelected({ captureId: sessionId, transcriptText, finalizedAt }),
       );
     },
     [recordInsight, recordInsightTerms],
@@ -693,7 +756,7 @@ export default function App() {
    */
   const recordCaptureFinalized = useCallback(
     (session: DictationSession) => {
-      recordInsight(async () => {
+      void recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -1224,7 +1287,7 @@ export default function App() {
         // One authored revision exists now (E29): change counts come from
         // the word-level diff between raw and refined text, and are never
         // labeled corrected errors.
-        recordInsight(() =>
+        void recordInsight(() =>
           insights.transformationCompleted({
             captureId: session.id,
             rawText: transcript.text,
@@ -1847,35 +1910,54 @@ export default function App() {
    * removes every derived contribution (E28/E29): the event tombstone
    * dominates stale replays, and the content-derived term aggregates are
    * deleted outright, so a deleted take cannot reappear in a number, a
-   * card, a recap or a share preview.
+   * card, a recap or a share preview. Both deletion chains are AWAITED — a
+   * store that fails leaves its own, visibly persistent notice (never a
+   * misattributed "recording not deleted": the recording is gone) instead
+   * of the failure being lost with the take's UI flow.
    */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
     try {
       await store.delete(id);
-      // Two independent tombstones, deliberately on separate chains: the
-      // event log's health must not decide whether the content-derived
-      // aggregates die, and vice versa — either store failing leaves the
-      // other's deletion intact and surfaces its own notice.
-      recordInsight(() => insights.captureDeleted(id));
-      recordInsightTerms("delete", () => insightTerms.captureDeleted(id));
+    } catch (caught) {
+      setError(`Could not delete the recording: ${messageFrom(caught)}`);
+
+      return;
+    }
+
+    // Two independent tombstones, deliberately on separate chains: the
+    // event log's health must not decide whether the content-derived
+    // aggregates die, and vice versa — either store failing leaves the
+    // other's deletion intact and surfaces its own notice. Neither promise
+    // rejects; their catch arms already wrote the notice.
+    await Promise.all([
+      recordInsight(() => insights.captureDeleted(id)),
+      recordInsightTerms("delete", () => insightTerms.captureDeleted(id)),
+    ]);
+
+    try {
       await refresh();
     } catch (caught) {
       setError(`Could not delete the recording: ${messageFrom(caught)}`);
     }
   }
 
-  /** Reset Insights: both stores start over empty; recordings are untouched. */
+  /**
+   * Reset Insights: both stores start over empty; recordings are untouched.
+   * The two chains stay independent, and both failures are visible at once
+   * — each writes its own notice, and notices no longer overwrite each
+   * other.
+   */
   const resetInsights = useCallback(() => {
     void insights
       .reset()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
-        setInsightsIssue(`Insights could not reset the event log: ${messageFrom(caught)}`),
+        addInsightNotice(`Insights could not reset the event log: ${messageFrom(caught)}`),
       );
-    recordInsightTerms("reset", () => insightTerms.reset());
-  }, [recordInsightTerms]);
+    void recordInsightTerms("reset", () => insightTerms.reset());
+  }, [recordInsightTerms, addInsightNotice]);
 
   /**
    * Apply one whole consent change (E29 phase 2). Persistence lands first,
@@ -1883,11 +1965,13 @@ export default function App() {
    * once; then every grant this change revoked has its retained data
    * deleted — the UI's promise is that turning a kind off deletes what it
    * retained, not merely hides it — and only then does the committed state
-   * swap. A purge failure is a notice, never a reason to keep the old
-   * consent. The prior grants are read from storage at call time, not from
-   * the rendered state: two changes applied before a re-render must each
-   * diff against the actual previous grants, or a kind withdrawn by the
-   * first could be missed by the second.
+   * swap. A persistence failure is a notice and the change does not
+   * half-land: the state stays as it was, visibly, instead of crashing the
+   * toggle that asked for it. A purge failure is a notice, never a reason
+   * to keep the old consent. The prior grants are read from storage at call
+   * time, not from the rendered state: two changes applied before a
+   * re-render must each diff against the actual previous grants, or a kind
+   * withdrawn by the first could be missed by the second.
    */
   const applyInsightConsent = useCallback(
     (next: InsightConsent) => {
@@ -1898,14 +1982,21 @@ export default function App() {
 
       if (previous.vocabularyPatterns && !next.vocabularyPatterns) withdrawn.add("terms");
 
-      writeInsightConsent(localStorage, next);
+      try {
+        writeInsightConsent(localStorage, next);
+      } catch (caught) {
+        addInsightNotice(`Insights could not save the consent change: ${messageFrom(caught)}`);
+
+        return;
+      }
+
       setInsightConsent(next);
 
       if (withdrawn.size > 0) {
-        recordInsightTerms("delete", () => insightTerms.withdrawKinds(withdrawn));
+        void recordInsightTerms("delete", () => insightTerms.withdrawKinds(withdrawn));
       }
     },
-    [recordInsightTerms],
+    [recordInsightTerms, addInsightNotice],
   );
 
   /**
@@ -2079,6 +2170,218 @@ export default function App() {
     setDraft((current) => (current === undefined ? current : { ...current, ...patch }));
   }
 
+  // The Insights toggle is unavailable mid-take: switching views would hide
+  // the recorder — the button, timer, waveform and live text — with no
+  // signal that dictation continues, and for a dictation app an unnoticed
+  // recording is the worst outcome. The toggle returns the moment the take
+  // settles.
+  const takeInFlight = recording || takePhase === "starting" || takePhase === "stopping";
+
+  // The capture pane and history, kept in one named element so the view
+  // switch stays one line and edits to the capture workspace never have to
+  // thread through the Insights branch's ternary.
+  const captureWorkspace = (
+    <main className="workspace">
+      <section className="capture-pane">
+        <div className="capture-copy">
+          <p className="eyebrow">LOCAL DICTATION</p>
+          <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
+          <p className="lede">
+            Your recording is saved locally, sent only to your selected server, and shown exactly as
+            the model returned it.
+          </p>
+        </div>
+
+        <div className={`recorder ${recording ? "is-recording" : ""}`}>
+          <div className="waveform" aria-hidden="true">
+            {levels.map((level, index) => (
+              <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
+            ))}
+          </div>
+          <button
+            className="record-button"
+            onClick={() => void toggleRecording()}
+            disabled={takePhase === "starting" || takePhase === "stopping"}
+            aria-label={recording ? "Stop recording" : "Start recording"}
+          >
+            <span className="record-button-inner">
+              {recording ? <span className="stop-glyph" /> : <Mic size={34} strokeWidth={1.7} />}
+            </span>
+          </button>
+          <div className="record-meta">
+            <span>{recording ? formatDuration(elapsedMs) : recordMetaIdle(busy)}</span>
+            <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
+          </div>
+        </div>
+
+        {recording && streamStatus && (
+          <div className={`live-stream ${streamStatus.state}`}>
+            {streamStatus.state === "live" && (
+              <p className="live-text" aria-live="polite">
+                {partialText || <em>Listening for the first words…</em>}
+              </p>
+            )}
+            {streamStatus.state === "connecting" && (
+              <p className="live-note">
+                <Radio size={15} /> Connecting live transcription…
+              </p>
+            )}
+            {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
+              <p className="live-note" role="status">
+                <CircleAlert size={15} />
+                {streamStatus.detail ?? "Live transcription is unavailable."} The recording is still
+                saved and will be transcribed when you stop.
+              </p>
+            )}
+          </div>
+        )}
+
+        <button
+          className="import-button"
+          aria-describedby="import-format"
+          onClick={() => fileRef.current?.click()}
+        >
+          <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
+        </button>
+        <span id="import-format" className="visually-hidden">
+          WAV files only
+        </span>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".wav,audio/wav,audio/x-wav"
+          hidden
+          onChange={(event) => void importAudio(event.target.files?.[0])}
+        />
+
+        {(error || unsavedWavs.length > 0) && (
+          <div className="error-banner" role="alert">
+            <CircleAlert size={18} />
+            <div>
+              <strong>{error ? "Action failed" : "Recording not saved"}</strong>
+              {error && <span>{error}</span>}
+              <small>
+                {unsavedWavs.length > 0
+                  ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
+                  : "Starling keeps audio in history after a successful local save."}
+              </small>
+            </div>
+            {unsavedWavs.length > 0 && (
+              <div className="recovery-actions">
+                {unsavedWavs.map((capture, index) => (
+                  <button
+                    key={capture.id}
+                    className="recover-audio"
+                    onClick={() => exportUnsavedAudio(capture.id)}
+                  >
+                    Download WAV {index + 1}
+                  </button>
+                ))}
+                <button className="recover-audio" onClick={discardUnsavedAudio}>
+                  Discard unsaved
+                </button>
+              </div>
+            )}
+            {unsavedWavs.length === 0 && (
+              <button onClick={() => setError(undefined)} aria-label="Dismiss error">
+                <X size={16} />
+              </button>
+            )}
+          </div>
+        )}
+      </section>
+
+      <aside className="history-pane">
+        <div className="history-head">
+          <div>
+            <p className="eyebrow">ARCHIVE</p>
+            <h2>Recent takes</h2>
+          </div>
+          <Clock3 size={18} />
+        </div>
+        {activeThread && (
+          <div className="thread-strip">
+            <span>Active thread: {activeThread.slice(0, 8)}</span>
+            <button onClick={startNewThread}>start new thread</button>
+          </div>
+        )}
+        <div className="history-list">
+          {damaged.length > 0 && (
+            <div className="history-warning" role="status">
+              <CircleAlert size={16} />
+              <div>
+                <strong>
+                  {damaged.length === 1
+                    ? "1 saved recording could not be read"
+                    : `${damaged.length} saved recordings could not be read`}
+                </strong>
+                <small>
+                  Damaged entries are kept until you delete them; the list below shows every
+                  recording that is still readable.
+                </small>
+                <div className="recovery-actions">
+                  {damaged.map((entry, index) => {
+                    const wav = invalidSessionWav(entry);
+
+                    return (
+                      <span key={`${entry.id}-${index}`} className="damaged-entry">
+                        {wav ? (
+                          <button
+                            className="recover-audio"
+                            onClick={() => exportDamagedAudio(index)}
+                          >
+                            Download WAV {index + 1}
+                          </button>
+                        ) : null}
+                        {entry.key !== undefined ? (
+                          <button
+                            className="recover-audio dismiss-damaged"
+                            onClick={() => void dismissDamagedEntry(index)}
+                            aria-label={`Delete damaged recording ${index + 1}`}
+                          >
+                            Delete entry {index + 1}
+                          </button>
+                        ) : null}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+          {sessions.length === 0 && (
+            <div className="history-empty">
+              Your recordings will collect here, ready to retry or export.
+            </div>
+          )}
+          {sessions.map((session) => (
+            <button
+              key={session.id}
+              className={`history-row ${session.id === selectedId ? "active" : ""}`}
+              onClick={() => setSelectedId(session.id)}
+              aria-label={historyRowLabel(session)}
+            >
+              <span className={`take-state ${session.status}`}>
+                {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
+              </span>
+              <span className="take-copy">
+                <strong>{sessionTitle(session)}</strong>
+                <small>
+                  {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
+                  {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
+                </small>
+                {session.threadId && (
+                  <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
+                )}
+              </span>
+              <ChevronRight size={16} />
+            </button>
+          ))}
+        </div>
+      </aside>
+    </main>
+  );
+
   return (
     <div className={`app-shell ${selected ? "has-transcript" : ""}`}>
       <header className="topbar">
@@ -2101,6 +2404,8 @@ export default function App() {
           onClick={() => setView(view === "insights" ? "capture" : "insights")}
           aria-pressed={view === "insights"}
           aria-label={view === "insights" ? "Back to dictation" : "Open Insights"}
+          disabled={takeInFlight}
+          title={takeInFlight ? "Insights opens when no recording is in progress" : undefined}
         >
           <BarChart3 size={19} />
         </button>
@@ -2121,221 +2426,13 @@ export default function App() {
             termRecords={termRecords}
             consent={insightConsent}
             onConsentChange={applyInsightConsent}
-            issue={insightsIssue}
-            onDismissIssue={() => setInsightsIssue(undefined)}
+            notices={insightNotices}
+            onDismissNotice={dismissInsightNotice}
             onReset={resetInsights}
           />
         </main>
       ) : (
-        <main className="workspace">
-          <section className="capture-pane">
-            <div className="capture-copy">
-              <p className="eyebrow">LOCAL DICTATION</p>
-              <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
-              <p className="lede">
-                Your recording is saved locally, sent only to your selected server, and shown
-                exactly as the model returned it.
-              </p>
-            </div>
-
-            <div className={`recorder ${recording ? "is-recording" : ""}`}>
-              <div className="waveform" aria-hidden="true">
-                {levels.map((level, index) => (
-                  <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
-                ))}
-              </div>
-              <button
-                className="record-button"
-                onClick={() => void toggleRecording()}
-                disabled={takePhase === "starting" || takePhase === "stopping"}
-                aria-label={recording ? "Stop recording" : "Start recording"}
-              >
-                <span className="record-button-inner">
-                  {recording ? (
-                    <span className="stop-glyph" />
-                  ) : (
-                    <Mic size={34} strokeWidth={1.7} />
-                  )}
-                </span>
-              </button>
-              <div className="record-meta">
-                <span>
-                  {recording
-                    ? formatDuration(elapsedMs)
-                    : busy
-                      ? "Transcribing…"
-                      : "Click to record"}
-                </span>
-                <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
-              </div>
-            </div>
-
-            {recording && streamStatus && (
-              <div className={`live-stream ${streamStatus.state}`}>
-                {streamStatus.state === "live" && (
-                  <p className="live-text" aria-live="polite">
-                    {partialText || <em>Listening for the first words…</em>}
-                  </p>
-                )}
-                {streamStatus.state === "connecting" && (
-                  <p className="live-note">
-                    <Radio size={15} /> Connecting live transcription…
-                  </p>
-                )}
-                {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
-                  <p className="live-note" role="status">
-                    <CircleAlert size={15} />
-                    {streamStatus.detail ?? "Live transcription is unavailable."} The recording is
-                    still saved and will be transcribed when you stop.
-                  </p>
-                )}
-              </div>
-            )}
-
-            <button
-              className="import-button"
-              aria-describedby="import-format"
-              onClick={() => fileRef.current?.click()}
-            >
-              <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
-            </button>
-            <span id="import-format" className="visually-hidden">
-              WAV files only
-            </span>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".wav,audio/wav,audio/x-wav"
-              hidden
-              onChange={(event) => void importAudio(event.target.files?.[0])}
-            />
-
-            {(error || unsavedWavs.length > 0) && (
-              <div className="error-banner" role="alert">
-                <CircleAlert size={18} />
-                <div>
-                  <strong>{error ? "Action failed" : "Recording not saved"}</strong>
-                  {error && <span>{error}</span>}
-                  <small>
-                    {unsavedWavs.length > 0
-                      ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
-                      : "Starling keeps audio in history after a successful local save."}
-                  </small>
-                </div>
-                {unsavedWavs.length > 0 && (
-                  <div className="recovery-actions">
-                    {unsavedWavs.map((capture, index) => (
-                      <button
-                        key={capture.id}
-                        className="recover-audio"
-                        onClick={() => exportUnsavedAudio(capture.id)}
-                      >
-                        Download WAV {index + 1}
-                      </button>
-                    ))}
-                    <button className="recover-audio" onClick={discardUnsavedAudio}>
-                      Discard unsaved
-                    </button>
-                  </div>
-                )}
-                {unsavedWavs.length === 0 && (
-                  <button onClick={() => setError(undefined)} aria-label="Dismiss error">
-                    <X size={16} />
-                  </button>
-                )}
-              </div>
-            )}
-          </section>
-
-          <aside className="history-pane">
-            <div className="history-head">
-              <div>
-                <p className="eyebrow">ARCHIVE</p>
-                <h2>Recent takes</h2>
-              </div>
-              <Clock3 size={18} />
-            </div>
-            {activeThread && (
-              <div className="thread-strip">
-                <span>Active thread: {activeThread.slice(0, 8)}</span>
-                <button onClick={startNewThread}>start new thread</button>
-              </div>
-            )}
-            <div className="history-list">
-              {damaged.length > 0 && (
-                <div className="history-warning" role="status">
-                  <CircleAlert size={16} />
-                  <div>
-                    <strong>
-                      {damaged.length === 1
-                        ? "1 saved recording could not be read"
-                        : `${damaged.length} saved recordings could not be read`}
-                    </strong>
-                    <small>
-                      Damaged entries are kept until you delete them; the list below shows every
-                      recording that is still readable.
-                    </small>
-                    <div className="recovery-actions">
-                      {damaged.map((entry, index) => {
-                        const wav = invalidSessionWav(entry);
-
-                        return (
-                          <span key={`${entry.id}-${index}`} className="damaged-entry">
-                            {wav ? (
-                              <button
-                                className="recover-audio"
-                                onClick={() => exportDamagedAudio(index)}
-                              >
-                                Download WAV {index + 1}
-                              </button>
-                            ) : null}
-                            {entry.key !== undefined ? (
-                              <button
-                                className="recover-audio dismiss-damaged"
-                                onClick={() => void dismissDamagedEntry(index)}
-                                aria-label={`Delete damaged recording ${index + 1}`}
-                              >
-                                Delete entry {index + 1}
-                              </button>
-                            ) : null}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-              )}
-              {sessions.length === 0 && (
-                <div className="history-empty">
-                  Your recordings will collect here, ready to retry or export.
-                </div>
-              )}
-              {sessions.map((session) => (
-                <button
-                  key={session.id}
-                  className={`history-row ${session.id === selectedId ? "active" : ""}`}
-                  onClick={() => setSelectedId(session.id)}
-                  aria-label={historyRowLabel(session)}
-                >
-                  <span className={`take-state ${session.status}`}>
-                    {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
-                  </span>
-                  <span className="take-copy">
-                    <strong>{sessionTitle(session)}</strong>
-                    <small>
-                      {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
-                      {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
-                    </small>
-                    {session.threadId && (
-                      <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
-                    )}
-                  </span>
-                  <ChevronRight size={16} />
-                </button>
-              ))}
-            </div>
-          </aside>
-        </main>
+        captureWorkspace
       )}
 
       {selected && (

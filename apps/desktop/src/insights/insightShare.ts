@@ -60,7 +60,12 @@ export interface ShareCard {
   readonly rangeEndDay: string;
   /** The card's body lines, ready to render — only included fields appear. */
   readonly lines: readonly string[];
-  /** Field names withheld by the redaction default, for the preview to show. */
+  /**
+   * Field names withheld by the redaction default. Preview-only metadata:
+   * the preview shows it so the user knows what exists and is not leaving,
+   * but it never travels with the copied or saved text — the artifact must
+   * not disclose that content-derived data exists and was withheld.
+   */
   readonly withheld: readonly ShareCardField[];
   /** The definitions footnote every card carries (INSIGHTS.md). */
   readonly definitions: string;
@@ -134,10 +139,39 @@ function hasValue(input: ShareCardInput, field: ShareCardField): boolean {
   }
 }
 
+/** A milestone the card could cite, when it was reached. */
+export interface ShareMilestone {
+  readonly label: string;
+  /** Local day key the milestone was achieved on. */
+  readonly achievedOnDay: string;
+}
+
+/**
+ * The latest milestone achieved inside the card's date range, when any. The
+ * card states a seven-day range, so every claim must rest on that range: a
+ * milestone from months ago is not the card's to state inside "this week".
+ * The list is oldest-first, so the last in-range entry is the latest.
+ */
+export function milestoneInRange(
+  milestones: readonly ShareMilestone[],
+  rangeStartDay: string,
+): string | undefined {
+  let inRange: ShareMilestone | undefined;
+
+  for (const milestone of milestones) {
+    if (milestone.achievedOnDay >= rangeStartDay) inRange = milestone;
+  }
+
+  return inRange?.label;
+}
+
 /**
  * Render the card as plain text — the preview the user sees and the bytes
- * a copy or save action places on the clipboard or disk. Pure and local:
- * no network primitive is reachable from this module by construction.
+ * a copy or save action places on the clipboard or disk. The withheld list
+ * is preview-only metadata and deliberately has no line here: what the
+ * artifact discloses is exactly the fields the user included, nothing about
+ * the ones they did not. Pure and local: no network primitive is reachable
+ * from this module by construction.
  */
 export function renderShareCard(card: ShareCard): string {
   const parts = [
@@ -146,10 +180,6 @@ export function renderShareCard(card: ShareCard): string {
     ...card.lines,
     card.definitions,
   ];
-
-  if (card.withheld.length > 0) {
-    parts.push(`Withheld by default: ${card.withheld.join(", ")}`);
-  }
 
   return parts.join("\n");
 }
