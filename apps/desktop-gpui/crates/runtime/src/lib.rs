@@ -102,8 +102,9 @@ pub struct RuntimeConfig {
     pub capture_source: Arc<dyn CaptureSource>,
     /// Where finished/salvaged takes are persisted. The default is the
     /// in-memory store so that constructing a config — tests do it freely
-    /// — never touches the user's data root; production embeds
-    /// [`default_capture_store`] (storage v2 at the default root).
+    /// — never touches the user's data root; the production embedder
+    /// overrides this with [`default_capture_store`] (storage v2 at the
+    /// default root).
     pub capture_store: Arc<dyn CaptureStore>,
     /// The documents persistence seam.
     pub document_store: Arc<dyn DocumentStore>,
@@ -183,6 +184,13 @@ impl RuntimeConfig {
 /// `StoreV2`'s default data root. The in-memory store is returned only
 /// when no data root can be opened at all — a degenerate host, not a
 /// second backend to switch to.
+///
+/// Embedder-facing: nothing inside this workspace calls it yet —
+/// [`RuntimeConfig::default`] deliberately stays on the in-memory store
+/// so constructing a config (tests do it freely) never touches the
+/// user's data root. The production embedder (the GPUI switchover / the
+/// I4 service host) passes `.with_capture_store(default_capture_store())`
+/// at its entry point; that wiring is the consuming increment's work.
 pub fn default_capture_store() -> Arc<dyn CaptureStore> {
     if let Ok(root) = starling_dictation::store_v2::StoreV2::default_root() {
         if let Ok(store) = machine::capture::V2CaptureStore::open(root) {

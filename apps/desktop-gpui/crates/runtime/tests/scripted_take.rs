@@ -2108,34 +2108,37 @@ fn take_record(id: &str, samples: &[f32], journal: Option<JournalReport>) -> Tak
     }
 }
 
-/// A real, finalized journal file at an arbitrary path (the on-disk shape
+/// A real, finalized journal file at a stable path (the on-disk shape
 /// the recorder hands the store), built through a scratch v2 store's own
 /// take protocol: begin + append + boundary + finalize leaves the sealed
-/// journal in the scratch root's `staging/`.
-fn real_journal(tag: &str, samples: &[f32]) -> JournalReport {
+/// journal in the scratch root's `staging/`. The scratch root is a unique
+/// `tempfile` directory returned alongside the report — keep it alive
+/// until the store has adopted the journal (the adoption *moves* the
+/// file); dropping it cleans up the scratch store and its SQLite db.
+fn real_journal(samples: &[f32]) -> (JournalReport, tempfile::TempDir) {
     use starling_dictation::store_v2::{StoreV2, TakeMeta};
-    let scratch_root = std::env::temp_dir().join(format!(
-        "starling-v2store-journal-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch_root);
-    let scratch = StoreV2::open(&scratch_root).expect("scratch store");
-    let mut take = scratch
+    let scratch = tempfile::tempdir().expect("scratch store temp dir");
+    let store = StoreV2::open(scratch.path()).expect("scratch store");
+    let mut take = store
         .begin_take(TakeMeta::for_device("test"))
         .expect("begin take");
     take.append_frames(samples).expect("append");
     take.write_boundary().expect("boundary");
     let finalized = take.finalize().expect("finalize");
-    JournalReport {
-        path: scratch_root
-            .join("staging")
-            .join(format!("{}.sj", finalized.id)),
-        id: finalized.id.clone(),
-        sample_rate: finalized.sample_rate,
-        acknowledged_samples: finalized.total_samples,
-        finalized: true,
-        fault: None,
-    }
+    (
+        JournalReport {
+            path: scratch
+                .path()
+                .join("staging")
+                .join(format!("{}.sj", finalized.id)),
+            id: finalized.id.clone(),
+            sample_rate: finalized.sample_rate,
+            acknowledged_samples: finalized.total_samples,
+            finalized: true,
+            fault: None,
+        },
+        scratch,
+    )
 }
 
 #[test]
@@ -2143,7 +2146,7 @@ fn v2_store_adopts_real_journal_evidence() {
     let dir = tempfile::tempdir().expect("v2 store temp dir");
     let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
     let samples: Vec<f32> = (0..300).map(|i| (i % 37) as f32 * 0.001).collect();
-    let journal = real_journal("adopt", &samples);
+    let (journal, _scratch) = real_journal(&samples);
 
     // A cleanly stopped take whose recorder journaled: the journal is the
     // evidence, and adoption is the commit path.
@@ -2172,7 +2175,7 @@ fn v2_store_forces_interrupted_on_a_salvaged_adopted_take() {
     let dir = tempfile::tempdir().expect("v2 store temp dir");
     let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
     let samples: Vec<f32> = (0..120).map(|i| (i % 31) as f32 * 0.002).collect();
-    let journal = real_journal("salvage", &samples);
+    let (journal, _scratch) = real_journal(&samples);
 
     store
         .mark_interrupted(
@@ -2187,6 +2190,115 @@ fn v2_store_forces_interrupted_on_a_salvaged_adopted_take() {
     assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Interrupted);
     let note = record.recovery_note().expect("the salvage note");
     assert!(note.contains("salvaged take was kept"), "{note}");
+}
+
+/// A real journal renamed to a caller-chosen id at `dest` (on the same
+/// filesystem), for tests that need a controlled capture id.
+fn journal_as(id: &str, samples: &[f32], dest: &std::path::Path) -> (JournalReport, tempfile::TempDir) {
+    let (mut report, scratch) = real_journal(samples);
+    let new_path = dest.join(format!("{id}.sj"));
+    std::fs::rename(&report.path, &new_path).expect("rename the journal into place");
+    report.id = id.to_string();
+    report.path = new_path;
+    (report, scratch)
+}
+
+#[test]
+fn a_destination_conflict_falls_back_once_with_a_recorded_diagnostic() {
+    // Adoption refuses to overwrite audio that already exists (a journal
+    // is evidence). With no row behind that audio, the take still must be
+    // stored — from its samples, exactly once — and the row must record
+    // WHY it was not adopted instead of silently losing the diagnosis.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..200).map(|i| (i % 53) as f32 * 0.004).collect();
+    let (journal, _scratch) = journal_as("j_conflict", &samples, dir.path());
+    // The conflict: orphaned audio under the journal's id with no row —
+    // the crash-window shape adoption's own check refuses.
+    std::fs::write(dir.path().join("audio").join("j_conflict.sj"), b"orphaned audio")
+        .expect("pre-place the destination conflict");
+
+    store
+        .commit_take(&take_record("take_conflict", &samples, Some(journal.clone())))
+        .expect("the take is stored from its samples");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 1, "no duplicate row for the take: {rows:?}");
+    let starling_dictation::store_v2::ListedCapture::Capture(listing) = &rows.records[0] else {
+        panic!("expected a readable capture, got {:?}", rows.records[0]);
+    };
+    assert_eq!(listing.record.frame_count, 200, "the samples row");
+    let extra = listing.record.extra_json.as_deref().unwrap_or_default();
+    assert!(
+        extra.contains("journalAdoptionError"),
+        "the fallback's provenance is recorded: {extra}"
+    );
+    assert!(
+        extra.contains("j_conflict"),
+        "the diagnostic names the conflicting journal: {extra}"
+    );
+    // The orphaned audio evidence is untouched for reconcile to heal —
+    // the fallback never overwrites it.
+    assert!(
+        dir.path().join("audio").join("j_conflict.sj").exists(),
+        "the orphaned audio stays"
+    );
+}
+
+#[test]
+fn a_retry_against_an_already_adopted_row_commits_no_duplicate() {
+    // The retry shape: a first commit adopted the journal (source moved
+    // into `audio/`, row committed) and the ack was lost, so the caller
+    // commits again with a report re-pointing at a copy of the same
+    // journal. Adoption refuses (destination holds the audio), the row
+    // IS there — the retry must be satisfied by that row, never by
+    // storing the take a second time from samples.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..150).map(|i| (i % 41) as f32 * 0.005).collect();
+    let (journal, _scratch) = real_journal(&samples);
+    let id = journal.id.clone();
+
+    store
+        .commit_take(&take_record(&id, &samples, Some(journal.clone())))
+        .expect("first commit adopts");
+
+    // The retry's report points at a copy of the same journal.
+    let spare = dir.path().join(format!("{id}.sj"));
+    std::fs::copy(dir.path().join("audio").join(format!("{id}.sj")), &spare)
+        .expect("spare journal copy");
+    let mut retry = journal.clone();
+    retry.path = spare.clone();
+    store
+        .commit_take(&take_record(&id, &samples, Some(retry)))
+        .expect("the retry is satisfied by the adopted row");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 1, "exactly the adopted row: {rows:?}");
+
+    // A salvaged retry against the same row forces the status on it —
+    // the R34 downgrade, without a second row and without moving the
+    // spare copy.
+    let mut salvage_retry = journal.clone();
+    salvage_retry.path = spare;
+    store
+        .mark_interrupted(
+            &take_record(&id, &samples, Some(salvage_retry)),
+            "The microphone did not stop cleanly; the salvaged take was kept.",
+        )
+        .expect("salvage retry");
+    let rows = inner.list_records(0, 10).expect("list again");
+    assert_eq!(rows.total, 1, "still exactly one row");
+    let starling_dictation::store_v2::ListedCapture::Capture(listing) = &rows.records[0] else {
+        panic!("expected a readable capture, got {:?}", rows.records[0]);
+    };
+    assert_eq!(
+        listing.record.status,
+        starling_dictation::store_v2::CaptureStatus::Interrupted,
+        "the salvage retry downgraded the adopted row"
+    );
 }
 
 #[test]

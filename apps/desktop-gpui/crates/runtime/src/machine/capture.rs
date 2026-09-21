@@ -322,12 +322,25 @@ impl CaptureStore for InMemoryCaptureStore {
 /// protocol the app's WAV path uses (staging journal → finalize → promote
 /// → commit), so a journal-level problem can never cost the audio.
 ///
-/// The evidence the runtime layers on top — `takeCorr`, gaps, the sample /
-/// wall-clock split — rides in `extra_json` on the samples path; on the
-/// adoption path the journal itself is the durable evidence and the row
-/// carries the store's own adoption semantics (plus the salvage note on
-/// the interrupted paths). Nothing reads those keys back today; the
-/// registry is the runtime's session-scoped source of take detail.
+/// An adoption that fails *after* its durable effects is never silently
+/// re-stored from samples: if the row landed anyway (a retry against an
+/// already-adopted take, or a destination that already holds the capture)
+/// the commit is satisfied by that row — no duplicate. Only a failure
+/// that left nothing behind falls back to the samples path, and the
+/// reason rides along: recorded in the stored row's `extra_json`
+/// (`journalAdoptionError`) and chained into the error should the samples
+/// write fail too. A failed post-adoption status flip is non-fatal for
+/// the same reason — the take is durably persisted; the caller must not
+/// read "not persisted" and retry into the adoption's row.
+///
+/// The evidence the runtime layers on top — `takeCorr`, `captureId`,
+/// gaps, the sample / wall-clock split — rides in `extra_json` on the
+/// samples path (both ids, so a consumer can find the row by the
+/// `capture_id` the machine emits); on the adoption path the journal
+/// itself is the durable evidence and the row carries the store's own
+/// adoption semantics (plus the salvage note on the interrupted paths).
+/// Nothing reads those keys back today; the registry is the runtime's
+/// session-scoped source of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
 }
@@ -346,53 +359,137 @@ impl V2CaptureStore {
         status: CaptureStatus,
         note: Option<&str>,
     ) -> Result<(), String> {
-        let mut store = self.store.lock().expect("v2 store lock");
-        // Journal evidence first, when it exists on disk. Adoption failure
-        // (an unreadable source, a destination conflict, no verified
-        // samples) falls through to the samples path below — exactly the
-        // app facade's rule: a journal problem never costs the audio.
-        let adopted = match &take.journal {
-            Some(report) if report.path.exists() => store
-                .adopt_journal(&report.path, note)
-                .ok()
-                .map(|record| record.id),
-            _ => None,
-        };
-        if let Some(id) = adopted {
-            // The salvage paths force interrupted-ness regardless of the
-            // journal's own verdict (the app facade's R34 rule): the
-            // interruption derives from how the take ended, not from the
-            // journal's finalized-ness. The note itself already rode along
-            // with the adoption; passing no note keeps its combined
-            // wording intact.
-            if status == CaptureStatus::Interrupted {
-                store
-                    .update_capture_status(&id, CaptureStatus::Interrupted, None)
-                    .map_err(|err| err.to_string())?;
+        // Journal evidence first, when it exists on disk. The lock is held
+        // only for the adoption (one SQLite transaction); the samples path
+        // below releases it for the staging-journal writes — tens of MB of
+        // fsync'd I/O for a long take — and retakes it for the commit, the
+        // same split the app facade's save path uses, so concurrent
+        // persists do not serialize behind each other's writes.
+        let mut adoption_error = None;
+        {
+            let mut store = self.store.lock().expect("v2 store lock");
+            let adoption = match &take.journal {
+                Some(report) if report.path.exists() => {
+                    Some((report, store.adopt_journal(&report.path, note)))
+                }
+                _ => None,
+            };
+            match adoption {
+                Some((_, Ok(record))) => {
+                    // The salvage paths force interrupted-ness regardless of
+                    // the journal's own verdict (the app facade's R34 rule):
+                    // the interruption derives from how the take ended, not
+                    // from the journal's finalized-ness. The note itself
+                    // already rode along with the adoption; passing no note
+                    // keeps its combined wording intact. A failure here is
+                    // non-fatal: the take IS durably persisted, and a
+                    // "not persisted" answer would invite a retry that
+                    // collides with the adopted row.
+                    if status == CaptureStatus::Interrupted {
+                        // Non-fatal on purpose: the take IS durably
+                        // persisted, and a "not persisted" answer would
+                        // invite a retry that collides with the adopted
+                        // row. The adoption carried the salvage note, so
+                        // the row keeps its wording either way.
+                        if let Err(err) = store.update_capture_status(
+                            &record.id,
+                            CaptureStatus::Interrupted,
+                            None,
+                        ) {
+                            eprintln!(
+                                "v2 capture store: adopted take {} committed; the interrupted \
+                                 status flip failed ({err}) — the row keeps the salvage note",
+                                record.id
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Some((report, Err(err))) => {
+                    // The adoption may have failed *after* its durable
+                    // effects: a row for the journal's id means the take is
+                    // already stored (a retry, or a partial prior adoption)
+                    // and must not be stored a second time from samples.
+                    match store.get_capture(&report.id) {
+                        Ok(Some(existing)) => {
+                            if status == CaptureStatus::Interrupted {
+                                if let Err(flip_err) = store.update_capture_status(
+                                    &existing.id,
+                                    CaptureStatus::Interrupted,
+                                    None,
+                                ) {
+                                    eprintln!(
+                                        "v2 capture store: adopted take {} committed; the \
+                                         interrupted status flip failed ({flip_err})",
+                                        existing.id
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+                        _ => {
+                            // Nothing landed: a journal-readability failure
+                            // (unreadable source, no verified samples) is
+                            // the legitimate fallback; anything else
+                            // (destination conflict without a row, SQLite
+                            // trouble) falls back too — the audio must not
+                            // be lost — but the reason is kept and recorded.
+                            adoption_error = Some(err.to_string());
+                        }
+                    }
+                }
+                None => {}
             }
-            return Ok(());
         }
 
-        // No journal evidence: the take's samples through the §4 protocol.
+        // No journal evidence (or an adoption that left nothing behind):
+        // the take's samples through the §4 protocol.
         let mut meta = TakeMeta::for_device(take.device.clone());
         meta.policy = take.policy.clone();
-        meta.extra_json = Some(
-            serde_json::json!({
-                "takeCorr": take.id,
-                "gaps": take.gaps,
-                "acknowledgedSamples": take.acknowledged_samples,
-                "journalFinalized": take.journal.as_ref().map(|r| r.finalized),
-                "journalFault": take.journal.as_ref().and_then(|r| r.fault.clone()),
-                "wallClockMs": take.wall_clock_ms,
-            })
-            .to_string(),
-        );
-        let mut v2_take = store
-            .begin_take_at_rate(take.sample_rate, meta)
-            .map_err(|err| err.to_string())?;
-        v2_take
-            .append_and_seal(&take.samples)
-            .map_err(|err| err.to_string())?;
+        let mut extra = serde_json::json!({
+            "takeCorr": take.id,
+            "captureId": take.capture_id,
+            "gaps": take.gaps,
+            "acknowledgedSamples": take.acknowledged_samples,
+            "journalFinalized": take.journal.as_ref().map(|r| r.finalized),
+            "journalFault": take.journal.as_ref().and_then(|r| r.fault.clone()),
+            "wallClockMs": take.wall_clock_ms,
+        });
+        if let Some(reason) = &adoption_error {
+            // The fallback's provenance stays diagnosable in the stored
+            // row instead of dying with the process.
+            extra["journalAdoptionError"] = serde_json::Value::String(reason.clone());
+        }
+        meta.extra_json = Some(extra.to_string());
+
+        // Cheap step under the guard: mint the staging journal. The bulk
+        // writes and fsyncs run on the take's own writer, off the lock.
+        let mut v2_take = {
+            let store = self.store.lock().expect("v2 store lock");
+            store
+                .begin_take_at_rate(take.sample_rate, meta)
+                .map_err(|err| chain_adoption_failure(&adoption_error, err.to_string()))?
+        };
+        let staged_id = v2_take.id().to_string();
+        if let Err(err) = v2_take.append_and_seal(&take.samples) {
+            // The staging journal of a write that failed is not evidence
+            // to salvage — it is a partial duplicate of whatever gets
+            // stored instead. Roll it back explicitly.
+            self.store
+                .lock()
+                .expect("v2 store lock")
+                .discard_staging(&staged_id)
+                .map_err(|err| err.to_string())?;
+            return Err(chain_adoption_failure(&adoption_error, err.to_string()));
+        }
+        let finalized = match v2_take.finalize() {
+            Ok(finalized) => finalized,
+            Err(err) => {
+                let store = self.store.lock().expect("v2 store lock");
+                let _ = store.discard_staging(&staged_id);
+                return Err(chain_adoption_failure(&adoption_error, err.to_string()));
+            }
+        };
         let mark = match (status, note) {
             (CaptureStatus::Interrupted, Some(note)) => CommitMark::Interrupted {
                 note: note.to_string(),
@@ -403,12 +500,25 @@ impl V2CaptureStore {
             },
             (CaptureStatus::Complete, _) => CommitMark::Complete,
         };
-        v2_take
-            .finalize()
-            .map_err(|err| err.to_string())?
+        let mut store = self.store.lock().expect("v2 store lock");
+        finalized
             .commit_marked(&mut store, mark)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| chain_adoption_failure(&adoption_error, err.to_string()))?;
         Ok(())
+    }
+}
+
+/// Fold the adoption failure into a samples-path failure: the take was
+/// stored from neither path, and the surfaced error must say both — the
+/// samples error alone would hide the journal trouble that forced the
+/// fall-back.
+fn chain_adoption_failure(adoption_error: &Option<String>, samples_error: String) -> String {
+    match adoption_error {
+        None => samples_error,
+        Some(reason) => format!(
+            "journal adoption failed ({reason}); storing the take from its samples \
+             failed too: {samples_error}"
+        ),
     }
 }
 
