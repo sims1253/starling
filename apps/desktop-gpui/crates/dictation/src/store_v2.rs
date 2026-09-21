@@ -66,7 +66,7 @@
 //!   R21 semantics) stay dead — recovery never resurrects a confirmed
 //!   deletion, and an interrupted delete is completed, not half-kept.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1319,6 +1319,16 @@ impl StoreV2 {
             sync_dir(&self.root.join(QUARANTINE_DIR))?;
         }
         if self.get_capture(id)?.is_some() {
+            // The capture's attempt ids go first: the DELETE cascades the
+            // attempt rows away, and their markers must not outlive them
+            // (#213 review — every row-removal path releases markers).
+            let attempt_ids: Vec<String> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM recognition_attempts WHERE capture_id = ?1")?;
+                let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
             let tx = self.conn.transaction()?;
             tx.execute(
                 "INSERT OR REPLACE INTO tombstones(id, kind, deleted_utc, retention)
@@ -1327,6 +1337,9 @@ impl StoreV2 {
             )?;
             tx.execute("DELETE FROM captures WHERE id = ?1", params![id])?;
             tx.commit()?;
+            for attempt_id in &attempt_ids {
+                self.release_attempt_lock(attempt_id);
+            }
         }
         report.completed_deletes.push(id.to_string());
         Ok(())
@@ -1617,7 +1630,10 @@ impl StoreV2 {
     /// conditional write keyed by the exact attempt row, so a settle (or
     /// delete) that commits between the probe and the write cannot
     /// last-writer-lose its outcome to a failure (#162 semantics).
-    /// Returns the affected capture ids. Completed attempts are untouched.
+    /// Returns the affected capture ids — each capture once, even when
+    /// several of its attempts were swept. Completed attempts are
+    /// untouched. The pass also garbage-collects the marker directory (see
+    /// [`Self::gc_attempt_markers`]).
     pub fn interrupt_stale_attempts(&mut self, note: &str) -> Result<Vec<String>, StoreV2Error> {
         let mut started: Vec<(String, String)> = Vec::new();
         {
@@ -1633,9 +1649,10 @@ impl StoreV2 {
             }
         }
         let extra = serde_json::json!({ "error": note }).to_string();
-        let mut swept = Vec::new();
-        for (capture_id, attempt_id) in started {
-            if self.attempt_is_owned(&attempt_id) {
+        let mut swept: Vec<String> = Vec::new();
+        let mut swept_captures: HashSet<&str> = HashSet::new();
+        for (capture_id, attempt_id) in &started {
+            if self.attempt_is_owned(attempt_id) {
                 // Another window may still own this attempt (#144, #213):
                 // only an owner whose signal is gone is treated as
                 // interrupted.
@@ -1647,15 +1664,19 @@ impl StoreV2 {
                  WHERE id = ?2 AND status = 'started'",
                 params![extra, attempt_id],
             )?;
-            if changed > 0 {
-                swept.push(capture_id);
+            if changed > 0 && swept_captures.insert(capture_id) {
+                // The distinct-capture contract of the old `SELECT
+                // DISTINCT` sweep: one entry per capture, however many of
+                // its attempts this pass failed.
+                swept.push(capture_id.clone());
             }
             // changed == 0: the owner settled (or a delete cascaded)
             // between the probe and the write — nothing stale remains.
             // Either way the attempt is settled now, and a marker for a
             // settled row is disk garbage: take it with the sweep.
-            self.release_attempt_lock(&attempt_id);
+            self.release_attempt_lock(attempt_id);
         }
+        self.gc_attempt_markers();
         Ok(swept)
     }
 
@@ -1672,24 +1693,43 @@ impl StoreV2 {
     }
 
     /// Hold one attempt's cross-process marker (#213): create the lock
-    /// file and flock it. The handle lives in [`Self::attempt_locks`] —
-    /// keeping the file open is what holds the lock — until the attempt
-    /// settles, the capture is deleted, or the process exits.
+    /// file, flock it where the platform has flock, and record this
+    /// process's PID in the file — the ownership signal everywhere flock
+    /// cannot answer (see [`attempt_owned_from`]). The handle lives in
+    /// [`Self::attempt_locks`] — keeping the file open is what holds the
+    /// lock — until the attempt settles, the capture is deleted, or the
+    /// process exits. The marker directory is created at
+    /// [`StoreV2::open`]; this path never recreates it.
     fn hold_attempt_lock(&mut self, attempt_id: &str) -> Result<(), StoreV2Error> {
-        std::fs::create_dir_all(self.root.join(ATTEMPT_LOCKS_DIR))?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(self.attempt_lock_path(attempt_id))?;
-        if !try_flock_exclusive(&file)? {
-            // Unique-per-attempt ids make this unreachable short of
-            // external tampering with the locks directory.
-            return Err(StoreV2Error::Io(io::Error::other(format!(
-                "attempt marker {attempt_id} is already held"
-            ))));
-        }
+        let mut file = match try_flock_exclusive(&file) {
+            Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => file,
+            Ok(FlockEvidence::Held) => {
+                // Unique-per-attempt ids make this unreachable short of
+                // external tampering with the locks directory; whatever
+                // file sits at this freshly minted id's path is not a live
+                // attempt's marker, and the failed hold must not leave it
+                // behind (#213 review). A real owner can never share a
+                // minted id, so nothing legitimate is unlinked.
+                drop(file);
+                let _ = std::fs::remove_file(self.attempt_lock_path(attempt_id));
+                return Err(StoreV2Error::Io(io::Error::other(format!(
+                    "attempt marker {attempt_id} is already held"
+                ))));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        // Best-effort: on flock platforms the lock decides ownership and
+        // the PID is observability; where flock cannot answer, a PID that
+        // failed to write degrades that marker to "held" — the safe
+        // direction.
+        use std::io::Write as _;
+        let _ = file.write_all(std::process::id().to_string().as_bytes());
         self.attempt_locks.insert(attempt_id.to_string(), file);
         Ok(())
     }
@@ -1710,11 +1750,12 @@ impl StoreV2 {
 
     /// Whether a live owner holds the attempt's marker (#213): this
     /// process's own registry first (the within-process signal that also
-    /// covers flock-less platforms), then the flock itself. A missing
-    /// marker means no owner — a `started` row from a pre-marker build
-    /// stays sweepable; marker *presence* alone is never the signal, so a
-    /// stale file left by a crash cannot block the sweep (the OS released
-    /// its flock when the owner died). A marker that cannot be probed
+    /// covers flock-less platforms), then the marker itself — flock where
+    /// the platform has it, the recorded PID otherwise. A missing marker
+    /// means no owner — a `started` row from a pre-marker build stays
+    /// sweepable; marker *presence* alone is never the signal, so a stale
+    /// file left by a crash cannot block the sweep (the OS released its
+    /// flock when the owner died). A marker that cannot be probed at all
     /// (permissions, I/O trouble) is treated as owned: an unreadable
     /// liveness signal must not manufacture an interruption — the same
     /// rule the Electron reference applies when the lock manager cannot
@@ -1726,7 +1767,7 @@ impl StoreV2 {
         if !is_safe_path_component(attempt_id) {
             return false;
         }
-        let file = match OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .read(true)
             .write(true)
             .open(self.attempt_lock_path(attempt_id))
@@ -1735,12 +1776,73 @@ impl StoreV2 {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return false,
             Err(_) => return true,
         };
-        match try_flock_exclusive(&file) {
-            // The probe acquired the lock and released it again on drop:
-            // no live owner anywhere.
-            Ok(true) => false,
-            Ok(false) => true,
-            Err(_) => true,
+        let flock = match try_flock_exclusive(&file) {
+            Ok(evidence) => evidence,
+            Err(_) => FlockEvidence::Unknown,
+        };
+        // The flock decides when it answered; otherwise the PID the marker
+        // records decides.
+        let pid_alive = if flock == FlockEvidence::Unknown {
+            read_recorded_pid(&mut file).map(process_is_alive)
+        } else {
+            None
+        };
+        attempt_owned_from(flock, pid_alive)
+    }
+
+    /// Best-effort garbage collection of the marker directory (#213
+    /// review): removes markers whose attempt row no longer reads
+    /// `started`, so row-removal paths beyond `finish_recognition` and
+    /// `delete_capture` (cascades, future reconciliation work) cannot
+    /// leak them. Two guards keep it safe: a marker whose flock is held
+    /// is never touched — its holder may be a live owner between
+    /// acquiring the marker and inserting its row (the order
+    /// [`Self::begin_recognition`] guarantees) — and without a flock
+    /// answer the marker is removed only when its recorded PID is
+    /// provably dead. Errors are ignored: a marker that cannot be
+    /// examined today is simply revisited by the next sweep.
+    fn gc_attempt_markers(&self) {
+        let Ok(entries) = std::fs::read_dir(self.root.join(ATTEMPT_LOCKS_DIR)) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+                continue;
+            }
+            let Some(attempt_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !is_safe_path_component(attempt_id) {
+                continue;
+            }
+            let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) else {
+                continue;
+            };
+            match try_flock_exclusive(&file) {
+                // Held (or unanswerable with a PID that cannot be proven
+                // dead): a live owner may exist — leave the marker alone.
+                Ok(FlockEvidence::Held) | Err(_) => continue,
+                Ok(FlockEvidence::Unknown) => {
+                    if read_recorded_pid(&mut file).map(process_is_alive) != Some(false) {
+                        continue;
+                    }
+                }
+                Ok(FlockEvidence::Free) => {}
+            }
+            let started = self
+                .conn
+                .query_row(
+                    "SELECT status FROM recognition_attempts WHERE id = ?1",
+                    params![attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if started.as_deref() != Some("started") {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 }
@@ -2046,35 +2148,102 @@ fn validate_capture_id(id: &str) -> Result<(), StoreV2Error> {
     Ok(())
 }
 
+/// What one marker probe learned about its flock (#213 review).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlockEvidence {
+    /// The probe acquired the exclusive lock itself (releasing it with the
+    /// handle): no live owner anywhere — the OS frees the lock when the
+    /// owning process dies.
+    Free,
+    /// A live owner holds the lock.
+    Held,
+    /// The platform has no flock, or the call could not answer.
+    Unknown,
+}
+
+/// Whether an attempt reads as owned, given the flock evidence and the
+/// liveness of the PID its marker records (#213 review). Pure, so the
+/// whole degradation ladder is testable on platforms that always have
+/// flock:
+///
+/// - a held flock decides outright — the owner is alive by construction;
+/// - a freed flock decides outright — the owner is dead by construction;
+/// - without a flock answer (no flock on the platform, or the call
+///   errored) the recorded PID's liveness decides;
+/// - with neither answer the marker reads as held: an unanswerable
+///   liveness signal must not manufacture an interruption — the same rule
+///   the Electron reference applies when the lock manager cannot answer.
+fn attempt_owned_from(flock: FlockEvidence, pid_alive: Option<bool>) -> bool {
+    match flock {
+        FlockEvidence::Held => true,
+        FlockEvidence::Free => false,
+        FlockEvidence::Unknown => match pid_alive {
+            Some(true) => true,
+            Some(false) => false,
+            None => true,
+        },
+    }
+}
+
+/// The PID recorded in a marker file (#213 review), when one is readable.
+fn read_recorded_pid(file: &mut File) -> Option<u32> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    text.trim().parse().ok()
+}
+
 /// Take a non-blocking exclusive advisory lock on an open file (#213).
-/// `Ok(true)` — acquired, held until the file is dropped; `Ok(false)` — a
-/// live owner holds it. Because the lock lives on the open file
-/// description, the OS releases it when the owning process dies, which is
-/// what makes a leftover marker file after a crash harmless.
+/// Because the lock lives on the open file description, the OS releases
+/// it when the owning process dies, which is what makes a leftover marker
+/// file after a crash harmless.
 #[cfg(unix)]
-fn try_flock_exclusive(file: &File) -> io::Result<bool> {
+fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     use std::os::fd::AsRawFd;
     // SAFETY: flock(2) on an fd this caller owns and keeps open for the
     // lock's lifetime; no close or hand-off happens here.
-    let acquired =
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if acquired {
-        return Ok(true);
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(FlockEvidence::Free);
     }
     let error = io::Error::last_os_error();
     if error.kind() == io::ErrorKind::WouldBlock {
-        return Ok(false);
+        return Ok(FlockEvidence::Held);
     }
     Err(error)
 }
 
-/// Without flock there is no cross-process signal (#213): the call reports
-/// acquired so attempts stay visible only within the one store that holds
-/// them — the same degradation the Electron reference applies on hosts
-/// without `navigator.locks`.
+/// Without flock there is no lock to ask (#213 review): the probe answers
+/// [`FlockEvidence::Unknown`] and the marker's recorded PID decides
+/// ownership instead (see [`attempt_owned_from`]). Every desktop target
+/// this port builds today is unix; this arm keeps the crate honest
+/// wherever it compiles without one, degrading to PID-liveness rather
+/// than to "no owner".
 #[cfg(not(unix))]
-fn try_flock_exclusive(_file: &File) -> io::Result<bool> {
-    Ok(true)
+fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
+    Ok(FlockEvidence::Unknown)
+}
+
+/// Whether the process `pid` is still alive (#213 review) — the fallback
+/// ownership signal wherever the flock cannot answer.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: kill(2) with signal 0 performs existence and permission
+    // checks only — no signal is ever delivered.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // EPERM means the process exists but belongs to another user; only
+    // ESRCH (no such process) means it is gone.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a std primitive to ask the OS about a PID (#213 review), the
+/// recorded owner is presumed alive and the marker reads as held (see
+/// [`attempt_owned_from`]) — the safe direction, at the cost of sweeping
+/// marker-bearing attempts only on platforms where liveness can be asked.
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 fn int64(value: u64) -> Result<i64, StoreV2Error> {
@@ -3385,6 +3554,174 @@ mod tests {
         // marker must not linger as disk garbage.
         store.delete_capture(&id).expect("delete");
         assert!(!marker.exists(), "the marker went with the rows");
+    }
+
+    // ---- ownership evidence and its fallbacks (#213 review) -----------
+
+    #[test]
+    fn ownership_evidence_falls_back_to_the_recorded_pid_then_to_held() {
+        // Platform-agnostic contract of the ladder: the flock decides
+        // when it answered — either way, outright; without an answer the
+        // recorded PID's liveness decides; with no answer at all the
+        // marker reads as held (the safe direction).
+        assert!(attempt_owned_from(FlockEvidence::Held, None));
+        assert!(
+            attempt_owned_from(FlockEvidence::Held, Some(false)),
+            "a held flock means a live owner by construction"
+        );
+        assert!(!attempt_owned_from(FlockEvidence::Free, None));
+        assert!(
+            !attempt_owned_from(FlockEvidence::Free, Some(true)),
+            "a freed flock means a dead owner by construction"
+        );
+        assert!(attempt_owned_from(FlockEvidence::Unknown, Some(true)));
+        assert!(!attempt_owned_from(FlockEvidence::Unknown, Some(false)));
+        assert!(attempt_owned_from(FlockEvidence::Unknown, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_liveness_answers_for_live_and_dead_processes() {
+        // The fallback signal has to actually distinguish owners: this
+        // process is alive; a child that exited is not (pid reuse inside
+        // the test window is not a practical concern).
+        assert!(process_is_alive(std::process::id()));
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait for the child");
+        assert!(!process_is_alive(pid), "pid {pid} has exited");
+    }
+
+    #[test]
+    fn a_held_marker_names_its_owner_pid() {
+        // The PID is the ownership fallback wherever flock cannot answer,
+        // so every held marker records one.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        store.hold_attempt_lock("a_marker").expect("hold");
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join("v2")
+                .join(ATTEMPT_LOCKS_DIR)
+                .join("a_marker.lock"),
+        )
+        .expect("read the marker");
+        assert_eq!(text.trim(), std::process::id().to_string());
+        store.release_attempt_lock("a_marker");
+    }
+
+    #[test]
+    fn the_sweep_reports_each_swept_capture_once() {
+        // #213 review: the old sweep's DISTINCT-capture contract must
+        // survive the per-attempt loop — two swept attempts on one
+        // capture fail together, and the capture is reported once.
+        let dir = TempDir::new().expect("tempdir");
+        let id = {
+            let mut owner = store_in(&dir);
+            let id = committed_take(&mut owner, &ramp(30, 0)).record.id.clone();
+            owner
+                .begin_recognition(&id, "starling", None)
+                .expect("begin one");
+            owner
+                .begin_recognition(&id, "starling", None)
+                .expect("begin two");
+            drop(owner); // both attempts' owner is gone
+            id
+        };
+
+        let mut store = store_in(&dir);
+        let swept = store
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("sweep");
+        assert_eq!(swept, vec![id.clone()], "one entry per capture");
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| attempt.status == "failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_contended_marker_hold_leaves_no_marker_behind() {
+        // #213 review: the contention path (a holder at a freshly minted
+        // id's marker — external tampering by definition, since ids are
+        // unique per attempt) must not leave the marker file on disk.
+        let dir = TempDir::new().expect("tempdir");
+        let mut holder = store_in(&dir);
+        holder.hold_attempt_lock("a_tamper").expect("first hold acquires");
+
+        let mut contender = store_in(&dir);
+        let marker = contender.attempt_lock_path("a_tamper");
+        assert!(marker.exists());
+        assert!(
+            contender.hold_attempt_lock("a_tamper").is_err(),
+            "the held marker contends"
+        );
+        assert!(
+            !marker.exists(),
+            "the contended marker is removed with the error"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_collects_markers_whose_attempts_are_gone() {
+        // #213 review: markers can outlive their rows through paths other
+        // than finish/delete; the sweep garbage-collects them — but never
+        // a flocked marker, whose holder may be a live owner inside
+        // begin_recognition's marker-before-row window.
+        let dir = TempDir::new().expect("tempdir");
+        let locks = dir.path().join("v2").join(ATTEMPT_LOCKS_DIR);
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(20, 0)).record.id.clone();
+        let settled = store
+            .begin_recognition(&id, "starling", None)
+            .expect("begin");
+        store
+            .finish_recognition(&id, RecognitionOutcome::Failed { message: "x" })
+            .expect("settle"); // takes its marker with it
+
+        // A marker for a settled row, planted back (the crash window
+        // between the terminal write and the unlink): garbage.
+        std::fs::write(
+            locks.join(format!("{settled}.lock")),
+            std::process::id().to_string(),
+        )
+        .expect("plant the settled-row marker");
+        // A marker with no row at all and a free flock (a crash between
+        // marker creation and the row insert): garbage.
+        std::fs::write(locks.join("a_orphan.lock"), std::process::id().to_string())
+            .expect("plant the row-less marker");
+        // A marker with no row whose flock is held: a live owner may be
+        // between marker and row — never touched.
+        let live = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(locks.join("a_live.lock"))
+            .expect("open the live marker");
+        assert_eq!(
+            try_flock_exclusive(&live).expect("flock"),
+            FlockEvidence::Free,
+            "the test handle now holds it, like a mid-begin owner"
+        );
+
+        store
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("sweep");
+
+        assert!(
+            !locks.join(format!("{settled}.lock")).exists(),
+            "the settled row's marker is collected"
+        );
+        assert!(
+            !locks.join("a_orphan.lock").exists(),
+            "the row-less unlocked marker is collected"
+        );
+        assert!(
+            locks.join("a_live.lock").exists(),
+            "a flocked marker is never collected"
+        );
     }
 
     #[test]

@@ -278,20 +278,21 @@ pub(crate) fn normalize_draft_endpoint(draft: &str) -> String {
     draft.trim().trim_end_matches('/').to_string()
 }
 
-/// Validate the endpoint a save would commit (#213): the draft is
-/// normalized exactly like [`normalize_draft_endpoint`], then refused
-/// when empty — the Electron reference's `normalizeSettings` refusal,
+/// Validate the endpoint a save would commit (#213): takes the
+/// already-normalized draft (see [`normalize_draft_endpoint`]) and refuses
+/// it when empty — the Electron reference's `normalizeSettings` refusal,
 /// same wording — or when the client's own `cleanEndpoint` rules reject
 /// it (http/https only, no embedded credentials). A value the client
 /// cannot use must never reach disk: it would re-offline the app on
 /// every restart with the "Invalid server endpoint." banner until the
 /// user revisited settings.
-pub(crate) fn validated_draft_endpoint(draft: &str) -> Result<String, String> {
-    let clean = normalize_draft_endpoint(draft);
+pub(crate) fn validated_draft_endpoint(clean: &str) -> Result<(), String> {
     if clean.is_empty() {
         return Err(EMPTY_ENDPOINT_REASON.to_string());
     }
-    client::clean_endpoint(&clean).map_err(|err| err.to_string())
+    client::clean_endpoint(clean)
+        .map_err(|err| err.to_string())
+        .map(|_| ())
 }
 
 /// Decide one Test Connection press (#207 review) before any request
@@ -1095,27 +1096,25 @@ impl StarlingApp {
 
     pub fn save_settings(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
-        let clean = match validated_draft_endpoint(&draft) {
-            Ok(clean) => clean,
-            Err(reason) => {
-                // #213: a draft the client cannot use is refused before
-                // anything is applied or persisted — the dialog stays open
-                // with the reason in its callout, the in-modal twin of the
-                // Electron reference's `settingsIssue` refusal. The refusal
-                // settles under a freshly claimed token, so an in-flight
-                // probe cannot land afterwards and overwrite the reason
-                // (the same ownership rule as the empty-draft probe
-                // failure in `test_connection`).
-                let _ = self.probe_sequencer.begin();
-                self.probe = Some(ConnectionProbe::Done {
-                    endpoint: normalize_draft_endpoint(&draft),
-                    outcome: ProbeOutcome::Failed { message: reason },
-                });
-                cx.notify();
-                return;
-            }
-        };
-        self.endpoint = clean.clone();
+        let clean = normalize_draft_endpoint(&draft);
+        if let Err(reason) = validated_draft_endpoint(&clean) {
+            // #213: a draft the client cannot use is refused before
+            // anything is applied or persisted — the dialog stays open
+            // with the reason in its callout, the in-modal twin of the
+            // Electron reference's `settingsIssue` refusal. The refusal
+            // settles under a freshly claimed token, so an in-flight
+            // probe cannot land afterwards and overwrite the reason
+            // (the same ownership rule as the empty-draft probe
+            // failure in `test_connection`).
+            let _ = self.probe_sequencer.begin();
+            self.probe = Some(ConnectionProbe::Done {
+                endpoint: clean,
+                outcome: ProbeOutcome::Failed { message: reason },
+            });
+            cx.notify();
+            return;
+        }
+        self.endpoint = clean;
         self.protocol = self.settings_protocol;
         // R02: only a save that changes the model marks it user-set, so an
         // endpoint-only edit keeps the server's health auto-sync alive.
@@ -2657,30 +2656,27 @@ mod tests {
         assert_eq!(normalize_draft_endpoint(""), "");
     }
 
+    /// The save's exact two steps (#213): normalize, then validate — one
+    /// place, so the tests exercise the same contract the save does.
+    fn validated(draft: &str) -> Result<(), String> {
+        validated_draft_endpoint(&normalize_draft_endpoint(draft))
+    }
+
     #[test]
     fn a_usable_draft_endpoint_passes_the_save_validation_normalized() {
         // #213: a save commits the trimmed, slash-dropped shape — the same
         // values the Electron reference's `normalizeSettings` returns for
         // a usable draft.
-        assert_eq!(
-            validated_draft_endpoint("  http://127.0.0.1:8181/ "),
-            Ok("http://127.0.0.1:8181".to_string())
-        );
-        assert_eq!(
-            validated_draft_endpoint("https://example.net/api"),
-            Ok("https://example.net/api".to_string())
-        );
+        assert_eq!(validated("  http://127.0.0.1:8181/ "), Ok(()));
+        assert_eq!(validated("https://example.net/api"), Ok(()));
     }
 
     #[test]
     fn an_empty_draft_endpoint_is_refused_with_the_reference_wording() {
         // The `normalizeSettings` refusal, verbatim — the save no longer
         // returns silently on an empty draft (#213).
-        assert_eq!(
-            validated_draft_endpoint("   "),
-            Err(EMPTY_ENDPOINT_REASON.to_string())
-        );
-        assert_eq!(validated_draft_endpoint(""), Err(EMPTY_ENDPOINT_REASON.to_string()));
+        assert_eq!(validated("   "), Err(EMPTY_ENDPOINT_REASON.to_string()));
+        assert_eq!(validated(""), Err(EMPTY_ENDPOINT_REASON.to_string()));
     }
 
     #[test]
@@ -2689,15 +2685,15 @@ mod tests {
         // with the same messages — "localhost 8181" has no URL base, a
         // wrong scheme and embedded credentials each name their own fix.
         assert_eq!(
-            validated_draft_endpoint("localhost 8181"),
+            validated("localhost 8181"),
             Err("Invalid server endpoint.".to_string())
         );
         assert_eq!(
-            validated_draft_endpoint("ftp://x"),
+            validated("ftp://x"),
             Err("Server endpoint must use http or https.".to_string())
         );
         assert_eq!(
-            validated_draft_endpoint("http://user:pass@host:8181"),
+            validated("http://user:pass@host:8181"),
             Err("Put credentials in a trusted proxy, not the endpoint URL.".to_string())
         );
     }
