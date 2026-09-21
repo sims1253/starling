@@ -924,13 +924,17 @@ impl FileSessionStore {
         let destination = trash.join(id);
         // Trash left under the same id by a delete that crashed between
         // its rename and its removal (and a backup then restored the
-        // session) is replaced: `rename` refuses a non-empty destination
-        // on Unix and any existing destination on Windows. Removing it is
-        // safe by construction — it is already deleted data.
-        if destination.exists() {
-            std::fs::remove_dir_all(&destination)?;
+        // session) is cleared best-effort — a failure here must not fail
+        // the delete; the rename retry below covers a destination that
+        // still exists (it is already deleted data either way).
+        let _ = std::fs::remove_dir_all(&destination);
+        if std::fs::rename(&dir, &destination).is_err() {
+            // A stale or raced destination survived the clear, or the
+            // rename genuinely failed. Clear once more and retry; the
+            // retry's error is the one that propagates (review on #250).
+            let _ = std::fs::remove_dir_all(&destination);
+            std::fs::rename(&dir, &destination)?;
         }
-        std::fs::rename(&dir, &destination)?;
         sync_dir(&self.root)?;
         sync_dir(&trash)?;
 
@@ -1246,6 +1250,12 @@ fn validate_session_id(id: &str) -> Result<(), StorageError> {
 /// path component that is not [`DELETED_DIR`] (#206). Session ids *are*
 /// directory names, so the trash tree's own name must stay unassignable —
 /// a take named `deleted` would collide with the deletion commit point.
+/// Backward compatibility (review on #250): an id literally equal to
+/// `"deleted"` was theoretically addressable before the trash existed —
+/// in practice minted ids are uuids or `j_*` journal ids, so no real
+/// record can collide; if one ever did (hand-crafted data), its directory
+/// is now quarantined-by-design: unreadable through the store's paths and
+/// swept by `open` alongside other trash.
 fn is_valid_session_dir_name(id: &str) -> bool {
     is_safe_path_component(id) && id != DELETED_DIR
 }
