@@ -554,6 +554,10 @@ void StreamSession::maybe_trim_samples() {
 // and failed calls return nullopt and never enter the entry; a stale retained
 // entry cannot false-match later because audio_rev_ only moves forward.
 TranscribeFn StreamSession::active_tx() {
+    // Built once and cached (R29, issue #236): rebuilt only after
+    // set_transcribe_fn()/set_engine_identity() drop the cache — the two
+    // sole mutators of everything the wrapper snapshots below.
+    if (wrapped_tx_) return wrapped_tx_;  // a copy: see the return below
     TranscribeFn inner = custom_tx_ ? custom_tx_ : make_transcribe_fn(nullptr);
     // Snapshot the generation together with the callback it belongs to
     // (PR #199 batch-2): reading tx_gen_ inside the lambda would pair the
@@ -571,7 +575,7 @@ TranscribeFn StreamSession::active_tx() {
     // inside the lambda would key a mid-step set_engine_identity() under the
     // new identity for a wrapper built against the old one.
     std::string engine_id = engine_id_;
-    return [this, inner = std::move(inner), tx_gen,
+    wrapped_tx_ = [this, inner = std::move(inner), tx_gen,
             engine_id = std::move(engine_id)](const float* p, int64_t n)
                -> std::optional<std::string> {
         StreamTailKey key;
@@ -582,6 +586,12 @@ TranscribeFn StreamSession::active_tx() {
                         + static_cast<int64_t>(p - samples_.data());
         key.length = n;
         key.audio_rev = audio_rev_;
+        // Per-window cost note (R29, issue #236): the identity string is
+        // copied into the key — and string-compared on the hit path — once
+        // per transcribe call, i.e. per window, not per sample. An integer
+        // identity (hash or generation counter from set_engine_identity)
+        // could short-circuit that, but at one call per window the copy is
+        // noise next to the inference it keys; accepted as-is.
         key.engine_id = engine_id;
         key.tx_gen = tx_gen;
         if (tail_valid_ && tail_key_ == key) {
@@ -598,6 +608,11 @@ TranscribeFn StreamSession::active_tx() {
         }
         return result;
     };
+    // Returned by value, deliberately: an engine callback may swap the fn or
+    // the identity mid-step, which clears wrapped_tx_ — the caller's copy
+    // keeps the (callback, generation, identity) snapshot it was built with
+    // (see active_tx() in the header).
+    return wrapped_tx_;
 }
 
 void StreamSession::invalidate_tail_result() {
@@ -612,6 +627,7 @@ void StreamSession::set_engine_identity(std::string id) {
     // differently: the retained result is no longer an exact answer.
     invalidate_tail_result();
     engine_id_ = std::move(id);
+    wrapped_tx_ = nullptr;  // the cached wrapper snapshots the old identity
 }
 
 std::optional<std::string> StreamSession::stream_step(double now) {
