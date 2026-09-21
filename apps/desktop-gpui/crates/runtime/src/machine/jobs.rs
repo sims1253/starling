@@ -432,10 +432,9 @@ impl JobsActor {
             .name(format!("starling-job-{worker_job}"))
             .spawn(move || {
                 let report = |report: WorkerReport| {
-                    let _ = inbox.try_send(JobsMsg::Worker {
-                        job: worker_job.clone(),
-                        report,
-                    });
+                    // The Result is already surfaced inside (stderr on a
+                    // closed inbox); the worker can do nothing further.
+                    let _ = deliver_worker_report(&inbox, &worker_job, report);
                 };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut on_partial = |partial: Partial| {
@@ -539,4 +538,131 @@ fn is_active(state: &str) -> bool {
         state,
         "Queued" | "Dispatched" | "Loading" | "Recognizing" | "Transforming"
     )
+}
+
+/// Posts a worker's report into the scheduler's inbox with a delivery
+/// guarantee instead of a best-effort `try_send`.
+///
+/// The inbox is the same bounded queue that carries every `jobs.*`
+/// command, so a burst of submits can fill it while the scheduler is
+/// busy — and a report dropped there would silently corrupt the
+/// projection (a lost `Done` wedges the job's core in `Recognizing`
+/// forever and leaks its worker slot, the failure mode of issue #210).
+/// Delivery therefore mirrors [`crate::bus::EventBus::emit`]:
+/// `try_send` first (the common case), then [`Sender::send_blocking`]
+/// for bounded backpressure while the scheduler drains. This runs on
+/// the worker's own thread, so parking applies backpressure to the
+/// provider — it never blocks the scheduler loop, which is the only
+/// consumer that could free the queue (no cycle, no lost report while
+/// the actor lives).
+///
+/// `Closed` means the scheduler actor itself is gone — runtime
+/// shutdown, where in-flight workers legitimately outlive the actor
+/// (see [`crate::Runtime`]). There is no scheduler left that could
+/// wedge or recover, so the report is surfaced on stderr and dropped
+/// rather than vanishing silently.
+fn deliver_worker_report(
+    inbox: &crate::channel::Sender<JobsMsg>,
+    job: &str,
+    report: WorkerReport,
+) -> Result<(), crate::channel::RecvError> {
+    let kind = match &report {
+        WorkerReport::Partial(_) => "partial",
+        WorkerReport::Done(ProviderOutcome::Completed { .. }) => "done(completed)",
+        WorkerReport::Done(ProviderOutcome::Failed { .. }) => "done(failed)",
+    };
+    let sent = match inbox.try_send(JobsMsg::Worker {
+        job: job.to_string(),
+        report,
+    }) {
+        Ok(()) => Ok(()),
+        // Full is recoverable: park until the scheduler makes room.
+        Err(crate::channel::TrySendError::Full(message)) => inbox.send_blocking(message),
+        Err(crate::channel::TrySendError::Closed(_)) => Err(crate::channel::RecvError::Closed),
+    };
+    if sent.is_err() {
+        eprintln!(
+            "starling-runtime: jobs scheduler gone before job {job} reported {kind}; report dropped"
+        );
+    }
+    sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn completed(text: &str) -> ProviderOutcome {
+        ProviderOutcome::Completed {
+            text: text.to_string(),
+            backend: "fake-provider".to_string(),
+            timing_ms: 12.0,
+            completion_evidence: "final_decode".to_string(),
+            transformed: false,
+        }
+    }
+
+    #[test]
+    fn report_on_a_full_inbox_parks_then_lands() {
+        let (tx, rx) = crate::channel::bounded::<JobsMsg>(1);
+        // Occupy the only slot so the next send faces Full.
+        assert!(tx.try_send(JobsMsg::Shutdown).is_ok());
+        let sender = tx.clone();
+        let worker = std::thread::spawn(move || {
+            deliver_worker_report(&sender, "job-1", WorkerReport::Done(completed("kept")))
+        });
+        // The delivery must park (backpressure), not drop the report.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !worker.is_finished(),
+            "report delivery dropped instead of parking"
+        );
+        assert!(matches!(rx.recv(), Ok(JobsMsg::Shutdown)));
+        assert_eq!(worker.join().expect("worker thread"), Ok(()));
+        match rx.recv() {
+            Ok(JobsMsg::Worker {
+                job,
+                report: WorkerReport::Done(ProviderOutcome::Completed { text, .. }),
+            }) => {
+                assert_eq!(job, "job-1");
+                assert_eq!(text, "kept");
+            }
+            _ => panic!("the parked report must land once the inbox drains"),
+        }
+    }
+
+    #[test]
+    fn report_on_a_closed_inbox_is_surfaced_not_silent() {
+        let (tx, rx) = crate::channel::bounded::<JobsMsg>(2);
+        drop(rx); // the scheduler actor is gone
+        assert_eq!(
+            deliver_worker_report(&tx, "job-2", WorkerReport::Done(completed("lost"))),
+            Err(crate::channel::RecvError::Closed)
+        );
+    }
+
+    #[test]
+    fn report_parked_on_full_surfaces_closed_when_the_actor_dies() {
+        let (tx, rx) = crate::channel::bounded::<JobsMsg>(1);
+        assert!(tx.try_send(JobsMsg::Shutdown).is_ok());
+        let sender = tx.clone();
+        let worker = std::thread::spawn(move || {
+            deliver_worker_report(
+                &sender,
+                "job-3",
+                WorkerReport::Partial(Partial {
+                    text: "mid-flight".to_string(),
+                    stability_hint: "unstable".to_string(),
+                }),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!worker.is_finished(), "delivery should be parked on the full inbox");
+        drop(rx); // shutdown while the worker waits for room
+        assert_eq!(
+            worker.join().expect("worker thread"),
+            Err(crate::channel::RecvError::Closed)
+        );
+    }
 }

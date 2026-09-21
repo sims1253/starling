@@ -19,7 +19,10 @@ use starling_runtime::machine::capture::{CaptureConfig, InMemoryCaptureStore, Ta
 use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::protocol::{Command, Event, JobLimits, Revision};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript, FakeStop};
-use starling_runtime::{provider::FakeJob, Runtime, RuntimeClient, RuntimeConfig};
+use starling_runtime::{
+    provider::{FakeJob, Partial, ProviderOutcome},
+    Runtime, RuntimeClient, RuntimeConfig,
+};
 
 fn revision(base: u64, text: &str, attempts: &[&str]) -> Revision {
     Revision {
@@ -767,6 +770,156 @@ fn jobs_failure_from_provider_error_is_retryable_and_isolated() {
     }
     // Capture and history untouched: capture stayed Persisted.
     assert_eq!(client.snapshot().capture.state, "Persisted");
+    runtime.shutdown();
+}
+
+/// Empties the subscription's queue (bounded-capacity setups need a
+/// known-clean subscriber before provoking backpressure on purpose).
+fn drain(events: &EventSub) {
+    while events.try_recv().is_ok() {}
+}
+
+// ------------------------------------------------------------------------- //
+// Worker-report delivery under a full inbox (issue #210)
+// ------------------------------------------------------------------------- //
+
+/// Regression for issue #210: worker reports shared the `jobs.*` command
+/// inbox and were `try_send`-discarded on `Full` — a lost `Done` wedged
+/// the job's core in `Recognizing` forever and permanently leaked its
+/// scheduler slot.
+///
+/// The inbox fills for real: the runtime's only event subscriber stops
+/// draining, so the scheduler parks inside `bus.emit` (the bus's own
+/// backpressure contract) while the worker's partial storm backs the
+/// inbox up past its bound. With the fix, the worker parks on the full
+/// inbox instead of dropping — every report, the `Done` included, lands
+/// as soon as the subscriber resumes, and the slot is provably released
+/// (a second job dispatches after it).
+#[test]
+fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = InMemoryCaptureStore::new();
+    let partials: Vec<Partial> = (0..2_000)
+        .map(|index| Partial {
+            text: format!("chunk {index}"),
+            stability_hint: "unstable".to_string(),
+        })
+        .collect();
+    let storm = FakeJob {
+        outcome: ProviderOutcome::Completed {
+            text: "storm result".to_string(),
+            backend: "fake-provider".to_string(),
+            timing_ms: 12.0,
+            completion_evidence: "final_decode".to_string(),
+            transformed: false,
+        },
+        partials,
+        work_ms: 5,
+    };
+    // FakeProvider pops its script LIFO, so the second job's entry comes
+    // first in the vector.
+    let provider = starling_runtime::provider::FakeProvider::new(vec![
+        FakeJob::completes_with("after the storm"),
+        storm,
+    ]);
+    let mut config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        store,
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    // A tiny subscriber queue makes the stall deterministic: within a
+    // handful of progress events the scheduler is parked in bus.emit and
+    // stops draining its inbox while the storm floods it.
+    config.event_capacity = 8;
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    run_take(&source, &client, &events, "take_s", FakeTakeScript::clean());
+    // Settle trailing capture events, then leave the queue empty so the
+    // submit below cannot park the scheduler before its worker runs.
+    std::thread::sleep(Duration::from_millis(100));
+    drain(&events);
+
+    client
+        .send(Some("job-1"), Command::JobsSubmit {
+            capture_ref: "take_s".into(),
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("submit accepted");
+
+    // The stall: nobody drains the subscriber, so the scheduler parks in
+    // bus.emit while the worker's 2 000 partial reports fill the inbox
+    // (bound 64) — exactly the window in which a best-effort try_send
+    // drops the Done. (With the fix the worker parks here instead.)
+    std::thread::sleep(Duration::from_millis(250));
+
+    // Resume draining: the parked system must unwind and the Done must
+    // still land, completing the job instead of wedging it.
+    let collected = until(
+        &events,
+        "jobs.completed(job-1)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-1"),
+        Duration::from_secs(10),
+    );
+    // The storm really did exceed the inbox bound, so under drop-on-Full
+    // semantics the Done could not have survived.
+    let progress = collected
+        .iter()
+        .filter(|m| m.type_name() == "jobs.progress" && m.corr.as_deref() == Some("job-1"))
+        .count();
+    assert!(
+        progress > 64,
+        "the partial storm must exceed the inbox bound (saw {progress} of 2 000)"
+    );
+    let completed = collected
+        .iter()
+        .rev()
+        .find(|m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-1"))
+        .unwrap();
+    match &completed.event {
+        Event::JobsCompleted(data) => assert_eq!(data.text, "storm result"),
+        other => panic!("expected JobsCompleted, got {other:?}"),
+    }
+    // The slot was released: the projection shows no active jobs.
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = client.snapshot();
+            if snapshot.jobs.active == 0 && snapshot.jobs.state == "Completed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job-1 must be Completed with its slot released: {:?}",
+                snapshot.jobs
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Capacity was truly restored: a second job dispatches onto the freed
+    // slot and completes (a leaked slot would park it at Queued forever).
+    client
+        .send(Some("job-2"), Command::JobsSubmit {
+            capture_ref: "take_s".into(), // job-1 is terminal, so no duplicate
+            route: "local-default".into(),
+            budget: "standard".into(),
+        })
+        .expect("job-2 accepted");
+    until(
+        &events,
+        "jobs.completed(job-2)",
+        |m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-2"),
+        Duration::from_secs(5),
+    );
+
     runtime.shutdown();
 }
 
