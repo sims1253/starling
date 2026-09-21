@@ -831,13 +831,14 @@
     "E28"
    ],
    "existing_issue": null,
-   "status": "integrated",
+   "status": "implemented",
    "owner": "impl-agent-34",
-   "branch": "program/wave-a",
+   "branch": "feat/insights-225-phase2",
    "evidence": [
-    "coordinator-completed after agent rate-limit death: 287/287 (19 files incl. 3 insight suites, 58 tests), lint 0/0, tsc+fmt clean; oracle-semantics TS port + emitter wiring + usage/quality views"
+    "coordinator-completed after agent rate-limit death: 287/287 (19 files incl. 3 insight suites, 58 tests), lint 0/0, tsc+fmt clean; oracle-semantics TS port + emitter wiring + usage/quality views",
+    "phase 2 (issue #225, branch feat/insights-225-phase2): consent-gated recurring-phrase and vocabulary cards from a separate bounded content-derived term store (replaces per capture, tombstones on delete, purges on withdrawal, transcripts structurally unrepresentable), locally previewed redacted-by-default share cards with no network path, opt-in milestones/goal/streak, matched-period weekly recap; session deletion now emits the phase-1 capture_deleted tombstone and deletes term aggregates; vp desktop 342/342, full vp run -r test 515/515, lint 0/0, fmt+tsc clean"
    ],
-   "notes": "phase 1; Your Voice patterns (E29 part 2) + share cards + weekly recap polish remain; model-free (metrics from local events only); lint gate satisfied 4ffe6fd (56 errors -> 0)"
+   "notes": "phase 1 integrated via #195; phase 2 (E29-p2, issue #225) on feat/insights-225-phase2; model-free (metrics from local events only); INSIGHTS.md remainder: mounting the Insights view in the app shell, commonly-used-modes/time-of-day cards, optional local-model narrative"
   },
   {
    "id": "E30",
@@ -1820,7 +1821,8 @@
   "194": "gpui/fixes-wave-a2 -> gpui-port (G03-G07 fixes)",
   "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
   "196": "program/s01-moss-kv-clear -> master (S01)",
-  "254": "fix/clients-235-bounded-http-bodies -> master (R06: zero-copy WAV upload + capped response bodies)"
+  "254": "fix/clients-235-bounded-http-bodies -> master (R06: zero-copy WAV upload + capped response bodies)",
+  "258": "feat/insights-225-phase2 -> master (E29-p2 / issue #225: consent-gated voice cards, redacted share cards, milestones/goal/streak, weekly recap)"
  },
  "issue_filing": {
   "note": "2026-09-21: 19 consolidated issues filed (#218-#236) covering all open program work; per-item github_issue fields map local IDs to issues. Exception: #225 (Insights phase 2) has no single local task ID \u2014 it is phase-2 product work building on the integrated E28/E29 \u2014 so it carries no per-item mapping."

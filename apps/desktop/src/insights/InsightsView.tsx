@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Predicate } from "effect";
 import { CalendarDays, CircleAlert, Download, RotateCcw, X } from "lucide-react";
 import { TRANSFORMATION_KINDS, type InsightEvent } from "./insightEvents";
 import {
@@ -9,21 +10,41 @@ import {
   selectionStats,
   type InsightAggregate,
 } from "./insightMetrics";
+import type { InsightConsent } from "./insightConsent";
+import type { InsightTermRecord } from "./insightTerms";
+import { voicePanel, type VoicePatternCard } from "./insightVoice";
+import {
+  DEFAULT_SHARE_INCLUDES,
+  SHARE_CARD_FIELDS,
+  buildShareCard,
+  renderShareCard,
+  type ShareCardField,
+} from "./insightShare";
+import { milestonePanel } from "./insightMilestones";
+import { weeklyRecap } from "./insightRecap";
+import { formatMinutes } from "./insightFormat";
 
 /**
- * The Insights surface (E29, phase 1): Usage and Quality panels computed from
- * the local E28 event log. The discipline is fixed by INSIGHTS.md and is not
- * decoration: speech words stay separate from generated output, a submission
- * never reads as a confirmed delivery, change counts are never labeled
- * corrected errors, the typing-time comparison states its assumptions and
- * displays negative results, and anything the events cannot compute yet
- * renders as "not enough data" — never a fabricated zero. No accuracy,
- * personality or productivity score appears anywhere, because none is
- * knowable from these events.
+ * The Insights surface (E29): Usage and Quality panels computed from the
+ * local E28 event log, plus the phase-2 surfaces — the consented "Your
+ * voice" cards, milestones/goals/streaks, a matched-period weekly recap and
+ * a locally rendered, redacted-by-default share card. The discipline is
+ * fixed by INSIGHTS.md and is not decoration: speech words stay separate
+ * from generated output, a submission never reads as a confirmed delivery,
+ * change counts are never labeled corrected errors, the typing-time
+ * comparison states its assumptions and displays negative results, voice
+ * cards claim only what their counts support, the share card omits
+ * content-derived fields unless explicitly included and is never posted
+ * anywhere by the app itself, and anything the data cannot compute renders
+ * as "not enough data" — never a fabricated zero. No accuracy, personality
+ * or productivity score appears anywhere, because none is knowable.
  */
 
 /** localStorage key for the user's typing baseline (words per minute). */
 const TYPING_BASELINE_KEY = "starling:insights:typingWpm";
+
+/** localStorage key for the user's excluded voice-card labels. */
+const EXCLUSIONS_KEY = "starling:insights:exclusions";
 
 const CALENDAR_DAYS = 28;
 
@@ -31,6 +52,11 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface InsightsViewProps {
   readonly events: readonly InsightEvent[];
+  /** The consented content-derived aggregates, when any grant is on. */
+  readonly termRecords: readonly InsightTermRecord[];
+  readonly consent: InsightConsent;
+  /** Applies a whole consent object at once; grants never half-land. */
+  readonly onConsentChange: (next: InsightConsent) => void;
   /** Storage/recording issue notice; dismissed by the user. */
   readonly issue?: string;
   readonly onDismissIssue: () => void;
@@ -54,8 +80,9 @@ function compute<T>(work: () => T): Computed<T> {
   }
 }
 
-function formatMinutes(seconds: number): string {
-  return `${(seconds / 60).toFixed(1)} min`;
+/** Captured seconds through the one shared minutes rendering. */
+function formatCapturedMinutes(seconds: number): string {
+  return formatMinutes(seconds / 60);
 }
 
 function formatSeconds(seconds: number): string {
@@ -72,6 +99,16 @@ function plural(count: number, singularWord: string, pluralWord = `${singularWor
   return `${count} ${count === 1 ? singularWord : pluralWord}`;
 }
 
+function readExclusions(): ReadonlySet<string> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(EXCLUSIONS_KEY) ?? "[]");
+
+    return new Set(Array.isArray(parsed) ? parsed.filter(Predicate.isString) : []);
+  } catch {
+    return new Set();
+  }
+}
+
 /** The one honest placeholder: absence of data, stated as absence. */
 function NotEnoughData({ note }: { readonly note: string }) {
   return (
@@ -82,12 +119,30 @@ function NotEnoughData({ note }: { readonly note: string }) {
   );
 }
 
-export function InsightsView({ events, issue, onDismissIssue, onReset }: InsightsViewProps) {
+export function InsightsView({
+  events,
+  termRecords,
+  consent,
+  onConsentChange,
+  issue,
+  onDismissIssue,
+  onReset,
+}: InsightsViewProps) {
   const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
 
   const [baselineDraft, setBaselineDraft] = useState(
     () => localStorage.getItem(TYPING_BASELINE_KEY) ?? "",
   );
+
+  const [excluded, setExcluded] = useState<ReadonlySet<string>>(readExclusions);
+
+  const [shareIncludes, setShareIncludes] = useState<ReadonlySet<ShareCardField>>(
+    () => new Set(DEFAULT_SHARE_INCLUDES),
+  );
+
+  const [shareCopied, setShareCopied] = useState(false);
+
+  const [shareCopyFailed, setShareCopyFailed] = useState<string>();
 
   const parsedBaseline = Number.parseInt(baselineDraft, 10);
   const baseline = Number.isInteger(parsedBaseline) && parsedBaseline > 0 ? parsedBaseline : null;
@@ -104,9 +159,44 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
     return compute(() => aggregate(within, baseline));
   }, [events, baseline]);
 
+  const voice = useMemo(
+    () => compute(() => voicePanel(events, termRecords, consent, { exclude: excluded })),
+    [events, termRecords, consent, excluded],
+  );
+
+  const celebrated = useMemo(
+    () => compute(() => milestonePanel(events, consent, { timezone })),
+    [events, consent, timezone],
+  );
+
+  const recap = useMemo(() => compute(() => weeklyRecap(events, { timezone })), [events, timezone]);
+
   function changeBaseline(value: string) {
     setBaselineDraft(value);
     localStorage.setItem(TYPING_BASELINE_KEY, value);
+  }
+
+  function excludeLabel(label: string) {
+    const next = new Set(excluded);
+
+    next.add(label);
+    setExcluded(next);
+    localStorage.setItem(EXCLUSIONS_KEY, JSON.stringify([...next]));
+  }
+
+  function toggleConsent(patch: Partial<InsightConsent>) {
+    onConsentChange({ ...consent, ...patch });
+  }
+
+  function toggleShareField(field: ShareCardField, included: boolean) {
+    const next = new Set(shareIncludes);
+
+    if (included) next.add(field);
+    else next.delete(field);
+
+    setShareIncludes(next);
+    setShareCopied(false);
+    setShareCopyFailed(undefined);
   }
 
   function exportAggregate() {
@@ -120,6 +210,70 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
 
     anchor.href = url;
     anchor.download = `starling-insights-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+
+  /**
+   * The share card, previewed before anything exists to copy or save. The
+   * builder itself enforces the redaction default, so this assembly cannot
+   * leak a field the include set does not name.
+   */
+  const shareCard = useMemo(() => {
+    if (!week.ok || week.value.unique_takes === 0) return undefined;
+
+    const milestones = celebrated.ok ? celebrated.value.milestones : [];
+    const latestMilestone = milestones.length > 0 ? milestones[milestones.length - 1] : undefined;
+    const topPhrase = voice.ok ? voice.value.phraseCards[0] : undefined;
+
+    return buildShareCard(
+      {
+        rangeStartDay: localDayKey(new Date().getTime() - WEEK_MS, timezone),
+        rangeEndDay: localDayKey(new Date().getTime(), timezone),
+        words: week.value.recognized_words,
+        minutes: week.value.captured_seconds / 60,
+        takes: week.value.unique_takes,
+        milestone: latestMilestone?.label,
+        topPhrase,
+      },
+      { include: shareIncludes },
+    );
+  }, [week, celebrated, voice, shareIncludes, timezone]);
+
+  async function copyShareCard() {
+    if (shareCard === undefined || !navigator.clipboard) return;
+
+    setShareCopyFailed(undefined);
+
+    try {
+      await navigator.clipboard.writeText(renderShareCard(shareCard));
+    } catch (caught) {
+      // A clipboard can refuse on focus or permission grounds; the user
+      // sees why copying failed and still has the local save path.
+      setShareCopyFailed(
+        `Copy failed (${messageFrom(caught)}) — the previewed text is unchanged; try "Save as text" instead.`,
+      );
+
+      return;
+    }
+
+    setShareCopied(true);
+    window.setTimeout(() => setShareCopied(false), 2_000);
+  }
+
+  /**
+   * Saving is a local download of the previewed text — the only export
+   * paths are copy and save; sharing to any site is never automatic.
+   */
+  function saveShareCard() {
+    if (shareCard === undefined) return;
+
+    const url = URL.createObjectURL(new Blob([renderShareCard(shareCard)], { type: "text/plain" }));
+
+    const anchor = document.createElement("a");
+
+    anchor.href = url;
+    anchor.download = `starling-share-card-${new Date().toISOString().slice(0, 10)}.txt`;
     anchor.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
@@ -229,7 +383,7 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
               <span>recognized from speech — final selected transcripts only</span>
             </div>
             <div className="insight-tile">
-              <strong>{formatMinutes(usage.value.captured_seconds)}</strong>
+              <strong>{formatCapturedMinutes(usage.value.captured_seconds)}</strong>
               <span>captured audio, silence included</span>
             </div>
             <div className="insight-tile">
@@ -257,8 +411,45 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
 
           <div className="insights-recap">
             <p className="eyebrow">WEEKLY RECAP</p>
-            <p className="recap-text">{recapText(week)}</p>
+            <p className="recap-text">{recapText(recap)}</p>
           </div>
+
+          {celebrated.ok && (celebrated.value.enabled || celebrated.value.streak !== null) && (
+            <div className="insights-milestones">
+              {celebrated.value.enabled && (
+                <>
+                  <p className="eyebrow">MILESTONES — OPTIONAL, YOURS TO SWITCH OFF</p>
+                  {celebrated.value.milestones.length === 0 ? (
+                    <NotEnoughData note="milestones appear as totals cross their thresholds — the first take already earns one" />
+                  ) : (
+                    <ul>
+                      {celebrated.value.milestones.map((milestone) => (
+                        <li key={milestone.id}>
+                          <strong>{milestone.label}</strong>
+                          <span>
+                            {milestone.achievedOnDay} — {milestone.evidence}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {celebrated.value.goal !== null && (
+                    <p className="goal-line">
+                      Goal: {celebrated.value.goal.description}
+                      {celebrated.value.goal.achieved ? " — reached this week." : "."} A quieter
+                      week is never a failure here.
+                    </p>
+                  )}
+                </>
+              )}
+              {celebrated.value.streak !== null && (
+                <p className="streak-line">
+                  {celebrated.value.streak.description}. Rest days are not failures — the counter
+                  just waits.
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="insights-calendar">
             <p className="eyebrow">ACTIVITY · LAST {CALENDAR_DAYS} DAYS</p>
@@ -277,7 +468,7 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
                           aria-label={
                             day.activity === undefined
                               ? `${day.label}: no takes — a rest day, not a failure`
-                              : `${day.label}: ${plural(day.activity.takes, "take")}, ${formatMinutes(day.activity.captured_seconds)}`
+                              : `${day.label}: ${plural(day.activity.takes, "take")}, ${formatCapturedMinutes(day.activity.captured_seconds)}`
                           }
                         >
                           <span aria-hidden="true">{day.label}</span>
@@ -324,6 +515,151 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
               </li>
             </ul>
           </div>
+        </section>
+      )}
+
+      {voice.ok && usage.ok && !empty && (
+        <section className="insights-panel" aria-label="Your voice">
+          <div className="insights-panel-head">
+            <div>
+              <p className="eyebrow">YOUR VOICE — OPT-IN, COMPUTED FROM YOUR TRANSCRIPTS</p>
+              <h3>Patterns from your own words</h3>
+            </div>
+          </div>
+
+          <div className="insights-consent">
+            <p>
+              These cards are the only Insights that read transcript contents, so each kind needs
+              its own grant. Aggregates are computed locally, retained per these settings, and
+              deleted with the take they came from. Turning a kind off deletes what it had retained.
+            </p>
+            <label>
+              <input
+                type="checkbox"
+                checked={consent.recurringPhrases}
+                onChange={(event) => toggleConsent({ recurringPhrases: event.target.checked })}
+              />
+              Recurring phrases
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={consent.vocabularyPatterns}
+                onChange={(event) => toggleConsent({ vocabularyPatterns: event.target.checked })}
+              />
+              Vocabulary patterns
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={consent.milestones}
+                onChange={(event) => toggleConsent({ milestones: event.target.checked })}
+              />
+              Milestones and goals
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={consent.streaks}
+                onChange={(event) => toggleConsent({ streaks: event.target.checked })}
+              />
+              Streak counter
+            </label>
+            <label>
+              Weekly word goal (optional)
+              <input
+                inputMode="numeric"
+                value={consent.weeklyGoalWords ?? ""}
+                onChange={(event) => {
+                  const parsed = Number.parseInt(event.target.value, 10);
+
+                  toggleConsent({
+                    weeklyGoalWords: Number.isInteger(parsed) && parsed > 0 ? parsed : null,
+                  });
+                }}
+                placeholder="no goal"
+              />
+            </label>
+          </div>
+
+          {!consent.recurringPhrases && !consent.vocabularyPatterns ? (
+            <NotEnoughData note="no content-derived analysis is enabled — enable one above; nothing is read or retained while both are off" />
+          ) : (
+            <div className="insight-tiles">
+              {voice.value.analyzedTakes < voice.value.windowTakes && (
+                <p className="voice-coverage" role="status">
+                  Aggregates cover {voice.value.analyzedTakes} of {voice.value.windowTakes} takes
+                  with transcripts in the window — takes recorded while a grant was off have none,
+                  and cards count only the takes they could actually read.
+                </p>
+              )}
+              {consent.recurringPhrases &&
+                (voice.value.phraseCards.length > 0 ? (
+                  voice.value.phraseCards.map((card) => (
+                    <VoiceCardTile key={`p-${card.label}`} card={card} onExclude={excludeLabel} />
+                  ))
+                ) : (
+                  <NotEnoughData note="no phrase repeated across takes in the window yet" />
+                ))}
+              {consent.vocabularyPatterns &&
+                (voice.value.vocabularyCards.length > 0 ? (
+                  voice.value.vocabularyCards.map((card) => (
+                    <VoiceCardTile key={`v-${card.label}`} card={card} onExclude={excludeLabel} />
+                  ))
+                ) : (
+                  <NotEnoughData note="no term repeated across takes in the window yet" />
+                ))}
+            </div>
+          )}
+          <small>
+            Cards state only what their counts support; excluded labels are kept in local settings
+            and never shown again. No card infers traits, moods or ability.
+          </small>
+        </section>
+      )}
+
+      {shareCard !== undefined && (
+        <section className="insights-panel" aria-label="Share card">
+          <div className="insights-panel-head">
+            <div>
+              <p className="eyebrow">SHARE CARD — PREVIEWED, REDACTED BY DEFAULT</p>
+              <h3>Review exactly what would leave your hands</h3>
+            </div>
+          </div>
+
+          <pre className="share-card-preview">{renderShareCard(shareCard)}</pre>
+
+          <div className="share-card-fields">
+            {SHARE_CARD_FIELDS.map((field) => (
+              <label key={field}>
+                <input
+                  type="checkbox"
+                  checked={shareIncludes.has(field)}
+                  disabled={
+                    field === "topPhrase" && voice.ok && voice.value.phraseCards.length === 0
+                  }
+                  onChange={(event) => toggleShareField(field, event.target.checked)}
+                />
+                {field === "topPhrase" ? "top phrase (content-derived)" : field}
+              </label>
+            ))}
+          </div>
+
+          <div className="insights-actions">
+            <button onClick={() => void copyShareCard()} disabled={!navigator.clipboard}>
+              {shareCopied ? "Copied" : "Copy card text"}
+            </button>
+            <button onClick={saveShareCard}>Save as text</button>
+          </div>
+          {shareCopyFailed !== undefined && (
+            <p className="share-copy-failure" role="alert">
+              {shareCopyFailed}
+            </p>
+          )}
+          <small>
+            Copy and save are the only actions — Starling never posts anywhere for you. Aggregate
+            fields only, unless you explicitly include the content-derived one.
+          </small>
         </section>
       )}
 
@@ -435,7 +771,12 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
               </li>
               <li>
                 Deleting a recording removes its contribution from every number here — the tombstone
-                dominates stale replays, so deleted takes cannot reappear.
+                dominates stale replays, so deleted takes cannot reappear — and deletes its
+                content-derived term aggregates with it.
+              </li>
+              <li>
+                The weekly recap compares two consecutive seven-day windows of equal instant length,
+                so a clock change never shortens one side; word deltas are counts, never praise.
               </li>
               <li>
                 Deliberately absent: accuracy, personality, health and productivity scores. The
@@ -445,6 +786,24 @@ export function InsightsView({ events, issue, onDismissIssue, onReset }: Insight
           </details>
         </section>
       )}
+    </div>
+  );
+}
+
+function VoiceCardTile({
+  card,
+  onExclude,
+}: {
+  readonly card: VoicePatternCard;
+  readonly onExclude: (label: string) => void;
+}) {
+  return (
+    <div className="insight-tile voice-card">
+      <strong>{card.label}</strong>
+      <span>{card.description}</span>
+      <button className="link" onClick={() => onExclude(card.label)}>
+        Exclude this {card.kind === "recurring_phrase" ? "phrase" : "term"}
+      </button>
     </div>
   );
 }
@@ -487,30 +846,16 @@ function calendarWeeks(
   return weeks;
 }
 
-function recapText(week: Computed<InsightAggregate>): string {
-  if (!week.ok) {
-    return `The weekly recap could not be computed: ${week.reason}`;
+function recapText(recap: Computed<ReturnType<typeof weeklyRecap>>): string {
+  if (!recap.ok) {
+    return `The weekly recap could not be computed: ${recap.reason}`;
   }
 
-  if (week.value.unique_takes === 0) {
+  if (!recap.value.ok) {
     return "Not enough data yet — takes from the last seven days will fill this in.";
   }
 
-  const generated =
-    week.value.generated_words_by_status.confirmed +
-    week.value.generated_words_by_status.submitted_unconfirmed;
-
-  const parts = [
-    `${plural(week.value.recognized_words, "word")} recognized from speech`,
-    `${plural(week.value.unique_takes, "take")}`,
-    `${formatMinutes(week.value.captured_seconds)} captured`,
-  ];
-
-  if (generated > 0) {
-    parts.push(`${generated} of the delivered words were model-generated, not speech`);
-  }
-
-  return `This week: ${parts.join(" · ")}.`;
+  return recap.value.recap.lines.join(" ");
 }
 
 function proxyText(
