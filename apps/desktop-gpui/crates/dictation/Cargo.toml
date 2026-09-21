@@ -22,7 +22,8 @@ time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 # Drives the async reqwest client behind the blocking façade (issue #251):
 # `rt` runs it on a dedicated current-thread runtime, `net`/`time` back
 # `enable_all` (the connection and timeout drivers reqwest needs), `sync`
-# is `Notify` (the cancellation wakeup), `macros` is `tokio::select!`.
+# is the `watch` channel (the cancellation broadcast), `macros` is
+# `tokio::select!`.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 

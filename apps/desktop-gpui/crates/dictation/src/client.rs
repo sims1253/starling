@@ -13,7 +13,6 @@ use reqwest::redirect::Policy;
 use reqwest::{Client, RequestBuilder, Url};
 use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
-use tokio::sync::Notify;
 
 use crate::storage::{TranscriptionResult, TranscriptionSegment};
 
@@ -65,21 +64,34 @@ pub enum ClientError {
 
 /// A cooperative cancellation signal for in-flight requests (issue #251).
 ///
-/// One side calls [`CancelToken::cancel`] — from any thread, once — and
-/// every request carrying this token aborts: the flag covers the
-/// before-send fast path, and the [`Notify`] permit wakes a request that
-/// is already selecting on the token (`notify_one` stores its permit, so
-/// a cancel that lands between the flag check and the select is still
-/// observed). Clone shares the signal.
+/// One side calls [`CancelToken::cancel`] — from any thread; the signal
+/// is monotonic, so extra trips are harmless — and every request
+/// carrying this token aborts. The wakeup is a *broadcast*: any number
+/// of concurrent waiters each observe the change, so a token shared by
+/// several in-flight requests cancels all of them (the durable flag
+/// covers the before-send fast path; a `watch` channel reaches every
+/// waiter). Clone shares the signal.
 #[derive(Clone, Default)]
 pub struct CancelToken {
     state: Arc<CancelState>,
 }
 
-#[derive(Default)]
 struct CancelState {
     flag: AtomicBool,
-    notify: Notify,
+    /// The broadcast side of the signal. Every waiter subscribes its
+    /// own receiver — unlike `Notify`'s single stored permit, which
+    /// would wake exactly one of several concurrent waiters.
+    cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for CancelState {
+    fn default() -> Self {
+        let (cancelled, _) = tokio::sync::watch::channel(false);
+        CancelState {
+            flag: AtomicBool::new(false),
+            cancelled,
+        }
+    }
 }
 
 impl CancelToken {
@@ -87,10 +99,14 @@ impl CancelToken {
         Self::default()
     }
 
-    /// Sets the signal and wakes every request waiting on this token.
+    /// Trips the signal (idempotently) and wakes every request waiting
+    /// on this token.
     pub fn cancel(&self) {
         self.state.flag.store(true, Ordering::Release);
-        self.state.notify.notify_one();
+        // `send` fails only when no receiver is alive — then there is
+        // nothing to wake; the flag above is the durable half of the
+        // signal for anyone who checks later.
+        let _ = self.state.cancelled.send(true);
     }
 
     /// Whether [`CancelToken::cancel`] has been called.
@@ -98,11 +114,14 @@ impl CancelToken {
         self.state.flag.load(Ordering::Acquire)
     }
 
-    /// Resolves once the token is cancelled. The `notify_one` permit is
-    /// stored when no one is waiting, so this completes immediately for a
-    /// token cancelled before the future is first polled.
+    /// Resolves once the token is cancelled — for *every* concurrent
+    /// caller: each waiter watches its own receiver, and `wait_for`
+    /// consults the current value first, so a cancel that landed before
+    /// the subscription is seen immediately (no registration race, no
+    /// permit to win).
     async fn notified(&self) {
-        self.state.notify.notified().await
+        let mut receiver = self.state.cancelled.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
     }
 }
 
@@ -312,6 +331,13 @@ fn build_http_client(timeout_ms: u64) -> Result<Client, ClientError> {
 /// The runtime behind the blocking façade: current-thread (no extra
 /// threads — requests run on the caller's thread inside `block_on`) with
 /// the I/O and time drivers reqwest needs.
+///
+/// A build failure here is environmental (thread/resource limits on
+/// this machine), not a request condition. `ClientError` has no
+/// config/setup variant — the taxonomy is the request lifecycle — so it
+/// maps to `Transport`, the local-unavailability bucket; either way the
+/// client could not be constructed, which every caller treats as a
+/// hard setup failure rather than something to classify finer.
 fn build_runtime() -> Result<Runtime, ClientError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1010,14 +1036,23 @@ mod tests {
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&seen);
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut stream = stream;
-                let _ = read_request(&mut stream);
-                counter.fetch_add(1, Ordering::SeqCst);
-                // Never answer within the test's horizon: the only way
-                // the client can return is cancellation (or its 30 s
-                // timeout, which the assertions below rule out).
-                std::thread::sleep(Duration::from_secs(600));
+            // Exactly one connection is expected; accepting it and
+            // dropping the listener lets this thread exit instead of
+            // parking on `incoming()` for the rest of the suite.
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = read_request(&mut stream);
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Hold the connection open (never answer) until the client's
+            // abort closes it — read EOF here. The read timeout is only
+            // an escape hatch so a misbehaving client cannot pin this
+            // thread; the abort path is what ends it, promptly.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut sink = [0u8; 1024];
+            loop {
+                match stream.read(&mut sink) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
             }
         });
         let client = StarlingClient::new(&format!("http://{addr}"), Protocol::Starling, "")
@@ -1055,7 +1090,7 @@ mod tests {
         }
     }
 
-    /// The already-cancelled case needs no server cooperation: the early
+    /// The precancelled case needs no server cooperation: the early
     /// flag check returns before any connection is attempted, so nothing
     /// is ever sent.
     #[test]
@@ -1074,5 +1109,29 @@ mod tests {
             0,
             "a precancelled request must not reach the server"
         );
+    }
+
+    /// Review on #253: the token's wakeup is a broadcast, not a single
+    /// `Notify` permit — two waiters registered *before* the cancel must
+    /// both wake on one trip (the shape that would leave exactly one of
+    /// them parked forever under `notify_one`).
+    #[tokio::test]
+    async fn one_cancel_wakes_every_registered_waiter() {
+        let token = CancelToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                // A trigger, not a gate: both waiters below are polled
+                // (registered) before this fires.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                token.cancel();
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let ((), ()) = tokio::join!(token.notified(), token.notified());
+        })
+        .await
+        .expect("both concurrent waiters must wake on a single cancel");
+        canceller.await.expect("canceller task");
     }
 }

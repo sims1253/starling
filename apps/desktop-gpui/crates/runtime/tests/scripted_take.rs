@@ -190,6 +190,23 @@ fn wait_for_projection(
     }
 }
 
+/// Polls `predicate` every 10 ms until it holds or `deadline` passes
+/// (#217: observation-gated waits, not fixed sleeps), returning whether
+/// it held. A `false` return is a legal outcome for race-shaped
+/// assertions — the two-outcome cancellation races below use it to
+/// observe "never happened" as a *verified* absence across the window
+/// rather than one check claimed to be final.
+fn poll_until(deadline: Duration, predicate: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    while !predicate() {
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 #[test]
 fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
     let source = FakeCaptureSource::new(vec![]);
@@ -1740,43 +1757,47 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
 
     // Since #251 the cancelled worker stops instead of running the
     // recognition out for a result nobody will keep. The cancel races
-    // the ~60 MB encode, so exactly one of two shapes holds — poll for
-    // the decision to settle, then hold the line either way:
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let requests = provider_handle.requests();
-        if requests.iter().any(|(id, _)| id == "job-big") {
-            // The cancel lost the race to the encode: the recognition
-            // was entered, so it must unwind at the cancel flag —
-            // promptly, not after the scripted work. The full-sized WAV
-            // also proves the encode itself really ran at this scale
-            // (#216's original point).
-            let entry = requests
-                .iter()
-                .find(|(id, _)| id == "job-big")
-                .expect("just checked");
-            assert!(
-                entry.1 > 40_000_000,
-                "the worker never encoded the full-sized WAV: {entry:?}"
-            );
-            let unwind_by = Instant::now() + Duration::from_secs(2);
-            while !provider_handle.recognize_returned("job-big") {
-                assert!(
-                    Instant::now() < unwind_by,
-                    "the entered recognition must unwind at the cancel flag"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            // The cancel won: no recognition was ever handed to the
-            // provider for the cancelled job, and none may appear after
-            // the settle (the post-encode check refuses it whenever the
-            // encode ends).
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    // the worker's start (and, when it loses that, the ~60 MB encode):
+    // usually the flag is set before the worker's pre-encode check, so
+    // the encode never runs and nothing is ever handed to the provider;
+    // on a loaded runner the worker can be mid-encode when the cancel
+    // lands. Observe which shape holds, then hold the line either way.
+    // The decision window sits past the encode's measured duration
+    // (~2.5 s when it runs), so a runner of ordinary load still
+    // exercises the entered shape and its #216 proof.
+    let saw_request = || provider_handle.requests().iter().any(|(id, _)| id == "job-big");
+    if poll_until(Duration::from_secs(4), saw_request) {
+        // The cancel lost the race to the encode: the recognition was
+        // entered, so it must unwind at the cancel flag — promptly, not
+        // after the scripted work. The full-sized WAV also proves the
+        // encode itself really ran at this scale (#216's original
+        // point).
+        let entry = provider_handle
+            .requests()
+            .iter()
+            .find(|(id, _)| id == "job-big")
+            .expect("just polled present")
+            .clone();
+        assert!(
+            entry.1 > 40_000_000,
+            "the worker never encoded the full-sized WAV: {entry:?}"
+        );
+        assert!(
+            poll_until(Duration::from_secs(2), || provider_handle
+                .recognize_returned("job-big")),
+            "the entered recognition must unwind at the cancel flag"
+        );
+    } else {
+        // The cancel won: no recognition was handed to the provider.
+        // That absence is *verified*, not assumed — poll a second
+        // horizon and fail the moment a recognition appears: a pre-#251
+        // worker still encoding when the decision window closed would
+        // hand the provider the WAV here, which the post-encode cancel
+        // check must refuse.
+        assert!(
+            !poll_until(Duration::from_secs(3), saw_request),
+            "a recognition appeared for the cancelled job after the decision window"
+        );
     }
 
     runtime.shutdown();
@@ -1870,14 +1891,11 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
     // The worker stops early: the provider's `recognize` for job-1
     // returns within seconds of the cancel — not after its 30 s work.
     // (Pre-#251 this poll runs the full deadline and fails loudly.)
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !provider_handle.recognize_returned("job-1") {
-        assert!(
-            Instant::now() < deadline,
-            "job-1's recognition must return promptly after cancellation, not after its 30 s work"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        poll_until(Duration::from_secs(5), || provider_handle
+            .recognize_returned("job-1")),
+        "job-1's recognition must return promptly after cancellation, not after its 30 s work"
+    );
 
     // The freed slot serves the queued job.
     let mut seen = until(

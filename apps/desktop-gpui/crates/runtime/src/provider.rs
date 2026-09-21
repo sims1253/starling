@@ -241,6 +241,15 @@ impl FakeProvider {
             .iter()
             .any(|id| id == request_id)
     }
+
+    /// Records that the `recognize` call for `request_id` is returning
+    /// (the last thing a path does before its `return`).
+    fn note_return(&self, request_id: &str) {
+        self.returned
+            .lock()
+            .expect("fake provider lock")
+            .push(request_id.to_string());
+    }
 }
 
 impl TranscriptionProvider for FakeProvider {
@@ -268,10 +277,7 @@ impl TranscriptionProvider for FakeProvider {
         let deadline = Instant::now() + Duration::from_millis(job.work_ms);
         while Instant::now() < deadline {
             if cancel.is_cancelled() {
-                self.returned
-                    .lock()
-                    .expect("fake provider lock")
-                    .push(request_id.to_string());
+                self.note_return(request_id);
                 return ProviderOutcome::Failed {
                     reason: "cancelled".to_string(),
                     retryable: false,
@@ -282,10 +288,7 @@ impl TranscriptionProvider for FakeProvider {
         for partial in job.partials {
             on_partial(partial);
         }
-        self.returned
-            .lock()
-            .expect("fake provider lock")
-            .push(request_id.to_string());
+        self.note_return(request_id);
         job.outcome
     }
 }
