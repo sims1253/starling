@@ -53,6 +53,10 @@ pub fn failure_from_client_error(error: &ClientError) -> (String, bool) {
             (format!("http_{status}"), *status >= 500)
         }
         ClientError::Protocol(_) => ("protocol_error".to_string(), false),
+        // An oversized body is deterministic server behavior: the same
+        // request would produce the same wall of bytes, so retrying
+        // cannot help (issue #235).
+        ClientError::ResponseTooLarge(_) => ("response_too_large".to_string(), false),
         // A cancelled call is not a server condition: non-retryable, and
         // the scheduler drops it anyway (the job is already Cancelled).
         ClientError::Cancelled => ("cancelled".to_string(), false),
@@ -106,9 +110,12 @@ impl TranscriptionProvider for StarlingProvider {
         cancel: &CancelToken,
     ) -> ProviderOutcome {
         let started = Instant::now();
+        // The owned WAV moves into the shared buffer the client uploads
+        // zero-copy (issue #235) — no second copy of the recording.
+        let wav = Arc::new(wav);
         match self
             .client
-            .transcribe_with_cancel(&wav, request_id, Some(cancel))
+            .transcribe_with_cancel(wav, request_id, Some(cancel))
         {
             Ok(result) => ProviderOutcome::Completed {
                 text: result.text,

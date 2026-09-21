@@ -6,7 +6,9 @@ import {
   DictationHttpError,
   DictationInputError,
   DictationProtocolError,
+  DictationResponseTooLargeError,
   DictationTimeoutError,
+  DictationTransportError,
   StarlingClient,
 } from "../src/client.js";
 import { prepareWav16k } from "../src/audio.js";
@@ -315,6 +317,28 @@ describe("StarlingClient protocol compatibility", () => {
     assert.equal(bodyWasAborted, true);
   });
 
+  it("cancels a stalled body reader when the deadline fires", async () => {
+    let cancelled = false;
+
+    // A passive stream: it never enqueues and reacts to nothing — unlike
+    // the test above, nothing errors the controller on abort, so only
+    // the client's own deadline machinery can release the connection.
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      timeoutMs: 10,
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(client.health(), DictationTimeoutError);
+    assert.equal(cancelled, true, "the stalled reader must be cancelled at the deadline");
+  });
+
   it("aborts fetch when an Effect fiber is interrupted", async () => {
     let requestSignal: AbortSignal | undefined;
 
@@ -339,5 +363,317 @@ describe("StarlingClient protocol compatibility", () => {
 
     await Effect.runPromise(Fiber.interrupt(fiber));
     assert.equal(requestSignal.aborted, true);
+  });
+
+  it("uploads the prepared WAV by reference instead of re-buffering it", async () => {
+    const blobReads: string[] = [];
+
+    // A Blob whose read surface is instrumented: any client-side
+    // re-buffering (arrayBuffer/text/stream/slice) would have to go
+    // through one of these. Only the platform's own serialization,
+    // inside a real fetch, may touch them — this fetch double never does.
+    const watchedBlob = new Blob([prepared.wav.slice()], { type: "audio/wav" });
+
+    for (const method of ["arrayBuffer", "slice", "stream", "text"] as const) {
+      Object.defineProperty(watchedBlob, method, {
+        value: () => {
+          blobReads.push(method);
+          throw new Error(`client must not call Blob.${method}() while building the request`);
+        },
+      });
+    }
+
+    const watched: typeof prepared = { ...prepared, blob: watchedBlob };
+    let capturedBody: FormData | undefined;
+
+    const fetcher: typeof fetch = async (_input, init) => {
+      const body = init?.body;
+      assert.ok(body instanceof FormData);
+      capturedBody = body;
+
+      return new Response(JSON.stringify({ text: "streamed" }), { status: 200 });
+    };
+
+    const result = await new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: fetcher,
+    }).transcribe(watched);
+
+    // The file part carries the whole recording (issue #235) without the
+    // client ever reading or copying the WAV into a second buffer.
+    const uploaded = capturedBody?.get("file");
+    assert.ok(uploaded instanceof Blob);
+    assert.equal(uploaded.type, "audio/wav");
+    assert.equal(uploaded.size, prepared.wav.byteLength);
+    assert.deepEqual(blobReads, []);
+    assert.equal(result.text, "streamed");
+  });
+
+  it("rejects an oversized response body with a distinct error and cancels its reader", async () => {
+    let pulls = 0;
+    let cancelled = false;
+
+    // More chunks than the cap could ever allow: only the client's limit
+    // can end the read.
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulls === 5) {
+          controller.close();
+
+          return;
+        }
+
+        pulls += 1;
+        controller.enqueue(new Uint8Array(64).fill(0x61));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 100,
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) =>
+        cause instanceof DictationResponseTooLargeError &&
+        cause.limitBytes === 100 &&
+        cause.message === "dictation response body exceeded the 100 byte limit",
+    );
+    assert.equal(cancelled, true, "the reader must be cancelled at the cap, not drained");
+    // 64 + 64 crosses 100 bytes, so the read stops after the second
+    // chunk reaches the accumulator — several chunks before the stream
+    // ends. (The reader may prefetch one chunk ahead, hence the bound.)
+    assert.ok(pulls < 5, `the client kept reading past the cap (${pulls} pulls)`);
+  });
+
+  it("enforces the default response cap when none is configured", async () => {
+    const twoMebibytes = 2 * 1024 * 1024;
+    let sent = 0;
+
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent === 6) {
+          controller.close();
+
+          return;
+        }
+
+        // 6 x 2 MiB = 12 MiB crosses the 10 MiB default on chunk six.
+        sent += 1;
+        controller.enqueue(new Uint8Array(twoMebibytes));
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) =>
+        cause instanceof DictationResponseTooLargeError && cause.limitBytes === 10 * 1024 * 1024,
+    );
+    assert.equal(sent, 6);
+  });
+
+  it("reassembles chunked bodies under the cap across multibyte boundaries", async () => {
+    const encoded = new TextEncoder().encode('{"status":"réady"}');
+    // Split inside the two-byte é (0xc3 0xa9): a naive per-chunk decode
+    // would corrupt it, the streaming decoder must not.
+    const split = encoded.indexOf(0xc3) + 1;
+    const chunks = [encoded.slice(0, split), encoded.slice(split)];
+    let index = 0;
+
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[index];
+        index += 1;
+
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    });
+
+    const health = await new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      fetch: async () => new Response(body, { status: 200 }),
+    }).health();
+
+    assert.equal(health.status, "réady");
+  });
+
+  it("refuses a response whose declared content-length already exceeds the cap", async () => {
+    let cancelled = false;
+
+    // 64 bytes queued — at, not over, the 64-byte cap — while the header
+    // declares 65: the pre-check must refuse before a single chunk is
+    // read (parity with the Rust client's content-length pre-check).
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64).fill(0x61));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+    assert.equal(cancelled, true, "the reader must be cancelled without reading");
+  });
+
+  it("refuses an oversized declared length even when the body is null", async () => {
+    // The declaration alone is grounds for refusal: a null body must not
+    // slip past the pre-check through the empty-body early return.
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(null, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("accepts a body exactly at the cap and refuses one byte past it", async () => {
+    // The cap is inclusive: `received === limitBytes` must succeed, only
+    // `>` throws (mirrors the Rust client's at-the-limit test).
+    const clientWith = (fetcher: typeof fetch) =>
+      new StarlingClient({
+        baseUrl: "http://localhost:8181",
+        maxResponseBytes: 64,
+        fetch: fetcher,
+      });
+
+    const atCap = JSON.stringify({ status: "ok" }).padEnd(64);
+
+    assert.equal(atCap.length, 64);
+
+    const health = await clientWith(async () => new Response(atCap, { status: 200 })).health();
+
+    assert.equal(health.status, "ok");
+
+    await assert.rejects(
+      clientWith(async () => new Response("a".repeat(65), { status: 200 })).health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("keeps the cap refusal out of the transport error channel", async () => {
+    // readBodyCapped throws inside Effect.tryPromise: the catch must pass
+    // the tagged error through unchanged, never rewrap it as a transport
+    // failure (which would flip retry classification downstream).
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        new StarlingClient({
+          baseUrl: "http://localhost:8181",
+          maxResponseBytes: 64,
+          fetch: async () => new Response("a".repeat(65), { status: 200 }),
+        }).healthEffect(),
+      ),
+    );
+
+    assert.ok(failure instanceof DictationResponseTooLargeError);
+    assert.equal(failure.limitBytes, 64);
+    assert.equal(failure instanceof DictationTransportError, false);
+  });
+
+  it("still reports the streaming refusal when cancelling the reader rejects", async () => {
+    // The cancel is fire-and-forget: a transport failure while releasing
+    // an already-dead connection must not mask the cap error. Under an
+    // awaited `reader.cancel()` shape this reject would win and surface
+    // as a DictationTransportError — that is what this test pins.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65).fill(0x61));
+      },
+      cancel() {
+        return Promise.reject(new TypeError("cancel failed"));
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200 }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("still reports the declared-length refusal when cancelling the body rejects", async () => {
+    // The pre-check's fire-and-forget cancel, same pin: the rejecting
+    // cancel of the underlying source must not displace the cap error.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(64).fill(0x61));
+      },
+      cancel() {
+        return Promise.reject(new TypeError("cancel failed"));
+      },
+    });
+
+    const client = new StarlingClient({
+      baseUrl: "http://localhost:8181",
+      maxResponseBytes: 64,
+      fetch: async () => new Response(body, { status: 200, headers: { "Content-Length": "65" } }),
+    });
+
+    await assert.rejects(
+      client.health(),
+      (cause) => cause instanceof DictationResponseTooLargeError && cause.limitBytes === 64,
+    );
+  });
+
+  it("rejects a non-positive or non-finite maxResponseBytes", () => {
+    for (const maxResponseBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      assert.throws(
+        () =>
+          new StarlingClient({
+            baseUrl: "http://localhost:8181",
+            maxResponseBytes,
+            fetch: async () => assert.fail("invalid options must fail before any request"),
+          }),
+        TypeError,
+      );
+    }
+  });
+
+  it("rejects a non-positive limit at the schema level", () => {
+    // The error keeps the standard fields-object signature (schema-driven
+    // instantiation constructs it like every other tagged error); the
+    // strictly positive `limitBytes` field is the enforcement, so the
+    // schema machinery itself refuses a non-positive cap. Runtime caps
+    // are validated once, at StarlingClient construction.
+    const good = new DictationResponseTooLargeError({
+      message: "dictation response body exceeded the 64 byte limit",
+      limitBytes: 64,
+    });
+
+    assert.ok(good instanceof DictationResponseTooLargeError);
+    assert.equal(good.limitBytes, 64);
+
+    for (const limitBytes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      assert.throws(() => new DictationResponseTooLargeError({ message: "x", limitBytes }));
+    }
   });
 });

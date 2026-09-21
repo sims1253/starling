@@ -1273,13 +1273,14 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "filed",
-   "owner": null,
-   "branch": null,
+   "status": "implemented",
+   "owner": "impl-agent-235",
+   "branch": "fix/clients-235-bounded-http-bodies",
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "PR #254: clients upload the caller\u2019s shared WAV zero-copy (Rust: Bytes::from_owner over Arc<Vec<u8>>, multipart Part::stream_with_length; TS: prepared Blob by reference, pinned by a no-read test) and cap response bodies at a 10 MiB default with a distinct error (ClientError::ResponseTooLarge / DictationResponseTooLargeError), configurable per client; cargo test -p starling-dictation 213/213, -p starling-runtime -p starling-gpui 167 total, vp dictation 105/105, full vp run -r test 452/452, lint 0/0, fmt clean, tsc clean"
    ],
-   "notes": "client.rs; 256MB recording doubles peak memory",
+   "notes": "Rust upload keeps content-length framing (hyper honors an explicit length with a streaming body); both caps mirror each other (with_max_response_bytes / maxResponseBytes)",
    "github_issue": 235
   },
   {
@@ -1815,9 +1816,10 @@
  "prs": {
   "194": "gpui/fixes-wave-a2 -> gpui-port (G03-G07 fixes)",
   "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
-  "196": "program/s01-moss-kv-clear -> master (S01)"
+  "196": "program/s01-moss-kv-clear -> master (S01)",
+  "254": "fix/clients-235-bounded-http-bodies -> master (R06: zero-copy WAV upload + capped response bodies)"
  },
  "issue_filing": {
-  "note": "2026-09-21: 19 consolidated issues filed (#218-#236) covering all open program work; per-item github_issue fields map local IDs to issues. Exception: #225 (Insights phase 2) has no single local task ID — it is phase-2 product work building on the integrated E28/E29 — so it carries no per-item mapping."
+  "note": "2026-09-21: 19 consolidated issues filed (#218-#236) covering all open program work; per-item github_issue fields map local IDs to issues. Exception: #225 (Insights phase 2) has no single local task ID \u2014 it is phase-2 product work building on the integrated E28/E29 \u2014 so it carries no per-item mapping."
  }
 }

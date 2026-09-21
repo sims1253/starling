@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::multipart;
 use reqwest::redirect::Policy;
 use reqwest::{Client, RequestBuilder, Url};
@@ -21,6 +22,13 @@ const MIN_TIMEOUT_MS: u64 = 1;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MIN_AUDIO_BYTES: usize = 44;
 const MAX_AUDIO_BYTES: usize = 256 * 1024 * 1024;
+/// Response bodies are refused past this size (issue #235). Health and
+/// transcription payloads are small JSON documents (a transcript is text),
+/// so 10 MiB is orders of magnitude above anything a real backend returns
+/// while still bounding what a broken or hostile server can make the
+/// client buffer. Override per client with
+/// [`StarlingClient::with_max_response_bytes`].
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Transcription backend wire protocol.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -55,6 +63,12 @@ pub enum ClientError {
     Http { status: u16, message: String },
     #[error("The server returned invalid {0} JSON.")]
     Protocol(&'static str),
+    /// The server's response body exceeded the client's size limit (issue
+    /// #235): a malformed or hostile endpoint cannot make the client buffer
+    /// unbounded output. Exceeding the limit fails the request outright —
+    /// never a silent truncation.
+    #[error("Server response body exceeded the {0} byte limit.")]
+    ResponseTooLarge(usize),
     /// The caller cancelled the request while it was in flight (issue
     /// #251): the connection was aborted, not timed out — distinct from
     /// [`ClientError::Timeout`], which is the server being slow.
@@ -137,6 +151,7 @@ pub struct StarlingClient {
     protocol: Protocol,
     model: String,
     timeout_ms: u64,
+    max_response_bytes: usize,
     http: Client,
     runtime: Runtime,
 }
@@ -157,6 +172,7 @@ impl StarlingClient {
             protocol,
             model,
             DEFAULT_TIMEOUT_MS,
+            DEFAULT_MAX_RESPONSE_BYTES,
         )
     }
 
@@ -168,17 +184,27 @@ impl StarlingClient {
         Ok(self)
     }
 
+    /// Overrides the response-body size limit (default 10 MiB, issue
+    /// #235). A body declared or delivered past the limit fails with
+    /// [`ClientError::ResponseTooLarge`] instead of being buffered.
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Result<Self, ClientError> {
+        self.max_response_bytes = response_limit(max_bytes)?;
+        Ok(self)
+    }
+
     fn build(
         base_url: String,
         protocol: Protocol,
         model: &str,
         timeout_ms: u64,
+        max_response_bytes: usize,
     ) -> Result<Self, ClientError> {
         Ok(Self {
             base_url,
             protocol,
             model: model.trim().to_string(),
             timeout_ms,
+            max_response_bytes,
             http: build_http_client(timeout_ms)?,
             runtime: build_runtime()?,
         })
@@ -199,9 +225,14 @@ impl StarlingClient {
     }
 
     /// `transcribeProgram` without cancellation: runs to the timeout.
+    ///
+    /// The WAV travels as the caller's shared buffer: the request body is
+    /// built from it without copying (issue #235 — a 256 MB take must not
+    /// double peak memory per request), so both sides hold one recording,
+    /// not two.
     pub fn transcribe(
         &self,
-        wav: &[u8],
+        wav: Arc<Vec<u8>>,
         request_id: &str,
     ) -> Result<TranscriptionResult, ClientError> {
         self.transcribe_with_cancel(wav, request_id, None)
@@ -214,7 +245,7 @@ impl StarlingClient {
     /// the whole-recognition timeout.
     pub fn transcribe_with_cancel(
         &self,
-        wav: &[u8],
+        wav: Arc<Vec<u8>>,
         request_id: &str,
         cancel: Option<&CancelToken>,
     ) -> Result<TranscriptionResult, ClientError> {
@@ -233,7 +264,7 @@ impl StarlingClient {
                     .post(&url)
                     .header("x-request-id", sent_request_id.as_str())
                     .header("content-type", "audio/wav")
-                    .body(wav.to_vec());
+                    .body(wav_bytes(&wav));
                 self.execute(request, cancel)?
             }
             Protocol::OpenAi => {
@@ -243,7 +274,7 @@ impl StarlingClient {
                 } else {
                     self.model.as_str()
                 };
-                let file = multipart::Part::bytes(wav.to_vec())
+                let file = multipart::Part::stream_with_length(wav_bytes(&wav), wav.len() as u64)
                     .file_name("recording.wav")
                     .mime_str("audio/wav")
                     .map_err(|error| ClientError::Transport(error.to_string()))?;
@@ -267,8 +298,9 @@ impl StarlingClient {
         )
     }
 
-    /// Sends one request and buffers the response, mirroring `requestBody` in
-    /// `main.ts`: 3xx -> Redirect, non-2xx -> Http with the best detail.
+    /// Sends one request and reads the response under the client's size
+    /// limit, mirroring `requestBody` in `main.ts`: 3xx -> Redirect,
+    /// non-2xx -> Http with the best detail.
     ///
     /// With `cancel`, the request future races the token in
     /// [`tokio::select!`]: a cancellation aborts the in-flight request —
@@ -291,10 +323,7 @@ impl StarlingClient {
                 .get("x-request-id")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let body = response
-                .text()
-                .await
-                .map_err(|error| transport_error(&error, self.timeout_ms))?;
+            let body = read_body_capped(response, self.max_response_bytes, self.timeout_ms).await?;
 
             if (300..400).contains(&status) {
                 return Err(ClientError::Redirect(status));
@@ -381,6 +410,87 @@ fn request_timeout(timeout_ms: u64) -> Result<u64, ClientError> {
             "Request timeout must be between 1 ms and 10 minutes.".to_string(),
         ))
     }
+}
+
+/// The response-body limit must leave room for at least one byte; there
+/// is no upper bound (a caller may legitimately want a bigger ceiling,
+/// not a smaller floor).
+fn response_limit(max_bytes: usize) -> Result<usize, ClientError> {
+    if max_bytes >= 1 {
+        Ok(max_bytes)
+    } else {
+        Err(ClientError::Input(
+            "Response size limit must be at least 1 byte.".to_string(),
+        ))
+    }
+}
+
+/// A borrowed view of the caller's shared recording buffer. `Bytes::
+/// from_owner` keeps the `Arc` alive while the request body points into
+/// it, so the upload streams the WAV hyper already holds — no second
+/// copy of a 256 MB take exists anywhere (issue #235). `Arc<Vec<u8>>`
+/// has no `AsRef<[u8]>` of its own, hence the newtype.
+struct SharedWav(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedWav {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn wav_bytes(wav: &Arc<Vec<u8>>) -> Bytes {
+    Bytes::from_owner(SharedWav(Arc::clone(wav)))
+}
+
+/// Reads a response body under a hard size cap (issue #235): the declared
+/// `content-length` is checked before a byte is read, and a chunked or
+/// lying body is policed chunk by chunk — a malformed server cannot make
+/// the client buffer unbounded output. Exceeding the limit is
+/// [`ClientError::ResponseTooLarge`], distinct from truncation and from
+/// transport failures; the response is dropped (closing the connection)
+/// as soon as the cap is crossed. Decoding is lossy UTF-8, matching
+/// `Response::text` for the charset-less JSON these endpoints return.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+    timeout_ms: u64,
+) -> Result<String, ClientError> {
+    // The cap bounds what the client holds in memory, so it counts
+    // DECOMPRESSED bytes: with transparent gzip/br decompression,
+    // `content_length()` is the compressed wire size while the chunk
+    // loop below sees the decoded stream — the loop is what enforces the
+    // real bound; this pre-check is the fast path for uncompressed
+    // bodies.
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ClientError::ResponseTooLarge(limit));
+    }
+    // The declared length — already pre-checked against the limit —
+    // reserves capacity up front so a content-length-framed body is read
+    // without reallocation, but the reservation is capped small: a lying
+    // content-length near the limit must not force a full-limit
+    // allocation before any body arrives. The Vec grows as chunks
+    // actually arrive; an undeclared (chunked) body starts empty.
+    const MAX_INITIAL_RESERVATION: usize = 64 * 1024;
+    let capacity = response.content_length().map_or(0, |length| {
+        length
+            .min(MAX_INITIAL_RESERVATION as u64)
+            .min(limit as u64) as usize
+    });
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| transport_error(&error, timeout_ms))?
+    {
+        if bytes.len() + chunk.len() > limit {
+            return Err(ClientError::ResponseTooLarge(limit));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// `validateRequestId`: non-empty, no CR/LF, not starting with `#`.
@@ -719,6 +829,21 @@ mod tests {
         canned_response("200 OK", &[("content-type", "application/json")], body)
     }
 
+    /// A 200 with `transfer-encoding: chunked` framing: no declared
+    /// length, so the client's cap can only bite while streaming (issue
+    /// #235).
+    fn chunked_response(chunks: &[&str]) -> Vec<u8> {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n".to_vec();
+        for chunk in chunks {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk.as_bytes());
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
     fn fake_wav() -> Vec<u8> {
         let mut wav = Vec::new();
         wav.extend_from_slice(b"RIFF");
@@ -789,7 +914,7 @@ mod tests {
         let (addr, recorded) = spawn_server(vec![ok_json(body)]);
         let wav = fake_wav();
         let result = client_at(addr, Protocol::Starling)
-            .transcribe(&wav, "req-1")
+            .transcribe(Arc::new(wav.clone()), "req-1")
             .expect("transcription");
 
         let request = recorded.lock().expect("recorded lock");
@@ -798,6 +923,14 @@ mod tests {
         assert_eq!(request[0].path, "/transcribe");
         assert_eq!(request[0].header("x-request-id"), Some("req-1"));
         assert_eq!(request[0].header("content-type"), Some("audio/wav"));
+        // The zero-copy body (issue #235) keeps the plain framing: the
+        // length is declared up front, the upload is not chunked, and the
+        // bytes arrive whole.
+        assert_eq!(
+            request[0].header("content-length"),
+            Some(wav.len().to_string().as_str())
+        );
+        assert_eq!(request[0].header("transfer-encoding"), None);
         assert_eq!(request[0].body, wav);
         drop(request);
 
@@ -818,7 +951,7 @@ mod tests {
         let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"hi"}"#)]);
         let wav = fake_wav();
         let result = client_at(addr, Protocol::OpenAi)
-            .transcribe(&wav, "req-2")
+            .transcribe(Arc::new(wav.clone()), "req-2")
             .expect("transcription");
 
         let request = recorded.lock().expect("recorded lock");
@@ -833,6 +966,14 @@ mod tests {
             content_type.starts_with("multipart/form-data; boundary="),
             "got content-type {content_type}"
         );
+        // `stream_with_length` keeps the whole form length-declared, so
+        // the streamed file part does not switch the request to chunked
+        // transfer encoding (issue #235).
+        assert_eq!(
+            request[0].header("content-length"),
+            Some(request[0].body.len().to_string().as_str())
+        );
+        assert_eq!(request[0].header("transfer-encoding"), None);
         let body = String::from_utf8_lossy(&request[0].body).to_string();
         assert!(
             body.contains("name=\"file\"; filename=\"recording.wav\""),
@@ -911,7 +1052,7 @@ mod tests {
 
         let (addr, _) = spawn_server(vec![ok_json("{")]);
         assert!(matches!(
-            client_at(addr, Protocol::Starling).transcribe(&fake_wav(), "req"),
+            client_at(addr, Protocol::Starling).transcribe(Arc::new(fake_wav()), "req"),
             Err(ClientError::Protocol("transcription"))
         ));
     }
@@ -936,7 +1077,7 @@ mod tests {
         for body in cases {
             let (addr, _) = spawn_server(vec![ok_json(body)]);
             let error = client_at(addr, Protocol::Starling)
-                .transcribe(&fake_wav(), "req")
+                .transcribe(Arc::new(fake_wav()), "req")
                 .unwrap_err();
             assert!(
                 matches!(&error, ClientError::Protocol("transcription")),
@@ -986,19 +1127,25 @@ mod tests {
         let client = StarlingClient::new("http://127.0.0.1:9", Protocol::Starling, "")
             .expect("valid client");
         expect_input(
-            client.transcribe(&fake_wav(), "").unwrap_err(),
+            client.transcribe(Arc::new(fake_wav()), "").unwrap_err(),
             "Invalid transcription request id.",
         );
         expect_input(
-            client.transcribe(&fake_wav(), "#hidden").unwrap_err(),
+            client
+                .transcribe(Arc::new(fake_wav()), "#hidden")
+                .unwrap_err(),
             "Invalid transcription request id.",
         );
         expect_input(
-            client.transcribe(&fake_wav(), "a\r\nb").unwrap_err(),
+            client
+                .transcribe(Arc::new(fake_wav()), "a\r\nb")
+                .unwrap_err(),
             "Invalid transcription request id.",
         );
         expect_input(
-            client.transcribe(&[0u8; 43], "req").unwrap_err(),
+            client
+                .transcribe(Arc::new(vec![0u8; 43]), "req")
+                .unwrap_err(),
             "Audio payload is empty or too large.",
         );
     }
@@ -1023,6 +1170,60 @@ mod tests {
             Err(ClientError::Timeout(50)) => {}
             other => panic!("expected Timeout(50), got {other:?}"),
         }
+    }
+
+    /// Issue #235: a response whose declared content-length already
+    /// exceeds the client's limit is refused before a byte is read — a
+    /// malformed or hostile server cannot make the client buffer it.
+    #[test]
+    fn oversized_declared_response_is_refused() {
+        let (addr, _) = spawn_server(vec![canned_response("200 OK", &[], &"x".repeat(65))]);
+        let client = client_at(addr, Protocol::Starling)
+            .with_max_response_bytes(64)
+            .expect("valid limit");
+        match client.health() {
+            Err(ClientError::ResponseTooLarge(64)) => {}
+            other => panic!("expected ResponseTooLarge(64), got {other:?}"),
+        }
+    }
+
+    /// A body with no declared length (chunked framing) is policed chunk
+    /// by chunk: the refusal lands once the stream crosses the limit, not
+    /// after buffering everything the server cared to send.
+    #[test]
+    fn oversized_chunked_response_is_refused_while_streaming() {
+        let (addr, _) = spawn_server(vec![chunked_response(&[&"a".repeat(40), &"b".repeat(40)])]);
+        let client = client_at(addr, Protocol::Starling)
+            .with_max_response_bytes(64)
+            .expect("valid limit");
+        match client.health() {
+            Err(ClientError::ResponseTooLarge(64)) => {}
+            other => panic!("expected ResponseTooLarge(64), got {other:?}"),
+        }
+    }
+
+    /// The cap must not bite honest payloads: a body exactly at the limit
+    /// parses normally (every smaller one — the rest of this suite —
+    /// already exercises the under-the-cap path).
+    #[test]
+    fn response_exactly_at_the_limit_is_accepted() {
+        let padded = format!("{:<64}", r#"{"status":"ok"}"#);
+        assert_eq!(padded.len(), 64);
+        let (addr, _) = spawn_server(vec![ok_json(&padded)]);
+        let client = client_at(addr, Protocol::Starling)
+            .with_max_response_bytes(64)
+            .expect("valid limit");
+        assert_eq!(client.health().expect("health").status, "ok");
+    }
+
+    #[test]
+    fn response_limit_must_be_positive() {
+        let client = StarlingClient::new("http://127.0.0.1:9", Protocol::Starling, "")
+            .expect("valid client");
+        expect_client_input_error(
+            client.with_max_response_bytes(0),
+            "Response size limit must be at least 1 byte.",
+        );
     }
 
     /// Issue #251, client half: a cancelled request must abort the
@@ -1060,11 +1261,11 @@ mod tests {
             .with_timeout_ms(30_000)
             .expect("valid timeout");
         let token = CancelToken::new();
-        let wav = fake_wav();
+        let wav = Arc::new(fake_wav());
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let caller_token = token.clone();
         let caller = std::thread::spawn(move || {
-            let result = client.transcribe_with_cancel(&wav, "req-cancel", Some(&caller_token));
+            let result = client.transcribe_with_cancel(wav, "req-cancel", Some(&caller_token));
             let _ = done_tx.send(());
             result
         });
@@ -1099,7 +1300,7 @@ mod tests {
         let token = CancelToken::new();
         token.cancel();
         let client = client_at(addr, Protocol::Starling);
-        match client.transcribe_with_cancel(&fake_wav(), "req-precancel", Some(&token)) {
+        match client.transcribe_with_cancel(Arc::new(fake_wav()), "req-precancel", Some(&token)) {
             Err(ClientError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }

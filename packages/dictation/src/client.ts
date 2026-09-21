@@ -31,6 +31,7 @@ export interface StarlingClientOptions {
   readonly auth?: BearerAuth | (() => BearerAuth | Promise<BearerAuth>);
   readonly headers?: StringHeaders;
   readonly timeoutMs?: number;
+  readonly maxResponseBytes?: number;
   readonly fetch?: typeof globalThis.fetch;
 }
 
@@ -43,6 +44,11 @@ export interface TranscribeOptions extends TranscribeEffectOptions {
 }
 
 const NonNegativeFinite = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0));
+
+// The response-cap limit is strictly positive: 0 bytes would refuse every
+// response, so unlike NonNegativeFinite (which lets a timeout be 0 =
+// disabled) there is no zero case to admit.
+const PositiveFinite = Schema.Finite.check(Schema.isGreaterThan(0));
 
 export const TranscriptionSegmentSchema = Schema.Struct({
   text: Schema.String,
@@ -144,6 +150,32 @@ export class DictationProtocolError extends Schema.TaggedError<DictationProtocol
   }
 }
 
+/** Response bodies are refused past this size (issue #235). Health and
+ * transcription payloads are small JSON documents (a transcript is text),
+ * so 10 MiB is orders of magnitude above anything a real backend returns
+ * while still bounding what a broken or hostile server can make the
+ * client buffer. Override per client with `maxResponseBytes`.
+ */
+const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+// The error keeps the standard fields-object signature so schema-driven
+// instantiation (decode, Effect serialization) constructs it exactly like
+// the other tagged errors; `limitBytes: PositiveFinite` is what refuses a
+// non-positive cap at the type level. Runtime caps are validated once, at
+// StarlingClient construction (`maxResponseBytes`).
+export class DictationResponseTooLargeError extends Schema.TaggedError<DictationResponseTooLargeError>()(
+  "DictationResponseTooLargeError",
+  { message: Schema.String, limitBytes: PositiveFinite },
+) {}
+
+/** The cap refusal at every throw site: one message shape, one place. */
+function responseTooLarge(limitBytes: number): DictationResponseTooLargeError {
+  return new DictationResponseTooLargeError({
+    message: `dictation response body exceeded the ${limitBytes} byte limit`,
+    limitBytes,
+  });
+}
+
 export class DictationTimeoutError extends Schema.TaggedError<DictationTimeoutError>()(
   "DictationTimeoutError",
   { message: Schema.String, timeoutMs: NonNegativeFinite },
@@ -176,6 +208,7 @@ export type DictationClientError =
   | DictationHttpError
   | DictationInputError
   | DictationProtocolError
+  | DictationResponseTooLargeError
   | DictationTimeoutError
   | DictationTransportError;
 
@@ -308,6 +341,103 @@ function protocolError(label: string): DictationProtocolError {
   return new DictationProtocolError(`dictation server returned invalid ${label} JSON`);
 }
 
+/** Reads a response body under a hard cap (issue #235). A declared
+ * content-length already past the cap is refused before a byte is read
+ * (parity with the Rust client); otherwise the stream is consumed
+ * incrementally and cancelled the moment the cap is crossed, so a broken
+ * or hostile server cannot balloon memory: the accumulated chunks stay
+ * under the limit, and the final join transiently adds one more copy —
+ * the peak is bounded at roughly twice the limit. The failure is the
+ * distinct `DictationResponseTooLargeError`, never a silent truncation.
+ * The decoder runs in streaming mode, so multi-byte UTF-8 sequences
+ * split across chunks survive.
+ */
+async function readBodyCapped(
+  response: Response,
+  limitBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
+  // The cap bounds what the client holds in memory, so it counts
+  // DECOMPRESSED bytes: fetch transparently inflates gzip/br responses,
+  // meaning a declared Content-Length (the compressed wire size) can sit
+  // under the cap while the decoded body does not — the streaming check
+  // below is what enforces the real bound; this pre-check is the fast
+  // path for uncompressed bodies. (Deliberate asymmetry with the Rust
+  // client, whose transport does not decompress: its pre-check refuses
+  // an oversized declaration outright, while here the streaming counter
+  // catches a compressed-undersized declaration — both clients bound the
+  // decoded stream regardless.) The header parse is deliberately
+  // lenient: a malformed value ("12abc") parses to NaN and simply skips
+  // the fast path, and runtimes that expose Content-Length as the
+  // decompressed size — or strip it — skip it the same way. The
+  // streaming counter is the real bound either way.
+  const declared = response.headers.get("Content-Length");
+  const declaredBytes = declared === null ? Number.NaN : Number(declared);
+
+  // Checked before anything else — including the null-body return — so
+  // an oversized declaration is refused no matter what the body looks
+  // like. The cancel is fire-and-forget: a rejecting cancel against an
+  // already-dead connection must not mask the cap error (and flip
+  // downstream retry classification) with a transport failure.
+  if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
+    void response.body?.cancel().catch(() => {});
+
+    throw responseTooLarge(limitBytes);
+  }
+
+  const body = response.body;
+
+  if (body === null) return "";
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  const chunks: Array<string> = [];
+  let completed = false;
+
+  // When the deadline (or a fiber interrupt) aborts the request, a
+  // pending read on an injected fetcher's stream may never settle on its
+  // own — nothing else is wired to the signal. Cancel from the abort so
+  // the connection is released promptly instead of at GC; the effect has
+  // already failed by then, so whatever this loop resolves with is
+  // discarded.
+  signal.addEventListener(
+    "abort",
+    () => {
+      if (!completed) void reader.cancel().catch(() => {});
+    },
+    { once: true },
+  );
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        completed = true;
+
+        return chunks.join("") + decoder.decode();
+      }
+
+      // Decompressed bytes — see the pre-check note above.
+      received += value.byteLength;
+
+      if (received > limitBytes) throw responseTooLarge(limitBytes);
+
+      // Joined once at the end: `+=` on a growing string is quadratic in
+      // the body size, which matters near the 10 MiB default cap.
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+  } finally {
+    // Every non-clean exit — the cap refusal, a failed read, or the
+    // abort above racing a slow chunk — releases the reader. The cancel
+    // stays fire-and-forget: a rejecting cancel must not mask the cap
+    // error with a transport failure. The clean return above is the only
+    // path that leaves the stream alone.
+    if (!completed) void reader.cancel().catch(() => {});
+  }
+}
+
 const decodeTranscriptionResponse = Schema.decodeEffect(
   Schema.fromJsonString(TranscriptionResponseSchema),
 );
@@ -426,6 +556,7 @@ export class StarlingClient {
   private readonly endpoint: string;
   private readonly fetcher: typeof globalThis.fetch;
   private readonly headers: StringHeaders;
+  private readonly maxResponseBytes: number;
   private readonly model: string;
   private readonly timeoutMs: number;
 
@@ -439,9 +570,14 @@ export class StarlingClient {
     this.auth = options.auth;
     this.headers = options.headers ?? {};
     this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
 
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs < 0) {
       throw new TypeError("timeoutMs must be a finite non-negative number");
+    }
+
+    if (!Number.isFinite(this.maxResponseBytes) || this.maxResponseBytes <= 0) {
+      throw new TypeError("maxResponseBytes must be a finite positive number");
     }
 
     const fetcher = options.fetch ?? globalThis.fetch;
@@ -470,6 +606,9 @@ export class StarlingClient {
         );
       }
 
+      // The prepared Blob is appended by reference (issue #235): the
+      // client never copies the WAV into a second buffer — the platform
+      // serializes the multipart body incrementally while sending.
       const form = new FormData();
       form.append("file", prepared.blob, "recording.wav");
 
@@ -589,7 +728,7 @@ export class StarlingClient {
         // and the iOS client: audio and credentials must never silently
         // follow a server redirect to an origin the user did not configure.
         const response = await this.fetcher(url, { ...init, signal, redirect: "manual" });
-        const body = await response.text();
+        const body = await readBodyCapped(response, this.maxResponseBytes, signal);
 
         return {
           body,
@@ -600,7 +739,12 @@ export class StarlingClient {
           statusText: response.statusText,
         } satisfies BufferedResponse;
       },
-      catch: (cause) => new DictationTransportError(describeCause(cause)),
+      catch: (cause) =>
+        // The size cap is a first-class failure, not a transport fault:
+        // keep it distinct on its way out of the promise boundary.
+        cause instanceof DictationResponseTooLargeError
+          ? cause
+          : new DictationTransportError(describeCause(cause)),
     }).pipe(Effect.flatMap(ensureNotRedirected), Effect.flatMap(ensureOk));
 
     return withTimeout(request, this.timeoutMs);
