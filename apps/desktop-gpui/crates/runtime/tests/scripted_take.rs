@@ -2302,6 +2302,64 @@ fn a_retry_against_an_already_adopted_row_commits_no_duplicate() {
 }
 
 #[test]
+fn a_retry_against_a_row_holding_different_audio_stores_the_real_take() {
+    // The stale-journal shape: the journal id is just the file stem, so a
+    // row under that id is only THIS take's evidence if its audio matches
+    // the journal's verified payloads. Here the row holds different audio
+    // (a stale or reused journal under the same id, or a collision) —
+    // treating the row as satisfying the retry would silently discard this
+    // take's audio, so the commit must fall back to the samples path and
+    // record the identity refusal.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let first: Vec<f32> = (0..150).map(|i| (i % 41) as f32 * 0.005).collect();
+    let (journal, _scratch) = real_journal(&first);
+    let id = journal.id.clone();
+
+    store
+        .commit_take(&take_record(&id, &first, Some(journal.clone())))
+        .expect("first commit adopts");
+
+    // A different journal under the SAME id — the stem proves nothing
+    // about content.
+    let second: Vec<f32> = (0..90).map(|i| (i % 23) as f32 * 0.007).collect();
+    let (stale, _stale_scratch) = journal_as(&id, &second, dir.path());
+
+    store
+        .commit_take(&take_record(&id, &second, Some(stale)))
+        .expect("the take is stored from its samples");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 2, "the adopted row and the fallback row: {rows:?}");
+
+    let adopted = inner.get_capture(&id).expect("row").expect("adopted row present");
+    assert_eq!(
+        adopted.frame_count,
+        first.len() as u64,
+        "the adopted row keeps its own audio"
+    );
+
+    let fallback = rows
+        .records
+        .iter()
+        .find_map(|entry| match entry {
+            starling_dictation::store_v2::ListedCapture::Capture(listing) => {
+                (listing.record.id != id).then(|| listing.record.clone())
+            }
+            starling_dictation::store_v2::ListedCapture::Damaged(_) => None,
+        })
+        .expect("the fallback row");
+    let audio = inner.load_audio(&fallback.id).expect("fallback audio");
+    assert_eq!(audio.samples, second, "this take's real audio is stored");
+    let extra = fallback.extra_json.as_deref().unwrap_or_default();
+    assert!(
+        extra.contains("journalAdoptionError") && extra.contains("journal hash mismatch"),
+        "the identity refusal is recorded: {extra}"
+    );
+}
+
+#[test]
 fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
     let dir = tempfile::tempdir().expect("v2 store temp dir");
     let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");

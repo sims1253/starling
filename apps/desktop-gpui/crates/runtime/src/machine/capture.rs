@@ -409,23 +409,50 @@ impl V2CaptureStore {
                     // The adoption may have failed *after* its durable
                     // effects: a row for the journal's id means the take is
                     // already stored (a retry, or a partial prior adoption)
-                    // and must not be stored a second time from samples.
+                    // and must not be stored a second time from samples —
+                    // but only if the row holds THIS journal's audio. The
+                    // id is the file stem and proves nothing about content:
+                    // a stale, renamed or reused journal (or an id
+                    // collision) must not silently satisfy the commit while
+                    // this take's audio is discarded, so the row's stored
+                    // hash is checked against the journal's verified
+                    // payload hash before the retry counts as satisfied.
                     match store.get_capture(&report.id) {
                         Ok(Some(existing)) => {
-                            if status == CaptureStatus::Interrupted {
-                                if let Err(flip_err) = store.update_capture_status(
-                                    &existing.id,
-                                    CaptureStatus::Interrupted,
-                                    None,
-                                ) {
-                                    eprintln!(
-                                        "v2 capture store: adopted take {} committed; the \
-                                         interrupted status flip failed ({flip_err})",
-                                        existing.id
-                                    );
+                            let same_audio = starling_dictation::journal::verified_journal_hash(
+                                &report.path,
+                            )
+                            .map(|hash| hash == existing.journal_hash)
+                            .unwrap_or(false);
+
+                            if !same_audio {
+                                eprintln!(
+                                    "v2 capture store: journal id {} is occupied by a \
+                                     different capture (stored journal hash {} does not \
+                                     match this journal) — storing this take from samples",
+                                    report.id, existing.journal_hash
+                                );
+                                adoption_error = Some(format!(
+                                    "journal id {} already holds different audio \
+                                     (journal hash mismatch)",
+                                    report.id
+                                ));
+                            } else {
+                                if status == CaptureStatus::Interrupted {
+                                    if let Err(flip_err) = store.update_capture_status(
+                                        &existing.id,
+                                        CaptureStatus::Interrupted,
+                                        None,
+                                    ) {
+                                        eprintln!(
+                                            "v2 capture store: adopted take {} committed; the \
+                                             interrupted status flip failed ({flip_err})",
+                                            existing.id
+                                        );
+                                    }
                                 }
+                                return Ok(());
                             }
-                            return Ok(());
                         }
                         _ => {
                             // Nothing landed: a journal-readability failure

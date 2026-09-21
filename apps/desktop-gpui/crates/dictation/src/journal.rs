@@ -566,6 +566,20 @@ pub(crate) fn samples_hash(samples: &[f32]) -> u64 {
     hash
 }
 
+/// The FNV-1a 64 hash of a journal's VERIFIED sample payloads — the exact
+/// value `StoreV2::adopt_journal` stores as the adopted row's
+/// `journal_hash` (computed over the verified prefix, never the trailer's
+/// unverified claim). Callers use it to prove content identity before
+/// treating a row found under a journal's id as that journal's audio: the
+/// id alone is the file stem and proves nothing — a stale, renamed or
+/// reused journal file under the same id must not satisfy a different
+/// take's commit. An unreadable journal yields `Err`, which callers treat
+/// as "identity unproven" rather than as a match.
+pub fn verified_journal_hash(path: &Path) -> Result<String, JournalReadError> {
+    let parsed = read_journal(path)?;
+    Ok(format!("{:016x}", samples_hash(&parsed.samples)))
+}
+
 /// Seal a recovered journal (storage v2, I2): physically truncate the file
 /// to the end of its last checksum-valid verification point (boundary or
 /// trailer), append a trailer covering the verified samples, and fsync —

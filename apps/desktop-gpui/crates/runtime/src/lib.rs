@@ -185,6 +185,14 @@ impl RuntimeConfig {
 /// when no data root can be opened at all — a degenerate host, not a
 /// second backend to switch to.
 ///
+/// Data-visibility note (D14, docs/program/DECISIONS.md): the v1
+/// `FileSessionStore`, its reader and the migration flow were removed
+/// deliberately, by user directive — the product is pre-release and there
+/// is no user data to be compatible with. Takes persisted under the old
+/// v1 layout are therefore invisible to a v2 root by design, not by
+/// accident; if that ever changes, the directive (not this seam) is what
+/// changes. This is not a migration entry point and must not grow one.
+///
 /// Embedder-facing: nothing inside this workspace calls it yet —
 /// [`RuntimeConfig::default`] deliberately stays on the in-memory store
 /// so constructing a config (tests do it freely) never touches the
