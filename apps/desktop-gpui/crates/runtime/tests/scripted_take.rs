@@ -16,11 +16,11 @@
 
 use std::time::{Duration, Instant};
 
-use starling_dictation::recorder::{CaptureGap, RecorderFault};
+use starling_dictation::recorder::{CaptureGap, JournalReport, RecorderFault};
 use starling_runtime::bus::{EventMessage, EventSub};
 use starling_runtime::machine::capture::{
     CaptureSource, CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
-    V1FileCaptureStore,
+    V2CaptureStore,
 };
 use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::machine::Rejection;
@@ -1933,16 +1933,17 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
     runtime.shutdown();
 }
 
-/// The real v1-file capture store with a completion flag: the durable
-/// write (WAV encode + fsync'd session layout) is the real one, and the
-/// flag gives the responsiveness regression an order-based witness of the
-/// commit landing — no timing guesses.
-struct FlaggedV1Store {
-    inner: V1FileCaptureStore,
+/// The real storage-v2 capture store with a completion flag: the durable
+/// write (the take's samples through the fsync'd staging-journal protocol,
+/// or the journal's verification and move on adoption) is the real one,
+/// and the flag gives the responsiveness regression an order-based
+/// witness of the commit landing — no timing guesses.
+struct FlaggedV2Store {
+    inner: V2CaptureStore,
     landed: std::sync::Mutex<Vec<String>>,
 }
 
-impl CaptureStore for FlaggedV1Store {
+impl CaptureStore for FlaggedV2Store {
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
         let result = self.inner.commit_take(take);
         if result.is_ok() {
@@ -1962,24 +1963,25 @@ impl CaptureStore for FlaggedV1Store {
     }
 }
 
-/// Issue #249, the capture-side twin of #216: with the v1-file store, the
-/// stop handshake used to run the take's whole WAV encode inline on the
-/// capture actor — a multi-minute take stalled every `capture.*` command
-/// for the duration. The persist now runs on a per-take worker, so:
+/// Issue #249, the capture-side twin of #216: with the v2 store's
+/// samples path, the stop handshake used to run the take's whole
+/// staging-journal write inline on the capture actor — a multi-minute
+/// take stalled every `capture.*` command for the duration. The persist
+/// now runs on a per-take worker, so:
 ///
-/// - the machine observably enters `Draining` while the encode is still
+/// - the machine observably enters `Draining` while the persist is still
 ///   running (pre-#249 the projection jumped `Recording → Persisted`
 ///   inside one blocked command — `Draining` was never publishable);
-/// - a `capture.*` command sent mid-encode is answered immediately, while
-///   the durable commit has not landed (the order-based property);
+/// - a `capture.*` command sent mid-persist is answered immediately,
+///   while the durable commit has not landed (the order-based property);
 /// - and the take still completes with the unchanged contract: durable
 ///   store row first, `capture.stopped` after, machine `Persisted`.
 #[test]
-fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
+fn capture_commands_stay_answered_while_a_long_v2_persist_writes() {
     let source = FakeCaptureSource::new(vec![]);
-    let dir = tempfile::tempdir().expect("v1 store temp dir");
-    let store = std::sync::Arc::new(FlaggedV1Store {
-        inner: V1FileCaptureStore::open(dir.path()).expect("v1 store opens"),
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = std::sync::Arc::new(FlaggedV2Store {
+        inner: V2CaptureStore::open(dir.path()).expect("v2 store opens"),
         landed: std::sync::Mutex::new(Vec::new()),
     });
     let config = test_config(
@@ -1996,40 +1998,42 @@ fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
     let events = client.subscribe();
     freeze_route(&client, &events);
 
-    // A multi-minute take (30M samples ≈ a 60 MB WAV the v1 store must
-    // encode and durably write), pinned the same way the #216 jobs test
-    // pins its take.
+    // A multi-minute take (30M samples ≈ 120 MB of f32 the v2 store must
+    // journal, fsync, finalize, promote, and commit), pinned the same way
+    // the #216 jobs test pins its take. The fake source's journal report
+    // has no real file behind it, so this take exercises the samples
+    // path — the store's whole-audio route.
     source.push(FakeTakeScript {
-        stop: FakeStop::Clean { journal_id: "j_v1big".into(), ack_fraction: 1.0 },
+        stop: FakeStop::Clean { journal_id: "j_v2big".into(), ack_fraction: 1.0 },
         samples_per_second: 4_000_000_000,
         sample_cap: 30_000_000,
         ..FakeTakeScript::clean()
     });
     client
-        .send(Some("take_v1"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(Some("take_v2"), Command::CaptureStart { policy: "push-to-talk".into() })
         .expect("start accepted");
     until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
     until(
         &events,
         "capture.progress (samples accumulated)",
-        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_v1"),
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_v2"),
         Duration::from_secs(5),
     );
     client
-        .send(Some("take_v1"), Command::CaptureStop { drain: Some(true) })
+        .send(Some("take_v2"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
 
     // The gate: the machine sits in Draining while the persist worker
-    // encodes. This itself pins the fix — the old inline shape never
-    // published Draining at all (the whole encode ran inside the stop's
+    // writes. This itself pins the fix — the old inline shape never
+    // published Draining at all (the whole persist ran inside the stop's
     // command handling), so this wait would time out there.
     wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
 
-    // The probe: a capture.start raced against the encode. Pre-#249 it
-    // queued behind the whole persist and only then got its table
+    // The probe: a capture.start raced against the persist. Pre-#249 it
+    // queued behind the whole write and only then got its table
     // rejection; now the actor answers from a live loop.
     let probe_started = Instant::now();
-    let probed = client.send(Some("take_v1b"), Command::CaptureStart { policy: "dictation".into() });
+    let probed = client.send(Some("take_v2b"), Command::CaptureStart { policy: "dictation".into() });
     let probe_latency = probe_started.elapsed();
     assert!(
         matches!(&probed, Err(Rejection::IllegalInState { state, .. }) if state == "Draining"),
@@ -2037,7 +2041,7 @@ fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
     );
     assert!(
         probe_latency < Duration::from_millis(500),
-        "the start took {probe_latency:?} to be rejected — the capture actor appears stalled on the WAV encode"
+        "the start took {probe_latency:?} to be rejected — the capture actor appears stalled on the store write"
     );
 
     // The order-based property: the answer came while the durable commit
@@ -2045,7 +2049,7 @@ fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
     // capture.stopped is on the wire (it follows the commit, §4).
     assert!(
         store.landed.lock().unwrap().is_empty(),
-        "the v1 persist had already landed when the probe was answered — the probe did not race the encode"
+        "the v2 persist had already landed when the probe was answered — the probe did not race the write"
     );
     let mut buffered = Vec::new();
     while let Ok(message) = events.try_recv() {
@@ -2061,24 +2065,182 @@ fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
     // capture.stopped after it, machine Persisted, take usable.
     until(
         &events,
-        "capture.stopped (take_v1)",
-        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_v1"),
-        Duration::from_secs(10),
+        "capture.stopped (take_v2)",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_v2"),
+        Duration::from_secs(30),
     );
     wait_for_capture_state(&client, "Persisted", Duration::from_secs(5));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let landed = store.landed.lock().unwrap().clone();
-        if landed.iter().any(|id| id == "j_v1big") {
+        if landed.iter().any(|id| id == "j_v2big") {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the v1 store row never landed: {landed:?}"
+            "the v2 store row never landed: {landed:?}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
     runtime.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// The storage-v2 capture store (D14: THE store)
+// ---------------------------------------------------------------------------
+
+/// A minimal take record for direct CaptureStore tests.
+fn take_record(id: &str, samples: &[f32], journal: Option<JournalReport>) -> TakeRecord {
+    TakeRecord {
+        id: id.to_string(),
+        device: "default-input".to_string(),
+        policy: "push-to-talk".to_string(),
+        samples: samples.to_vec(),
+        sample_rate: 16_000,
+        gaps: Vec::new(),
+        acknowledged_samples: samples.len() as u64,
+        final_sample_index: samples.len() as u64,
+        journal,
+        status: TakeStatus::Complete,
+        sample_duration_ms: samples.len() as f64 * 1000.0 / 16_000.0,
+        wall_clock_ms: samples.len() as f64 * 1000.0 / 16_000.0,
+        capture_id: id.to_string(),
+    }
+}
+
+/// A real, finalized journal file at an arbitrary path (the on-disk shape
+/// the recorder hands the store), built through a scratch v2 store's own
+/// take protocol: begin + append + boundary + finalize leaves the sealed
+/// journal in the scratch root's `staging/`.
+fn real_journal(tag: &str, samples: &[f32]) -> JournalReport {
+    use starling_dictation::store_v2::{StoreV2, TakeMeta};
+    let scratch_root = std::env::temp_dir().join(format!(
+        "starling-v2store-journal-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    let scratch = StoreV2::open(&scratch_root).expect("scratch store");
+    let mut take = scratch
+        .begin_take(TakeMeta::for_device("test"))
+        .expect("begin take");
+    take.append_frames(samples).expect("append");
+    take.write_boundary().expect("boundary");
+    let finalized = take.finalize().expect("finalize");
+    JournalReport {
+        path: scratch_root
+            .join("staging")
+            .join(format!("{}.sj", finalized.id)),
+        id: finalized.id.clone(),
+        sample_rate: finalized.sample_rate,
+        acknowledged_samples: finalized.total_samples,
+        finalized: true,
+        fault: None,
+    }
+}
+
+#[test]
+fn v2_store_adopts_real_journal_evidence() {
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..300).map(|i| (i % 37) as f32 * 0.001).collect();
+    let journal = real_journal("adopt", &samples);
+
+    // A cleanly stopped take whose recorder journaled: the journal is the
+    // evidence, and adoption is the commit path.
+    store
+        .commit_take(&take_record(&journal.id, &samples, Some(journal.clone())))
+        .expect("commit");
+
+    // The journal moved in and became the stored audio; the row exists
+    // with the store's own verified counts (adoption re-reads and seals
+    // the journal rather than trusting the take's in-memory figures).
+    assert!(!journal.path.exists(), "adoption moves the source");
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let record = inner.get_capture(&journal.id).expect("row").expect("committed");
+    assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Complete);
+    assert_eq!(record.frame_count, 300);
+    let audio = inner.load_audio(&journal.id).expect("audio");
+    assert_eq!(audio.samples, samples, "the stored audio is the journal's");
+    assert!(audio.finalized);
+}
+
+#[test]
+fn v2_store_forces_interrupted_on_a_salvaged_adopted_take() {
+    // A salvaged take (quiesce timeout) adopts a finalized journal — the
+    // writer's exit path sealed it — and must still land interrupted with
+    // its salvage note, exactly like the app facade's R34 rule.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..120).map(|i| (i % 31) as f32 * 0.002).collect();
+    let journal = real_journal("salvage", &samples);
+
+    store
+        .mark_interrupted(
+            &take_record(&journal.id, &samples, Some(journal.clone())),
+            "The microphone did not stop cleanly; the salvaged take was kept.",
+        )
+        .expect("salvaged commit");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    // The row is keyed by the journal's id (adoption names it).
+    let record = inner.get_capture(&journal.id).expect("row").expect("committed");
+    assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Interrupted);
+    let note = record.recovery_note().expect("the salvage note");
+    assert!(note.contains("salvaged take was kept"), "{note}");
+}
+
+#[test]
+fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..200).map(|i| (i % 53) as f32 * 0.003).collect();
+
+    // No journal at all.
+    store
+        .commit_take(&take_record("take_nojournal", &samples, None))
+        .expect("commit without a journal");
+
+    // A journal report whose file does not exist (the fake-source shape;
+    // on a real device, a recorder whose journal vanished before commit).
+    let ghost = JournalReport {
+        path: dir.path().join("nope").join("j_ghost.sj"),
+        id: "j_ghost".to_string(),
+        sample_rate: 16_000,
+        acknowledged_samples: 0,
+        finalized: false,
+        fault: Some("journal write failed".to_string()),
+    };
+    store
+        .mark_interrupted(
+            &take_record("take_ghost", &samples, Some(ghost)),
+            "kept from memory after the fault",
+        )
+        .expect("salvage with unusable journal");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 2, "both takes were stored from their samples");
+
+    // Each stored take round-trips: the samples path wrote exactly the
+    // in-memory audio through the §4 protocol — the clean take complete,
+    // the salvaged one interrupted with its note.
+    for row in &rows.records {
+        let starling_dictation::store_v2::ListedCapture::Capture(listing) = row else {
+            panic!("expected a readable capture, got {row:?}");
+        };
+        assert_eq!(listing.record.frame_count, 200);
+        let audio = inner.load_audio(&listing.record.id).expect("audio");
+        assert_eq!(audio.samples, samples);
+        match listing.record.status {
+            starling_dictation::store_v2::CaptureStatus::Complete => {
+                assert_eq!(listing.record.policy, "push-to-talk")
+            }
+            starling_dictation::store_v2::CaptureStatus::Interrupted => {
+                let note = listing.record.recovery_note().expect("the salvage note");
+                assert!(note.contains("kept from memory"), "{note}");
+            }
+        }
+    }
 }
 
 /// A store whose commits take a fixed while — a deterministic stand-in

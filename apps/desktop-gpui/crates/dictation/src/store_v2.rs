@@ -1,8 +1,8 @@
 //! Storage v2 core (I2, `docs/program/design/e17-native-runtime.md` §4).
 //!
 //! This is THE store (D14: no backwards compatibility of any kind — the
-//! v1 file store remains in the tree only where the runtime state machine
-//! and journal recovery still reference it). The data root —
+//! v1 file store and its opt-in flag are deleted; the runtime state
+//! machine persists through this store as well). The data root —
 //! `<data-root>/starling-gpui/` — holds the v2 layout:
 //!
 //! ```text
@@ -143,12 +143,6 @@ const LEASES_DIR: &str = "leases";
 /// (never-delete-until-swept), but nothing writes into it anymore.
 const LEGACY_DELETED_DIRS: &[&str] = &["journals", "deleted"];
 const DB_FILE: &str = "starling.db";
-
-/// Environment variable the runtime state machine's capture store uses to
-/// opt its persistence into v2 (I2: v2 ships alongside v1 there, with no
-/// automatic switchover). The desktop app itself runs v2 unconditionally
-/// (D14) and never reads this flag.
-pub const STORAGE_V2_FLAG_ENV: &str = "STARLING_STORAGE_V2";
 
 /// The §4 schema, in one place. `CREATE ... IF NOT EXISTS` throughout so
 /// applying it to an existing same-version database is a no-op.
@@ -573,9 +567,10 @@ impl StoreV2 {
         })
     }
 
-    /// `<data-dir>/starling-gpui` — the same root the v1 store uses for
-    /// `sessions/` and `journals/`, so both stores coexist during the
-    /// transition.
+    /// `<data-dir>/starling-gpui` — the single data root. The recorder's
+    /// live journals still scratch under `journals/` beside it (adopted
+    /// here at save time), and the v1 store's tombstone tree
+    /// `journals/deleted/` is swept here (see [`Self::sweep_retention`]).
     pub fn default_root() -> Result<PathBuf, StoreV2Error> {
         Ok(dirs::data_dir()
             .ok_or(crate::storage::StorageError::DataDirUnavailable)?
@@ -1676,7 +1671,6 @@ impl StoreV2 {
                 owner_id: stem,
                 pid: record.as_ref().map_or(0, |record| record.pid),
                 record,
-                flock,
                 alive,
             });
         }
@@ -1741,7 +1735,6 @@ impl StoreV2 {
                     pid: record.as_ref().map_or(0, |record| record.pid),
                     mine: false,
                     record,
-                    flock,
                     alive,
                 }));
             }
@@ -2592,26 +2585,6 @@ pub struct SweptFile {
 // Free helpers.
 // ---------------------------------------------------------------------------
 
-/// Whether the testing flag is on. Only the runtime state machine reads
-/// it (see [`STORAGE_V2_FLAG_ENV`]); the desktop app runs v2
-/// unconditionally (D14).
-pub fn v2_enabled_for_testing() -> bool {
-    v2_enabled_from(std::env::var(STORAGE_V2_FLAG_ENV).ok().as_deref())
-}
-
-/// The flag mapping, pure so it is testable without racing the process
-/// environment: `1`, `true`, `yes`, `on` (case-insensitive) are on;
-/// everything else — including unset — is off.
-pub fn v2_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(text) => matches!(
-            text.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        None => false,
-    }
-}
-
 /// A local UTC-offset label for the `tz` column; `UTC` when the local
 /// offset cannot be determined (multi-threaded sandbox).
 fn local_tz_label() -> String {
@@ -2809,9 +2782,6 @@ pub struct LeaseInfo {
     pub owner_id: String,
     pub pid: u32,
     pub record: Option<LeaseRecord>,
-    /// The flock evidence the probe gathered (crate-internal diagnostic;
-    /// `alive` is the verdict callers act on).
-    pub(crate) flock: FlockEvidence,
     pub alive: bool,
 }
 
@@ -4419,19 +4389,6 @@ mod tests {
 
         let quiet = ReconciliationReport::default();
         assert!(!quiet.has_findings());
-    }
-
-    // ---- testing flag ---------------------------------------------------
-
-    #[test]
-    fn the_v2_flag_maps_values_and_defaults_off() {
-        assert!(!v2_enabled_from(None), "unset = off");
-        for off in ["", "0", "false", "no", "off", "garbage"] {
-            assert!(!v2_enabled_from(Some(off)), "{off:?} must be off");
-        }
-        for on in ["1", "true", "TRUE", "Yes", "on"] {
-            assert!(v2_enabled_from(Some(on)), "{on:?} must be on");
-        }
     }
 
     // ---- leases (§4 ownership) ------------------------------------------

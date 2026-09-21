@@ -100,7 +100,10 @@ pub struct RuntimeConfig {
     /// The capture device source (production:
     /// [`machine::capture::DeviceCaptureSource`]).
     pub capture_source: Arc<dyn CaptureSource>,
-    /// Where finished/salvaged takes are persisted.
+    /// Where finished/salvaged takes are persisted. The default is the
+    /// in-memory store so that constructing a config — tests do it freely
+    /// — never touches the user's data root; production embeds
+    /// [`default_capture_store`] (storage v2 at the default root).
     pub capture_store: Arc<dyn CaptureStore>,
     /// The documents persistence seam.
     pub document_store: Arc<dyn DocumentStore>,
@@ -123,7 +126,7 @@ impl Default for RuntimeConfig {
             },
             provider: Arc::new(provider::UnconfiguredProvider),
             capture_source: Arc::new(DeviceCaptureSource),
-            capture_store: default_capture_store(),
+            capture_store: InMemoryCaptureStore::new(),
             document_store: MemoryDocumentStore::new(),
             delivery_adapter: StubDeliveryAdapter::new(),
             context_provider: StubContextProvider::new(),
@@ -175,22 +178,14 @@ impl RuntimeConfig {
     }
 }
 
-/// The capture persistence selection: storage v2 when
-/// `STARLING_STORAGE_V2` opts in (I2 ships v2 alongside v1 with no
-/// automatic switchover), the landed v1 file store otherwise, in-memory
-/// if neither root can be opened.
+/// The production capture persistence (D14: storage v2 is THE store — no
+/// opt-in flag, no v1 fallback): [`machine::capture::V2CaptureStore`] at
+/// `StoreV2`'s default data root. The in-memory store is returned only
+/// when no data root can be opened at all — a degenerate host, not a
+/// second backend to switch to.
 pub fn default_capture_store() -> Arc<dyn CaptureStore> {
-    if std::env::var_os(machine::capture::STORE_FLAG)
-        .is_some_and(|value| value != "0" && !value.is_empty())
-    {
-        if let Ok(root) = starling_dictation::store_v2::StoreV2::default_root() {
-            if let Ok(store) = machine::capture::V2CaptureStore::open(root) {
-                return Arc::new(store);
-            }
-        }
-    }
-    if let Ok(root) = starling_dictation::storage::FileSessionStore::default_root() {
-        if let Ok(store) = machine::capture::V1FileCaptureStore::open(root) {
+    if let Ok(root) = starling_dictation::store_v2::StoreV2::default_root() {
+        if let Ok(store) = machine::capture::V2CaptureStore::open(root) {
             return Arc::new(store);
         }
     }

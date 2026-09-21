@@ -52,10 +52,10 @@ struct DocumentRecord {
 /// (`{docId → revision}`), runtime-owned.
 pub type RevisionRegistry = Arc<Mutex<HashMap<String, (String, Revision)>>>;
 
-/// The persistence seam for documents and revisions. The v1 session store
-/// has no document model and `store_v2`'s document tables are not yet
-/// surfaced as a public API (I5); the in-memory default keeps the machine
-/// honest about that gap instead of faking rows.
+/// The persistence seam for documents and revisions. `store_v2`'s
+/// document tables are not yet surfaced as a public API (I5); the
+/// in-memory default keeps the machine honest about that gap instead of
+/// faking rows.
 pub trait DocumentStore: Send + Sync {
     fn upsert_document(&self, doc_id: &str, name: &str, head_revision: u64, turn_seq: u32)
         -> Result<(), String>;

@@ -31,11 +31,13 @@
 //! still in a state that admits the event.
 //!
 //! **The persist runs off the actor loop** (issue #249, the capture-side
-//! twin of #216's jobs fix). The v1-file store's `commit_take` encodes
-//! the take's whole audio into a WAV before its fsync'd write — tens of
-//! MB of CPU and I/O for a multi-minute take — and running that inline
-//! on the stop handshake stalled every `capture.*` command behind it. The
-//! actor therefore hands each take's persist to a dedicated worker thread
+//! twin of #216's jobs fix). A store commit does whole-audio work — the
+//! v2 store's adoption verifies and moves the journal and its samples
+//! path writes the take's every sample through a fsync'd staging journal,
+//! tens of MB of CPU and I/O for a multi-minute take — and running that
+//! inline on the stop handshake stalled every `capture.*` command behind
+//! it. The actor therefore hands each take's persist to a dedicated
+//! worker thread
 //! (one per take, like the jobs scheduler's encode workers) and defers
 //! only the emissions that the durable commit gates: `capture.stopped`
 //! still follows the successful commit (§4, the watermark-agreement ack
@@ -71,8 +73,7 @@ use starling_dictation::audio::encode_wav_16k_parts;
 use starling_dictation::recorder::{
     CaptureGap, CapturedTake, JournalReport, RecorderError, RecorderFault, RecorderHandle,
 };
-use starling_dictation::storage::FileSessionStore;
-use starling_dictation::store_v2::{CaptureRecord, CaptureStatus, StoreV2, TakeMeta};
+use starling_dictation::store_v2::{CaptureStatus, CommitMark, StoreV2, TakeMeta};
 
 use crate::bus::EventBus;
 use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
@@ -80,11 +81,6 @@ use crate::protocol::tables::CAPTURE;
 use crate::protocol::{Command, Event, SampleGap};
 
 use super::context::RouteFreezer;
-
-/// The environment flag that opts into the storage v2 capture store
-/// (`store_v2::STORAGE_V2_FLAG_ENV`, I2: v2 ships alongside v1 with no
-/// automatic switchover).
-pub const STORE_FLAG: &str = starling_dictation::store_v2::STORAGE_V2_FLAG_ENV;
 
 /// How a take ended — the persistence-facing counterpart of the machine's
 /// `Persisted` state (a `Persisted` take may reference a `complete` or an
@@ -268,8 +264,9 @@ fn error_is_fatal(fault: &RecorderFault) -> bool {
 /// Implementations run on the **persist worker**, not the capture actor
 /// loop (issue #249): the actor hands each take off to a dedicated thread
 /// and resumes the take's close-out when the commit's result comes back,
-/// so a whole-audio encode inside an implementation (the v1-file store's
-/// WAV path) cannot stall `capture.*` commands.
+/// so whole-audio work inside an implementation (the v2 store's journal
+/// verification/move on adoption, or its staging-journal write of every
+/// sample on the samples path) cannot stall `capture.*` commands.
 pub trait CaptureStore: Send + Sync {
     /// Persists a cleanly stopped take.
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String>;
@@ -314,90 +311,69 @@ impl CaptureStore for InMemoryCaptureStore {
     }
 }
 
-/// The landed v1 store (`FileSessionStore`): audio as WAV sessions with
-/// the additive journal linkage, interrupted takes marked on the session.
-/// Its commits are the slow ones this actor's persist workers exist for
-/// (issue #249): `to_wav` encodes the take's whole audio and the store's
-/// write is the fsync'd WAV-before-manifest layout — both run on the
-/// worker thread the actor hands the take to, never on the actor loop.
-pub struct V1FileCaptureStore {
-    store: FileSessionStore,
-}
-
-impl V1FileCaptureStore {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
-        FileSessionStore::open(root)
-            .map(|store| V1FileCaptureStore { store })
-            .map_err(|err| err.to_string())
-    }
-}
-
-impl CaptureStore for V1FileCaptureStore {
-    fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
-        let wav = take.to_wav()?;
-        self.store
-            .create_with_journal(
-                wav,
-                Some(take.sample_duration_ms),
-                take.journal.as_ref().map(|report| report.id.as_str()),
-            )
-            .map(|_| ())
-            .map_err(|err| err.to_string())
-    }
-    fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
-        let wav = take.to_wav()?;
-        let session = self
-            .store
-            .create_with_journal(
-                wav,
-                Some(take.sample_duration_ms),
-                take.journal.as_ref().map(|report| report.id.as_str()),
-            )
-            .map_err(|err| err.to_string())?;
-        self.store
-            .mark_interrupted(&session.id, note)
-            .map(|_| ())
-            .map_err(|err| err.to_string())
-    }
-    fn describe(&self) -> String {
-        "v1-file".to_string()
-    }
-}
-
-/// The storage v2 store (behind `STARLING_STORAGE_V2`, I2): the recorder's
-/// finalized `.sj` journal is adopted into `<root>/audio/` (the journal
-/// format is the one `store_v2` reads) and the `captures` row committed in
-/// one SQLite transaction — the §4 metadata step.
+/// The storage v2 store (D14: THE store — there is no v1 seam anymore).
+/// A take with journal evidence is **adopted**: the recorder's finalized
+/// `.sj` journal is read, verified, sealed to its last valid boundary when
+/// torn, moved into `<root>/audio/`, and the `captures` row committed in
+/// one SQLite transaction — the §4 metadata step, on the store's own
+/// protocol rather than a hand-built row. A take without usable journal
+/// evidence (no journal, a writer that faulted before its first boundary,
+/// an unreadable file) is written from its samples through the same crash
+/// protocol the app's WAV path uses (staging journal → finalize → promote
+/// → commit), so a journal-level problem can never cost the audio.
+///
+/// The evidence the runtime layers on top — `takeCorr`, gaps, the sample /
+/// wall-clock split — rides in `extra_json` on the samples path; on the
+/// adoption path the journal itself is the durable evidence and the row
+/// carries the store's own adoption semantics (plus the salvage note on
+/// the interrupted paths). Nothing reads those keys back today; the
+/// registry is the runtime's session-scoped source of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
-    root: PathBuf,
 }
 
 impl V2CaptureStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
-        let root = root.into();
-        let store = StoreV2::open(&root).map_err(|err| err.to_string())?;
+        let store = StoreV2::open(root).map_err(|err| err.to_string())?;
         Ok(V2CaptureStore {
             store: Mutex::new(store),
-            root,
         })
     }
 
-    fn adopt_journal(&self, take: &TakeRecord) -> Result<(), String> {
-        let audio_dir = self.root.join("audio");
-        std::fs::create_dir_all(&audio_dir).map_err(|err| err.to_string())?;
-        let Some(report) = &take.journal else {
-            return Ok(()); // unjournaled take: row only, noted in extra_json
+    fn commit(
+        &self,
+        take: &TakeRecord,
+        status: CaptureStatus,
+        note: Option<&str>,
+    ) -> Result<(), String> {
+        let mut store = self.store.lock().expect("v2 store lock");
+        // Journal evidence first, when it exists on disk. Adoption failure
+        // (an unreadable source, a destination conflict, no verified
+        // samples) falls through to the samples path below — exactly the
+        // app facade's rule: a journal problem never costs the audio.
+        let adopted = match &take.journal {
+            Some(report) if report.path.exists() => store
+                .adopt_journal(&report.path, note)
+                .ok()
+                .map(|record| record.id),
+            _ => None,
         };
-        let destination = audio_dir.join(format!("{}.sj", take.capture_id));
-        if !destination.exists() {
-            std::fs::copy(&report.path, &destination).map_err(|err| err.to_string())?;
+        if let Some(id) = adopted {
+            // The salvage paths force interrupted-ness regardless of the
+            // journal's own verdict (the app facade's R34 rule): the
+            // interruption derives from how the take ended, not from the
+            // journal's finalized-ness. The note itself already rode along
+            // with the adoption; passing no note keeps its combined
+            // wording intact.
+            if status == CaptureStatus::Interrupted {
+                store
+                    .update_capture_status(&id, CaptureStatus::Interrupted, None)
+                    .map_err(|err| err.to_string())?;
+            }
+            return Ok(());
         }
-        Ok(())
-    }
 
-    fn commit(&self, take: &TakeRecord, status: CaptureStatus) -> Result<(), String> {
-        self.adopt_journal(take)?;
+        // No journal evidence: the take's samples through the §4 protocol.
         let mut meta = TakeMeta::for_device(take.device.clone());
         meta.policy = take.policy.clone();
         meta.extra_json = Some(
@@ -411,31 +387,37 @@ impl V2CaptureStore {
             })
             .to_string(),
         );
-        let record = CaptureRecord {
-            id: take.capture_id.clone(),
-            created_utc: crate::bus::now_ts(),
-            tz: meta.tz.clone(),
-            device: meta.device.clone(),
-            actual_rate: take.sample_rate,
-            policy: meta.policy.clone(),
-            frame_count: take.samples.len() as u64,
-            ack_sample_index: take.acknowledged_samples,
-            journal_hash: take.journal_hash(),
-            status,
-            retention_class: meta.retention_class.clone(),
-            extra_json: meta.extra_json.clone(),
+        let mut v2_take = store
+            .begin_take_at_rate(take.sample_rate, meta)
+            .map_err(|err| err.to_string())?;
+        v2_take
+            .append_and_seal(&take.samples)
+            .map_err(|err| err.to_string())?;
+        let mark = match (status, note) {
+            (CaptureStatus::Interrupted, Some(note)) => CommitMark::Interrupted {
+                note: note.to_string(),
+            },
+            (CaptureStatus::Interrupted, None) => CommitMark::Interrupted {
+                note: "The take ended without a clean stop; its captured samples were kept."
+                    .to_string(),
+            },
+            (CaptureStatus::Complete, _) => CommitMark::Complete,
         };
-        let mut store = self.store.lock().expect("v2 store lock");
-        store.commit_capture(&record).map_err(|err| err.to_string())
+        v2_take
+            .finalize()
+            .map_err(|err| err.to_string())?
+            .commit_marked(&mut store, mark)
+            .map_err(|err| err.to_string())?;
+        Ok(())
     }
 }
 
 impl CaptureStore for V2CaptureStore {
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Complete)
+        self.commit(take, CaptureStatus::Complete, None)
     }
-    fn mark_interrupted(&self, take: &TakeRecord, _note: &str) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Interrupted)
+    fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
+        self.commit(take, CaptureStatus::Interrupted, Some(note))
     }
     fn describe(&self) -> String {
         "storage-v2".to_string()
