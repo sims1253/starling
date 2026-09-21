@@ -1,9 +1,9 @@
 //! Storage v2 core (I2, `docs/program/design/e17-native-runtime.md` §4).
 //!
-//! One data root — `<data-root>/starling-gpui/` — holds both stores side by
-//! side during the transition: the v1 `sessions/` + `journals/` trees (the
-//! app keeps using those by default; no automatic switchover in this
-//! increment) and the v2 layout:
+//! This is THE store (D14: no backwards compatibility of any kind — the
+//! v1 file store remains in the tree only where the runtime state machine
+//! and journal recovery still reference it). The data root —
+//! `<data-root>/starling-gpui/` — holds the v2 layout:
 //!
 //! ```text
 //! <root>/starling.db   SQLite (WAL) transactional metadata
@@ -64,36 +64,24 @@
 //! - tombstoned ids (a `tombstones` row or a file under `quarantine/`,
 //!   R21 semantics) stay dead — recovery never resurrects a confirmed
 //!   deletion, and an interrupted delete is completed, not half-kept.
-//!
-//! # Migration (additive, reversible, dry-run)
-//!
-//! [`StoreV2::migrate_v1_dry_run`] / [`StoreV2::migrate_v1_apply`] import
-//! the v1 [`crate::storage::FileSessionStore`] directories: copies only
-//! (originals are never rewritten), verified by per-record content hashes
-//! in the *sample domain* plus counts — not just row counts — with a
-//! `migration_report.json` written for user review before any cutover.
-//! Unknown v1 manifest fields land in `extra_json`. Rollback
-//! ([`StoreV2::rollback_import`]) discards the imported rows and
-//! quarantines their journals; the v1 originals are untouched throughout.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::audio::{PcmAudio, decode_pcm16_wav};
+use crate::audio::decode_pcm16_wav;
 use crate::journal::{
     self, JournalWriter, read_journal, samples_hash, seal_recovered_journal, sync_dir,
 };
-use crate::storage::{
-    DictationSession, FileSessionStore, SessionStatus, TranscriptionResult, is_safe_path_component,
-    now_iso,
-};
+use crate::storage::{is_safe_path_component, now_iso};
 
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
-/// is refused at open.
-pub const V2_SCHEMA_VERSION: u32 = 1;
+/// is refused at open. v2 added `recognition_attempts.created_utc` (the
+/// real updated-at source for the summaries).
+pub const V2_SCHEMA_VERSION: u32 = 2;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -108,12 +96,10 @@ const STAGING_DIR: &str = "staging";
 const QUARANTINE_DIR: &str = "quarantine";
 const DB_FILE: &str = "starling.db";
 
-/// The migration report file written beside the database for user review.
-pub const MIGRATION_REPORT_FILE: &str = "migration_report.json";
-
-/// Environment variable that opts the app into the v2 store for testing
-/// (I2 ships v2 alongside v1 with no automatic switchover; wiring the app
-/// to consult this flag is cutover work, see the module docs).
+/// Environment variable the runtime state machine's capture store uses to
+/// opt its persistence into v2 (I2: v2 ships alongside v1 there, with no
+/// automatic switchover). The desktop app itself runs v2 unconditionally
+/// (D14) and never reads this flag.
 pub const STORAGE_V2_FLAG_ENV: &str = "STARLING_STORAGE_V2";
 
 /// The §4 schema, in one place. `CREATE ... IF NOT EXISTS` throughout so
@@ -148,7 +134,8 @@ CREATE TABLE IF NOT EXISTS recognition_attempts (
     partial_or_final TEXT NOT NULL,
     status           TEXT NOT NULL,
     timing_json      TEXT,
-    extra_json       TEXT
+    extra_json       TEXT,
+    created_utc      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_recognition_attempts_capture
     ON recognition_attempts(capture_id);
@@ -219,6 +206,12 @@ pub enum StoreV2Error {
     Invalid(String),
     #[error("capture {0} was not found")]
     NotFound(String),
+    /// The journal handed to [`StoreV2::adopt_journal`] held no verified
+    /// samples — a header-only journal from a writer that faulted before
+    /// its first boundary. Not a storage fault: the caller falls back to
+    /// storing its encoded WAV instead of adopting.
+    #[error("capture journal {id} has no verified samples; nothing to adopt")]
+    NoVerifiedSamples { id: String },
     #[error("storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
     #[error("audio error: {0}")]
@@ -277,6 +270,23 @@ pub struct CaptureRecord {
     pub extra_json: Option<String>,
 }
 
+impl CaptureRecord {
+    /// The recovery note an interrupted take carries in `extra_json` (the
+    /// gap/salvage note stating exactly what survived).
+    pub fn recovery_note(&self) -> Option<String> {
+        self.extra_json.as_deref().and_then(|extra| {
+            serde_json::from_str::<serde_json::Value>(extra)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("recovery")
+                        .and_then(|note| note.as_str())
+                        .map(str::to_string)
+                })
+        })
+    }
+}
+
 /// One `recognition_attempts` row (§4 direction). Structured columns carry
 /// what querying needs; everything else (v1 transcripts, request ids,
 /// timing blobs) rides in `extra_json`/`*_json` text.
@@ -294,6 +304,46 @@ pub struct AttemptRecord {
     pub status: String,
     pub timing_json: Option<String>,
     pub extra_json: Option<String>,
+    /// When the attempt was inserted, the real updated-at source for
+    /// summaries. On insert, `None` means "stamp with now_iso()"
+    /// ([`StoreV2::insert_attempt`] applies the default — a caller cannot
+    /// write an explicit NULL); readers see `None` only on rows written
+    /// before the v2 schema added the column.
+    pub created_utc: Option<String>,
+}
+
+impl AttemptRecord {
+    /// Whether this attempt is a completed final transcript.
+    pub fn is_final_transcript(&self) -> bool {
+        self.status == "completed" && self.partial_or_final == "final"
+    }
+
+    /// The v1-shaped transcript this attempt carries, when it has one: the
+    /// verbatim result a writer preserved in `extra_json` (the shape both
+    /// the app writes). `None` when the row has no `extra_json` **or when
+    /// that JSON is not a transcript** — a failed attempt's
+    /// `{"error": ...}` blob, or a corrupted one, deserializes to `None`
+    /// just like an absent column (the parse failure is not
+    /// distinguishable to the caller).
+    pub fn transcript(&self) -> Option<crate::storage::TranscriptionResult> {
+        self.extra_json
+            .as_deref()
+            .and_then(|extra| serde_json::from_str(extra).ok())
+    }
+
+    /// The surfaced failure message on a failed attempt.
+    pub fn failure_message(&self) -> Option<String> {
+        self.extra_json.as_deref().and_then(|extra| {
+            serde_json::from_str::<serde_json::Value>(extra)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .map(str::to_string)
+                })
+        })
+    }
 }
 
 /// Metadata known when a take starts (the columns not derived from the
@@ -397,9 +447,30 @@ impl StoreV2 {
                 // version row is sane and touch nothing else.
             }
             Some(found) if found < V2_SCHEMA_VERSION => {
-                // Lower version: apply the (idempotent) schema and bump.
+                // Lower version: apply the (idempotent) schema, add any
+                // columns introduced since `found` (`CREATE TABLE IF NOT
+                // EXISTS` cannot extend an existing table), and bump.
                 let tx = conn.transaction()?;
                 tx.execute_batch(SCHEMA_SQL)?;
+                if found < 2 {
+                    // v1 → v2: attempts gained a creation timestamp. Rows
+                    // written before the upgrade keep NULL — readers fall
+                    // back to the capture's creation time.
+                    let has_created: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM pragma_table_info('recognition_attempts')
+                             WHERE name = 'created_utc'",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !has_created {
+                        tx.execute_batch(
+                            "ALTER TABLE recognition_attempts ADD COLUMN created_utc TEXT",
+                        )?;
+                    }
+                }
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -508,9 +579,24 @@ impl StoreV2 {
         self.begin_take_with_id(id, 16_000, meta)
     }
 
+    /// [`Self::begin_take`] recording at an explicit sample rate — the
+    /// WAV-import shape, whose decoded bytes carry whatever rate the file
+    /// had. The id is minted the same way. The returned [`V2Take`] owns its
+    /// staging journal: appending, sealing, and finalizing are pure journal
+    /// work with no store access, so a caller sharing one store behind a
+    /// lock may release the lock for the write phase and retake it for
+    /// [`FinalizedTake::commit_marked`].
+    pub fn begin_take_at_rate(
+        &self,
+        sample_rate: u32,
+        meta: TakeMeta,
+    ) -> Result<V2Take, StoreV2Error> {
+        let id = format!("c_{}", uuid::Uuid::new_v4().simple());
+        self.begin_take_with_id(id, sample_rate, meta)
+    }
+
     /// [`Self::begin_take`] with a caller-chosen id and journal sample
-    /// rate — the migration path (the v1 session id becomes the capture
-    /// id so imports are traceable and re-runnable).
+    /// rate (the WAV-save path, which mints its own id).
     fn begin_take_with_id(
         &self,
         id: String,
@@ -689,14 +775,15 @@ impl StoreV2 {
         Ok(())
     }
 
-    /// Inserts a `recognition_attempts` row.
+    /// Inserts a `recognition_attempts` row, stamped with its creation
+    /// time (the summary's updated-at source).
     pub fn insert_attempt(&mut self, attempt: &AttemptRecord) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO recognition_attempts(
                 id, capture_id, backend, model_hash, language, options_json, text,
-                partial_or_final, status, timing_json, extra_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                partial_or_final, status, timing_json, extra_json, created_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 attempt.id,
                 attempt.capture_id,
@@ -709,10 +796,30 @@ impl StoreV2 {
                 attempt.status,
                 attempt.timing_json,
                 attempt.extra_json,
+                attempt.created_utc.clone().unwrap_or_else(now_iso),
             ],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Map one `recognition_attempts` row (column order shared by every
+    /// SELECT in this file).
+    fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRecord> {
+        Ok(AttemptRecord {
+            id: row.get(0)?,
+            capture_id: row.get(1)?,
+            backend: row.get(2)?,
+            model_hash: row.get(3)?,
+            language: row.get(4)?,
+            options_json: row.get(5)?,
+            text: row.get(6)?,
+            partial_or_final: row.get(7)?,
+            status: row.get(8)?,
+            timing_json: row.get(9)?,
+            extra_json: row.get(10)?,
+            created_utc: row.get(11)?,
+        })
     }
 
     /// All attempts for a capture, oldest first (insertion id order is
@@ -720,24 +827,10 @@ impl StoreV2 {
     pub fn attempts_for(&self, capture_id: &str) -> Result<Vec<AttemptRecord>, StoreV2Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, capture_id, backend, model_hash, language, options_json, text,
-                    partial_or_final, status, timing_json, extra_json
+                    partial_or_final, status, timing_json, extra_json, created_utc
              FROM recognition_attempts WHERE capture_id = ?1 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(params![capture_id], |row| {
-            Ok(AttemptRecord {
-                id: row.get(0)?,
-                capture_id: row.get(1)?,
-                backend: row.get(2)?,
-                model_hash: row.get(3)?,
-                language: row.get(4)?,
-                options_json: row.get(5)?,
-                text: row.get(6)?,
-                partial_or_final: row.get(7)?,
-                status: row.get(8)?,
-                timing_json: row.get(9)?,
-                extra_json: row.get(10)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![capture_id], Self::row_to_attempt)?;
         let mut attempts = Vec::new();
         for row in rows {
             attempts.push(row?);
@@ -745,24 +838,42 @@ impl StoreV2 {
         Ok(attempts)
     }
 
-    fn meta_get(&self, key: &str) -> Result<Option<String>, StoreV2Error> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    fn meta_set(&mut self, key: &str, value: &str) -> Result<(), StoreV2Error> {
-        self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
-        Ok(())
+    /// All attempts for every capture in `capture_ids`, oldest first,
+    /// grouped by capture id — one query per chunk instead of one per
+    /// record (the listing path runs after every save, transcript,
+    /// failure, and delete, so the per-record round-trips added up).
+    /// Captures with no attempts are simply absent from the map.
+    pub fn attempts_grouped_by_capture(
+        &self,
+        capture_ids: &[String],
+    ) -> Result<HashMap<String, Vec<AttemptRecord>>, StoreV2Error> {
+        let mut grouped: HashMap<String, Vec<AttemptRecord>> = HashMap::new();
+        // Stay well under SQLite's default 999 host-parameter limit.
+        for chunk in capture_ids.chunks(500) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id, capture_id, backend, model_hash, language, options_json, text,
+                        partial_or_final, status, timing_json, extra_json, created_utc
+                 FROM recognition_attempts WHERE capture_id IN ({placeholders}) ORDER BY rowid"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), Self::row_to_attempt)?;
+            for row in rows {
+                let attempt = row?;
+                grouped
+                    .entry(attempt.capture_id.clone())
+                    .or_default()
+                    .push(attempt);
+            }
+        }
+        Ok(grouped)
     }
 
     // ------------------------------------------------------------------
@@ -850,10 +961,13 @@ impl StoreV2 {
         }
     }
 
-    /// Lazily loads one take's audio (the G02 "load on demand" contract):
-    /// reads and verifies `audio/<id>.sj`. The verified prefix excludes any
-    /// torn tail; `torn_tail_bytes` reports it.
-    pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
+    /// Metadata-only half of [`Self::load_audio`]: the on-disk path of a
+    /// capture's audio journal. [`StoreV2Error::NotFound`] when the id has
+    /// no row; [`StoreV2Error::Invalid`] when the row exists but its journal
+    /// file is gone. Deliberately split out so a caller sharing the store
+    /// behind a lock can resolve the path under the guard and do the heavy
+    /// read + verify + WAV encode (via [`read_audio_journal`]) without it.
+    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {
         validate_capture_id(id)?;
         if self.get_capture(id)?.is_none() {
             return Err(StoreV2Error::NotFound(id.to_string()));
@@ -864,14 +978,15 @@ impl StoreV2 {
                 "capture {id} has no audio journal on disk"
             )));
         }
-        let parsed =
-            read_journal(&path).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        Ok(JournalAudio {
-            sample_rate: parsed.sample_rate,
-            samples: parsed.samples,
-            finalized: parsed.finalized,
-            torn_tail_bytes: parsed.torn_tail_bytes,
-        })
+        Ok(path)
+    }
+
+    /// Lazily loads one take's audio (the G02 "load on demand" contract):
+    /// reads and verifies `audio/<id>.sj`. The verified prefix excludes any
+    /// torn tail; `torn_tail_bytes` reports it.
+    pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
+        let path = self.audio_journal_path(id)?;
+        read_audio_journal(&path)
     }
 
     // ------------------------------------------------------------------
@@ -1187,258 +1302,308 @@ impl StoreV2 {
         Ok(())
     }
 
+
     // ------------------------------------------------------------------
-    // v1 migration (additive, reversible, dry-run).
+    // Daily-use operations.
     // ------------------------------------------------------------------
 
-    /// Dry-run: classify the v1 store and hash every importable record
-    /// without writing anything to v2. The report is written to
-    /// `<root>/migration_report.json` for user review.
-    pub fn migrate_v1_dry_run(
+    /// Adopts a finalized (or faulted) capture journal written elsewhere —
+    /// the live-capture path journals to the recorder's own tree and moves
+    /// the evidence here instead of re-encoding it. The journal is read and
+    /// verified first; a torn tail is sealed to its verified prefix (the
+    /// discarded bytes become a gap note, never a silent join); only then
+    /// is the file renamed into `audio/` (fsyncing both directories) and
+    /// the `captures` row committed.
+    ///
+    /// # What can happen to the source
+    ///
+    /// The source is read, verified, and **sealed in place when its tail is
+    /// torn or it never finalized** — the pre-adoption byte layout is *not*
+    /// preserved. A failure after the seal but before the rename leaves a
+    /// sealed-but-unadopted source at its original path: its verified
+    /// samples are intact, and callers treat any adoption failure as "no
+    /// adoption happened" (the app stores the take from its encoded WAV
+    /// instead). A failure after the rename but before the commit leaves
+    /// the journal in `audio/` with no `captures` row — repaired by the
+    /// next [`Self::reconcile`] (an orphan session), not by restoring the
+    /// source. The capture id is the journal's file stem, so an adopted
+    /// take stays traceable to its origin.
+    pub fn adopt_journal(
         &mut self,
-        v1_root: impl AsRef<Path>,
-    ) -> Result<MigrationReport, StoreV2Error> {
-        let v1_root = v1_root.as_ref();
-        let batch_id = format!("mig_{}", uuid::Uuid::new_v4().simple());
-        let (planned, skipped) = plan_v1_import(v1_root)?;
-        let report = MigrationReport::for_plan(&batch_id, v1_root, &planned, skipped, true);
-        self.write_migration_report(&report)?;
-        Ok(report)
-    }
-
-    /// Verified import: each importable v1 record is copied through the §4
-    /// crash protocol into v2 (staging journal → finalize → promote →
-    /// commit), then verified by re-reading the journal and comparing
-    /// sample-domain content hashes and counts. Originals are only ever
-    /// read. The verified report is written to
-    /// `<root>/migration_report.json`; the batch id it carries is the
-    /// rollback handle ([`Self::rollback_import`]).
-    pub fn migrate_v1_apply(
-        &mut self,
-        v1_root: impl AsRef<Path>,
-    ) -> Result<MigrationReport, StoreV2Error> {
-        let v1_root = v1_root.as_ref();
-        let batch_id = format!("mig_{}", uuid::Uuid::new_v4().simple());
-        let (planned, skipped) = plan_v1_import(v1_root)?;
-        let mut report = MigrationReport::for_plan(&batch_id, v1_root, &planned, skipped, false);
-
-        for planned_record in &planned {
-            let entry = report.records.iter_mut().find(|r| r.id == planned_record.id);
-            let entry = match entry {
-                Some(entry) => entry,
-                None => continue,
-            };
-            match self.import_one(&batch_id, planned_record) {
-                Ok(ImportOutcome {
-                    journal_hash,
-                    sample_hash,
-                    sample_count,
-                }) => {
-                    entry.dest_journal_hash = Some(journal_hash);
-                    entry.dest_sample_hash = Some(sample_hash);
-                    entry.dest_sample_count = Some(sample_count);
-                    entry.verified = Some(
-                        entry.dest_sample_hash.as_deref()
-                            == Some(entry.source_sample_hash.as_str())
-                            && entry.dest_sample_count == Some(entry.source_sample_count),
-                    );
-                }
-                Err(err) => {
-                    entry.error = Some(err.to_string());
-                    entry.verified = Some(false);
-                }
-            }
-        }
-
-        report.counts.imported = report.records.iter().filter(|r| r.error.is_none()).count();
-        report.counts.verified = report
-            .records
-            .iter()
-            .filter(|r| r.verified == Some(true))
-            .count();
-        self.write_migration_report(&report)?;
-        self.meta_set(
-            &format!("migration:{batch_id}"),
-            &serde_json::to_string(&report)
-                .map_err(|err| StoreV2Error::Invalid(err.to_string()))?,
-        )?;
-        Ok(report)
-    }
-
-    fn import_one(
-        &mut self,
-        batch_id: &str,
-        planned: &PlannedRecord,
-    ) -> Result<ImportOutcome, StoreV2Error> {
-        if !is_safe_path_component(&planned.id) {
+        source: impl AsRef<Path>,
+        note: Option<&str>,
+    ) -> Result<CaptureRecord, StoreV2Error> {
+        let source = source.as_ref();
+        let id = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                StoreV2Error::Invalid(format!(
+                    "journal path {:?} has no usable file stem",
+                    source.display()
+                ))
+            })?
+            .to_string();
+        validate_capture_id(&id)?;
+        if self.get_capture(&id)?.is_some() || self.audio_path(&id).exists() {
             return Err(StoreV2Error::Invalid(format!(
-                "v1 session id {:?} is not a safe path component",
-                planned.id
-            )));
-        }
-        if self.get_capture(&planned.id)?.is_some() || self.audio_path(&planned.id).exists() {
-            return Err(StoreV2Error::Invalid(format!(
-                "destination already holds capture {}; refusing to overwrite (re-run after a \
-                 rollback if this was a retry)",
-                planned.id
+                "destination already holds capture {id}; refusing to overwrite"
             )));
         }
 
-        // Copy through the crash protocol: staging → finalize → promote →
-        // commit. A crash mid-import leaves a recoverable orphan, exactly
-        // like a take. The v1 session id becomes the capture id.
-        let extra = serde_json::json!({
-            "importedFrom": "file-v1",
-            "importBatch": batch_id,
-            "v1": planned.v1_extra,
-        });
-        let meta = TakeMeta {
-            tz: String::new(),
-            device: String::new(),
-            policy: "v1-import".to_string(),
-            retention_class: "standard".to_string(),
-            extra_json: Some(
-                serde_json::to_string(&extra)
-                    .map_err(|err| StoreV2Error::Invalid(err.to_string()))?,
+        let mut parsed = read_journal(source).map_err(|err| {
+            StoreV2Error::Invalid(format!(
+                "capture journal {}: {err}",
+                source.display()
+            ))
+        })?;
+        if parsed.samples.is_empty() {
+            return Err(StoreV2Error::NoVerifiedSamples { id: id.clone() });
+        }
+
+        // An unsealed or torn journal is sealed to its verified prefix
+        // first (idempotent), so audio/ only ever holds trailer-valid
+        // files. The discarded tail — if any — is recorded as the gap.
+        let torn_tail_bytes = parsed.torn_tail_bytes;
+        let was_finalized = parsed.finalized;
+        if !was_finalized || torn_tail_bytes > 0 {
+            seal_recovered_journal(source, &parsed)?;
+            parsed.finalized = true;
+            parsed.torn_tail_bytes = 0;
+        }
+
+        std::fs::create_dir_all(self.root.join(AUDIO_DIR))?;
+        let destination = self.audio_path(&id);
+        if let Some(parent) = source.parent() {
+            sync_dir(parent)?;
+        }
+        std::fs::rename(source, &destination)?;
+        sync_dir(&self.root.join(AUDIO_DIR))?;
+
+        let recovery_note = match (torn_tail_bytes, was_finalized) {
+            (torn, _) if torn > 0 => Some(format!(
+                "Adopted from a capture journal whose last {torn} bytes were an \
+                 unfinished write; they were discarded (gap flagged, never joined)."
+            )),
+            (_, false) => Some(
+                "Adopted from a capture journal that was never finalized; audio up \
+                 to the last verified boundary was kept."
+                    .to_string(),
             ),
+            (_, true) => None,
         };
-        let mut take = self.begin_take_with_id(planned.id.clone(), planned.pcm.sample_rate, meta)?;
-        for chunk in planned.pcm.samples.chunks(4096) {
-            take.append_frames(chunk)?;
-        }
-        let ack = take.write_boundary()?;
-        if ack != planned.pcm.samples.len() as u64 {
-            return Err(StoreV2Error::Invalid(format!(
-                "journal acknowledged {ack} samples for {} written",
-                planned.pcm.samples.len()
-            )));
-        }
-        let finalized = take.finalize()?;
-        self.promote_from_staging(&finalized.id)?;
+        let note = [note.map(str::to_string), recovery_note]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let count = parsed.samples.len() as u64;
         let record = CaptureRecord {
-            id: finalized.id.clone(),
-            created_utc: planned.created_utc.clone(),
-            tz: finalized.meta.tz,
-            device: finalized.meta.device,
-            actual_rate: finalized.sample_rate,
-            policy: finalized.meta.policy,
-            frame_count: finalized.total_samples,
-            ack_sample_index: finalized.total_samples,
-            journal_hash: finalized.content_hash,
-            status: if planned.v1_interrupted {
+            id: id.clone(),
+            created_utc: now_iso(),
+            tz: local_tz_label(),
+            device: String::new(),
+            actual_rate: parsed.sample_rate,
+            policy: "adopted".to_string(),
+            frame_count: count,
+            ack_sample_index: count,
+            journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
+            status: if torn_tail_bytes > 0 || !was_finalized {
                 CaptureStatus::Interrupted
             } else {
                 CaptureStatus::Complete
             },
-            retention_class: finalized.meta.retention_class,
-            extra_json: finalized.meta.extra_json,
+            retention_class: "standard".to_string(),
+            extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
         };
         self.commit_capture(&record)?;
-
-        // Recognition history: one attempt row per retained transcript
-        // (history first, current last — the reading order).
-        let mut history = planned.transcript_history.clone();
-        if let Some(current) = planned.transcript.clone() {
-            history.push(current);
-        }
-        for transcript in history {
-            let extra = serde_json::to_string(&transcript)
-                .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-            self.insert_attempt(&AttemptRecord {
-                id: format!("a_{}", uuid::Uuid::new_v4().simple()),
-                capture_id: planned.id.clone(),
-                backend: "v1-import".to_string(),
-                model_hash: None,
-                language: None,
-                options_json: None,
-                text: transcript.text,
-                partial_or_final: "final".to_string(),
-                status: "completed".to_string(),
-                timing_json: None,
-                extra_json: Some(extra),
-            })?;
-        }
-
-        // Verify: re-read the journal from disk and hash its verified
-        // samples — the destination is checked in the sample domain
-        // against the source, not against what we intended to write.
-        let parsed = read_journal(&self.audio_path(&planned.id))
-            .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        Ok(ImportOutcome {
-            journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
-            sample_hash: fnv1a_hex_samples(&parsed.samples),
-            sample_count: parsed.samples.len() as u64,
-        })
+        Ok(record)
     }
 
-    fn write_migration_report(&self, report: &MigrationReport) -> Result<(), StoreV2Error> {
-        let json = serde_json::to_string_pretty(report)
-            .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
-        std::fs::write(self.root.join(MIGRATION_REPORT_FILE), json)?;
+    /// Saves an encoded WAV as a new capture through the full §4 crash
+    /// protocol (staging journal → finalize → promote → commit). The
+    /// import-audio and quiesce-salvage paths arrive as canonical 16 kHz
+    /// WAVs rather than live journals; this writes them through the same
+    /// durable steps a take gets. The audio is verified by re-reading the
+    /// journal before the row commits. Note this decodes the entire WAV
+    /// into an in-memory [`crate::audio::PcmAudio`] while the caller still
+    /// holds the encoded bytes — roughly doubling peak memory for long
+    /// imports; acceptable at desktop scale, worth knowing for future
+    /// bulk-import callers.
+    ///
+    /// Everything runs under the caller's `&mut self`; a caller that shares
+    /// the store behind a lock and wants the journal writes off it drives
+    /// the same steps itself ([`Self::begin_take_at_rate`] +
+    /// [`V2Take::append_and_seal`] + [`V2Take::finalize`] +
+    /// [`FinalizedTake::commit_marked`]).
+    pub fn save_wav_capture(
+        &mut self,
+        wav: &[u8],
+        meta: TakeMeta,
+    ) -> Result<CommittedTake, StoreV2Error> {
+        let pcm = decode_pcm16_wav(wav)?;
+        if pcm.samples.is_empty() {
+            return Err(StoreV2Error::Invalid(
+                "wav has no samples; nothing to store".to_string(),
+            ));
+        }
+        let mut take = self.begin_take_at_rate(pcm.sample_rate, meta)?;
+        take.append_and_seal(&pcm.samples)?;
+        take.finalize()?.commit_marked(self, CommitMark::Complete)
+    }
+
+    /// Marks the start of one recognition attempt on a capture: a
+    /// `recognition_attempts` row with status `started` (v2's analog of the
+    /// v1 `mark_attempt` status bump). Returns the attempt id. Recognizing
+    /// an unknown capture is [`StoreV2Error::NotFound`].
+    pub fn begin_recognition(
+        &mut self,
+        capture_id: &str,
+        backend: &str,
+        options_json: Option<&str>,
+    ) -> Result<String, StoreV2Error> {
+        if self.get_capture(capture_id)?.is_none() {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        let id = format!("a_{}", uuid::Uuid::new_v4().simple());
+        self.insert_attempt(&AttemptRecord {
+            id: id.clone(),
+            capture_id: capture_id.to_string(),
+            backend: backend.to_string(),
+            model_hash: None,
+            language: None,
+            options_json: options_json.map(str::to_string),
+            text: String::new(),
+            partial_or_final: "partial".to_string(),
+            status: "started".to_string(),
+            timing_json: None,
+            extra_json: None,
+            created_utc: None,
+        })?;
+        Ok(id)
+    }
+
+    /// How one recognition attempt ended. Applies to the capture's most
+    /// recent `started` attempt — the app guards one in-flight job per
+    /// capture, so "latest started" is that job. [`StoreV2Error::NotFound`]
+    /// when the capture is gone or no attempt is in flight: the v1 delete
+    /// race maps onto exactly that (a delete cascades the attempts away).
+    pub fn finish_recognition(
+        &mut self,
+        capture_id: &str,
+        outcome: RecognitionOutcome<'_>,
+    ) -> Result<(), StoreV2Error> {
+        if self.get_capture(capture_id)?.is_none() {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        let attempt_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM recognition_attempts
+                 WHERE capture_id = ?1 AND status = 'started'
+                 ORDER BY rowid DESC LIMIT 1",
+                params![capture_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(attempt_id) = attempt_id else {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        };
+
+        let changed = match outcome {
+            RecognitionOutcome::Completed { text, extra_json } => self.conn.execute(
+                "UPDATE recognition_attempts
+                 SET text = ?1, partial_or_final = 'final', status = 'completed',
+                     extra_json = COALESCE(?2, extra_json)
+                 WHERE id = ?3 AND status = 'started'",
+                params![text, extra_json, attempt_id],
+            )?,
+            RecognitionOutcome::Failed { message } => {
+                let extra = serde_json::json!({ "error": message });
+                self.conn.execute(
+                    "UPDATE recognition_attempts
+                     SET status = 'failed', extra_json = ?1
+                     WHERE id = ?2 AND status = 'started'",
+                    params![extra.to_string(), attempt_id],
+                )?
+            }
+        };
+        if changed == 0 {
+            // A second finisher lost the race to the first: never re-write
+            // a terminal row.
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
         Ok(())
     }
 
-    /// The stored report of a completed migration batch (see
-    /// [`Self::migrate_v1_apply`]), for review before cutover and as the
-    /// record of what a rollback would discard.
-    pub fn migration_report(&self, batch_id: &str) -> Result<Option<MigrationReport>, StoreV2Error> {
-        match self.meta_get(&format!("migration:{batch_id}"))? {
-            None => Ok(None),
-            Some(text) => serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|err| StoreV2Error::Invalid(format!("stored migration report: {err}"))),
-        }
+    /// [`Self::finish_recognition`] with the v1-shaped transcript result:
+    /// the full result (text, segments, duration, request id) is preserved
+    /// verbatim in the attempt row.
+    pub fn finish_recognition_transcript(
+        &mut self,
+        capture_id: &str,
+        transcript: &crate::storage::TranscriptionResult,
+    ) -> Result<(), StoreV2Error> {
+        let text = transcript.text.clone();
+        let extra = serde_json::to_string(transcript)
+            .map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+        self.finish_recognition(
+            capture_id,
+            RecognitionOutcome::Completed {
+                text: &text,
+                extra_json: Some(&extra),
+            },
+        )
     }
 
-    /// Rollback (reversible migration): discard every row imported by
-    /// `batch_id` — their journals are moved into `quarantine/` (never
-    /// unlinked; reconciliation treats them as tombstoned) — and drop the
-    /// batch's `meta` entry. The v1 originals are of course untouched.
-    /// Returns how many captures were discarded.
-    pub fn rollback_import(&mut self, batch_id: &str) -> Result<usize, StoreV2Error> {
-        let marker = format!("\"importBatch\":\"{batch_id}\"");
-        let mut ids = Vec::new();
+    /// Finishes every `started` attempt left behind by a previous run
+    /// (v2's analog of the v1 "stuck in Transcribing" startup fix): each is
+    /// marked failed with `note`, because the process that started it is
+    /// gone. Returns the affected capture ids. Completed attempts are
+    /// untouched.
+    pub fn interrupt_stale_attempts(&mut self, note: &str) -> Result<Vec<String>, StoreV2Error> {
+        let mut stale = Vec::new();
         {
-            let mut stmt = self.conn.prepare("SELECT id, extra_json FROM captures")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?;
-            for row in rows {
-                let (id, extra) = row?;
-                if extra.as_deref().is_some_and(|text| text.contains(&marker)) {
-                    ids.push(id);
-                }
-            }
-        }
-
-        for id in &ids {
-            let audio = self.audio_path(id);
-            if audio.exists() {
-                std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
-                let destination = self.quarantine_path(id);
-                let _ = std::fs::remove_file(&destination);
-                std::fs::rename(&audio, &destination)?;
-                sync_dir(&self.root.join(AUDIO_DIR))?;
-                sync_dir(&self.root.join(QUARANTINE_DIR))?;
-            }
-        }
-
-        let tx = self.conn.transaction()?;
-        for id in &ids {
-            tx.execute(
-                "INSERT OR REPLACE INTO tombstones(id, kind, deleted_utc, retention)
-                 VALUES (?1, 'migration-rollback', ?2, 'quarantined')",
-                params![id, now_iso()],
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT capture_id FROM recognition_attempts
+                 WHERE status = 'started' ORDER BY capture_id",
             )?;
-            tx.execute("DELETE FROM captures WHERE id = ?1", params![id])?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                stale.push(row?);
+            }
         }
-        tx.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            params![format!("migration:{batch_id}")],
-        )?;
-        tx.commit()?;
-        Ok(ids.len())
+        for capture_id in &stale {
+            self.finish_recognition(capture_id, RecognitionOutcome::Failed { message: note })?;
+        }
+        Ok(stale)
     }
+}
+
+/// How one recognition attempt ended ([`StoreV2::finish_recognition`]).
+#[derive(Debug, Clone, Copy)]
+pub enum RecognitionOutcome<'a> {
+    /// The backend returned text; `extra_json` carries the full v1-shaped
+    /// transcript (segments, duration, request id) verbatim when the caller
+    /// has one.
+    Completed {
+        text: &'a str,
+        extra_json: Option<&'a str>,
+    },
+    /// The attempt failed; `message` is surfaced with the row.
+    Failed { message: &'a str },
+}
+
+/// How a finalized take's `captures` row is written at commit time
+/// ([`FinalizedTake::commit_marked`]). `Interrupted` writes the status and
+/// its recovery note inside the commit transaction itself — there is no
+/// second update that a crash could skip (R34: a salvaged take must never
+/// rest as a complete take without its note).
+#[derive(Debug, Clone)]
+pub enum CommitMark {
+    Complete,
+    Interrupted { note: String },
 }
 
 impl V2Take {
@@ -1457,6 +1622,25 @@ impl V2Take {
     /// count (§3: acknowledged = boundary fsynced).
     pub fn write_boundary(&mut self) -> Result<u64, StoreV2Error> {
         Ok(self.writer.write_boundary()?)
+    }
+
+    /// Appends `samples` in §3-sized chunks and writes the closing
+    /// boundary, verifying the acknowledged count covers everything
+    /// written (the write half of the WAV-import protocol). Pure journal
+    /// work through the take's own writer — no store access, so it needs
+    /// no store lock.
+    pub fn append_and_seal(&mut self, samples: &[f32]) -> Result<(), StoreV2Error> {
+        for chunk in samples.chunks(4096) {
+            self.append_frames(chunk)?;
+        }
+        let acked = self.write_boundary()?;
+        if acked != samples.len() as u64 {
+            return Err(StoreV2Error::Invalid(format!(
+                "journal acknowledged {acked} samples for {} written",
+                samples.len()
+            )));
+        }
+        Ok(())
     }
 
     /// §4 step 2 (first half): trailer with length + content hash, fsync
@@ -1479,21 +1663,42 @@ impl V2Take {
     /// [`CommittedTake`] is the durable ack — it exists only after the
     /// SQLite commit.
     pub fn finish(self, store: &mut StoreV2) -> Result<CommittedTake, StoreV2Error> {
-        let finalized = self.finalize()?;
-        store.promote_from_staging(&finalized.id)?;
+        self.finalize()?.commit_marked(store, CommitMark::Complete)
+    }
+}
+
+impl FinalizedTake {
+    /// §4 steps 2 (second half) – 4: promote out of staging, commit the
+    /// `captures` row (one transaction), sweep staging. The commit is
+    /// where the row first exists — with [`CommitMark::Interrupted`] the
+    /// status and recovery note land in that same transaction, so no crash
+    /// window can leave a salvaged take looking complete (R34).
+    pub fn commit_marked(
+        self,
+        store: &mut StoreV2,
+        mark: CommitMark,
+    ) -> Result<CommittedTake, StoreV2Error> {
+        store.promote_from_staging(&self.id)?;
+        let (status, extra_json) = match mark {
+            CommitMark::Complete => (CaptureStatus::Complete, self.meta.extra_json),
+            CommitMark::Interrupted { note } => (
+                CaptureStatus::Interrupted,
+                Some(merge_extra_note(self.meta.extra_json.as_deref(), &note)),
+            ),
+        };
         let record = CaptureRecord {
-            id: finalized.id.clone(),
-            created_utc: finalized.created_utc.clone(),
-            tz: finalized.meta.tz.clone(),
-            device: finalized.meta.device.clone(),
-            actual_rate: finalized.sample_rate,
-            policy: finalized.meta.policy.clone(),
-            frame_count: finalized.total_samples,
-            ack_sample_index: finalized.total_samples,
-            journal_hash: finalized.content_hash,
-            status: CaptureStatus::Complete,
-            retention_class: finalized.meta.retention_class,
-            extra_json: finalized.meta.extra_json,
+            id: self.id.clone(),
+            created_utc: self.created_utc.clone(),
+            tz: self.meta.tz.clone(),
+            device: self.meta.device.clone(),
+            actual_rate: self.sample_rate,
+            policy: self.meta.policy.clone(),
+            frame_count: self.total_samples,
+            ack_sample_index: self.total_samples,
+            journal_hash: self.content_hash,
+            status,
+            retention_class: self.meta.retention_class.clone(),
+            extra_json,
         };
         store.commit_capture(&record)?;
         store.gc_staging()?;
@@ -1579,6 +1784,56 @@ pub struct ReconciliationReport {
     pub unreadable: Vec<(String, String)>,
 }
 
+impl ReconciliationReport {
+    /// Whether anything user-facing happened (the app surfaces a summary
+    /// only when there is something to say).
+    pub fn has_findings(&self) -> bool {
+        !self.recovered_torn.is_empty()
+            || !self.promoted_finalized.is_empty()
+            || !self.orphan_sessions.is_empty()
+            || !self.marked_interrupted.is_empty()
+            || !self.completed_deletes.is_empty()
+            || !self.unreadable.is_empty()
+    }
+
+    /// One-line summary for the app's error banner, in the voice of the v1
+    /// recovery report: what was recovered, what was flagged, what was
+    /// kept. Counts only — per-record detail lives in the report fields.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        let recovered =
+            self.recovered_torn.len() + self.promoted_finalized.len() + self.orphan_sessions.len();
+        if recovered > 0 {
+            parts.push(format!(
+                "recovered {recovered} interrupted recording{} into history",
+                if recovered == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.marked_interrupted.is_empty() {
+            parts.push(format!(
+                "{} recording{} marked interrupted (audio missing)",
+                self.marked_interrupted.len(),
+                if self.marked_interrupted.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.completed_deletes.is_empty() {
+            parts.push(format!(
+                "completed {} pending deletion{}",
+                self.completed_deletes.len(),
+                if self.completed_deletes.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.unreadable.is_empty() {
+            parts.push(format!(
+                "{} journal file{} could not be read and were left in place",
+                self.unreadable.len(),
+                if self.unreadable.len() == 1 { "" } else { "s" }
+            ));
+        }
+        format!("Startup scan: {}.", parts.join("; "))
+    }
+}
+
 /// One torn-take recovery, with the discarded tail size (the gap).
 #[derive(Debug, Clone)]
 pub struct RecoveredTake {
@@ -1586,141 +1841,13 @@ pub struct RecoveredTake {
     pub torn_tail_bytes: u64,
 }
 
-/// The JSON migration report produced for user review before any cutover.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigrationReport {
-    /// Report format version (independent of the DB schema version).
-    pub schema_version: u32,
-    pub generated_at: String,
-    pub source_root: String,
-    pub dry_run: bool,
-    pub batch_id: String,
-    pub counts: MigrationCounts,
-    pub records: Vec<MigratedRecord>,
-    pub skipped_damaged: Vec<SkippedRecord>,
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigrationCounts {
-    /// Readable v1 records found (sessions plus recovered orphans).
-    pub source_sessions: usize,
-    /// v1 records too damaged to read.
-    pub source_damaged: usize,
-    /// Records copied into v2 without error.
-    pub imported: usize,
-    /// Records whose re-read destination content hash + count matched the
-    /// source exactly.
-    pub verified: usize,
-    /// Damaged records listed in `skipped_damaged`.
-    pub skipped_damaged: usize,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MigratedRecord {
-    pub id: String,
-    /// "session" (manifest present) or "orphan" (WAV-only directory).
-    pub category: String,
-    pub v1_status: String,
-    /// FNV-1a 64 hex over the source `recording.wav` bytes.
-    pub source_wav_hash: String,
-    /// FNV-1a 64 hex over the source's decoded f32 samples (little-endian
-    /// bit patterns) — the domain the destination is verified in.
-    pub source_sample_hash: String,
-    pub source_sample_count: u64,
-    pub dest_journal_hash: Option<String>,
-    pub dest_sample_hash: Option<String>,
-    pub dest_sample_count: Option<u64>,
-    pub verified: Option<bool>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkippedRecord {
-    pub id: String,
-    pub reason: String,
-}
-
-/// Internal: everything needed to import one v1 record.
-struct PlannedRecord {
-    id: String,
-    category: &'static str,
-    v1_interrupted: bool,
-    v1_status: String,
-    created_utc: String,
-    transcript: Option<TranscriptionResult>,
-    transcript_history: Vec<TranscriptionResult>,
-    pcm: PcmAudio,
-    wav_hash: String,
-    sample_hash: String,
-    v1_extra: serde_json::Value,
-}
-
-struct ImportOutcome {
-    journal_hash: String,
-    sample_hash: String,
-    sample_count: u64,
-}
-
-impl MigrationReport {
-    fn for_plan(
-        batch_id: &str,
-        source_root: &Path,
-        planned: &[PlannedRecord],
-        skipped: Vec<SkippedRecord>,
-        dry_run: bool,
-    ) -> Self {
-        let records = planned
-            .iter()
-            .map(|record| MigratedRecord {
-                id: record.id.clone(),
-                category: record.category.to_string(),
-                v1_status: record.v1_status.clone(),
-                source_wav_hash: record.wav_hash.clone(),
-                source_sample_hash: record.sample_hash.clone(),
-                source_sample_count: record.pcm.samples.len() as u64,
-                dest_journal_hash: None,
-                dest_sample_hash: None,
-                dest_sample_count: None,
-                verified: None,
-                error: None,
-            })
-            .collect();
-        let counts = MigrationCounts {
-            source_sessions: planned.len(),
-            source_damaged: skipped.len(),
-            imported: 0,
-            verified: 0,
-            skipped_damaged: skipped.len(),
-        };
-        Self {
-            schema_version: 1,
-            generated_at: now_iso(),
-            source_root: source_root.display().to_string(),
-            dry_run,
-            batch_id: batch_id.to_string(),
-            counts,
-            records,
-            skipped_damaged: skipped,
-        }
-    }
-
-    /// The path this report is written to under the store root.
-    pub fn path_for_root(root: &Path) -> PathBuf {
-        root.join(MIGRATION_REPORT_FILE)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Free helpers.
 // ---------------------------------------------------------------------------
 
-/// Whether the testing flag is on. The app reads its config/env and calls
-/// [`v2_enabled_from`]; I2 ships with the flag off (v1 remains the store
-/// of record — see the module docs).
+/// Whether the testing flag is on. Only the runtime state machine reads
+/// it (see [`STORAGE_V2_FLAG_ENV`]); the desktop app runs v2
+/// unconditionally (D14).
 pub fn v2_enabled_for_testing() -> bool {
     v2_enabled_from(std::env::var(STORAGE_V2_FLAG_ENV).ok().as_deref())
 }
@@ -1772,6 +1899,21 @@ fn merge_extra_note(current: Option<&str>, note: &str) -> String {
         .expect("a JSON object serializes")
 }
 
+/// Read and verify one audio journal from disk (the lock-free half of
+/// [`StoreV2::load_audio`]). No store state is touched — only the file at
+/// `path` — so a caller sharing the store behind a lock resolves the path
+/// via [`StoreV2::audio_journal_path`] under the guard and does this work
+/// without it.
+pub fn read_audio_journal(path: &Path) -> Result<JournalAudio, StoreV2Error> {
+    let parsed = read_journal(path).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+    Ok(JournalAudio {
+        sample_rate: parsed.sample_rate,
+        samples: parsed.samples,
+        finalized: parsed.finalized,
+        torn_tail_bytes: parsed.torn_tail_bytes,
+    })
+}
+
 /// Sorted `.sj` stems under `dir` (missing dir = empty).
 fn journal_ids_in(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1791,151 +1933,6 @@ fn journal_ids_in(dir: &Path) -> Vec<String> {
     ids
 }
 
-/// FNV-1a 64 over raw bytes, hex-encoded — the house content hash.
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-/// The v1 manifest keys this migration understands; anything else is an
-/// unknown field and lands in `extra_json` verbatim.
-const KNOWN_V1_MANIFEST_FIELDS: &[&str] = &[
-    "schemaVersion",
-    "id",
-    "createdAt",
-    "updatedAt",
-    "status",
-    "audioFile",
-    "durationMs",
-    "attemptCount",
-    "transcript",
-    "transcriptHistory",
-    "lastError",
-    "journalId",
-];
-
-/// Classify a v1 store for migration. Readable records (including
-/// recovered orphans — G02's classification) become [`PlannedRecord`]s
-/// with source hashes; damaged records become skips with reasons.
-/// Originals are only read.
-fn plan_v1_import(v1_root: &Path) -> Result<(Vec<PlannedRecord>, Vec<SkippedRecord>), StoreV2Error> {
-    let store = FileSessionStore::open(v1_root)?;
-    let mut planned = Vec::new();
-    let mut skipped = Vec::new();
-
-    for record in store.list_records()? {
-        match record {
-            crate::storage::ListedRecord::Session(summary) => {
-                let Some(session) = store.get(&summary.id)? else {
-                    skipped.push(SkippedRecord {
-                        id: summary.id.clone(),
-                        reason: "record vanished while planning the migration".to_string(),
-                    });
-                    continue;
-                };
-                match plan_one(v1_root, &session) {
-                    Ok(record) => planned.push(record),
-                    Err(reason) => skipped.push(SkippedRecord {
-                        id: session.id,
-                        reason,
-                    }),
-                }
-            }
-            crate::storage::ListedRecord::Damaged(damaged) => {
-                skipped.push(SkippedRecord {
-                    id: damaged.id,
-                    reason: damaged.reason,
-                });
-            }
-        }
-    }
-
-    planned.sort_by(|left, right| left.id.cmp(&right.id));
-    skipped.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok((planned, skipped))
-}
-
-/// Build one [`PlannedRecord`]: decode the WAV (the sample-domain hashes
-/// are computed over its decoded samples), collect unknown manifest
-/// fields.
-fn plan_one(v1_root: &Path, session: &DictationSession) -> Result<PlannedRecord, String> {
-    let dir = v1_root.join(&session.id);
-    let wav_path = dir.join("recording.wav");
-    let wav_bytes =
-        std::fs::read(&wav_path).map_err(|err| format!("recording.wav: {err}"))?;
-    let pcm = decode_pcm16_wav(&wav_bytes)
-        .map_err(|err| format!("recording.wav does not decode: {err}"))?;
-
-    // Unknown manifest fields → extra_json, verbatim values.
-    let mut v1_extra = serde_json::Map::new();
-    if let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) {
-        if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            let unknown: serde_json::Map<String, serde_json::Value> = fields
-                .into_iter()
-                .filter(|(key, _)| !KNOWN_V1_MANIFEST_FIELDS.contains(&key.as_str()))
-                .collect();
-            if !unknown.is_empty() {
-                v1_extra.insert("unknownFields".to_string(), unknown.into());
-            }
-        }
-    }
-    v1_extra.insert(
-        "status".to_string(),
-        serde_json::Value::String(status_to_text(session.status).to_string()),
-    );
-    if let Some(duration) = session.duration_ms {
-        v1_extra.insert("durationMs".to_string(), serde_json::json!(duration));
-    }
-    v1_extra.insert("attemptCount".to_string(), serde_json::json!(session.attempt_count));
-    if let Some(error) = &session.last_error {
-        v1_extra.insert("lastError".to_string(), serde_json::json!(error));
-    }
-    if let Some(journal_id) = &session.journal_id {
-        v1_extra.insert("journalId".to_string(), serde_json::json!(journal_id));
-    }
-
-    let category = if dir.join("manifest.json").exists() {
-        "session"
-    } else {
-        "orphan"
-    };
-    let samples = &pcm.samples;
-    Ok(PlannedRecord {
-        id: session.id.clone(),
-        category,
-        v1_interrupted: session.status == SessionStatus::Interrupted,
-        v1_status: status_to_text(session.status).to_string(),
-        created_utc: session.created_at.clone(),
-        transcript: session.transcript.clone(),
-        transcript_history: session.transcript_history.clone(),
-        sample_hash: fnv1a_hex_samples(samples),
-        wav_hash: fnv1a_hex(&wav_bytes),
-        pcm,
-        v1_extra: serde_json::Value::Object(v1_extra),
-    })
-}
-
-/// Sample-domain hash: FNV-1a 64 over the little-endian bit patterns of
-/// the f32 samples — identical to what a journal seals into its trailer,
-/// so source and destination compare without re-encoding WAV headers.
-fn fnv1a_hex_samples(samples: &[f32]) -> String {
-    format!("{:016x}", samples_hash(samples))
-}
-
-fn status_to_text(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Captured => "captured",
-        SessionStatus::Transcribing => "transcribing",
-        SessionStatus::Transcribed => "transcribed",
-        SessionStatus::Failed => "failed",
-        SessionStatus::Interrupted => "interrupted",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -1992,12 +1989,101 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_schema_database_is_upgraded_in_place() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(40, 0));
+        let id = take.record.id.clone();
+        store
+            .begin_recognition(&id, "starling:parakeet", None)
+            .expect("begin");
+        drop(store);
+
+        // Rewind the database to the v1 shape: drop the created_utc
+        // column's data by rebuilding the table without it (SQLite cannot
+        // drop columns portably) and stamp schema_version 1.
+        {
+            let conn = Connection::open(dir.path().join("v2").join(DB_FILE)).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE recognition_attempts_v1 (
+                    id TEXT PRIMARY KEY,
+                    capture_id TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+                    backend TEXT NOT NULL,
+                    model_hash TEXT,
+                    language TEXT,
+                    options_json TEXT,
+                    text TEXT NOT NULL,
+                    partial_or_final TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timing_json TEXT,
+                    extra_json TEXT
+                 );
+                 INSERT INTO recognition_attempts_v1
+                    SELECT id, capture_id, backend, model_hash, language, options_json,
+                           text, partial_or_final, status, timing_json, extra_json
+                    FROM recognition_attempts;
+                 DROP TABLE recognition_attempts;
+                 ALTER TABLE recognition_attempts_v1 RENAME TO recognition_attempts;
+                 UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+            )
+            .expect("rewind to v1");
+        }
+
+        // Opening upgrades: version bumped, column added, and the
+        // pre-upgrade attempt reads back with NULL created_utc (readers
+        // fall back to the capture's creation time).
+        let mut store = store_in(&dir);
+        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].created_utc, None);
+        // The upgraded store accepts new work normally.
+        store
+            .finish_recognition(&id, RecognitionOutcome::Failed { message: "x" })
+            .expect("finish on upgraded schema");
+    }
+
+    #[test]
+    fn attempts_grouped_by_capture_fetches_a_page_in_one_query() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let first = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
+        let second = committed_take(&mut store, &ramp(30, 1)).record.id.clone();
+        store
+            .begin_recognition(&first, "starling:parakeet", None)
+            .expect("begin first");
+        store
+            .begin_recognition(&second, "starling:parakeet", None)
+            .expect("begin second");
+        store
+            .finish_recognition(&first, RecognitionOutcome::Failed { message: "nope" })
+            .expect("fail first");
+        store
+            .begin_recognition(&first, "starling:parakeet", None)
+            .expect("retry first");
+
+        let grouped = store
+            .attempts_grouped_by_capture(&[first.clone(), second.clone()])
+            .expect("grouped");
+        assert_eq!(grouped.len(), 2, "both captures present");
+        assert_eq!(grouped[&first].len(), 2, "history + retry, oldest first");
+        assert_eq!(grouped[&first][0].status, "failed");
+        assert_eq!(grouped[&first][1].status, "started");
+        assert_eq!(grouped[&second].len(), 1);
+
+        // Ids with no attempts are absent, not empty entries.
+        let empty = store
+            .attempts_grouped_by_capture(&["c_nope".to_string()])
+            .expect("grouped");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn higher_schema_version_database_is_refused_without_mutation() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
         let take = committed_take(&mut store, &ramp(50, 0));
         drop(store);
-
         // A future build stamped a higher version.
         {
             let conn = Connection::open(dir.path().join("v2").join(DB_FILE)).expect("open");
@@ -2113,8 +2199,15 @@ mod tests {
                 status: "completed".to_string(),
                 timing_json: Some(r#"{"totalMs":120}"#.to_string()),
                 extra_json: Some(extra.to_string()),
+                created_utc: None,
             })
             .expect("insert attempt");
+
+        // Insert stamped it with a creation time (the summary's real
+        // updated-at source), and it round-trips.
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].created_utc.is_some(), "stamped on insert");
 
         let attempts = store.attempts_for(&id).expect("attempts");
         assert_eq!(attempts.len(), 1);
@@ -2536,7 +2629,7 @@ mod tests {
         }
     }
 
-    // ---- migration ----------------------------------------------------
+    // ---- hand-built WAV fixture ---------------------------------------
 
     /// A minimal canonical WAV built by hand (same shape the storage tests
     /// use) so this suite stays independent of the audio encoder.
@@ -2567,313 +2660,380 @@ mod tests {
         wav
     }
 
-    /// The mixed v1 fixture: good sessions (one with transcripts and
-    /// history, one with unknown manifest fields), an orphan, and every
-    /// damaged shape. Returns (tempdir, expected readable ids).
-    fn mixed_v1_store() -> (TempDir, Vec<String>) {
-        let temp = TempDir::new().expect("tempdir");
-        let store = FileSessionStore::open(temp.path().join("sessions"))
-            .expect("open v1 store");
+    // ---- daily-use operations -----------------------------------------
 
-        let plain = store
-            .create(wav_bytes(&ramp(100, 0)), Some(100.0))
-            .expect("plain session");
-
-        let transcribed = store
-            .create(wav_bytes(&ramp(150, 100)), None)
-            .expect("transcribed session");
-        store
-            .save_transcript(
-                &transcribed.id,
-                TranscriptionResult {
-                    text: "first pass".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .expect("first transcript");
-        store
-            .save_transcript(
-                &transcribed.id,
-                TranscriptionResult {
-                    text: "second pass".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: Some("req-2".to_string()),
-                },
-            )
-            .expect("second transcript");
-
-        let interrupted = store
-            .create_with_journal(wav_bytes(&ramp(80, 250)), Some(80.0), Some("j_v1"))
-            .expect("interrupted session");
-        store
-            .mark_interrupted(&interrupted.id, "torn tail of 12 bytes")
-            .expect("mark interrupted");
-
-        // Unknown manifest fields from a future v1 writer.
-        let unknown = store.create(wav_bytes(&ramp(60, 330)), None).expect("unknown");
-        let manifest_path = temp
-            .path()
-            .join("sessions")
-            .join(&unknown.id)
-            .join("manifest.json");
-        let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
-        let mut manifest: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        manifest
-            .as_object_mut()
-            .expect("object")
-            .insert("futureField".into(), serde_json::json!({"a": 1}));
-        manifest
-            .as_object_mut()
-            .expect("object")
-            .insert("anotherUnknown".into(), serde_json::json!("kept verbatim"));
-        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap())
-            .expect("rewrite manifest");
-
-        // A WAV-only orphan directory.
-        let orphan_dir = temp.path().join("sessions").join("orphan-take");
-        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
-        std::fs::write(orphan_dir.join("recording.wav"), wav_bytes(&ramp(70, 400)))
-            .expect("orphan wav");
-
-        // Damaged shapes the migration must skip, not choke on.
-        let missing_wav = store.create(wav_bytes(&ramp(10, 0)), None).expect("missing wav");
-        std::fs::remove_file(
-            temp.path().join("sessions").join(&missing_wav.id).join("recording.wav"),
-        )
-        .expect("remove wav");
-
-        let garbage_dir = temp.path().join("sessions").join("garbage-wav");
-        std::fs::create_dir_all(&garbage_dir).expect("garbage dir");
-        std::fs::write(garbage_dir.join("recording.wav"), b"not audio").expect("garbage wav");
-
-        let mut ids = vec![
-            plain.id.clone(),
-            transcribed.id.clone(),
-            interrupted.id.clone(),
-            unknown.id.clone(),
-            "orphan-take".to_string(),
-        ];
-        ids.sort();
-        (temp, ids)
-    }
-
-    /// Snapshot every file under `dir` as (path, hash) for byte-identity
-    /// checks.
-    fn snapshot(dir: &Path) -> Vec<(PathBuf, String)> {
-        let mut files = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(current) = stack.pop() {
-            for entry in std::fs::read_dir(&current).expect("read dir") {
-                let path = entry.expect("entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else {
-                    let bytes = std::fs::read(&path).expect("read file");
-                    files.push((path, fnv1a_hex(&bytes)));
-                }
-            }
+    /// A finalized capture journal in the recorder's own tree, outside the
+    /// store (the live-capture shape: `journals/<id>.sj`).
+    fn external_journal(dir: &TempDir, id: &str, samples: &[f32], finalize: bool) -> PathBuf {
+        let tree = dir.path().join("capture-tree");
+        std::fs::create_dir_all(&tree).expect("capture tree");
+        let mut writer =
+            JournalWriter::create_named(&tree, id.to_string(), 16_000).expect("writer");
+        writer.append_frames(samples).expect("append");
+        writer.write_boundary().expect("boundary");
+        if finalize {
+            writer.finalize().expect("finalize");
         }
-        files.sort();
-        files
+        tree.join(format!("{id}.sj"))
     }
 
     #[test]
-    fn migration_dry_run_reports_without_touching_either_side() {
-        let (v1, expected_ids) = mixed_v1_store();
-        let before = snapshot(&v1.path().join("sessions"));
+    fn adopt_journal_moves_a_finalized_journal_in_and_commits() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
+        let samples = ramp(300, 0);
+        let source = external_journal(&dir, "j_adopt", &samples, true);
 
-        let report = store
-            .migrate_v1_dry_run(v1.path().join("sessions"))
-            .expect("dry run");
+        let record = store.adopt_journal(&source, None).expect("adopt");
+        assert_eq!(record.id, "j_adopt");
+        assert_eq!(record.status, CaptureStatus::Complete);
+        assert_eq!(record.actual_rate, 16_000);
+        assert_eq!(record.frame_count, 300);
 
-        assert!(report.dry_run);
-        assert_eq!(report.counts.source_sessions, 5, "4 sessions + 1 orphan");
-        assert_eq!(report.counts.source_damaged, 2);
-        assert_eq!(report.counts.imported, 0, "a dry run imports nothing");
-        let got: Vec<String> = {
-            let mut ids: Vec<String> = report.records.iter().map(|r| r.id.clone()).collect();
-            ids.sort();
-            ids
-        };
-        assert_eq!(got, expected_ids);
-        let skipped: Vec<String> = report
-            .skipped_damaged
-            .iter()
-            .map(|record| record.id.clone())
-            .collect();
-        assert!(skipped.contains(&"garbage-wav".to_string()));
-        assert!(
-            report
-                .skipped_damaged
-                .iter()
-                .any(|record| record.reason.contains("recording.wav")),
-            "damaged reasons are surfaced: {:?}",
-            report.skipped_damaged
-        );
-        // Orphan vs session categorization.
-        let orphan = report
-            .records
-            .iter()
-            .find(|record| record.id == "orphan-take")
-            .expect("orphan planned");
-        assert_eq!(orphan.category, "orphan");
-        assert_eq!(orphan.v1_status, "interrupted");
-
-        // Nothing entered v2…
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        assert!(journal_ids_in(&store.root.join(AUDIO_DIR)).is_empty());
-        // …but the report file exists for review.
-        assert!(MigrationReport::path_for_root(&store.root).exists());
-
-        // …and the v1 originals are byte-identical.
-        assert_eq!(snapshot(&v1.path().join("sessions")), before);
-    }
-
-    #[test]
-    fn migration_apply_verifies_hashes_and_preserves_originals() {
-        let (v1, _) = mixed_v1_store();
-        let sessions = v1.path().join("sessions");
-        let before = snapshot(&sessions);
-        let dir = TempDir::new().expect("tempdir");
-        let mut store = store_in(&dir);
-
-        let report = store.migrate_v1_apply(&sessions).expect("apply");
-        assert!(!report.dry_run);
-        assert_eq!(report.counts.imported, 5);
-        assert_eq!(report.counts.verified, 5, "every record verified");
-        assert!(report.records.iter().all(|record| record.error.is_none()));
-        for record in &report.records {
-            assert_eq!(record.verified, Some(true), "{:?}", record.id);
-            assert_eq!(
-                record.dest_sample_hash.as_deref(),
-                Some(record.source_sample_hash.as_str()),
-                "sample-domain hashes match for {}",
-                record.id
-            );
-            assert_eq!(record.dest_sample_count, Some(record.source_sample_count));
-            assert!(!record.source_wav_hash.is_empty());
-        }
-
-        // The v1 originals were only read.
-        assert_eq!(snapshot(&sessions), before, "originals byte-identical");
-
-        // v2 now lists every imported capture, metadata-only.
-        let page = store.list_records(0, 10).expect("list");
-        assert_eq!(page.total, 5);
-        for record in &page.records {
-            match record {
-                ListedCapture::Capture(listing) => {
-                    assert!(listing.problems.is_empty());
-                    // Unknown manifest fields survived in extra_json.
-                    let extra: serde_json::Value = serde_json::from_str(
-                        listing.record.extra_json.as_deref().expect("extra"),
-                    )
-                    .expect("parse extra");
-                    assert_eq!(extra["importedFrom"], "file-v1");
-                    assert_eq!(extra["importBatch"], report.batch_id);
-                    if listing.record.id == "orphan-take" {
-                        assert_eq!(listing.record.status, CaptureStatus::Interrupted);
-                        assert_eq!(extra["v1"]["status"], "interrupted");
-                    }
-                }
-                other => panic!("imported records must be clean: {other:?}"),
-            }
-        }
-
-        // The session with unknown fields carried them verbatim.
-        let unknown_row = {
-            let mut found = None;
-            for record in &page.records {
-                if let ListedCapture::Capture(listing) = record {
-                    let extra: serde_json::Value = serde_json::from_str(
-                        listing.record.extra_json.as_deref().expect("extra"),
-                    )
-                    .expect("parse");
-                    if extra["v1"]["unknownFields"]["futureField"]["a"] == serde_json::json!(1) {
-                        found = Some(listing.record.id.clone());
-                    }
-                }
-            }
-            found.expect("unknown fields landed in extra_json")
-        };
-        assert!(!unknown_row.is_empty());
-
-        // The transcribed session's history became attempts (oldest first).
-        let with_attempts = page
-            .records
-            .iter()
-            .filter_map(|record| match record {
-                ListedCapture::Capture(listing) => Some(listing.record.id.clone()),
-                _ => None,
-            })
-            .find(|id| store.attempts_for(id).expect("attempts").len() == 2)
-            .expect("history + current transcript imported");
-        let attempts = store.attempts_for(&with_attempts).expect("attempts");
-        assert_eq!(attempts[0].text, "first pass");
-        assert_eq!(attempts[1].text, "second pass");
-        assert_eq!(attempts[1].partial_or_final, "final");
-        let extra: serde_json::Value =
-            serde_json::from_str(attempts[1].extra_json.as_deref().expect("extra")).expect("parse");
-        assert_eq!(extra["requestId"], "req-2");
-
-        // Imported audio loads lazily and is bit-identical to the source
-        // samples in the sample domain.
-        let audio = store.load_audio(&unknown_row).expect("load imported audio");
+        // The file moved; the row points at it; the audio round-trips.
+        assert!(!source.exists(), "the journal left the capture tree");
+        assert!(store.audio_path("j_adopt").exists());
+        let audio = store.load_audio("j_adopt").expect("audio");
         assert!(audio.finalized);
-        let expected = decode_pcm16_wav(
-            &std::fs::read(sessions.join(&unknown_row).join("recording.wav")).expect("source wav"),
-        )
-        .expect("decode source");
-        assert_eq!(audio.samples, expected.samples);
+        assert_eq!(audio.samples, samples);
+        let stored = store.get_capture("j_adopt").expect("get").expect("row");
+        assert_eq!(
+            stored.journal_hash,
+            format!("{:016x}", samples_hash(&samples))
+        );
 
-        // The verified report is on disk for review, with the batch id.
-        let raw =
-            std::fs::read_to_string(MigrationReport::path_for_root(&store.root)).expect("report");
-        let on_disk: MigrationReport = serde_json::from_str(&raw).expect("parse report");
-        assert!(!on_disk.dry_run);
-        assert_eq!(on_disk.batch_id, report.batch_id);
-        assert_eq!(on_disk.counts.verified, 5);
-
-        // A rerun without a rollback refuses to overwrite (no double import).
-        let second = store.migrate_v1_apply(&sessions).expect("rerun report");
-        assert_eq!(second.counts.imported, 0);
-        assert!(second.records.iter().all(|record| record.error.is_some()));
-        assert_eq!(store.list_records(0, 10).expect("list").total, 5);
+        // A second adoption of anything under that id refuses to overwrite.
+        let again = external_journal(&dir, "j_adopt", &ramp(5, 0), true);
+        match store.adopt_journal(&again, None) {
+            Err(StoreV2Error::Invalid(reason)) => {
+                assert!(reason.contains("refusing to overwrite"), "{reason}")
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
     }
 
     #[test]
-    fn migration_rollback_discards_the_import_and_stays_dead() {
-        let (v1, _) = mixed_v1_store();
-        let sessions = v1.path().join("sessions");
-        let before = snapshot(&sessions);
+    fn adopt_journal_seals_a_torn_tail_and_flags_the_gap() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
 
-        let report = store.migrate_v1_apply(&sessions).expect("apply");
-        assert_eq!(store.list_records(0, 10).expect("list").total, 5);
+        // Frames + boundary + an unconfirmed tail, never finalized: the
+        // quiesce-fault / kill shape.
+        let tree = dir.path().join("capture-tree");
+        std::fs::create_dir_all(&tree).expect("tree");
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_torn".to_string(), 16_000).expect("writer");
+        let confirmed = ramp(500, 0);
+        writer.append_frames(&confirmed).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.append_frames(&ramp(40, 500)).expect("tail");
+        drop(writer);
+        let source = tree.join("j_torn.sj");
 
-        let discarded = store.rollback_import(&report.batch_id).expect("rollback");
-        assert_eq!(discarded, 5);
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        // The imported journals were quarantined, not unlinked…
-        assert_eq!(journal_ids_in(&store.root.join(QUARANTINE_DIR)).len(), 5);
-        assert!(journal_ids_in(&store.root.join(AUDIO_DIR)).is_empty());
-        // …and reconciliation treats them as tombstoned: no resurrection.
-        let rerun = store.reconcile().expect("reconcile");
-        assert!(rerun.orphan_sessions.is_empty());
-        assert_eq!(store.list_records(0, 10).expect("list").total, 0);
-        // The meta entry for the batch is gone.
-        assert!(store.meta_get(&format!("migration:{}", report.batch_id)).expect("meta").is_none());
+        let record = store
+            .adopt_journal(&source, Some("salvage note from the caller"))
+            .expect("adopt");
+        assert_eq!(record.status, CaptureStatus::Interrupted);
+        assert_eq!(record.frame_count, 500, "verified prefix only");
+        let extra: serde_json::Value =
+            serde_json::from_str(record.extra_json.as_deref().expect("note")).expect("parse");
+        let note = extra["recovery"].as_str().expect("note");
+        assert!(note.contains("salvage note from the caller"), "{note}");
+        assert!(note.contains("gap flagged"), "{note}");
 
-        // Originals still byte-identical, and a fresh import works again.
-        assert_eq!(snapshot(&sessions), before);
-        let again = store.migrate_v1_apply(&sessions).expect("re-import");
-        assert_eq!(again.counts.verified, 5);
+        let audio = store.load_audio("j_torn").expect("audio");
+        assert!(audio.finalized, "adoption sealed a valid trailer");
+        assert_eq!(audio.samples, confirmed);
+        assert_eq!(audio.torn_tail_bytes, 0);
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn adopt_journal_refuses_empty_journals_without_touching_the_source() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+
+        // Header-only journal: a take that never reached its first boundary.
+        let source = external_journal(&dir, "j_empty", &[], true);
+        match store.adopt_journal(&source, None) {
+            Err(StoreV2Error::NoVerifiedSamples { id }) => {
+                assert_eq!(id, "j_empty");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+        assert!(source.exists(), "the source is kept for the caller");
+        assert!(
+            store
+                .list_records(0, 10)
+                .expect("list")
+                .records
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn save_wav_capture_round_trips_through_the_crash_protocol() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+
+        let samples = ramp(240, 0);
+        let committed = store
+            .save_wav_capture(&wav_bytes(&samples), TakeMeta::for_device("import"))
+            .expect("save");
+        assert_eq!(committed.record.status, CaptureStatus::Complete);
+        assert_eq!(committed.record.device, "import");
+        assert_eq!(committed.record.frame_count, 240);
+
+        // Metadata-only listing sees it; the audio is bit-identical in the
+        // sample domain; staging is drained.
+        assert_eq!(store.list_records(0, 10).expect("list").total, 1);
+        let audio = store.load_audio(&committed.record.id).expect("audio");
+        assert!(audio.finalized);
+        assert_eq!(audio.samples.len(), 240);
+        assert!(journal_ids_in(&store.root.join(STAGING_DIR)).is_empty());
+
+        // Empty audio is refused honestly (the decoder rejects a zero-length
+        // data chunk before anything is written).
+        assert!(
+            store
+                .save_wav_capture(&wav_bytes(&[]), TakeMeta::for_device("x"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_staged_protocol_walks_the_same_steps_without_holding_the_store() {
+        // The step-wise protocol a lock-sharing caller drives: begin under
+        // the guard, write + finalize with only the take's own journal,
+        // commit back under the guard. The end state must be exactly
+        // `save_wav_capture`'s (same row shape, same audio, staging swept).
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let samples = ramp(120, 0);
+
+        // `&self` borrows only — the point of the split: nothing here
+        // needs `&mut StoreV2` until the commit.
+        let mut take = store
+            .begin_take_at_rate(16_000, TakeMeta::for_device("staged"))
+            .expect("begin");
+        let staged_id = take.id().to_string();
+        take.append_and_seal(&samples).expect("append + seal");
+        let finalized = take.finalize().expect("finalize");
+        let committed = finalized
+            .commit_marked(&mut store, CommitMark::Complete)
+            .expect("commit");
+
+        assert_eq!(committed.record.id, staged_id);
+        assert_eq!(committed.record.status, CaptureStatus::Complete);
+        assert_eq!(committed.record.frame_count, 120);
+        let audio = store.load_audio(&staged_id).expect("audio");
+        assert_eq!(audio.samples, samples);
+        assert!(journal_ids_in(&store.root.join(STAGING_DIR)).is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_commit_writes_status_and_note_in_one_transaction() {
+        // R34: a salvaged take committed through the WAV path must land as
+        // interrupted with its note in the row's own INSERT — there is no
+        // follow-up status update a crash between the two could skip.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let samples = ramp(90, 0);
+
+        let mut take = store
+            .begin_take_at_rate(16_000, TakeMeta::for_device("salvage"))
+            .expect("begin");
+        take.append_and_seal(&samples).expect("append");
+        let committed = take
+            .finalize()
+            .expect("finalize")
+            .commit_marked(
+                &mut store,
+                CommitMark::Interrupted {
+                    note: "salvaged and kept as this interrupted recording".to_string(),
+                },
+            )
+            .expect("commit");
+
+        let id = committed.record.id.clone();
+        assert_eq!(committed.record.status, CaptureStatus::Interrupted);
+        let record = store.get_capture(&id).expect("get").expect("row");
+        assert_eq!(record.status, CaptureStatus::Interrupted);
+        let note = record.recovery_note().expect("the note landed with the row");
+        assert!(note.contains("salvaged and kept"), "{note}");
+        let audio = store.load_audio(&id).expect("audio");
+        assert_eq!(audio.samples, samples);
+    }
+
+    #[test]
+    fn read_audio_journal_agrees_with_load_audio() {
+        // The lock-free read half of `load_audio`: given only the path (as
+        // `audio_journal_path` resolves it under a caller's guard), it
+        // yields exactly what the store-owned read yields.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(70, 0));
+        let id = take.record.id.clone();
+
+        let path = store.audio_journal_path(&id).expect("path");
+        let free_read = read_audio_journal(&path).expect("free read");
+        let store_read = store.load_audio(&id).expect("store read");
+        assert_eq!(free_read.samples, store_read.samples);
+        assert_eq!(free_read.sample_rate, store_read.sample_rate);
+        assert_eq!(free_read.finalized, store_read.finalized);
+
+        // The metadata-only half keeps load_audio's typed failures.
+        match store.audio_journal_path("c_missing_row") {
+            Err(StoreV2Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognition_lifecycle_started_completed_failed_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(30, 0));
+        let id = take.record.id.clone();
+
+        // Started: one partial row.
+        store
+            .begin_recognition(&id, "starling:parakeet", Some(r#"{"model":"parakeet"}"#))
+            .expect("begin");
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "started");
+        assert_eq!(attempts[0].partial_or_final, "partial");
+        assert_eq!(attempts[0].backend, "starling:parakeet");
+
+        // Completed: the same row becomes final text with verbatim extra.
+        let extra = r#"{"text":"hello","segments":[]}"#;
+        store
+            .finish_recognition(
+                &id,
+                RecognitionOutcome::Completed {
+                    text: "hello",
+                    extra_json: Some(extra),
+                },
+            )
+            .expect("finish");
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 1, "one row per attempt, updated in place");
+        assert_eq!(attempts[0].status, "completed");
+        assert_eq!(attempts[0].partial_or_final, "final");
+        assert_eq!(attempts[0].text, "hello");
+        assert_eq!(attempts[0].extra_json.as_deref(), Some(extra));
+
+        // A second finish has nothing started to land on.
+        match store.finish_recognition(&id, RecognitionOutcome::Failed { message: "late" }) {
+            Err(StoreV2Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // Failed retry: history keeps the earlier completion above it.
+        store.begin_recognition(&id, "starling:parakeet", None).expect("begin 2");
+        store
+            .finish_recognition(&id, RecognitionOutcome::Failed { message: "offline" })
+            .expect("fail");
+        let attempts = store.attempts_for(&id).expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, "completed", "insertion order kept");
+        assert_eq!(attempts[1].status, "failed");
+        let extra: serde_json::Value =
+            serde_json::from_str(attempts[1].extra_json.as_deref().expect("extra"))
+                .expect("parse");
+        assert_eq!(extra["error"], "offline");
+
+        // Unknown captures refuse up front.
+        match store.begin_recognition("c_nope", "starling", None) {
+            Err(StoreV2Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finishing_recognition_on_a_deleted_capture_is_not_found() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(30, 0));
+        let id = take.record.id.clone();
+        store.begin_recognition(&id, "starling", None).expect("begin");
+
+        // The user's delete wins the race (R21): the cascade removes the
+        // in-flight attempt with the row.
+        store.delete_capture(&id).expect("delete");
+        match store.finish_recognition(
+            &id,
+            RecognitionOutcome::Completed {
+                text: "late",
+                extra_json: None,
+            },
+        ) {
+            Err(StoreV2Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupt_stale_attempts_fails_only_started_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let live = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
+        let done = committed_take(&mut store, &ramp(30, 1)).record.id.clone();
+
+        store.begin_recognition(&live, "starling", None).expect("begin live");
+        store.begin_recognition(&done, "starling", None).expect("begin done");
+        store
+            .finish_recognition(
+                &done,
+                RecognitionOutcome::Completed {
+                    text: "kept",
+                    extra_json: None,
+                },
+            )
+            .expect("finish done");
+
+        let stale = store
+            .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
+            .expect("interrupt");
+        assert_eq!(stale, vec![live.clone()]);
+
+        let attempts = store.attempts_for(&live).expect("attempts");
+        assert_eq!(attempts[0].status, "failed");
+        let extra: serde_json::Value =
+            serde_json::from_str(attempts[0].extra_json.as_deref().expect("extra"))
+                .expect("parse");
+        assert_eq!(
+            extra["error"],
+            "Interrupted before the server returned a transcript."
+        );
+        let attempts = store.attempts_for(&done).expect("attempts");
+        assert_eq!(attempts[0].status, "completed", "terminal rows untouched");
+
+        // Idempotent: a rerun finds nothing started.
+        assert!(store
+            .interrupt_stale_attempts("again")
+            .expect("rerun")
+            .is_empty());
+    }
+
+    #[test]
+    fn reconciliation_summary_names_its_findings() {
+        let report = ReconciliationReport {
+            recovered_torn: vec![RecoveredTake {
+                id: "c_1".to_string(),
+                torn_tail_bytes: 4,
+            }],
+            orphan_sessions: vec!["c_2".to_string()],
+            ..ReconciliationReport::default()
+        };
+        assert!(report.has_findings());
+        let summary = report.summary();
+        assert!(summary.starts_with("Startup scan:"), "{summary}");
+        assert!(summary.contains("recovered 2 interrupted recordings"), "{summary}");
+
+        let quiet = ReconciliationReport::default();
+        assert!(!quiet.has_findings());
     }
 
     // ---- testing flag ---------------------------------------------------

@@ -3,6 +3,17 @@
 //! `starling:model`, `starling:terms`) with a JSON file. See
 //! `apps/desktop-gpui/PORT.md`.
 
+//! # The dropped `storageBackend` key (D14, deliberate)
+//!
+//! The cutover-era build persisted a `storageBackend` choice
+//! (`"v1"`/`"v2"`). Since D14 (storage v2 is THE store — no backwards
+//! compatibility of any kind) this build runs v2 unconditionally: the key
+//! is unknown, ignored on load, and dropped on the next save. That drop is
+//! intended, not an oversight — pinned by
+//! `a_legacy_storage_backend_choice_is_ignored_since_d14` below. The same
+//! posture applies to the v1 `sessions/`/`journals/` histories: they stay
+//! on disk, untouched and no longer read anywhere.
+
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -182,6 +193,28 @@ mod tests {
             serde_json::json!(["auth", "Starling"])
         );
         assert_eq!(value["userSetModel"], true);
+    }
+
+    #[test]
+    fn a_legacy_storage_backend_choice_is_ignored_since_d14() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+
+        // A file written by the cutover-era build carried a storageBackend
+        // choice. Storage v2 is THE store (D14, no backwards compatibility);
+        // the key is unknown to this build and simply ignored — the file
+        // still loads, and saving drops the key.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","protocol":"starling","model":"parakeet","expectedTerms":["auth"],"storageBackend":"v1"}"#,
+        )
+        .expect("write legacy settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://127.0.0.1:8181");
+
+        settings.save(&path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("storageBackend"), "{raw}");
     }
 
     #[test]

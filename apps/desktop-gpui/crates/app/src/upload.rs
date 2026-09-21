@@ -6,13 +6,14 @@ use std::sync::Arc;
 use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
-    client::{ClientError, StarlingClient},
+    client::{ClientError, Protocol, StarlingClient},
     journal,
     recorder,
-    storage::{self, FileSessionStore},
+    storage,
 };
 
 use crate::app::{StarlingApp, UnsavedWav};
+use crate::store::Store;
 
 /// What a failed job says about server reachability (R13).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,7 +163,6 @@ impl StarlingApp {
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
-            let duration_ms = handle.elapsed().as_secs_f64() * 1000.0;
             // G03: clipping is measured on the raw captured samples (before
             // the attenuation-only auto gain), so an already-clipped source
             // stays visible even when its attenuated copy peaks below
@@ -179,13 +179,9 @@ impl StarlingApp {
                     if let Some(fault) = capture_fault {
                         self.error = Some(fault);
                     }
-                    // The journal→session linkage is additive metadata on
-                    // the manifest; the audio goes through the existing
-                    // storage path as before.
-                    let journal_id = take
-                        .journal
-                        .as_ref()
-                        .map(|report| report.id.clone());
+                    // The journal itself becomes the stored audio (adopted
+                    // by the facade).
+                    let journal_report = take.journal.clone();
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
@@ -194,12 +190,7 @@ impl StarlingApp {
                         match encoded {
                             Ok(wav) => {
                                 this.update(cx, |app, cx| {
-                                    app.save_and_transcribe(
-                                        Arc::new(wav),
-                                        Some(duration_ms),
-                                        journal_id,
-                                        cx,
-                                    );
+                                    app.save_and_transcribe(Arc::new(wav), journal_report, cx);
                                 })
                                 .ok();
                             }
@@ -224,7 +215,7 @@ impl StarlingApp {
                     // persisted as an interrupted-but-usable take, linked
                     // to its (already finalized) journal; the quiesce gap
                     // is recorded in the session note.
-                    let journal_id = journal.as_ref().map(|report| report.id.clone());
+                    let journal_report = journal.clone();
                     let note = quiesce_salvage_note(acknowledged_samples, audio.sample_rate);
                     self.levels = vec![0.06; 52];
                     self.capture_warning = recorder::clipping_warning(source_clip_ratio);
@@ -235,11 +226,6 @@ impl StarlingApp {
                     ));
                     cx.notify();
                     cx.spawn(async move |this, cx| {
-                        // Duration from the salvaged sample count at the
-                        // device rate — not the wall clock, which includes
-                        // the drain wait.
-                        let duration_ms = audio.samples.len() as f64 * 1000.0
-                            / audio.sample_rate as f64;
                         let encoded = cx
                             .background_spawn(async move {
                                 audio::encode_wav_16k(&audio)
@@ -250,8 +236,7 @@ impl StarlingApp {
                                 this.update(cx, |app, cx| {
                                     app.save_interrupted_take(
                                         Arc::new(wav),
-                                        duration_ms,
-                                        journal_id,
+                                        journal_report,
                                         note,
                                         cx,
                                     );
@@ -297,8 +282,7 @@ impl StarlingApp {
     pub fn save_and_transcribe(
         &mut self,
         wav: Arc<Vec<u8>>,
-        duration_ms: Option<f64>,
-        journal_id: Option<String>,
+        journal: Option<recorder::JournalReport>,
         cx: &mut Context<Self>,
     ) {
         // Deliberately no `self.error = None` here: every caller clears the
@@ -318,18 +302,22 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let bytes = (*wav).clone();
+            let job_wav = wav.clone();
             let create_store = store.clone();
             let created = cx
                 .background_spawn(async move {
-                    create_store.create_with_journal(bytes, duration_ms, journal_id.as_deref())
+                    create_store.save_capture(job_wav, journal.as_ref())
                 })
                 .await;
             match created {
-                Ok(session) => {
+                Ok(saved) => {
                     refresh_sessions(&this, &store, cx).await;
                     this.update(cx, |app, cx| {
-                        app.transcribe(session.id.clone(), session.wav.clone(), cx);
+                        // `saved.wav` is the audio to transcribe: the
+                        // stored evidence itself when the journal was
+                        // adopted (the same bytes a retry loads), the
+                        // caller's WAV otherwise.
+                        app.transcribe(saved.id, saved.wav, cx);
                     })
                     .ok();
                 }
@@ -354,8 +342,7 @@ impl StarlingApp {
     pub fn save_interrupted_take(
         &mut self,
         wav: Arc<Vec<u8>>,
-        duration_ms: f64,
-        journal_id: Option<String>,
+        journal: Option<recorder::JournalReport>,
         note: String,
         cx: &mut Context<Self>,
     ) {
@@ -371,18 +358,15 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let bytes = (*wav).clone();
+            let job_wav = wav.clone();
             let note_store = store.clone();
             let created = cx
                 .background_spawn(async move {
-                    let session = note_store
-                        .create_with_journal(bytes, Some(duration_ms), journal_id.as_deref())?;
-                    note_store.mark_interrupted(&session.id, &note)?;
-                    Ok::<_, storage::StorageError>(session)
+                    note_store.save_interrupted_capture(job_wav, journal.as_ref(), &note)
                 })
                 .await;
             match created {
-                Ok(_session) => {
+                Ok(_id) => {
                     refresh_sessions(&this, &store, cx).await;
                 }
                 Err(err) => {
@@ -429,6 +413,15 @@ impl StarlingApp {
         // wire protocol; no conversion layer.
         let protocol = self.protocol;
         let model = self.model.clone();
+        // The attempt row's backend label (v2 keeps it on the recognition
+        // attempt; v1 ignores it).
+        let backend = format!(
+            "{}:{model}",
+            match protocol {
+                Protocol::Starling => "starling",
+                Protocol::OpenAi => "openai",
+            }
+        );
         let store_for_job = store.clone();
 
         cx.spawn(async move |this, cx| {
@@ -444,8 +437,9 @@ impl StarlingApp {
 
             let marked = {
                 let id = id.clone();
+                let backend = backend.clone();
                 let store = store_for_job.clone();
-                cx.background_spawn(async move { store.mark_attempt(&id) })
+                cx.background_spawn(async move { store.mark_attempt(&id, &backend) })
                     .await
             };
             match marked {
@@ -477,7 +471,7 @@ impl StarlingApp {
                                 let id = id.clone();
                                 let store = store_for_job.clone();
                                 cx.background_spawn(async move {
-                                    let session_found = store.get(&id)?.is_some();
+                                    let session_found = store.exists(&id)?;
                                     let write_error = if session_found {
                                         store.save_transcript(&id, result).err()
                                     } else {
@@ -561,8 +555,8 @@ impl StarlingApp {
                     let id_for_failure = id.clone();
                     let failure_message = failure.clone();
                     cx.background_spawn(async move {
-                        if store.get(&id_for_failure)?.is_some() {
-                            store.save_failure(&id_for_failure, failure_message)?;
+                        if store.exists(&id_for_failure)? {
+                            store.save_failure(&id_for_failure, &failure_message)?;
                         }
                         Ok::<(), storage::StorageError>(())
                     })
@@ -649,12 +643,7 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(
-                                    Arc::new(prepared.wav),
-                                    Some(prepared.duration_ms),
-                                    None,
-                                    cx,
-                                );
+                                app.save_and_transcribe(Arc::new(prepared.wav), None, cx);
                             })
                             .ok();
                         }
@@ -686,11 +675,11 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.get(&id) }).await
+                cx.background_spawn(async move { store.audio_wav(&id) }).await
             };
             this.update(cx, |app, cx| match loaded {
-                Ok(Some(session)) => {
-                    app.transcribe(session.id.clone(), session.wav.clone(), cx);
+                Ok(Some(wav)) => {
+                    app.transcribe(id, wav, cx);
                 }
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));
@@ -709,13 +698,13 @@ impl StarlingApp {
 
 pub(crate) async fn refresh_sessions(
     this: &WeakEntity<StarlingApp>,
-    store: &Arc<FileSessionStore>,
+    store: &Store,
     cx: &mut AsyncApp,
 ) {
     let store = store.clone();
     // G02: metadata-only listing — good and orphan-recovered records arrive
     // as summaries, damaged ones flagged with their reason.
-    let result = cx.background_spawn(async move { store.list_records() }).await;
+    let result = cx.background_spawn(async move { store.list() }).await;
     match result {
         Ok(list) => {
             this.update(cx, |app, cx| {

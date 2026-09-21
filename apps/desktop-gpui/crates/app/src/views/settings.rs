@@ -11,9 +11,7 @@ use starling_dictation::settings;
 
 use crate::app::{Connection, StarlingApp};
 use crate::theme;
-use crate::views::{
-    SETTINGS_CALLOUT_DOT_ID, icon, protocol_option_id, status_dot,
-};
+use crate::views::{SETTINGS_CALLOUT_DOT_ID, icon, protocol_option_id, status_dot};
 
 pub fn render_settings_modal(
     app: &mut StarlingApp,
@@ -38,6 +36,8 @@ pub fn render_settings_modal(
         .relative()
         .w(px(510.))
         .max_w_full()
+        .max_h(px(680.))
+        .overflow_y_scroll()
         .bg(theme::PAPER_LIGHT)
         .text_color(theme::SETTINGS_INK)
         .p(px(33.))

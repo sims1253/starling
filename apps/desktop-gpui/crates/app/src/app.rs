@@ -20,10 +20,10 @@ use starling_dictation::{
     player::Player,
     recorder::RecorderHandle,
     settings::{self, Settings},
-    storage::{DamagedRecord, FileSessionStore, ListedRecord, SessionStatus, SessionSummary},
+    storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
-use crate::{input::TextField, theme, upload::refresh_sessions, views};
+use crate::{input::TextField, store::Store, theme, upload::refresh_sessions, views};
 
 actions!(starling, [ToggleRecording]);
 
@@ -42,7 +42,12 @@ pub struct UnsavedWav {
 }
 
 pub struct StarlingApp {
-    pub store: Option<Arc<FileSessionStore>>,
+    /// The recording store: storage v2, unconditionally (D14 — there is
+    /// no backend choice and no fallback). `None` only when the store
+    /// could not be opened at startup; the error is surfaced honestly and
+    /// new takes are kept in memory until it is fixed and the app is
+    /// restarted.
+    pub store: Option<Store>,
     pub store_error: Option<String>,
     pub player: Option<Player>,
     pub root_focus: FocusHandle,
@@ -291,15 +296,23 @@ impl StarlingApp {
         let protocol = settings.protocol;
         let model = settings.model.clone();
         let terms_input = settings.expected_terms_input();
-        let (store, store_error) = match FileSessionStore::default_root()
-            .and_then(FileSessionStore::open)
-        {
-            Ok(store) => (Some(Arc::new(store)), None),
+
+        // D14: storage v2 is THE store, opened unconditionally. An open
+        // failure is a hard, honest startup error — there is no other
+        // backend to fall back to and no flag to clear; the cause must be
+        // fixed and the app restarted.
+        let (store, store_error) = match Store::open() {
+            Ok(store) => (Some(store), None),
             Err(err) => (
                 None,
-                Some(format!("Could not open saved recordings: {err}")),
+                Some(format!(
+                    "Could not open the recording store (storage v2): {err}. There is no \
+                     fallback store — fix the cause and restart. Until then, new recordings are \
+                     kept in memory only and can be downloaded from the unsaved list."
+                )),
             ),
         };
+
         let player = Player::new().ok();
         let draft_endpoint = cx.new(|cx| TextField::new("http://127.0.0.1:8181", &endpoint, cx));
         let draft_model = cx.new(|cx| TextField::new("parakeet", &model, cx));
@@ -344,84 +357,38 @@ impl StarlingApp {
 
     pub fn init(&mut self, cx: &mut Context<Self>) {
         if let Some(store) = self.store.clone() {
-            let list_store = store.clone();
-            let fix_store = store.clone();
             cx.spawn(async move |this, cx| {
-                let listed = cx
-                    .background_spawn(async move { list_store.list_records() })
-                    .await;
-                match listed {
-                    Ok(records) => {
-                        let interrupted: Vec<String> = records
-                            .iter()
-                            .filter_map(|record| match record {
-                                ListedRecord::Session(summary)
-                                    if summary.status == SessionStatus::Transcribing =>
-                                {
-                                    Some(summary.id.clone())
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        if !interrupted.is_empty() {
-                            let fix = cx.background_spawn(async move {
-                                for id in interrupted {
-                                    let _ = fix_store.save_failure(
-                                        &id,
-                                        "Interrupted before the server returned a transcript. Your audio is ready to retry.",
-                                    );
-                                }
-                            });
-                            fix.await;
-                        }
-
-                        // I1 phase 2 (§4 recovery, journal-only): scan the
-                        // journals directory for takes the previous run
-                        // never saved — a journal without a trailer (or
-                        // without a linked session) is recovered to its
-                        // last valid boundary and becomes an interrupted
-                        // session. Source journals are left in place.
-                        let journals_root = starling_dictation::journal::default_journals_root();
-                        let recovered = {
-                            let store = store.clone();
-                            cx.background_spawn(async move {
-                                starling_dictation::journal::recover_interrupted_takes(
-                                    store.as_ref(),
-                                    &journals_root,
-                                )
-                            })
-                            .await
-                        };
-                        match recovered {
-                            Ok(report) if report.has_findings() => {
-                                this.update(cx, |app, cx| {
-                                    app.error = Some(report.summary());
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                this.update(cx, |app, cx| {
-                                    app.error = Some(format!(
-                                        "Could not recover interrupted recordings: {err}"
-                                    ));
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                        }
-
-                        refresh_sessions(&this, &store, cx).await;
+                // Startup recovery, v2 (§4): reconcile journals against the
+                // metadata rows and fail recognition attempts a previous
+                // run left "started" (the "stuck in Transcribing" fix —
+                // same note, same outcome). Findings surface through the
+                // error banner; recovery is never a reason to abort
+                // startup.
+                let recovered = {
+                    let store = store.clone();
+                    cx.background_spawn(async move { store.startup_recovery() }).await
+                };
+                match recovered {
+                    Ok(summary) if !summary.is_empty() => {
+                        this.update(cx, |app, cx| {
+                            app.error = Some(summary);
+                            cx.notify();
+                        })
+                        .ok();
                     }
+                    Ok(_) => {}
                     Err(err) => {
                         this.update(cx, |app, cx| {
-                            app.error = Some(format!("Could not open saved recordings: {err}"));
+                            app.error = Some(format!(
+                                "Could not recover interrupted recordings: {err}"
+                            ));
                             cx.notify();
                         })
                         .ok();
                     }
                 }
+
+                refresh_sessions(&this, &store, cx).await;
             })
             .detach();
         }
@@ -620,18 +587,14 @@ impl StarlingApp {
                 let id = id.clone();
                 cx.background_spawn(async move {
                     // R21: the confirmed delete (B05's "permanently removes
-                    // the audio" warning) must take the linked capture
-                    // journal with it — quarantined into journals/deleted/
-                    // before the row removal, so startup recovery can never
-                    // resurrect the take as interrupted. The R05 stash path
-                    // never comes through here: only this entry point
+                    // the audio" warning) takes the capture journal with it
+                    // — v1 quarantines the manifest-linked journal before
+                    // the row removal; v2's delete_capture quarantines the
+                    // audio journal and tombstones the row — so startup
+                    // recovery can never resurrect the take. The R05 stash
+                    // path never comes through here: only this entry point
                     // tombstones.
-                    let journals_root = starling_dictation::journal::default_journals_root();
-                    starling_dictation::journal::delete_session_and_journal(
-                        store.as_ref(),
-                        &journals_root,
-                        &id,
-                    )
+                    store.delete(&id)
                 })
                 .await
             };
@@ -695,11 +658,10 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.get(&id) }).await
+                cx.background_spawn(async move { store.audio_wav(&id) }).await
             };
             this.update(cx, |app, cx| match loaded {
-                Ok(Some(session)) => {
-                    let wav = session.wav.clone();
+                Ok(Some(wav)) => {
                     app.write_download(name, wav, true, true, cx);
                 }
                 Ok(None) => {
@@ -859,17 +821,17 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.get(&id) }).await
+                cx.background_spawn(async move { store.audio_wav(&id) }).await
             };
             this.update(cx, |app, cx| {
                 match loaded {
-                    Ok(Some(session)) => {
+                    Ok(Some(wav)) => {
                         let Some(player) = app.player.as_ref() else {
                             return;
                         };
-                        match player.play(session.wav.as_slice()) {
+                        match player.play(wav.as_slice()) {
                             Ok(()) => {
-                                app.playing_id = Some(session.id.clone());
+                                app.playing_id = Some(id.clone());
                                 // New playback, new generation: any watcher
                                 // still polling for the previous playback is
                                 // stale from here on.
@@ -1026,6 +988,7 @@ impl Render for StarlingApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_dictation::storage::SessionStatus;
 
     /// A fresh scratch directory under the system temp dir, removed first so
     /// reruns start clean. Each test uses its own tag.
