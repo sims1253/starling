@@ -16,11 +16,14 @@
 //! [`FakeCaptureSource`] (test twin, `testing` module) scripts devices,
 //! gaps, faults and quiesce timeouts without hardware.
 //!
-//! One recovery rule completes the picture: a failed device open is fatal
+//! Two recovery rules complete the picture: a failed device open is fatal
 //! to the take *attempt*, not the machine — after `capture.error{
 //! device_open_failed}` the actor takes the runtime-internal settle edge
 //! `Interrupted → Idle` so the next `capture.start` can retry (issue
-//! #211).
+//! #211); and a stop handshake that returns `Err` never drops the take —
+//! the quiesce timeout's preserved samples, or a metadata-only record
+//! when a device-side error salvages nothing in-process, are still
+//! registered as interrupted with their gap evidence (issue #212).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -425,6 +428,142 @@ impl LiveTake {
             })
             .collect()
     }
+}
+
+/// A salvage outcome: the interrupted record to persist plus whether any
+/// audio came back through the stop handshake (drives the persisted note).
+struct SalvagedTake {
+    record: TakeRecord,
+    /// Whether the recorder handed back audio (a clean stop, or the
+    /// quiesce timeout's preserved samples) — `false` for a device-side
+    /// stop error, where the record is metadata-only.
+    audio_preserved: bool,
+}
+
+/// The interrupted record for a stop outcome that carries no audio (a
+/// device-side stop error, `RecorderError::Device`): metadata only. The
+/// handshake consumed the session and the error salvages nothing
+/// in-process, but the take must not vanish with it (issue #212): the
+/// registry keeps the take visible for the jobs loader, the gap evidence
+/// survives (the surfaced gap spans plus the unacknowledged tail), and
+/// the acknowledged samples remain in the on-disk journal for the app's
+/// orphan-recovery scan.
+#[allow(clippy::too_many_arguments)]
+fn metadata_only_record(
+    corr: String,
+    device: String,
+    policy: String,
+    rate: u32,
+    final_sample_index: u64,
+    mut gaps: Vec<SampleGap>,
+    acknowledged: u64,
+    wall_clock_ms: f64,
+) -> TakeRecord {
+    if final_sample_index > acknowledged {
+        // The record holds no samples, so everything past the last
+        // acknowledged boundary is missing audio — record it as a gap,
+        // mirroring the quiesce-timeout salvage.
+        gaps.push(SampleGap {
+            start_sample: acknowledged,
+            end_sample: final_sample_index,
+        });
+    }
+    TakeRecord {
+        id: corr,
+        device,
+        policy,
+        samples: Vec::new(),
+        sample_rate: rate,
+        gaps,
+        acknowledged_samples: acknowledged,
+        final_sample_index,
+        journal: None,
+        status: TakeStatus::Interrupted,
+        sample_duration_ms: acknowledged as f64 * 1000.0 / rate.max(1) as f64,
+        wall_clock_ms,
+        capture_id: crate::bus::new_id("cap"),
+    }
+}
+
+/// The persisted note for a device-side stop error: the handshake returned
+/// no audio, so the note states exactly what was kept (`upload.rs`'s
+/// "never silently dropped" rule).
+fn device_stop_note(cause: &str, acknowledged: u64) -> String {
+    format!(
+        "{cause}; the stop handshake failed on a device error, so this interrupted \
+         recording keeps the take's metadata and gap evidence while {acknowledged} \
+         acknowledged samples remain in the durable journal."
+    )
+}
+
+/// Consumes a live take's session through the stop handshake and salvages
+/// whatever comes back as an interrupted record — the shared back half of
+/// `capture.abort` and the fatal mid-take salvage. A clean stop and a
+/// quiesce timeout both hand back audio (the timeout's preserved samples
+/// ride in the error, R09/I1 phase 2); a device-side stop error carries
+/// none, so the record is metadata-only; `RecorderError::Empty` has
+/// nothing to keep.
+fn salvage_take(live: LiveTake) -> Option<SalvagedTake> {
+    let rate = live.session.sample_rate();
+    let final_sample_index = live.session.captured_sample_count();
+    let mut gaps = live.gaps_so_far();
+    let acknowledged_hint = live.last_progress_ack;
+    let wall_clock_ms = live.started_at.elapsed().as_secs_f64() * 1000.0;
+    let outcome = live.session.stop();
+    let (samples, journal, acknowledged, audio_preserved) = match outcome {
+        Ok(captured) => {
+            let salvaged = captured.audio.samples.len() as u64;
+            (captured.audio.samples, captured.journal, salvaged, true)
+        }
+        Err(RecorderError::QuiesceTimeout { audio, journal, .. }) => {
+            let salvaged = audio.samples.len() as u64;
+            if final_sample_index > salvaged {
+                gaps.push(SampleGap {
+                    start_sample: salvaged,
+                    end_sample: final_sample_index,
+                });
+            }
+            (audio.samples, journal, salvaged, true)
+        }
+        Err(RecorderError::Device(_)) => {
+            return Some(SalvagedTake {
+                record: metadata_only_record(
+                    live.corr,
+                    live.device,
+                    live.policy,
+                    rate,
+                    final_sample_index,
+                    gaps,
+                    acknowledged_hint,
+                    wall_clock_ms,
+                ),
+                audio_preserved: false,
+            });
+        }
+        Err(RecorderError::Empty) => return None,
+    };
+    let capture_id = journal
+        .as_ref()
+        .map(|report| report.id.clone())
+        .unwrap_or_else(|| crate::bus::new_id("cap"));
+    Some(SalvagedTake {
+        record: TakeRecord {
+            id: live.corr.clone(),
+            device: live.device.clone(),
+            policy: live.policy.clone(),
+            samples,
+            sample_rate: rate,
+            gaps,
+            acknowledged_samples: acknowledged,
+            final_sample_index: final_sample_index.max(acknowledged),
+            journal,
+            status: TakeStatus::Interrupted,
+            sample_duration_ms: acknowledged as f64 * 1000.0 / rate.max(1) as f64,
+            wall_clock_ms,
+            capture_id,
+        },
+        audio_preserved,
+    })
 }
 
 /// The capture actor's configuration.
@@ -921,6 +1060,31 @@ impl CaptureActor {
                     },
                     &corr,
                 );
+                // The handshake consumed the session and the error carries
+                // no audio — the take still must not vanish with it (issue
+                // #212). Register the metadata-only interrupted record
+                // (gap evidence included); the acknowledged samples remain
+                // in the on-disk journal for the orphan-recovery scan. The
+                // fatal error above already entered `Interrupted`, the
+                // contract's terminal state for a lost device (the fixture
+                // capture-interrupted.json), so no `capture.stopped`
+                // follows.
+                let record = metadata_only_record(
+                    corr.clone(),
+                    live.device.clone(),
+                    live.policy.clone(),
+                    rate,
+                    final_sample_index,
+                    gaps,
+                    live.last_progress_ack,
+                    wall_clock_ms,
+                );
+                let acknowledged = record.acknowledged_samples;
+                let _ = self.store.mark_interrupted(
+                    &record,
+                    &device_stop_note("The microphone failed during the stop handshake", acknowledged),
+                );
+                self.register(record);
             }
         }
         self.publish_view();
@@ -928,43 +1092,26 @@ impl CaptureActor {
 
     /// `capture.abort` — v1 defines no event; the machine returns to Idle
     /// and whatever the recorder acknowledged is salvaged as an
-    /// interrupted take (source preserved, never deleted).
+    /// interrupted take (source preserved, never deleted). A stop
+    /// handshake that itself fails is no exception (issue #212): the
+    /// quiesce timeout's preserved samples ride in the error, and a
+    /// device-side stop error still registers the metadata-only record.
     fn abort_take(&mut self) {
         let Some(live) = self.take.take() else {
             return;
         };
-        let corr = live.corr.clone();
-        let rate = live.session.sample_rate();
-        let final_sample_index = live.session.captured_sample_count();
-        let gaps = live.gaps_so_far();
-        let wall_clock_ms = live.started_at.elapsed().as_secs_f64() * 1000.0;
-        if let Ok(captured) = live.session.stop() {
-            let journal = captured.journal.clone();
-            let capture_id = journal
-                .as_ref()
-                .map(|report| report.id.clone())
-                .unwrap_or_else(|| crate::bus::new_id("cap"));
-            let salvaged = captured.audio.samples.len() as u64;
-            let record = TakeRecord {
-                id: corr.clone(),
-                device: live.device.clone(),
-                policy: live.policy.clone(),
-                samples: captured.audio.samples,
-                sample_rate: rate,
-                gaps,
-                acknowledged_samples: salvaged,
-                final_sample_index: final_sample_index.max(salvaged),
-                journal,
-                status: TakeStatus::Interrupted,
-                sample_duration_ms: salvaged as f64 * 1000.0 / rate.max(1) as f64,
-                wall_clock_ms,
-                capture_id,
+        if let Some(salvaged) = salvage_take(live) {
+            let note = if salvaged.audio_preserved {
+                "Take aborted by user; captured samples kept as an interrupted recording."
+                    .to_string()
+            } else {
+                device_stop_note(
+                    "Take aborted by user",
+                    salvaged.record.acknowledged_samples,
+                )
             };
-            let _ = self.store.mark_interrupted(
-                &record,
-                "Take aborted by user; captured samples kept as an interrupted recording.",
-            );
-            self.register(record);
+            let _ = self.store.mark_interrupted(&salvaged.record, &note);
+            self.register(salvaged.record);
         }
         self.publish_view();
     }
@@ -975,34 +1122,18 @@ impl CaptureActor {
         let Some(live) = self.take.take() else {
             return;
         };
-        let corr = live.corr.clone();
-        let rate = live.session.sample_rate();
-        let final_sample_index = live.session.captured_sample_count();
-        let wall_clock_ms = live.started_at.elapsed().as_secs_f64() * 1000.0;
-        if let Ok(captured) = live.session.stop() {
-            let journal = captured.journal.clone();
-            let capture_id = journal
-                .as_ref()
-                .map(|report| report.id.clone())
-                .unwrap_or_else(|| crate::bus::new_id("cap"));
-            let salvaged = captured.audio.samples.len() as u64;
-            let record = TakeRecord {
-                id: corr.clone(),
-                device: live.device.clone(),
-                policy: live.policy.clone(),
-                samples: captured.audio.samples,
-                sample_rate: rate,
-                gaps: vec![],
-                acknowledged_samples: salvaged,
-                final_sample_index: final_sample_index.max(salvaged),
-                journal,
-                status: TakeStatus::Interrupted,
-                sample_duration_ms: salvaged as f64 * 1000.0 / rate.max(1) as f64,
-                wall_clock_ms,
-                capture_id,
+        if let Some(salvaged) = salvage_take(live) {
+            // Whatever the recorder acknowledged is salvaged, and the gap
+            // spans already surfaced as `capture.gap` events travel with
+            // the persisted record (issue #212: they used to be dropped on
+            // this path).
+            let persisted_note = if salvaged.audio_preserved {
+                note
+            } else {
+                device_stop_note(&note, salvaged.record.acknowledged_samples)
             };
-            let _ = self.store.mark_interrupted(&record, &note);
-            self.register(record);
+            let _ = self.store.mark_interrupted(&salvaged.record, &persisted_note);
+            self.register(salvaged.record);
         }
         self.publish_view();
     }

@@ -10,14 +10,17 @@
 //! monotonicity, the NACK path for unknown envelope versions, the
 //! route-freeze-before-submit invariant, quiesce-timeout salvage, and the
 //! fatal device-error interruption path — plus the capture-machine
-//! recovery regression (issue #211): a failed device open settles back to
-//! Idle so a retry can succeed.
+//! recovery regressions (issues #211/#212): a failed device open settles
+//! back to Idle for the retry, and stop-handshake errors never drop the
+//! take or its gap evidence.
 
 use std::time::{Duration, Instant};
 
 use starling_dictation::recorder::CaptureGap;
 use starling_runtime::bus::{EventMessage, EventSub};
-use starling_runtime::machine::capture::{CaptureConfig, InMemoryCaptureStore, TakeStatus};
+use starling_runtime::machine::capture::{
+    CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
+};
 use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::protocol::{Command, Event, JobLimits, Revision};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript, FakeStop};
@@ -70,7 +73,7 @@ fn until(
 fn test_config(
     source: std::sync::Arc<FakeCaptureSource>,
     provider: std::sync::Arc<starling_runtime::provider::FakeProvider>,
-    store: std::sync::Arc<InMemoryCaptureStore>,
+    store: std::sync::Arc<dyn CaptureStore>,
     limits: JobLimits,
 ) -> RuntimeConfig {
     RuntimeConfig::default()
@@ -772,9 +775,57 @@ fn jobs_failure_from_provider_error_is_retryable_and_isolated() {
     runtime.shutdown();
 }
 
+// CaptureGap is referenced for signature compatibility with the fake
+// scripts' gap spans.
+#[allow(dead_code)]
+fn _gap_compat(_gap: CaptureGap) {}
+
 // ------------------------------------------------------------------------- //
-// Capture-machine recovery (issue #211)
+// Capture-machine recovery (issues #211 / #212)
 // ------------------------------------------------------------------------- //
+
+/// A test store that records the full persisted `TakeRecord`s (the
+/// in-memory store keeps only ids), so the salvage regressions can assert
+/// gap evidence and acknowledged boundaries.
+#[derive(Default)]
+struct RecordingStore {
+    records: std::sync::Mutex<Vec<(TakeStatus, TakeRecord, String)>>,
+}
+
+impl RecordingStore {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    fn interrupted(&self, id: &str) -> Option<TakeRecord> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(status, record, _)| *status == TakeStatus::Interrupted && record.id == id)
+            .map(|(_, record, _)| record.clone())
+    }
+}
+
+impl CaptureStore for RecordingStore {
+    fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
+        self.records
+            .lock()
+            .unwrap()
+            .push((TakeStatus::Complete, take.clone(), String::new()));
+        Ok(())
+    }
+    fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
+        self.records
+            .lock()
+            .unwrap()
+            .push((TakeStatus::Interrupted, take.clone(), note.to_string()));
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        "recording".to_string()
+    }
+}
 
 /// Polls until the capture projection shows `state`, or panics.
 fn wait_for_capture_state(client: &RuntimeClient, state: &str, deadline: Duration) {
@@ -874,7 +925,244 @@ fn failed_device_open_returns_to_idle_and_a_retry_succeeds() {
     runtime.shutdown();
 }
 
-// CaptureGap is referenced for signature compatibility with the fake
-// scripts' gap spans.
-#[allow(dead_code)]
-fn _gap_compat(_gap: CaptureGap) {}
+/// Issue #212: a device error on the stop handshake consumed the session
+/// and used to drop the whole take. The interrupted record is still
+/// registered — metadata-only (the error carries no audio) but with the
+/// gap evidence and the last acknowledged boundary intact.
+#[test]
+fn device_error_on_stop_still_registers_an_interrupted_take() {
+    let source = FakeCaptureSource::new(vec![FakeTakeScript {
+        gaps: vec![(
+            Duration::from_millis(5),
+            CaptureGap { start_sample: 160, end_sample: 320 },
+        )],
+        stop: FakeStop::DeviceError("DeviceUnavailable".into()),
+        ..FakeTakeScript::clean()
+    }]);
+    let store = RecordingStore::new();
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    client
+        .send(Some("take_d"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(40));
+    client
+        .send(Some("take_d"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    let collected = until(&events, "capture.error", |m| m.type_name() == "capture.error", Duration::from_secs(5));
+    match &collected.last().unwrap().event {
+        Event::CaptureError { code, fatal } => {
+            assert_eq!(code, "device_error_on_stop");
+            assert!(*fatal);
+        }
+        other => panic!("expected CaptureError, got {other:?}"),
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let record = loop {
+        if let Some(record) = store.interrupted("take_d") {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "take_d never registered as interrupted after the stop error"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(record.samples.is_empty(), "no audio rides a device stop error");
+    assert!(
+        record.acknowledged_samples > 0,
+        "the last acknowledged boundary is kept: {:?}",
+        record.acknowledged_samples
+    );
+    assert!(
+        record
+            .gaps
+            .iter()
+            .any(|gap| gap.start_sample == 160 && gap.end_sample == 320),
+        "the surfaced gap span travels with the record: {:?}",
+        record.gaps
+    );
+    if record.final_sample_index > record.acknowledged_samples {
+        assert!(
+            record.gaps.iter().any(|gap| gap.start_sample == record.acknowledged_samples
+                && gap.end_sample == record.final_sample_index),
+            "the unacknowledged tail is recorded as a gap: {:?}",
+            record.gaps
+        );
+    }
+    // The contract's terminal state for a lost device (capture-interrupted
+    // fixture): the fatal error entered Interrupted and no stopped event
+    // follows.
+    wait_for_capture_state(&client, "Interrupted", Duration::from_secs(5));
+    runtime.shutdown();
+}
+
+/// Issue #212: `capture.abort` salvages "whatever the recorder
+/// acknowledged ... source preserved, never deleted" — a stop() error used
+/// to discard the whole take. A quiesce-timeout abort keeps the preserved
+/// samples; a device-side error keeps the metadata-only record.
+#[test]
+fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
+    let source = FakeCaptureSource::new(vec![
+        FakeTakeScript {
+            gaps: vec![(
+                Duration::from_millis(5),
+                CaptureGap { start_sample: 160, end_sample: 320 },
+            )],
+            stop: FakeStop::QuiesceTimeout { journal_id: "j_abort_q".into() },
+            ..FakeTakeScript::clean()
+        },
+        FakeTakeScript {
+            stop: FakeStop::DeviceError("DeviceUnavailable".into()),
+            ..FakeTakeScript::clean()
+        },
+    ]);
+    let store = RecordingStore::new();
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    // take_a: abort whose stop times out — the preserved samples ride in
+    // the error and must still be salvaged.
+    client
+        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(40));
+    client
+        .send(Some("take_a"), Command::CaptureAbort)
+        .expect("abort accepted");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let salvaged = loop {
+        if let Some(record) = store.interrupted("take_a") {
+            break record;
+        }
+        assert!(Instant::now() < deadline, "take_a never salvaged");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(!salvaged.samples.is_empty(), "quiesce-salvaged samples kept: {:?}", salvaged.samples.len());
+    assert_eq!(
+        salvaged.journal.as_ref().expect("journal linkage").id,
+        "j_abort_q"
+    );
+    assert!(
+        salvaged
+            .gaps
+            .iter()
+            .any(|gap| gap.start_sample == 160 && gap.end_sample == 320),
+        "gap evidence kept: {:?}",
+        salvaged.gaps
+    );
+    // abort returned the machine to Idle, so the second take can run.
+    wait_for_capture_state(&client, "Idle", Duration::from_secs(5));
+
+    // take_b: abort whose stop fails device-side — metadata-only, still
+    // registered.
+    client
+        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(40));
+    client
+        .send(Some("take_b"), Command::CaptureAbort)
+        .expect("abort accepted");
+    let metadata_only = loop {
+        if let Some(record) = store.interrupted("take_b") {
+            break record;
+        }
+        assert!(Instant::now() < deadline, "take_b never registered as interrupted");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(metadata_only.samples.is_empty());
+    assert!(metadata_only.acknowledged_samples > 0);
+    runtime.shutdown();
+}
+
+/// Issue #212: the gap spans surfaced as `capture.gap` events during a
+/// fatal mid-take fault used to be dropped from the persisted interrupted
+/// record (hard-coded empty); they must travel with it.
+#[test]
+fn fatal_mid_take_salvage_keeps_gap_evidence() {
+    let source = FakeCaptureSource::new(vec![FakeTakeScript {
+        gaps: vec![(
+            Duration::from_millis(5),
+            CaptureGap { start_sample: 160, end_sample: 320 },
+        )],
+        error_after: Some((Duration::from_millis(15), "DeviceUnavailable".into())),
+        stop: FakeStop::Clean {
+            journal_id: "j_lost2".into(),
+            ack_fraction: 1.0,
+        },
+        ..FakeTakeScript::clean()
+    }]);
+    let store = RecordingStore::new();
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    client
+        .send(Some("take_5"), Command::CaptureStart { policy: "dictation".into() })
+        .expect("start accepted");
+    let collected = until(&events, "capture.error", |m| m.type_name() == "capture.error", Duration::from_secs(5));
+    match &collected.last().unwrap().event {
+        Event::CaptureError { code, fatal } => {
+            assert_eq!(code, "device_stream_lost");
+            assert!(*fatal);
+        }
+        other => panic!("expected fatal CaptureError, got {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let record = loop {
+        if let Some(record) = store.interrupted("take_5") {
+            break record;
+        }
+        assert!(Instant::now() < deadline, "take_5 never salvaged");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        record
+            .gaps
+            .iter()
+            .any(|gap| gap.start_sample == 160 && gap.end_sample == 320),
+        "the surfaced gap span reaches the persisted record: {:?}",
+        record.gaps
+    );
+    assert!(!record.samples.is_empty(), "the clean-stop salvage keeps the audio");
+    assert_eq!(
+        record.journal.as_ref().expect("journal linkage").id,
+        "j_lost2"
+    );
+    runtime.shutdown();
+}
