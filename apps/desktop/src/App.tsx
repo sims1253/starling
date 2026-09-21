@@ -639,16 +639,22 @@ export default function App() {
    * surfaces under its own name — the recognition event it accompanied has
    * already been recorded, and its mirror must not be staled by a store it
    * never touched. The term store is re-read only here, where a write
-   * actually changed it.
+   * actually changed it. `what` names the attempted operation so a failed
+   * purge says "delete", never a misattributed "record".
    */
-  const recordInsightTerms = useCallback((action: () => Promise<void>) => {
-    void action()
-      .then(() => insightTermStore.load())
-      .then((log) => setTermRecords(log.records))
-      .catch((caught) =>
-        setInsightsIssue(`Insights could not record the term aggregates: ${messageFrom(caught)}`),
-      );
-  }, []);
+  const recordInsightTerms = useCallback(
+    (what: "record" | "delete" | "reset", action: () => Promise<void>) => {
+      void action()
+        .then(() => insightTermStore.load())
+        .then((log) => setTermRecords(log.records))
+        .catch((caught) =>
+          setInsightsIssue(
+            `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
+          ),
+        );
+    },
+    [],
+  );
 
   /**
    * Emit recognition_selected for a settled transcript (E29): word counts
@@ -672,7 +678,7 @@ export default function App() {
           postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
         }),
       );
-      recordInsightTerms(() =>
+      recordInsightTerms("record", () =>
         insightTerms.recognitionSelected({ captureId: sessionId, transcriptText }),
       );
     },
@@ -1853,7 +1859,7 @@ export default function App() {
       // aggregates die, and vice versa — either store failing leaves the
       // other's deletion intact and surfaces its own notice.
       recordInsight(() => insights.captureDeleted(id));
-      recordInsightTerms(() => insightTerms.captureDeleted(id));
+      recordInsightTerms("delete", () => insightTerms.captureDeleted(id));
       await refresh();
     } catch (caught) {
       setError(`Could not delete the recording: ${messageFrom(caught)}`);
@@ -1868,7 +1874,7 @@ export default function App() {
       .catch((caught) =>
         setInsightsIssue(`Insights could not reset the event log: ${messageFrom(caught)}`),
       );
-    recordInsightTerms(() => insightTerms.reset());
+    recordInsightTerms("reset", () => insightTerms.reset());
   }, [recordInsightTerms]);
 
   /**
@@ -1896,7 +1902,7 @@ export default function App() {
       setInsightConsent(next);
 
       if (withdrawn.size > 0) {
-        recordInsightTerms(() => insightTerms.withdrawKinds(withdrawn));
+        recordInsightTerms("delete", () => insightTerms.withdrawKinds(withdrawn));
       }
     },
     [recordInsightTerms],
