@@ -80,7 +80,12 @@ fn main() {
                                     cx.update(|cx| {
                                         let _ = window.update(cx, |app, window, cx| {
                                             window.activate_window();
-                                            app.toggle_recording(cx);
+                                            // Same guarded entry as the
+                                            // in-app binding (#209, #214.1):
+                                            // the global path must not start
+                                            // recording behind an open modal
+                                            // or eat a repeat burst either.
+                                            app.hotkey_toggle_recording(cx);
                                         });
                                     })
                                     .ok();

@@ -445,7 +445,9 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                     .child(format!("Download WAV {}", index + 1)),
             );
         }
-        let confirm = app.confirm_discard;
+        // #214.4: the arm only counts while it was armed for exactly the
+        // batch now in the banner — a take stashed since disarms it.
+        let confirm = app.discard_armed();
         actions = actions.child(
             div()
                 .id("discard-unsaved")
