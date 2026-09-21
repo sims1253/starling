@@ -287,6 +287,9 @@ impl Runtime {
         let freezer = RouteFreezer::new(context_tx.clone());
         let capture_actor = CaptureActor::new(
             capture_rx,
+            // The persist workers' self-addressed report channel (the
+            // same inbox, from the sender side — issue #249).
+            capture_tx.clone(),
             Arc::clone(&bus),
             Arc::clone(&views.capture),
             Arc::clone(&config.capture_source),

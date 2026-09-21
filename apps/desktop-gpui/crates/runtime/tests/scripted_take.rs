@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use starling_dictation::recorder::{CaptureGap, RecorderFault};
 use starling_runtime::bus::{EventMessage, EventSub};
 use starling_runtime::machine::capture::{
-    CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
+    CaptureSource, CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
+    V1FileCaptureStore,
 };
 use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::machine::Rejection;
@@ -87,6 +88,7 @@ fn test_config(
         .with_capture_config(CaptureConfig {
             journals_dir: std::env::temp_dir().join("starling-runtime-test-journals"),
             poll_interval: Duration::from_millis(10),
+            ..CaptureConfig::default()
         })
         .with_jobs_limits(limits)
 }
@@ -1926,6 +1928,797 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
             .any(|m| m.type_name() == "jobs.completed" && m.corr.as_deref() == Some("job-1")),
         "a cancelled job must never complete: {:?}",
         seen.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+
+    runtime.shutdown();
+}
+
+/// The real v1-file capture store with a completion flag: the durable
+/// write (WAV encode + fsync'd session layout) is the real one, and the
+/// flag gives the responsiveness regression an order-based witness of the
+/// commit landing — no timing guesses.
+struct FlaggedV1Store {
+    inner: V1FileCaptureStore,
+    landed: std::sync::Mutex<Vec<String>>,
+}
+
+impl CaptureStore for FlaggedV1Store {
+    fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
+        let result = self.inner.commit_take(take);
+        if result.is_ok() {
+            self.landed.lock().unwrap().push(take.capture_id.clone());
+        }
+        result
+    }
+    fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
+        let result = self.inner.mark_interrupted(take, note);
+        if result.is_ok() {
+            self.landed.lock().unwrap().push(take.capture_id.clone());
+        }
+        result
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// Issue #249, the capture-side twin of #216: with the v1-file store, the
+/// stop handshake used to run the take's whole WAV encode inline on the
+/// capture actor — a multi-minute take stalled every `capture.*` command
+/// for the duration. The persist now runs on a per-take worker, so:
+///
+/// - the machine observably enters `Draining` while the encode is still
+///   running (pre-#249 the projection jumped `Recording → Persisted`
+///   inside one blocked command — `Draining` was never publishable);
+/// - a `capture.*` command sent mid-encode is answered immediately, while
+///   the durable commit has not landed (the order-based property);
+/// - and the take still completes with the unchanged contract: durable
+///   store row first, `capture.stopped` after, machine `Persisted`.
+#[test]
+fn capture_commands_stay_answered_while_a_long_v1_persist_encodes() {
+    let source = FakeCaptureSource::new(vec![]);
+    let dir = tempfile::tempdir().expect("v1 store temp dir");
+    let store = std::sync::Arc::new(FlaggedV1Store {
+        inner: V1FileCaptureStore::open(dir.path()).expect("v1 store opens"),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    // A multi-minute take (30M samples ≈ a 60 MB WAV the v1 store must
+    // encode and durably write), pinned the same way the #216 jobs test
+    // pins its take.
+    source.push(FakeTakeScript {
+        stop: FakeStop::Clean { journal_id: "j_v1big".into(), ack_fraction: 1.0 },
+        samples_per_second: 4_000_000_000,
+        sample_cap: 30_000_000,
+        ..FakeTakeScript::clean()
+    });
+    client
+        .send(Some("take_v1"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_v1"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_v1"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+
+    // The gate: the machine sits in Draining while the persist worker
+    // encodes. This itself pins the fix — the old inline shape never
+    // published Draining at all (the whole encode ran inside the stop's
+    // command handling), so this wait would time out there.
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // The probe: a capture.start raced against the encode. Pre-#249 it
+    // queued behind the whole persist and only then got its table
+    // rejection; now the actor answers from a live loop.
+    let probe_started = Instant::now();
+    let probed = client.send(Some("take_v1b"), Command::CaptureStart { policy: "dictation".into() });
+    let probe_latency = probe_started.elapsed();
+    assert!(
+        matches!(&probed, Err(Rejection::IllegalInState { state, .. }) if state == "Draining"),
+        "a start during the drain is answered with the table rejection, got {probed:?}"
+    );
+    assert!(
+        probe_latency < Duration::from_millis(500),
+        "the start took {probe_latency:?} to be rejected — the capture actor appears stalled on the WAV encode"
+    );
+
+    // The order-based property: the answer came while the durable commit
+    // was still in flight — nothing has landed in the store yet, and no
+    // capture.stopped is on the wire (it follows the commit, §4).
+    assert!(
+        store.landed.lock().unwrap().is_empty(),
+        "the v1 persist had already landed when the probe was answered — the probe did not race the encode"
+    );
+    let mut buffered = Vec::new();
+    while let Ok(message) = events.try_recv() {
+        buffered.push(message);
+    }
+    assert!(
+        !buffered.iter().any(|m| m.type_name() == "capture.stopped"),
+        "capture.stopped preceded the probe's answer: {:?}",
+        buffered.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+
+    // The take still completes exactly as before: durable row first,
+    // capture.stopped after it, machine Persisted, take usable.
+    until(
+        &events,
+        "capture.stopped (take_v1)",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_v1"),
+        Duration::from_secs(10),
+    );
+    wait_for_capture_state(&client, "Persisted", Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let landed = store.landed.lock().unwrap().clone();
+        if landed.iter().any(|id| id == "j_v1big") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the v1 store row never landed: {landed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+}
+
+/// A store whose commits take a fixed while — a deterministic stand-in
+/// for the v1 store's encode window, for the interleavings only the
+/// off-actor persist makes reachable. `failing` names takes whose
+/// commits fail after the delay (the storage-fault injection); `attempts`
+/// records every commit that ran, succeeded or not, so tests can wait
+/// for a persist to have happened without guessing timings.
+struct SlowStore {
+    delay: Duration,
+    failing: Vec<String>,
+    attempts: std::sync::Mutex<Vec<String>>,
+    landed: std::sync::Mutex<Vec<(TakeStatus, String)>>,
+}
+
+impl SlowStore {
+    /// Blocks for the delay, then records the attempt.
+    fn slow_attempt(&self, id: &str) {
+        std::thread::sleep(self.delay);
+        self.attempts.lock().unwrap().push(id.to_string());
+    }
+
+    fn waited_for_attempt(&self, id: &str, deadline: Instant) {
+        loop {
+            if self.attempts.lock().unwrap().iter().any(|attempted| attempted == id) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the persist for {id} never ran: {:?}",
+                self.attempts.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl CaptureStore for SlowStore {
+    fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
+        self.slow_attempt(&take.id);
+        if self.failing.iter().any(|id| id == &take.id) {
+            return Err("simulated storage fault".to_string());
+        }
+        self.landed
+            .lock()
+            .unwrap()
+            .push((TakeStatus::Complete, take.id.clone()));
+        Ok(())
+    }
+    fn mark_interrupted(&self, take: &TakeRecord, _note: &str) -> Result<(), String> {
+        self.slow_attempt(&take.id);
+        self.landed
+            .lock()
+            .unwrap()
+            .push((TakeStatus::Interrupted, take.id.clone()));
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        "slow".to_string()
+    }
+}
+
+/// The one interleaving the off-actor persist newly exposes (issue #249):
+/// `capture.abort` has always been table-legal from `Draining`, but the
+/// inline encode meant no abort could ever arrive there — it queued
+/// behind the whole persist. Now it is answered immediately, the machine
+/// returns to Idle, and the already-in-flight durable write still lands:
+/// silently (no `capture.*` event is legal from Idle), with the take
+/// registered, the route released, and the machine ready for the next
+/// take — no wedge, no phantom `capture.stopped`.
+#[test]
+fn abort_during_a_pending_persist_lands_the_take_silently() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(400),
+        failing: Vec::new(),
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_ab"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_ab"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_ab"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // The abort races the (deterministically) slow persist and must win.
+    let abort_started = Instant::now();
+    let aborted = client.send(Some("take_ab"), Command::CaptureAbort);
+    let abort_latency = abort_started.elapsed();
+    aborted.expect("abort is table-legal from Draining while the persist runs");
+    assert!(
+        abort_latency < Duration::from_millis(200),
+        "abort took {abort_latency:?} — the capture actor appears stalled on the persist"
+    );
+    wait_for_capture_state(&client, "Idle", Duration::from_secs(2));
+
+    // The durable write was already in flight; aborting a finished take
+    // cannot un-write it. It lands — with no wire announcement (none is
+    // legal from Idle) — and the route release still runs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let landed = store.landed.lock().unwrap().clone();
+        if landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_ab") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pending persist never landed after the abort: {landed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_for_context_state(&client, "Released", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(100));
+    let mut drained = Vec::new();
+    while let Ok(message) = events.try_recv() {
+        drained.push(message);
+    }
+    assert!(
+        !drained.iter().any(|m| m.corr.as_deref() == Some("take_ab")
+            && matches!(m.type_name(), "capture.stopped" | "capture.error")),
+        "an aborted mid-persist take must not be announced on the wire: {:?}",
+        drained.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+
+    // And the machine is not wedged behind the landed-in-the-dark take:
+    // the next take runs end to end.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_next"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start after the silent persist accepted");
+    until(&events, "capture.started (take_next)", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_next)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_next"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_next"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(
+        &events,
+        "capture.stopped (take_next)",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_next"),
+        Duration::from_secs(5),
+    );
+    wait_for_capture_state(&client, "Persisted", Duration::from_secs(5));
+    runtime.shutdown();
+}
+
+/// A store whose commits block until the test opens the gate — the hung
+/// store write (an fsync on a full disk, say) that the bounded shutdown
+/// drain exists for.
+struct GatedStore {
+    opened: std::sync::Mutex<bool>,
+    signal: std::sync::Condvar,
+}
+
+impl GatedStore {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(GatedStore {
+            opened: std::sync::Mutex::new(false),
+            signal: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Lets every blocked (and future) commit through.
+    fn open(&self) {
+        let mut opened = self.opened.lock().unwrap();
+        *opened = true;
+        self.signal.notify_all();
+    }
+
+    fn hold(&self) {
+        let mut opened = self.opened.lock().unwrap();
+        while !*opened {
+            opened = self.signal.wait(opened).unwrap();
+        }
+    }
+}
+
+impl CaptureStore for GatedStore {
+    fn commit_take(&self, _take: &TakeRecord) -> Result<(), String> {
+        self.hold();
+        Ok(())
+    }
+    fn mark_interrupted(&self, _take: &TakeRecord, _note: &str) -> Result<(), String> {
+        self.hold();
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        "gated".to_string()
+    }
+}
+
+/// Review on #252, defect 1: `Runtime::shutdown` joins the capture actor,
+/// and the actor's drain waited for in-flight persists without a bound —
+/// a worker wedged in a hung store write kept shutdown from ever
+/// returning, and this PR makes that window seconds long by design. The
+/// drain is bounded by `persist_drain_timeout` (250 ms here): shutdown
+/// returns, names what it abandoned on stderr, and the take's durable
+/// journal remains startup recovery's path.
+#[test]
+fn shutdown_returns_while_a_store_write_hangs() {
+    let source = FakeCaptureSource::new(vec![]);
+    let capture_source: std::sync::Arc<dyn CaptureSource> = source.clone();
+    let store = GatedStore::new();
+    let config = RuntimeConfig::default()
+        .with_capture_source(capture_source)
+        .with_provider(starling_runtime::provider::FakeProvider::new(vec![]))
+        .with_capture_store(store.clone())
+        .with_capture_config(CaptureConfig {
+            journals_dir: std::env::temp_dir().join("starling-runtime-test-journals"),
+            poll_interval: Duration::from_millis(10),
+            persist_drain_timeout: Duration::from_millis(250),
+        })
+        .with_jobs_limits(JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        });
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_hang"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (samples accumulated)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_hang"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_hang"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // The persist is gated shut. Shutdown must still return — after the
+    // bounded drain, not after the (never-arriving) report.
+    let shutdown_started = Instant::now();
+    let shutting_down = std::thread::spawn(move || runtime.shutdown());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !shutting_down.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        shutting_down.is_finished(),
+        "shutdown never returned while a store write hung — the drain is unbounded"
+    );
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?} with a 250 ms drain bound",
+        shutdown_started.elapsed()
+    );
+    // Cleanup: let the hung worker finish; its report lands on a closed
+    // inbox by design (surfaced on stderr, dropped).
+    store.open();
+    shutting_down.join().expect("shutdown thread");
+}
+
+/// Review on #252, defects 2 and 4 (the reproduced swallow): take_a
+/// stops, the persist is handed off, the user aborts (table-legal from
+/// Draining) and a new take starts and stops — all before take_a's slow
+/// report lands. The stale report must land registry-only: emitting its
+/// `capture.stopped` would consume the Draining that belongs to take_b,
+/// and take_b's own announcement would then be refused as illegal from
+/// Persisted — silently swallowed.
+#[test]
+fn stale_persist_report_lands_nothing_on_the_next_take() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(600),
+        failing: Vec::new(),
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    // take_a: stopped, then aborted mid-persist, then replaced.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_a)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_a"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_a"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+    client
+        .send(Some("take_a"), Command::CaptureAbort)
+        .expect("abort is table-legal from Draining while the persist runs");
+
+    // take_b replaces take_a well before the slow report lands.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start after the abort accepted");
+    until(
+        &events,
+        "capture.started (take_b)",
+        |m| m.type_name() == "capture.started" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    until(
+        &events,
+        "capture.progress (take_b)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_b"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // take_a's stale report lands during take_b's Draining. With the
+    // scoping fix it emits nothing; without it, its capture.stopped
+    // consumed the Draining and take_b's own stopped was swallowed (the
+    // wait below would time out).
+    until(
+        &events,
+        "capture.stopped (take_b, not swallowed by take_a's stale report)",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    wait_for_capture_state(&client, "Persisted", Duration::from_secs(5));
+    store.waited_for_attempt("take_a", Instant::now() + Duration::from_secs(5));
+    store.waited_for_attempt("take_b", Instant::now() + Duration::from_secs(5));
+
+    // Nothing was ever announced for the aborted take, and both takes'
+    // store rows landed — the stale one registry-only, but never dropped.
+    std::thread::sleep(Duration::from_millis(100));
+    let mut drained = Vec::new();
+    while let Ok(message) = events.try_recv() {
+        drained.push(message);
+    }
+    assert!(
+        !drained
+            .iter()
+            .any(|m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_a")),
+        "a stale persist report must not announce its aborted take: {:?}",
+        drained.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let landed = store.landed.lock().unwrap().clone();
+        let a = landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_a");
+        let b = landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_b");
+        if a && b {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both takes' store rows must land (stale registry-only, current announced): {landed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+}
+
+/// Review on #252, defect 2 (the poison variant): a stale report whose
+/// commit FAILED used to be judged legal from the *new* take's
+/// `Recording` and emitted its fatal `storage_commit_failed` —
+/// interrupting the new take, whose stop was then refused outright. The
+/// failed stale report must land registry-only, and the live take must
+/// complete untouched.
+#[test]
+fn a_failed_stale_persist_cannot_poison_the_next_take() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(600),
+        failing: vec!["take_a".into()],
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    // take_a: stopped (commit will fail), aborted mid-persist.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_a)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_a"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_a"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+    client
+        .send(Some("take_a"), Command::CaptureAbort)
+        .expect("abort is table-legal from Draining while the persist runs");
+
+    // take_b goes live (Recording) and stays recording while take_a's
+    // failed report arrives.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start after the abort accepted");
+    until(
+        &events,
+        "capture.started (take_b)",
+        |m| m.type_name() == "capture.started" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    until(
+        &events,
+        "capture.progress (take_b)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    store.waited_for_attempt("take_a", Instant::now() + Duration::from_secs(5));
+
+    // The live take completes untouched: its stop is accepted and its
+    // capture.stopped lands — no fatal error for take_a poisoned it.
+    client
+        .send(Some("take_b"), Command::CaptureStop { drain: Some(true) })
+        .expect("the live take's stop must still be legal");
+    until(
+        &events,
+        "capture.stopped (take_b)",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_b"),
+        Duration::from_secs(5),
+    );
+    wait_for_capture_state(&client, "Persisted", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(100));
+    let mut drained = Vec::new();
+    while let Ok(message) = events.try_recv() {
+        drained.push(message);
+    }
+    assert!(
+        !drained
+            .iter()
+            .any(|m| m.type_name() == "capture.error" && m.corr.as_deref() == Some("take_a")),
+        "a failed stale persist must not emit a fatal error against the live take: {:?}",
+        drained.iter().map(|m| m.type_name()).collect::<Vec<_>>()
+    );
+    runtime.shutdown();
+}
+
+/// Review on #252, defect 3: the abort path's route release used to ride
+/// with the persist report — but the store commit is precisely the slow
+/// encode, so the freeze outlived the aborted take by the full persist
+/// duration and `context.snapshot` was wedged out of `RouteFrozen`. The
+/// release happens at the abort decision point now: the context cycle is
+/// free while the persist is still in flight.
+#[test]
+fn an_aborts_route_release_does_not_wait_for_its_persist() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(600),
+        failing: Vec::new(),
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_c"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_c)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_c"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_c"), Command::CaptureAbort)
+        .expect("abort accepted");
+
+    // The route releases at the decision point — long before the slow
+    // persist lands (order-based: nothing has landed yet).
+    wait_for_context_state(&client, "Released", Duration::from_secs(2));
+    assert!(
+        store.landed.lock().unwrap().is_empty(),
+        "the route released only after the persist landed — the freeze outlived the aborted take"
+    );
+
+    // And the context cycle really is free mid-persist: a fresh snapshot
+    // is answered (from RouteFrozen it would be the wedge's rejection).
+    client
+        .send(Some("ctx-2"), Command::ContextSnapshot { source: "vscode".into() })
+        .expect("context.snapshot answered while the abort's persist runs");
+    until(
+        &events,
+        "context.targetSnapshot",
+        |m| m.type_name() == "context.targetSnapshot",
+        Duration::from_secs(2),
+    );
+
+    // The persist still lands afterwards — deferred, not dropped.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let landed = store.landed.lock().unwrap().clone();
+        if landed
+            .iter()
+            .any(|(status, id)| *status == TakeStatus::Interrupted && id == "take_c")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the aborted take's persist never landed: {landed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    runtime.shutdown();
+}
+
+/// pullfrog on #252 (reproduced): an abort arriving while a STOP's persist
+/// is in flight finds the take already consumed — the abort's decision-point
+/// release must still run there, or the context stays RouteFrozen for the
+/// whole persist window.
+#[test]
+fn an_abort_during_a_stops_persist_still_releases_the_route_at_the_decision_point() {
+    let source = FakeCaptureSource::new(vec![]);
+    let store = std::sync::Arc::new(SlowStore {
+        delay: Duration::from_millis(600),
+        failing: Vec::new(),
+        attempts: std::sync::Mutex::new(Vec::new()),
+        landed: std::sync::Mutex::new(Vec::new()),
+    });
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        store.clone(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+    freeze_route(&client, &events);
+
+    // A clean take that STOPs — the machine enters Draining while the
+    // slow persist encodes.
+    source.push(FakeTakeScript::clean());
+    client
+        .send(Some("take_s"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.progress (take_s)",
+        |m| m.type_name() == "capture.progress" && m.corr.as_deref() == Some("take_s"),
+        Duration::from_secs(5),
+    );
+    client
+        .send(Some("take_s"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
+
+    // The abort lands inside the stop's persist window (table-legal from
+    // Draining): the take is already consumed, but the route must release
+    // at the decision point — long before the slow store lands anything.
+    client
+        .send(Some("take_s"), Command::CaptureAbort)
+        .expect("abort accepted during the stop's persist");
+    wait_for_context_state(&client, "Released", Duration::from_secs(2));
+    assert!(
+        store.landed.lock().unwrap().is_empty(),
+        "the route released only after the persist landed — the freeze outlived \
+         the aborted stop for the whole persist window"
     );
 
     runtime.shutdown();
