@@ -183,6 +183,21 @@ std::vector<UnsupportedGraphNode> enumerate_unsupported_graph_nodes(
 std::string format_unsupported_graph_node(const UnsupportedGraphNode& node,
                                           int n_nodes);
 
+// The build-time guard ReplayGraph::alloc_internal runs on every GPU-routed
+// captured graph (issue #184): enumerate every node `supports` rejects and
+// throw a std::runtime_error naming them (device, rejected/total counts, up
+// to 16 sched-dbg node lines, and the actionable tail pointing at #184 and
+// STARLING_SCHED_DEBUG, which also echoes the FULL enumeration to stderr when
+// set to 1). The exception rides the engine's normal error path (capi's
+// g_last_error -> HTTP 500); without it the captured graph would take the
+// ggml_backend_sched route, whose buffers abort ReplayGraph's first async
+// input upload inside ggml. Predicate-taking so tests drive it with fakes —
+// no GPU backend needed. No-op when every node passes `supports`.
+void check_no_unsupported_graph_nodes(
+    ggml_cgraph* gf,
+    const std::function<bool(const ggml_tensor*)>& supports,
+    const char* device_name);
+
 // A graph built once and replayed many times, keeping the same ggml context +
 // cgraph alive so ggml-cuda can capture + replay it. Callers feed fresh input
 // data each call via set_input.

@@ -536,6 +536,54 @@ std::string format_unsupported_graph_node(const UnsupportedGraphNode& node,
     return line;
 }
 
+void check_no_unsupported_graph_nodes(
+    ggml_cgraph* gf,
+    const std::function<bool(const ggml_tensor*)>& supports,
+    const char* device_name) {
+    // The build-time guard ReplayGraph::alloc_internal runs on every
+    // GPU-routed captured graph (issue #184). Extracted from it so tests can
+    // drive the real throw path with a fake predicate — no GPU backend
+    // needed. No-op when every node passes `supports`.
+    const std::vector<UnsupportedGraphNode> unsupported =
+        enumerate_unsupported_graph_nodes(gf, supports);
+    if (unsupported.empty()) return;
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    // STARLING_SCHED_DEBUG echoes the enumeration to stderr at allocation
+    // time; it survives callers that log only part of the thrown error below.
+    if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
+        debug && debug[0] == '1') {
+        for (const auto& u : unsupported)
+            std::fprintf(stderr, "[sched-dbg] unsupported %s\n",
+                         format_unsupported_graph_node(u, n_nodes).c_str());
+    }
+    std::string msg =
+        "ReplayGraph allocation failed: device '" +
+        std::string(device_name) + "' rejected " +
+        std::to_string(unsupported.size()) + " of " +
+        std::to_string(n_nodes) + " captured-graph nodes:\n";
+    // The message crosses the C API into a 2048-byte error buffer
+    // (g_last_error in capi.cpp), so cap the embedded per-node lines or the
+    // actionable tail below would truncate away first. The
+    // STARLING_SCHED_DEBUG echo above always prints every node.
+    constexpr size_t kMaxEmbeddedLines = 16;
+    for (size_t i = 0; i < unsupported.size() && i < kMaxEmbeddedLines; ++i)
+        msg += "  " + format_unsupported_graph_node(unsupported[i], n_nodes) + "\n";
+    if (unsupported.size() > kMaxEmbeddedLines)
+        msg += "  ... and " +
+               std::to_string(unsupported.size() - kMaxEmbeddedLines) +
+               " more rejected node(s) - run with STARLING_SCHED_DEBUG=1"
+               " to print all of them\n";
+    msg +=
+        "A captured (replayed) graph cannot fall back to"
+        " ggml_backend_sched: its input uploads run on the primary"
+        " backend against sched-allocated buffers and abort inside"
+        " ggml. This is a starling graph-construction bug - please"
+        " report it (see https://github.com/sims1253/starling/issues/184)."
+        " Set STARLING_SCHED_DEBUG=1 to also print this enumeration to"
+        " stderr at allocation time.";
+    throw std::runtime_error(msg);
+}
+
 // --------------------------------------------------------------------------- //
 // ReplayGraph
 // --------------------------------------------------------------------------- //
@@ -640,54 +688,19 @@ bool ReplayGraph::alloc_internal() {
     // replays upload via ggml_backend_tensor_set_async with the PRIMARY
     // backend, which aborts on sched-allocated buffers ("unsupported buffer
     // type", issue #184). So for captured graphs the unsupported-op route is
-    // a hard allocation error, not a fallback. (The imatrix route below stays
-    // a supported sched configuration.)
+    // a hard allocation error, not a fallback. The guard runs for EVERY
+    // GPU-routed captured graph, the imatrix sched route included: the
+    // STARLING_IMATRIX env gate does not pin the device to CPU, and a
+    // rejected node behind that route would hit the same first-upload
+    // assert. (A fully-supported graph still takes the imatrix sched route
+    // below — that configuration is unchanged.)
     need_sched_ = ImatrixCollector::enabled();
-    if (backend_.is_gpu() && !need_sched_) {
+    if (backend_.is_gpu()) {
         ggml_backend_t backend = backend_.handle();
-        const std::vector<UnsupportedGraphNode> unsupported =
-            enumerate_unsupported_graph_nodes(
-                gf_, [backend](const ggml_tensor* n) {
-                    return ggml_backend_supports_op(backend, n);
-                });
-        if (!unsupported.empty()) {
-            const int n_nodes = ggml_graph_n_nodes(gf_);
-            // STARLING_SCHED_DEBUG echoes the enumeration to stderr at
-            // allocation time; it survives callers that log only part of the
-            // thrown error below.
-            if (const char* debug = std::getenv("STARLING_SCHED_DEBUG");
-                debug && debug[0] == '1') {
-                for (const auto& u : unsupported)
-                    std::fprintf(stderr, "[sched-dbg] unsupported %s\n",
-                                 format_unsupported_graph_node(u, n_nodes).c_str());
-            }
-            std::string msg =
-                "ReplayGraph allocation failed: device '" +
-                std::string(backend_.device_name()) + "' rejected " +
-                std::to_string(unsupported.size()) + " of " +
-                std::to_string(n_nodes) + " captured-graph nodes:\n";
-            // The message crosses the C API into a 2048-byte error buffer
-            // (g_last_error in capi.cpp), so cap the embedded per-node lines
-            // or the actionable tail below would truncate away first. The
-            // STARLING_SCHED_DEBUG echo above always prints every node.
-            constexpr size_t kMaxEmbeddedLines = 16;
-            for (size_t i = 0; i < unsupported.size() && i < kMaxEmbeddedLines; ++i)
-                msg += "  " + format_unsupported_graph_node(unsupported[i], n_nodes) + "\n";
-            if (unsupported.size() > kMaxEmbeddedLines)
-                msg += "  ... and " +
-                       std::to_string(unsupported.size() - kMaxEmbeddedLines) +
-                       " more rejected node(s) - run with STARLING_SCHED_DEBUG=1"
-                       " to print all of them\n";
-            msg +=
-                "A captured (replayed) graph cannot fall back to"
-                " ggml_backend_sched: its input uploads run on the primary"
-                " backend against sched-allocated buffers and abort inside"
-                " ggml. This is a starling graph-construction bug - please"
-                " report it (see https://github.com/sims1253/starling/issues/184)."
-                " Set STARLING_SCHED_DEBUG=1 to also print this enumeration to"
-                " stderr at allocation time.";
-            throw std::runtime_error(msg);
-        }
+        check_no_unsupported_graph_nodes(
+            gf_, [backend](const ggml_tensor* n) {
+                return ggml_backend_supports_op(backend, n);
+            }, backend_.device_name());
     }
     if (!need_sched_) {
         // PRIVATE gallocr per ReplayGraph: a shared one would invalidate other
