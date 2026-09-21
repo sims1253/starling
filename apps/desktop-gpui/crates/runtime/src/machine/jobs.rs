@@ -437,8 +437,19 @@ impl JobsActor {
                     .map(|job| job.capture_ref.clone())
                     .and_then(|capture_ref| registry.get(&capture_ref).cloned())
             };
-            if let Some(job) = self.jobs.get_mut(&job_id) {
-                let _ = job.core.advance_internal("Recognizing");
+            // Per-job core advances to `Recognizing` at dispatch, BEFORE
+            // the worker spawns (the projection observably sits there while
+            // the worker runs — the shape the #210 storm test gates on). If
+            // the internal edge were ever refused, the job must NOT run
+            // with a core left behind in `Loading` — that snapshot would
+            // read as in-flight forever once retired (review on #248).
+            let recognized = self
+                .jobs
+                .get_mut(&job_id)
+                .and_then(|job| job.core.advance_internal("Recognizing").ok());
+            if recognized.is_none() {
+                self.waiting.push_back(job_id);
+                continue;
             }
             self.active.insert(job_id.clone());
             self.spawn_worker(job_id, record);
@@ -615,8 +626,14 @@ impl JobsActor {
     /// merely finished).
     fn retire(&mut self, job_id: &str) {
         if let Some(job) = self.jobs.remove(job_id) {
-            self.retired_state = job.core.state().to_string();
-            self.retired_violations = job.core.view().violations;
+            // Only the LATEST job's terminal view is wire-visible: an older
+            // job retiring after the latest one must not clobber the
+            // retained snapshot with its own state/violations (review on
+            // #248).
+            if self.latest.as_deref() == Some(job_id) {
+                self.retired_state = job.core.state().to_string();
+                self.retired_violations = job.core.view().violations;
+            }
         }
     }
 }
