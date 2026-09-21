@@ -14,6 +14,7 @@
  },
  "status_vocab": [
   "pending",
+  "filed",
   "in_progress",
   "implemented",
   "integrated",
@@ -212,11 +213,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 221
   },
   {
    "id": "E02",
@@ -235,7 +237,8 @@
     "I2 CORE COMPLETE: coordinator rerun 161/161 + 42/42 (06a80bb, pushed to #194); all 8 \u00a74 tables; 4-step crash protocol w/ per-step fault injection; reconcile matrix incl. tombstones; dry-run migration verified in sample domain w/ rollback; extra_json preservation; SchemaTooNew refusal",
     "CUTOVER PHASE 1: coordinator rerun 170+56+50 (27b15e5); dry-run->apply->cutover/rollback state machine w/ every refusal tested; journal adoption + WAV crash-protocol saves + attempt lifecycle; honest v1-degradation ban pinned by test"
    ],
-   "notes": "v2-ONLY per D14: migration flow + dual store + flag deleted (net -1987 lines); remaining: leases, retention sweep, bounded reads, runtime-side store integration; v1 FileSessionStore kept only because crates/runtime references it (delete on I3 integration)"
+   "notes": "v2-ONLY per D14: migration flow + dual store + flag deleted (net -1987 lines); remaining: leases, retention sweep, bounded reads, runtime-side store integration; v1 FileSessionStore kept only because crates/runtime references it (delete on I3 integration)",
+   "github_issue": 219
   },
   {
    "id": "E03",
@@ -249,11 +252,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 221
   },
   {
    "id": "E04",
@@ -265,11 +269,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 221
   },
   {
    "id": "E05",
@@ -282,11 +287,12 @@
     "E16"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 222
   },
   {
    "id": "E06",
@@ -315,11 +321,12 @@
     "E06"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 223
   },
   {
    "id": "E08",
@@ -332,11 +339,12 @@
     "B09"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 223
   },
   {
    "id": "E09",
@@ -349,11 +357,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 227
   },
   {
    "id": "E10",
@@ -367,7 +376,7 @@
    "owner": "impl-agent-6",
    "branch": null,
    "evidence": [],
-   "notes": "capability descriptor + conformance fixtures; evidence-derived from live server code"
+   "notes": "capability descriptor + conformance fixtures; evidence-derived from live server code; contract merged; client adoption wiring remains (folded into #221/#223 product work)"
   },
   {
    "id": "E11",
@@ -381,11 +390,12 @@
     "E28"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 226
   },
   {
    "id": "E12",
@@ -400,11 +410,12 @@
     "E16"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 228
   },
   {
    "id": "E13",
@@ -417,11 +428,12 @@
     "E10"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 229
   },
   {
    "id": "E14",
@@ -434,11 +446,12 @@
     "E10"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 230
   },
   {
    "id": "E15",
@@ -450,11 +463,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 228
   },
   {
    "id": "E16",
@@ -488,7 +502,8 @@
     "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)",
     "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)"
    ],
-   "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain"
+   "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain",
+   "github_issue": 220
   },
   {
    "id": "E18",
@@ -536,11 +551,12 @@
     "E08"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 223
   },
   {
    "id": "E21",
@@ -553,11 +569,12 @@
     "E17"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 224
   },
   {
    "id": "E22",
@@ -569,11 +586,12 @@
     "E10"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 229
   },
   {
    "id": "E23",
@@ -586,11 +604,12 @@
     "E09"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 224
   },
   {
    "id": "E24",
@@ -623,11 +642,12 @@
     "E28"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 227
   },
   {
    "id": "G01",
@@ -773,11 +793,12 @@
     "E21"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 223
   },
   {
    "id": "E28",
@@ -828,11 +849,12 @@
     "E27"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 223
   },
   {
    "id": "S01",
@@ -906,11 +928,12 @@
     "S02"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 232
   },
   {
    "id": "S05",
@@ -920,11 +943,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 231
   },
   {
    "id": "S06",
@@ -936,11 +960,12 @@
     "S01"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 231
   },
   {
    "id": "S07",
@@ -952,11 +977,12 @@
     "S02"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 231
   },
   {
    "id": "S08",
@@ -968,11 +994,12 @@
     "S02"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 232
   },
   {
    "id": "S09",
@@ -982,11 +1009,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 233
   },
   {
    "id": "S10",
@@ -998,11 +1026,12 @@
     "S02"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 231
   },
   {
    "id": "S11",
@@ -1033,11 +1062,12 @@
     "S02"
    ],
    "existing_issue": 178,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 233
   },
   {
    "id": "S13",
@@ -1047,11 +1077,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 234
   },
   {
    "id": "S14",
@@ -1061,11 +1092,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 234
   },
   {
    "id": "S15",
@@ -1075,11 +1107,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 231
   },
   {
    "id": "S16",
@@ -1089,11 +1122,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": 171,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 233
   },
   {
    "id": "S17",
@@ -1105,11 +1139,12 @@
     "S11"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 233
   },
   {
    "id": "S18",
@@ -1121,11 +1156,12 @@
     "S12"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 233
   },
   {
    "id": "S19",
@@ -1137,11 +1173,12 @@
     "S02"
    ],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [],
-   "notes": ""
+   "notes": "",
+   "github_issue": 232
   },
   {
    "id": "R01",
@@ -1151,11 +1188,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
    "branch": null,
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "status corrected: structurally fixed by the lock-free ring rewrite (merged via #194/#193); stale pending entry"
    ],
    "notes": "feeds G01/E01 capture rework; OCR bug-high"
   },
@@ -1235,13 +1273,14 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [
     "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
    ],
-   "notes": "client.rs; 256MB recording doubles peak memory"
+   "notes": "client.rs; 256MB recording doubles peak memory",
+   "github_issue": 235
   },
   {
    "id": "R07",
@@ -1285,11 +1324,12 @@
    "area": "app",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": null,
    "branch": null,
    "evidence": [
-    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19"
+    "PR #193 OpenCodeReview run 35474104500-1, 2026-09-19",
+    "status corrected: structurally fixed by the lock-free ring rewrite (merged via #194/#193); stale pending entry"
    ],
    "notes": "folds into G01 capture lifecycle rework"
   },
@@ -1578,13 +1618,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [
     "PR #198 OCR run 35518206319 (2 findings)"
    ],
-   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch"
+   "notes": "medium REBUTTED with file:line evidence (test_env_budget_parsing:264); remaining: fault-hook RAII guard on next engine touch",
+   "github_issue": 236
   },
   {
    "id": "R28",
@@ -1594,11 +1635,12 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "integrated",
    "owner": "coordinator",
    "branch": null,
    "evidence": [
-    "PR #197 rerun finding 4057347666: R18 wiring exists only on program/wave-a; engine branches build explicit target lists without device_cache_clear/greedy_termination/tdt_graph_budget tests"
+    "PR #197 rerun finding 4057347666: R18 wiring exists only on program/wave-a; engine branches build explicit target lists without device_cache_clear/greedy_termination/tdt_graph_budget tests",
+    "status corrected: landed on all four engine branches and merged via #196-#199"
    ],
    "notes": "cherry-pick 6f64d8f (conditional version) onto s01/s02/s03/s11 branches + push"
   },
@@ -1610,13 +1652,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": null,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [
     "PR #199 OCR rerun 35518232105-2"
    ],
-   "notes": "verify-then-fix; fold into next engine touch with R27"
+   "notes": "verify-then-fix; fold into next engine touch with R27",
+   "github_issue": 236
   },
   {
    "id": "R32",
@@ -1626,13 +1669,14 @@
    "area": "serving",
    "deps": [],
    "existing_issue": 184,
-   "status": "pending",
+   "status": "filed",
    "owner": null,
    "branch": null,
    "evidence": [
     "5090 report Gate C: ReplayGraph rejects 24/1869 nodes (all CONV_2D_DW, src0=f16) on CUDA; plain master 12b6548 fails identically; ggml-cuda.cu:5533 returns src0->type==F32; convert_parakeet_gguf.py deliberately stores F16"
    ],
-   "notes": "fix directions: extend pinned-ggml CUDA CONV_2D_DW to accept F16 src0 (patch series) or add a capture-time cast; blocks parakeet CUDA E2E + S02 VRAM-plateau evidence; coordinator to draft as GitHub issue for user review"
+   "notes": "fix directions: extend pinned-ggml CUDA CONV_2D_DW to accept F16 src0 (patch series) or add a capture-time cast; blocks parakeet CUDA E2E + S02 VRAM-plateau evidence; coordinator to draft as GitHub issue for user review",
+   "github_issue": 218
   },
   {
    "id": "R33",
@@ -1770,5 +1814,8 @@
   "194": "gpui/fixes-wave-a2 -> gpui-port (G03-G07 fixes)",
   "195": "program/wave-a -> master (draft, living branch: contracts+B11+control plane)",
   "196": "program/s01-moss-kv-clear -> master (S01)"
+ },
+ "issue_filing": {
+  "note": "2026-09-21: 19 consolidated issues filed (#218-#236) covering all open program work; per-item github_issue fields map local IDs to issues. Exception: #225 (Insights phase 2) has no single local task ID — it is phase-2 product work building on the integrated E28/E29 — so it carries no per-item mapping."
  }
 }

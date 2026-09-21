@@ -41,6 +41,10 @@ Every tasks.json item carries one status from the fixed vocabulary; a compiled
 change is `implemented`, merged into a program branch is `integrated`, and only
 executed-on-named-hardware evidence yields `verified_on_target`. Historical
 cumulative speedups from unmerged branches are not counted as gains.
+2026-09-21 addendum: `filed` marks not-yet-started open work consolidated into
+a GitHub issue via the per-item `github_issue` field; it is orthogonal to
+progress states — an item that starts work moves to `in_progress` (or beyond)
+with `github_issue` retained.
 
 ## D6 — 2026-09-20 — E17 sequencing: library-first, envelope before IPC
 Adopted the design note (e576a7a): `starling-runtime` in-process library (Mode A)
