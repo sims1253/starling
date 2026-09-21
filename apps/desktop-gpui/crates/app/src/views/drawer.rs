@@ -24,8 +24,11 @@ pub fn render_drawer(
 
     let active = app.is_active(&session.id);
     let playing = app.playing_id.as_deref() == Some(session.id.as_str());
-    let copied = app.copied;
-    let wav_saved = app.wav_saved;
+    // #214.2: the flags name the take they were earned on, so switching
+    // selections can never show "Copied"/"Saved" for a take nothing
+    // happened on.
+    let copied = app.copied.as_deref() == Some(session.id.as_str());
+    let wav_saved = app.wav_saved.as_deref() == Some(session.id.as_str());
     let transcript_scale = app.transcript_scale(window.viewport_size().width);
     let transcript = session.transcript.clone();
     let warnings = app.fidelity_warnings();
@@ -88,7 +91,12 @@ pub fn render_drawer(
         .child("Export"),
     );
 
-    let delete_disabled = active;
+    // B05, #208: the trash button never deletes on its first click. It
+    // arms a "Confirm delete?" state for exactly the selected take; only a
+    // second click confirms. Also disabled while a confirmed delete is in
+    // flight (#214.3), like the transcription-active case above.
+    let delete_disabled = active || app.is_deleting(&session.id);
+    let delete_armed = app.delete_armed();
     let delete_id = session.id.clone();
     actions = actions.child(
         action_button(
@@ -96,12 +104,13 @@ pub fn render_drawer(
             delete_disabled,
             cx.listener(move |this, _, _window, cx| {
                 let id = delete_id.clone();
-                this.remove_session(id, cx);
+                this.request_delete_session(id, cx);
             }),
         )
         .px(px(7.))
         .text_color(theme::DANGER)
-        .child(icon("icons/trash.svg", 16., theme::DANGER)),
+        .child(icon("icons/trash.svg", 16., theme::DANGER))
+        .when(delete_armed, |button| button.child("Confirm delete?")),
     );
 
     let mut body = div()

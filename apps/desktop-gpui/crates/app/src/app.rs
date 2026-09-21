@@ -360,9 +360,32 @@ pub struct StarlingApp {
     /// transient flags.
     pub export_notice: Option<String>,
     pub unsaved: Vec<UnsavedWav>,
-    pub confirm_discard: bool,
-    pub copied: bool,
-    pub wav_saved: bool,
+    /// The armed discard confirmation (#214.4): the batch token (see
+    /// [`unsaved_batch_token`]) of the unsaved batch the user armed
+    /// discarding. Scoped to the exact batch on purpose — see
+    /// [`discard_intent`].
+    pub confirm_discard_for: Option<u64>,
+    /// Ephemeral drawer flags, scoped to the take they were earned on
+    /// (#214.2): the id of the session whose transcript was copied / whose
+    /// WAV was saved, so the flag can never bleed onto another selection.
+    pub copied: Option<String>,
+    pub wav_saved: Option<String>,
+    /// The armed delete confirmation (B05, #208): the id of the take whose
+    /// trash button was clicked once. Only a second click on that same
+    /// take's button deletes — see [`delete_intent`].
+    pub confirm_delete_id: Option<String>,
+    /// Sessions with a delete job in flight (#214.3): a delete click while
+    /// the store operation is still running is ignored instead of spawning
+    /// a second job that would race the first into a spurious `NotFound`.
+    /// An id is released only by a listing that no longer contains it (see
+    /// [`surviving_deletes`]) — or by the job's own failure, so a failed
+    /// delete stays retryable.
+    pub deleting_ids: HashSet<String>,
+    /// When the last record-hotkey event arrived, accepted or not (#209):
+    /// the debounce window slides on every event, so a held key — whose
+    /// auto-repeats arrive every ~25–33 ms — can never squeeze a second
+    /// toggle through. See [`hotkey_toggle_at`].
+    pub last_hotkey_toggle: Option<Instant>,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -489,6 +512,168 @@ pub(crate) fn banner_notice<'a>(
     export_notice: Option<&'a str>,
 ) -> Option<&'a str> {
     capture_warning.or(export_notice)
+}
+
+/// How close together two record-hotkey events may arrive and still be
+/// treated as distinct presses (#209). Keyboard auto-repeat begins after
+/// the platform's initial delay (X11 default 660 ms, desktop settings
+/// commonly 500 ms) and then fires every 25–33 ms — some setups as slowly
+/// as 2 Hz. The window must exceed that interval, and it slides on every
+/// event (see [`hotkey_toggle_at`]), so any repeat stream is suppressed
+/// forever after its first event; only a genuinely separate press — a
+/// human re-pressing the chord — is spaced far enough to pass.
+const HOTKEY_TOGGLE_MIN_INTERVAL: Duration = Duration::from_millis(750);
+
+/// What a record-hotkey event does (#209, #214.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HotkeyToggle {
+    /// A deliberate press: run the toggle.
+    Accept,
+    /// Any modal is open: the toggle is ignored so recording can never
+    /// start invisibly behind a settings scrim.
+    SuppressModalOpen,
+    /// Too close to the previous event: auto-repeat or a double-eaten
+    /// chord, not a deliberate press.
+    SuppressRepeatBurst,
+}
+
+/// The record hotkey's debounce gate (#209, #214.1), as a pure state
+/// machine over `last_event` so the burst behavior is testable.
+///
+/// The window slides — `last_event` is advanced on *every* event, accepted
+/// or suppressed — which is what kills the auto-repeat loop: repeats arrive
+/// 25–33 ms apart, each refreshing the window, so after the first accepted
+/// press no repeat of the same hold can ever be `HOTKEY_TOGGLE_MIN_INTERVAL`
+/// away from its predecessor. A modal-open event also slides the window, so
+/// a chord held through the modal's lifetime cannot fire on the way out.
+pub(crate) fn hotkey_toggle_at(
+    modal_open: bool,
+    last_event: &mut Option<Instant>,
+    now: Instant,
+) -> HotkeyToggle {
+    let decision = if modal_open {
+        HotkeyToggle::SuppressModalOpen
+    } else if last_event
+        .as_ref()
+        .is_some_and(|last| now.duration_since(*last) < HOTKEY_TOGGLE_MIN_INTERVAL)
+    {
+        HotkeyToggle::SuppressRepeatBurst
+    } else {
+        HotkeyToggle::Accept
+    };
+    *last_event = Some(now);
+    decision
+}
+
+/// What a click on a take's trash button does (B05, #208).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteIntent {
+    /// First click (or a click on a different take): arm the confirmation,
+    /// delete nothing.
+    Arm,
+    /// Second click on the same take's armed button: delete it.
+    Delete,
+}
+
+/// The delete confirmation state machine (B05, #208): one click arms
+/// exactly the take it was pressed on; only a second click on that same
+/// take deletes. A click on another take's button re-arms for it, so an
+/// armed confirmation can never delete something it was not armed for.
+pub(crate) fn delete_intent(armed_for: Option<&str>, clicked: &str) -> DeleteIntent {
+    if armed_for == Some(clicked) {
+        DeleteIntent::Delete
+    } else {
+        DeleteIntent::Arm
+    }
+}
+
+/// Whether the armed delete confirmation still targets the selected take
+/// (#208, with #214.2's lesson applied to it): an arm is inert the moment
+/// the selection moves — including selection changes that bypass
+/// `select_session`, like a new take jumping the drawer after it is
+/// recorded — so a stale arm can never resurface as "Confirm delete?" on a
+/// take the user never armed.
+pub(crate) fn effective_delete_arm(armed_for: Option<&str>, selected: Option<&str>) -> bool {
+    armed_for.is_some() && armed_for == selected
+}
+
+/// Whether applying a listing moves the selection off its current take
+/// (review finding 1): the move must run the same reset as an explicit
+/// click in `select_session` — including stopping playback of a take that
+/// just vanished from the listing.
+pub(crate) fn listing_moves_selection(
+    current: Option<&str>,
+    sessions: &[SessionSummary],
+) -> bool {
+    next_selection(current, sessions).as_deref() != current
+}
+
+/// A batch identity for the unsaved list (review finding 3): a digest over
+/// the stashed ids in order, so ANY change to the batch — another stash
+/// today, any insert, removal, or reorder a future change might add —
+/// invalidates an armed discard confirmation. Derived on demand, so the
+/// stash path itself (`stash_unsaved`) needs no hook.
+///
+/// `DefaultHasher::new()` hashes with fixed keys, making the token stable
+/// for an unchanged batch across calls.
+pub(crate) fn unsaved_batch_token(unsaved: &[UnsavedWav]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for capture in unsaved {
+        capture.id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// What a click on the discard button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscardIntent {
+    /// Arm the confirmation for the current batch of unsaved takes.
+    Arm,
+    /// Confirmed for exactly this batch: discard them.
+    Execute,
+}
+
+/// The discard confirmation state machine, scoped to the batch it was
+/// armed for (#214.4): the confirmation only executes while the unsaved
+/// list is still the exact batch it was armed against, identified by
+/// [`unsaved_batch_token`]. A take stashed later (a new failed save)
+/// changes the token, so the carried-over arm is dead — the next click
+/// re-arms for the new batch instead of single-click-discarding audio the
+/// user never armed for. This is the derived form of resetting the arm in
+/// the stash path itself.
+pub(crate) fn discard_intent(armed_for: Option<u64>, batch_token: u64) -> DiscardIntent {
+    if armed_for == Some(batch_token) {
+        DiscardIntent::Execute
+    } else {
+        DiscardIntent::Arm
+    }
+}
+
+/// Which in-flight delete ids survive a landed listing (review finding 2):
+/// an id is released only when the listing itself confirms the row is
+/// gone — never by the delete job's own completion, whose refresh may
+/// fail or land late while the row is still on screen. Until a listing
+/// without the row arrives, the guard stays up (the safe direction).
+pub(crate) fn surviving_deletes(
+    deleting_ids: &HashSet<String>,
+    sessions: &[SessionSummary],
+) -> HashSet<String> {
+    deleting_ids
+        .iter()
+        .filter(|id| sessions.iter().any(|session| &session.id == *id))
+        .cloned()
+        .collect()
+}
+
+/// Which ephemeral drawer flag a scheduled reset owns, and the take it was
+/// earned for (#214.2): a timer only clears its flag while the flag still
+/// names that take, so a copy earned on take B is not wiped by take A's
+/// still-running reset timer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EphemeralFlag {
+    Copied(String),
+    WavSaved(String),
 }
 
 /// Highest `-N` suffix attempted when dodging an existing download name.
@@ -622,9 +807,12 @@ impl StarlingApp {
             selected_id: None,
             active_ids: HashSet::new(),
             unsaved: Vec::new(),
-            confirm_discard: false,
-            copied: false,
-            wav_saved: false,
+            confirm_discard_for: None,
+            copied: None,
+            wav_saved: None,
+            confirm_delete_id: None,
+            deleting_ids: HashSet::new(),
+            last_hotkey_toggle: None,
             playing_id: None,
             playback_generation: 0,
             recorder: None,
@@ -700,9 +888,20 @@ impl StarlingApp {
     /// pointed at a record that can no longer be read.
     pub fn apply_sessions(&mut self, list: Vec<ListedRecord>) {
         let (sessions, damaged) = split_listing(list);
-        self.selected_id = next_selection(self.selected_id.as_deref(), &sessions);
+        let next = next_selection(self.selected_id.as_deref(), &sessions);
+        if next != self.selected_id {
+            // Review finding 1: a listing-driven selection move runs the
+            // same reset as an explicit click — playback of the take that
+            // just vanished stops instead of running on under the drawer.
+            self.selection_moved();
+        }
+        self.selected_id = next;
         self.sessions = sessions;
         self.damaged = damaged;
+        // Review finding 2: this is the only place a landed listing may
+        // release an in-flight delete — the row's absence from the listing
+        // is the proof the delete landed.
+        self.deleting_ids = surviving_deletes(&self.deleting_ids, &self.sessions);
     }
 
     /// G02: interacting with a damaged history row surfaces the recorded
@@ -944,22 +1143,100 @@ impl StarlingApp {
 
     pub fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
         if self.selected_id.as_deref() != Some(id.as_str()) {
-            self.stop_playback();
+            self.selection_moved();
         }
         self.selected_id = Some(id);
         cx.notify();
     }
 
-    pub fn remove_session(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.active_ids.contains(&id) {
-            return;
+    /// Everything a move off the current selection must reset, in one place
+    /// so an explicit click (`select_session`) and a listing-driven change
+    /// (`apply_sessions`) cannot drift apart (review finding 1):
+    /// playback of the old take stops, and the per-selection ephemeral
+    /// state (#214.2's Copied/Saved flags, #208's armed delete) is
+    /// dropped.
+    fn selection_moved(&mut self) {
+        self.stop_playback();
+        self.selection_changed();
+    }
+
+    /// Ephemeral state that describes the *selected* take, so a selection
+    /// change must drop it (#214.2): the Copied/Saved flips were earned on
+    /// the previous take and would otherwise bleed onto the new one, and an
+    /// armed delete confirmation (#208) must never carry over to a take the
+    /// user never armed.
+    fn selection_changed(&mut self) {
+        self.copied = None;
+        self.wav_saved = None;
+        self.confirm_delete_id = None;
+    }
+
+    /// Whether the drawer's delete button is in its armed "Confirm delete?"
+    /// state for the selected take (B05, #208). Derived, so an arm left
+    /// behind by any selection change bypassing `select_session` is inert.
+    pub fn delete_armed(&self) -> bool {
+        effective_delete_arm(self.confirm_delete_id.as_deref(), self.selected_id.as_deref())
+    }
+
+    /// Whether a delete job for `id` is still in flight (#214.3).
+    pub fn is_deleting(&self, id: &str) -> bool {
+        self.deleting_ids.contains(id)
+    }
+
+    /// B05, #208: the trash button never deletes straight away. The first
+    /// click arms a "Confirm delete?" state for exactly that take; only a
+    /// second click on the same take's armed button reaches
+    /// [`remove_session`]. The arm is cleared on confirm, and dropped by
+    /// every selection change ([`selection_moved`]).
+    pub fn request_delete_session(&mut self, id: String, cx: &mut Context<Self>) {
+        match delete_intent(self.confirm_delete_id.as_deref(), &id) {
+            DeleteIntent::Delete => {
+                self.confirm_delete_id = None;
+                // Review finding 4: the confirmed delete can still be
+                // refused (transcription started, a delete already in
+                // flight, or the store is gone). Surface that instead of
+                // silently doing nothing — nothing was deleted.
+                if !self.remove_session(id, cx) {
+                    self.error = Some(
+                        "This take cannot be deleted right now — it is still transcribing, a \
+                         delete is already in flight, or the session store is unavailable. \
+                         Nothing was deleted."
+                            .to_string(),
+                    );
+                    cx.notify();
+                }
+            }
+            DeleteIntent::Arm => {
+                // Review finding 5: arm only the take the drawer is
+                // showing, so the stored arm always equals the selection —
+                // correctness must not depend on the drawer's rendering
+                // reach.
+                if self.selected_id.as_deref() == Some(id.as_str()) {
+                    self.confirm_delete_id = Some(id);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Deletes one recording. Returns whether a delete job actually
+    /// started; `false` means the request was refused (transcription in
+    /// flight, a delete already in flight, or no store).
+    pub fn remove_session(&mut self, id: String, cx: &mut Context<Self>) -> bool {
+        if self.active_ids.contains(&id) || self.deleting_ids.contains(&id) {
+            // #214.3: a delete already in flight for this take ignores the
+            // click — the second job would only race the first into a
+            // `NotFound` and overwrite an already-vanished row with a
+            // spurious "Could not delete the recording" error.
+            return false;
         }
         if self.playing_id.as_deref() == Some(id.as_str()) {
             self.stop_playback();
         }
         let Some(store) = self.store.clone() else {
-            return;
+            return false;
         };
+        self.deleting_ids.insert(id.clone());
         cx.spawn(async move |this, cx| {
             let deleted = {
                 let store = store.clone();
@@ -978,9 +1255,20 @@ impl StarlingApp {
                 .await
             };
             match deleted {
-                Ok(()) => refresh_sessions(&this, &store, cx).await,
+                Ok(()) => {
+                    // Review finding 2: the in-flight slot is deliberately
+                    // NOT released here. The refresh may fail or land late
+                    // while the row is still on screen, and the
+                    // double-click guard must hold until a listing that
+                    // actually omits the row arrives — that release lives
+                    // in `apply_sessions`.
+                    refresh_sessions(&this, &store, cx).await;
+                }
                 Err(err) => {
                     this.update(cx, |app, cx| {
+                        // A failed delete leaves the recording in place, so
+                        // release the slot here and let the user retry.
+                        app.deleting_ids.remove(&id);
                         app.error = Some(format!("Could not delete the recording: {err}"));
                         cx.notify();
                     })
@@ -989,9 +1277,16 @@ impl StarlingApp {
             }
         })
         .detach();
+        true
     }
 
     pub fn copy_transcript(&mut self, cx: &mut Context<Self>) {
+        // Review finding 6: the clipboard write and its Copied flag are
+        // one operation on one selected take — either both happen or
+        // neither does.
+        let Some(id) = self.selected_id.clone() else {
+            return;
+        };
         let Some(transcript) = self
             .selected()
             .and_then(|session| session.transcript.clone())
@@ -999,8 +1294,10 @@ impl StarlingApp {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(transcript.text));
-        self.copied = true;
-        self.schedule_flag_reset(true, false, cx);
+        // #214.2: the flag names the take it was earned on, so it can never
+        // show "Copied" on a different selection.
+        self.copied = Some(id.clone());
+        self.schedule_flag_reset(EphemeralFlag::Copied(id), cx);
         cx.notify();
     }
 
@@ -1015,8 +1312,15 @@ impl StarlingApp {
             "starling-{}.txt",
             session.created_at.replace([':', '.'], "-")
         );
-        // Re-exportable from history, so no fsync (see write_download_exclusive).
-        self.write_download(name, Arc::new(transcript.text.into_bytes()), false, false, cx);
+        // Re-exportable from history, so no fsync (see write_download_exclusive);
+        // a transcript export flips no Saved flag.
+        self.write_download(
+            name,
+            Arc::new(transcript.text.into_bytes()),
+            None,
+            false,
+            cx,
+        );
     }
 
     pub fn export_audio(&mut self, cx: &mut Context<Self>) {
@@ -1041,7 +1345,7 @@ impl StarlingApp {
             };
             this.update(cx, |app, cx| match loaded {
                 Ok(Some(wav)) => {
-                    app.write_download(name, wav, true, true, cx);
+                    app.write_download(name, wav, Some(id), true, cx);
                 }
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));
@@ -1067,17 +1371,31 @@ impl StarlingApp {
             &capture.id[capture.id.len().saturating_sub(8)..]
         );
         let wav = capture.wav.clone();
-        // The only copy of the recording: fsync it.
-        self.write_download(name, wav, false, true, cx);
+        // The only copy of the recording: fsync it. Flips no Saved flag —
+        // the unsaved banner is not the drawer's WAV button.
+        self.write_download(name, wav, None, true, cx);
+    }
+
+    /// Whether the discard button is in its armed "Confirm discard" state
+    /// for the current batch of unsaved takes (#214.4).
+    pub fn discard_armed(&self) -> bool {
+        discard_intent(self.confirm_discard_for, unsaved_batch_token(&self.unsaved))
+            == DiscardIntent::Execute
     }
 
     pub fn discard_unsaved(&mut self, cx: &mut Context<Self>) {
-        if self.confirm_discard {
-            self.unsaved.clear();
-            self.error = None;
-            self.confirm_discard = false;
-        } else {
-            self.confirm_discard = true;
+        match discard_intent(self.confirm_discard_for, unsaved_batch_token(&self.unsaved)) {
+            DiscardIntent::Execute => {
+                self.unsaved.clear();
+                self.error = None;
+                self.confirm_discard_for = None;
+            }
+            // Also the re-arm path: an arm carried over from an earlier
+            // batch (a take stashed since) is dead and becomes a fresh
+            // arm for the batch now in the banner.
+            DiscardIntent::Arm => {
+                self.confirm_discard_for = Some(unsaved_batch_token(&self.unsaved));
+            }
         }
         cx.notify();
     }
@@ -1086,7 +1404,7 @@ impl StarlingApp {
         &mut self,
         name: String,
         bytes: Arc<Vec<u8>>,
-        mark_saved: bool,
+        saved_for: Option<String>,
         sync: bool,
         cx: &mut Context<Self>,
     ) {
@@ -1117,9 +1435,14 @@ impl StarlingApp {
                         ));
                         app.schedule_export_notice_reset(cx);
                     }
-                    if mark_saved {
-                        app.wav_saved = true;
-                        app.schedule_flag_reset(false, true, cx);
+                    // Review finding 7: move the owner in, clone it exactly
+                    // once — the second use moves it on into the timer.
+                    if let Some(owner) = saved_for {
+                        // #214.2: the Saved flag names the take it was
+                        // earned on, so it can never show on a different
+                        // selection.
+                        app.wav_saved = Some(owner.clone());
+                        app.schedule_flag_reset(EphemeralFlag::WavSaved(owner), cx);
                     }
                     cx.notify();
                 }
@@ -1149,22 +1472,59 @@ impl StarlingApp {
         .detach();
     }
 
-    fn schedule_flag_reset(&mut self, copied: bool, wav_saved: bool, cx: &mut Context<Self>) {
-        let delay = if copied { 1400 } else { 2000 };
+    /// Clears one ephemeral drawer flag after its read-through window.
+    /// The timer only clears the flag while it still names the take it was
+    /// earned for (#214.2): a reset scheduled for take A's copy must not
+    /// wipe the "Copied" flip take B earned while A's timer was running.
+    fn schedule_flag_reset(&mut self, flag: EphemeralFlag, cx: &mut Context<Self>) {
+        let delay = match &flag {
+            EphemeralFlag::Copied(_) => 1_400,
+            EphemeralFlag::WavSaved(_) => 2_000,
+        };
         cx.spawn(async move |this, cx| {
             Timer::after(Duration::from_millis(delay)).await;
             this.update(cx, |app, cx| {
-                if copied {
-                    app.copied = false;
-                }
-                if wav_saved {
-                    app.wav_saved = false;
+                match &flag {
+                    EphemeralFlag::Copied(owner) => {
+                        if app.copied.as_deref() == Some(owner.as_str()) {
+                            app.copied = None;
+                        }
+                    }
+                    EphemeralFlag::WavSaved(owner) => {
+                        if app.wav_saved.as_deref() == Some(owner.as_str()) {
+                            app.wav_saved = None;
+                        }
+                    }
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The record hotkey's single entry point (#209, #214.1), shared by the
+    /// in-app key binding and the global-hotkey bridge in `main`. The
+    /// on-screen record button calls [`toggle_recording`](Self::toggle_recording)
+    /// directly: mouse clicks do not auto-repeat, and an intentional quick
+    /// start/stop double-click must keep working.
+    ///
+    /// One guard covers both defects: a toggle while any modal is open
+    /// would start recording invisibly behind the scrim, and a toggle
+    /// within the debounce window of the last hotkey event is keyboard
+    /// auto-repeat — each repeated toggle persists a junk take and kicks
+    /// off a transcription job. `toggle_recording` itself transitions
+    /// synchronously, so the sliding window is also the in-flight guard:
+    /// no second toggle can begin until the burst ends.
+    pub fn hotkey_toggle_recording(&mut self, cx: &mut Context<Self>) {
+        let decision = hotkey_toggle_at(
+            self.settings_open,
+            &mut self.last_hotkey_toggle,
+            Instant::now(),
+        );
+        if decision == HotkeyToggle::Accept {
+            self.toggle_recording(cx);
+        }
     }
 
     pub fn toggle_play(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1345,7 +1705,7 @@ impl Render for StarlingApp {
             .track_focus(&root_focus)
             .key_context("Starling")
             .on_action(cx.listener(|this, _: &ToggleRecording, _window, cx| {
-                this.toggle_recording(cx);
+                this.hotkey_toggle_recording(cx);
             }))
             .relative()
             .size_full()
@@ -1664,6 +2024,229 @@ mod tests {
         assert_eq!(next_selection(None, &[]), None);
     }
 
+    #[test]
+    fn a_first_trash_click_arms_and_a_second_on_the_same_take_confirms() {
+        // B05, #208: the first click on a take's trash button may never
+        // delete; only the second click on that same button does.
+        assert_eq!(delete_intent(None, "take-a"), DeleteIntent::Arm);
+        assert_eq!(delete_intent(Some("take-a"), "take-a"), DeleteIntent::Delete);
+    }
+
+    #[test]
+    fn an_armed_delete_never_confirms_for_a_different_take() {
+        // #208 with #214.4's lesson applied: an arm belongs to the take it
+        // was pressed on. A click on another take's trash while the first
+        // is armed re-arms for the new take instead of deleting anything.
+        assert_eq!(delete_intent(Some("take-a"), "take-b"), DeleteIntent::Arm);
+    }
+
+    #[test]
+    fn an_armed_delete_is_inert_once_the_selection_moves_on() {
+        // #208: the arm dies with the selection it was armed under — also
+        // when the selection changed without passing through
+        // `select_session` (a fresh take jumping the drawer).
+        assert!(effective_delete_arm(Some("take-a"), Some("take-a")));
+        assert!(!effective_delete_arm(Some("take-a"), Some("take-b")));
+        assert!(!effective_delete_arm(Some("take-a"), None));
+        assert!(!effective_delete_arm(None, Some("take-a")));
+    }
+
+    fn unsaved(id: &str) -> UnsavedWav {
+        UnsavedWav {
+            id: id.to_string(),
+            wav: Arc::new(Vec::new()),
+            created_at: "2026-09-21T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_armed_discard_executes_only_for_the_batch_it_was_armed_for() {
+        // Two clicks on the unchanged batch discard it.
+        let batch = vec![unsaved("unsaved-1")];
+        let token = unsaved_batch_token(&batch);
+        // Stable for an unchanged batch (review finding 3).
+        assert_eq!(unsaved_batch_token(&batch), token);
+        assert_eq!(discard_intent(None, token), DiscardIntent::Arm);
+        assert_eq!(discard_intent(Some(token), token), DiscardIntent::Execute);
+    }
+
+    #[test]
+    fn a_take_stashed_after_arming_disarms_the_discard_confirmation() {
+        // #214.4: arm "Confirm discard", change your mind; a new failed
+        // save stashes another take. The carried-over arm must be dead:
+        // one click re-arms for the new batch, never single-click-
+        // discards audio the user never armed for.
+        let armed = unsaved_batch_token(&[unsaved("unsaved-1")]);
+        let after_stash = unsaved_batch_token(&[unsaved("unsaved-1"), unsaved("unsaved-2")]);
+        assert_eq!(discard_intent(Some(armed), after_stash), DiscardIntent::Arm);
+        // Re-arming the grown batch executes on it.
+        assert_eq!(
+            discard_intent(Some(after_stash), after_stash),
+            DiscardIntent::Execute
+        );
+        // A third stash kills that arm again.
+        let after_third =
+            unsaved_batch_token(&[unsaved("unsaved-1"), unsaved("unsaved-2"), unsaved("unsaved-3")]);
+        assert_eq!(
+            discard_intent(Some(after_stash), after_third),
+            DiscardIntent::Arm
+        );
+    }
+
+    #[test]
+    fn the_discard_batch_token_covers_any_batch_mutation_not_just_growth() {
+        // Review finding 3: the token identifies the batch by content and
+        // order, so a future insert, removal, or reorder — not only a size
+        // change — invalidates an armed confirmation.
+        let armed = unsaved_batch_token(&[unsaved("unsaved-1"), unsaved("unsaved-2")]);
+        let reordered = unsaved_batch_token(&[unsaved("unsaved-2"), unsaved("unsaved-1")]);
+        assert_ne!(armed, reordered);
+        assert_eq!(discard_intent(Some(armed), reordered), DiscardIntent::Arm);
+    }
+
+    #[test]
+    fn a_listing_that_loses_the_selected_take_moves_the_selection() {
+        // Review finding 1: when a refresh drops the selected take
+        // (deleted from another window, flagged damaged), the drawer moves
+        // — and the move must run the same reset as an explicit click,
+        // including stopping playback of the vanished take.
+        let sessions = vec![summary("next")];
+        assert!(listing_moves_selection(Some("gone"), &sessions));
+        assert!(listing_moves_selection(Some("gone"), &[]));
+        // A listing that keeps the selection is not a move.
+        assert!(!listing_moves_selection(Some("next"), &sessions));
+        assert!(!listing_moves_selection(
+            Some("selected"),
+            &vec![summary("newest"), summary("selected")]
+        ));
+        // Gaining a first selection runs the same reset as clicking that
+        // row with nothing selected — exactly what `select_session` does.
+        assert!(listing_moves_selection(None, &sessions));
+    }
+
+    #[test]
+    fn an_in_flight_delete_is_released_only_when_a_listing_confirms_it_gone() {
+        // Review finding 2: the delete job's own completion releases
+        // nothing — the refresh may fail or land late while the row is
+        // still on screen. Only a listing that omits the row releases the
+        // id; a row still listed keeps its guard up.
+        let sessions = vec![summary("still-listed")];
+        let deleting: HashSet<String> = ["still-listed", "deleted-elsewhere"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let surviving = surviving_deletes(&deleting, &sessions);
+        assert!(surviving.contains("still-listed"));
+        assert!(!surviving.contains("deleted-elsewhere"));
+        // A listing where everything landed removes every guard.
+        assert!(surviving_deletes(&deleting, &[]).is_empty());
+    }
+
+    #[test]
+    fn hotkey_toggles_outside_the_debounce_window_are_accepted() {
+        // Deliberate presses are spaced far apart and must keep working.
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, start),
+            HotkeyToggle::Accept
+        );
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, start + Duration::from_millis(900)),
+            HotkeyToggle::Accept
+        );
+    }
+
+    #[test]
+    fn hotkey_events_inside_the_debounce_window_are_suppressed() {
+        let start = Instant::now();
+        let mut last = None;
+        hotkey_toggle_at(false, &mut last, start);
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, start + Duration::from_millis(100)),
+            HotkeyToggle::SuppressRepeatBurst
+        );
+        // A deliberate re-press just past the window passes — measured from
+        // the *suppressed* event, which slid it.
+        assert_eq!(
+            hotkey_toggle_at(
+                false,
+                &mut last,
+                start + Duration::from_millis(100) + HOTKEY_TOGGLE_MIN_INTERVAL
+            ),
+            HotkeyToggle::Accept
+        );
+    }
+
+    #[test]
+    fn a_held_hotkey_never_multi_fires_through_the_repeat_stream() {
+        // #209: hold the chord for seconds. The platform starts repeating
+        // after its initial delay (here the 500 ms desktop default; X11's
+        // stock 660 ms behaves the same) and then fires every 33 ms. The
+        // first repeat is already inside the window, and every suppressed
+        // repeat slides it further — exactly one toggle, the initial
+        // press, is ever accepted: no start/stop/start loop, no junk
+        // takes.
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, start),
+            HotkeyToggle::Accept
+        );
+        let mut accepted = 1;
+        for repeat in 0..45 {
+            let at = start + Duration::from_millis(500 + 33 * repeat);
+            if hotkey_toggle_at(false, &mut last, at) == HotkeyToggle::Accept {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 1, "a held chord may toggle exactly once");
+    }
+
+    #[test]
+    fn a_slow_repeat_stream_is_suppressed_too_because_the_window_slides() {
+        // A keyboard repeating as slowly as 2 Hz (500 ms interval) would
+        // beat a static window of less than 500 ms; the sliding window —
+        // advanced by suppressed events as well — keeps it suppressed.
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, start),
+            HotkeyToggle::Accept
+        );
+        for tick in 1..=6 {
+            assert_eq!(
+                hotkey_toggle_at(false, &mut last, start + Duration::from_millis(500 * tick)),
+                HotkeyToggle::SuppressRepeatBurst,
+                "repeat #{tick} at a 500 ms interval must stay suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hotkey_is_ignored_while_a_modal_is_open() {
+        // #214.1: with the settings modal up, the toggle must never start
+        // recording invisibly behind the scrim — whatever the event
+        // spacing.
+        let start = Instant::now();
+        let mut last = None;
+        assert_eq!(
+            hotkey_toggle_at(true, &mut last, start),
+            HotkeyToggle::SuppressModalOpen
+        );
+        assert_eq!(
+            hotkey_toggle_at(true, &mut last, start + Duration::from_secs(30)),
+            HotkeyToggle::SuppressModalOpen
+        );
+        // The window slid during the modal, so a repeat arriving right
+        // after it closes cannot fire either.
+        let after_close = start + Duration::from_secs(30) + HOTKEY_TOGGLE_MIN_INTERVAL / 2;
+        assert_eq!(
+            hotkey_toggle_at(false, &mut last, after_close),
+            HotkeyToggle::SuppressRepeatBurst
+        );
+    }
+
     // --- #207: the health-probe subsystem ---
 
     fn health(
@@ -1682,6 +2265,7 @@ mod tests {
     }
 
     #[test]
+
     fn only_the_newest_sequencer_token_may_report() {
         // #207 defect 3: save endpoint A (slow probe), then B (fast) — B
         // lands first, and A's late result must be dropped, not layered on
@@ -1698,6 +2282,7 @@ mod tests {
     }
 
     #[test]
+
     fn cancel_all_retires_every_in_flight_token() {
         let mut sequencer = CheckSequencer::new();
         let first = sequencer.begin();
@@ -1752,6 +2337,7 @@ mod tests {
     }
 
     #[test]
+
     fn a_settled_or_absent_probe_lets_the_press_claim_the_next_token() {
         let mut sequencer = CheckSequencer::new();
         let previous = sequencer.begin();
@@ -2006,6 +2592,7 @@ mod tests {
     }
 
     #[test]
+
     fn busyness_comes_from_the_flag_or_a_queue_depth() {
         let flagged = live_check_writes(
             HealthCheckPurpose::Live,
