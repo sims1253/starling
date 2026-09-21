@@ -1758,13 +1758,14 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
     // Since #251 the cancelled worker stops instead of running the
     // recognition out for a result nobody will keep. The cancel races
     // the worker's start (and, when it loses that, the ~60 MB encode):
-    // usually the flag is set before the worker's pre-encode check, so
-    // the encode never runs and nothing is ever handed to the provider;
-    // on a loaded runner the worker can be mid-encode when the cancel
-    // lands. Observe which shape holds, then hold the line either way.
-    // The decision window sits past the encode's measured duration
-    // (~2.5 s when it runs), so a runner of ordinary load still
-    // exercises the entered shape and its #216 proof.
+    // the scheduler trips the token one message after spawn_worker, so
+    // on a runner of ordinary load the flag is set before the worker's
+    // pre-encode check — the encode never runs and nothing is ever
+    // handed to the provider. The entered shape (worker already
+    // mid-encode when the cancel lands) needs a loaded runner to reach;
+    // observe which shape holds, then hold the line either way — the
+    // entered branch keeps #216's full-sized-WAV proof for whenever it
+    // is reached.
     let saw_request = || provider_handle.requests().iter().any(|(id, _)| id == "job-big");
     if poll_until(Duration::from_secs(4), saw_request) {
         // The cancel lost the race to the encode: the recognition was
