@@ -9,7 +9,7 @@ use gpui::{
 };
 use starling_dictation::settings;
 
-use crate::app::{Connection, StarlingApp};
+use crate::app::{ConnectionProbe, StarlingApp, settings_callout_view};
 use crate::theme;
 use crate::views::{SETTINGS_CALLOUT_DOT_ID, icon, protocol_option_id, status_dot};
 
@@ -18,8 +18,11 @@ pub fn render_settings_modal(
     _window: &mut Window,
     cx: &mut Context<StarlingApp>,
 ) -> impl IntoElement {
-    let endpoint_for_callout = app.endpoint.clone();
-    let connection = app.connection;
+    // B06 (#207): the status line belongs to the probe once one ran — a
+    // draft's failure shows here without touching the live connection —
+    // and without a probe the committed status shows.
+    let callout = settings_callout_view(app.probe.as_ref(), app.connection, &app.endpoint);
+    let probing = matches!(app.probe, Some(ConnectionProbe::Testing { .. }));
     let draft_endpoint = app.draft_endpoint.clone();
     let draft_model = app.draft_model.clone();
     let draft_terms = app.draft_terms.clone();
@@ -132,26 +135,20 @@ pub fn render_settings_modal(
                 .bg(theme::SETTINGS_CALLOUT)
                 .p(px(12.))
                 .mt(px(21.))
-                .child(status_dot(SETTINGS_CALLOUT_DOT_ID, connection, false))
+                .child(status_dot(SETTINGS_CALLOUT_DOT_ID, callout.dot, false))
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .gap(px(2.))
                         .text_size(px(10.))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(
-                            if connection == Connection::Ready {
-                                "Server connected"
-                            } else {
-                                "Server needs attention"
-                            },
-                        ))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(callout.title))
                         .child(
                             div()
                                 .font(theme::mono_font())
                                 .text_size(px(9.))
                                 .text_color(theme::SETTINGS_CALLOUT_ENDPOINT)
-                                .child(endpoint_for_callout),
+                                .child(callout.detail),
                         ),
                 ),
         )
@@ -171,12 +168,21 @@ pub fn render_settings_modal(
                         .border_1()
                         .border_color(theme::SETTINGS_FOOT_LINE)
                         .text_size(px(10.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme::PAPER_HOVER))
+                        // B06 (#207): one probe at a time — the button is
+                        // inert while the newest press is still in flight.
+                        .when(!probing, |button| {
+                            button
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::PAPER_HOVER))
+                        })
                         .on_click(cx.listener(|this, _, _window, cx| {
                             this.test_connection(cx);
                         }))
-                        .child("Test connection"),
+                        .child(if probing {
+                            "Testing…"
+                        } else {
+                            "Test connection"
+                        }),
                 )
                 .child(
                     div()

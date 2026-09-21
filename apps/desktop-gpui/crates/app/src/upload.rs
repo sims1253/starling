@@ -12,7 +12,7 @@ use starling_dictation::{
     storage,
 };
 
-use crate::app::{StarlingApp, UnsavedWav};
+use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::store::Store;
 
 /// What a failed job says about server reachability (R13).
@@ -104,7 +104,10 @@ pub(crate) fn session_deleted_message() -> String {
 /// of connection state. What R13 adds: a failure classified
 /// [`FailureClass::Transport`] prompts a health probe, whose *result* —
 /// not the job — updates the badge, so a server that dies mid-session no
-/// longer shows a stale `Ready` until the next probe.
+/// longer shows a stale `Ready` until the next probe. That probe runs as
+/// a Diagnostic check (#207): it owns the badge and the server model
+/// only, never the error banner, so the job's explanation for the
+/// missing transcript survives a successful probe.
 pub(crate) enum FinishedJob {
     /// Transcript saved: no global-state effects.
     Saved,
@@ -579,10 +582,19 @@ impl StarlingApp {
                         // re-check — and even it only triggers the probe.
                         // `check_health` stays the single writer of
                         // connection state, so a local failure still
-                        // cannot flip the badge, and a transport failure
-                        // whose probe succeeds shows the server recovered.
+                        // cannot flip the badge. The probe is Diagnostic
+                        // (#207): it corrects the badge (a transport
+                        // failure whose probe succeeds shows the server
+                        // recovered) but never touches `app.error`, so
+                        // the explanation for the missing transcript is
+                        // not wiped ~5 s after it appeared.
                         if class == FailureClass::Transport {
-                            app.check_health(app.endpoint.clone(), cx);
+                            app.check_health(
+                                HealthCheckPurpose::Diagnostic,
+                                app.endpoint.clone(),
+                                app.protocol,
+                                cx,
+                            );
                         }
                         cx.notify();
                     })
