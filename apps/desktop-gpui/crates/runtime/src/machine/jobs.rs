@@ -448,7 +448,25 @@ impl JobsActor {
                 .get_mut(&job_id)
                 .and_then(|job| job.core.advance_internal("Recognizing").ok());
             if recognized.is_none() {
-                self.waiting.push_back(job_id);
+                // A refused internal edge is a machine invariant break, not
+                // a transient state: the candidate filter only re-selects
+                // `Queued` jobs, so re-queueing could never pick this one
+                // again — surface the failure and retire the entry instead
+                // of leaking a forever-in-flight snapshot (review on #248).
+                let state = self
+                    .jobs
+                    .get(&job_id)
+                    .map(|job| job.core.state())
+                    .unwrap_or("?")
+                    .to_string();
+                self.emit(
+                    &job_id,
+                    Event::JobsFailed {
+                        reason: format!("internal dispatch refused in state {state}"),
+                        retryable: false,
+                    },
+                );
+                self.retire(&job_id);
                 continue;
             }
             self.active.insert(job_id.clone());
@@ -626,12 +644,25 @@ impl JobsActor {
     /// merely finished).
     fn retire(&mut self, job_id: &str) {
         if let Some(job) = self.jobs.remove(job_id) {
-            // Only the LATEST job's terminal view is wire-visible: an older
-            // job retiring after the latest one must not clobber the
-            // retained snapshot with its own state/violations (review on
-            // #248).
-            if self.latest.as_deref() == Some(job_id) {
-                self.retired_state = job.core.state().to_string();
+            let state = job.core.state();
+            // The retained view is permanent — the entry is gone from the
+            // map, so nothing can ever update it again. Only a TERMINAL
+            // state may be frozen into it (review on #248): a retire from
+            // a non-terminal state (a refused emit path) keeps the
+            // previous retained view rather than freezing "in-flight"
+            // forever; the debug_assert fires in testing on the invariant
+            // break itself.
+            debug_assert!(
+                matches!(
+                    state,
+                    "Completed" | "Failed" | "Cancelled" | "Rejected"
+                ),
+                "retiring job {job_id} in non-terminal state {state}"
+            );
+            if matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected")
+                && self.latest.as_deref() == Some(job_id)
+            {
+                self.retired_state = state.to_string();
                 self.retired_violations = job.core.view().violations;
             }
         }
