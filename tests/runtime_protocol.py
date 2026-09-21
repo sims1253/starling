@@ -193,7 +193,13 @@ MACHINES: dict[str, dict[str, Any]] = {
             },
             "capture.stopped": {"from": ["Draining", "Recovering"], "to": "Persisted"},
         },
-        "internal": [["Interrupted", "Recovering"]],
+        # Runtime-internal edges out of Interrupted (no wire message): a
+        # salvaged take replays its durable boundary through Recovering,
+        # while a failure that killed only the take attempt -- the device
+        # never opened, so there is nothing to salvage or replay -- settles
+        # straight back to Idle so the machine can accept the next
+        # capture.start (issue #211).
+        "internal": [["Interrupted", "Recovering"], ["Interrupted", "Idle"]],
     },
     "jobs": {
         "initial": "Idle",

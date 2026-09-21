@@ -477,6 +477,30 @@ mod tests {
         assert_eq!(view.state, "Idle");
     }
 
+    /// Issue #211: a fatal device-open failure (`Acquiring → Interrupted`,
+    /// fixture take_9's `device_open_failed`) must not wedge the machine —
+    /// the runtime-internal settle edge returns it to Idle so the next
+    /// `capture.start` is legal again.
+    #[test]
+    fn failed_device_open_settles_back_to_idle() {
+        let mut core = MachineCore::new(&CAPTURE);
+        assert!(matches!(
+            core.commit_command("capture.start", Some("take_9".into())),
+            Ok(CommandAction::Entered)
+        ));
+        assert_eq!(
+            core.emit_event("capture.error", Some(true)).unwrap(),
+            Some("Interrupted")
+        );
+        core.advance_internal("Idle").expect("Interrupted -> Idle edge");
+        assert_eq!(core.state(), "Idle");
+        // The retry is legal — the machine is not wedged in Interrupted.
+        assert!(matches!(
+            core.commit_command("capture.start", Some("take_10".into())),
+            Ok(CommandAction::Entered)
+        ));
+    }
+
     use crate::protocol::tables::JOBS;
 
     #[test]
