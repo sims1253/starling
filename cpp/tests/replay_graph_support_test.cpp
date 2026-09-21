@@ -33,6 +33,7 @@
 
 #include "ggml.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -148,12 +149,22 @@ struct UnaryChainGraph {
 #ifndef _WIN32
 // Run the guard in a forked child with stderr redirected into a pipe and
 // STARLING_SCHED_DEBUG forced on/off in the child's environment; return the
-// child's captured stderr. The guard always throws here (the predicate
-// rejects UNARY), which the child swallows — the observable is the echo.
+// child's captured stderr. The child appends a GUARD_THREW marker line to
+// stderr from the catch block, so a silently non-throwing guard is
+// distinguishable from a broken stderr echo.
 std::string guard_stderr_with_debug(bool debug_on) {
     int fds[2];
-    if (pipe(fds) != 0) return "(pipe failed)";
+    if (pipe(fds) != 0) {
+        check(false, "guard_stderr_with_debug: pipe() failed");
+        return {};
+    }
     pid_t pid = fork();
+    if (pid < 0) {
+        check(false, "guard_stderr_with_debug: fork() failed");
+        close(fds[0]);
+        close(fds[1]);
+        return {};
+    }
     if (pid == 0) {
         // Child: stderr -> pipe, control the env, run, exit.
         close(fds[0]);
@@ -162,24 +173,34 @@ std::string guard_stderr_with_debug(bool debug_on) {
         if (debug_on) setenv("STARLING_SCHED_DEBUG", "1", 1);
         else unsetenv("STARLING_SCHED_DEBUG");
         UnaryChainGraph tg(3);
+        bool threw = false;
         try {
             check_no_unsupported_graph_nodes(
                 tg.gf, supports_only({GGML_OP_UNARY}), "CUDA0-fake");
-        } catch (const std::runtime_error&) { /* expected */ }
+        } catch (const std::runtime_error&) { threw = true; /* expected */ }
+        if (threw) std::fputs("GUARD_THREW\n", stderr);
         std::fflush(nullptr);
         _exit(0);
     }
     close(fds[1]);
     std::string captured;
     char buf[512];
-    ssize_t n;
-    while ((n = read(fds[0], buf, sizeof buf)) > 0)
-        captured.append(buf, (size_t)n);
+    for (;;) {
+        ssize_t n = read(fds[0], buf, sizeof buf);
+        if (n > 0) { captured.append(buf, (size_t)n); continue; }
+        if (n < 0 && errno == EINTR) continue; // e.g. SIGCHLD mid-read
+        break; // EOF or unrecoverable error
+    }
     close(fds[0]);
     int status = 0;
-    waitpid(pid, &status, 0);
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+    check(waited == pid, "guard_stderr_with_debug: waitpid() failed");
     check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
           "sched-dbg child exited cleanly");
+    check(captured.find("GUARD_THREW\n") != std::string::npos,
+          "guard threw in the child (a silent non-throw is a regression, "
+          "not an echo problem)");
     return captured;
 }
 #endif // !_WIN32
