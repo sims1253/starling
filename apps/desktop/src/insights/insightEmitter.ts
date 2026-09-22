@@ -3,6 +3,7 @@ import {
   InsightEventConflictError,
   InsightEventValidationError,
   insightEventProblems,
+  isCaptureDeleted,
   isCaptureFinalized,
   isRecognitionSelected,
   isTransformationCompleted,
@@ -244,7 +245,10 @@ export class InsightRecorder {
    * capture_id → occurred_at of its latest capture_finalized event,
    * maintained as events enter the mirror — the anchor read is on the
    * recognition hot path (once per settled transcript), where a linear
-   * scan of the whole log per read would make a session O(n²).
+   * scan of the whole log per read would make a session O(n²). A
+   * capture_deleted event drops its capture's entry: the take is gone, so
+   * its anchor must not linger (the map stays bounded across a long
+   * session of deletions).
    */
   private readonly finalizedAt = new Map<string, string>();
   private writeChain: Promise<void> = Promise.resolve();
@@ -268,8 +272,7 @@ export class InsightRecorder {
     this.loadPromise ??= this.store.load().then((log) => {
       for (const event of log.events) {
         this.eventsById.set(event.event_id, event);
-
-        if (isCaptureFinalized(event)) this.finalizedAt.set(event.capture_id, event.occurred_at);
+        this.applyFinalizedAt(event);
       }
     });
 
@@ -484,9 +487,19 @@ export class InsightRecorder {
     await this.enqueue(async () => {
       await this.store.append(event);
       this.eventsById.set(event.event_id, event);
-
-      if (isCaptureFinalized(event)) this.finalizedAt.set(event.capture_id, event.occurred_at);
+      this.applyFinalizedAt(event);
     });
+  }
+
+  /** Maintain the anchor index as one event enters the mirror. */
+  private applyFinalizedAt(event: InsightEvent): void {
+    if (isCaptureFinalized(event)) {
+      this.finalizedAt.set(event.capture_id, event.occurred_at);
+    } else if (isCaptureDeleted(event)) {
+      // Replay order: a deletion drops the anchor a later finalized event
+      // could re-establish, mirroring the tombstone's own dominance.
+      this.finalizedAt.delete(event.capture_id);
+    }
   }
 
   private enqueue(work: () => Promise<void>): Promise<void> {

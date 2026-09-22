@@ -89,7 +89,11 @@ import { InsightsView, type InsightNotice } from "./insights/InsightsView";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
-/** How long a term write waits on the event log before anchoring to its own clock. */
+/**
+ * How long a term write waits on the event log — its load, or a take's
+ * finalize emit — before anchoring to its own clock. Precision-only: a
+ * wedged store transaction must never hold the term write hostage.
+ */
 const ANCHOR_LOAD_TIMEOUT_MS = 5_000;
 
 /** Unresolved Insights notices kept at once; more is a failing store, not news. */
@@ -151,11 +155,6 @@ function formatDuration(ms?: number) {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 }
 
-/** The record button's idle status line; while recording it is the live elapsed time. */
-function recordMetaIdle(busy: boolean): string {
-  return busy ? "Transcribing…" : "Click to record";
-}
-
 function formatWhen(iso: string) {
   const date = new Date(iso);
   const today = new Date().toDateString() === date.toDateString();
@@ -177,6 +176,26 @@ function historyRowLabel(session: DictationSession) {
 
 function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Race one precision-only wait against the anchor bound: the term write
+ * must never be held hostage by a wedged event store, so a hung load or
+ * finalize emit costs only the anchor's precision, never the write. The
+ * promise never rejects, and the losing timer is released the moment the
+ * wait settles — the recognition hot path must not accumulate live timers.
+ */
+function withAnchorBound(wait: Promise<unknown>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ANCHOR_LOAD_TIMEOUT_MS);
+
+    void Promise.resolve(wait)
+      .finally(() => clearTimeout(timer))
+      .then(
+        () => resolve(),
+        () => resolve(),
+      );
+  });
 }
 
 /**
@@ -298,13 +317,19 @@ export default function App() {
   // it — a failed write changed nothing, so the snapshot is still the
   // freshest full view and the mirror keeps its recovery path.
   const termMirrorLandedRef = useRef(false);
+  // Term-mirror deltas apply on a chain of their own, serialized: even if
+  // two writes' surrounding waits settle out of order (a delete racing a
+  // record), each delta lands only after the previous one has applied, so
+  // the mirror's order can never diverge from the recorder's store order.
+  const termMirrorChainRef = useRef<Promise<void>>(Promise.resolve());
   /**
    * capture_id → the in-flight capture_finalized emit for that take.
    * The batch path fires the finalize fire-and-forget and transcribes
    * separately, so a settling transcript's term write can beat its own
    * finalize into the mirror; waiting for the registered promise (when
    * one exists) reads the true finalization anchor instead of falling
-   * back to the write clock. Entries remove themselves once settled.
+   * back to the write clock. Entries remove themselves once settled — or
+   * after the anchor bound, so a wedged chain cannot leak them.
    */
   const pendingFinalizesRef = useRef(new Map<string, Promise<void>>());
 
@@ -735,7 +760,13 @@ export default function App() {
           // leave the mirror empty for the whole session.
           if (write.kind !== "none") termMirrorLandedRef.current = true;
 
-          setTermRecords((current) => applyTermWrite(current, write));
+          // Serialized on the mirror chain: the delta applies only after
+          // every earlier write's delta has applied, so the mirror cannot
+          // diverge from the recorder's store order when two writes'
+          // surrounding waits settle out of order.
+          termMirrorChainRef.current = termMirrorChainRef.current.then(() => {
+            setTermRecords((current) => applyTermWrite(current, write));
+          });
         })
         .catch((caught) => {
           addInsightNotice(
@@ -775,27 +806,15 @@ export default function App() {
       );
       void recordInsightTerms("record", () =>
         // Wait for this take's own in-flight finalize first (the batch
-        // path races them); the promise never rejects, and the wait is
-        // precision-only — a finalize failure costs the anchor, never the
-        // term write.
-        (pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
-          .catch(() => undefined)
-          // The event log's health must not gate the term write, and
-          // neither may its liveness: a failed load only means the anchor
-          // falls back to the write clock, and a HUNG load (a wedged
-          // store transaction) must not hold the term write hostage — the
-          // load wait is bounded, precision-only.
-          .then(() =>
-            Promise.race([
-              insights.load().then(
-                () => undefined,
-                () => undefined,
-              ),
-              new Promise<void>((resolve) => {
-                setTimeout(resolve, ANCHOR_LOAD_TIMEOUT_MS);
-              }),
-            ]),
-          )
+        // path races them), then for the event log's mirror. Both waits
+        // are precision-only and bounded (withAnchorBound): the promises
+        // never reject, a failure or a HUNG store (a wedged transaction)
+        // costs only the anchor — never the term write — and a missing
+        // finalize entry means none is in flight for this take yet, so
+        // the anchor falls back to the write clock, which is safe by
+        // design rather than a lost write.
+        withAnchorBound(pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
+          .then(() => withAnchorBound(insights.load()))
           .then(() =>
             insightTerms.recognitionSelected({
               captureId: sessionId,
@@ -816,9 +835,18 @@ export default function App() {
    */
   const recordCaptureFinalized = useCallback(
     (session: DictationSession): Promise<void> => {
-      let settled: Promise<void>;
+      // Bounded registration: a wedged store transaction would otherwise
+      // leave this entry pending forever, with every later recognition for
+      // the same take waiting on it. The same anchor bound that bounds
+      // their wait releases the entry here — a released entry costs only
+      // anchor precision, never a write.
+      const discardTimer = setTimeout(() => {
+        if (pendingFinalizesRef.current.get(session.id) === settled) {
+          pendingFinalizesRef.current.delete(session.id);
+        }
+      }, ANCHOR_LOAD_TIMEOUT_MS);
 
-      settled = recordInsight(async () => {
+      const settled = recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -828,6 +856,8 @@ export default function App() {
           completeAudio: true,
         });
       }).finally(() => {
+        clearTimeout(discardTimer);
+
         // Delete only OUR registration — a second finalize for the same
         // session may already have replaced it, and removing that newer
         // entry would strand its recognition without an anchor wait.
@@ -2276,8 +2306,11 @@ export default function App() {
   // The Insights toggle is unavailable mid-take: switching views would hide
   // the recorder — the button, timer, waveform and live text — with no
   // signal that dictation continues, and for a dictation app an unnoticed
-  // recording is the worst outcome. The toggle returns the moment the take
-  // settles.
+  // recording is the worst outcome. Transcription is deliberately excluded
+  // from this guard: after Stop the audio is durable and transcription is
+  // safe background work (a new take may even start), so the toggle returns
+  // while a take settles and the history row's spinner keeps the work
+  // visible from either view.
   const takeInFlight = recording || takePhase === "starting" || takePhase === "stopping";
 
   // The capture pane and history, kept in one named element so the view
@@ -2312,7 +2345,9 @@ export default function App() {
             </span>
           </button>
           <div className="record-meta">
-            <span>{recording ? formatDuration(elapsedMs) : recordMetaIdle(busy)}</span>
+            <span>
+              {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Click to record"}
+            </span>
             <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
           </div>
         </div>

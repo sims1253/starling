@@ -10,6 +10,7 @@ import {
   InsightTermValidationError,
   MAX_TERMS_PER_KIND,
   MemoryInsightTermStore,
+  analyzedKinds,
   applyTermWrite,
   captureTerms,
   insightTermRecordProblems,
@@ -103,6 +104,33 @@ describe("captureTerms", () => {
     ) as InsightTermRecord;
 
     await expect(store.put(smuggled)).rejects.toThrow(InsightTermValidationError);
+  });
+});
+
+describe("analyzedKinds", () => {
+  it("reads the stamp, with a stamped-but-empty kind still a real zero", () => {
+    const stamped = recordOf("take-1", "hello world", {
+      kinds: new Set(["terms"]),
+    });
+
+    expect(analyzedKinds(stamped)).toEqual({ terms: true, phrases: false });
+
+    // A stamp with no labels at all is an analyzed take that found nothing.
+    const analyzedEmpty = { ...stamped, terms: [], phrases: [] };
+
+    expect(analyzedKinds(analyzedEmpty)).toEqual({ terms: true, phrases: false });
+  });
+
+  it("falls back to label evidence for unstamped legacy records", () => {
+    const { derived_kinds: _stamp, ...legacy } = recordOf("take-1", "alpha beta gamma");
+
+    expect(analyzedKinds(legacy)).toEqual({ terms: true, phrases: true });
+
+    // Empty and unstamped is the one honest unknown: no stamp, no evidence.
+    expect(analyzedKinds({ ...legacy, terms: [], phrases: [] })).toEqual({
+      terms: false,
+      phrases: false,
+    });
   });
 });
 

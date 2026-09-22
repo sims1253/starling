@@ -16,6 +16,7 @@ import {
   type InsightConsent,
 } from "./insightConsent";
 import { readExclusions, writeExclusions } from "./insightExclusions";
+import { readTypingBaseline, writeTypingBaseline } from "./insightBaseline";
 import type { InsightTermRecord } from "./insightTerms";
 import { voicePanel, type VoicePatternCard } from "./insightVoice";
 import {
@@ -45,9 +46,6 @@ import { formatMinutes } from "./insightFormat";
  * as "not enough data" — never a fabricated zero. No accuracy, personality
  * or productivity score appears anywhere, because none is knowable.
  */
-
-/** localStorage key for the user's typing baseline (words per minute). */
-const TYPING_BASELINE_KEY = "starling:insights:typingWpm";
 
 const CALENDAR_DAYS = 28;
 
@@ -113,6 +111,11 @@ function plural(count: number, singularWord: string, pluralWord = `${singularWor
   return `${count} ${count === 1 ? singularWord : pluralWord}`;
 }
 
+/** One wording for every settings-storage refusal, so the copies cannot drift. */
+function storageRefusalMessage(setting: string): string {
+  return `Local settings storage refused the save — ${setting} is kept for this session only.`;
+}
+
 /** The local settings this view persists directly, each with its own refusal slot. */
 type SettingKey = "baseline" | "exclusion";
 
@@ -140,9 +143,7 @@ export function InsightsView({
 }: InsightsViewProps) {
   const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
 
-  const [baselineDraft, setBaselineDraft] = useState(
-    () => localStorage.getItem(TYPING_BASELINE_KEY) ?? "",
-  );
+  const [baselineDraft, setBaselineDraft] = useState(() => readTypingBaseline(localStorage));
 
   const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => readExclusions(localStorage));
 
@@ -196,6 +197,9 @@ export function InsightsView({
       setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
       setGoalIssue(undefined);
     }
+
+    // While focused, goalIssue intentionally stays as it is: it describes
+    // the last commit, not the in-progress draft — blur re-evaluates it.
   }
 
   const parsedBaseline = Number.parseInt(baselineDraft, 10);
@@ -228,17 +232,15 @@ export function InsightsView({
   function changeBaseline(value: string) {
     setBaselineDraft(value);
 
-    try {
-      localStorage.setItem(TYPING_BASELINE_KEY, value);
-      noteSettingsSave("baseline", undefined);
-    } catch {
-      // Storage refused (quota, privacy mode); the baseline holds for this
-      // session only and the next mount starts from what was last saved.
-      noteSettingsSave(
-        "baseline",
-        "Local settings storage refused the save — the typing baseline is kept for this session only.",
-      );
-    }
+    // The boundary reports its own refusal (quota, privacy mode, a value
+    // too large to be a draft); the baseline then holds for this session
+    // only and the next mount starts from what was last saved.
+    noteSettingsSave(
+      "baseline",
+      writeTypingBaseline(localStorage, value)
+        ? undefined
+        : storageRefusalMessage("the typing baseline"),
+    );
   }
 
   function excludeLabel(label: string) {
@@ -248,9 +250,7 @@ export function InsightsView({
     setExcluded(next);
     noteSettingsSave(
       "exclusion",
-      writeExclusions(localStorage, next)
-        ? undefined
-        : "Local settings storage refused the save — the exclusion is kept for this session only.",
+      writeExclusions(localStorage, next) ? undefined : storageRefusalMessage("the exclusion"),
     );
   }
 
@@ -281,7 +281,11 @@ export function InsightsView({
     }
 
     setGoalIssue(undefined);
-    toggleConsent({ weeklyGoalWords: parsed });
+
+    // An unchanged goal is a no-op: blur alone must never trigger a
+    // persistence write or a purge-diff pass for a value consent already
+    // holds — the empty-draft branch above guards the same way.
+    if (parsed !== consent.weeklyGoalWords) toggleConsent({ weeklyGoalWords: parsed });
   }
 
   function toggleShareField(field: ShareCardField, included: boolean) {
@@ -430,6 +434,9 @@ export function InsightsView({
 
       {notices.length > 0 && (
         <div className="insights-issues">
+          {/* Requires unique notice texts — the producer (App's
+              addInsightNotice) merges repeats into one counted entry, so
+              the text is a stable key and dismissal is unambiguous. */}
           {notices.map((notice) => (
             <div className="insights-issue" role="alert" key={notice.text}>
               <CircleAlert size={16} />
@@ -685,6 +692,11 @@ export function InsightsView({
                 onBlur={() => {
                   setGoalFocused(false);
                   commitGoalDraft();
+                }}
+                onKeyDown={(event) => {
+                  // Enter commits like a single-field form: the draft would
+                  // otherwise wait for a blur the keyboard flow never issues.
+                  if (event.key === "Enter") event.currentTarget.blur();
                 }}
                 placeholder="no goal"
                 aria-describedby={goalIssue === undefined ? undefined : "weekly-goal-issue"}

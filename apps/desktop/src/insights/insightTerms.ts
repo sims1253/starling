@@ -120,8 +120,9 @@ export interface InsightTermRecord {
    * write time from the granted kinds and narrowed by withdrawal purges.
    * A kind listed here with an empty label list is an analyzed take that
    * yielded nothing of that kind — a real zero, not an unknown. A record
-   * without the stamp (pre-`derived_kinds` dev data) is an unknown for
-   * every per-kind denominator: readers must not guess what it analyzed.
+   * without the stamp (pre-`derived_kinds` data) has only its labels as
+   * evidence: `analyzedKinds` counts a kind whose labels survive and
+   * treats a fully empty unstamped record as an unknown.
    */
   readonly derived_kinds?: readonly InsightTermKind[];
 }
@@ -346,6 +347,27 @@ function evidencedKinds(record: InsightTermRecord): readonly InsightTermKind[] {
   return (["terms", "phrases"] as const).filter((kind) =>
     kind === "terms" ? record.terms.length > 0 : record.phrases.length > 0,
   );
+}
+
+/**
+ * The kinds a record is analyzed for, as the one shared per-kind predicate
+ * every denominator derives from — the per-kind card counts and the panel's
+ * any-kind count can never drift apart. A stamped record reads its stamp (a
+ * kind stamped with an empty label list is a real zero: analyzed, nothing
+ * found); an unstamped record falls back to label evidence
+ * (`evidencedKinds`): labels of the kind present prove the take was
+ * analyzed for it, which beats treating pre-stamp data as an unknown.
+ */
+export function analyzedKinds(
+  record: InsightTermRecord,
+): Readonly<Record<InsightTermKind, boolean>> {
+  const stamped = record.derived_kinds;
+
+  if (stamped !== undefined) {
+    return { terms: stamped.includes("terms"), phrases: stamped.includes("phrases") };
+  }
+
+  return { terms: record.terms.length > 0, phrases: record.phrases.length > 0 };
 }
 
 /**

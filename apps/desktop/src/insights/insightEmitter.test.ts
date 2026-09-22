@@ -136,6 +136,29 @@ describe("InsightRecorder", () => {
     expect(second.recorder.captureFinalizedAt("take-9")).toBeUndefined();
   });
 
+  it("drops a deleted capture's anchor on append and on load replay", async () => {
+    // The anchor index must not outlive the take it describes: a deletion
+    // clears the entry in the live mirror and in a later recorder's load
+    // replay, so long sessions of deletions cannot grow the map.
+    const first = recorder();
+
+    await first.recorder.captureFinalized({
+      captureId: "take-2",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+    await first.recorder.captureDeleted("take-2");
+
+    expect(first.recorder.captureFinalizedAt("take-2")).toBeUndefined();
+
+    const second = recorder(first.store);
+
+    await second.recorder.load();
+
+    expect(second.recorder.captureFinalizedAt("take-2")).toBeUndefined();
+  });
+
   it("emits schema-valid events for the full lifecycle", async () => {
     const { recorder: insights } = recorder();
 

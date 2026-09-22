@@ -1,6 +1,6 @@
 import { isCaptureDeleted, isRecognitionSelected, type InsightEvent } from "./insightEvents";
 import { parseInsightTimestamp } from "./insightMetrics";
-import type { InsightTermKind, InsightTermRecord } from "./insightTerms";
+import { analyzedKinds, type InsightTermKind, type InsightTermRecord } from "./insightTerms";
 
 /**
  * The "Your voice" cards (E29 phase 2): recurring phrases and recurring
@@ -62,36 +62,21 @@ interface WindowedTotals {
 }
 
 /**
- * A record is analyzed for a kind when its write stamped that kind in
- * `derived_kinds` and no withdrawal purge has removed the stamp since.
- * The stamp is what makes the distinction an empty label list cannot: a
- * take that analyzed but yielded zero of the kind still counts as analyzed
- * — "no findings" is a real result — while a purged or never-granted kind
- * is an unknown the denominator must not guess about. A record from
- * before the stamp existed falls back to label evidence: labels of the
- * kind present prove the take was analyzed for it (the writer derives
- * only granted kinds), which beats treating pre-stamp data as unknown.
- */
-function analyzedForKind(record: InsightTermRecord, kind: InsightTermKind): boolean {
-  const stamped = record.derived_kinds;
-
-  if (stamped !== undefined) return stamped.includes(kind);
-
-  return kind === "terms" ? record.terms.length > 0 : record.phrases.length > 0;
-}
-
-/**
  * Aggregate labels over the records inside the time window. A record counts
  * a label once per take no matter how often it repeats inside that take, so
  * "3 of 8 takes" stays a statement about takes, and the occurrence total is
  * carried separately and never presented as takes.
  *
  * The `takes` denominator is per-kind and provenance-based: only records
- * stamped as analyzed for THIS kind count (see `analyzedForKind`). A take
- * recorded under a narrower grant — or emptied by a withdrawal purge — is
- * an unknown for these cards, not a negative, so it must not inflate the
- * denominator; a take that analyzed and found nothing of the kind is a
- * real zero and must.
+ * `analyzedKinds` — the one shared predicate, exported from insightTerms.ts
+ * so every denominator derives from it — marks analyzed for THIS kind count.
+ * For a stamped record the `derived_kinds` stamp is the truth (a kind
+ * stamped with an empty label list is a real zero: analyzed, nothing
+ * found); an unstamped record falls back to label evidence. A take recorded
+ * under a narrower grant — or emptied by a withdrawal purge — is an unknown
+ * for these cards, not a negative, so it must not inflate the denominator;
+ * a take that analyzed and found nothing of the kind is a real zero and
+ * must.
  */
 function windowTotals(
   records: readonly InsightTermRecord[],
@@ -109,7 +94,7 @@ function windowTotals(
     // AND to the labels. Counting labels from an unanalyzed record could
     // push a card's numerator past its own denominator ("N of M" with
     // N > M); an unanalyzed take is an unknown for both.
-    if (!analyzedForKind(record, kind)) continue;
+    if (!analyzedKinds(record)[kind]) continue;
 
     takes += 1;
 
@@ -270,13 +255,17 @@ export function voicePanel(
     }
   }
 
-  const analyzedTakes = records.filter(
-    (record) =>
-      windowCaptures.has(record.capture_id) &&
-      ((record.derived_kinds?.length ?? 0) > 0 ||
-        record.terms.length > 0 ||
-        record.phrases.length > 0),
-  ).length;
+  // Any-kind analyzed count: a take counts when the shared predicate says
+  // it was analyzed for at least one kind — stamped non-empty, or unstamped
+  // with surviving labels (legacy evidence) — so the panel denominator and
+  // the per-kind card denominators can never disagree about provenance.
+  const analyzedTakes = records.filter((record) => {
+    if (!windowCaptures.has(record.capture_id)) return false;
+
+    const kinds = analyzedKinds(record);
+
+    return kinds.terms || kinds.phrases;
+  }).length;
 
   return {
     phraseCards: consent.recurringPhrases ? recurringPhraseCards(records, resolved) : [],
