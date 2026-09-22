@@ -5905,8 +5905,20 @@ mod tests {
             store_root_has_staging(&store, &other_id),
             "an unrelated in-flight take is untouched"
         );
-        // Idempotent.
-        store.discard_staging(&id).expect("discard again");
+        // The Ok(bool) contract: this call removed it...
+        assert!(
+            store
+                .discard_staging(&other_id)
+                .expect("discard other"),
+            "a present journal reports removed-by-this-call"
+        );
+        // ...and a second discard of the now-missing id reports the
+        // idempotent already-gone shape, not another removal — the two
+        // sides rollback reporting distinguishes.
+        assert!(
+            !store.discard_staging(&id).expect("discard again"),
+            "an already-gone journal reports already-gone, not removed"
+        );
         drop(take);
 
         // A committed row is never touched: its audio lives in `audio/`,
@@ -5951,10 +5963,13 @@ mod tests {
             "a real removal failure must surface, not read as rolled back"
         );
         assert!(squat.exists(), "the failed removal left it in place");
-        // The idempotent no-op stays Ok.
-        store
-            .discard_staging("c_missing")
-            .expect("a missing staging file is the no-op");
+        // The idempotent no-op stays Ok — and reports already-gone.
+        assert!(
+            !store
+                .discard_staging("c_missing")
+                .expect("a missing staging file is the no-op"),
+            "a missing file reports already-gone, not removed"
+        );
     }
 
     #[test]

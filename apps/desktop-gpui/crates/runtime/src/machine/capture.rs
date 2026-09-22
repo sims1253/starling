@@ -406,27 +406,43 @@ impl V2CaptureStore {
     }
 
     /// Roll the staging journal back after the `phase` step ("append" /
-    /// "finalize" / "commit") failed, reporting every shape honestly:
-    /// removed (quiet), already gone — the promoted-past-the-rename
-    /// orphan, named so the operator never believes a rollback ran when
-    /// the journal sits in `audio/` (reconcile surfaces it) — or
-    /// genuinely leaked (removal failed; the leftover is what reconcile
-    /// would salvage as a duplicate).
-    fn rollback_staging(&self, staged_id: &str, phase: &str) {
+    /// "finalize" / "commit") failed. Returns the rollback failure text
+    /// when the journal could not be removed — the caller chains it into
+    /// its own error, because the leak must survive the process and
+    /// stderr alone does not. The other shapes are reported here and
+    /// return `None`: removed (quiet — success is not divergence), or
+    /// already gone (the promoted-past-the-rename orphan on the commit
+    /// phase; on the earlier phases the journal was never sealed, so
+    /// "already gone" means another actor removed it — the tail says
+    /// which).
+    fn rollback_staging(&self, staged_id: &str, phase: &str) -> Option<String> {
         match self
             .store
             .lock()
             .expect("v2 store lock")
             .discard_staging(staged_id)
         {
-            Ok(true) => {}
-            Ok(false) => report_divergence(format!(
-                "the staging journal for {staged_id} was already gone at the {phase} \
-                 rollback — likely promoted; reconcile will surface whatever landed"
-            )),
-            Err(discard_err) => report_divergence(format!(
-                "staging journal {staged_id} leaked after the {phase} failure ({discard_err})"
-            )),
+            Ok(true) => None,
+            Ok(false) => {
+                let how = if phase == "commit" {
+                    "likely promoted"
+                } else {
+                    "removed by another actor"
+                };
+                report_divergence(format!(
+                    "the staging journal for {staged_id} was already gone at the {phase} \
+                     rollback — {how}; reconcile will surface whatever landed"
+                ));
+                None
+            }
+            Err(discard_err) => {
+                let failure =
+                    format!("the staging rollback for {staged_id} failed ({discard_err})");
+                report_divergence(format!(
+                    "{failure} — the staging journal leaked after the {phase} failure"
+                ));
+                Some(failure)
+            }
         }
     }
 
@@ -580,14 +596,18 @@ impl V2CaptureStore {
         // beside it — never swallowed, never allowed to replace the root
         // cause.
         if let Err(err) = v2_take.append_and_seal(&take.samples) {
-            self.rollback_staging(&staged_id, "append");
-            return Err(chain_adoption_failure(&adoption_error, err.to_string()));
+            return Err(chained_with_rollback(
+                chain_adoption_failure(&adoption_error, err.to_string()),
+                self.rollback_staging(&staged_id, "append"),
+            ));
         }
         let finalized = match v2_take.finalize() {
             Ok(finalized) => finalized,
             Err(err) => {
-                self.rollback_staging(&staged_id, "finalize");
-                return Err(chain_adoption_failure(&adoption_error, err.to_string()));
+                return Err(chained_with_rollback(
+                    chain_adoption_failure(&adoption_error, err.to_string()),
+                    self.rollback_staging(&staged_id, "finalize"),
+                ));
             }
         };
         let mark = match (status, note) {
@@ -654,11 +674,10 @@ impl V2CaptureStore {
                             "recording the post-commit divergence on {staged_id} failed \
                              ({note_err}) — the row keeps its committed contents; {note}"
                         ));
-                    } else {
-                        report_divergence(format!(
-                            "{staged_id}: recovery note recorded on the row"
-                        ));
                     }
+                    // A successfully recorded note is the normal sub-path,
+                    // not divergence — the channel stays free of
+                    // normal-path traffic for operators keying on it.
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -679,9 +698,10 @@ impl V2CaptureStore {
             // itself errors is reported — never silently read as "not
             // promoted" — and falls through to the discard attempt, the
             // safer default (removing a not-yet-promoted partial is
-            // correct; the discard no-ops if it was wrong). Like the
-            // begin-take step above, the probe takes the lock in its own
-            // short scope — the store's SQLite work is done.
+            // correct; the discard no-ops if it was wrong). The probe
+            // takes the lock in its own short scope purely to keep the
+            // filesystem stat off the mutex — audio_journal_exists does
+            // no SQLite work; there is no DB step being protected.
             let promoted = {
                 let store = self.store.lock().expect("v2 store lock");
                 match store.audio_journal_exists(&staged_id) {
@@ -695,19 +715,29 @@ impl V2CaptureStore {
                     }
                 }
             };
-            if promoted {
+            // The check-then-act span (read outcome → probe → rollback) is
+            // not atomic, but the actors that could interleave are
+            // bounded: within this process the store mutex serializes
+            // every V2CaptureStore mutation, and cross-process staging
+            // promotion is the lease owner's alone (in Mode B, this
+            // process's host). The benign interleaving — promoted between
+            // probe and discard — is caught by discard_staging's
+            // already-gone outcome; the reverse window is documented here
+            // rather than closed with wider locking.
+            let rollback = if promoted {
                 report_divergence(format!(
                     "commit failed after the audio for {staged_id} was promoted — the \
                      journal sits in audio/ with no row; reconcile will surface it as an \
                      orphaned session"
                 ));
+                None
             } else {
                 // Also the probe-unknown shape: rollback_staging names the
                 // already-gone (promoted) case itself, so an operator is
                 // never left believing a rollback ran.
-                self.rollback_staging(&staged_id, "commit");
-            }
-            return Err(err);
+                self.rollback_staging(&staged_id, "commit")
+            };
+            return Err(chained_with_rollback(err, rollback));
         }
         Ok(())
     }
@@ -724,6 +754,17 @@ fn chain_adoption_failure(adoption_error: &Option<String>, samples_error: String
             "journal adoption failed ({reason}); storing the take from its samples \
              failed too: {samples_error}"
         ),
+    }
+}
+
+/// Append a failed staging rollback to the write's own error: the write
+/// stays primary (the root cause), but a leaked staging journal must be
+/// visible in the returned error — stderr alone does not survive the
+/// process.
+fn chained_with_rollback(error: String, rollback: Option<String>) -> String {
+    match rollback {
+        None => error,
+        Some(rollback) => format!("{error}; {rollback}"),
     }
 }
 
