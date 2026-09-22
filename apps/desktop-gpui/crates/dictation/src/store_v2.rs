@@ -785,19 +785,22 @@ impl StoreV2 {
     /// [`FinalizedTake::commit_marked`]: without this, a failed write
     /// would leave a partial staging journal for reconcile to salvage as
     /// an *interrupted take* — duplicate audio of whatever the caller
-    /// stored instead. Idempotent: a committed row for the id is never
-    /// touched (its audio lives in `audio/`), and a missing file is the
-    /// no-op. Every removal failure (permissions, a directory squatting
-    /// on the name, I/O trouble) is an error: the caller must be able to
-    /// tell "rolled back" from "the partial staging journal is still
-    /// there" — the leftover is exactly what reconcile would salvage as
-    /// a duplicate. Once the removal itself succeeded, the journal is
-    /// gone; the dirent fsync afterwards is best-effort (the same trade
+    /// stored instead. Returns whether **this call removed** the
+    /// journal: `Ok(false)` is the idempotent "already gone" (promoted
+    /// past the rename, or raced) — callers report that shape
+    /// distinctly, never as a rollback that ran. A committed row for the
+    /// id is never touched (its audio lives in `audio/`). Removal
+    /// failures (permissions, a directory squatting on the name, I/O
+    /// trouble) are errors: the caller must be able to tell "rolled
+    /// back" from "the partial staging journal is still there" — the
+    /// leftover is exactly what reconcile would salvage as a duplicate.
+    /// Once the removal itself succeeded, the journal is gone; the
+    /// dirent fsync afterwards is best-effort (the same trade
     /// [`Self::release_lease`] makes after removing the lease files): a
     /// sync failure must not read as "still there" — the crash window it
     /// leaves (an unsynced deletion can resurface after a crash) is
     /// narrower than the misleading-error alternative.
-    pub fn discard_staging(&self, id: &str) -> Result<(), StoreV2Error> {
+    pub fn discard_staging(&self, id: &str) -> Result<bool, StoreV2Error> {
         validate_capture_id(id)?;
         let path = self.staging_path(id);
         match std::fs::remove_file(&path) {
@@ -805,9 +808,11 @@ impl StoreV2 {
                 // Best-effort: the journal is gone; only the durability
                 // of the deletion's dirent is at stake now.
                 let _ = sync_dir(&self.root.join(STAGING_DIR));
+                Ok(true)
             }
-            // Only "gone already" is the idempotent no-op.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            // Already gone: promoted past the rename, or raced — the
+            // idempotent no-op, reported as such.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             // Context over structure: nothing walks the source chain (the
             // runtime callers report the message), but the ErrorKind stays
             // inspectable and a bare `IsADirectory` without the path
@@ -819,7 +824,6 @@ impl StoreV2 {
                 )))
             }
         }
-        Ok(())
     }
 
     /// Runs a passive WAL checkpoint now, resetting the policy counter.

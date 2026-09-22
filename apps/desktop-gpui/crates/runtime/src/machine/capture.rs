@@ -405,6 +405,31 @@ impl V2CaptureStore {
         })
     }
 
+    /// Roll the staging journal back after the `phase` step ("append" /
+    /// "finalize" / "commit") failed, reporting every shape honestly:
+    /// removed (quiet), already gone — the promoted-past-the-rename
+    /// orphan, named so the operator never believes a rollback ran when
+    /// the journal sits in `audio/` (reconcile surfaces it) — or
+    /// genuinely leaked (removal failed; the leftover is what reconcile
+    /// would salvage as a duplicate).
+    fn rollback_staging(&self, staged_id: &str, phase: &str) {
+        match self
+            .store
+            .lock()
+            .expect("v2 store lock")
+            .discard_staging(staged_id)
+        {
+            Ok(true) => {}
+            Ok(false) => report_divergence(format!(
+                "the staging journal for {staged_id} was already gone at the {phase} \
+                 rollback — likely promoted; reconcile will surface whatever landed"
+            )),
+            Err(discard_err) => report_divergence(format!(
+                "staging journal {staged_id} leaked after the {phase} failure ({discard_err})"
+            )),
+        }
+    }
+
     fn commit(
         &self,
         take: &TakeRecord,
@@ -555,32 +580,13 @@ impl V2CaptureStore {
         // beside it — never swallowed, never allowed to replace the root
         // cause.
         if let Err(err) = v2_take.append_and_seal(&take.samples) {
-            if let Err(discard_err) = self
-                .store
-                .lock()
-                .expect("v2 store lock")
-                .discard_staging(&staged_id)
-            {
-                report_divergence(format!(
-                    "staging journal {staged_id} leaked after the append failure ({discard_err})"
-                ));
-            }
+            self.rollback_staging(&staged_id, "append");
             return Err(chain_adoption_failure(&adoption_error, err.to_string()));
         }
         let finalized = match v2_take.finalize() {
             Ok(finalized) => finalized,
             Err(err) => {
-                if let Err(discard_err) = self
-                    .store
-                    .lock()
-                    .expect("v2 store lock")
-                    .discard_staging(&staged_id)
-                {
-                    report_divergence(format!(
-                        "staging journal {staged_id} leaked after the finalize failure \
-                         ({discard_err})"
-                    ));
-                }
+                self.rollback_staging(&staged_id, "finalize");
                 return Err(chain_adoption_failure(&adoption_error, err.to_string()));
             }
         };
@@ -695,15 +701,11 @@ impl V2CaptureStore {
                      journal sits in audio/ with no row; reconcile will surface it as an \
                      orphaned session"
                 ));
-            } else if let Err(discard_err) = self
-                .store
-                .lock()
-                .expect("v2 store lock")
-                .discard_staging(&staged_id)
-            {
-                report_divergence(format!(
-                    "staging journal {staged_id} leaked after the commit failure ({discard_err})"
-                ));
+            } else {
+                // Also the probe-unknown shape: rollback_staging names the
+                // already-gone (promoted) case itself, so an operator is
+                // never left believing a rollback ran.
+                self.rollback_staging(&staged_id, "commit");
             }
             return Err(err);
         }
