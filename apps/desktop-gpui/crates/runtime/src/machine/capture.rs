@@ -584,19 +584,43 @@ impl V2CaptureStore {
             // sit before OR after the promoting rename, and each shape
             // gets its own honest answer:
             //
-            // - the row may have landed anyway (an error surfaced after
-            //   the transaction committed): the take IS durably stored,
-            //   and an Err would invite a retry that duplicates it;
-            // - a failure before the rename leaves the sealed journal in
-            //   staging — discard_staging rolls it back, else reconcile
-            //   would salvage it as an interrupted duplicate of a retry;
-            // - a failure after the rename (commit or gc) leaves the
-            //   journal in audio/ with no row: the discard is a no-op
-            //   (staging is gone), so the orphan is named in a divergence
-            //   report — reconcile heals it as an orphaned session, never
-            //   silently.
-            if matches!(store.get_capture(&staged_id), Ok(Some(_))) {
-                return Ok(());
+            // - the row may have landed anyway (an error after the
+            //   transaction committed — a failed WAL checkpoint or gc
+            //   pass): the take IS durably stored, and an Err would
+            //   invite a retry that collides with the row — answer Ok,
+            //   with the failure named so the persisted take keeps a
+            //   trace of it;
+            // - the row read itself may fail: the commit's outcome is
+            //   unknown, and Err carries the same retry-collision risk —
+            //   the sealed journal survives on disk either way (staging
+            //   or audio/, for reconcile to surface), so the honest
+            //   answer is Ok with the unknown state reported;
+            // - a provably rowless failure before the rename leaves the
+            //   sealed journal in staging — discard_staging rolls it
+            //   back, else reconcile would salvage it as an interrupted
+            //   duplicate of a retry;
+            // - a provably rowless failure after the rename (commit or
+            //   gc) leaves the journal in audio/ with no row: the discard
+            //   is a no-op (staging is gone), so the orphan is named in a
+            //   divergence report — reconcile heals it as an orphaned
+            //   session, never silently.
+            match store.get_capture(&staged_id) {
+                Ok(Some(_)) => {
+                    report_divergence(format!(
+                        "commit_marked errored after the row for {staged_id} landed ({err}) — \
+                         the take is durably persisted"
+                    ));
+                    return Ok(());
+                }
+                Err(read_err) => {
+                    report_divergence(format!(
+                        "commit_marked failed ({err}) and the row for {staged_id} could not be \
+                         read back ({read_err}) — the commit's outcome is unknown; reconcile \
+                         will surface whatever landed"
+                    ));
+                    return Ok(());
+                }
+                Ok(None) => {}
             }
             let err = chain_adoption_failure(&adoption_error, err.to_string());
             let promoted = store.load_audio(&staged_id).is_ok();
