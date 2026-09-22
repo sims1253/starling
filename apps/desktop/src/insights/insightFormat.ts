@@ -33,11 +33,11 @@ export function formatDayKey(dayKey: string, options?: { readonly withYear?: boo
 
   if (Number.isNaN(date.getTime())) return dayKey;
 
-  return date.toLocaleDateString([], {
-    month: "short",
-    day: "numeric",
-    ...(options?.withYear === true ? { year: "numeric" } : {}),
-  });
+  const parts: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" };
+
+  if (options?.withYear === true) parts.year = "numeric";
+
+  return date.toLocaleDateString([], parts);
 }
 
 /** "take"/"takes", "day"/"days" — the word alone, pluralized by its count. */
