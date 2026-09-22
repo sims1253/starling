@@ -240,6 +240,13 @@ export class InsightRecorder {
   private readonly now: () => Date;
   private readonly uuid: () => string;
   private readonly eventsById = new Map<string, InsightEvent>();
+  /**
+   * capture_id → occurred_at of its latest capture_finalized event,
+   * maintained as events enter the mirror — the anchor read is on the
+   * recognition hot path (once per settled transcript), where a linear
+   * scan of the whole log per read would make a session O(n²).
+   */
+  private readonly finalizedAt = new Map<string, string>();
   private writeChain: Promise<void> = Promise.resolve();
   private loadPromise: Promise<void> | undefined;
 
@@ -259,7 +266,11 @@ export class InsightRecorder {
    */
   async load(): Promise<void> {
     this.loadPromise ??= this.store.load().then((log) => {
-      for (const event of log.events) this.eventsById.set(event.event_id, event);
+      for (const event of log.events) {
+        this.eventsById.set(event.event_id, event);
+
+        if (isCaptureFinalized(event)) this.finalizedAt.set(event.capture_id, event.occurred_at);
+      }
     });
 
     return this.loadPromise;
@@ -404,6 +415,7 @@ export class InsightRecorder {
     await this.enqueue(async () => {
       await this.store.clear();
       this.eventsById.clear();
+      this.finalizedAt.clear();
     });
   }
 
@@ -420,13 +432,7 @@ export class InsightRecorder {
    * appended; this stays correct if that ever changes.
    */
   captureFinalizedAt(captureId: string): string | undefined {
-    let finalized: CaptureFinalizedEvent | undefined;
-
-    for (const event of this.snapshot()) {
-      if (isCaptureFinalized(event) && event.capture_id === captureId) finalized = event;
-    }
-
-    return finalized?.occurred_at;
+    return this.finalizedAt.get(captureId);
   }
 
   private tombstoneFor(captureId: string): InsightEvent | undefined {
@@ -478,6 +484,8 @@ export class InsightRecorder {
     await this.enqueue(async () => {
       await this.store.append(event);
       this.eventsById.set(event.event_id, event);
+
+      if (isCaptureFinalized(event)) this.finalizedAt.set(event.capture_id, event.occurred_at);
     });
   }
 

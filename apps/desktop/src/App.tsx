@@ -85,7 +85,7 @@ import {
   type InsightTermRecord,
   type InsightTermWrite,
 } from "./insights/insightTerms";
-import { InsightsView } from "./insights/InsightsView";
+import { InsightsView, type InsightNotice } from "./insights/InsightsView";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
@@ -287,7 +287,7 @@ export default function App() {
 
   const [termRecords, setTermRecords] = useState<readonly InsightTermRecord[]>(() => []);
 
-  const [insightNotices, setInsightNotices] = useState<readonly string[]>(() => []);
+  const [insightNotices, setInsightNotices] = useState<readonly InsightNotice[]>(() => []);
 
   // Set when the first term-aggregate write delta LANDS in the mirror: from
   // that moment the mount-time load() snapshot is stale by construction and
@@ -295,6 +295,15 @@ export default function App() {
   // it — a failed write changed nothing, so the snapshot is still the
   // freshest full view and the mirror keeps its recovery path.
   const termMirrorLandedRef = useRef(false);
+  /**
+   * capture_id → the in-flight capture_finalized emit for that take.
+   * The batch path fires the finalize fire-and-forget and transcribes
+   * separately, so a settling transcript's term write can beat its own
+   * finalize into the mirror; waiting for the registered promise (when
+   * one exists) reads the true finalization anchor instead of falling
+   * back to the write clock. Entries remove themselves once settled.
+   */
+  const pendingFinalizesRef = useRef(new Map<string, Promise<void>>());
 
   // The Insights consent state (E29 phase 2): read once from local settings
   // and thereafter changed only through applyInsightConsent, which persists
@@ -622,16 +631,27 @@ export default function App() {
    */
   const addInsightNotice = useCallback((notice: string) => {
     setInsightNotices((current) => {
-      if (current.includes(notice)) return current;
+      const existing = current.find((item) => item.text === notice);
 
-      const next = [...current, notice];
+      // A repeat of a visible notice counts it (stays fully visible — a
+      // same-text second failure is real news, not a duplicate to hide)
+      // and moves it to the newest-last end.
+      if (existing !== undefined) {
+        return [
+          ...current.filter((item) => item.text !== notice),
+          { text: notice, count: existing.count + 1 },
+        ];
+      }
+
+      const next: readonly InsightNotice[] = [...current, { text: notice, count: 1 }];
 
       return next.length > MAX_INSIGHT_NOTICES ? next.slice(-MAX_INSIGHT_NOTICES) : next;
     });
   }, []);
 
   const dismissInsightNotice = useCallback(
-    (notice: string) => setInsightNotices((current) => current.filter((item) => item !== notice)),
+    (notice: string) =>
+      setInsightNotices((current) => current.filter((item) => item.text !== notice)),
     [],
   );
 
@@ -706,7 +726,11 @@ export default function App() {
     (what: "record" | "delete" | "reset", action: () => Promise<InsightTermWrite>): Promise<void> =>
       action()
         .then((write) => {
-          termMirrorLandedRef.current = true;
+          // A "none" write touched nothing (no term kind is granted), so
+          // it must not arm the mirror guard — a none-write landing before
+          // the mount-time load would otherwise discard that snapshot and
+          // leave the mirror empty for the whole session.
+          if (write.kind !== "none") termMirrorLandedRef.current = true;
 
           setTermRecords((current) => applyTermWrite(current, write));
         })
@@ -747,17 +771,26 @@ export default function App() {
         }),
       );
       void recordInsightTerms("record", () =>
-        insights
-          .load()
-          // The event log's health must not gate the term write: a failed
-          // load only means the anchor falls back to the write clock.
+        // Wait for this take's own in-flight finalize first (the batch
+        // path races them); the promise never rejects, and the wait is
+        // precision-only — a finalize failure costs the anchor, never the
+        // term write.
+        (pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
           .catch(() => undefined)
           .then(() =>
-            insightTerms.recognitionSelected({
-              captureId: sessionId,
-              transcriptText,
-              finalizedAt: insights.captureFinalizedAt(sessionId),
-            }),
+            insights
+              .load()
+              // The event log's health must not gate the term write: a
+              // failed load only means the anchor falls back to the write
+              // clock.
+              .catch(() => undefined)
+              .then(() =>
+                insightTerms.recognitionSelected({
+                  captureId: sessionId,
+                  transcriptText,
+                  finalizedAt: insights.captureFinalizedAt(sessionId),
+                }),
+              ),
           ),
       );
     },
@@ -771,8 +804,8 @@ export default function App() {
    * incomplete audio is parked or discarded before a session owns it.
    */
   const recordCaptureFinalized = useCallback(
-    (session: DictationSession): Promise<void> =>
-      recordInsight(async () => {
+    (session: DictationSession): Promise<void> => {
+      const done = recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -781,7 +814,12 @@ export default function App() {
           sampleRate: stats.sampleRate,
           completeAudio: true,
         });
-      }),
+      }).finally(() => pendingFinalizesRef.current.delete(session.id));
+
+      pendingFinalizesRef.current.set(session.id, done);
+
+      return done;
+    },
     [recordInsight],
   );
 

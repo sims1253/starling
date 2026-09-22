@@ -53,6 +53,12 @@ const CALENDAR_DAYS = 28;
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** One unresolved Insights notice: its text and how often it struck. */
+export interface InsightNotice {
+  readonly text: string;
+  readonly count: number;
+}
+
 export interface InsightsViewProps {
   readonly events: readonly InsightEvent[];
   /** The consented content-derived aggregates, when any grant is on. */
@@ -62,10 +68,11 @@ export interface InsightsViewProps {
   readonly onConsentChange: (next: InsightConsent) => void;
   /**
    * Storage/recording issue notices. A list, not a slot: two stores can
-   * fail in the same moment, and every unresolved notice stays visible
-   * until the user dismisses it.
+   * fail in the same moment, every unresolved notice stays visible until
+   * the user dismisses it, and a repeated failure counts up on its entry
+   * instead of being hidden by an identical sibling.
    */
-  readonly notices: readonly string[];
+  readonly notices: readonly InsightNotice[];
   readonly onDismissNotice: (notice: string) => void;
   readonly onReset: () => void;
 }
@@ -265,7 +272,7 @@ export function InsightsView({
 
     if (parsed === null) {
       setGoalIssue(
-        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString("en-US")}.`,
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
       );
 
       return;
@@ -422,10 +429,16 @@ export function InsightsView({
       {notices.length > 0 && (
         <div className="insights-issues">
           {notices.map((notice) => (
-            <div className="insights-issue" role="alert" key={notice}>
+            <div className="insights-issue" role="alert" key={notice.text}>
               <CircleAlert size={16} />
-              <span>{notice}</span>
-              <button onClick={() => onDismissNotice(notice)} aria-label="Dismiss insights notice">
+              <span>
+                {notice.text}
+                {notice.count > 1 ? ` (×${notice.count})` : ""}
+              </span>
+              <button
+                onClick={() => onDismissNotice(notice.text)}
+                aria-label="Dismiss insights notice"
+              >
                 <X size={14} />
               </button>
             </div>

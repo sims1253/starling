@@ -10,7 +10,11 @@ import {
   wavCaptureStats,
   wordMultisetDifference,
 } from "./insightEmitter";
-import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
+import {
+  MemoryInsightEventStore,
+  insightEventProblems,
+  type InsightEventStore,
+} from "./insightEvents";
 
 /**
  * Emitter coverage (E29): every emitted event conforms to the frozen schema —
@@ -22,8 +26,7 @@ import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
 
 const T0 = Date.parse("2026-09-20T12:00:00Z");
 
-function recorder() {
-  const store = new MemoryInsightEventStore();
+function recorder(store: InsightEventStore = new MemoryInsightEventStore()) {
   let tick = 0;
   let serial = 0;
 
@@ -106,6 +109,31 @@ describe("InsightRecorder", () => {
     // across a card window boundary. The injected clock's first tick is T0.
     expect(insights.captureFinalizedAt("take-1")).toBe(new Date(T0).toISOString());
     expect(insights.captureFinalizedAt("take-unknown")).toBeUndefined();
+  });
+
+  it("anchors survive load replays and reset without rescanning the log", async () => {
+    // The anchor index is maintained at insert time (load replays,
+    // appends, reset) rather than derived by scanning — pinned here at
+    // the behavior level: a second recorder replaying the same durable
+    // log answers the same anchors, and a reset leaves none behind.
+    const first = recorder();
+
+    await first.recorder.captureFinalized({
+      captureId: "take-9",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    const second = recorder(first.store);
+
+    await second.recorder.load();
+
+    expect(second.recorder.captureFinalizedAt("take-9")).toBe(new Date(T0).toISOString());
+
+    await second.recorder.reset();
+
+    expect(second.recorder.captureFinalizedAt("take-9")).toBeUndefined();
   });
 
   it("emits schema-valid events for the full lifecycle", async () => {
