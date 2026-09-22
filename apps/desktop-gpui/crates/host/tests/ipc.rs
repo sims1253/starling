@@ -23,7 +23,7 @@ use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime::{provider::FakeProvider, Runtime, RuntimeConfig};
 use starling_runtime_host::auth::{ExpectUid, PeerPolicy};
 use starling_runtime_host::client::{ClientError, HostClient};
-use starling_runtime_host::frame::{Frame, FrameReader, TransportErrorCode};
+use starling_runtime_host::frame::{Frame, FrameError, FrameReader, TransportErrorCode};
 use starling_runtime_host::limits::RateLimit;
 use starling_runtime_host::{serve, HostConfig, HostError, HostHandle};
 
@@ -1585,6 +1585,35 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
         };
         assert_eq!(rc, 0, "failed to shrink the receive buffer");
     }
+    stalled
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    // The connection was served before it was flooded: read the hello
+    // (the only deterministic proof of service — after the close, a
+    // reset can discard everything still queued, so nothing later can
+    // stand in for it).
+    let hello_by = Instant::now() + Duration::from_secs(5);
+    loop {
+        let outcome = {
+            let mut reader = FrameReader::new(&mut stalled, usize::MAX);
+            match reader.read_frame() {
+                Ok(Frame::Hello { .. }) => Ok(()),
+                // Idle poll slice before the host's accept+greet lands.
+                Err(FrameError::Io(err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Err::<(), std::io::Error>(err)
+                }
+                other => panic!("expected the hello first, got {other:?}"),
+            }
+        };
+        match outcome {
+            Ok(()) => break,
+            Err(_) if Instant::now() < hello_by => continue,
+            Err(err) => panic!("no hello from the host: {err}"),
+        }
+    }
     let request =
         serde_json::to_vec(&Frame::GetSnapshot { req: "flood".into() }).expect("serializes");
     // The flood must decisively exceed every kernel buffer in front of
@@ -1607,15 +1636,13 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
 
     // The flood parks the writer mid-reply; the next reply cannot be
     // queued and the connection is torn down (socket and all — the
-    // parked writer must be unblocked, not left wedged). Drain raw
-    // bytes: the assertion is that the host ENDS the connection, as
-    // EOF, as ECONNRESET (the peer had unread inbound data at close
-    // time), or as EPIPE.
-    stalled
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
+    // parked writer must be unblocked, not left wedged). The assertion
+    // is that the host ENDS the connection — as EOF, or as ECONNRESET /
+    // EPIPE (the close can arrive while our unread flood still sits in
+    // the host's receive queue, which the kernel reports as a reset
+    // instead of a clean EOF; a reset discards whatever was still
+    // queued, which is why the hello above is the proof of service).
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut drained = Vec::new();
     loop {
         assert!(
             Instant::now() < deadline,
@@ -1623,8 +1650,8 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
         );
         let mut chunk = [0u8; 4096];
         match std::io::Read::read(&mut stalled, &mut chunk) {
-            Ok(0) => break,                                    // clean EOF
-            Ok(n) => drained.extend_from_slice(&chunk[..n]),   // keep draining
+            Ok(0) => break,                                  // clean EOF
+            Ok(_) => continue,                               // late replies leaving the kernel
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
@@ -1637,13 +1664,14 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
             {
                 break
             }
-            Err(err) => panic!("draining the wedged connection: {err}"),
+            Err(err) => panic!("reading the wedged connection's end: {err}"),
         }
     }
-    // The connection was real (hello and replies were drained) — what
-    // the close carried as an explanation is best-effort by design and
-    // not asserted (see the terminate-on-overflow docs in server.rs).
-    assert!(!drained.is_empty(), "the connection served before it closed");
+    // Reaching any of the three ends is the assertion: the hello proved
+    // the connection served, and the close — not a wedge, not a bare
+    // reply timeout — is what a stopped reader is owed. Any explanation
+    // frame is best-effort by design (see the terminate/close split in
+    // server.rs) and not asserted.
 
     host.shutdown();
 }
