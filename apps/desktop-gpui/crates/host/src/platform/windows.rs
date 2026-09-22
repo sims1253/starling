@@ -1,12 +1,16 @@
 //! The Windows transport: a named pipe with a restrictive DACL.
 //!
-//! **Compile-unverified (recorded gap):** no Windows target is installed
-//! on the machine this was written on, so `cargo check --target …` could
-//! not run against this module (and the workspace's bundled-SQLite C
-//! dependency would additionally need a cross C toolchain). The code
-//! follows the documented Win32 named-pipe semantics; its first Windows
-//! build is expected to be its first compile. The runtime tests for it
-//! are equally absent — see the PR's "Not executed here" section.
+//! **Compile-verified, runtime-untested (recorded gap):** this module
+//! (with `auth` and the platform surface it sits on) is type-checked
+//! against `x86_64-pc-windows-msvc` on Linux — the full crate cannot
+//! cross-check there (the bundled-SQLite C dependency needs an MSVC C
+//! toolchain), so the exact sources are checked in a dependency-free
+//! scratch crate — and the whole crate is compiled on every push by the
+//! `windows-check` CI job on a native Windows runner. But no Windows
+//! machine has *executed* this code — the runtime tests for it are
+//! equally absent. The code follows the documented Win32 named-pipe
+//! semantics; its first Windows run is expected to be its first run,
+//! not its first compile.
 //!
 //! Security posture (what "authenticated" means on Windows — there is no
 //! `SO_PEERCRED` analogue): the pipe is created with a security
@@ -25,36 +29,43 @@
 //! acceptor by connecting to the pipe as a client — the pending
 //! `ConnectNamedPipe` completes with that self-connection, the acceptor
 //! finds its channel closed, and it closes its handles and exits. This
-//! avoids overlapped I/O entirely at the cost of one wake connection at
-//! shutdown.
+//! avoids overlapped I/O at the cost of one wake connection at shutdown.
+//!
+//! Recorded gaps (compile-verified shapes, unrun): a synchronous
+//! `ReadFile` cannot poll (see [`PipeConn::set_read_timeout`]), and
+//! canceling a parked synchronous write relies on the instance-wide
+//! `DisconnectNamedPipe` in [`PipeConn::shutdown_both`].
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-#[allow(unused_imports)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND,
-    ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE,
+    ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows_sys::Win32::Security::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetTokenInformation, OpenProcessToken, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, TokenUser, PSID, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
 };
-#[allow(unused_imports)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, GENERIC_READ, GENERIC_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
+    PIPE_ACCESS_DUPLEX,
 };
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    WaitNamedPipeW, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    NMPWAIT_NOWAIT, NMPWAIT_USE_DEFAULT_WAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::{Probe, TransportConn, TransportListener};
 use crate::auth::PeerCredentials;
@@ -69,20 +80,39 @@ pub fn sddl_for_owner(owner_sid: &str) -> String {
     format!("D:P(A;;GRGW;;;SY)(A;;GRGW;;;{owner_sid})")
 }
 
+/// A raw pipe handle wrapped for movement across threads. windows-sys
+/// 0.59's `HANDLE` is a raw pointer (not `Send` by construction), but the
+/// value is a kernel object identifier, not a pointer into this
+/// process's memory — Win32 calls on one handle are thread-safe.
+struct SendHandle(HANDLE);
+
+// SAFETY: the handle is a kernel object identifier, not a pointer into
+// this process's memory; Win32 calls on one handle are thread-safe.
+unsafe impl Send for SendHandle {}
+
 /// The current process user's SID, as a string (S-1-5-21-…).
 fn current_user_sid() -> io::Result<String> {
     unsafe {
-        let mut token = INVALID_HANDLE_VALUE;
+        let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return Err(io::Error::last_os_error());
         }
-        // Two-call protocol: size first, then the buffer.
+        // Two-call protocol: the sizing call fails with
+        // ERROR_INSUFFICIENT_BUFFER and sets `needed`. Any other outcome
+        // (or a zero size) must be a real failure — an empty buffer
+        // would make the second call fail confusingly.
         let mut needed = 0u32;
-        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut needed);
+        if GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) != 0
+            || needed == 0
+        {
+            let err = io::Error::last_os_error();
+            CloseHandle(token);
+            return Err(err);
+        }
         let mut buffer = vec![0u8; needed as usize];
         if GetTokenInformation(
             token,
-            TOKEN_USER,
+            TokenUser,
             buffer.as_mut_ptr() as *mut core::ffi::c_void,
             needed,
             &mut needed,
@@ -92,10 +122,12 @@ fn current_user_sid() -> io::Result<String> {
             CloseHandle(token);
             return Err(err);
         }
-        // TOKEN_USER's first member is the SID pointer (repr(C)).
-        let sid = buffer.as_ptr() as *const *const core::ffi::c_void;
+        // TOKEN_USER is repr(C): { SID_AND_ATTRIBUTES { Sid: PSID, .. } }
+        // — the SID pointer rides at the buffer's start.
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let sid: PSID = user.User.Sid;
         let mut sid_wstr: *mut u16 = std::ptr::null_mut();
-        if ConvertSidToStringSidW(*sid, &mut sid_wstr) == 0 {
+        if ConvertSidToStringSidW(sid, &mut sid_wstr) == 0 {
             let err = io::Error::last_os_error();
             CloseHandle(token);
             return Err(err);
@@ -137,7 +169,7 @@ pub fn pipe_path(runtime_dir: &Path, root: &Path) -> PathBuf {
 fn owner_security_attributes() -> io::Result<SECURITY_ATTRIBUTES> {
     let sid = current_user_sid()?;
     let sddl = sddl_for_owner(&sid);
-    let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let wide = to_wide(&sddl);
     unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -159,7 +191,7 @@ fn owner_security_attributes() -> io::Result<SECURITY_ATTRIBUTES> {
 
 pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
     let name = to_wide(&path.to_string_lossy());
-    let mut security = owner_security_attributes()?;
+    let security = owner_security_attributes()?;
     unsafe {
         let handle = CreateNamedPipeW(
             name.as_ptr(),
@@ -180,16 +212,25 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
             return Err(io::Error::last_os_error());
         }
         // Hand the created-but-unconnected first instance to the acceptor
-        // thread, which will block in ConnectNamedPipe on it.
-        let (tx, rx) = mpsc::channel::<io::Result<HANDLE>>();
+        // thread, which will block in ConnectNamedPipe on it. The handle
+        // crosses as a SendHandle — wrapped *before* the closure so the
+        // closure captures the (Send) wrapper, not the raw pointer.
+        let first = SendHandle(handle);
+        let (tx, rx) = mpsc::channel::<io::Result<SendHandle>>();
         let name_for_thread = name.clone();
         let acceptor = std::thread::Builder::new()
             .name("starling-host-pipe-accept".into())
-            .spawn(move || acceptor_loop(name_for_thread, handle, tx))
-            .map_err(io::Error::other)?;
+            .spawn(move || acceptor_loop(name_for_thread, first, tx))
+            .map_err(|err| {
+                // The acceptor will never service (or close) the
+                // instance: close it here or it leaks for the process
+                // lifetime. (Inside this fn's outer unsafe block.)
+                CloseHandle(handle);
+                io::Error::other(err)
+            })?;
         Ok(Box::new(PipeListener {
             name,
-            connections: rx,
+            connections: Some(rx),
             _acceptor: acceptor,
         }))
     }
@@ -199,53 +240,81 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
 /// instance, deliver it, create the next instance, repeat. Exits when the
 /// receiver is gone (listener dropped — the Drop impl wakes the pending
 /// ConnectNamedPipe with a self-connection first).
-fn acceptor_loop(name: Vec<u16>, mut current: HANDLE, tx: mpsc::Sender<io::Result<HANDLE>>) {
+fn acceptor_loop(
+    name: Vec<u16>,
+    mut current: SendHandle,
+    tx: mpsc::Sender<io::Result<SendHandle>>,
+) {
     loop {
-        unsafe {
-            if ConnectNamedPipe(current, std::ptr::null()) == 0 {
-                let err = GetLastError();
-                // ERROR_NO_DATA / ERROR_PIPE_CONNECTED: a client had
-                // already connected between instance creation and our
-                // call — the instance is still good to service.
-                const ERROR_NO_DATA: u32 = 232;
-                const ERROR_PIPE_CONNECTED: u32 = 535;
-                if err != ERROR_NO_DATA && err != ERROR_PIPE_CONNECTED {
-                    if tx
-                        .send(Err(io::Error::from_raw_os_error(err as i32)))
-                        .is_err()
-                    {
-                        CloseHandle(current);
-                        return;
+        let connected = unsafe { ConnectNamedPipe(current.0, std::ptr::null_mut()) } != 0;
+        if !connected {
+            let err = unsafe { GetLastError() };
+            // ERROR_PIPE_CONNECTED: a client completed the connection
+            // between instance creation and this call — the instance is
+            // good to service, fall through and deliver it.
+            if err != ERROR_PIPE_CONNECTED {
+                if err == ERROR_NO_DATA {
+                    // The client connected and already went away: no
+                    // usable connection exists on this instance. Discard
+                    // it and listen on a fresh one rather than hand
+                    // `accept()` a dead handle.
+                    unsafe {
+                        DisconnectNamedPipe(current.0);
+                        CloseHandle(current.0);
                     }
-                    current = match create_instance(&name) {
+                    current = match unsafe { create_instance(&name) } {
                         Ok(next) => next,
                         Err(_) => return,
                     };
                     continue;
                 }
+                // A real acceptor failure: report it, close the failed
+                // instance (its handle is ours alone now — the error we
+                // sent never carried it), listen on the next. When even
+                // the report cannot be delivered the listener is gone:
+                // nobody else will close the instance.
+                let reported = io::Error::from_raw_os_error(err as i32);
+                let listener_gone = tx.send(Err(reported)).is_err();
+                unsafe {
+                    DisconnectNamedPipe(current.0);
+                    CloseHandle(current.0);
+                }
+                if listener_gone {
+                    return;
+                }
+                current = match unsafe { create_instance(&name) } {
+                    Ok(next) => next,
+                    Err(_) => return,
+                };
+                continue;
             }
         }
-        if tx.send(Ok(current)).is_err() {
-            // Listener gone: nobody will service this instance.
-            unsafe {
-                DisconnectNamedPipe(current);
-                CloseHandle(current);
+        match tx.send(Ok(current)) {
+            Ok(()) => {}
+            Err(sent) => {
+                // Listener gone: nobody will service this instance. The
+                // value bounced back is the one we tried to send — the
+                // connected instance by construction.
+                if let Ok(SendHandle(dead)) = sent.0 {
+                    unsafe {
+                        DisconnectNamedPipe(dead);
+                        CloseHandle(dead);
+                    }
+                }
+                return;
             }
-            return;
         }
-        unsafe {
-            current = match create_instance(&name) {
-                Ok(next) => next,
-                Err(_) => return,
-            };
-        }
+        current = match unsafe { create_instance(&name) } {
+            Ok(next) => next,
+            Err(_) => return,
+        };
     }
 }
 
-unsafe fn create_instance(name: &[u16]) -> io::Result<HANDLE> {
+unsafe fn create_instance(name: &[u16]) -> io::Result<SendHandle> {
     // Subsequent instances do not re-claim first-instance (only the
     // first did, in `listen`); same DACL applies.
-    let mut security = owner_security_attributes()?;
+    let security = owner_security_attributes()?;
     let handle = CreateNamedPipeW(
         name.as_ptr(),
         PIPE_ACCESS_DUPLEX,
@@ -260,22 +329,30 @@ unsafe fn create_instance(name: &[u16]) -> io::Result<HANDLE> {
     if handle == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
-        Ok(handle)
+        Ok(SendHandle(handle))
     }
 }
 
 pub fn connect(path: &Path) -> io::Result<Box<dyn TransportConn>> {
+    connect_with_wait(path, NMPWAIT_USE_DEFAULT_WAIT)
+}
+
+/// [`connect`] with an explicit `WaitNamedPipeW` mode. The probe path
+/// passes [`NMPWAIT_NOWAIT`] so probing a busy server stays non-blocking
+/// (a busy pipe is a `Live` answer, not something to wait out).
+fn connect_with_wait(path: &Path, wait: u32) -> io::Result<Box<dyn TransportConn>> {
     let name = to_wide(&path.to_string_lossy());
     unsafe {
         // A pipe server with all instances busy answers ERROR_PIPE_BUSY;
-        // a short wait-and-retry keeps an honest client from racing a
-        // host that is creating its next instance.
-        const NMPWAIT_USE_DEFAULT_WAIT: u32 = 0;
-        if WaitNamedPipeW(name.as_ptr(), NMPWAIT_USE_DEFAULT_WAIT) == 0 {
+        // a wait-and-retry keeps an honest client from racing a host
+        // that is creating its next instance.
+        if WaitNamedPipeW(name.as_ptr(), wait) == 0 {
             let err = GetLastError();
             if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
+            // Not found: fall through to CreateFileW, which reports the
+            // canonical error for a name no server created.
         }
         let handle = CreateFileW(
             name.as_ptr(),
@@ -289,32 +366,30 @@ pub fn connect(path: &Path) -> io::Result<Box<dyn TransportConn>> {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        Ok(Box::new(PipeConn { handle }))
+        Ok(Box::new(PipeConn {
+            handle: SendHandle(handle),
+            server: false,
+        }))
     }
 }
 
 pub fn probe(path: &Path) -> Probe {
-    match connect(path) {
+    match connect_with_wait(path, NMPWAIT_NOWAIT) {
         Ok(conn) => {
             drop(conn);
             Probe::Live
         }
         Err(err) => match err.raw_os_error() {
             Some(code)
-                if code == ERROR_FILE_NOT_FOUND as i32
-                    || code == ERROR_PATH_NOT_FOUND as i32
-                    || code == ERROR_PIPE_BUSY as i32 =>
+                if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32 =>
             {
-                // Not found: no server by this name. Busy: a server
-                // exists with every instance occupied — both are
-                // definitive answers about the name.
-                if code == ERROR_PIPE_BUSY as i32 {
-                    Probe::Live
-                } else {
-                    Probe::Dead
-                }
+                Probe::Dead
             }
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Probe::Unknown(err.to_string()),
+            // Busy: a server exists with every instance occupied — a
+            // definitive answer about the name (Live).
+            Some(code) if code == ERROR_PIPE_BUSY as i32 => Probe::Live,
+            // Everything else (ACCESS_DENIED included): liveness could
+            // not be tested; the caller fails closed.
             _ => Probe::Unknown(err.to_string()),
         },
     }
@@ -322,7 +397,9 @@ pub fn probe(path: &Path) -> Probe {
 
 pub struct PipeListener {
     name: Vec<u16>,
-    connections: mpsc::Receiver<io::Result<HANDLE>>,
+    /// `Option` so `Drop` can end the channel **before** joining the
+    /// acceptor (see [`Drop for PipeListener`]).
+    connections: Option<mpsc::Receiver<io::Result<SendHandle>>>,
     /// Kept alive so the acceptor thread's channel has a sender-side
     /// counterpart to observe; joined on Drop.
     _acceptor: std::thread::JoinHandle<()>,
@@ -332,8 +409,15 @@ impl TransportListener for PipeListener {
     fn accept(&self) -> io::Result<Box<dyn TransportConn>> {
         // Channel semantics stand in for the socket's: a connection is
         // either waiting (accept returns it) or not (WouldBlock).
-        match self.connections.try_recv() {
-            Ok(result) => Ok(Box::new(PipeConn { handle: result? })),
+        let connections = self
+            .connections
+            .as_ref()
+            .expect("the receiver lives until Drop");
+        match connections.try_recv() {
+            Ok(result) => Ok(Box::new(PipeConn {
+                handle: result?,
+                server: true,
+            })),
             Err(mpsc::TryRecvError::Empty) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "no pipe client waiting",
@@ -346,33 +430,50 @@ impl TransportListener for PipeListener {
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
-        // The channel in `accept` already behaves in the polling style
-        // the host's accept loop wants; nothing to toggle.
+        // Documented divergence from the trait's toggle: this listener is
+        // permanently non-blocking — the channel behind `accept` answers
+        // in exactly the polling style the host's accept loop wants, and
+        // there is no blocking mode to switch to. The only caller (the
+        // host's loop) always polls.
         Ok(())
     }
 }
 
 impl Drop for PipeListener {
     fn drop(&mut self) {
-        // Wake the acceptor: connect to our own pipe name so the pending
-        // ConnectNamedPipe completes; the acceptor then finds the channel
-        // closed and cleans up its handles.
+        // Order matters. (1) End the channel first: once the wake
+        // connection below completes the acceptor's pending
+        // ConnectNamedPipe, its `send` must fail so it exits — with the
+        // receiver still alive it would instead create the *next*
+        // instance and park on it forever, and the join would hang even
+        // on this happy path.
+        drop(self.connections.take());
+        // (2) Wake the acceptor: connect to our own pipe name so the
+        // pending ConnectNamedPipe completes.
         let _ = connect(Path::new(&String::from_utf16_lossy(&self.name)));
-        let _ = self._acceptor.join();
+        // (3) Bounded wait: a wake that cannot reach the acceptor
+        // (create_instance failed, the name is gone) must not hang the
+        // dropping thread — the acceptor is left detached instead.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self._acceptor.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
-/// A connected pipe instance (server or client side).
+/// A connected pipe instance. `server` marks instances this process
+/// created with `CreateNamedPipeW` — only those may be passed to
+/// `DisconnectNamedPipe` (client-side handles from `CreateFileW` are
+/// closed, never disconnected).
 pub struct PipeConn {
-    handle: HANDLE,
+    handle: SendHandle,
+    server: bool,
 }
 
 // SAFETY: the handle is a kernel object identifier, not a pointer into
 // this process's memory; Win32 calls on one handle are thread-safe.
 unsafe impl Send for PipeConn {}
 unsafe impl Sync for PipeConn {}
-
-type HANDLE = *mut core::ffi::c_void;
 
 impl PipeConn {
     fn pid_of(handle: HANDLE) -> Option<u32> {
@@ -392,7 +493,7 @@ impl TransportConn for PipeConn {
         // `crate::auth`).
         Ok(PeerCredentials {
             uid: None,
-            pid: Self::pid_of(self.handle),
+            pid: Self::pid_of(self.handle.0),
         })
     }
 
@@ -400,11 +501,11 @@ impl TransportConn for PipeConn {
         // DuplicateHandle: a real second handle to the same pipe, so the
         // host's reader/writer/shutdown split works exactly as on unix.
         unsafe {
-            let mut duplicate = INVALID_HANDLE_VALUE;
+            let mut duplicate: HANDLE = std::ptr::null_mut();
             let process = GetCurrentProcess();
             if DuplicateHandle(
                 process,
-                self.handle,
+                self.handle.0,
                 process,
                 &mut duplicate,
                 0,
@@ -414,27 +515,53 @@ impl TransportConn for PipeConn {
             {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Box::new(PipeConn { handle: duplicate }))
+            Ok(Box::new(PipeConn {
+                handle: SendHandle(duplicate),
+                server: self.server,
+            }))
         }
     }
 
     fn shutdown_both(&self) -> io::Result<()> {
-        // There is no shutdown(2) for pipes: the host closes the handle
-        // (drop) to end both directions. Flush what is buffered first.
+        // There is no shutdown(2) for pipes, and the nearest flush
+        // (FlushFileBuffers) BLOCKS on a full pipe — the exact stall the
+        // callers (the event pump's eviction, bounded shutdown) must
+        // never cause. Server instances: DisconnectNamedPipe forces the
+        // disconnect; pending operations on other handles to the same
+        // instance complete with an error, which is what unblocks a
+        // parked writer. Client handles: CancelIoEx cancels this handle's
+        // pending synchronous I/O (the reader's ReadFile) best-effort.
         unsafe {
-            if FlushFileBuffers(self.handle) == 0 {
+            if self.server {
+                if DisconnectNamedPipe(self.handle.0) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if CancelIoEx(self.handle.0, std::ptr::null()) == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
+        Ok(())
+    }
+
+    fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        // Recorded gap: a synchronous (non-overlapped) ReadFile cannot
+        // poll; converting the read side to overlapped I/O is the
+        // prerequisite. Until then the client library's event backlog
+        // flushes on inbound frames instead of on an idle tick (see
+        // `client.rs`).
         Ok(())
     }
 }
 
 impl Drop for PipeConn {
     fn drop(&mut self) {
+        // Only server-side instances are disconnected; both sides'
+        // handles are closed.
         unsafe {
-            DisconnectNamedPipe(self.handle);
-            CloseHandle(self.handle);
+            if self.server {
+                DisconnectNamedPipe(self.handle.0);
+            }
+            CloseHandle(self.handle.0);
         }
     }
 }
@@ -443,9 +570,9 @@ impl Read for PipeConn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read = 0u32;
         let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::ReadFile(
-                self.handle,
-                buf.as_mut_ptr() as *mut core::ffi::c_void,
+            ReadFile(
+                self.handle.0,
+                buf.as_mut_ptr(),
                 buf.len() as u32,
                 &mut read,
                 std::ptr::null_mut(),
@@ -454,7 +581,7 @@ impl Read for PipeConn {
         if ok == 0 {
             // ERROR_BROKEN_PIPE: the peer closed — a clean EOF for a
             // pipe.
-            if unsafe { GetLastError() } == 109 {
+            if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
                 return Ok(0);
             }
             return Err(io::Error::last_os_error());
@@ -467,9 +594,9 @@ impl Write for PipeConn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut written = 0u32;
         let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::WriteFile(
-                self.handle,
-                buf.as_ptr() as *const core::ffi::c_void,
+            WriteFile(
+                self.handle.0,
+                buf.as_ptr(),
                 buf.len() as u32,
                 &mut written,
                 std::ptr::null_mut(),
@@ -482,11 +609,9 @@ impl Write for PipeConn {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        unsafe {
-            if FlushFileBuffers(self.handle) == 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
+        // Byte-mode synchronous writes are delivered by the time
+        // WriteFile returns; FlushFileBuffers would add nothing but a
+        // blocking wait against a peer that is not reading.
         Ok(())
     }
 }

@@ -50,8 +50,8 @@ pub trait TransportListener: Send {
 pub trait TransportConn: Read + Write + Send + Sync {
     /// The kernel's evidence about the peer (see [`crate::auth`] for what
     /// each platform can supply). Errors when the platform syscall fails;
-    /// `PeerCredentials::absent()` when the platform has no mechanism at
-    /// all.
+    /// `PeerCredentials::absent()` when the platform has no mechanism
+    /// at all.
     fn peer_credentials(&self) -> io::Result<PeerCredentials>;
     /// A second handle to the same connection (the host splits reader,
     /// writer and shutdown duties across threads).
@@ -59,6 +59,13 @@ pub trait TransportConn: Read + Write + Send + Sync {
     /// Immediately ends both directions (unblocks a reader parked on this
     /// connection).
     fn shutdown_both(&self) -> io::Result<()>;
+    /// Arms a read poll on this connection so a blocking read wakes up
+    /// periodically ([io::ErrorKind::WouldBlock]/[io::ErrorKind::TimedOut])
+    /// instead of parking forever — the mechanism behind both sides'
+    /// "idle" loops. Errors where the platform cannot poll a synchronous
+    /// read (Windows' synchronous `ReadFile`; recorded gap there — see
+    /// `platform::windows`).
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()>;
 }
 
 /// What a probe of an endpoint found.
@@ -106,12 +113,14 @@ pub fn default_runtime_dir() -> PathBuf {
 /// namespace). Deterministic across processes; distinct roots never
 /// collide in practice.
 pub fn endpoint_stem(root: &Path) -> String {
-    // FNV-1a 64 over the canonical-ish root string. Not cryptographic —
-    // it only has to not collide between a user's distinct roots.
-    let text = root.to_string_lossy();
+    // FNV-1a 64 over the root's raw OS-encoded bytes. Not cryptographic —
+    // it only has to not collide between a user's distinct roots — but
+    // hashing the *bytes* (not a lossy UTF-8 rendering) keeps distinct
+    // non-UTF-8 paths distinct: two roots that collapse under
+    // `to_string_lossy` must never share one endpoint.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in text.bytes() {
-        hash ^= byte as u64;
+    for byte in root.as_os_str().as_encoded_bytes() {
+        hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("starling-runtime-{:016x}", hash)
@@ -130,10 +139,31 @@ pub fn socket_path(runtime_dir: &Path, root: &Path) -> PathBuf {
     windows::pipe_path(runtime_dir, root)
 }
 
-/// Ensure the runtime dir exists with user-only permissions.
+/// Ensure the runtime dir exists with user-only permissions. An existing
+/// directory is **tightened** to 0700 (unix): the fallback
+/// `/tmp/starling-runtime-<uid>` and an externally-supplied
+/// `XDG_RUNTIME_DIR` are both paths this process did not create, and the
+/// 0700 assumption the endpoint's security docs rely on must hold, not
+/// be presumed. A directory this user cannot tighten (owned by someone
+/// else) is an error — fail closed rather than serve from a shared dir.
 pub fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     use std::fs::DirBuilder;
     if dir.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(dir)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("runtime dir {dir:?} exists and is not a directory"),
+                ));
+            }
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         return Ok(());
     }
     #[cfg(unix)]
@@ -193,13 +223,34 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_stem_distinguishes_non_utf8_roots() {
+        // Two roots that collapse under to_string_lossy (each invalid
+        // byte becomes U+FFFD) must still hash differently: the hash is
+        // over the raw OS bytes, not the lossy rendering.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let a = std::ffi::OsStr::from_bytes(b"/tmp/root-\xff");
+            let b = std::ffi::OsStr::from_bytes(b"/tmp/root-\xfe");
+            assert_ne!(
+                endpoint_stem(Path::new(a)),
+                endpoint_stem(Path::new(b)),
+                "distinct non-UTF-8 roots must not share an endpoint"
+            );
+            // And the lossy collision case itself: two *different*
+            // invalid bytes render to the same lossy string.
+            assert_eq!(a.to_string_lossy(), b.to_string_lossy());
+        }
+    }
+
+    #[test]
     fn endpoint_stem_hex_is_stable() {
         // Pin the hash so a future refactor cannot silently move every
         // user's socket path (all live clients would miss the host).
         let stem = endpoint_stem(Path::new("/opt/starling-test-root"));
         let hex = stem.trim_start_matches("starling-runtime-");
         assert_eq!(hex.len(), 16);
-        // FNV-1a 64 of that exact path, computed independently:
+        // FNV-1a 64 of that exact path's bytes, computed independently:
         assert_eq!(hex, fnv64(b"/opt/starling-test-root"));
     }
 
@@ -210,5 +261,29 @@ mod tests {
             hash = hash.wrapping_mul(0x100000001b3);
         }
         format!("{hash:016x}")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_existing_runtime_dir_is_tightened_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("shared-runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_dir(&runtime).expect("existing dir is accepted");
+        let mode = std::fs::metadata(&runtime).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "group/world bits are gone");
+
+        // Already-tight dirs pass through untouched.
+        ensure_runtime_dir(&runtime).expect("tight dir stays accepted");
+        let mode = std::fs::metadata(&runtime).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Fresh creation is 0700 from the start.
+        let fresh = dir.path().join("fresh-runtime");
+        ensure_runtime_dir(&fresh).expect("fresh dir is created");
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }

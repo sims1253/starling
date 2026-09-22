@@ -39,3 +39,21 @@ jobs:
         run: |
           cargo check --workspace
           cargo test --workspace
+
+  # The service host's Windows named-pipe transport is cfg(windows) — the
+  # ubuntu job never compiles it. Keep that path compile-verified on a
+  # native MSVC toolchain so the DACL/FFI surface cannot rot silently
+  # (runtime coverage on Windows remains a recorded gap; see
+  # crates/host/src/platform/windows.rs).
+  windows-check:
+    name: cargo check starling-runtime-host (windows)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check the host crate
+        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
+        working-directory: apps/desktop-gpui
+        run: cargo check -p starling-runtime-host

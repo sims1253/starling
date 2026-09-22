@@ -25,10 +25,67 @@ use super::{Probe, TransportConn, TransportListener};
 use crate::auth::PeerCredentials;
 
 /// Binds at `path` (an existing stale file is the caller's problem — see
-/// [`super::probe`]); sets the socket file to 0600.
+/// [`super::probe`]).
+///
+/// The socket is bound under a unique temporary name in the same
+/// directory, set to 0600, and then renamed onto `path`: the endpoint is
+/// never reachable under its final name with anything looser than 0600.
+/// (`UnixListener::bind` alone would create the file with umask-default
+/// permissions first — a window another local user could connect in when
+/// the runtime dir is not this process's own 0700 creation.)
 pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "starling-runtime.sock".to_string());
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut listener = None;
+    let mut temp = None;
+    for _ in 0..8 {
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = directory.join(format!(
+            "{file_name}.{}.{}.tmp",
+            std::process::id(),
+            attempt
+        ));
+        match UnixListener::bind(&candidate) {
+            Ok(bound) => {
+                std::fs::set_permissions(
+                    &candidate,
+                    std::fs::Permissions::from_mode(0o600),
+                )?;
+                listener = Some(bound);
+                temp = Some(candidate);
+                break;
+            }
+            // The unique name collided (practically impossible): try the
+            // next. Any other error (missing directory, permissions) is
+            // a real bind failure — surface it.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    let (listener, temp) =
+        match (listener, temp) {
+            (Some(listener), Some(temp)) => (listener, temp),
+            _ => return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not find a free temp name for the endpoint socket",
+            )),
+        };
+    // Rename publishes the 0600 socket under its final name atomically.
+    // A server that bound `path` between the caller's probe and this
+    // rename is silently displaced — the same check-then-act window
+    // [`remove_stale`] documents; the data-root lease is what serializes
+    // hosts against it. A failed rename drops the listener (closing the
+    // temp socket) and removes the temp file — no residue for the next
+    // boot to trip over.
+    if let Err(err) = std::fs::rename(&temp, path) {
+        drop(listener);
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
     Ok(Box::new(UdsListener { listener }))
 }
 
@@ -46,17 +103,34 @@ pub fn probe(path: &Path) -> Probe {
         // accept loop simply never hears from it again.
         Ok(_) => Probe::Live,
         Err(err) => match err.kind() {
-            io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied => Probe::Dead,
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => Probe::Dead,
+            // EACCES means liveness could NOT be tested (a socket file
+            // planted or re-permissioned by another local user, or one
+            // whose mode was lost) — the caller must fail closed, not
+            // treat the path as stale and unlink it (the Windows
+            // transport maps ACCESS_DENIED the same way).
             _ => Probe::Unknown(err.to_string()),
         },
     }
 }
 
-/// Removes a stale socket file. Refuses when a probe just said `Live` —
-/// that is the caller's decision tree, not this helper's.
+/// Removes a stale socket file. Re-probes immediately before unlinking:
+/// a server that bound between the caller's earlier `Dead` probe and now
+/// must not lose its socket file (clients would silently miss it). A
+/// `Live` answer aborts the takeover — the caller treats it as the
+/// foreign-server refusal. The probe-to-unlink window itself cannot be
+/// closed from user space (the lease serializes hosts; only exotic
+/// non-host binders can race it).
 pub fn remove_stale(path: &Path) -> io::Result<()> {
+    if let Probe::Live = probe(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to unlink {path:?}: a live server answered it \
+                 between the stale probe and the removal"
+            ),
+        ));
+    }
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -185,6 +259,10 @@ impl TransportConn for UdsConn {
     fn shutdown_both(&self) -> io::Result<()> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }
+
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
 }
 
 impl Read for UdsConn {
@@ -200,5 +278,55 @@ impl Write for UdsConn {
 
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_file_without_permissions_probes_unknown_not_dead() {
+        // EACCES means liveness could not be tested. Treating it as Dead
+        // would let a host unlink (and rebind) a socket it could not
+        // even connect to — an attacker-planted or re-permissioned file
+        // must fail closed instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            matches!(probe(&path), Probe::Unknown(_)),
+            "EACCES must read Unknown (fail closed), not Dead"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn remove_stale_refuses_a_socket_that_went_live_again() {
+        let dir = tempfile::tempdir().unwrap();
+        // Live: a server is bound right now — removal must refuse.
+        let live_path = dir.path().join("live.sock");
+        let squatter = UnixListener::bind(&live_path).unwrap();
+        let refused = remove_stale(&live_path);
+        assert!(
+            refused.is_err(),
+            "a live server's socket file must not be unlinked"
+        );
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(live_path.exists(), "the squatter keeps its socket file");
+        drop(squatter);
+
+        // And the residue case still works: a leftover file with no
+        // listener behind it is stale and removable.
+        let dead_path = dir.path().join("dead.sock");
+        let gone = UnixListener::bind(&dead_path).unwrap();
+        drop(gone);
+        assert!(matches!(probe(&dead_path), Probe::Dead));
+        remove_stale(&dead_path).expect("stale residue is removed");
+        assert!(!dead_path.exists());
     }
 }

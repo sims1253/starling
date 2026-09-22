@@ -15,7 +15,12 @@
 //!   at creation — only the creating user (and the system) holds a pipe
 //!   handle, so the kernel has already enforced "same user" before a
 //!   connect can succeed. `GetNamedPipeClientProcessId` supplies the
-//!   peer pid for diagnostics. See `platform::windows`.
+//!   peer pid for diagnostics. See `platform::windows`. The DACL
+//!   construction path is compile-verified by CI on a native Windows
+//!   runner (the `windows-check` job in desktop-gpui-rust.yml), so a
+//!   regression in the SDDL/security-descriptor code fails the build
+//!   rather than shipping silently; an in-band re-check of the peer's
+//!   user at accept time remains a recorded gap there.
 //!
 //! Fail-closed: on unix, a platform that cannot supply peer credentials
 //! (an unsupported `cfg`) yields `PeerCredentials::absent()`, and the
