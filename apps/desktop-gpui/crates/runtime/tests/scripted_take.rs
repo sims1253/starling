@@ -2499,6 +2499,10 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
              ignores directory write bits; the permission-based injection cannot bite"
         );
         return; // the PermRestore drop puts the directory back
+        // TODO(#259 follow-up): a privilege-independent injection seam
+        // (a fault-injectable promote step) would exercise this arm on
+        // root CI runners too; the SKIP marker above makes the gap
+        // visible in the meantime.
     }
 
     let result = store.commit_take(&take_record("take_commitfail", &samples, None));
