@@ -81,6 +81,22 @@ pub enum HostError {
         owner_pid: u32,
         socket_path: PathBuf,
     },
+    /// A lease file exists that can be neither probed nor broken (it
+    /// will not open or parse, and no evidence proves its owner dead —
+    /// never break what cannot be proven dead): no ownership was taken,
+    /// rather than a second owner writing beside an unanswerable one
+    /// whose reconciles would defer forever. `unreadable` names each
+    /// lease file with its reason — repair (remove or fix the named
+    /// files) or investigate that owner, then retry.
+    #[error(
+        "a lease file that cannot be probed blocks ownership of {root:?} — \
+         never break what cannot be proven dead: {unreadable:?}; repair the \
+         named file(s) or investigate that owner, then retry"
+    )]
+    LeaseUnanswerable {
+        root: PathBuf,
+        unreadable: Vec<(String, String)>,
+    },
     /// The endpoint probe answered while this host held the lease: a
     /// server that serves without owning. Refuse.
     #[error("a live server is already bound at {0:?} while this host holds the lease")]
@@ -326,6 +342,16 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
                 owner_pid: owner.pid,
                 socket_path: config.socket_path(),
             })
+        }
+        Ok(LeaseAcquisition::UnanswerableLeases { unreadable }) => {
+            // An unanswerable lease reads as an owner we must defer to
+            // (reconcile would, forever) — surface it instead of serving
+            // beside it: this host would be a second writer on a root
+            // whose recovery is already disabled.
+            return Err(HostError::LeaseUnanswerable {
+                root: config.data_root.clone(),
+                unreadable,
+            });
         }
         Err(source) => return Err(HostError::Lease(source.to_string())),
     };
