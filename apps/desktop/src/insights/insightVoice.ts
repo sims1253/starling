@@ -214,11 +214,11 @@ function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
  * off yields no cards even when its aggregates exist (and after a
  * withdrawal plus purge, none exist to yield).
  *
- * Two denominators, both stated: `windowTakes` is the distinct captures
- * with a selected recognition inside the window (a retranscription is the
- * same take, never counted twice, and a deleted take drops out — the
+ * Two denominators, both stated. `windowTakes` is the distinct captures
+ * with a selected recognition inside the window — a retranscription is the
+ * same take, never counted twice, and a deleted take drops out (the
  * tombstone removes it here exactly like the metric contract removes it
- * from every other surface), and `analyzedTakes` is how many of those
+ * from every other surface). `analyzedTakes` is how many of those
  * retained aggregates under the current grants. Cards cite their own
  * per-kind analyzed count ("appeared in 3 of 5 analyzed takes" where 5
  * counts only takes stamped as analyzed for that card's kind — a take

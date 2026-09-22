@@ -243,11 +243,14 @@ describe("MemoryInsightTermStore", () => {
 
     // The purged kind is no longer stamped: an unknown again, not a zero.
     expect(log.records[0]?.derived_kinds).toEqual(["terms"]);
-    expect(purged[0]?.derived_kinds).toEqual(["terms"]);
+    expect(purged.updated[0]?.derived_kinds).toEqual(["terms"]);
 
     // A second withdrawal of the same kind changes nothing — the returned
-    // delta stays honest to what actually changed.
-    expect(await store.purgeKinds(new Set(["phrases"]))).toEqual([]);
+    // delta stays honest to what actually changed, and nothing was damaged.
+    const second = await store.purgeKinds(new Set(["phrases"]));
+
+    expect(second.updated).toEqual([]);
+    expect(second.skippedInvalid).toBe(0);
 
     await store.clear();
     log = await store.load();
@@ -269,7 +272,7 @@ describe("MemoryInsightTermStore", () => {
 
     const purged = await store.purgeKinds(new Set(["phrases"]));
 
-    expect(purged[0]?.derived_kinds).toEqual(["terms"]);
+    expect(purged.updated[0]?.derived_kinds).toEqual(["terms"]);
 
     const log = await store.load();
 
@@ -319,9 +322,9 @@ describe("IndexedDbInsightTermStore", () => {
 
     const purged = await store.purgeKinds(new Set(["phrases"]));
 
-    expect(purged).toHaveLength(1);
-    expect(purged[0]?.phrases).toEqual([]);
-    expect(purged[0]?.terms.length).toBe(3);
+    expect(purged.updated).toHaveLength(1);
+    expect(purged.updated[0]?.phrases).toEqual([]);
+    expect(purged.updated[0]?.terms.length).toBe(3);
 
     const log = await store.load();
 
@@ -398,9 +401,11 @@ describe("IndexedDbInsightTermStore", () => {
     const purged = await store.purgeKinds(new Set(["terms"]));
 
     // The conforming record is purged; the damaged one is quarantined, not
-    // repaired or deleted by the withdrawal.
-    expect(purged).toHaveLength(1);
-    expect(purged[0]?.capture_id).toBe("take-1");
+    // repaired or deleted by the withdrawal — and the skip is counted so
+    // the weaker guarantee is visible to the caller.
+    expect(purged.updated).toHaveLength(1);
+    expect(purged.updated[0]?.capture_id).toBe("take-1");
+    expect(purged.skippedInvalid).toBe(1);
 
     const log = await store.load();
 
@@ -416,8 +421,12 @@ describe("IndexedDbInsightTermStore", () => {
     // First withdrawal rewrites the record (phrases held data); a second
     // finds nothing held and nothing stamped, so it rewrites and returns
     // nothing — no no-op IndexedDB writes, no phantom purge delta.
-    expect(await store.purgeKinds(new Set(["phrases"]))).toHaveLength(1);
-    expect(await store.purgeKinds(new Set(["phrases"]))).toEqual([]);
+    expect((await store.purgeKinds(new Set(["phrases"]))).updated).toHaveLength(1);
+
+    const second = await store.purgeKinds(new Set(["phrases"]));
+
+    expect(second.updated).toEqual([]);
+    expect(second.skippedInvalid).toBe(0);
 
     const log = await store.load();
 
@@ -693,6 +702,7 @@ describe("applyTermWrite", () => {
     const purged = applyTermWrite(withoutDeleted, {
       kind: "purge",
       records: [{ ...original, phrases: [] }],
+      skippedInvalid: 0,
     });
 
     expect(purged[0]?.phrases).toEqual([]);

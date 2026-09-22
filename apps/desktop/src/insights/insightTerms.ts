@@ -197,6 +197,18 @@ export interface InsightTermLog {
   readonly invalidCount: number;
 }
 
+/**
+ * What one withdrawal purge did: the records it rewrote and only those, plus
+ * how many damaged records it had to quarantine. Quarantined records may
+ * still retain the withdrawn kind's aggregates — the count exists so the
+ * caller can state the weaker guarantee instead of reporting the withdrawal
+ * as complete.
+ */
+export interface InsightTermPurgeResult {
+  readonly updated: readonly InsightTermRecord[];
+  readonly skippedInvalid: number;
+}
+
 let wordSegmenter: Intl.Segmenter | undefined;
 
 function segmenter(): Intl.Segmenter {
@@ -321,7 +333,7 @@ export interface InsightTermStore {
   load(): Promise<InsightTermLog>;
   put(record: InsightTermRecord): Promise<InsightTermRecord>;
   tombstone(captureId: string): Promise<void>;
-  purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]>;
+  purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<InsightTermPurgeResult>;
   clear(): Promise<void>;
 }
 
@@ -429,7 +441,7 @@ export class MemoryInsightTermStore implements InsightTermStore {
     this.tombstones.add(captureId);
   }
 
-  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]> {
+  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<InsightTermPurgeResult> {
     const updated: InsightTermRecord[] = [];
 
     for (const [captureId, record] of this.records) {
@@ -441,7 +453,7 @@ export class MemoryInsightTermStore implements InsightTermStore {
       updated.push(purged);
     }
 
-    return Object.freeze(updated);
+    return Object.freeze({ updated: Object.freeze(updated), skippedInvalid: 0 });
   }
 
   async clear(): Promise<void> {
@@ -600,16 +612,19 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
    * chain, another window) can never be clobbered by a stale pre-purge
    * snapshot — the deleted kind is gone from every record the transaction
    * actually saw, and nothing else changes. Damaged records are
-   * quarantined, not repaired: the cursor skips what does not decode,
-   * exactly like `load()` would.
+   * quarantined, not repaired: the cursor skips what does not decode
+   * (exactly like `load()` would) and the skip is counted, because a
+   * quarantined record may still retain the withdrawn kind's data and the
+   * caller must be able to say so.
    */
-  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]> {
+  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<InsightTermPurgeResult> {
     const database = await this.database();
 
     return new Promise((resolve, reject) => {
       const transaction = database.transaction(RECORDS_OBJECT_STORE, "readwrite");
       const cursorRequest = transaction.objectStore(RECORDS_OBJECT_STORE).openCursor();
       const updated: InsightTermRecord[] = [];
+      let skippedInvalid = 0;
 
       cursorRequest.onsuccess = () => {
         const cursor = cursorRequest.result;
@@ -629,12 +644,15 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
             cursor.update(purged);
             updated.push(purged);
           }
+        } else {
+          skippedInvalid += 1;
         }
 
         cursor.continue();
       };
 
-      transaction.oncomplete = () => resolve(Object.freeze(updated));
+      transaction.oncomplete = () =>
+        resolve(Object.freeze({ updated: Object.freeze(updated), skippedInvalid }));
       transaction.onerror = () =>
         reject(
           new Error(`an insight term store purge failed: ${transaction.error?.message ?? ""}`),
@@ -728,7 +746,12 @@ export type InsightTermWrite =
   | { readonly kind: "none" }
   | { readonly kind: "record"; readonly record: InsightTermRecord }
   | { readonly kind: "tombstone"; readonly captureId: string }
-  | { readonly kind: "purge"; readonly records: readonly InsightTermRecord[] }
+  | {
+      readonly kind: "purge";
+      readonly records: readonly InsightTermRecord[];
+      /** Damaged records the purge quarantined; their data may survive. */
+      readonly skippedInvalid: number;
+    }
   | { readonly kind: "clear" };
 
 /**
@@ -834,9 +857,9 @@ export class InsightTermRecorder {
 
   /** Consent withdrawal for a kind deletes that kind's retained data. */
   async withdrawKinds(kinds: ReadonlySet<InsightTermKind>): Promise<InsightTermWrite> {
-    const records = await this.enqueue(() => this.store.purgeKinds(kinds));
+    const { updated, skippedInvalid } = await this.enqueue(() => this.store.purgeKinds(kinds));
 
-    return { kind: "purge", records };
+    return { kind: "purge", records: updated, skippedInvalid };
   }
 
   /** Reset: term aggregation starts over from an empty store. */

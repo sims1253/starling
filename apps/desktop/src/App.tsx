@@ -322,6 +322,11 @@ export default function App() {
   // record), each delta lands only after the previous one has applied, so
   // the mirror's order can never diverge from the recorder's store order.
   const termMirrorChainRef = useRef<Promise<void>>(Promise.resolve());
+  // The mount-time term-store load whose settlement every mirror delta
+  // waits behind, so a first write that beats a slow cold-start load can
+  // neither be overwritten by its snapshot nor strand the mirror with a
+  // delta-only view of the store. The promise never rejects.
+  const termLoadOnceRef = useRef<Promise<void> | null>(null);
   /**
    * capture_id → the in-flight capture_finalized emit for that take.
    * The batch path fires the finalize fire-and-forget and transcribes
@@ -693,16 +698,15 @@ export default function App() {
         addInsightNotice(`Insights could not open the local event log: ${messageFrom(caught)}`),
       );
 
-    void insightTermStore
+    const termLoaded = insightTermStore
       .load()
       .then((log) => {
-        // Once a write delta has LANDED, the mirror is newer than any
-        // mount-time snapshot: applying one now would overwrite the delta's
-        // records with a pre-write view. Landing is the condition, not
-        // starting — a write that only started and then failed never touched
-        // the store, so the snapshot stays the freshest full view and may
-        // (and must) still apply, or a failed first write would orphan the
-        // mirror for the whole session.
+        // Deltas wait behind this very promise (see recordInsightTerms),
+        // so in the normal course no delta has applied yet and the
+        // snapshot lands first; the guard stays as defense for any future
+        // path that applies a delta outside that chain — once one has
+        // LANDED, the mirror is newer than this snapshot and applying it
+        // would overwrite the delta's records with a pre-write view.
         if (termMirrorLandedRef.current) return;
 
         setTermRecords(log.records);
@@ -712,6 +716,8 @@ export default function App() {
           `Insights could not open the local term aggregates: ${messageFrom(caught)}`,
         ),
       );
+
+    termLoadOnceRef.current = termLoaded;
   }, [addInsightNotice]);
 
   /**
@@ -754,20 +760,22 @@ export default function App() {
     (what: "record" | "delete" | "reset", action: () => Promise<InsightTermWrite>): Promise<void> =>
       action()
         .then((write) => {
-          // A "none" write touched nothing (no term kind is granted), so
-          // it must not arm the mirror guard — a none-write landing before
-          // the mount-time load would otherwise discard that snapshot and
-          // leave the mirror empty for the whole session.
-          if (write.kind !== "none") termMirrorLandedRef.current = true;
-
-          // Serialized on the mirror chain: the delta applies only after
-          // every earlier write's delta has applied, so the mirror cannot
-          // diverge from the recorder's store order when two writes'
-          // surrounding waits settle out of order. The catch keeps the
-          // chain alive and notices instead of letting one bad delta
-          // strand every later one.
+          // Serialized on the mirror chain, behind the mount-time load:
+          // each delta applies only after every earlier delta AND after the
+          // initial snapshot has applied (or failed), so a first write
+          // beating a slow cold-start load can neither be overwritten by
+          // that snapshot nor strand the mirror with a delta-only view of
+          // the store. A "none" write touched nothing — the recorder's
+          // contract (see InsightTermWrite): no kind granted, nothing
+          // written — so it arms no guard and applies no delta.
           termMirrorChainRef.current = termMirrorChainRef.current
+            .then(() => termLoadOnceRef.current ?? Promise.resolve())
             .then(() => {
+              // Arming tracks the delta actually landing, not the write
+              // merely resolving: the guard may close only once the
+              // snapshot is no longer the freshest full view.
+              if (write.kind !== "none") termMirrorLandedRef.current = true;
+
               setTermRecords((current) => applyTermWrite(current, write));
             })
             .catch((caught) => {
@@ -775,12 +783,52 @@ export default function App() {
                 `Insights could not apply a term-aggregate update: ${messageFrom(caught)}`,
               );
             });
+
+          if (write.kind === "purge" && write.skippedInvalid > 0) {
+            // Quarantined records the withdrawal could not rewrite: their
+            // retained data may survive the consent change, and the weaker
+            // guarantee is stated instead of silently reported complete.
+            addInsightNotice(
+              `Insights skipped ${write.skippedInvalid} damaged term record${
+                write.skippedInvalid === 1 ? "" : "s"
+              } while withdrawing — their data may survive; Reset Insights clears everything.`,
+            );
+          }
         })
         .catch((caught) => {
           addInsightNotice(
             `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
           );
         }),
+    [addInsightNotice],
+  );
+
+  /**
+   * Surface a notice when a fire-and-forget chain does not settle within
+   * the anchor bound: a wedged store transaction hangs silently (neither
+   * the success nor the failure path fires), and the user would otherwise
+   * see a partial deletion with nothing explaining it. The chain itself
+   * keeps running — only its visibility is bounded.
+   */
+  const noticeWhenChainHangs = useCallback(
+    (what: string, wait: Promise<unknown>) => {
+      let settled = false;
+
+      const timer = window.setTimeout(() => {
+        if (!settled) {
+          addInsightNotice(
+            `Insights has not confirmed ${what} within ${
+              ANCHOR_LOAD_TIMEOUT_MS / 1000
+            }s — a local store may be wedged; the action may still land.`,
+          );
+        }
+      }, ANCHOR_LOAD_TIMEOUT_MS);
+
+      void Promise.resolve(wait).finally(() => {
+        settled = true;
+        window.clearTimeout(timer);
+      });
+    },
     [addInsightNotice],
   );
 
@@ -2073,11 +2121,15 @@ export default function App() {
     // so visibility does not need the wait, and the UI's refresh must not
     // be gated on stores that could hang (a wedged transaction) — the
     // history list reflects the deletion the moment the session store
-    // confirms it, whatever the insight stores are doing.
-    void Promise.all([
+    // confirms it, whatever the insight stores are doing. A HUNG store
+    // settles neither path, so the bound below keeps the wedge visible
+    // instead of a silent partial deletion.
+    const tombstones = Promise.all([
       recordInsight(() => insights.captureDeleted(id)),
       recordInsightTerms("delete", () => insightTerms.captureDeleted(id)),
     ]);
+
+    noticeWhenChainHangs("the deletion of this take's insight data", tombstones);
 
     try {
       await refresh();
@@ -2096,14 +2148,17 @@ export default function App() {
    * other.
    */
   const resetInsights = useCallback(() => {
-    void insights
+    const eventReset = insights
       .reset()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
         addInsightNotice(`Insights could not reset the event log: ${messageFrom(caught)}`),
       );
-    void recordInsightTerms("reset", () => insightTerms.reset());
-  }, [recordInsightTerms, addInsightNotice]);
+
+    const termReset = recordInsightTerms("reset", () => insightTerms.reset());
+
+    noticeWhenChainHangs("the Insights reset", Promise.all([eventReset, termReset]));
+  }, [recordInsightTerms, addInsightNotice, noticeWhenChainHangs]);
 
   /**
    * Apply one whole consent change (E29 phase 2). Persistence lands first,

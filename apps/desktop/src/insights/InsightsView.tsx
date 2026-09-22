@@ -189,7 +189,10 @@ export function InsightsView({
   if (consent.weeklyGoalWords !== goalSyncedTo) {
     setGoalSyncedTo(consent.weeklyGoalWords);
 
-    if (!goalFocused) {
+    // A focused draft survives any external change EXCEPT a reset to
+    // no-goal: blurring a stale draft afterwards would silently resurrect
+    // the goal the user just cleared, so the reset clears the field too.
+    if (!goalFocused || consent.weeklyGoalWords === null) {
       setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
       setGoalIssue(undefined);
     }
@@ -306,11 +309,12 @@ export function InsightsView({
 
   /**
    * Both exports name their file from one clock — the local reporting day
-   * the card content and calendar use — so a save around local midnight is
-   * never dated the day the card itself says it is not.
+   * the card content and calendar use — and the share card passes its own
+   * frozen range-end day, so a card saved after local midnight is never
+   * dated the day the card itself says it is not.
    */
-  function exportFilename(kind: string, extension: string): string {
-    return `starling-${kind}-${localDayKey(Date.now(), timezone)}.${extension}`;
+  function exportFilename(kind: string, extension: string, dayKey: string): string {
+    return `starling-${kind}-${dayKey}.${extension}`;
   }
 
   function exportAggregate() {
@@ -318,7 +322,7 @@ export function InsightsView({
 
     downloadText(
       JSON.stringify(usage.value, null, 2),
-      exportFilename("insights", "json"),
+      exportFilename("insights", "json", localDayKey(Date.now(), timezone)),
       "application/json",
     );
   }
@@ -384,7 +388,11 @@ export function InsightsView({
   function saveShareCard() {
     if (shareCard === undefined) return;
 
-    downloadText(renderShareCard(shareCard), exportFilename("share-card", "txt"), "text/plain");
+    downloadText(
+      renderShareCard(shareCard),
+      exportFilename("share-card", "txt", shareCard.rangeEndDay),
+      "text/plain",
+    );
   }
 
   function resetInsights() {
@@ -624,6 +632,12 @@ export function InsightsView({
                   value={baselineDraft}
                   onChange={(event) => changeBaseline(event.target.value)}
                   onBlur={commitBaselineDraft}
+                  onKeyDown={(event) => {
+                    // Enter commits like the goal input: the draft would
+                    // otherwise wait for a blur the keyboard flow never
+                    // issues, and an unblurred draft never persists.
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
                   placeholder="not set"
                   aria-describedby="proxy-assumptions"
                 />

@@ -20,10 +20,12 @@ export interface BaselineStorage {
 const TYPING_BASELINE_KEY = "starling:insights:typingWpm";
 
 /**
- * The longest draft the boundary admits. A real WPM is at most a few digits;
- * the bound exists so a pasted novel cannot occupy the settings entry.
+ * The longest admissible draft: an optional minus plus nine digits — the
+ * pattern's own bound, exported so the stated contract matches exactly
+ * what is enforced. A real WPM is at most a few digits; the bound exists
+ * so a pasted novel cannot occupy the settings entry.
  */
-export const MAX_BASELINE_DRAFT_LENGTH = 16;
+export const MAX_BASELINE_DRAFT_LENGTH = 10;
 
 /**
  * A stored draft is admissible only when it could be part of a whole-number

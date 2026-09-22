@@ -251,6 +251,12 @@ export class InsightRecorder {
    * session of deletions).
    */
   private readonly finalizedAt = new Map<string, string>();
+  /**
+   * Capture ids with a capture_deleted tombstone, maintained alongside the
+   * anchor index so tombstone checks are O(1) on the append path (and load
+   * stays linear, not a per-event scan of the whole mirror).
+   */
+  private readonly tombstonedCaptures = new Set<string>();
   private writeChain: Promise<void> = Promise.resolve();
   private loadPromise: Promise<void> | undefined;
 
@@ -398,9 +404,7 @@ export class InsightRecorder {
    * stale replays of the capture's events can never resurrect its totals.
    */
   async captureDeleted(captureId: string): Promise<void> {
-    const existing = this.tombstoneFor(captureId);
-
-    if (existing !== undefined) return;
+    if (this.tombstonedCaptures.has(captureId)) return;
 
     const event: InsightEvent = {
       schema_version: 1,
@@ -419,6 +423,7 @@ export class InsightRecorder {
       await this.store.clear();
       this.eventsById.clear();
       this.finalizedAt.clear();
+      this.tombstonedCaptures.clear();
     });
   }
 
@@ -438,12 +443,6 @@ export class InsightRecorder {
    */
   captureFinalizedAt(captureId: string): string | undefined {
     return this.finalizedAt.get(captureId);
-  }
-
-  private tombstoneFor(captureId: string): InsightEvent | undefined {
-    return this.snapshot().find(
-      (event) => event.type === "capture_deleted" && event.capture_id === captureId,
-    );
   }
 
   private nextSequence(
@@ -493,17 +492,18 @@ export class InsightRecorder {
     });
   }
 
-  /** Maintain the anchor index as one event enters the mirror. */
+  /** Maintain the anchor and tombstone indexes as one event enters the mirror. */
   private applyFinalizedAt(event: InsightEvent): void {
     if (isCaptureFinalized(event)) {
       // A finalize landing after its tombstone (an in-flight crossing: the
       // delete confirmed while the finalize emit was still queued) must not
       // re-establish the anchor — the tombstone dominates here exactly as
       // it does in every other read of this contract.
-      if (this.tombstoneFor(event.capture_id) !== undefined) return;
+      if (this.tombstonedCaptures.has(event.capture_id)) return;
 
       this.finalizedAt.set(event.capture_id, event.occurred_at);
     } else if (isCaptureDeleted(event)) {
+      this.tombstonedCaptures.add(event.capture_id);
       this.finalizedAt.delete(event.capture_id);
     }
   }
