@@ -239,7 +239,7 @@ export function weeklyGoalProgress(
     goalWordsPerWeek: options.goalWordsPerWeek,
     thisWeekWords: words,
     achieved: words >= options.goalWordsPerWeek,
-    description: `${words} of ${options.goalWordsPerWeek} words recognized from speech in the last 7 days`,
+    description: `${words.toLocaleString()} of ${options.goalWordsPerWeek.toLocaleString()} words recognized from speech in the last 7 days`,
   };
 }
 

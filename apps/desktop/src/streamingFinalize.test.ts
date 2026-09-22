@@ -469,6 +469,42 @@ describe("finishStreamingTake", () => {
     expect(store.deleted).toEqual([]);
   });
 
+  it("delivers the settled session to onDurableSave so the post-Stop wait can be armed", async () => {
+    // QA round 2 (streamed takes): the wrapper handed to the stream dropped
+    // the session argument, so releaseCapture never armed the Stop-wait
+    // clock and every streamed take recorded post_stop_ready_ms: null —
+    // permanently suppressing the typing-time comparison card. The session
+    // the journal became must arrive with the release. `armed` is also a
+    // compile-time pin: if the onDurableSave type regresses to `() => void`,
+    // its first parameter stops naming a DictationSession and this line no
+    // longer compiles.
+    const armed: Parameters<NonNullable<StreamingFinalizeDeps["onDurableSave"]>>[0] =
+      session("streamed-take");
+
+    const stream = new FakeStream();
+    const store = new FakeStore();
+    stream.journaled = 1;
+    stream.finishResult = Object.freeze({
+      wav,
+      durationMs: 500,
+      session: session("streamed-take"),
+      streamed: true,
+      transcript,
+    });
+
+    const released: (DictationSession | undefined)[] = [];
+
+    await finishStreamingTake(
+      {
+        ...handlersFor(stream, store, () => true),
+        onDurableSave: (settled) => released.push(settled),
+      },
+      store,
+    );
+
+    expect(released).toEqual([armed]);
+  });
+
   it("releases the capture lifecycle at the durable save, before the transcription runs (B03)", async () => {
     // The B03 acceptance shape: a deliberately delayed transcription
     // response. The release fires once the journal is durably owned by its
@@ -573,7 +609,7 @@ describe("finishStreamingTake", () => {
     const finalizeOne = finishStreamingTake(
       {
         ...handlersFor(streamOne, store, () => true),
-        onDurableSave: () => released.push("take-one"),
+        onDurableSave: (settled) => released.push(settled.id),
       },
       store,
     );
@@ -581,7 +617,7 @@ describe("finishStreamingTake", () => {
     const finalizeTwo = finishStreamingTake(
       {
         ...handlersFor(streamTwo, store, () => true),
-        onDurableSave: () => released.push("take-two"),
+        onDurableSave: (settled) => released.push(settled.id),
       },
       store,
     );
