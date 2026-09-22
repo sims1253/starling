@@ -2413,6 +2413,84 @@ fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
     }
 }
 
+#[test]
+fn the_samples_row_carries_the_take_ids_and_content_hash_in_extra() {
+    // The row-keying contract on V2CaptureStore: the samples-fallback row
+    // is keyed by the staging journal's minted id, NOT take.capture_id —
+    // the take's own ids (and its FNV content hash, the forensic bridge
+    // to journal evidence the store could not adopt) ride in extra_json
+    // so a consumer can still bridge row ↔ take.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..60).map(|i| (i % 13) as f32 * 0.02).collect();
+
+    let record = take_record("take_ids", &samples, None);
+    let capture_id = record.capture_id.clone();
+    let content_hash = record.journal_hash();
+    store.commit_take(&record).expect("commit");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 1, "{rows:?}");
+    let starling_dictation::store_v2::ListedCapture::Capture(listing) = &rows.records[0] else {
+        panic!("expected a readable capture, got {:?}", rows.records[0]);
+    };
+    assert_ne!(
+        listing.record.id, capture_id,
+        "the row is keyed by the staged id, not the take's capture id"
+    );
+    let extra: serde_json::Value =
+        serde_json::from_str(listing.record.extra_json.as_deref().unwrap_or_default())
+            .expect("extra json parses");
+    assert_eq!(extra["captureId"].as_str(), Some(capture_id.as_str()));
+    assert_eq!(extra["takeCorr"].as_str(), Some("take_ids"));
+    assert_eq!(
+        extra["journalHash"].as_str(),
+        Some(content_hash.as_str()),
+        "the take's content hash survives in extra_json"
+    );
+}
+
+#[test]
+fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
+    // The samples path's rollback covers its LAST failure arm too: when
+    // commit_marked fails before the promoting rename (here: the audio
+    // tree refuses the move), the take's whole sealed journal is still in
+    // staging, and reconcile would salvage it as an interrupted duplicate
+    // of whatever a retry stores — the exact shape discard_staging exists
+    // to prevent (its doc names this caller). No row and no audio land.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..90).map(|i| (i % 19) as f32 * 0.01).collect();
+
+    // Deny the staging→audio rename (read-only audio directory) while
+    // staging stays writable, so the rollback after the failed commit
+    // can genuinely succeed.
+    let audio = dir.path().join("audio");
+    let perms = std::fs::metadata(&audio).expect("audio dir").permissions();
+    let mut denied = perms.clone();
+    denied.set_readonly(true);
+    std::fs::set_permissions(&audio, denied).expect("deny audio writes");
+
+    let result = store.commit_take(&take_record("take_commitfail", &samples, None));
+
+    std::fs::set_permissions(&audio, perms).expect("restore audio writes");
+    let err = result.expect_err("the commit must fail while audio is unwritable");
+    assert!(!err.is_empty());
+
+    let staging: Vec<_> = std::fs::read_dir(dir.path().join("staging"))
+        .expect("staging dir")
+        .flatten()
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "the sealed staging journal was rolled back, not left for reconcile to salvage"
+    );
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 0, "no row landed: {rows:?}");
+}
+
 /// A store whose commits take a fixed while — a deterministic stand-in
 /// for the v1 store's encode window, for the interleavings only the
 /// off-actor persist makes reachable. `failing` names takes whose

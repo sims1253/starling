@@ -381,29 +381,36 @@ pub(crate) fn read_journal(path: &Path) -> Result<ParsedJournal, JournalReadErro
     parse_journal_from(&mut reader, file_len)
 }
 
-/// What one bounded read learned: the bytes were filled, the stream ended
-/// before they were (`Ok(false)` — torn tail), or the read genuinely
-/// failed (`Err` — propagated, never collapsed into end-of-stream).
-type Filled = bool;
+/// What one bounded read learned: the buffer was filled, the stream
+/// ended before it was (`Eof` — torn tail), or the read genuinely failed
+/// (`Err` — propagated, never collapsed into end-of-stream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filled {
+    /// The buffer was filled completely.
+    Yes,
+    /// The stream ended before the buffer was full — the caller treats
+    /// whatever it was building as torn.
+    Eof,
+}
 
 /// Read exactly `buf.len()` bytes from `reader`.
 ///
-/// `Ok(true)` — filled. `Ok(false)` — the stream ended first (only
-/// `Ok(0)` counts as end-of-stream); the caller treats whatever it was
-/// building as torn. `Err` — a non-`Interrupted` I/O error, retried on
-/// `Interrupted` and propagated otherwise so real failures surface as
-/// [`JournalReadError::Io`] like the old whole-file read.
+/// [`Filled::Yes`] — filled. [`Filled::Eof`] — the stream ended first
+/// (only `Ok(0)` counts as end-of-stream). `Err` — a non-`Interrupted`
+/// I/O error, retried on `Interrupted` and propagated otherwise so real
+/// failures surface as [`JournalReadError::Io`] like the old whole-file
+/// read.
 fn read_exact(reader: &mut impl std::io::Read, buf: &mut [u8]) -> io::Result<Filled> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
-            Ok(0) => return Ok(false),
+            Ok(0) => return Ok(Filled::Eof),
             Ok(n) => filled += n,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
     }
-    Ok(true)
+    Ok(Filled::Yes)
 }
 
 /// The streaming parser over any reader, pinned to `file_len` (the
@@ -420,7 +427,7 @@ fn parse_journal_from(
         ));
     }
     let mut header = [0u8; HEADER_LEN];
-    if !read_exact(reader, &mut header)? {
+    if read_exact(reader, &mut header)? == Filled::Eof {
         return Err(JournalReadError::NotAJournal(
             "journal ended inside the v1 header".to_string(),
         ));
@@ -452,13 +459,13 @@ fn parse_journal_from(
     'parse: while pos < file_len {
         let remaining = file_len - pos;
         let mut tag = [0u8; 1];
-        if !read_exact(reader, &mut tag)? {
+        if read_exact(reader, &mut tag)? == Filled::Eof {
             break 'parse; // stream ended early: torn
         }
         match tag[0] {
             TAG_FRAME => {
                 let mut count_buf = [0u8; 4];
-                if !read_exact(reader, &mut count_buf)? {
+                if read_exact(reader, &mut count_buf)? == Filled::Eof {
                     break 'parse;
                 }
                 let count = u32::from_le_bytes(count_buf) as usize;
@@ -471,22 +478,28 @@ fn parse_journal_from(
                 samples.reserve(count);
                 // A frame record is atomic for verification purposes: if
                 // the stream ends inside its payload, the bytes already
-                // streamed in were hashed and pushed but belong to no
-                // verification point — roll the sample vector back to the
-                // frame's start so `samples` only ever holds
-                // boundary-verified audio (the whole-file parser's guard
-                // guaranteed the same by never entering a short record).
+                // streamed in were pushed but belong to no verification
+                // point — roll the sample vector back to the frame's
+                // start so `samples` only ever holds boundary-verified
+                // audio (the whole-file parser's guard guaranteed the
+                // same by never entering a short record). The running
+                // hash is never polluted in the first place: payload
+                // chunks fold into a frame-local hash that is committed
+                // to the running one only when the frame completed, so
+                // no future change that continues past a torn frame can
+                // verify against half a frame's bytes.
                 let frame_start_len = samples.len();
+                let mut frame_hash = hash;
                 let mut complete = true;
                 let mut left = payload_len;
                 while left > 0 {
                     let take = left.min(io_buf.len());
                     let (chunk, _) = io_buf.split_at_mut(take);
-                    if !read_exact(reader, chunk)? {
+                    if read_exact(reader, chunk)? == Filled::Eof {
                         complete = false;
                         break;
                     }
-                    hash = fnv1a(hash, chunk);
+                    frame_hash = fnv1a(frame_hash, chunk);
                     for bytes in chunk.chunks_exact(4) {
                         let bits = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                         samples.push(f32::from_bits(bits));
@@ -497,6 +510,7 @@ fn parse_journal_from(
                     samples.truncate(frame_start_len);
                     break 'parse;
                 }
+                hash = frame_hash;
                 pos += 5 + payload_len as u64;
             }
             TAG_BOUNDARY | TAG_TRAILER => {
@@ -504,7 +518,7 @@ fn parse_journal_from(
                     break 'parse;
                 }
                 let mut record = [0u8; 16];
-                if !read_exact(reader, &mut record)? {
+                if read_exact(reader, &mut record)? == Filled::Eof {
                     break 'parse;
                 }
                 let count = u64::from_le_bytes(

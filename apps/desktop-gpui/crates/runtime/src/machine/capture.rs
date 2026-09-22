@@ -322,27 +322,68 @@ impl CaptureStore for InMemoryCaptureStore {
 /// protocol the app's WAV path uses (staging journal → finalize → promote
 /// → commit), so a journal-level problem can never cost the audio.
 ///
+/// **Row keying contract (the samples path).** The samples-fallback row
+/// is keyed by the staging journal's minted id (`c_<uuid>`), NOT by
+/// `take.capture_id` — deliberately, not as an oversight. The capture id
+/// equals the journal's id on the journaled paths, and the one shape that
+/// reaches the samples path *with* journal evidence is an adoption that
+/// failed leaving nothing behind; on the occupied-id shape (a row
+/// already holds that id) keying the fallback row by the same id would
+/// collide with the existing row and lose the audio. So the take's real
+/// id rides in `extra_json["captureId"]` (beside `takeCorr`) for any
+/// consumer that needs to find the row from the machine's ids, and a
+/// re-commit of the same take stores a second row instead of colliding
+/// idempotently the way the adoption path does — preventing retries is
+/// the capture actor's job (each take is handed to exactly one persist
+/// worker, issue #249).
+///
 /// An adoption that fails *after* its durable effects is never silently
 /// re-stored from samples: if the row landed anyway (a retry against an
-/// already-adopted take, or a destination that already holds the capture)
-/// the commit is satisfied by that row — no duplicate. Only a failure
-/// that left nothing behind falls back to the samples path, and the
-/// reason rides along: recorded in the stored row's `extra_json`
+/// already-adopted take, or a destination that already holds the
+/// capture) the commit is satisfied by that row — no duplicate. Only a
+/// failure that left nothing behind falls back to the samples path, and
+/// the reason rides along: recorded in the stored row's `extra_json`
 /// (`journalAdoptionError`) and chained into the error should the samples
 /// write fail too. A failed post-adoption status flip is non-fatal for
 /// the same reason — the take is durably persisted; the caller must not
 /// read "not persisted" and retry into the adoption's row.
 ///
 /// The evidence the runtime layers on top — `takeCorr`, `captureId`,
-/// gaps, the sample / wall-clock split — rides in `extra_json` on the
-/// samples path (both ids, so a consumer can find the row by the
-/// `capture_id` the machine emits); on the adoption path the journal
-/// itself is the durable evidence and the row carries the store's own
-/// adoption semantics (plus the salvage note on the interrupted paths).
-/// Nothing reads those keys back today; the registry is the runtime's
-/// session-scoped source of take detail.
+/// `gaps`, the sample / wall-clock split — rides in `extra_json` on the
+/// samples path, plus `journalHash`: the take's own FNV-1a content hash,
+/// the forensic bridge to journal evidence the store could not adopt
+/// (the store owns the row's `journal_hash` column — it is the staged
+/// journal's sealed hash — so the take's hash rides in `extra_json`).
+/// On the adoption path the journal itself is the durable evidence and
+/// the row carries the store's own adoption semantics (plus the salvage
+/// note on the interrupted paths). Nothing reads those keys back today;
+/// the registry is the runtime's session-scoped source of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
+}
+
+/// Report a post-commit (or rollback) divergence that must not change
+/// the answer the caller gets: a durably committed take whose follow-up
+/// failed, or a staging rollback that leaked, is diagnosable state
+/// divergence — surfacing it as `Err` would invite a retry that
+/// collides with the committed row, or mask the write's own root cause.
+/// One channel for all of them — stderr, the same channel the capture
+/// actor's drain notices use — because this crate has no logging
+/// facade; the day the workspace adopts one, this is the single site to
+/// swap.
+fn report_divergence(message: String) {
+    eprintln!("v2 capture store: {message}");
+}
+
+/// The post-commit divergence for a committed row whose interrupted
+/// status flip failed — the row reads complete while the take was
+/// salvaged. Non-fatal on purpose (see [`report_divergence`]); the
+/// adoption carried the salvage note, so the row keeps its wording.
+fn report_status_flip_failure(id: &str, err: impl std::fmt::Display) {
+    report_divergence(format!(
+        "adopted take {id} committed; the interrupted status flip failed ({err}) — \
+         the row keeps the salvage note"
+    ));
 }
 
 impl V2CaptureStore {
@@ -381,26 +422,15 @@ impl V2CaptureStore {
                     // the interruption derives from how the take ended, not
                     // from the journal's finalized-ness. The note itself
                     // already rode along with the adoption; passing no note
-                    // keeps its combined wording intact. A failure here is
-                    // non-fatal: the take IS durably persisted, and a
-                    // "not persisted" answer would invite a retry that
-                    // collides with the adopted row.
+                    // keeps its combined wording intact. A flip failure is
+                    // non-fatal via [`report_status_flip_failure`].
                     if status == CaptureStatus::Interrupted {
-                        // Non-fatal on purpose: the take IS durably
-                        // persisted, and a "not persisted" answer would
-                        // invite a retry that collides with the adopted
-                        // row. The adoption carried the salvage note, so
-                        // the row keeps its wording either way.
                         if let Err(err) = store.update_capture_status(
                             &record.id,
                             CaptureStatus::Interrupted,
                             None,
                         ) {
-                            eprintln!(
-                                "v2 capture store: adopted take {} committed; the interrupted \
-                                 status flip failed ({err}) — the row keeps the salvage note",
-                                record.id
-                            );
+                            report_status_flip_failure(&record.id, err);
                         }
                     }
                     return Ok(());
@@ -426,12 +456,12 @@ impl V2CaptureStore {
                             .unwrap_or(false);
 
                             if !same_audio {
-                                eprintln!(
-                                    "v2 capture store: journal id {} is occupied by a \
-                                     different capture (stored journal hash {} does not \
-                                     match this journal) — storing this take from samples",
+                                report_divergence(format!(
+                                    "journal id {} is occupied by a different capture (stored \
+                                     journal hash {} does not match this journal) — storing \
+                                     this take from samples",
                                     report.id, existing.journal_hash
-                                );
+                                ));
                                 adoption_error = Some(format!(
                                     "journal id {} already holds different audio \
                                      (journal hash mismatch)",
@@ -444,11 +474,7 @@ impl V2CaptureStore {
                                         CaptureStatus::Interrupted,
                                         None,
                                     ) {
-                                        eprintln!(
-                                            "v2 capture store: adopted take {} committed; the \
-                                             interrupted status flip failed ({flip_err})",
-                                            existing.id
-                                        );
+                                        report_status_flip_failure(&existing.id, flip_err);
                                     }
                                 }
                                 return Ok(());
@@ -480,6 +506,10 @@ impl V2CaptureStore {
             "acknowledgedSamples": take.acknowledged_samples,
             "journalFinalized": take.journal.as_ref().map(|r| r.finalized),
             "journalFault": take.journal.as_ref().and_then(|r| r.fault.clone()),
+            // The take's own content hash — the forensic bridge to journal
+            // evidence even when the journal could not be adopted (the
+            // row's journal_hash column is the staged journal's hash).
+            "journalHash": take.journal_hash(),
             "wallClockMs": take.wall_clock_ms,
         });
         if let Some(reason) = &adoption_error {
@@ -498,22 +528,40 @@ impl V2CaptureStore {
                 .map_err(|err| chain_adoption_failure(&adoption_error, err.to_string()))?
         };
         let staged_id = v2_take.id().to_string();
+        // The staging journal of a write that failed is not evidence to
+        // salvage — it is a partial (or, past finalize, complete) duplicate
+        // of whatever a retry stores instead — so every failure arm below
+        // rolls it back explicitly. The write's own error is always the one
+        // returned (the root cause); a rollback that fails too is reported
+        // beside it — never swallowed, never allowed to replace the root
+        // cause.
         if let Err(err) = v2_take.append_and_seal(&take.samples) {
-            // The staging journal of a write that failed is not evidence
-            // to salvage — it is a partial duplicate of whatever gets
-            // stored instead. Roll it back explicitly.
-            self.store
+            if let Err(discard_err) = self
+                .store
                 .lock()
                 .expect("v2 store lock")
                 .discard_staging(&staged_id)
-                .map_err(|err| err.to_string())?;
+            {
+                report_divergence(format!(
+                    "staging journal {staged_id} leaked after the append failure ({discard_err})"
+                ));
+            }
             return Err(chain_adoption_failure(&adoption_error, err.to_string()));
         }
         let finalized = match v2_take.finalize() {
             Ok(finalized) => finalized,
             Err(err) => {
-                let store = self.store.lock().expect("v2 store lock");
-                let _ = store.discard_staging(&staged_id);
+                if let Err(discard_err) = self
+                    .store
+                    .lock()
+                    .expect("v2 store lock")
+                    .discard_staging(&staged_id)
+                {
+                    report_divergence(format!(
+                        "staging journal {staged_id} leaked after the finalize failure \
+                         ({discard_err})"
+                    ));
+                }
                 return Err(chain_adoption_failure(&adoption_error, err.to_string()));
             }
         };
@@ -528,9 +576,20 @@ impl V2CaptureStore {
             (CaptureStatus::Complete, _) => CommitMark::Complete,
         };
         let mut store = self.store.lock().expect("v2 store lock");
-        finalized
-            .commit_marked(&mut store, mark)
-            .map_err(|err| chain_adoption_failure(&adoption_error, err.to_string()))?;
+        if let Err(err) = finalized.commit_marked(&mut store, mark) {
+            let err = chain_adoption_failure(&adoption_error, err.to_string());
+            // The commit_marked doc names this caller: a failure before
+            // the promoting rename leaves the take's whole sealed audio in
+            // staging, which reconcile would salvage as an interrupted
+            // duplicate. Best-effort discard under the same lock, then
+            // the commit's error is the answer.
+            if let Err(discard_err) = store.discard_staging(&staged_id) {
+                report_divergence(format!(
+                    "staging journal {staged_id} leaked after the commit failure ({discard_err})"
+                ));
+            }
+            return Err(err);
+        }
         Ok(())
     }
 }
