@@ -3462,7 +3462,9 @@ fn boot_matches(recorded: &str) -> Option<bool> {
     }
 }
 
-/// Unix epoch milliseconds.
+/// Unix epoch milliseconds; never 0 (0 is the "no heartbeat parsed"
+/// sentinel — a pre-epoch or exactly-epoch clock saturates to 1, see
+/// [`epoch_ms`]).
 fn now_epoch_ms() -> u64 {
     epoch_ms(std::time::SystemTime::now())
 }

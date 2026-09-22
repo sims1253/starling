@@ -2492,6 +2492,7 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     // injection bites instead of asserting a rollback that never ran.
     let probe = audio.join(".write_probe");
     if std::fs::write(&probe, b"x").is_ok() {
+        // Best-effort cleanup; the tempdir removes any leftover anyway.
         let _ = std::fs::remove_file(&probe);
         eprintln!(
             "skipping: this process ignores directory write bits; the \

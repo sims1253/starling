@@ -374,6 +374,12 @@ pub struct V2CaptureStore {
 /// actor's drain notices use — because this crate has no logging
 /// facade; the day the workspace adopts one, this is the single site to
 /// swap.
+///
+/// **Operational dependency:** for the arms that have no row to write
+/// a durable `recovery` note to (the promoted-orphan and unknown-outcome
+/// shapes), this stderr line is the only immediate trace — deployers
+/// must capture stderr (or adopt a durable side-channel as follow-up
+/// work) or those states surface only at the next startup reconcile.
 fn report_divergence(message: String) {
     eprintln!("v2 capture store: {message}");
 }
@@ -625,9 +631,6 @@ impl V2CaptureStore {
                         "commit_marked errored after the row landed ({err}); \
                          the take is durably persisted"
                     );
-                    report_divergence(format!(
-                        "the row for {staged_id} landed, but {note}"
-                    ));
                     if let Err(note_err) = store.update_capture_status(
                         &staged_id,
                         record.status,
@@ -635,7 +638,11 @@ impl V2CaptureStore {
                     ) {
                         report_divergence(format!(
                             "recording the post-commit divergence on {staged_id} failed \
-                             ({note_err}) — the row keeps its committed contents"
+                             ({note_err}) — the row keeps its committed contents; {note}"
+                        ));
+                    } else {
+                        report_divergence(format!(
+                            "{staged_id}: recovery note recorded on the row"
                         ));
                     }
                     return Ok(());
@@ -651,24 +658,29 @@ impl V2CaptureStore {
                 Ok(None) => {}
             }
             let err = chain_adoption_failure(&adoption_error, err.to_string());
+            drop(store); // what follows is filesystem work — off the lock
             // Metadata-only probe (one stat; load_audio would read and
-            // verify the whole journal under the lock): which side of the
-            // promoting rename did the failure leave the bytes on? A
-            // probe that itself errors is reported — never silently
-            // read as "not promoted" — and falls through to the discard
-            // attempt, the safer default (removing a not-yet-promoted
-            // partial is correct; the discard no-ops if it was wrong).
-            let promoted = match store.audio_journal_exists(&staged_id) {
-                Ok(promoted) => promoted,
-                Err(probe_err) => {
-                    report_divergence(format!(
-                        "the promotion probe for {staged_id} failed ({probe_err}) — \
-                         attempting the staging rollback anyway"
-                    ));
-                    false
+            // verify the whole journal): which side of the promoting
+            // rename did the failure leave the bytes on? A probe that
+            // itself errors is reported — never silently read as "not
+            // promoted" — and falls through to the discard attempt, the
+            // safer default (removing a not-yet-promoted partial is
+            // correct; the discard no-ops if it was wrong). Like the
+            // begin-take step above, the probe takes the lock in its own
+            // short scope — the store's SQLite work is done.
+            let promoted = {
+                let store = self.store.lock().expect("v2 store lock");
+                match store.audio_journal_exists(&staged_id) {
+                    Ok(promoted) => promoted,
+                    Err(probe_err) => {
+                        report_divergence(format!(
+                            "the promotion probe for {staged_id} failed ({probe_err}) — \
+                             attempting the staging rollback anyway"
+                        ));
+                        false
+                    }
                 }
             };
-            drop(store); // the filesystem work below runs off the lock
             if promoted {
                 report_divergence(format!(
                     "commit failed after the audio for {staged_id} was promoted — the \
