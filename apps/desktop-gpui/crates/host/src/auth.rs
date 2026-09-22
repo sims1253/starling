@@ -17,10 +17,12 @@
 //!   connect can succeed. `GetNamedPipeClientProcessId` supplies the
 //!   peer pid for diagnostics. See `platform::windows`. The DACL
 //!   construction path is compile-verified by CI on a native Windows
-//!   runner (the `windows-check` job in desktop-gpui-rust.yml), so a
-//!   regression in the SDDL/security-descriptor code fails the build
-//!   rather than shipping silently; an in-band re-check of the peer's
-//!   user at accept time remains a recorded gap there.
+//!   runner (the `windows-check` job in desktop-gpui-rust.yml) **and**
+//!   verified against the kernel at bind time: `listen` reads the
+//!   created instance's DACL back and refuses to serve unless every
+//!   allow-ACE names a narrow principal (SYSTEM and the owner — never
+//!   Everyone/Anonymous/BUILTIN\Users), so a descriptor regression
+//!   fails the bind instead of shipping silently.
 //!
 //! Fail-closed: on unix, a platform that cannot supply peer credentials
 //! (an unsupported `cfg`) yields `PeerCredentials::absent()`, and the

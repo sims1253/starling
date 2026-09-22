@@ -5622,8 +5622,6 @@ dependencies = [
  "starling-runtime",
  "tempfile",
  "thiserror 2.0.20",
- "time",
- "uuid",
  "windows-sys 0.59.0",
 ]
 

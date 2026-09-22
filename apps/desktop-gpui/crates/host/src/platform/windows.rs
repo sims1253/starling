@@ -19,8 +19,12 @@
 //! enforces the DACL on every `CreateFileW` against the pipe name, so a
 //! connection this server accepts has already been proven to run as the
 //! creating user — the same-user decision the unix side makes from
-//! `SO_PEERCRED`, made here at object-creation time instead. The client
-//! pid (`GetNamedPipeClientProcessId`) is captured for diagnostics.
+//! `SO_PEERCRED`, made here at object-creation time instead. As defense
+//! in depth, `listen` reads the created instance's DACL back from the
+//! kernel and refuses to serve unless it holds only allow-ACEs for
+//! narrow principals (`verify_pipe_dacl`): a construction regression
+//! fails the bind, not the first foreign connection. The client pid
+//! (`GetNamedPipeClientProcessId`) is captured for diagnostics.
 //!
 //! Server shape: a dedicated acceptor thread blocks in synchronous
 //! `ConnectNamedPipe` on the current pipe instance and hands connected
@@ -50,11 +54,12 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenUser, PSID, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetAce, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, PSID,
+    PSECURITY_DESCRIPTOR, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -217,6 +222,104 @@ fn owner_security_attributes() -> io::Result<SECURITY_ATTRIBUTES> {
     })
 }
 
+/// The allow-ACE type this DACL is built from (`ACCESS_ALLOWED_ACE_TYPE`
+/// is not exported by windows-sys 0.59).
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// Fail-closed self-check on the pipe's **actual** DACL, read back from
+/// the kernel at bind time. The SDDL string says one thing, but the
+/// entire admission guarantee on Windows rests on the descriptor the
+/// API actually attached — a regression in the construction path (a
+/// loosely-accepted malformed SDDL, a future edit) must fail the bind,
+/// not silently admit every local user to a host that owns the user's
+/// audio data. The check: the DACL exists, every ACE is an allow-ACE,
+/// and no allow-ACE grants a broad principal — Everyone (`S-1-1-0`),
+/// Anonymous (`S-1-5-7`), or BUILTIN\Users (`S-1-5-32-545`). The only
+/// acceptable grants are the ones the SDDL names: SYSTEM and the owner.
+fn verify_pipe_dacl(handle: HANDLE) -> io::Result<()> {
+    unsafe {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let result = GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        // GetSecurityInfo allocates the DACL it hands back.
+        let check = verify_dacl_aces(dacl);
+        LocalFree(dacl as _);
+        check
+    }
+}
+
+/// The ACE-walking half of [`verify_pipe_dacl`], split out so the
+/// LocalFree above runs on every path.
+fn verify_dacl_aces(dacl: *mut ACL) -> io::Result<()> {
+    // A NULL DACL means "everyone, full access" — the worst possible
+    // reading, refuse it outright.
+    if dacl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe carries no DACL; refusing to serve on it",
+        ));
+    }
+    unsafe {
+        let ace_count = (*dacl).AceCount;
+        for index in 0..ace_count {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if GetAce(dacl, index as u32, &mut ace) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: GetAce hands back a pointer into the ACL's ACE
+            // array; the header is the common prefix of every ACE shape.
+            let header = &*(ace as *const ACE_HEADER);
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "unexpected ACE type {} in the pipe DACL; refusing to serve",
+                        header.AceType
+                    ),
+                ));
+            }
+            // SAFETY: for an allow-ACE the shape is
+            // { header, mask, sid… } — SidStart is the SID's first
+            // dword, and the SID runs to the ACE's end.
+            let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+            let sid: PSID = std::ptr::from_ref(&allowed.SidStart) as PSID;
+            let mut sid_wstr: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut sid_wstr) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: ConvertSidToStringSidW's contract is an allocated,
+            // NUL-terminated wide string; the scan stops at that
+            // terminator and the LocalFree below releases it.
+            let text = wide_to_string(sid_wstr);
+            LocalFree(sid_wstr as _);
+            if matches!(
+                text.as_str(),
+                "S-1-1-0" | "S-1-5-7" | "S-1-5-32-545"
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "pipe DACL grants broad principal {text}; \
+                         refusing to serve on it"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
     let name = to_wide(&path.to_string_lossy());
     let security = owner_security_attributes()?;
@@ -238,6 +341,15 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         LocalFree(security.lpSecurityDescriptor as _);
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
+        }
+        // Defense in depth (fail closed): the admission guarantee rests
+        // on the DACL the kernel actually attached, so read it back and
+        // verify it grants no broad principal before serving anyone. A
+        // construction regression fails the bind here, not the first
+        // foreign connection.
+        if let Err(err) = verify_pipe_dacl(handle) {
+            CloseHandle(handle);
+            return Err(err);
         }
         // Hand the created-but-unconnected first instance to the acceptor
         // thread, which will block in ConnectNamedPipe on it. The handle
