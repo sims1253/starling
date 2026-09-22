@@ -198,11 +198,15 @@ describe("weeklyGoalProgress", () => {
       take("t2", "2026-09-10T10:00:00Z", 400), // outside the window
     ]);
 
-    const progress = weeklyGoalProgress(events, { goalWordsPerWeek: 500, now: NOW });
+    const progress = weeklyGoalProgress(events, { goalWordsPerWeek: 500_000, now: NOW });
 
     expect(progress.thisWeekWords).toBe(312);
     expect(progress.achieved).toBe(false);
-    expect(progress.description).toBe("312 of 500 words recognized from speech in the last 7 days");
+    // The goal target reads with locale grouping, like the milestone
+    // thresholds and the goal-bounds message on the same surface.
+    expect(progress.description).toBe(
+      `312 of ${(500_000).toLocaleString()} words recognized from speech in the last 7 days`,
+    );
   });
 
   it("marks a reached goal without any evaluative language", () => {

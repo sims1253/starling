@@ -39,10 +39,12 @@ export interface StreamingFinalizeDeps {
   /**
    * Invoked once the journal is durably owned by its session, before the
    * transcript work (B03): the caller ends the capture transition here, so a
-   * new take can start while transcription is still in flight. Never invoked
-   * for a discarded take or a failed durable save.
+   * new take can start while transcription is still in flight. Receives the
+   * session the journal became, so the caller can arm the post-Stop wait for
+   * the recognition's `post_stop_ready_ms` (E29). Never invoked for a
+   * discarded take or a failed durable save.
    */
-  readonly onDurableSave?: () => void;
+  readonly onDurableSave?: (session: DictationSession) => void;
   /**
    * Invoked after a streamed transcript settles durably on its session (E29
    * insight wiring), while the finalize still owns the take: receives the
@@ -86,8 +88,9 @@ async function dropProvisional(
  *
  * `deps.onDurableSave` fires the moment the journal is durably owned by its
  * session — before the commit, the transcript write, or any batch
- * transcription — so the caller can release the recording lifecycle while
- * inference is still in flight (B03).
+ * transcription — with that session, so the caller can release the recording
+ * lifecycle while inference is still in flight (B03) and arm the post-Stop
+ * wait the session's first recognition will measure (E29).
  */
 export async function finishStreamingTake(
   deps: StreamingFinalizeDeps,
@@ -114,7 +117,9 @@ export async function finishStreamingTake(
   const result = await stream.finish(
     durationMs,
     () => !isCurrentTake(),
-    () => deps.onDurableSave?.(),
+    // The stream hands back the session the journal became; it must reach
+    // the caller untouched or its post-Stop wait can never be measured.
+    (session) => deps.onDurableSave?.(session),
   );
 
   if (result.session === undefined) {

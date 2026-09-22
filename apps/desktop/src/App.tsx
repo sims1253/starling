@@ -1669,14 +1669,15 @@ export default function App() {
    *
    * `releaseCapture` is invoked the moment the journal is durably owned by
    * its session, before the transcript work: the stop transition ends there
-   * so the next take can start while transcription is in flight (B03).
+   * so the next take can start while transcription is in flight (B03), and
+   * the settled session rides along so its post-Stop wait is armed (E29).
    */
   const finishStreamingTake = useCallback(
     async (
       stream: StreamingDictation,
       durationMs: number,
       generation: number,
-      releaseCapture: () => void,
+      releaseCapture: (session?: DictationSession) => void,
     ): Promise<boolean> => {
       streamRef.current = undefined;
       const bailed = streamBailedRef.current;
@@ -1815,7 +1816,9 @@ export default function App() {
 
       // Ends the capture transition the moment this take's audio is durably
       // owned by its session (B03): the streamed journal's commit or the
-      // batch store.create. Transcription keeps running in the background,
+      // batch store.create. The streamed path arrives with its settled
+      // session, which arms the post-Stop wait for that session's first
+      // recognition (E29). Transcription keeps running in the background,
       // so a new take may start while it is in flight. Released at most
       // once: a stop that already handed off must never end a newer take's
       // transition from its finally.

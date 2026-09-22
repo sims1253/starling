@@ -246,6 +246,31 @@ describe("InsightRecorder", () => {
     expect(selected).toMatchObject({ tokenizer: TOKENIZER_ID, post_stop_ready_ms: null });
   });
 
+  it("records a measured post-Stop wait verbatim", async () => {
+    // The streamed-take shape (QA round 2): the Stop wait was armed when the
+    // journal's session settled, so the recognition carries the measured
+    // wait — a number the aggregate consumes, never the null that suppresses
+    // the typing-time comparison.
+    const { recorder: insights } = recorder();
+
+    await insights.captureFinalized({
+      captureId: "take-w",
+      sampleCount: 160_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+    await insights.recognitionSelected({
+      captureId: "take-w",
+      transcriptText: "one two three",
+      postStopReadyMs: 2400,
+    });
+
+    const selected = insights.snapshot().find((event) => event.type === "recognition_selected");
+
+    expect(selected).toMatchObject({ tokenizer: TOKENIZER_ID, post_stop_ready_ms: 2400 });
+    expect(aggregate(insights.snapshot(), 50).typing_time_comparison_seconds).not.toBeNull();
+  });
+
   it("replaces a retry's word count instead of adding it", async () => {
     const { recorder: insights } = recorder();
 
