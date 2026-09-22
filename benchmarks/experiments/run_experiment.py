@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 import wave
 from pathlib import Path
 
@@ -61,19 +62,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # tolerated_failures rides along because 24 fresh processes x 8 requests must
 # tolerate a single stray transport hiccup without the demo degrading to
 # "unavailable".
-DEMO_PROTOCOL = {
+# MappingProxyType seals the preregistered protocol: the demo spec is copied
+# via dict() at use sites (_demo_spec, the comparison record), so the sealed
+# originals cannot drift at runtime.
+DEMO_PROTOCOL = types.MappingProxyType({
     "repeats": 12,
     "requests_per_repeat": 6,
     "warmup_requests": 1,
     "order": "interleaved_random",
     "seed": 20260919,
     "timeout_s": 60,
-}
-DEMO_ACCEPTANCE = {
+})
+DEMO_ACCEPTANCE = types.MappingProxyType({
     "min_improvement_pct": 12.0,
     "max_ci_halfwidth_pct": 15.0,
     "max_regression_pct": 0.0,
-}
+})
 DEMO_TOLERATED_FAILURES = 2
 
 
