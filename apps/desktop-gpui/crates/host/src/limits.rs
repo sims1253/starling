@@ -82,9 +82,10 @@ impl SlidingWindow {
             None => {}
         }
         if self.arrivals.len() >= self.limit.max as usize {
-            // Still record the violation's arrival: the connection is
-            // closing anyway, and the count is diagnostic.
-            self.arrivals.push_back(now);
+            // Pure rejection: the connection closes immediately, so the
+            // violation is never recorded — nothing will ever read it,
+            // and pushing it would keep the window exhausted (and the
+            // deque growing) under a flood.
             return false;
         }
         self.arrivals.push_back(now);

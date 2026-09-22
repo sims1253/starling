@@ -66,17 +66,22 @@ impl HostConfig {
 
     /// The production host at `data_root`: storage v2 is THE capture
     /// persistence (D14 — no v1 seam, no second backend), the endpoint
-    /// directory is the per-user default, and the runtime dir is created
-    /// here so a missing `$XDG_RUNTIME_DIR` surfaces at launch, not at
-    /// first bind. The inference provider stays unconfigured until the
-    /// I5 adapter wiring lands — an honest default that fails jobs with
+    /// directory is `runtime_dir` when given (else the per-user default),
+    /// and only that final directory is created here — so a missing
+    /// `$XDG_RUNTIME_DIR` surfaces at launch, not at first bind, and an
+    /// overridden dir never leaves the default behind as stray residue.
+    /// The inference provider stays unconfigured until the I5 adapter
+    /// wiring lands — an honest default that fails jobs with
     /// `no_provider_configured` rather than inventing an endpoint.
     ///
     /// Errors when the root cannot open (the host is the designed lease
     /// acquirer; a root it cannot open is a host it must not be).
-    pub fn production(data_root: impl Into<PathBuf>) -> Result<HostConfig, String> {
+    pub fn production(
+        data_root: impl Into<PathBuf>,
+        runtime_dir: Option<PathBuf>,
+    ) -> Result<HostConfig, String> {
         let data_root: PathBuf = data_root.into();
-        let runtime_dir = platform::default_runtime_dir();
+        let runtime_dir = runtime_dir.unwrap_or_else(platform::default_runtime_dir);
         platform::ensure_runtime_dir(&runtime_dir).map_err(|err| {
             format!(
                 "cannot create the runtime endpoint directory {}: {err}",

@@ -16,8 +16,28 @@
 //! client-supplied envelope through untouched (own `seq`, own
 //! monotonicity exposure) — the envelope-level path the NACK contract
 //! tests use.
+//!
+//! # Draining contract (receipts never wait on events)
+//!
+//! The reader thread never parks delivering an event: when the event
+//! channel is full (the application stopped draining), events accumulate
+//! in a bounded local backlog while receipts and snapshots keep flowing —
+//! they have their own reply channels and never queue behind events.
+//! Past [`EVENT_BACKLOG_CAP`] undelivered events the connection is failed
+//! outright (the same slow-consumer posture the host applies: the client
+//! reconnects and resynchronizes from the snapshot, which is always the
+//! recovery story for a lost event tail).
+//!
+//! Delivery semantics worth stating for the Mode B switchover: a
+//! [`ClientError::Timeout`] on a send does **not** mean the command was
+//! not executed — receipts issue at acceptance, and a reply lost to a
+//! closed connection is indistinguishable from a slow one. A retry gets
+//! a fresh host-assigned `seq` (it passes the router's monotonicity
+//! check) and executes again: sends are at-least-once, and a caller that
+//! cannot tolerate a duplicate resolves it through the snapshot, the same
+//! way a reconnect does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,7 +45,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use starling_runtime::bus::{new_id, now_ts};
-use starling_runtime::channel::{bounded, Receiver, RecvError, Sender};
+use starling_runtime::channel::{bounded, Receiver, RecvError, Sender, TrySendError};
 use starling_runtime::machine::{Receipt, Rejection};
 use starling_runtime::protocol::Command;
 
@@ -36,6 +56,20 @@ use crate::platform::{self, TransportConn};
 /// *acceptance* (not outcome completion), so this is deliberately far
 /// above any healthy machine's answer time.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reader's read-poll slice: an idle connection wakes this often so
+/// the event backlog can flush the moment the application makes room
+/// (platforms whose transport cannot poll — see
+/// [`TransportConn::set_read_timeout`] — flush on the next inbound frame
+/// instead).
+const READ_POLL: Duration = Duration::from_millis(250);
+
+/// How many events accumulate locally while the application is not
+/// draining before the connection is failed. Mirrors the host's own
+/// outbound posture ([`crate::limits::DEFAULT_OUTBOUND_CAPACITY`]): by
+/// the time both sides' bounds are exhausted, the reconnect-and-snapshot
+/// resynchronization is the designed answer, not a degraded one.
+const EVENT_BACKLOG_CAP: usize = 1024;
 
 /// What the host told us at connect time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +159,10 @@ impl HostClient {
             path: path.to_path_buf(),
             source,
         })?;
+        // Arm the read poll so the reader thread's idle wakeups can flush
+        // the event backlog; where the platform cannot poll this is a
+        // no-op and the backlog flushes on the next inbound frame instead.
+        let _ = conn.set_read_timeout(Some(READ_POLL));
 
         let pending: Arc<Mutex<HashMap<String, Sender<Reply>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -141,17 +179,32 @@ impl HostClient {
                 let close_reason = Arc::clone(&close_reason);
                 move || client_reader(conn, pending, event_tx, hello_tx, closed, close_reason)
             })
-            .map_err(|err| ClientError::Protocol(format!("reader spawn: {err}")))?;
+            .map_err(|err| {
+                // No reader will close the connection: do it here so
+                // nothing leaks behind a failed handshake.
+                let _ = writer.shutdown_both();
+                ClientError::Protocol(format!("reader spawn: {err}"))
+            })?;
         reader.detach();
 
         let info = match hello_rx.recv_timeout(REPLY_TIMEOUT) {
             Ok(Ok(info)) => info,
             Ok(Err(detail)) => {
-                return Err(ClientError::Protocol(format!("handshake failed: {detail}")))
+                let _ = writer.shutdown_both();
+                return Err(ClientError::Protocol(format!("handshake failed: {detail}")));
             }
-            Err(RecvError::Timeout) => return Err(ClientError::Timeout),
+            Err(RecvError::Timeout) => {
+                // No HostClient object is constructed on this path, so its
+                // Drop (which ends both directions) never runs: shut the
+                // connection down explicitly so the detached reader's
+                // blocking read returns and its thread exits instead of
+                // leaking per failed connect attempt.
+                let _ = writer.shutdown_both();
+                return Err(ClientError::Timeout);
+            }
             Err(RecvError::Closed) => {
-                return Err(ClientError::Closed("no hello from the host".to_string()))
+                let _ = writer.shutdown_both();
+                return Err(ClientError::Closed("no hello from the host".to_string()));
             }
         };
 
@@ -258,12 +311,27 @@ impl HostClient {
             return Err(ClientError::Closed(self.close_reason()));
         }
         let (tx, rx) = bounded(1);
-        self.pending
-            .lock()
-            .expect("pending map")
-            .insert(id.clone(), tx);
+        {
+            let mut pending = self.pending.lock().expect("pending map");
+            // Ids must be unique among in-flight requests: a duplicate
+            // would overwrite the first caller's reply channel and turn
+            // its outcome into a full reply-timeout. Refuse the second
+            // caller instead (the check and the insert share one lock, so
+            // the guard is exact).
+            if pending.contains_key(&id) {
+                return Err(ClientError::Protocol(format!(
+                    "request id {id:?} is already in flight; ids must be \
+                     unique among concurrent requests"
+                )));
+            }
+            pending.insert(id.clone(), tx);
+        }
         let result = (|| {
-            let wire = encode(&frame, usize::MAX)
+            // Encode against the host's advertised cap so an oversized
+            // send is refused here, before any bytes hit the wire — a
+            // server-side refusal costs the whole connection.
+            let cap = usize::try_from(self.info.max_frame_bytes).unwrap_or(usize::MAX);
+            let wire = encode(&frame, cap)
                 .map_err(|err| ClientError::Protocol(format!("frame does not encode: {err:?}")))?;
             {
                 use std::io::Write;
@@ -336,7 +404,17 @@ fn client_reader(
     };
     let mut reader = FrameReader::new(conn, usize::MAX);
     let mut hello_done = false;
+    // Events the application has not made room for yet. Delivering from
+    // this backlog instead of parking on a full channel is what keeps
+    // receipts flowing while events back up: the reader stays free to
+    // pull the next frame off the socket, and receipts/snapshots answer
+    // through their own per-request channels.
+    let mut backlog: VecDeque<EventWire> = VecDeque::new();
     loop {
+        // An idle read-poll timeout is the flush tick: events must move
+        // the moment the application drains, not only when the host says
+        // something else.
+        flush_backlog(&events, &mut backlog);
         match reader.read_frame() {
             Ok(Frame::Hello {
                 protocol,
@@ -367,10 +445,22 @@ fn client_reader(
                 deliver(&pending, &req, Reply::Snapshot(snapshot));
             }
             Ok(Frame::Event { envelope }) => {
-                if events.send_blocking(EventWire(envelope)).is_err() {
-                    // The client stopped reading events; keep the command
-                    // channel alive (the host's slow-consumer close is
-                    // the backstop that ends this whole thread).
+                backlog.push_back(EventWire(envelope));
+                flush_backlog(&events, &mut backlog);
+                if backlog.len() > EVENT_BACKLOG_CAP {
+                    // The application is not draining at all. The
+                    // connection is failed on purpose — the same
+                    // slow-consumer posture the host applies to a client
+                    // that stopped reading — rather than letting the
+                    // backlog (and with it the reader's memory) grow
+                    // without bound. A reconnect resynchronizes from the
+                    // snapshot; nothing acknowledged is lost.
+                    fail(format!(
+                        "event stream undrained past the {}-event backlog cap; \
+                         reconnect and resynchronize from the snapshot",
+                        EVENT_BACKLOG_CAP
+                    ));
+                    break;
                 }
             }
             Ok(Frame::TransportError { code, detail }) => {
@@ -393,11 +483,15 @@ fn client_reader(
                 fail("connection closed by the host".to_string());
                 break;
             }
+            Err(FrameError::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Read-poll timeout: idle, not an error. The loop head
+                // flushed the backlog; keep waiting.
+                continue;
+            }
             Err(FrameError::Io(err)) => {
-                // Read-poll timeouts (WouldBlock/TimedOut) are idle, not
-                // errors — the connection is a blocking stream with no
-                // timeout on the client side, so an Io error here is a
-                // real one.
                 fail(format!("connection error: {err}"));
                 break;
             }
@@ -407,6 +501,24 @@ fn client_reader(
             }
             Err(FrameError::Malformed(detail)) => {
                 fail(format!("host sent a malformed frame: {detail}"));
+                break;
+            }
+        }
+    }
+}
+
+/// Moves backlog into the event channel while there is room; never
+/// parks. A dropped receiver clears the backlog (the client is gone).
+fn flush_backlog(events: &Sender<EventWire>, backlog: &mut VecDeque<EventWire>) {
+    while let Some(event) = backlog.pop_front() {
+        match events.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(event)) => {
+                backlog.push_front(event);
+                break;
+            }
+            Err(TrySendError::Closed(_)) => {
+                backlog.clear();
                 break;
             }
         }

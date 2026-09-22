@@ -40,7 +40,48 @@ OPTIONS:
     std::process::exit(2);
 }
 
+/// `--help` is not an error: print to stdout and exit 0, the convention
+/// launchers and scripts probing the interface rely on.
+fn help() -> ! {
+    println!(
+        "starling-runtime-host — the Starling runtime service host (E17 I4)
+
+USAGE:
+    starling-runtime-host [--root <dir>] [--runtime-dir <dir>]
+
+OPTIONS:
+    --root <dir>         storage v2 data root to own
+                         (default: the platform default root)
+    --runtime-dir <dir>  directory for the IPC endpoint
+                         (default: {})",
+        platform::default_runtime_dir().display()
+    );
+    std::process::exit(0);
+}
+
 fn main() {
+    // Signals first, before any fallible startup step: store open, lease
+    // acquisition (with stale-lease breaking) and the endpoint probe can
+    // all take a while, and a SIGTERM in that window must set the flag
+    // this loop reads rather than hit the default disposition (which
+    // would kill the process with the lease held and the endpoint
+    // half-prepared). The handler is one atomic store, so registering it
+    // this early is safe.
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: `on_signal` only stores to a static atomic; `signal`
+        // registers it. This is the standard no-dependency Ctrl-C path.
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: no console-ctrl handler wired yet (recorded gap);
+        // the process still exits on window-close / taskkill and the OS
+        // closes the pipe handles, so clients observe EOF, and the lease
+        // flock-equivalent (the DACL'd pipe name) disappears with it.
+    }
+
     let mut root: Option<std::path::PathBuf> = None;
     let mut runtime_dir: Option<std::path::PathBuf> = None;
     let mut args = std::env::args().skip(1);
@@ -48,7 +89,7 @@ fn main() {
         match flag.as_str() {
             "--root" => root = Some(value_of(&mut args, &flag)),
             "--runtime-dir" => runtime_dir = Some(value_of(&mut args, &flag)),
-            "--help" | "-h" => usage(),
+            "--help" | "-h" => help(),
             other => {
                 eprintln!("unknown argument {other:?}");
                 usage();
@@ -67,35 +108,33 @@ fn main() {
         },
     };
 
-    let mut config = match HostConfig::production(&root) {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("starling-runtime-host: {err}");
-            std::process::exit(1);
-        }
-    };
-    if let Some(dir) = runtime_dir {
-        config.runtime_dir = dir;
-    }
-
-    let mut host = match serve(config) {
-        Ok(host) => host,
-        Err(starling_runtime_host::HostError::OwnerLive {
-            owner_id,
-            owner_pid,
-            socket_path,
-        }) => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "already-running",
-                    "socket": socket_path,
-                    "owner": owner_id,
-                    "ownerPid": owner_pid,
-                })
-            );
-            std::process::exit(0);
-        }
+    // The runtime dir rides into `production` so only the *final*
+    // endpoint directory is created — applying an override afterwards
+    // would leave the default directory behind as stray residue.
+    let mut host = match HostConfig::production(&root, runtime_dir) {
+        Ok(config) => match serve(config) {
+            Ok(host) => host,
+            Err(starling_runtime_host::HostError::OwnerLive {
+                owner_id,
+                owner_pid,
+                socket_path,
+            }) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "already-running",
+                        "socket": socket_path,
+                        "owner": owner_id,
+                        "ownerPid": owner_pid,
+                    })
+                );
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("starling-runtime-host: {err}");
+                std::process::exit(1);
+            }
+        },
         Err(err) => {
             eprintln!("starling-runtime-host: {err}");
             std::process::exit(1);
@@ -111,21 +150,6 @@ fn main() {
             "pid": std::process::id(),
         })
     );
-
-    #[cfg(unix)]
-    unsafe {
-        // SAFETY: `on_signal` only stores to a static atomic; `signal`
-        // registers it. This is the standard no-dependency Ctrl-C path.
-        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: no console-ctrl handler wired yet (recorded gap);
-        // the process still exits on window-close / taskkill and the OS
-        // closes the pipe handles, so clients observe EOF, and the lease
-        // flock-equivalent (the DACL'd pipe name) disappears with it.
-    }
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));

@@ -10,7 +10,11 @@
 //!    a client — it must not serve (the binary then reports the owner's
 //!    endpoint and exits 0). A dead owner's lease breaks via the lease
 //!    machinery (flock released at process death, heartbeat TTL
-//!    otherwise).
+//!    otherwise). With the lease held, the host runs
+//!    `StoreV2::reconcile` in owner mode: it is the recovering owner the
+//!    client-mode deferral names, so a crashed predecessor's staging
+//!    journals and orphan sessions are salvaged at startup (the report is
+//!    logged and kept on the handle).
 //! 2. **Endpoint**: with the lease held, probe the endpoint. Live →
 //!    [`HostError::ForeignServer`] (a server answering without holding
 //!    the lease is a contradiction; refuse rather than fight). Dead →
@@ -30,13 +34,16 @@
 //! reconnects via snapshot + fresh events, while acknowledged audio sits
 //! in storage v2 untouched (renderer-kill acceptance).
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use starling_dictation::store_v2::{LeaseAcquisition, StoreV2};
+use starling_dictation::store_v2::{
+    LeaseAcquisition, ReconciliationReport, StoreV2, StoreV2Error, LEASE_HEARTBEAT_TTL,
+};
 use starling_runtime::bus::EventSub;
 use starling_runtime::channel::{bounded, Receiver, Sender, TrySendError};
 use starling_runtime::{Runtime, RuntimeClient};
@@ -49,6 +56,15 @@ use crate::platform::{self, Probe, TransportConn, TransportListener};
 
 /// How often the accept loop and event pump re-check the shutdown flag.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long shutdown waits for every connection thread to end itself
+/// before it kills the sockets outright. A well-behaved peer drains its
+/// bye near-instantly; a peer that stopped reading (a writer parked in
+/// `write_all` against a full kernel buffer) must not hold the whole
+/// host hostage — the runtime shutdown, the lease release, the endpoint
+/// removal and the `stopped` line all wait behind this bound, never
+/// behind a peer.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 
 /// Why a host could not start serving.
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +101,11 @@ pub enum HostError {
     },
     #[error("preparing the endpoint directory {0:?}: {1}")]
     RuntimeDir(PathBuf, String),
+    #[error("reconciling storage v2 at {root:?} after taking the lease failed: {source}")]
+    Reconcile {
+        root: PathBuf,
+        source: StoreV2Error,
+    },
 }
 
 /// The running host. [`HostHandle::shutdown`] stops everything in order
@@ -99,6 +120,7 @@ pub struct HostHandle {
     threads: Mutex<Vec<JoinHandle<()>>>,
     lease: Arc<Mutex<StoreV2>>,
     runtime: Option<Runtime>,
+    startup_reconciliation: ReconciliationReport,
     done: AtomicBool,
 }
 
@@ -111,8 +133,23 @@ impl HostHandle {
         &self.owner_id
     }
 
+    /// The §4 reconciliation this host ran when it became the owner (see
+    /// [`serve`]): what the previous owner's crash left behind and what
+    /// startup did about it. Surfaced for status reporting — an empty
+    /// report is the normal case.
+    pub fn startup_reconciliation(&self) -> &ReconciliationReport {
+        &self.startup_reconciliation
+    }
+
     /// Graceful shutdown: no client is served past its `bye`, machines
     /// join, the lease is released, the endpoint is removed. Idempotent.
+    ///
+    /// The connection drain is **bounded**: after [`SHUTDOWN_DRAIN`] the
+    /// host kills any connection whose writer has not ended itself (a
+    /// peer that stopped reading parks `write_all` against a full kernel
+    /// buffer; the socket shutdown unblocks it on unix). The host process
+    /// therefore always finishes shutdown — a wedged renderer costs its
+    /// own bye, never the lease release.
     pub fn shutdown(&mut self) {
         if self.done.swap(true, Ordering::SeqCst) {
             return;
@@ -121,24 +158,33 @@ impl HostHandle {
 
         // Say goodbye and close every live connection first: writers
         // drain their queues (Bye included) before the senders drop.
-        {
-            let conns = self.shared.conns.lock().expect("conn registry").clone();
-            for conn in conns {
-                let _ = conn.try_deliver(Frame::Bye {
-                    reason: "host shutdown".to_string(),
-                });
-                // Marked, not killed: each writer drains its queue (the
-                // bye included) and ends the stream itself.
-                conn.mark_closed();
-            }
+        let conns = lock_registry(&self.shared.conns).clone();
+        for conn in &conns {
+            let _ = conn.try_deliver(Frame::Bye {
+                reason: "host shutdown".to_string(),
+            });
+            // Marked, not killed: each writer drains its queue (the
+            // bye included) and ends the stream itself.
+            conn.mark_closed();
         }
-        let conn_threads = self
-            .shared
-            .conn_threads
-            .lock()
-            .expect("conn threads")
+
+        // Bounded drain: wait for every connection thread to end itself;
+        // once the deadline passes, force the stragglers' sockets closed
+        // (which unblocks a writer parked in write_all) and join. The
+        // join after a forced close is prompt by construction — every
+        // connection loop treats a socket error as its exit condition.
+        let conn_threads = lock_registry(&self.shared.conn_threads)
             .drain(..)
             .collect::<Vec<_>>();
+        let deadline = Instant::now() + SHUTDOWN_DRAIN;
+        for thread in &conn_threads {
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(POLL);
+            }
+        }
+        for conn in &conns {
+            conn.close();
+        }
         for thread in conn_threads {
             let _ = thread.join();
         }
@@ -264,6 +310,42 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         }
     };
 
+    // 1b. §4 recovery: this host is now the **recovering** owner. Client
+    //     mode defers staging salvage and orphan adoption to "the owner"
+    //     (store_v2's contract) — in Mode B that owner is exactly this
+    //     process, so reconcile runs here, before the first client can
+    //     connect, on the lease-holding store (the only handle whose
+    //     reconcile runs owner-mode: the runtime's own V2CaptureStore
+    //     sees our lease as a live foreign owner and correctly defers).
+    //     A crashed predecessor's interrupted takes are salvaged, and the
+    //     report is surfaced (logged here, held on the handle for
+    //     status).
+    let startup_reconciliation = match lease.lock().expect("lease store").reconcile() {
+        Ok(report) => report,
+        Err(source) => {
+            release_lease_now(&lease);
+            return Err(HostError::Reconcile {
+                root: config.data_root.clone(),
+                source,
+            });
+        }
+    };
+    if startup_reconciliation.has_findings() {
+        eprintln!(
+            "starling-runtime-host: storage v2 reconciliation on {}: \
+             recovered {} interrupted take(s), promoted {} finalized journal(s), \
+             adopted {} orphan session(s), marked {} row(s) interrupted, \
+             completed {} interrupted delete(s); {} unreadable",
+            config.data_root.display(),
+            startup_reconciliation.recovered_torn.len(),
+            startup_reconciliation.promoted_finalized.len(),
+            startup_reconciliation.orphan_sessions.len(),
+            startup_reconciliation.marked_interrupted.len(),
+            startup_reconciliation.completed_deletes.len(),
+            startup_reconciliation.unreadable.len(),
+        );
+    }
+
     // 2. The endpoint.
     platform::ensure_runtime_dir(&config.runtime_dir)
         .map_err(|err| HostError::RuntimeDir(config.runtime_dir.clone(), err.to_string()))?;
@@ -346,8 +428,18 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         threads: Mutex::new(threads),
         lease,
         runtime: Some(runtime),
+        startup_reconciliation,
         done: AtomicBool::new(false),
     })
+}
+
+/// Locks one of the host's registry mutexes, tolerating poison: a
+/// connection thread that panicked leaves the data intact (worst case
+/// stale), and aborting every remaining client's session over bookkeeping
+/// is the wrong trade. The lease mutex keeps `expect` — its invariants
+/// are ownership-critical, not bookkeeping.
+fn lock_registry<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn spawn(name: &str, run: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
@@ -370,8 +462,12 @@ fn accept_loop(
         match listener.accept() {
             Ok(conn) => {
                 let mut conn = conn;
-                let live = shared.live_connections.load(Ordering::SeqCst);
+                // Reserve the slot atomically: load-then-act would let
+                // concurrent accepts all observe the same count below the
+                // cap and overshoot it (the cap is a documented bound).
+                let live = shared.live_connections.fetch_add(1, Ordering::SeqCst);
                 if live >= max_connections {
+                    shared.live_connections.fetch_sub(1, Ordering::SeqCst);
                     // Answer honestly, then close: the client learns why.
                     let error = Frame::TransportError {
                         code: TransportErrorCode::TooManyConnections,
@@ -389,6 +485,7 @@ fn accept_loop(
                     Ok(clone) => clone,
                     Err(err) => {
                         eprintln!("starling-runtime-host: connection clone failed: {err}");
+                        shared.live_connections.fetch_sub(1, Ordering::SeqCst);
                         let _ = conn.shutdown_both();
                         continue;
                     }
@@ -397,6 +494,7 @@ fn accept_loop(
                     Ok(clone) => clone,
                     Err(err) => {
                         eprintln!("starling-runtime-host: connection clone failed: {err}");
+                        shared.live_connections.fetch_sub(1, Ordering::SeqCst);
                         let _ = conn.shutdown_both();
                         continue;
                     }
@@ -407,12 +505,7 @@ fn accept_loop(
                     closed: AtomicBool::new(false),
                     closer,
                 });
-                shared
-                    .conns
-                    .lock()
-                    .expect("conn registry")
-                    .push(Arc::clone(&state));
-                shared.live_connections.fetch_add(1, Ordering::SeqCst);
+                lock_registry(&shared.conns).push(Arc::clone(&state));
 
                 let reader = spawn_conn_thread("starling-host-conn-read", {
                     let shared = Arc::clone(&shared);
@@ -426,7 +519,13 @@ fn accept_loop(
                     let state = Arc::clone(&state);
                     move || connection_writer(shared, state, writer_conn, outbound_rx)
                 });
-                let mut threads = shared.conn_threads.lock().expect("conn threads");
+                // Register, then reap: every accept sweeps the handles
+                // whose threads already exited, so the registry stays
+                // bounded on a long-lived host serving many short-lived
+                // clients (a crashlooping renderer reconnecting once a
+                // second must not grow it forever).
+                let mut threads = lock_registry(&shared.conn_threads);
+                threads.retain(|thread| !thread.is_finished());
                 threads.push(reader);
                 threads.push(writer);
             }
@@ -589,6 +688,25 @@ fn handle_command(
     state: &ConnState,
     envelope: &mut serde_json::Value,
 ) -> Result<(), ()> {
+    // Shape first: the receipt is keyed by the envelope's string `id`,
+    // so an envelope without one could never be answered — the command
+    // would execute while the client sat out its reply timeout. Refuse
+    // the frame instead of routing an unanswerable command.
+    let id = match envelope
+        .as_object()
+        .and_then(|object| object.get("id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(id) => id.to_string(),
+        None => {
+            terminate(
+                state,
+                TransportErrorCode::MalformedFrame,
+                "command envelope must be an object carrying a string id".to_string(),
+            );
+            return Err(());
+        }
+    };
     let corr = envelope
         .as_object()
         .and_then(|object| object.get("corr"))
@@ -607,18 +725,27 @@ fn handle_command(
         .as_object()
         .and_then(|object| object.get("seq"))
         .and_then(serde_json::Value::as_u64);
-    let id = envelope
-        .as_object()
-        .and_then(|object| object.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("?")
-        .to_string();
     let result = shared.client.send_raw(envelope.clone());
-    state.try_deliver(Frame::Receipt {
-        req: id,
-        seq,
-        result,
-    })
+    if state
+        .try_deliver(Frame::Receipt {
+            req: id,
+            seq,
+            result,
+        })
+        .is_err()
+    {
+        // The command already ran; the client must never sit out a bare
+        // reply timeout for an executed command (a timeout reads as "safe
+        // to resend" and a resend would duplicate it). Close with the
+        // reason so the client resynchronizes from the snapshot instead.
+        terminate(
+            state,
+            TransportErrorCode::SlowConsumer,
+            "receipt would overflow the outbound queue".to_string(),
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 /// One connection's outbound side: serialized writes from the bounded
@@ -651,7 +778,6 @@ fn connection_writer(
                             detail: format!("outbound frame {declared} bytes exceeds cap {cap}"),
                         };
                         if let Ok(wire) = encode(&error, shared.max_frame_bytes) {
-                            use std::io::Write;
                             let _ = sink.write_all(&wire);
                             let _ = sink.flush();
                         }
@@ -663,7 +789,6 @@ fn connection_writer(
                         break;
                     }
                 };
-                use std::io::Write;
                 if sink.write_all(&wire).is_err() || sink.flush().is_err() {
                     finish(&mut sink, &state);
                     break;
@@ -691,20 +816,19 @@ fn connection_writer(
 
 /// Ends a connection with a final transport-error frame: the frame is
 /// queued, the connection is marked closed, and the writer thread
-/// delivers the frame and then ends the stream (the reader-side
-/// violations all have a peer that is demonstrably still reading — it
-/// just sent us a frame).
+/// delivers the frame and then ends the stream. Ordering caveat, by
+/// construction: the error frame shares the outbound queue with event
+/// deliveries from the pump, so a concurrent event may be written after
+/// it — the terminal frame is best-effort-last, not guaranteed-last. The
+/// client treats any close after a transport error as terminal either
+/// way (it reconnects and resynchronizes from the snapshot).
 fn terminate(state: &ConnState, code: TransportErrorCode, detail: String) {
     let _ = state.try_deliver(Frame::TransportError { code, detail });
     state.mark_closed();
 }
 
 fn unregister(shared: &HostShared, state: &Arc<ConnState>) {
-    shared
-        .conns
-        .lock()
-        .expect("conn registry")
-        .retain(|registered| !Arc::ptr_eq(registered, state));
+    lock_registry(&shared.conns).retain(|registered| !Arc::ptr_eq(registered, state));
     shared.live_connections.fetch_sub(1, Ordering::SeqCst);
 }
 
@@ -723,7 +847,7 @@ fn event_pump(shared: Arc<HostShared>, events: EventSub) {
                 let frame = Frame::Event {
                     envelope: message.to_value(),
                 };
-                let conns = shared.conns.lock().expect("conn registry").clone();
+                let conns = lock_registry(&shared.conns).clone();
                 for conn in conns {
                     if conn.try_deliver(frame.clone()).is_err()
                         && !conn.closed.swap(true, Ordering::SeqCst)
@@ -743,15 +867,17 @@ fn event_pump(shared: Arc<HostShared>, events: EventSub) {
     }
 }
 
-/// Renews the storage-v2 lease heartbeat. The flock on the identity file
-/// is the ownership signal the OS maintains by itself; the heartbeat is
-/// the fallback for flock-less hosts, so a renewal failure is logged and
-/// outlived, never fatal here.
+/// Renews the storage-v2 lease heartbeat at TTL/3 — the designed cadence
+/// (a 30 s [`LEASE_HEARTBEAT_TTL`] renews every ~10 s, so a successor
+/// needs three missed beats before it may break the lease). The flock on
+/// the identity file is the ownership signal the OS maintains by itself;
+/// the heartbeat is the fallback for flock-less hosts, so a renewal
+/// failure is logged and outlived, never fatal here. The cadence is
+/// sliced into poll-sized sleeps so shutdown stays prompt.
 fn lease_heartbeat(lease: Arc<Mutex<StoreV2>>, shared: Arc<HostShared>) {
     loop {
-        for _ in 0..20 {
-            // ~10s at the default 30s TTL (TTL/3 cadence), in poll-sized
-            // slices so shutdown is prompt.
+        let next_beat = Instant::now() + LEASE_HEARTBEAT_TTL / 3;
+        while Instant::now() < next_beat {
             std::thread::sleep(POLL);
             if shared.shutdown.load(Ordering::SeqCst) {
                 return;
