@@ -3427,15 +3427,17 @@ fn now_epoch_ms() -> u64 {
 }
 
 /// A clock reading as epoch milliseconds. A clock before 1970 saturates
-/// to 1 ms past the epoch, never 0: `0` is the "no heartbeat parsed"
-/// sentinel (a missing `.hb` reads as `heartbeat_ms = 0` — ancient), so a
-/// skewed-but-live owner must not write a heartbeat indistinguishable
-/// from "never"; against a peer reading the same skewed clock, 1-vs-1
-/// still reads fresh.
+/// to 1 ms past the epoch, never 0 (and an exactly-epoch clock clamps to
+/// the same 1): `0` is the "no heartbeat parsed" sentinel (a missing
+/// `.hb` reads as `heartbeat_ms = 0` — ancient), so a skewed-but-live
+/// owner must not write a heartbeat indistinguishable from "never";
+/// against a peer reading the same skewed clock, 1-vs-1 still reads
+/// fresh.
 fn epoch_ms(now: std::time::SystemTime) -> u64 {
     now.duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_millis() as u64)
         .unwrap_or(1)
+        .max(1)
 }
 
 /// Whether a heartbeat recorded at `heartbeat_ms` is still fresh under
@@ -5997,9 +5999,10 @@ mod tests {
         // heartbeat_ms = 0 means "no heartbeat parsed" (ancient, stale);
         // a pre-epoch clock must not write its fresh heartbeat as that
         // sentinel — it saturates to 1 ms past the epoch, which still
-        // reads fresh against a peer reading the same skewed clock.
+        // reads fresh against a peer reading the same skewed clock. An
+        // exactly-epoch clock clamps to the same 1 for the same reason.
         let skewed = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(86_400);
         assert_eq!(epoch_ms(skewed), 1);
-        assert_eq!(epoch_ms(std::time::SystemTime::UNIX_EPOCH), 0);
+        assert_eq!(epoch_ms(std::time::SystemTime::UNIX_EPOCH), 1);
     }
 }

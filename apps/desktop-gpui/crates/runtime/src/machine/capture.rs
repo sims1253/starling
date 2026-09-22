@@ -351,13 +351,16 @@ impl CaptureStore for InMemoryCaptureStore {
 /// The evidence the runtime layers on top — `takeCorr`, `captureId`,
 /// `gaps`, the sample / wall-clock split — rides in `extra_json` on the
 /// samples path, plus `journalHash`: the take's own FNV-1a content hash,
-/// the forensic bridge to journal evidence the store could not adopt
-/// (the store owns the row's `journal_hash` column — it is the staged
-/// journal's sealed hash — so the take's hash rides in `extra_json`).
-/// On the adoption path the journal itself is the durable evidence and
-/// the row carries the store's own adoption semantics (plus the salvage
-/// note on the interrupted paths). Nothing reads those keys back today;
-/// the registry is the runtime's session-scoped source of take detail.
+/// the forensic bridge to journal evidence the store could not adopt.
+/// Do not join it against the row's `journal_hash` column by name: the
+/// column holds the staged journal's sealed hash — the same function
+/// over the same bytes on this path, but a different claim in general
+/// (on torn or drained evidence the take's hash and the journal's sealed
+/// hash diverge). On the adoption path the journal itself is the durable
+/// evidence and the row carries the store's own adoption semantics
+/// (plus the salvage note on the interrupted paths). Nothing reads those
+/// keys back today; the registry is the runtime's session-scoped source
+/// of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
 }
@@ -577,15 +580,34 @@ impl V2CaptureStore {
         };
         let mut store = self.store.lock().expect("v2 store lock");
         if let Err(err) = finalized.commit_marked(&mut store, mark) {
+            // commit_marked is promote → commit → gc, so the failure may
+            // sit before OR after the promoting rename, and each shape
+            // gets its own honest answer:
+            //
+            // - the row may have landed anyway (an error surfaced after
+            //   the transaction committed): the take IS durably stored,
+            //   and an Err would invite a retry that duplicates it;
+            // - a failure before the rename leaves the sealed journal in
+            //   staging — discard_staging rolls it back, else reconcile
+            //   would salvage it as an interrupted duplicate of a retry;
+            // - a failure after the rename (commit or gc) leaves the
+            //   journal in audio/ with no row: the discard is a no-op
+            //   (staging is gone), so the orphan is named in a divergence
+            //   report — reconcile heals it as an orphaned session, never
+            //   silently.
+            if matches!(store.get_capture(&staged_id), Ok(Some(_))) {
+                return Ok(());
+            }
             let err = chain_adoption_failure(&adoption_error, err.to_string());
-            // The commit_marked doc names this caller: a failure before
-            // the promoting rename leaves the take's whole sealed audio in
-            // staging, which reconcile would salvage as an interrupted
-            // duplicate. Best-effort discard — pure filesystem work, so it
-            // runs off the store lock like the bulk writes above — then
-            // the commit's error is the answer.
-            drop(store);
-            if let Err(discard_err) = self
+            let promoted = store.load_audio(&staged_id).is_ok();
+            drop(store); // the filesystem work below runs off the lock
+            if promoted {
+                report_divergence(format!(
+                    "commit failed after the audio for {staged_id} was promoted — the \
+                     journal sits in audio/ with no row; reconcile will surface it as an \
+                     orphaned session"
+                ));
+            } else if let Err(discard_err) = self
                 .store
                 .lock()
                 .expect("v2 store lock")
