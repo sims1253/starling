@@ -3,6 +3,8 @@ import {
   InsightEventConflictError,
   InsightEventValidationError,
   insightEventProblems,
+  isCaptureDeleted,
+  isCaptureFinalized,
   isRecognitionSelected,
   isTransformationCompleted,
   sameEventPayload,
@@ -239,6 +241,22 @@ export class InsightRecorder {
   private readonly now: () => Date;
   private readonly uuid: () => string;
   private readonly eventsById = new Map<string, InsightEvent>();
+  /**
+   * capture_id → occurred_at of its latest capture_finalized event,
+   * maintained as events enter the mirror — the anchor read is on the
+   * recognition hot path (once per settled transcript), where a linear
+   * scan of the whole log per read would make a session O(n²). A
+   * capture_deleted event drops its capture's entry: the take is gone, so
+   * its anchor must not linger (the map stays bounded across a long
+   * session of deletions).
+   */
+  private readonly finalizedAt = new Map<string, string>();
+  /**
+   * Capture ids with a capture_deleted tombstone, maintained alongside the
+   * anchor index so tombstone checks are O(1) on the append path (and load
+   * stays linear, not a per-event scan of the whole mirror).
+   */
+  private readonly tombstonedCaptures = new Set<string>();
   private writeChain: Promise<void> = Promise.resolve();
   private loadPromise: Promise<void> | undefined;
 
@@ -258,7 +276,10 @@ export class InsightRecorder {
    */
   async load(): Promise<void> {
     this.loadPromise ??= this.store.load().then((log) => {
-      for (const event of log.events) this.eventsById.set(event.event_id, event);
+      for (const event of log.events) {
+        this.eventsById.set(event.event_id, event);
+        this.applyFinalizedAt(event);
+      }
     });
 
     return this.loadPromise;
@@ -383,9 +404,7 @@ export class InsightRecorder {
    * stale replays of the capture's events can never resurrect its totals.
    */
   async captureDeleted(captureId: string): Promise<void> {
-    const existing = this.tombstoneFor(captureId);
-
-    if (existing !== undefined) return;
+    if (this.tombstonedCaptures.has(captureId)) return;
 
     const event: InsightEvent = {
       schema_version: 1,
@@ -403,13 +422,27 @@ export class InsightRecorder {
     await this.enqueue(async () => {
       await this.store.clear();
       this.eventsById.clear();
+      this.finalizedAt.clear();
+      this.tombstonedCaptures.clear();
     });
   }
 
-  private tombstoneFor(captureId: string): InsightEvent | undefined {
-    return this.snapshot().find(
-      (event) => event.type === "capture_deleted" && event.capture_id === captureId,
-    );
+  /**
+   * The capture's finalization instant — its capture_finalized event's
+   * occurred_at — when the mirror knows one, undefined when it does not
+   * (the event has not been emitted or loaded yet). The term-aggregate
+   * records anchor to this so a delayed retranscription cannot move a take
+   * across a card-window boundary; the caller falls back to its own clock
+   * only while the event is still in flight. The mirror is
+   * insertion-ordered, so the LAST match wins — later events supersede
+   * earlier ones everywhere else in this contract, and the id scheme
+   * (`cf-<captureId>`) currently makes replays idempotent rather than
+   * appended; this stays correct if that ever changes. One exception is
+   * structural: a capture_deleted tombstone dominates, so a finalize that
+   * lands after its own tombstone never re-establishes the anchor.
+   */
+  captureFinalizedAt(captureId: string): string | undefined {
+    return this.finalizedAt.get(captureId);
   }
 
   private nextSequence(
@@ -455,7 +488,24 @@ export class InsightRecorder {
     await this.enqueue(async () => {
       await this.store.append(event);
       this.eventsById.set(event.event_id, event);
+      this.applyFinalizedAt(event);
     });
+  }
+
+  /** Maintain the anchor and tombstone indexes as one event enters the mirror. */
+  private applyFinalizedAt(event: InsightEvent): void {
+    if (isCaptureFinalized(event)) {
+      // A finalize landing after its tombstone (an in-flight crossing: the
+      // delete confirmed while the finalize emit was still queued) must not
+      // re-establish the anchor — the tombstone dominates here exactly as
+      // it does in every other read of this contract.
+      if (this.tombstonedCaptures.has(event.capture_id)) return;
+
+      this.finalizedAt.set(event.capture_id, event.occurred_at);
+    } else if (isCaptureDeleted(event)) {
+      this.tombstonedCaptures.add(event.capture_id);
+      this.finalizedAt.delete(event.capture_id);
+    }
   }
 
   private enqueue(work: () => Promise<void>): Promise<void> {

@@ -1,5 +1,6 @@
 import { isCaptureFinalized, type InsightEvent } from "./insightEvents";
 import { aggregate, localDayKey, parseInsightTimestamp } from "./insightMetrics";
+import { plural, pluralWord } from "./insightFormat";
 import type { InsightConsent } from "./insightConsent";
 
 /**
@@ -43,6 +44,21 @@ const WORD_MILESTONES = [1_000, 10_000] as const;
 
 /** Captured-minute totals that earn a milestone, smallest first. */
 const MINUTE_MILESTONES = [60, 600] as const;
+
+/**
+ * Labels for the captured-minute milestones the pluralized form would
+ * mangle; every other threshold reads as its plain minute count.
+ */
+const MINUTE_MILESTONE_LABELS = new Map<number, string>([[60, "An hour of captured audio"]]);
+
+/** The streak's own line: the live run, or the honest absence of one. */
+function streakDescription(currentDays: number, longestDays: number): string {
+  if (currentDays === 0) {
+    return `No consecutive take days right now (longest ever: ${longestDays})`;
+  }
+
+  return `${currentDays} consecutive ${pluralWord(currentDays, "day")} with at least one take (longest: ${longestDays})`;
+}
 
 /**
  * The log's events grouped by capture id — the store dedupes by event_id,
@@ -138,7 +154,7 @@ export function milestones(
     id: "first-take",
     label: "First voice note",
     achievedOnDay: first.day,
-    evidence: `The earliest local day with a retained take (${first.takes} take${first.takes === 1 ? "" : "s"}).`,
+    evidence: `The earliest local day with a retained take (${plural(first.takes, "take")}).`,
   });
 
   // "First week of voice notes": the seventh distinct day with a take.
@@ -166,9 +182,9 @@ export function milestones(
       if (words >= threshold && !reached.some((item) => item.id === `words-${threshold}`)) {
         reached.push({
           id: `words-${threshold}`,
-          label: `${threshold.toLocaleString("en-US")} words recognized from speech`,
+          label: `${threshold.toLocaleString()} words recognized from speech`,
           achievedOnDay: day.day,
-          evidence: `Cumulative recognized words (selected final transcripts) crossed ${threshold.toLocaleString("en-US")} on this day.`,
+          evidence: `Cumulative recognized words (selected final transcripts) crossed ${threshold.toLocaleString()} on this day.`,
         });
       }
     }
@@ -182,10 +198,7 @@ export function milestones(
       ) {
         reached.push({
           id: `minutes-${threshold}`,
-          label:
-            threshold === 60
-              ? "An hour of captured audio"
-              : `${threshold} minutes of captured audio`,
+          label: MINUTE_MILESTONE_LABELS.get(threshold) ?? `${threshold} minutes of captured audio`,
           achievedOnDay: day.day,
           evidence: `Cumulative captured seconds (silence included) crossed ${minuteThreshold} on this day.`,
         });
@@ -276,10 +289,7 @@ export function streaks(events: readonly InsightEvent[], options: MilestoneOptio
   return {
     currentDays,
     longestDays,
-    description:
-      currentDays > 0
-        ? `${currentDays} consecutive day${currentDays === 1 ? "" : "s"} with at least one take (longest: ${longestDays})`
-        : `No consecutive take days right now (longest ever: ${longestDays})`,
+    description: streakDescription(currentDays, longestDays),
   };
 }
 

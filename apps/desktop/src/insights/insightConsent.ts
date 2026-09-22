@@ -60,9 +60,9 @@ export const DEFAULT_INSIGHT_CONSENT: InsightConsent = Object.freeze({
   weeklyGoalWords: null,
 });
 
-const GOAL_MIN = 1;
+export const WEEKLY_GOAL_MIN = 1;
 
-const GOAL_MAX = 1_000_000;
+export const WEEKLY_GOAL_MAX = 1_000_000;
 
 /**
  * Read the consent state; anything unreadable, absent or malformed is the
@@ -104,7 +104,25 @@ export function readInsightConsent(storage: ConsentStorage): InsightConsent {
 function readableGoal(value: number | null): number | null {
   if (value === null || !Number.isInteger(value)) return null;
 
-  return value >= GOAL_MIN && value <= GOAL_MAX ? value : null;
+  return value >= WEEKLY_GOAL_MIN && value <= WEEKLY_GOAL_MAX ? value : null;
+}
+
+/**
+ * Parse a weekly-goal draft from the input field: a whole number inside the
+ * declared bounds, or null. The draft is committed on blur, not per
+ * keystroke, so half-typed values ("1e" on the way to "1e3" is out of bounds
+ * anyway, "-" on the way to nothing) parse to null instead of rewriting the
+ * field under the user's cursor — and the bounds this states are the same
+ * ones `readableGoal` enforces on stored values.
+ */
+export function parseWeeklyGoal(value: string): number | null {
+  const trimmed = value.trim();
+
+  if (!/^\d+$/.test(trimmed)) return null;
+
+  const parsed = Number.parseInt(trimmed, 10);
+
+  return parsed >= WEEKLY_GOAL_MIN && parsed <= WEEKLY_GOAL_MAX ? parsed : null;
 }
 
 /** Persist the consent state as one whole object — grants never half-land. */

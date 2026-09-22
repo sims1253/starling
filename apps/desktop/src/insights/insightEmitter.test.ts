@@ -10,7 +10,11 @@ import {
   wavCaptureStats,
   wordMultisetDifference,
 } from "./insightEmitter";
-import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
+import {
+  MemoryInsightEventStore,
+  insightEventProblems,
+  type InsightEventStore,
+} from "./insightEvents";
 
 /**
  * Emitter coverage (E29): every emitted event conforms to the frozen schema —
@@ -22,8 +26,7 @@ import { MemoryInsightEventStore, insightEventProblems } from "./insightEvents";
 
 const T0 = Date.parse("2026-09-20T12:00:00Z");
 
-function recorder() {
-  const store = new MemoryInsightEventStore();
+function recorder(store: InsightEventStore = new MemoryInsightEventStore()) {
   let tick = 0;
   let serial = 0;
 
@@ -87,6 +90,92 @@ describe("declared tokenizer", () => {
 });
 
 describe("InsightRecorder", () => {
+  it("answers a capture's finalization instant from the log", async () => {
+    const { recorder: insights } = recorder();
+
+    // Before the event exists there is nothing to anchor to — the caller
+    // falls back to its own clock.
+    expect(insights.captureFinalizedAt("take-1")).toBeUndefined();
+
+    await insights.captureFinalized({
+      captureId: "take-1",
+      sampleCount: 640_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    // The instant the capture_finalized event carries — what term-aggregate
+    // records anchor to so a delayed retranscription cannot move a take
+    // across a card window boundary. The injected clock's first tick is T0.
+    expect(insights.captureFinalizedAt("take-1")).toBe(new Date(T0).toISOString());
+    expect(insights.captureFinalizedAt("take-unknown")).toBeUndefined();
+  });
+
+  it("anchors survive load replays and reset without rescanning the log", async () => {
+    // The anchor index is maintained at insert time (load replays,
+    // appends, reset) rather than derived by scanning — pinned here at
+    // the behavior level: a second recorder replaying the same durable
+    // log answers the same anchors, and a reset leaves none behind.
+    const first = recorder();
+
+    await first.recorder.captureFinalized({
+      captureId: "take-9",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    const second = recorder(first.store);
+
+    await second.recorder.load();
+
+    expect(second.recorder.captureFinalizedAt("take-9")).toBe(new Date(T0).toISOString());
+
+    await second.recorder.reset();
+
+    expect(second.recorder.captureFinalizedAt("take-9")).toBeUndefined();
+  });
+
+  it("drops a deleted capture's anchor on append and on load replay", async () => {
+    // The anchor index must not outlive the take it describes: a deletion
+    // clears the entry in the live mirror and in a later recorder's load
+    // replay, so long sessions of deletions cannot grow the map.
+    const first = recorder();
+
+    await first.recorder.captureFinalized({
+      captureId: "take-2",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+    await first.recorder.captureDeleted("take-2");
+
+    expect(first.recorder.captureFinalizedAt("take-2")).toBeUndefined();
+
+    const second = recorder(first.store);
+
+    await second.recorder.load();
+
+    expect(second.recorder.captureFinalizedAt("take-2")).toBeUndefined();
+  });
+
+  it("keeps a deleted capture anchorless when its finalize lands after the delete", async () => {
+    // The in-flight crossing: the delete confirms while the finalize emit
+    // is still queued, so the finalize append finds no same-id event to
+    // dedupe against — the tombstone must still dominate the anchor.
+    const { recorder: insights } = recorder();
+
+    await insights.captureDeleted("take-3");
+    await insights.captureFinalized({
+      captureId: "take-3",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    expect(insights.captureFinalizedAt("take-3")).toBeUndefined();
+  });
+
   it("emits schema-valid events for the full lifecycle", async () => {
     const { recorder: insights } = recorder();
 

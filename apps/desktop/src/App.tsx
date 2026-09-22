@@ -79,13 +79,25 @@ import {
   type InsightConsent,
 } from "./insights/insightConsent";
 import {
+  applyTermWrite,
   IndexedDbInsightTermStore,
   InsightTermRecorder,
   type InsightTermRecord,
+  type InsightTermWrite,
 } from "./insights/insightTerms";
-import { InsightsView } from "./insights/InsightsView";
+import { InsightsView, type InsightNotice } from "./insights/InsightsView";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
+
+/**
+ * How long a term write waits on the event log — its load, or a take's
+ * finalize emit — before anchoring to its own clock. Precision-only: a
+ * wedged store transaction must never hold the term write hostage.
+ */
+const ANCHOR_LOAD_TIMEOUT_MS = 5_000;
+
+/** Unresolved Insights notices kept at once; more is a failing store, not news. */
+const MAX_INSIGHT_NOTICES = 8;
 
 const DEFAULT_ENDPOINT = window.starlingDesktop ? "http://127.0.0.1:8181" : "/api";
 
@@ -164,6 +176,26 @@ function historyRowLabel(session: DictationSession) {
 
 function messageFrom(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Race one precision-only wait against the anchor bound: the term write
+ * must never be held hostage by a wedged event store, so a hung load or
+ * finalize emit costs only the anchor's precision, never the write. The
+ * promise never rejects, and the losing timer is released the moment the
+ * wait settles — the recognition hot path must not accumulate live timers.
+ */
+function withAnchorBound(wait: Promise<unknown>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ANCHOR_LOAD_TIMEOUT_MS);
+
+    void Promise.resolve(wait)
+      .finally(() => clearTimeout(timer))
+      .then(
+        () => resolve(),
+        () => resolve(),
+      );
+  });
 }
 
 /**
@@ -268,14 +300,45 @@ export default function App() {
   // The Insights surface (E29): a view toggle over the same app — no
   // router, just the two screens. The event log is the population the
   // surface aggregates, the term records are its consented content-derived
-  // half, and insightsIssue is the one storage/recording notice it shows.
+  // half, and insightNotices are the storage/recording notices it shows —
+  // a list, because two stores can fail in the same moment and every
+  // unresolved notice stays visible until dismissed.
   const [view, setView] = useState<"capture" | "insights">("capture");
 
   const [insightEvents, setInsightEvents] = useState<readonly InsightEvent[]>(() => []);
 
   const [termRecords, setTermRecords] = useState<readonly InsightTermRecord[]>(() => []);
 
-  const [insightsIssue, setInsightsIssue] = useState<string>();
+  const [insightNotices, setInsightNotices] = useState<readonly InsightNotice[]>(() => []);
+
+  // Set when the first term-aggregate write delta LANDS in the mirror: from
+  // that moment the mount-time load() snapshot is stale by construction and
+  // may never apply again (see the load effect). Failed writes do not set
+  // it — a failed write changed nothing, so the snapshot is still the
+  // freshest full view and the mirror keeps its recovery path.
+  const termMirrorLandedRef = useRef(false);
+  // Term-mirror deltas apply on a chain of their own, serialized: even if
+  // two writes' surrounding waits settle out of order (a delete racing a
+  // record), each delta lands only after the previous one has applied, so
+  // the mirror's order can never diverge from the recorder's store order.
+  const termMirrorChainRef = useRef<Promise<void>>(Promise.resolve());
+  // The mount-time term-store load whose settlement every mirror delta
+  // waits behind, so a first write that beats a slow cold-start load can
+  // neither be overwritten by its snapshot nor strand the mirror with a
+  // delta-only view of the store. The promise never rejects.
+  const termLoadOnceRef = useRef<Promise<void> | null>(null);
+  /**
+   * capture_id → the in-flight capture_finalized emit for that take.
+   * The batch path fires the finalize fire-and-forget and transcribes
+   * separately, so a settling transcript's term write can beat its own
+   * finalize into the mirror; waiting for the registered promise (when
+   * one exists) reads the true finalization anchor instead of falling
+   * back to the write clock. Entries remove themselves once settled — or
+   * after the anchor bound, so a wedged chain cannot leak them. Each
+   * promise resolves with whether the finalize event actually landed,
+   * because the never-rejecting chain cannot say so any other way.
+   */
+  const pendingFinalizesRef = useRef(new Map<string, Promise<boolean>>());
 
   // The Insights consent state (E29 phase 2): read once from local settings
   // and thereafter changed only through applyInsightConsent, which persists
@@ -594,6 +657,39 @@ export default function App() {
 
   const busy = activeIds.size > 0;
 
+  /**
+   * Record one Insights notice. Notices accumulate — deduplicated, newest
+   * last, bounded — so two failures in the same moment (an event-tombstone
+   * write and a term-aggregate delete both failing on removeSession, both
+   * reset chains failing) stay fully visible instead of the second message
+   * silently overwriting the first.
+   */
+  const addInsightNotice = useCallback((notice: string) => {
+    setInsightNotices((current) => {
+      const existing = current.find((item) => item.text === notice);
+
+      // A repeat of a visible notice counts it (stays fully visible — a
+      // same-text second failure is real news, not a duplicate to hide)
+      // and moves it to the newest-last end.
+      if (existing !== undefined) {
+        return [
+          ...current.filter((item) => item.text !== notice),
+          { text: notice, count: existing.count + 1 },
+        ];
+      }
+
+      const next: readonly InsightNotice[] = [...current, { text: notice, count: 1 }];
+
+      return next.length > MAX_INSIGHT_NOTICES ? next.slice(-MAX_INSIGHT_NOTICES) : next;
+    });
+  }, []);
+
+  const dismissInsightNotice = useCallback(
+    (notice: string) =>
+      setInsightNotices((current) => current.filter((item) => item.text !== notice)),
+    [],
+  );
+
   // The insight event log loads once, best-effort: a damaged log becomes an
   // Insights notice, never a startup failure (dictation works without it).
   useEffect(() => {
@@ -601,59 +697,163 @@ export default function App() {
       .load()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
-        setInsightsIssue(`Insights could not open the local event log: ${messageFrom(caught)}`),
+        addInsightNotice(`Insights could not open the local event log: ${messageFrom(caught)}`),
       );
 
-    void insightTermStore
+    const termLoaded = insightTermStore
       .load()
-      .then((log) => setTermRecords(log.records))
+      .then((log) => {
+        // Deltas wait behind this very promise (see recordInsightTerms),
+        // so in the normal course no delta has applied yet and the
+        // snapshot lands first; the guard stays as defense for any future
+        // path that applies a delta outside that chain — once one has
+        // LANDED, the mirror is newer than this snapshot and applying it
+        // would overwrite the delta's records with a pre-write view.
+        if (termMirrorLandedRef.current) return;
+
+        setTermRecords(log.records);
+      })
       .catch((caught) =>
-        setInsightsIssue(
+        addInsightNotice(
           `Insights could not open the local term aggregates: ${messageFrom(caught)}`,
         ),
       );
-  }, []);
+
+    termLoadOnceRef.current = termLoaded;
+  }, [addInsightNotice]);
 
   /**
    * Record one insight event without ever blocking the action it describes
    * (E29): the emit is fire-and-forget, load() inside is idempotent so the
    * mirror exists before sequence numbers are derived, and a failure lands
-   * in the Insights notice instead of the take's flow. This chain touches
+   * in the Insights notices instead of the take's flow. This chain touches
    * the event log only — the term aggregates have their own chain below, so
    * neither store's health can stale the other's mirror or misattribute the
-   * notice.
+   * notice. The returned promise never rejects; callers may await it to
+   * keep the recording's own sequencing without handling errors.
    */
-  const recordInsight = useCallback((action: () => Promise<void>) => {
-    void insights
-      .load()
-      .then(action)
-      .then(() => setInsightEvents(insights.snapshot()))
-      .catch((caught) =>
-        setInsightsIssue(`Insights could not record an event: ${messageFrom(caught)}`),
-      );
-  }, []);
+  const recordInsight = useCallback(
+    (action: () => Promise<void>): Promise<boolean> =>
+      insights
+        .load()
+        .then(action)
+        .then(() => {
+          setInsightEvents(insights.snapshot());
+
+          return true;
+        })
+        .catch((caught) => {
+          addInsightNotice(`Insights could not record an event: ${messageFrom(caught)}`);
+
+          return false;
+        }),
+    [addInsightNotice],
+  );
 
   /**
    * Record one consented term-aggregate write (E29 phase 2) on a chain of
-   * its own: a refusal or term-store failure refreshes the term mirror and
-   * surfaces under its own name — the recognition event it accompanied has
-   * already been recorded, and its mirror must not be staled by a store it
-   * never touched. The term store is re-read only here, where a write
-   * actually changed it. `what` names the attempted operation so a failed
-   * purge says "delete", never a misattributed "record".
+   * its own: a refusal or term-store failure surfaces under its own name —
+   * the recognition event it accompanied has already been recorded, and its
+   * mirror must not be staled by a store it never touched. The write
+   * resolves with exactly what changed, and the mirror applies that delta
+   * directly: no full store re-read on the recognition hot path, where a
+   * growing O(n) load per transcript would tax every settlement. The first
+   * delta to land arms the mirror guard, so the mount-time snapshot can
+   * never overwrite it afterwards — while a FAILED write arms nothing, and
+   * the snapshot keeps the mirror alive. `what` names the attempted
+   * operation so a failed purge says "delete", never a misattributed
+   * "record". The returned promise never rejects.
    */
   const recordInsightTerms = useCallback(
-    (what: "record" | "delete" | "reset", action: () => Promise<void>) => {
-      void action()
-        .then(() => insightTermStore.load())
-        .then((log) => setTermRecords(log.records))
-        .catch((caught) =>
-          setInsightsIssue(
+    (
+      what: "record" | "delete" | "reset",
+      action: () => Promise<InsightTermWrite>,
+    ): Promise<void> => {
+      // This delta's chain link, captured as it is appended so the return
+      // below can wait on exactly this delta's landing.
+      let landed = Promise.resolve();
+
+      const attempted = action()
+        .then((write) => {
+          // Serialized on the mirror chain, behind the mount-time load:
+          // each delta applies only after every earlier delta AND after the
+          // initial snapshot has applied (or failed), so a first write
+          // beating a slow cold-start load can neither be overwritten by
+          // that snapshot nor strand the mirror with a delta-only view of
+          // the store. A "none" write touched nothing — the recorder's
+          // contract (see InsightTermWrite): no kind granted, nothing
+          // written — so it arms no guard and applies no delta.
+          const link = termMirrorChainRef.current
+            .then(() => termLoadOnceRef.current ?? Promise.resolve())
+            .then(() => {
+              // Arming tracks the delta actually landing, not the write
+              // merely resolving: the guard may close only once the
+              // snapshot is no longer the freshest full view.
+              if (write.kind !== "none") termMirrorLandedRef.current = true;
+
+              setTermRecords((current) => applyTermWrite(current, write));
+            })
+            .catch((caught) => {
+              addInsightNotice(
+                `Insights could not apply a term-aggregate update: ${messageFrom(caught)}`,
+              );
+            });
+
+          termMirrorChainRef.current = link;
+          landed = link;
+
+          if (write.kind === "purge" && write.skippedInvalid > 0) {
+            // Quarantined records the withdrawal could not rewrite: their
+            // retained data may survive the consent change, and the weaker
+            // guarantee is stated instead of silently reported complete.
+            addInsightNotice(
+              `Insights skipped ${write.skippedInvalid} damaged term record${
+                write.skippedInvalid === 1 ? "" : "s"
+              } while withdrawing — their data may survive; Reset Insights clears everything.`,
+            );
+          }
+        })
+        .catch((caught) => {
+          addInsightNotice(
             `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
-          ),
-        );
+          );
+        });
+
+      // The caller's promise settles only when the delta has actually
+      // landed on the mirror (or its write failed loudly): a hang bound
+      // watching this promise cannot be defeated by the detached chain.
+      return attempted.then(() => landed);
     },
-    [],
+    [addInsightNotice],
+  );
+
+  /**
+   * Surface a notice when a fire-and-forget chain does not settle within
+   * the anchor bound: a wedged store transaction hangs silently (neither
+   * the success nor the failure path fires), and the user would otherwise
+   * see a partial deletion with nothing explaining it. The chain itself
+   * keeps running — only its visibility is bounded.
+   */
+  const noticeWhenChainHangs = useCallback(
+    (what: string, wait: Promise<unknown>) => {
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          addInsightNotice(
+            `Insights has not confirmed ${what} within ${
+              ANCHOR_LOAD_TIMEOUT_MS / 1000
+            }s — a local store may be wedged; the action may still land.`,
+          );
+        }
+      }, ANCHOR_LOAD_TIMEOUT_MS);
+
+      void Promise.resolve(wait).finally(() => {
+        settled = true;
+        clearTimeout(timer);
+      });
+    },
+    [addInsightNotice],
   );
 
   /**
@@ -664,22 +864,46 @@ export default function App() {
    * rather than fabricating one). The consented content-derived aggregates
    * ride their own chain: only term/phrase counts leave that call, only for
    * kinds the current consent grants, and a failure there is its own notice,
-   * never a take error and never a stale event mirror.
+   * never a take error and never a stale event mirror. The term record
+   * anchors to the take's own finalization instant from the event log, so a
+   * delayed retranscription cannot move the take across a card window. The
+   * anchor waits are bounded and precision-only: when the load or finalize
+   * wait fails or times out, the anchor reads a possibly-empty mirror and
+   * `anchorableFinalizedAt` falls back to the write clock — a degraded
+   * anchor, never a lost write.
    */
   const recordRecognitionSelected = useCallback(
     (sessionId: string, transcriptText: string) => {
       const startedAt = stopWaitStartsRef.current.get(sessionId);
 
       stopWaitStartsRef.current.delete(sessionId);
-      recordInsight(() =>
+
+      void recordInsight(() =>
         insights.recognitionSelected({
           captureId: sessionId,
           transcriptText,
           postStopReadyMs: startedAt === undefined ? null : Date.now() - startedAt,
         }),
       );
-      recordInsightTerms("record", () =>
-        insightTerms.recognitionSelected({ captureId: sessionId, transcriptText }),
+      void recordInsightTerms("record", () =>
+        // Wait for this take's own in-flight finalize first (the batch
+        // path races them), then for the event log's mirror. Both waits
+        // are precision-only and bounded (withAnchorBound): the promises
+        // never reject, a failure or a HUNG store (a wedged transaction)
+        // costs only the anchor — never the term write — and a missing
+        // finalize entry means none is in flight for this take yet (or it
+        // already settled and removed itself, in which case the anchor is
+        // in the mirror the load wait reads), so the fallback to the
+        // write clock is safe by design rather than a lost write.
+        withAnchorBound(pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
+          .then(() => withAnchorBound(insights.load()))
+          .then(() =>
+            insightTerms.recognitionSelected({
+              captureId: sessionId,
+              transcriptText,
+              finalizedAt: insights.captureFinalizedAt(sessionId),
+            }),
+          ),
       );
     },
     [recordInsight, recordInsightTerms],
@@ -692,8 +916,12 @@ export default function App() {
    * incomplete audio is parked or discarded before a session owns it.
    */
   const recordCaptureFinalized = useCallback(
-    (session: DictationSession) => {
-      recordInsight(async () => {
+    (session: DictationSession): Promise<boolean> => {
+      // Assigned after `settled` exists: both closures below read bindings
+      // declared before them, so no callback can ever observe a TDZ.
+      let discardTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const settled = recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -702,7 +930,31 @@ export default function App() {
           sampleRate: stats.sampleRate,
           completeAudio: true,
         });
+      }).finally(() => {
+        if (discardTimer !== undefined) clearTimeout(discardTimer);
+
+        // Delete only OUR registration — a second finalize for the same
+        // session may already have replaced it, and removing that newer
+        // entry would strand its recognition without an anchor wait.
+        if (pendingFinalizesRef.current.get(session.id) === settled) {
+          pendingFinalizesRef.current.delete(session.id);
+        }
       });
+
+      // Bounded registration: a wedged store transaction would otherwise
+      // leave this entry pending forever, with every later recognition for
+      // the same take waiting on it. The same anchor bound that bounds
+      // their wait releases the entry here — a released entry costs only
+      // anchor precision, never a write.
+      discardTimer = setTimeout(() => {
+        if (pendingFinalizesRef.current.get(session.id) === settled) {
+          pendingFinalizesRef.current.delete(session.id);
+        }
+      }, ANCHOR_LOAD_TIMEOUT_MS);
+
+      pendingFinalizesRef.current.set(session.id, settled);
+
+      return settled;
     },
     [recordInsight],
   );
@@ -1036,7 +1288,7 @@ export default function App() {
 
         // A durable take now exists for Insights (E29); the emit is
         // fire-and-forget so insights can never break the capture path.
-        recordCaptureFinalized(created);
+        void recordCaptureFinalized(created);
 
         return created;
       } catch (caught) {
@@ -1224,7 +1476,7 @@ export default function App() {
         // One authored revision exists now (E29): change counts come from
         // the word-level diff between raw and refined text, and are never
         // labeled corrected errors.
-        recordInsight(() =>
+        void recordInsight(() =>
           insights.transformationCompleted({
             captureId: session.id,
             rawText: transcript.text,
@@ -1449,6 +1701,14 @@ export default function App() {
 
       setStreamingFinalize(true);
 
+      // The settle path's finalize emit, claimed when the settle callback
+      // runs. Its LANDING — not the attempt — is what suppresses the
+      // post-finalize emit below: the emit chain never rejects, so whether
+      // it landed travels as the resolved boolean, and a failed emit (which
+      // wrote nothing under the fixed `cf-<captureId>` id) is retried once
+      // instead of costing the take its capture_finalized event forever.
+      let settleEmit: Promise<boolean> | undefined;
+
       try {
         const finalized = await finalizeStreamingTake(
           {
@@ -1461,17 +1721,42 @@ export default function App() {
             setConnectionReady: () => setConnection("ready"),
             transcribe,
             onDurableSave: releaseCapture,
-            onStreamedSettled: (session, transcript) =>
-              recordRecognitionSelected(session.id, transcript.text),
+            onStreamedSettled: (session, transcript) => {
+              // The finalize's LAST Discard check has passed, so the take
+              // is certain to keep its session: emit capture_finalized now
+              // and let the term write wait for it, so a streamed take's
+              // record anchors to the true finalization instant instead of
+              // the settlement clock. The wait is precision-only — the
+              // promise never rejects (an event-store failure costs the
+              // anchor, never the term write).
+              settleEmit = recordCaptureFinalized(session);
+
+              void settleEmit
+                .then(async (landed) => {
+                  // The settle emit failed and wrote nothing: one retry
+                  // through the same fixed id, so a transient store failure
+                  // cannot leave the take without its finalize event. A
+                  // still-broken store fails loudly (another notice),
+                  // never silently.
+                  if (!landed) await recordCaptureFinalized(session);
+
+                  return recordRecognitionSelected(session.id, transcript.text);
+                })
+                .then(() => undefined);
+            },
           },
           store,
         );
 
         // A streamed take's journal became its session (E29): the take now
-        // exists for Insights. A discarded or batch-fallback take never
-        // reaches here — the batch path's own save emits instead.
-        if (finalized.session !== undefined) {
-          recordCaptureFinalized(finalized.session);
+        // exists for Insights. The settle callback already emitted for a
+        // settled streamed take; this is the primary emit only for a take
+        // that kept its session without a settled streamed transcript (a
+        // stream-note fallback transcribed on the session) — a batch
+        // fallback's recorder capture is emitted by the batch path's own
+        // save instead.
+        if (finalized.session !== undefined && settleEmit === undefined) {
+          void recordCaptureFinalized(finalized.session);
         }
 
         if (finalized.discarded) return true;
@@ -1677,13 +1962,22 @@ export default function App() {
     if (!bridge) return;
 
     const dispose = bridge.onToggleRecording(() => {
+      // The Insights view hides the recorder, and a hotkey START there
+      // would begin dictation nobody can see — the exact "unnoticed
+      // recording" the toggle's guard exists for — so a start returns to
+      // the capture pane first. Stopping stays view-agnostic: the take
+      // settles in the background either way.
+      if (view === "insights" && lifecycle.current() !== "recording") {
+        setView("capture");
+      }
+
       void toggleRecording();
     });
 
     bridge.ready();
 
     return dispose;
-  }, [toggleRecording]);
+  }, [lifecycle, toggleRecording, view]);
 
   async function importAudio(file?: File) {
     if (!file) return;
@@ -1847,35 +2141,68 @@ export default function App() {
    * removes every derived contribution (E28/E29): the event tombstone
    * dominates stale replays, and the content-derived term aggregates are
    * deleted outright, so a deleted take cannot reappear in a number, a
-   * card, a recap or a share preview.
+   * card, a recap or a share preview. The deletion chains carry their own
+   * persistent notices — a store that fails stays visibly flagged (never
+   * misattributed as a "recording not deleted": the recording is gone)
+   * without the UI's refresh waiting on them.
    */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
 
     try {
       await store.delete(id);
-      // Two independent tombstones, deliberately on separate chains: the
-      // event log's health must not decide whether the content-derived
-      // aggregates die, and vice versa — either store failing leaves the
-      // other's deletion intact and surfaces its own notice.
-      recordInsight(() => insights.captureDeleted(id));
-      recordInsightTerms("delete", () => insightTerms.captureDeleted(id));
-      await refresh();
     } catch (caught) {
       setError(`Could not delete the recording: ${messageFrom(caught)}`);
+
+      return;
+    }
+
+    // Two independent tombstones, deliberately on separate chains: the
+    // event log's health must not decide whether the content-derived
+    // aggregates die, and vice versa — either store failing leaves the
+    // other's deletion intact and surfaces its own notice. The chains are
+    // fire-and-forget ON PURPOSE: their catches write persistent notices,
+    // so visibility does not need the wait, and the UI's refresh must not
+    // be gated on stores that could hang (a wedged transaction) — the
+    // history list reflects the deletion the moment the session store
+    // confirms it, whatever the insight stores are doing. A HUNG store
+    // settles neither path, so the bound below keeps the wedge visible
+    // instead of a silent partial deletion.
+    const tombstones = Promise.all([
+      recordInsight(() => insights.captureDeleted(id)),
+      recordInsightTerms("delete", () => insightTerms.captureDeleted(id)),
+    ]);
+
+    noticeWhenChainHangs("the deletion of this take's insight data", tombstones);
+
+    try {
+      await refresh();
+    } catch (caught) {
+      // The recording and both tombstones landed; only the history view
+      // failed to redraw. Saying "delete failed" here would be the
+      // misattribution this path exists to avoid.
+      setError(`Could not refresh the history: ${messageFrom(caught)}`);
     }
   }
 
-  /** Reset Insights: both stores start over empty; recordings are untouched. */
+  /**
+   * Reset Insights: both stores start over empty; recordings are untouched.
+   * The two chains stay independent, and both failures are visible at once
+   * — each writes its own notice, and notices no longer overwrite each
+   * other.
+   */
   const resetInsights = useCallback(() => {
-    void insights
+    const eventReset = insights
       .reset()
       .then(() => setInsightEvents(insights.snapshot()))
       .catch((caught) =>
-        setInsightsIssue(`Insights could not reset the event log: ${messageFrom(caught)}`),
+        addInsightNotice(`Insights could not reset the event log: ${messageFrom(caught)}`),
       );
-    recordInsightTerms("reset", () => insightTerms.reset());
-  }, [recordInsightTerms]);
+
+    const termReset = recordInsightTerms("reset", () => insightTerms.reset());
+
+    noticeWhenChainHangs("the Insights reset", Promise.all([eventReset, termReset]));
+  }, [recordInsightTerms, addInsightNotice, noticeWhenChainHangs]);
 
   /**
    * Apply one whole consent change (E29 phase 2). Persistence lands first,
@@ -1883,11 +2210,13 @@ export default function App() {
    * once; then every grant this change revoked has its retained data
    * deleted — the UI's promise is that turning a kind off deletes what it
    * retained, not merely hides it — and only then does the committed state
-   * swap. A purge failure is a notice, never a reason to keep the old
-   * consent. The prior grants are read from storage at call time, not from
-   * the rendered state: two changes applied before a re-render must each
-   * diff against the actual previous grants, or a kind withdrawn by the
-   * first could be missed by the second.
+   * swap. A persistence failure is a notice and the change does not
+   * half-land: the state stays as it was, visibly, instead of crashing the
+   * toggle that asked for it. A purge failure is a notice, never a reason
+   * to keep the old consent. The prior grants are read from storage at call
+   * time, not from the rendered state: two changes applied before a
+   * re-render must each diff against the actual previous grants, or a kind
+   * withdrawn by the first could be missed by the second.
    */
   const applyInsightConsent = useCallback(
     (next: InsightConsent) => {
@@ -1898,14 +2227,21 @@ export default function App() {
 
       if (previous.vocabularyPatterns && !next.vocabularyPatterns) withdrawn.add("terms");
 
-      writeInsightConsent(localStorage, next);
+      try {
+        writeInsightConsent(localStorage, next);
+      } catch (caught) {
+        addInsightNotice(`Insights could not save the consent change: ${messageFrom(caught)}`);
+
+        return;
+      }
+
       setInsightConsent(next);
 
       if (withdrawn.size > 0) {
-        recordInsightTerms("delete", () => insightTerms.withdrawKinds(withdrawn));
+        void recordInsightTerms("delete", () => insightTerms.withdrawKinds(withdrawn));
       }
     },
-    [recordInsightTerms],
+    [recordInsightTerms, addInsightNotice],
   );
 
   /**
@@ -2079,6 +2415,227 @@ export default function App() {
     setDraft((current) => (current === undefined ? current : { ...current, ...patch }));
   }
 
+  // The Insights toggle is unavailable mid-take: switching views would hide
+  // the recorder — the button, timer, waveform and live text — with no
+  // signal that dictation continues, and for a dictation app an unnoticed
+  // recording is the worst outcome. Transcription is deliberately excluded
+  // from this guard: after Stop the audio is durable and transcription is
+  // safe background work (a new take may even start), so the toggle returns
+  // while a take settles and the history row's spinner keeps the work
+  // visible from either view.
+  const takeInFlight = recording || takePhase === "starting" || takePhase === "stopping";
+
+  // The capture pane and history, kept in one named function so the view
+  // switch stays one line and edits to the capture workspace never have to
+  // thread through the Insights branch's ternary — and so the tree is only
+  // built when the view actually shows it, not eagerly on every Insights
+  // render that would discard it.
+  function renderCaptureWorkspace() {
+    return (
+      <main className="workspace">
+        <section className="capture-pane">
+          <div className="capture-copy">
+            <p className="eyebrow">LOCAL DICTATION</p>
+            <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
+            <p className="lede">
+              Your recording is saved locally, sent only to your selected server, and shown exactly
+              as the model returned it.
+            </p>
+          </div>
+
+          <div className={`recorder ${recording ? "is-recording" : ""}`}>
+            <div className="waveform" aria-hidden="true">
+              {levels.map((level, index) => (
+                <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
+              ))}
+            </div>
+            <button
+              className="record-button"
+              onClick={() => void toggleRecording()}
+              disabled={takePhase === "starting" || takePhase === "stopping"}
+              aria-label={recording ? "Stop recording" : "Start recording"}
+            >
+              <span className="record-button-inner">
+                {recording ? <span className="stop-glyph" /> : <Mic size={34} strokeWidth={1.7} />}
+              </span>
+            </button>
+            <div className="record-meta">
+              <span>
+                {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Click to record"}
+              </span>
+              <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
+            </div>
+          </div>
+
+          {recording && streamStatus && (
+            <div className={`live-stream ${streamStatus.state}`}>
+              {streamStatus.state === "live" && (
+                <p className="live-text" aria-live="polite">
+                  {partialText || <em>Listening for the first words…</em>}
+                </p>
+              )}
+              {streamStatus.state === "connecting" && (
+                <p className="live-note">
+                  <Radio size={15} /> Connecting live transcription…
+                </p>
+              )}
+              {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
+                <p className="live-note" role="status">
+                  <CircleAlert size={15} />
+                  {streamStatus.detail ?? "Live transcription is unavailable."} The recording is
+                  still saved and will be transcribed when you stop.
+                </p>
+              )}
+            </div>
+          )}
+
+          <button
+            className="import-button"
+            aria-describedby="import-format"
+            onClick={() => fileRef.current?.click()}
+          >
+            <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
+          </button>
+          <span id="import-format" className="visually-hidden">
+            WAV files only
+          </span>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".wav,audio/wav,audio/x-wav"
+            hidden
+            onChange={(event) => void importAudio(event.target.files?.[0])}
+          />
+
+          {(error || unsavedWavs.length > 0) && (
+            <div className="error-banner" role="alert">
+              <CircleAlert size={18} />
+              <div>
+                <strong>{error ? "Action failed" : "Recording not saved"}</strong>
+                {error && <span>{error}</span>}
+                <small>
+                  {unsavedWavs.length > 0
+                    ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
+                    : "Starling keeps audio in history after a successful local save."}
+                </small>
+              </div>
+              {unsavedWavs.length > 0 && (
+                <div className="recovery-actions">
+                  {unsavedWavs.map((capture, index) => (
+                    <button
+                      key={capture.id}
+                      className="recover-audio"
+                      onClick={() => exportUnsavedAudio(capture.id)}
+                    >
+                      Download WAV {index + 1}
+                    </button>
+                  ))}
+                  <button className="recover-audio" onClick={discardUnsavedAudio}>
+                    Discard unsaved
+                  </button>
+                </div>
+              )}
+              {unsavedWavs.length === 0 && (
+                <button onClick={() => setError(undefined)} aria-label="Dismiss error">
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+          )}
+        </section>
+
+        <aside className="history-pane">
+          <div className="history-head">
+            <div>
+              <p className="eyebrow">ARCHIVE</p>
+              <h2>Recent takes</h2>
+            </div>
+            <Clock3 size={18} />
+          </div>
+          {activeThread && (
+            <div className="thread-strip">
+              <span>Active thread: {activeThread.slice(0, 8)}</span>
+              <button onClick={startNewThread}>start new thread</button>
+            </div>
+          )}
+          <div className="history-list">
+            {damaged.length > 0 && (
+              <div className="history-warning" role="status">
+                <CircleAlert size={16} />
+                <div>
+                  <strong>
+                    {damaged.length === 1
+                      ? "1 saved recording could not be read"
+                      : `${damaged.length} saved recordings could not be read`}
+                  </strong>
+                  <small>
+                    Damaged entries are kept until you delete them; the list below shows every
+                    recording that is still readable.
+                  </small>
+                  <div className="recovery-actions">
+                    {damaged.map((entry, index) => {
+                      const wav = invalidSessionWav(entry);
+
+                      return (
+                        <span key={`${entry.id}-${index}`} className="damaged-entry">
+                          {wav ? (
+                            <button
+                              className="recover-audio"
+                              onClick={() => exportDamagedAudio(index)}
+                            >
+                              Download WAV {index + 1}
+                            </button>
+                          ) : null}
+                          {entry.key !== undefined ? (
+                            <button
+                              className="recover-audio dismiss-damaged"
+                              onClick={() => void dismissDamagedEntry(index)}
+                              aria-label={`Delete damaged recording ${index + 1}`}
+                            >
+                              Delete entry {index + 1}
+                            </button>
+                          ) : null}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+            {sessions.length === 0 && (
+              <div className="history-empty">
+                Your recordings will collect here, ready to retry or export.
+              </div>
+            )}
+            {sessions.map((session) => (
+              <button
+                key={session.id}
+                className={`history-row ${session.id === selectedId ? "active" : ""}`}
+                onClick={() => setSelectedId(session.id)}
+                aria-label={historyRowLabel(session)}
+              >
+                <span className={`take-state ${session.status}`}>
+                  {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
+                </span>
+                <span className="take-copy">
+                  <strong>{sessionTitle(session)}</strong>
+                  <small>
+                    {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
+                    {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
+                  </small>
+                  {session.threadId && (
+                    <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
+                  )}
+                </span>
+                <ChevronRight size={16} />
+              </button>
+            ))}
+          </div>
+        </aside>
+      </main>
+    );
+  }
+
   return (
     <div className={`app-shell ${selected ? "has-transcript" : ""}`}>
       <header className="topbar">
@@ -2096,22 +2653,26 @@ export default function App() {
             Match.orElse((status) => status),
           )}
         </div>
-        <button
-          className="icon-button"
-          onClick={() => setView(view === "insights" ? "capture" : "insights")}
-          aria-pressed={view === "insights"}
-          aria-label={view === "insights" ? "Back to dictation" : "Open Insights"}
-        >
-          <BarChart3 size={19} />
-        </button>
-        <button
-          ref={settingsGearRef}
-          className="icon-button"
-          onClick={openSettings}
-          aria-label="Open server settings"
-        >
-          <Settings2 size={19} />
-        </button>
+        <div className="topbar-actions">
+          <button
+            className="icon-button"
+            onClick={() => setView(view === "insights" ? "capture" : "insights")}
+            aria-pressed={view === "insights"}
+            aria-label={view === "insights" ? "Back to dictation" : "Open Insights"}
+            disabled={takeInFlight}
+            title={takeInFlight ? "Insights opens when no recording is in progress" : undefined}
+          >
+            <BarChart3 size={19} />
+          </button>
+          <button
+            ref={settingsGearRef}
+            className="icon-button"
+            onClick={openSettings}
+            aria-label="Open server settings"
+          >
+            <Settings2 size={19} />
+          </button>
+        </div>
       </header>
 
       {view === "insights" ? (
@@ -2121,221 +2682,13 @@ export default function App() {
             termRecords={termRecords}
             consent={insightConsent}
             onConsentChange={applyInsightConsent}
-            issue={insightsIssue}
-            onDismissIssue={() => setInsightsIssue(undefined)}
+            notices={insightNotices}
+            onDismissNotice={dismissInsightNotice}
             onReset={resetInsights}
           />
         </main>
       ) : (
-        <main className="workspace">
-          <section className="capture-pane">
-            <div className="capture-copy">
-              <p className="eyebrow">LOCAL DICTATION</p>
-              <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
-              <p className="lede">
-                Your recording is saved locally, sent only to your selected server, and shown
-                exactly as the model returned it.
-              </p>
-            </div>
-
-            <div className={`recorder ${recording ? "is-recording" : ""}`}>
-              <div className="waveform" aria-hidden="true">
-                {levels.map((level, index) => (
-                  <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
-                ))}
-              </div>
-              <button
-                className="record-button"
-                onClick={() => void toggleRecording()}
-                disabled={takePhase === "starting" || takePhase === "stopping"}
-                aria-label={recording ? "Stop recording" : "Start recording"}
-              >
-                <span className="record-button-inner">
-                  {recording ? (
-                    <span className="stop-glyph" />
-                  ) : (
-                    <Mic size={34} strokeWidth={1.7} />
-                  )}
-                </span>
-              </button>
-              <div className="record-meta">
-                <span>
-                  {recording
-                    ? formatDuration(elapsedMs)
-                    : busy
-                      ? "Transcribing…"
-                      : "Click to record"}
-                </span>
-                <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
-              </div>
-            </div>
-
-            {recording && streamStatus && (
-              <div className={`live-stream ${streamStatus.state}`}>
-                {streamStatus.state === "live" && (
-                  <p className="live-text" aria-live="polite">
-                    {partialText || <em>Listening for the first words…</em>}
-                  </p>
-                )}
-                {streamStatus.state === "connecting" && (
-                  <p className="live-note">
-                    <Radio size={15} /> Connecting live transcription…
-                  </p>
-                )}
-                {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
-                  <p className="live-note" role="status">
-                    <CircleAlert size={15} />
-                    {streamStatus.detail ?? "Live transcription is unavailable."} The recording is
-                    still saved and will be transcribed when you stop.
-                  </p>
-                )}
-              </div>
-            )}
-
-            <button
-              className="import-button"
-              aria-describedby="import-format"
-              onClick={() => fileRef.current?.click()}
-            >
-              <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
-            </button>
-            <span id="import-format" className="visually-hidden">
-              WAV files only
-            </span>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".wav,audio/wav,audio/x-wav"
-              hidden
-              onChange={(event) => void importAudio(event.target.files?.[0])}
-            />
-
-            {(error || unsavedWavs.length > 0) && (
-              <div className="error-banner" role="alert">
-                <CircleAlert size={18} />
-                <div>
-                  <strong>{error ? "Action failed" : "Recording not saved"}</strong>
-                  {error && <span>{error}</span>}
-                  <small>
-                    {unsavedWavs.length > 0
-                      ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
-                      : "Starling keeps audio in history after a successful local save."}
-                  </small>
-                </div>
-                {unsavedWavs.length > 0 && (
-                  <div className="recovery-actions">
-                    {unsavedWavs.map((capture, index) => (
-                      <button
-                        key={capture.id}
-                        className="recover-audio"
-                        onClick={() => exportUnsavedAudio(capture.id)}
-                      >
-                        Download WAV {index + 1}
-                      </button>
-                    ))}
-                    <button className="recover-audio" onClick={discardUnsavedAudio}>
-                      Discard unsaved
-                    </button>
-                  </div>
-                )}
-                {unsavedWavs.length === 0 && (
-                  <button onClick={() => setError(undefined)} aria-label="Dismiss error">
-                    <X size={16} />
-                  </button>
-                )}
-              </div>
-            )}
-          </section>
-
-          <aside className="history-pane">
-            <div className="history-head">
-              <div>
-                <p className="eyebrow">ARCHIVE</p>
-                <h2>Recent takes</h2>
-              </div>
-              <Clock3 size={18} />
-            </div>
-            {activeThread && (
-              <div className="thread-strip">
-                <span>Active thread: {activeThread.slice(0, 8)}</span>
-                <button onClick={startNewThread}>start new thread</button>
-              </div>
-            )}
-            <div className="history-list">
-              {damaged.length > 0 && (
-                <div className="history-warning" role="status">
-                  <CircleAlert size={16} />
-                  <div>
-                    <strong>
-                      {damaged.length === 1
-                        ? "1 saved recording could not be read"
-                        : `${damaged.length} saved recordings could not be read`}
-                    </strong>
-                    <small>
-                      Damaged entries are kept until you delete them; the list below shows every
-                      recording that is still readable.
-                    </small>
-                    <div className="recovery-actions">
-                      {damaged.map((entry, index) => {
-                        const wav = invalidSessionWav(entry);
-
-                        return (
-                          <span key={`${entry.id}-${index}`} className="damaged-entry">
-                            {wav ? (
-                              <button
-                                className="recover-audio"
-                                onClick={() => exportDamagedAudio(index)}
-                              >
-                                Download WAV {index + 1}
-                              </button>
-                            ) : null}
-                            {entry.key !== undefined ? (
-                              <button
-                                className="recover-audio dismiss-damaged"
-                                onClick={() => void dismissDamagedEntry(index)}
-                                aria-label={`Delete damaged recording ${index + 1}`}
-                              >
-                                Delete entry {index + 1}
-                              </button>
-                            ) : null}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-              )}
-              {sessions.length === 0 && (
-                <div className="history-empty">
-                  Your recordings will collect here, ready to retry or export.
-                </div>
-              )}
-              {sessions.map((session) => (
-                <button
-                  key={session.id}
-                  className={`history-row ${session.id === selectedId ? "active" : ""}`}
-                  onClick={() => setSelectedId(session.id)}
-                  aria-label={historyRowLabel(session)}
-                >
-                  <span className={`take-state ${session.status}`}>
-                    {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
-                  </span>
-                  <span className="take-copy">
-                    <strong>{sessionTitle(session)}</strong>
-                    <small>
-                      {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
-                      {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
-                    </small>
-                    {session.threadId && (
-                      <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
-                    )}
-                  </span>
-                  <ChevronRight size={16} />
-                </button>
-              ))}
-            </div>
-          </aside>
-        </main>
+        renderCaptureWorkspace()
       )}
 
       {selected && (

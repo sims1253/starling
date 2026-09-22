@@ -2,8 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { TOKENIZER_ID } from "./insightEmitter";
 import { DEFAULT_INSIGHT_CONSENT } from "./insightConsent";
-import { captureTerms, type InsightTermRecord } from "./insightTerms";
-import type { InsightEvent, RecognitionSelectedEvent } from "./insightEvents";
+import { captureTerms, type InsightTermKind, type InsightTermRecord } from "./insightTerms";
+import type { CaptureDeletedEvent, InsightEvent, RecognitionSelectedEvent } from "./insightEvents";
 import {
   recurringPhraseCards,
   vocabularyPatternCards,
@@ -16,7 +16,9 @@ import {
  * they cite the takes and occurrences counts they rest on and nothing
  * else — each kind is gated by its own consent, exclusions remove labels,
  * windows bound the population, and deleting a take's aggregates removes
- * its contribution from every card.
+ * its contribution from every card. Per-kind denominators rest on the
+ * record's derived_kinds stamp: an analyzed-but-empty take counts, a
+ * purged, never-granted or legacy-unstamped take is an unknown.
  */
 
 const NOW = Date.parse("2026-09-21T12:00:00Z");
@@ -26,14 +28,17 @@ const HOUR_MS = 60 * 60 * 1000;
 function recordOf(
   captureId: string,
   text: string,
-  options: { readonly hoursAgo?: number } = {},
+  options: {
+    readonly hoursAgo?: number;
+    readonly kinds?: ReadonlySet<InsightTermKind>;
+  } = {},
 ): InsightTermRecord {
   return {
     schema_version: 1,
     capture_id: captureId,
     occurred_at: new Date(NOW - (options.hoursAgo ?? 1) * HOUR_MS).toISOString(),
     tokenizer: TOKENIZER_ID,
-    ...captureTerms(text),
+    ...captureTerms(text, { kinds: options.kinds }),
   };
 }
 
@@ -50,6 +55,16 @@ function recognitionOf(captureId: string, hoursAgo = 1): RecognitionSelectedEven
     raw_words: 5,
     tokenizer: TOKENIZER_ID,
     post_stop_ready_ms: null,
+  };
+}
+
+function deletionOf(captureId: string): CaptureDeletedEvent {
+  return {
+    schema_version: 1,
+    event_id: `cd-${captureId}`,
+    capture_id: captureId,
+    occurred_at: new Date(NOW - 30 * 60 * 1000).toISOString(),
+    type: "capture_deleted",
   };
 }
 
@@ -77,14 +92,14 @@ describe("recurringPhraseCards", () => {
     );
   });
 
-  it("counts only takes that retained this kind's aggregates in the denominator", () => {
-    // take-3 kept terms but no phrases (recorded under a narrower grant, or
-    // emptied by a withdrawal purge): it is an unknown for phrase cards,
-    // not a negative — the denominator must not count it.
+  it("counts only takes stamped as analyzed for this kind in the denominator", () => {
+    // take-3 was written under a narrower grant (terms only, per its stamp):
+    // it is an unknown for phrase cards, not a negative — the denominator
+    // must not count it.
     const records = [
       recordOf("take-1", "deploy the server and deploy the server again"),
       recordOf("take-2", "please deploy the server once more"),
-      { ...recordOf("take-3", "unrelated solitary vocabulary"), phrases: [] },
+      recordOf("take-3", "unrelated solitary vocabulary", { kinds: new Set(["terms"]) }),
     ];
 
     const card = recurringPhraseCards(records, { now: NOW }).find(
@@ -95,6 +110,47 @@ describe("recurringPhraseCards", () => {
     expect(card?.description).toBe(
       `"deploy the server" appeared in 2 of 2 analyzed takes, 3 times in the last 14 days`,
     );
+  });
+
+  it("counts an analyzed take that yielded zero of the kind", () => {
+    // take-3 stamped phrases but the transcript produced no phrases: a real
+    // zero, not an unknown — excluding it would understate the denominator
+    // and overstate recurrence.
+    const records = [
+      recordOf("take-1", "deploy the server and deploy the server again"),
+      recordOf("take-2", "please deploy the server once more"),
+      { ...recordOf("take-3", "a"), phrases: [] },
+    ];
+
+    const card = recurringPhraseCards(records, { now: NOW }).find(
+      (candidate) => candidate.label === "deploy the server",
+    );
+
+    expect(card?.windowTakes).toBe(3);
+    expect(card?.description).toContain("2 of 3 analyzed takes");
+  });
+
+  it("counts a legacy unstamped record only through its label evidence", () => {
+    // A record written before derived_kinds existed decodes fine but says
+    // nothing about what it analyzed. Labels of a kind present are the
+    // evidence it was analyzed for that kind (the writer derives only
+    // granted kinds); absent labels stay an unknown — no guessing.
+    const { derived_kinds: _stamp, ...legacy } = recordOf("take-3", "deploy the server");
+    const { derived_kinds: _noStamp, ...emptyLegacy } = recordOf("take-4", "quiet");
+
+    const records = [
+      recordOf("take-1", "deploy the server and deploy the server again"),
+      recordOf("take-2", "please deploy the server once more"),
+      legacy,
+      emptyLegacy,
+    ];
+
+    const card = recurringPhraseCards(records, { now: NOW }).find(
+      (candidate) => candidate.label === "deploy the server",
+    );
+
+    expect(card?.windowTakes).toBe(3);
+    expect(card?.takes).toBeLessThanOrEqual(card?.windowTakes ?? 0);
   });
 
   it("requires the phrase to recur across takes, not within one", () => {
@@ -223,5 +279,99 @@ describe("voicePanel consent gating", () => {
 
     expect(vocabularyOnly.phraseCards).toEqual([]);
     expect(vocabularyOnly.vocabularyCards.length).toBeGreaterThan(0);
+  });
+});
+
+describe("voicePanel denominators", () => {
+  it("drops deleted takes from windowTakes like every other surface", () => {
+    const records = [
+      recordOf("take-1", "deploy the server"),
+      recordOf("take-2", "rotate the keys"),
+      recordOf("take-9", "deploy the server"),
+    ];
+
+    const deleted: readonly InsightEvent[] = [
+      recognitionOf("take-1"),
+      recognitionOf("take-2"),
+      recognitionOf("take-9"),
+      deletionOf("take-9"),
+    ];
+
+    const live: readonly InsightEvent[] = [
+      recognitionOf("take-1"),
+      recognitionOf("take-2"),
+      recognitionOf("take-9"),
+    ];
+
+    // The tombstone keeps take-9's recognition event in the log; the metric
+    // contract drops the capture everywhere, and so must this denominator —
+    // a deleted take cannot survive in a number.
+    expect(voicePanel(live, records, DEFAULT_INSIGHT_CONSENT, { now: NOW }).windowTakes).toBe(3);
+    expect(voicePanel(deleted, records, DEFAULT_INSIGHT_CONSENT, { now: NOW }).windowTakes).toBe(2);
+
+    // The dropped capture cannot be "analyzed" either.
+    expect(voicePanel(deleted, records, DEFAULT_INSIGHT_CONSENT, { now: NOW }).analyzedTakes).toBe(
+      2,
+    );
+  });
+
+  it("drops a deleted capture's still-present record from the per-kind cards too", () => {
+    // The two stores delete on separate chains: the event tombstone may
+    // already dominate while the term record still sits in the mirror (its
+    // deletion in flight, or failed with a notice). The card denominators
+    // must agree with windowTakes about that capture instead of counting
+    // a take every other surface has dropped.
+    const records = [
+      recordOf("take-1", "deploy the server and deploy the server again"),
+      recordOf("take-2", "please deploy the server once more"),
+    ];
+
+    const live: readonly InsightEvent[] = [recognitionOf("take-1"), recognitionOf("take-2")];
+    const deleted: readonly InsightEvent[] = [...live, deletionOf("take-2")];
+    const consent = { recurringPhrases: true, vocabularyPatterns: false };
+
+    const before = voicePanel(live, records, consent, { now: NOW });
+    const after = voicePanel(deleted, records, consent, { now: NOW });
+
+    expect(before.phraseCards.find((card) => card.label === "deploy the server")?.takes).toBe(2);
+
+    expect(after.windowTakes).toBe(1);
+    expect(after.analyzedTakes).toBe(1);
+    // The still-present record of the deleted take contributes neither a
+    // denominator share nor its labels: the phrase no longer recurs.
+    expect(labelsOf(after.phraseCards)).toEqual([]);
+  });
+
+  it("counts analyzedTakes by the derived_kinds stamp, not by label lists", () => {
+    const events: readonly InsightEvent[] = [
+      recognitionOf("take-1"),
+      recognitionOf("take-2"),
+      recognitionOf("take-3"),
+    ];
+
+    const stamped = [
+      recordOf("take-1", "deploy the server"),
+      // Analyzed under both grants but the transcript yielded nothing: a
+      // real zero for both kinds, still an analyzed take.
+      { ...recordOf("take-3", "solo"), terms: [], phrases: [] },
+    ];
+
+    expect(voicePanel(events, stamped, DEFAULT_INSIGHT_CONSENT, { now: NOW }).analyzedTakes).toBe(
+      2,
+    );
+
+    // A legacy unstamped record counts only through label evidence:
+    // one holding aggregates joins the coverage, an empty one does not.
+    const { derived_kinds: _stamp, ...legacy } = recordOf("take-2", "rotate the keys");
+    const { derived_kinds: _noStamp, ...emptyLegacy } = recordOf("take-4", "quiet");
+
+    expect(
+      voicePanel(events, [...stamped, legacy], DEFAULT_INSIGHT_CONSENT, { now: NOW }).analyzedTakes,
+    ).toBe(3);
+
+    expect(
+      voicePanel(events, [...stamped, emptyLegacy], DEFAULT_INSIGHT_CONSENT, { now: NOW })
+        .analyzedTakes,
+    ).toBe(2);
   });
 });

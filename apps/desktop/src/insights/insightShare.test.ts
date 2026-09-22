@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { recurringPhraseCards } from "./insightVoice";
+import { formatDayKey } from "./insightFormat";
 import {
   DEFAULT_SHARE_INCLUDES,
   SHARE_CARD_TITLE,
   buildShareCard,
+  milestoneInRange,
   renderShareCard,
   type ShareCardField,
 } from "./insightShare";
@@ -26,6 +28,7 @@ const TOP_PHRASE = recurringPhraseCards(
       tokenizer: "uax29-intl-v1",
       terms: [],
       phrases: [{ text: "deploy the server", count: 3 }],
+      derived_kinds: ["phrases"],
     },
     {
       schema_version: 1,
@@ -34,6 +37,7 @@ const TOP_PHRASE = recurringPhraseCards(
       tokenizer: "uax29-intl-v1",
       terms: [],
       phrases: [{ text: "deploy the server", count: 1 }],
+      derived_kinds: ["phrases"],
     },
   ],
   { now: Date.parse("2026-09-21T12:00:00Z") },
@@ -91,20 +95,63 @@ describe("buildShareCard", () => {
 });
 
 describe("renderShareCard", () => {
-  it("renders title, date range, lines and definitions, noting withholdings", () => {
+  it("renders title, date range, lines and definitions — nothing about withholdings", () => {
     const text = renderShareCard(buildShareCard(INPUT));
 
     expect(text.startsWith(SHARE_CARD_TITLE)).toBe(true);
-    expect(text).toContain("2026-09-14 – 2026-09-21");
+    // The range reads through the shared day formatter, like every other
+    // user-facing surface — asserted against the same helper so the test
+    // stays locale-independent, and with the years a saved card must state.
+    expect(text).toContain(
+      `${formatDayKey("2026-09-14", { withYear: true })} – ${formatDayKey("2026-09-21", {
+        withYear: true,
+      })}`,
+    );
     expect(text).toContain("312 words recognized from speech");
     expect(text).toContain("silence included");
-    expect(text).toContain("Withheld by default: takes, topPhrase");
     expect(text).not.toContain("deploy the server");
+    // The withheld list is preview-only metadata: the copied/saved artifact
+    // must not disclose that content-derived data exists and was withheld.
+    expect(text).not.toContain("Withheld");
+  });
+
+  it("keeps the withheld list on the card for the preview to show", () => {
+    const card = buildShareCard(INPUT);
+
+    expect(card.withheld).toContain("takes");
+    expect(card.withheld).toContain("topPhrase");
   });
 
   it("is deterministic for the same card", () => {
     const card = buildShareCard(INPUT);
 
     expect(renderShareCard(card)).toBe(renderShareCard(card));
+  });
+});
+
+describe("milestoneInRange", () => {
+  const milestones = [
+    { label: "First voice note", achievedOnDay: "2026-08-02" },
+    { label: "1,000 words recognized from speech", achievedOnDay: "2026-09-16" },
+  ];
+
+  it("cites the latest milestone achieved inside the card's range", () => {
+    expect(milestoneInRange(milestones, "2026-09-14", "2026-09-21")).toBe(
+      "1,000 words recognized from speech",
+    );
+  });
+
+  it("states no milestone when every one predates the range", () => {
+    // A milestone from months ago must not ride on a card labeled "this week".
+    expect(milestoneInRange(milestones, "2026-09-20", "2026-09-21")).toBeUndefined();
+    expect(milestoneInRange([], "2026-09-14", "2026-09-21")).toBeUndefined();
+  });
+
+  it("states no milestone dated after the range's last day", () => {
+    // Clock skew or a future-dated day key must not put a "future" milestone
+    // on a card whose range ends before it.
+    const future = [{ label: "Tomorrow's milestone", achievedOnDay: "2026-09-22" }];
+
+    expect(milestoneInRange(future, "2026-09-14", "2026-09-21")).toBeUndefined();
   });
 });
