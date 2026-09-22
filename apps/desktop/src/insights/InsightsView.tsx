@@ -106,6 +106,12 @@ function plural(count: number, singularWord: string, pluralWord = `${singularWor
   return `${count} ${count === 1 ? singularWord : pluralWord}`;
 }
 
+/** The local settings this view persists directly, each with its own refusal slot. */
+type SettingKey = "baseline" | "exclusion";
+
+/** Deterministic render order for the refusal slots. */
+const SETTINGS_ORDER: readonly SettingKey[] = ["exclusion", "baseline"];
+
 /** The one honest placeholder: absence of data, stated as absence. */
 function NotEnoughData({ note }: { readonly note: string }) {
   return (
@@ -133,10 +139,19 @@ export function InsightsView({
 
   const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => readExclusions(localStorage));
 
-  // Set when local settings refused a save (an exclusion or the typing
-  // baseline): the value still holds for this session, and saying so is the
-  // honest alternative to letting "kept" silently expire with the app.
-  const [settingsRefusalNotice, setSettingsRefusalNotice] = useState<string>();
+  // One refusal slot per setting that can be refused: a refused exclusion
+  // and a refused baseline save are both visible at once, and each clears
+  // the moment its own setting saves again — "kept for this session only"
+  // must stop being said the moment it stops being true.
+  const [settingsRefusals, setSettingsRefusals] = useState<
+    Readonly<Record<SettingKey, string | undefined>>
+  >(() => ({ baseline: undefined, exclusion: undefined }));
+
+  function noteSettingsSave(which: SettingKey, refused: string | undefined) {
+    setSettingsRefusals((current) =>
+      current[which] === refused ? current : { ...current, [which]: refused },
+    );
+  }
 
   const [shareIncludes, setShareIncludes] = useState<ReadonlySet<ShareCardField>>(
     () => new Set(DEFAULT_SHARE_INCLUDES),
@@ -155,15 +170,25 @@ export function InsightsView({
 
   const [goalIssue, setGoalIssue] = useState<string>();
 
+  // True while the goal input has focus — an in-progress draft exists that
+  // no external consent change is allowed to clobber.
+  const [goalFocused, setGoalFocused] = useState(false);
+
   // The committed goal this draft was last synced from. When the consent
   // changes away from this input (Reset, a restored value), the draft
   // follows during render — the documented adjust-state-on-prop-change
-  // pattern, one render, no effect.
+  // pattern, one render, no effect — but only while nobody is typing in
+  // the field: a focused draft is the user's, and their blur-commit decides
+  // what lands.
   const [goalSyncedTo, setGoalSyncedTo] = useState(consent.weeklyGoalWords);
 
   if (consent.weeklyGoalWords !== goalSyncedTo) {
     setGoalSyncedTo(consent.weeklyGoalWords);
-    setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
+
+    if (!goalFocused) {
+      setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
+      setGoalIssue(undefined);
+    }
   }
 
   const parsedBaseline = Number.parseInt(baselineDraft, 10);
@@ -198,10 +223,12 @@ export function InsightsView({
 
     try {
       localStorage.setItem(TYPING_BASELINE_KEY, value);
+      noteSettingsSave("baseline", undefined);
     } catch {
       // Storage refused (quota, privacy mode); the baseline holds for this
       // session only and the next mount starts from what was last saved.
-      setSettingsRefusalNotice(
+      noteSettingsSave(
+        "baseline",
         "Local settings storage refused the save — the typing baseline is kept for this session only.",
       );
     }
@@ -212,7 +239,8 @@ export function InsightsView({
 
     next.add(label);
     setExcluded(next);
-    setSettingsRefusalNotice(
+    noteSettingsSave(
+      "exclusion",
       writeExclusions(localStorage, next)
         ? undefined
         : "Local settings storage refused the save — the exclusion is kept for this session only.",
@@ -282,14 +310,15 @@ export function InsightsView({
 
     const nowMs = new Date().getTime();
     const rangeStartDay = localDayKey(nowMs - WEEK_MS, timezone);
+    const rangeEndDay = localDayKey(nowMs, timezone);
     const milestones = celebrated.ok ? celebrated.value.milestones : [];
-    const milestone = milestoneInRange(milestones, rangeStartDay);
+    const milestone = milestoneInRange(milestones, rangeStartDay, rangeEndDay);
     const topPhrase = voice.ok ? voice.value.phraseCards[0] : undefined;
 
     return buildShareCard(
       {
         rangeStartDay,
-        rangeEndDay: localDayKey(nowMs, timezone),
+        rangeEndDay,
         words: week.value.recognized_words,
         minutes: week.value.captured_seconds / 60,
         takes: week.value.unique_takes,
@@ -637,7 +666,11 @@ export function InsightsView({
                 inputMode="numeric"
                 value={goalDraft}
                 onChange={(event) => setGoalDraft(event.target.value)}
-                onBlur={commitGoalDraft}
+                onFocus={() => setGoalFocused(true)}
+                onBlur={() => {
+                  setGoalFocused(false);
+                  commitGoalDraft();
+                }}
                 placeholder="no goal"
                 aria-describedby={goalIssue === undefined ? undefined : "weekly-goal-issue"}
               />
@@ -649,11 +682,15 @@ export function InsightsView({
             </label>
           </div>
 
-          {settingsRefusalNotice !== undefined && (
-            <p className="storage-issue" role="status">
-              {settingsRefusalNotice}
-            </p>
-          )}
+          {SETTINGS_ORDER.map((which) => {
+            const notice = settingsRefusals[which];
+
+            return notice === undefined ? null : (
+              <p key={which} className="storage-issue" role="status">
+                {notice}
+              </p>
+            );
+          })}
 
           {!consent.recurringPhrases && !consent.vocabularyPatterns ? (
             <NotEnoughData note="no content-derived analysis is enabled — enable one above; nothing is read or retained while both are off" />

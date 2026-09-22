@@ -148,18 +148,23 @@ export interface ShareMilestone {
 
 /**
  * The latest milestone achieved inside the card's date range, when any. The
- * card states a seven-day range, so every claim must rest on that range: a
- * milestone from months ago is not the card's to state inside "this week".
+ * card states a seven-day range, so every claim must rest on that range:
+ * a milestone from months ago is not the card's to state inside "this
+ * week", and neither is one dated after the range's last day (clock skew
+ * or a future-dated day key) — the card cites only what the range covers.
  * The list is oldest-first, so the last in-range entry is the latest.
  */
 export function milestoneInRange(
   milestones: readonly ShareMilestone[],
   rangeStartDay: string,
+  rangeEndDay: string,
 ): string | undefined {
   let inRange: ShareMilestone | undefined;
 
   for (const milestone of milestones) {
-    if (milestone.achievedOnDay >= rangeStartDay) inRange = milestone;
+    if (milestone.achievedOnDay >= rangeStartDay && milestone.achievedOnDay <= rangeEndDay) {
+      inRange = milestone;
+    }
   }
 
   return inRange?.label;

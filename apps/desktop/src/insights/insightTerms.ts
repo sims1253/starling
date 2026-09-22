@@ -19,10 +19,16 @@ import { DEFAULT_INSIGHT_CONSENT, consentedTermKinds, type InsightConsent } from
  * small integer counts, sorted and deduplicated. A whole transcript, a
  * selection, a path or a secret does not fit the shape, so a poisoned
  * record is invalid before it can be persisted — the same discipline the
- * event schema enforces with closed branches.
+ * event schema enforces with closed branches. Each record also stamps
+ * `derived_kinds`, the kinds its write actually derived, so a later reader
+ * can tell an analyzed-but-empty take from one nobody analyzed — a
+ * distinction an empty label list alone cannot make.
  */
 
 export const INSIGHT_TERM_SCHEMA_VERSION = 1;
+
+/** The two content-derived kinds a record can retain aggregates of. */
+export type InsightTermKind = "terms" | "phrases";
 
 /**
  * Per-kind aggregate bound, sized for realistic long takes rather than
@@ -109,6 +115,15 @@ export interface InsightTermRecord {
   readonly tokenizer: string;
   readonly terms: readonly TermCount[];
   readonly phrases: readonly TermCount[];
+  /**
+   * The kinds this record actually derived and still retains, stamped at
+   * write time from the granted kinds and narrowed by withdrawal purges.
+   * A kind listed here with an empty label list is an analyzed take that
+   * yielded nothing of that kind — a real zero, not an unknown. A record
+   * without the stamp (pre-`derived_kinds` dev data) is an unknown for
+   * every per-kind denominator: readers must not guess what it analyzed.
+   */
+  readonly derived_kinds?: readonly InsightTermKind[];
 }
 
 export const InsightTermRecordSchema = Schema.Struct({
@@ -118,6 +133,7 @@ export const InsightTermRecordSchema = Schema.Struct({
   tokenizer: SafeTokenSchema,
   terms: TermCountsSchema,
   phrases: PhraseCountsSchema,
+  derived_kinds: Schema.optional(Schema.Array(Schema.Literals(["terms", "phrases"]))),
 });
 
 /**
@@ -253,7 +269,7 @@ function phraseTokens(tokens: readonly string[]): readonly string[] {
 
 export interface CaptureTermsOptions {
   /** Which kinds to derive; a kind the consent does not grant is left empty. */
-  readonly kinds?: ReadonlySet<"terms" | "phrases">;
+  readonly kinds?: ReadonlySet<InsightTermKind>;
 }
 
 /**
@@ -267,12 +283,15 @@ export interface CaptureTermsOptions {
  * deterministically to its most frequent entries rather than refused, so
  * deriving aggregates can never fail the take, and the truncation only
  * ever understates recurrence — the kept counts stay exact.
+ *
+ * The result names the kinds it derived in `derived_kinds`, so a stored
+ * record can always say which kinds an empty list is an honest zero for.
  */
 export function captureTerms(
   transcriptText: string,
   options: CaptureTermsOptions = {},
 ): Omit<InsightTermRecord, "schema_version" | "capture_id" | "occurred_at" | "tokenizer"> {
-  const kinds = options.kinds ?? new Set<"terms" | "phrases">(["terms", "phrases"]);
+  const kinds = options.kinds ?? new Set<InsightTermKind>(["terms", "phrases"]);
   const wantsTerms = kinds.has("terms");
   const wantsPhrases = kinds.has("phrases");
   const tokens = wantsTerms || wantsPhrases ? lexicalTokens(transcriptText) : [];
@@ -280,7 +299,7 @@ export function captureTerms(
   const terms = wantsTerms ? boundedEntries(countAll(tokens)) : [];
   const phrases = wantsPhrases ? boundedEntries(countAll(phraseTokens(tokens))) : [];
 
-  return { terms, phrases };
+  return { terms, phrases, derived_kinds: [...kinds].sort() };
 }
 
 /**
@@ -289,17 +308,19 @@ export function captureTerms(
  * second record), refuses tombstoned captures (a deleted take's phrases
  * cannot be resurrected by a stale re-record), and `tombstone` removes the
  * record and remembers the deletion. `purgeKinds` implements consent
- * withdrawal: the withdrawn kind's data is deleted from every record.
+ * withdrawal: the withdrawn kind's data is deleted from every record that
+ * still held or stamped it.
  *
  * The mutating methods resolve with what they changed — the written record,
- * the purged records — so a caller holding a mirror of `load()` can apply
- * the delta without re-reading the store on every write.
+ * the purged records and only those — so a caller holding a mirror of
+ * `load()` can apply the delta without re-reading the store on every write
+ * and without re-upserting records nothing touched.
  */
 export interface InsightTermStore {
   load(): Promise<InsightTermLog>;
   put(record: InsightTermRecord): Promise<InsightTermRecord>;
   tombstone(captureId: string): Promise<void>;
-  purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]>;
+  purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]>;
   clear(): Promise<void>;
 }
 
@@ -307,6 +328,51 @@ function assertConforming(record: InsightTermRecord): void {
   if (Option.isNone(decodeInsightTermRecord(record))) {
     throw new InsightTermValidationError(insightTermRecordProblems(record).join("; "));
   }
+}
+
+/** Whether a withdrawal of `kind` would change this record at all. */
+function purgeTouches(record: InsightTermRecord, kind: InsightTermKind): boolean {
+  const labels = kind === "terms" ? record.terms : record.phrases;
+
+  return labels.length > 0 || record.derived_kinds?.includes(kind) === true;
+}
+
+/**
+ * The kinds a record's retained aggregates prove it derived — the only
+ * evidence an unstamped (pre-`derived_kinds`) record has. Empty lists prove
+ * nothing either way, so they stamp nothing.
+ */
+function evidencedKinds(record: InsightTermRecord): readonly InsightTermKind[] {
+  return (["terms", "phrases"] as const).filter((kind) =>
+    kind === "terms" ? record.terms.length > 0 : record.phrases.length > 0,
+  );
+}
+
+/**
+ * One record after a withdrawal purge of `kinds`: the withdrawn kinds'
+ * aggregates are deleted and their stamp is removed from `derived_kinds` —
+ * a purged kind becomes an unknown again, not a zero. A stamped record
+ * narrows its own stamp; an unstamped one is stamped from what the purge
+ * left behind, so the withdrawal never erases provenance for a kind the
+ * record still holds data for. Undefined when the purge changes nothing
+ * (neither retained nor stamped for any of the kinds), so a store can skip
+ * the write and keep its returned delta to what actually changed.
+ */
+function purgedRecord(
+  record: InsightTermRecord,
+  kinds: ReadonlySet<InsightTermKind>,
+): InsightTermRecord | undefined {
+  if (![...kinds].some((kind) => purgeTouches(record, kind))) return undefined;
+
+  const emptied: InsightTermRecord = {
+    ...record,
+    terms: kinds.has("terms") ? [] : record.terms,
+    phrases: kinds.has("phrases") ? [] : record.phrases,
+  };
+
+  const retained = emptied.derived_kinds ?? evidencedKinds(emptied);
+
+  return { ...emptied, derived_kinds: retained.filter((kind) => !kinds.has(kind)) };
 }
 
 export class MemoryInsightTermStore implements InsightTermStore {
@@ -341,15 +407,13 @@ export class MemoryInsightTermStore implements InsightTermStore {
     this.tombstones.add(captureId);
   }
 
-  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]> {
+  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]> {
     const updated: InsightTermRecord[] = [];
 
     for (const [captureId, record] of this.records) {
-      const purged: InsightTermRecord = {
-        ...record,
-        terms: kinds.has("terms") ? [] : record.terms,
-        phrases: kinds.has("phrases") ? [] : record.phrases,
-      };
+      const purged = purgedRecord(record, kinds);
+
+      if (purged === undefined) continue;
 
       this.records.set(captureId, purged);
       updated.push(purged);
@@ -437,8 +501,9 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
     const database = await this.database();
 
     await new Promise<void>((resolve, reject) => {
-      // The tombstone refusal settles the promise itself; onabort must not
-      // race a second, generic rejection onto the same settled promise.
+      // The tombstone refusal settles the promise itself; onabort/onerror
+      // must not race a second, generic rejection onto the same settled
+      // promise (engines may fire either after an abort()).
       let refused: InsightTermTombstoneError | undefined;
 
       const transaction = database.transaction(
@@ -467,8 +532,13 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
       };
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = () =>
+
+      transaction.onerror = () => {
+        if (refused !== undefined) return;
+
         reject(new Error(`an insight term store put failed: ${transaction.error?.message ?? ""}`));
+      };
+
       transaction.onabort = () => {
         if (refused !== undefined) return;
 
@@ -502,15 +572,16 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
 
   /**
    * Withdrawal is one atomic read-modify-write: a single readwrite
-   * transaction walks the records store with a cursor and rewrites each
-   * conforming record in place, so a write that lands mid-purge (a
-   * recognition settlement from the serialized chain, another window) can
-   * never be clobbered by a stale pre-purge snapshot — the deleted kind is
-   * gone from every record the transaction actually saw, and nothing else
-   * changes. Damaged records are quarantined, not repaired: the cursor skips
-   * what does not decode, exactly like `load()` would.
+   * transaction walks the records store with a cursor and rewrites exactly
+   * the conforming records the withdrawal changes, in place, so a write
+   * that lands mid-purge (a recognition settlement from the serialized
+   * chain, another window) can never be clobbered by a stale pre-purge
+   * snapshot — the deleted kind is gone from every record the transaction
+   * actually saw, and nothing else changes. Damaged records are
+   * quarantined, not repaired: the cursor skips what does not decode,
+   * exactly like `load()` would.
    */
-  async purgeKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<readonly InsightTermRecord[]> {
+  async purgeKinds(kinds: ReadonlySet<InsightTermKind>): Promise<readonly InsightTermRecord[]> {
     const database = await this.database();
 
     return new Promise((resolve, reject) => {
@@ -526,14 +597,16 @@ export class IndexedDbInsightTermStore implements InsightTermStore {
         const decoded = decodeInsightTermRecord(cursor.value);
 
         if (Option.isSome(decoded)) {
-          const purged: InsightTermRecord = {
-            ...decoded.value,
-            terms: kinds.has("terms") ? [] : decoded.value.terms,
-            phrases: kinds.has("phrases") ? [] : decoded.value.phrases,
-          };
+          const purged = purgedRecord(decoded.value, kinds);
 
-          cursor.update(purged);
-          updated.push(purged);
+          // Only records the withdrawal actually changed are rewritten and
+          // returned — a second withdrawal of the same kind (or a record
+          // that never held or stamped it) is a no-op, so the delta callers
+          // apply stays honest and the store keeps its writes minimal.
+          if (purged !== undefined) {
+            cursor.update(purged);
+            updated.push(purged);
+          }
         }
 
         cursor.continue();
@@ -607,11 +680,20 @@ export interface RecognitionTermsInput {
    * The capture's finalization instant — its E28 capture_finalized event's
    * occurred_at — when the caller knows it. The record is anchored to the
    * take's own time so a delayed retranscription cannot move a take across
-   * a card-window boundary; the write-time clock is only the fallback for a
-   * finalization event still in flight. Must be a schema-shaped timestamp:
-   * the store's validation boundary rejects anything else.
+   * a card-window boundary. Only a schema-shaped timestamp anchors; the
+   * write-time clock is the fallback for a finalization event still in
+   * flight or a value that is not schema-shaped — an anchor must never
+   * cost the write its aggregates.
    */
   readonly finalizedAt?: string;
+}
+
+/**
+ * Only a schema-shaped timestamp may anchor a record; anything else falls
+ * back to the write-time clock instead of failing the store's validation.
+ */
+function anchorableFinalizedAt(value: string | undefined): string | undefined {
+  return value !== undefined && TIMESTAMP_PATTERN.test(value) ? value : undefined;
 }
 
 /**
@@ -689,7 +771,9 @@ export class InsightTermRecorder {
    * withdrawKinds, deletion by captureDeleted, and this path never invents
    * either. Writes serialize on a chain so store order follows emission
    * order, and the resolved write names exactly what changed so the caller's
-   * mirror can apply it without re-reading the store.
+   * mirror can apply it without re-reading the store. The record stamps the
+   * granted kinds (`derived_kinds`), so a later reader can tell an
+   * analyzed-but-empty take from one nobody analyzed.
    */
   async recognitionSelected(input: RecognitionTermsInput): Promise<InsightTermWrite> {
     const kinds = consentedTermKinds(this.consent());
@@ -701,10 +785,11 @@ export class InsightTermRecorder {
     const record: InsightTermRecord = {
       schema_version: INSIGHT_TERM_SCHEMA_VERSION,
       capture_id: input.captureId,
-      occurred_at: input.finalizedAt ?? this.now().toISOString(),
+      occurred_at: anchorableFinalizedAt(input.finalizedAt) ?? this.now().toISOString(),
       tokenizer: TOKENIZER_ID,
       terms: derived.terms,
       phrases: derived.phrases,
+      derived_kinds: derived.derived_kinds,
     };
 
     await this.enqueue(() => this.store.put(record));
@@ -720,7 +805,7 @@ export class InsightTermRecorder {
   }
 
   /** Consent withdrawal for a kind deletes that kind's retained data. */
-  async withdrawKinds(kinds: ReadonlySet<"terms" | "phrases">): Promise<InsightTermWrite> {
+  async withdrawKinds(kinds: ReadonlySet<InsightTermKind>): Promise<InsightTermWrite> {
     const records = await this.enqueue(() => this.store.purgeKinds(kinds));
 
     return { kind: "purge", records };

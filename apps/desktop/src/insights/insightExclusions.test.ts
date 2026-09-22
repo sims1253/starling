@@ -68,6 +68,22 @@ describe("readExclusions", () => {
     expect(read.has("")).toBe(false);
     expect([...read].some((label) => label.length > MAX_EXCLUSION_LABEL_LENGTH)).toBe(false);
   });
+
+  it("refuses labels that are not the one-to-three-token shape", () => {
+    // Double spaces, tabs and newlines survive a length bound but not the
+    // boundary: the comment's shape contract is enforced, not just stated.
+    const malformed = JSON.stringify([
+      "double  spaced",
+      "tab\tseparated",
+      "line\nbroken",
+      "trailing ",
+      "four word phrase here",
+    ]);
+
+    const read = readExclusions(storage({ "starling:insights:exclusions": malformed }));
+
+    expect(read.size).toBe(0);
+  });
 });
 
 describe("writeExclusions", () => {

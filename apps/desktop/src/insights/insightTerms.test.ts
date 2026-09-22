@@ -40,6 +40,7 @@ function recordOf(
     tokenizer: TOKENIZER_ID,
     terms: derived.terms,
     phrases: derived.phrases,
+    derived_kinds: derived.derived_kinds,
   };
 }
 
@@ -65,6 +66,11 @@ describe("captureTerms", () => {
 
     expect(derived.terms.length).toBe(3);
     expect(derived.phrases).toEqual([]);
+
+    // The stamp names exactly what was derived, sorted: a later reader can
+    // tell an analyzed-but-empty kind from one nobody analyzed.
+    expect(derived.derived_kinds).toEqual(["terms"]);
+    expect(captureTerms("one two three").derived_kinds).toEqual(["phrases", "terms"]);
   });
 
   it("truncates transcripts whose aggregates exceed the bounded size", () => {
@@ -103,6 +109,24 @@ describe("captureTerms", () => {
 describe("insightTermRecordProblems", () => {
   it("accepts a well-formed record", () => {
     expect(insightTermRecordProblems(recordOf("take-1", "hello world"))).toEqual([]);
+  });
+
+  it("accepts a record without the derived_kinds stamp, rejects a bogus one", () => {
+    const { derived_kinds: _stamp, ...legacy } = recordOf("take-1", "hello world");
+
+    // Pre-stamp dev data still decodes — it is an unknown for per-kind
+    // denominators, not damage — while a stamp naming an unknown kind is
+    // exactly the closed-branch violation the schema exists to catch.
+    expect(insightTermRecordProblems(legacy)).toEqual([]);
+
+    // SAFETY: deliberately bogus stamp ("moods" is not a kind) — the JSON
+    // round-trip cast bypasses the type check precisely so the schema
+    // boundary can be exercised with a value the types forbid.
+    const bogus = JSON.parse(
+      JSON.stringify({ ...recordOf("take-1", "hello world"), derived_kinds: ["moods"] }),
+    ) as InsightTermRecord;
+
+    expect(insightTermRecordProblems(bogus).length).toBeGreaterThan(0);
   });
 
   it("rejects a transcript smuggled into a term or an extra field", () => {
@@ -177,23 +201,52 @@ describe("MemoryInsightTermStore", () => {
     await expect(store.put(recordOf("take-1", "alpha"))).rejects.toThrow(/deleted/);
   });
 
-  it("purges only the withdrawn kind and clears on demand", async () => {
+  it("purges only the withdrawn kind, narrows its stamp, and clears on demand", async () => {
     const store = new MemoryInsightTermStore();
 
     await store.put(recordOf("take-1", "alpha beta gamma"));
 
-    await store.purgeKinds(new Set(["phrases"]));
+    const purged = await store.purgeKinds(new Set(["phrases"]));
 
     let log = await store.load();
 
     expect(log.records[0]?.phrases).toEqual([]);
     expect(log.records[0]?.terms?.length).toBe(3);
 
+    // The purged kind is no longer stamped: an unknown again, not a zero.
+    expect(log.records[0]?.derived_kinds).toEqual(["terms"]);
+    expect(purged[0]?.derived_kinds).toEqual(["terms"]);
+
+    // A second withdrawal of the same kind changes nothing — the returned
+    // delta stays honest to what actually changed.
+    expect(await store.purgeKinds(new Set(["phrases"]))).toEqual([]);
+
     await store.clear();
     log = await store.load();
 
     expect(log.records).toHaveLength(0);
     expect(log.tombstones).toHaveLength(0);
+  });
+
+  it("stamps an unstamped record from what a purge leaves behind", async () => {
+    const store = new MemoryInsightTermStore();
+
+    // Pre-derived_kinds dev data: a withdrawal must not erase the
+    // provenance of a kind the record still holds data for — the retained
+    // aggregates are the only evidence it has, so they become the stamp,
+    // while the emptied kind stays an unknown.
+    const { derived_kinds: _stamp, ...legacy } = recordOf("take-1", "alpha beta gamma");
+
+    await store.put(legacy);
+
+    const purged = await store.purgeKinds(new Set(["phrases"]));
+
+    expect(purged[0]?.derived_kinds).toEqual(["terms"]);
+
+    const log = await store.load();
+
+    expect(log.records[0]?.phrases).toEqual([]);
+    expect(log.records[0]?.derived_kinds).toEqual(["terms"]);
   });
 });
 
@@ -325,6 +378,24 @@ describe("IndexedDbInsightTermStore", () => {
 
     expect(log.invalidCount).toBe(1);
   });
+
+  it("skips records the withdrawal does not change, keeping the delta honest", async () => {
+    const factory = new IDBFactory();
+    const store = new IndexedDbInsightTermStore({ databaseName: "terms-g", indexedDB: factory });
+
+    await store.put(recordOf("take-1", "alpha beta gamma"));
+
+    // First withdrawal rewrites the record (phrases held data); a second
+    // finds nothing held and nothing stamped, so it rewrites and returns
+    // nothing — no no-op IndexedDB writes, no phantom purge delta.
+    expect(await store.purgeKinds(new Set(["phrases"]))).toHaveLength(1);
+    expect(await store.purgeKinds(new Set(["phrases"]))).toEqual([]);
+
+    const log = await store.load();
+
+    expect(log.records[0]?.phrases).toEqual([]);
+    expect(log.records[0]?.derived_kinds).toEqual(["terms"]);
+  });
 });
 
 /** A term-record-shaped value plus one forbidden free-text field. */
@@ -437,6 +508,38 @@ describe("InsightTermRecorder", () => {
     expect(fallback.record.occurred_at).toBe(new Date(T0).toISOString());
   });
 
+  it("falls back to the write clock for an anchor that is not schema-shaped", async () => {
+    const { store, recorder } = recorderWith(() => ({
+      ...DEFAULT_INSIGHT_CONSENT,
+      vocabularyPatterns: true,
+    }));
+
+    // A malformed anchor must cost its precision, never the whole write:
+    // flowing it into occurred_at would fail the store's validation and
+    // silently discard the take's aggregates.
+    const write = await recorder.recognitionSelected({
+      captureId: "take-1",
+      transcriptText: "alpha beta",
+      finalizedAt: "yesterday, probably",
+    });
+
+    if (write.kind !== "record") throw new Error("expected a record write");
+
+    expect(write.record.occurred_at).toBe(new Date(T0).toISOString());
+    expect((await store.load()).records).toHaveLength(1);
+  });
+
+  it("stamps the granted kinds on the written record", async () => {
+    const { store, recorder } = recorderWith(() => ({
+      ...DEFAULT_INSIGHT_CONSENT,
+      recurringPhrases: true,
+    }));
+
+    await recorder.recognitionSelected({ captureId: "take-1", transcriptText: "alpha beta" });
+
+    expect((await store.load()).records[0]?.derived_kinds).toEqual(["phrases"]);
+  });
+
   it("retains only the granted kind per write", async () => {
     const { store, recorder } = recorderWith(() => ({
       ...DEFAULT_INSIGHT_CONSENT,
@@ -509,12 +612,13 @@ describe("InsightTermRecorder", () => {
     expect(log.records[0]?.phrases).toEqual([]);
     expect(log.records[0]?.terms.length).toBe(3);
 
-    // The purge write names the records the store rewrote.
+    // The purge write names the records the store rewrote, stamp narrowed.
     expect(write.kind).toBe("purge");
 
     if (write.kind !== "purge") return;
 
     expect(write.records[0]?.phrases).toEqual([]);
+    expect(write.records[0]?.derived_kinds).toEqual(["terms"]);
   });
 
   it("names the deletion and the reset in their writes", async () => {

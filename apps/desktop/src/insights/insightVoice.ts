@@ -1,6 +1,6 @@
-import { isRecognitionSelected, type InsightEvent } from "./insightEvents";
+import { isCaptureDeleted, isRecognitionSelected, type InsightEvent } from "./insightEvents";
 import { parseInsightTimestamp } from "./insightMetrics";
-import type { InsightTermRecord } from "./insightTerms";
+import type { InsightTermKind, InsightTermRecord } from "./insightTerms";
 
 /**
  * The "Your voice" cards (E29 phase 2): recurring phrases and recurring
@@ -62,21 +62,34 @@ interface WindowedTotals {
 }
 
 /**
+ * A record is analyzed for a kind when its write stamped that kind in
+ * `derived_kinds` and no withdrawal purge has removed the stamp since.
+ * The stamp is what makes the distinction an empty label list cannot: a
+ * take that analyzed but yielded zero of the kind still counts as analyzed
+ * — "no findings" is a real result — while a purged or never-granted kind,
+ * and a legacy record written before the stamp existed, are unknowns the
+ * denominator must not guess about.
+ */
+function analyzedForKind(record: InsightTermRecord, kind: InsightTermKind): boolean {
+  return record.derived_kinds?.includes(kind) === true;
+}
+
+/**
  * Aggregate labels over the records inside the time window. A record counts
  * a label once per take no matter how often it repeats inside that take, so
  * "3 of 8 takes" stays a statement about takes, and the occurrence total is
  * carried separately and never presented as takes.
  *
- * The `takes` denominator is per-kind: only records that actually retained
- * aggregates of THIS kind count as analyzed. A take recorded under a
- * narrower grant — or emptied by a withdrawal purge — is an unknown for
- * these cards, not a negative, so it must not inflate the denominator.
+ * The `takes` denominator is per-kind and provenance-based: only records
+ * stamped as analyzed for THIS kind count (see `analyzedForKind`). A take
+ * recorded under a narrower grant — or emptied by a withdrawal purge — is
+ * an unknown for these cards, not a negative, so it must not inflate the
+ * denominator; a take that analyzed and found nothing of the kind is a
+ * real zero and must.
  */
 function windowTotals(
   records: readonly InsightTermRecord[],
-  labelsOf: (
-    record: InsightTermRecord,
-  ) => readonly { readonly text: string; readonly count: number }[],
+  kind: InsightTermKind,
   options: Required<Pick<VoiceCardOptions, "windowDays" | "now">>,
 ): WindowedTotals {
   const since = options.now - options.windowDays * 24 * 60 * 60 * 1000;
@@ -86,11 +99,9 @@ function windowTotals(
   for (const record of records) {
     if (parseInsightTimestamp(record.occurred_at) < since) continue;
 
-    const labels = labelsOf(record);
+    if (analyzedForKind(record, kind)) takes += 1;
 
-    if (labels.length > 0) takes += 1;
-
-    for (const entry of labels) {
+    for (const entry of kind === "terms" ? record.terms : record.phrases) {
       const tally = byLabel.get(entry.text) ?? { takes: 0, occurrences: 0 };
 
       tally.takes += 1;
@@ -163,11 +174,7 @@ export function recurringPhraseCards(
 ): readonly VoicePatternCard[] {
   const resolved = resolveOptions(options);
 
-  return buildCards(
-    "recurring_phrase",
-    windowTotals(records, (record) => record.phrases, resolved),
-    resolved,
-  );
+  return buildCards("recurring_phrase", windowTotals(records, "phrases", resolved), resolved);
 }
 
 /** Vocabulary-pattern cards: recurring word-like terms across takes. */
@@ -177,11 +184,7 @@ export function vocabularyPatternCards(
 ): readonly VoicePatternCard[] {
   const resolved = resolveOptions(options);
 
-  return buildCards(
-    "vocabulary_term",
-    windowTotals(records, (record) => record.terms, resolved),
-    resolved,
-  );
+  return buildCards("vocabulary_term", windowTotals(records, "terms", resolved), resolved);
 }
 
 function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
@@ -202,18 +205,22 @@ function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
  *
  * Two denominators, both stated: `windowTakes` is the distinct captures
  * with a selected recognition inside the window (a retranscription is the
- * same take, never counted twice), and `analyzedTakes` is how many of those
- * have retained aggregates of any kind. Cards cite their own per-kind
- * analyzed count ("appeared in 3 of 5 analyzed takes" where 5 counts only
- * takes that retained aggregates of that card's kind) because a take with
- * no aggregates for the kind is an unknown, not a negative: claiming "3 of
- * 8 takes" would assert the phrase is absent from takes nobody analyzed.
- * The UI shows both numbers so the coverage is visible.
+ * same take, never counted twice, and a deleted take drops out — the
+ * tombstone removes it here exactly like the metric contract removes it
+ * from every other surface), and `analyzedTakes` is how many of those
+ * retained aggregates under the current grants. Cards cite their own
+ * per-kind analyzed count ("appeared in 3 of 5 analyzed takes" where 5
+ * counts only takes stamped as analyzed for that card's kind — a take
+ * that analyzed and found nothing counts, a purged, never-granted or
+ * legacy-unstamped take is an unknown) because an unknown is not a
+ * negative: claiming "3 of 8 takes" would assert the phrase is absent
+ * from takes nobody analyzed. The UI shows both numbers so the coverage
+ * is visible.
  */
 export interface VoicePanel {
   readonly phraseCards: readonly VoicePatternCard[];
   readonly vocabularyCards: readonly VoicePatternCard[];
-  /** Distinct takes with a selected recognition inside the window. */
+  /** Distinct, non-deleted takes with a selected recognition in the window. */
   readonly windowTakes: number;
   /** Takes in the window whose aggregates exist under the current grants. */
   readonly analyzedTakes: number;
@@ -229,15 +236,31 @@ export function voicePanel(
 
   const since = resolved.now - resolved.windowDays * 24 * 60 * 60 * 1000;
 
+  // The metric contract's tombstone rule: any capture_deleted removes the
+  // capture's events regardless of arrival order. A deleted take's events
+  // stay in the log, so the denominator must skip them explicitly or it
+  // would keep counting takes every other surface has dropped.
+  const tombstonedCaptures = new Set<string>();
+
+  for (const event of events) {
+    if (isCaptureDeleted(event)) tombstonedCaptures.add(event.capture_id);
+  }
+
   const windowCaptures = new Set<string>();
 
   for (const event of events) {
-    if (isRecognitionSelected(event) && parseInsightTimestamp(event.occurred_at) >= since) {
+    if (
+      isRecognitionSelected(event) &&
+      parseInsightTimestamp(event.occurred_at) >= since &&
+      !tombstonedCaptures.has(event.capture_id)
+    ) {
       windowCaptures.add(event.capture_id);
     }
   }
 
-  const analyzedTakes = records.filter((record) => windowCaptures.has(record.capture_id)).length;
+  const analyzedTakes = records.filter(
+    (record) => windowCaptures.has(record.capture_id) && (record.derived_kinds?.length ?? 0) > 0,
+  ).length;
 
   return {
     phraseCards: consent.recurringPhrases ? recurringPhraseCards(records, resolved) : [],

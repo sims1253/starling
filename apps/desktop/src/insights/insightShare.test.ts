@@ -27,6 +27,7 @@ const TOP_PHRASE = recurringPhraseCards(
       tokenizer: "uax29-intl-v1",
       terms: [],
       phrases: [{ text: "deploy the server", count: 3 }],
+      derived_kinds: ["phrases"],
     },
     {
       schema_version: 1,
@@ -35,6 +36,7 @@ const TOP_PHRASE = recurringPhraseCards(
       tokenizer: "uax29-intl-v1",
       terms: [],
       phrases: [{ text: "deploy the server", count: 1 }],
+      derived_kinds: ["phrases"],
     },
   ],
   { now: Date.parse("2026-09-21T12:00:00Z") },
@@ -126,12 +128,22 @@ describe("milestoneInRange", () => {
   ];
 
   it("cites the latest milestone achieved inside the card's range", () => {
-    expect(milestoneInRange(milestones, "2026-09-14")).toBe("1,000 words recognized from speech");
+    expect(milestoneInRange(milestones, "2026-09-14", "2026-09-21")).toBe(
+      "1,000 words recognized from speech",
+    );
   });
 
   it("states no milestone when every one predates the range", () => {
     // A milestone from months ago must not ride on a card labeled "this week".
-    expect(milestoneInRange(milestones, "2026-09-20")).toBeUndefined();
-    expect(milestoneInRange([], "2026-09-14")).toBeUndefined();
+    expect(milestoneInRange(milestones, "2026-09-20", "2026-09-21")).toBeUndefined();
+    expect(milestoneInRange([], "2026-09-14", "2026-09-21")).toBeUndefined();
+  });
+
+  it("states no milestone dated after the range's last day", () => {
+    // Clock skew or a future-dated day key must not put a "future" milestone
+    // on a card whose range ends before it.
+    const future = [{ label: "Tomorrow's milestone", achievedOnDay: "2026-09-22" }];
+
+    expect(milestoneInRange(future, "2026-09-14", "2026-09-21")).toBeUndefined();
   });
 });

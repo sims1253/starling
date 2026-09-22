@@ -413,12 +413,18 @@ export class InsightRecorder {
    * (the event has not been emitted or loaded yet). The term-aggregate
    * records anchor to this so a delayed retranscription cannot move a take
    * across a card-window boundary; the caller falls back to its own clock
-   * only while the event is still in flight.
+   * only while the event is still in flight. The mirror is
+   * insertion-ordered, so the LAST match wins — later events supersede
+   * earlier ones everywhere else in this contract, and the id scheme
+   * (`cf-<captureId>`) currently makes replays idempotent rather than
+   * appended; this stays correct if that ever changes.
    */
   captureFinalizedAt(captureId: string): string | undefined {
-    const finalized = this.snapshot().find(
-      (event) => isCaptureFinalized(event) && event.capture_id === captureId,
-    );
+    let finalized: CaptureFinalizedEvent | undefined;
+
+    for (const event of this.snapshot()) {
+      if (isCaptureFinalized(event) && event.capture_id === captureId) finalized = event;
+    }
 
     return finalized?.occurred_at;
   }

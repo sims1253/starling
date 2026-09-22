@@ -289,11 +289,12 @@ export default function App() {
 
   const [insightNotices, setInsightNotices] = useState<readonly string[]>(() => []);
 
-  // Armed by the first term-aggregate write chain: once any write has
-  // started, the mount-time snapshot may no longer apply to the mirror — a
-  // write that already landed would be overwritten by the stale pre-write
-  // view (the mirror race the guard exists for).
-  const termMirrorWritesRef = useRef(false);
+  // Set when the first term-aggregate write delta LANDS in the mirror: from
+  // that moment the mount-time load() snapshot is stale by construction and
+  // may never apply again (see the load effect). Failed writes do not set
+  // it — a failed write changed nothing, so the snapshot is still the
+  // freshest full view and the mirror keeps its recovery path.
+  const termMirrorLandedRef = useRef(false);
 
   // The Insights consent state (E29 phase 2): read once from local settings
   // and thereafter changed only through applyInsightConsent, which persists
@@ -647,10 +648,14 @@ export default function App() {
     void insightTermStore
       .load()
       .then((log) => {
-        // A write chain that already started owns the mirror: applying this
-        // snapshot now would overwrite delta-applied records with the stale
-        // pre-write view. The write chains refresh the mirror themselves.
-        if (termMirrorWritesRef.current) return;
+        // Once a write delta has LANDED, the mirror is newer than any
+        // mount-time snapshot: applying one now would overwrite the delta's
+        // records with a pre-write view. Landing is the condition, not
+        // starting — a write that only started and then failed never touched
+        // the store, so the snapshot stays the freshest full view and may
+        // (and must) still apply, or a failed first write would orphan the
+        // mirror for the whole session.
+        if (termMirrorLandedRef.current) return;
 
         setTermRecords(log.records);
       })
@@ -690,27 +695,26 @@ export default function App() {
    * mirror must not be staled by a store it never touched. The write
    * resolves with exactly what changed, and the mirror applies that delta
    * directly: no full store re-read on the recognition hot path, where a
-   * growing O(n) load per transcript would tax every settlement. The chain
-   * also arms the mirror guard, so the mount-time snapshot can never
-   * overwrite it afterwards. `what` names the attempted operation so a
-   * failed purge says "delete", never a misattributed "record". The
-   * returned promise never rejects.
+   * growing O(n) load per transcript would tax every settlement. The first
+   * delta to land arms the mirror guard, so the mount-time snapshot can
+   * never overwrite it afterwards — while a FAILED write arms nothing, and
+   * the snapshot keeps the mirror alive. `what` names the attempted
+   * operation so a failed purge says "delete", never a misattributed
+   * "record". The returned promise never rejects.
    */
   const recordInsightTerms = useCallback(
-    (
-      what: "record" | "delete" | "reset",
-      action: () => Promise<InsightTermWrite>,
-    ): Promise<void> => {
-      termMirrorWritesRef.current = true;
+    (what: "record" | "delete" | "reset", action: () => Promise<InsightTermWrite>): Promise<void> =>
+      action()
+        .then((write) => {
+          termMirrorLandedRef.current = true;
 
-      return action()
-        .then((write) => setTermRecords((current) => applyTermWrite(current, write)))
+          setTermRecords((current) => applyTermWrite(current, write));
+        })
         .catch((caught) => {
           addInsightNotice(
             `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
           );
-        });
-    },
+        }),
     [addInsightNotice],
   );
 
@@ -724,15 +728,16 @@ export default function App() {
    * kinds the current consent grants, and a failure there is its own notice,
    * never a take error and never a stale event mirror. The term record
    * anchors to the take's own finalization instant from the event log, so a
-   * delayed retranscription cannot move the take across a card window.
+   * delayed retranscription cannot move the take across a card window — the
+   * anchor is read from a mirror known to be loaded, never a possibly-empty
+   * one, and a load failure costs only the anchor's precision, never the
+   * write itself.
    */
   const recordRecognitionSelected = useCallback(
     (sessionId: string, transcriptText: string) => {
       const startedAt = stopWaitStartsRef.current.get(sessionId);
 
       stopWaitStartsRef.current.delete(sessionId);
-
-      const finalizedAt = insights.captureFinalizedAt(sessionId);
 
       void recordInsight(() =>
         insights.recognitionSelected({
@@ -742,7 +747,18 @@ export default function App() {
         }),
       );
       void recordInsightTerms("record", () =>
-        insightTerms.recognitionSelected({ captureId: sessionId, transcriptText, finalizedAt }),
+        insights
+          .load()
+          // The event log's health must not gate the term write: a failed
+          // load only means the anchor falls back to the write clock.
+          .catch(() => undefined)
+          .then(() =>
+            insightTerms.recognitionSelected({
+              captureId: sessionId,
+              transcriptText,
+              finalizedAt: insights.captureFinalizedAt(sessionId),
+            }),
+          ),
       );
     },
     [recordInsight, recordInsightTerms],
@@ -755,8 +771,8 @@ export default function App() {
    * incomplete audio is parked or discarded before a session owns it.
    */
   const recordCaptureFinalized = useCallback(
-    (session: DictationSession) => {
-      void recordInsight(async () => {
+    (session: DictationSession): Promise<void> =>
+      recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -765,8 +781,7 @@ export default function App() {
           sampleRate: stats.sampleRate,
           completeAudio: true,
         });
-      });
-    },
+      }),
     [recordInsight],
   );
 
@@ -1099,7 +1114,7 @@ export default function App() {
 
         // A durable take now exists for Insights (E29); the emit is
         // fire-and-forget so insights can never break the capture path.
-        recordCaptureFinalized(created);
+        void recordCaptureFinalized(created);
 
         return created;
       } catch (caught) {
@@ -1512,6 +1527,13 @@ export default function App() {
 
       setStreamingFinalize(true);
 
+      // Set the moment the settle callback emits capture_finalized. The
+      // finalize's event id is fixed (`cf-<captureId>`) but its payload
+      // carries a fresh occurred_at, so a second emit under the same id is
+      // a conflict error, never an idempotent replay — this flag is what
+      // keeps the post-finalize emit below from firing the duplicate.
+      let settleEmitted = false;
+
       try {
         const finalized = await finalizeStreamingTake(
           {
@@ -1524,17 +1546,33 @@ export default function App() {
             setConnectionReady: () => setConnection("ready"),
             transcribe,
             onDurableSave: releaseCapture,
-            onStreamedSettled: (session, transcript) =>
-              recordRecognitionSelected(session.id, transcript.text),
+            onStreamedSettled: (session, transcript) => {
+              // The finalize's LAST Discard check has passed, so the take
+              // is certain to keep its session: emit capture_finalized now
+              // and let the term write wait for it, so a streamed take's
+              // record anchors to the true finalization instant instead of
+              // the settlement clock. The wait is precision-only — the
+              // promise never rejects (an event-store failure costs the
+              // anchor, never the term write).
+              settleEmitted = true;
+
+              void recordCaptureFinalized(session).then(() =>
+                recordRecognitionSelected(session.id, transcript.text),
+              );
+            },
           },
           store,
         );
 
         // A streamed take's journal became its session (E29): the take now
-        // exists for Insights. A discarded or batch-fallback take never
-        // reaches here — the batch path's own save emits instead.
-        if (finalized.session !== undefined) {
-          recordCaptureFinalized(finalized.session);
+        // exists for Insights. The settle callback already emitted for a
+        // settled streamed take; this is the primary emit only for a take
+        // that kept its session without a settled streamed transcript (a
+        // stream-note fallback transcribed on the session) — a batch
+        // fallback's recorder capture is emitted by the batch path's own
+        // save instead.
+        if (finalized.session !== undefined && !settleEmitted) {
+          void recordCaptureFinalized(finalized.session);
         }
 
         if (finalized.discarded) return true;
@@ -1910,10 +1948,10 @@ export default function App() {
    * removes every derived contribution (E28/E29): the event tombstone
    * dominates stale replays, and the content-derived term aggregates are
    * deleted outright, so a deleted take cannot reappear in a number, a
-   * card, a recap or a share preview. Both deletion chains are AWAITED — a
-   * store that fails leaves its own, visibly persistent notice (never a
-   * misattributed "recording not deleted": the recording is gone) instead
-   * of the failure being lost with the take's UI flow.
+   * card, a recap or a share preview. The deletion chains carry their own
+   * persistent notices — a store that fails stays visibly flagged (never
+   * misattributed as a "recording not deleted": the recording is gone)
+   * without the UI's refresh waiting on them.
    */
   async function removeSession(id: string) {
     if (activeUploadsRef.current.has(id)) return;
@@ -1929,9 +1967,13 @@ export default function App() {
     // Two independent tombstones, deliberately on separate chains: the
     // event log's health must not decide whether the content-derived
     // aggregates die, and vice versa — either store failing leaves the
-    // other's deletion intact and surfaces its own notice. Neither promise
-    // rejects; their catch arms already wrote the notice.
-    await Promise.all([
+    // other's deletion intact and surfaces its own notice. The chains are
+    // fire-and-forget ON PURPOSE: their catches write persistent notices,
+    // so visibility does not need the wait, and the UI's refresh must not
+    // be gated on stores that could hang (a wedged transaction) — the
+    // history list reflects the deletion the moment the session store
+    // confirms it, whatever the insight stores are doing.
+    void Promise.all([
       recordInsight(() => insights.captureDeleted(id)),
       recordInsightTerms("delete", () => insightTerms.captureDeleted(id)),
     ]);
@@ -1939,7 +1981,10 @@ export default function App() {
     try {
       await refresh();
     } catch (caught) {
-      setError(`Could not delete the recording: ${messageFrom(caught)}`);
+      // The recording and both tombstones landed; only the history view
+      // failed to redraw. Saying "delete failed" here would be the
+      // misattribution this path exists to avoid.
+      setError(`Could not refresh the history: ${messageFrom(caught)}`);
     }
   }
 
