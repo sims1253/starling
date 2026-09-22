@@ -24,12 +24,24 @@ import { streamWebSocketUrl } from "@starling/dictation";
  * validates the endpoint. The browser preview's documented surface for
  * non-loopback streaming is the `/api` WebSocket dev proxy (vite.config.ts),
  * which is same-origin.
+ *
+ * Bracketed IPv6 literals are not part of CSP's host-source grammar:
+ * Chromium drops `ws://[::1]:*`-style sources with a console error, so they
+ * never match anything (QA round 1). IPv6-loopback servers are therefore
+ * reached through the `localhost` spelling (which the policy permits and the
+ * OS resolves to ::1) or over the native bridge — never through a bracketed
+ * IPv6 token.
  */
 export const STATIC_CONNECT_SRC =
-  "'self' http: https: ws://127.0.0.1:* ws://localhost:* ws://[::1]:* wss://127.0.0.1:* wss://localhost:* wss://[::1]:*";
+  "'self' http: https: ws://127.0.0.1:* ws://localhost:* wss://127.0.0.1:* wss://localhost:*";
 
-/** Hosts a static token may name: loopback only, so the ws surface stays narrow. */
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+/**
+ * Hosts a static token may name: loopback spellings CSP's host-source grammar
+ * accepts. IPv6 loopback (`::1`) is deliberately absent — its bracketed
+ * spelling is not in the grammar, so those endpoints ride the native bridge
+ * instead of producing a token the browser would drop.
+ */
+const STATIC_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost"]);
 
 /** Default ports per URL scheme, used to compare ports that were omitted. */
 const DEFAULT_PORTS = {
@@ -59,18 +71,21 @@ export function staticConnectSrcTokens(): string[] {
 }
 
 /**
- * The CSP `host-source` token for one streaming URL, or null when the URL is
- * not loopback — non-loopback streaming is deliberately left to the packaged
- * app's native bridge instead of this static policy.
+ * The CSP `host-source` token for one streaming URL, or null when no valid
+ * token names it — non-loopback streaming and the bracketed IPv6 loopback
+ * spelling (which the CSP host-source grammar cannot express) are deliberately
+ * left to the packaged app's native bridge instead of this static policy.
  */
 export function loopbackStreamToken(streamUrl: string): string | null {
   const url = new URL(streamUrl);
-  // URL.hostname keeps IPv6 brackets ("[::1]"); the loopback set does not.
+  // URL.hostname keeps IPv6 brackets ("[::1]"); unwrap so ::1 endpoints fall
+  // out of the statically nameable set instead of yielding a token the
+  // browser would drop from the policy.
   const host = unwrapIpv6(url.hostname);
 
-  if (!LOOPBACK_HOSTS.has(host)) return null;
+  if (!STATIC_LOOPBACK_HOSTS.has(host)) return null;
 
-  return `${url.protocol}//${wrapIpv6(host)}:*`;
+  return `${url.protocol}//${host}:*`;
 }
 
 /**
@@ -102,10 +117,6 @@ export function parseConnectSrcTokens(policy: string): string[] {
     .trim()
     .split(/\s+/)
     .filter((token) => token !== "");
-}
-
-function wrapIpv6(hostname: string): string {
-  return hostname.includes(":") ? `[${hostname}]` : hostname;
 }
 
 function unwrapIpv6(host: string): string {

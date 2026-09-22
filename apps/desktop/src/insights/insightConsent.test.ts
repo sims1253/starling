@@ -2,7 +2,9 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   DEFAULT_INSIGHT_CONSENT,
+  WEEKLY_GOAL_MAX,
   consentedTermKinds,
+  parseWeeklyGoal,
   readInsightConsent,
   writeInsightConsent,
   type ConsentStorage,
@@ -112,5 +114,21 @@ describe("consentedTermKinds", () => {
         }),
       ].sort(),
     ).toEqual(["phrases", "terms"]);
+  });
+});
+
+describe("parseWeeklyGoal", () => {
+  it("parses a whole number inside the declared bounds", () => {
+    expect(parseWeeklyGoal("250")).toBe(250);
+    expect(parseWeeklyGoal(" 1000 ")).toBe(1000);
+    expect(parseWeeklyGoal(`${WEEKLY_GOAL_MAX}`)).toBe(WEEKLY_GOAL_MAX);
+  });
+
+  it("rejects drafts that are not whole numbers in bounds", () => {
+    // Half-typed states parse to null instead of rewriting the field under
+    // the cursor: the draft commits on blur, and the bounds say why not.
+    for (const draft of ["", "-", "1e", "12abc", "0", "-5", "1.5", `${WEEKLY_GOAL_MAX + 1}`]) {
+      expect(parseWeeklyGoal(draft)).toBeNull();
+    }
   });
 });

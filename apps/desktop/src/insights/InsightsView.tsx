@@ -1,5 +1,4 @@
 import { useMemo, useState } from "react";
-import { Predicate } from "effect";
 import { CalendarDays, CircleAlert, Download, RotateCcw, X } from "lucide-react";
 import { TRANSFORMATION_KINDS, type InsightEvent } from "./insightEvents";
 import {
@@ -10,19 +9,27 @@ import {
   selectionStats,
   type InsightAggregate,
 } from "./insightMetrics";
-import type { InsightConsent } from "./insightConsent";
+import {
+  WEEKLY_GOAL_MAX,
+  WEEKLY_GOAL_MIN,
+  parseWeeklyGoal,
+  type InsightConsent,
+} from "./insightConsent";
+import { readExclusions, writeExclusions } from "./insightExclusions";
+import { isBaselineDraft, readTypingBaseline, writeTypingBaseline } from "./insightBaseline";
 import type { InsightTermRecord } from "./insightTerms";
 import { voicePanel, type VoicePatternCard } from "./insightVoice";
 import {
   DEFAULT_SHARE_INCLUDES,
   SHARE_CARD_FIELDS,
   buildShareCard,
+  milestoneInRange,
   renderShareCard,
   type ShareCardField,
 } from "./insightShare";
 import { milestonePanel } from "./insightMilestones";
 import { weeklyRecap } from "./insightRecap";
-import { formatMinutes } from "./insightFormat";
+import { formatDayKey, formatMinutes, plural } from "./insightFormat";
 
 /**
  * The Insights surface (E29): Usage and Quality panels computed from the
@@ -40,15 +47,15 @@ import { formatMinutes } from "./insightFormat";
  * or productivity score appears anywhere, because none is knowable.
  */
 
-/** localStorage key for the user's typing baseline (words per minute). */
-const TYPING_BASELINE_KEY = "starling:insights:typingWpm";
-
-/** localStorage key for the user's excluded voice-card labels. */
-const EXCLUSIONS_KEY = "starling:insights:exclusions";
-
 const CALENDAR_DAYS = 28;
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** One unresolved Insights notice: its text and how often it struck. */
+export interface InsightNotice {
+  readonly text: string;
+  readonly count: number;
+}
 
 export interface InsightsViewProps {
   readonly events: readonly InsightEvent[];
@@ -57,9 +64,14 @@ export interface InsightsViewProps {
   readonly consent: InsightConsent;
   /** Applies a whole consent object at once; grants never half-land. */
   readonly onConsentChange: (next: InsightConsent) => void;
-  /** Storage/recording issue notice; dismissed by the user. */
-  readonly issue?: string;
-  readonly onDismissIssue: () => void;
+  /**
+   * Storage/recording issue notices. A list, not a slot: two stores can
+   * fail in the same moment, every unresolved notice stays visible until
+   * the user dismisses it, and a repeated failure counts up on its entry
+   * instead of being hidden by an identical sibling.
+   */
+  readonly notices: readonly InsightNotice[];
+  readonly onDismissNotice: (notice: string) => void;
   readonly onReset: () => void;
 }
 
@@ -95,19 +107,16 @@ function formatSeconds(seconds: number): string {
   return `${sign}${body}`;
 }
 
-function plural(count: number, singularWord: string, pluralWord = `${singularWord}s`) {
-  return `${count} ${count === 1 ? singularWord : pluralWord}`;
+/** One wording for every settings-storage refusal, so the copies cannot drift. */
+function storageRefusalMessage(setting: string): string {
+  return `Local settings storage refused the save — ${setting} is kept for this session only.`;
 }
 
-function readExclusions(): ReadonlySet<string> {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(EXCLUSIONS_KEY) ?? "[]");
+/** The local settings this view persists directly, each with its own refusal slot. */
+type SettingKey = "baseline" | "exclusion";
 
-    return new Set(Array.isArray(parsed) ? parsed.filter(Predicate.isString) : []);
-  } catch {
-    return new Set();
-  }
-}
+/** Deterministic render order for the refusal slots. */
+const SETTINGS_ORDER: readonly SettingKey[] = ["exclusion", "baseline"];
 
 /** The one honest placeholder: absence of data, stated as absence. */
 function NotEnoughData({ note }: { readonly note: string }) {
@@ -124,17 +133,29 @@ export function InsightsView({
   termRecords,
   consent,
   onConsentChange,
-  issue,
-  onDismissIssue,
+  notices,
+  onDismissNotice,
   onReset,
 }: InsightsViewProps) {
   const timezone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
 
-  const [baselineDraft, setBaselineDraft] = useState(
-    () => localStorage.getItem(TYPING_BASELINE_KEY) ?? "",
-  );
+  const [baselineDraft, setBaselineDraft] = useState(() => readTypingBaseline(localStorage));
 
-  const [excluded, setExcluded] = useState<ReadonlySet<string>>(readExclusions);
+  const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => readExclusions(localStorage));
+
+  // One refusal slot per setting that can be refused: a refused exclusion
+  // and a refused baseline save are both visible at once, and each clears
+  // the moment its own setting saves again — "kept for this session only"
+  // must stop being said the moment it stops being true.
+  const [settingsRefusals, setSettingsRefusals] = useState<
+    Readonly<Record<SettingKey, string | undefined>>
+  >(() => ({ baseline: undefined, exclusion: undefined }));
+
+  function noteSettingsSave(which: SettingKey, refused: string | undefined) {
+    setSettingsRefusals((current) =>
+      current[which] === refused ? current : { ...current, [which]: refused },
+    );
+  }
 
   const [shareIncludes, setShareIncludes] = useState<ReadonlySet<ShareCardField>>(
     () => new Set(DEFAULT_SHARE_INCLUDES),
@@ -144,7 +165,45 @@ export function InsightsView({
 
   const [shareCopyFailed, setShareCopyFailed] = useState<string>();
 
-  const parsedBaseline = Number.parseInt(baselineDraft, 10);
+  // The weekly-goal input's draft, committed on blur: parsing per keystroke
+  // would rewrite the field under the cursor (a "-" or "1e" mid-typing
+  // parses to nothing) and silently discard values outside the goal bounds.
+  const [goalDraft, setGoalDraft] = useState(() =>
+    consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords),
+  );
+
+  const [goalIssue, setGoalIssue] = useState<string>();
+
+  // True while the goal input has focus — an in-progress draft exists that
+  // no external consent change is allowed to clobber.
+  const [goalFocused, setGoalFocused] = useState(false);
+
+  // The committed goal this draft was last synced from. When the consent
+  // changes away from this input (Reset, a restored value), the draft
+  // follows during render — the documented adjust-state-on-prop-change
+  // pattern, one render, no effect — but only while nobody is typing in
+  // the field: a focused draft is the user's, and their blur-commit decides
+  // what lands.
+  const [goalSyncedTo, setGoalSyncedTo] = useState(consent.weeklyGoalWords);
+
+  if (consent.weeklyGoalWords !== goalSyncedTo) {
+    setGoalSyncedTo(consent.weeklyGoalWords);
+
+    // A focused draft survives any external change EXCEPT a reset to
+    // no-goal: blurring a stale draft afterwards would silently resurrect
+    // the goal the user just cleared, so the reset clears the field too.
+    if (!goalFocused || consent.weeklyGoalWords === null) {
+      setGoalDraft(consent.weeklyGoalWords === null ? "" : String(consent.weeklyGoalWords));
+      setGoalIssue(undefined);
+    }
+
+    // While focused, goalIssue intentionally stays as it is: it describes
+    // the last commit, not the in-progress draft — blur re-evaluates it.
+  }
+
+  // Parsed only when the boundary admits the draft: a value like "1e3"
+  // must not drive the live comparison while storage rightly refuses it.
+  const parsedBaseline = isBaselineDraft(baselineDraft) ? Number.parseInt(baselineDraft, 10) : NaN;
   const baseline = Number.isInteger(parsedBaseline) && parsedBaseline > 0 ? parsedBaseline : null;
 
   const usage = useMemo(() => compute(() => aggregate(events, baseline)), [events, baseline]);
@@ -172,8 +231,33 @@ export function InsightsView({
   const recap = useMemo(() => compute(() => weeklyRecap(events, { timezone })), [events, timezone]);
 
   function changeBaseline(value: string) {
+    // The draft persists on blur (commitBaselineDraft), like the goal
+    // input: a transient invalid shape ("1e3", a pasted sentence) is the
+    // field's own validation story, never a per-keystroke "storage
+    // refused" mislabel for something storage was never asked to keep.
     setBaselineDraft(value);
-    localStorage.setItem(TYPING_BASELINE_KEY, value);
+  }
+
+  /**
+   * Commit the baseline draft: persist what fits, and report a refusal
+   * only when a storable draft met a refusing storage — an inadmissible
+   * draft is the proxy line's own message, not a storage failure.
+   */
+  function commitBaselineDraft() {
+    // An unchanged draft is a no-op — blur alone must not rewrite storage
+    // (the goal input's commit guards the same way).
+    if (readTypingBaseline(localStorage) === baselineDraft) {
+      noteSettingsSave("baseline", undefined);
+
+      return;
+    }
+
+    noteSettingsSave(
+      "baseline",
+      isBaselineDraft(baselineDraft) && !writeTypingBaseline(localStorage, baselineDraft)
+        ? storageRefusalMessage("the typing baseline")
+        : undefined,
+    );
   }
 
   function excludeLabel(label: string) {
@@ -181,11 +265,45 @@ export function InsightsView({
 
     next.add(label);
     setExcluded(next);
-    localStorage.setItem(EXCLUSIONS_KEY, JSON.stringify([...next]));
+    noteSettingsSave(
+      "exclusion",
+      writeExclusions(localStorage, next) ? undefined : storageRefusalMessage("the exclusion"),
+    );
   }
 
   function toggleConsent(patch: Partial<InsightConsent>) {
     onConsentChange({ ...consent, ...patch });
+  }
+
+  /** Commit the goal draft: valid values apply, invalid ones say why. */
+  function commitGoalDraft() {
+    if (goalDraft.trim() === "") {
+      setGoalIssue(undefined);
+
+      if (consent.weeklyGoalWords !== null) toggleConsent({ weeklyGoalWords: null });
+
+      return;
+    }
+
+    const parsed = parseWeeklyGoal(goalDraft);
+
+    if (parsed === null) {
+      setGoalIssue(
+        // Runtime locale for both bounds, matching every other number on
+        // the surface (the milestone labels format their thresholds the
+        // same way) — one number style across the Insights views.
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN.toLocaleString()} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
+      );
+
+      return;
+    }
+
+    setGoalIssue(undefined);
+
+    // An unchanged goal is a no-op: blur alone must never trigger a
+    // persistence write or a purge-diff pass for a value consent already
+    // holds — the empty-draft branch above guards the same way.
+    if (parsed !== consent.weeklyGoalWords) toggleConsent({ weeklyGoalWords: parsed });
   }
 
   function toggleShareField(field: ShareCardField, included: boolean) {
@@ -199,41 +317,53 @@ export function InsightsView({
     setShareCopyFailed(undefined);
   }
 
+  /**
+   * Both exports name their file from one clock — the local reporting day
+   * the card content and calendar use — and the share card passes its own
+   * frozen range-end day, so a card saved after local midnight is never
+   * dated the day the card itself says it is not.
+   */
+  function exportFilename(kind: string, extension: string, dayKey: string): string {
+    return `starling-${kind}-${dayKey}.${extension}`;
+  }
+
   function exportAggregate() {
     if (!usage.ok) return;
 
-    const url = URL.createObjectURL(
-      new Blob([JSON.stringify(usage.value, null, 2)], { type: "application/json" }),
+    downloadText(
+      JSON.stringify(usage.value, null, 2),
+      exportFilename("insights", "json", localDayKey(Date.now(), timezone)),
+      "application/json",
     );
-
-    const anchor = document.createElement("a");
-
-    anchor.href = url;
-    anchor.download = `starling-insights-${new Date().toISOString().slice(0, 10)}.json`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
   }
 
   /**
    * The share card, previewed before anything exists to copy or save. The
    * builder itself enforces the redaction default, so this assembly cannot
-   * leak a field the include set does not name.
+   * leak a field the include set does not name. The window is captured from
+   * ONE clock read — two reads could straddle a local-day boundary and
+   * label an inverted range on a card about to be copied — and the
+   * milestone is restricted to ones achieved inside that range: the card
+   * states a week, so a milestone from months ago is not its claim to make.
    */
   const shareCard = useMemo(() => {
     if (!week.ok || week.value.unique_takes === 0) return undefined;
 
+    const nowMs = new Date().getTime();
+    const rangeStartDay = localDayKey(nowMs - WEEK_MS, timezone);
+    const rangeEndDay = localDayKey(nowMs, timezone);
     const milestones = celebrated.ok ? celebrated.value.milestones : [];
-    const latestMilestone = milestones.length > 0 ? milestones[milestones.length - 1] : undefined;
+    const milestone = milestoneInRange(milestones, rangeStartDay, rangeEndDay);
     const topPhrase = voice.ok ? voice.value.phraseCards[0] : undefined;
 
     return buildShareCard(
       {
-        rangeStartDay: localDayKey(new Date().getTime() - WEEK_MS, timezone),
-        rangeEndDay: localDayKey(new Date().getTime(), timezone),
+        rangeStartDay,
+        rangeEndDay,
         words: week.value.recognized_words,
         minutes: week.value.captured_seconds / 60,
         takes: week.value.unique_takes,
-        milestone: latestMilestone?.label,
+        milestone,
         topPhrase,
       },
       { include: shareIncludes },
@@ -268,14 +398,11 @@ export function InsightsView({
   function saveShareCard() {
     if (shareCard === undefined) return;
 
-    const url = URL.createObjectURL(new Blob([renderShareCard(shareCard)], { type: "text/plain" }));
-
-    const anchor = document.createElement("a");
-
-    anchor.href = url;
-    anchor.download = `starling-share-card-${new Date().toISOString().slice(0, 10)}.txt`;
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    downloadText(
+      renderShareCard(shareCard),
+      exportFilename("share-card", "txt", shareCard.rangeEndDay),
+      "text/plain",
+    );
   }
 
   function resetInsights() {
@@ -307,6 +434,11 @@ export function InsightsView({
 
   const empty = usage.ok && usage.value.unique_takes === 0;
 
+  // Whether a usable top phrase exists at all — the same condition the card
+  // input rests on. The include checkbox mirrors it exactly, so the include
+  // set can never claim a field the card silently drops.
+  const topPhraseAvailable = voice.ok && voice.value.phraseCards.length > 0;
+
   return (
     <div className="insights-shell">
       <header className="insights-head">
@@ -328,13 +460,26 @@ export function InsightsView({
         </div>
       </header>
 
-      {issue && (
-        <div className="insights-issue" role="alert">
-          <CircleAlert size={16} />
-          <span>{issue}</span>
-          <button onClick={onDismissIssue} aria-label="Dismiss insights notice">
-            <X size={14} />
-          </button>
+      {notices.length > 0 && (
+        <div className="insights-issues">
+          {/* Requires unique notice texts — the producer (App's
+              addInsightNotice) merges repeats into one counted entry, so
+              the text is a stable key and dismissal is unambiguous. */}
+          {notices.map((notice) => (
+            <div className="insights-issue" role="alert" key={notice.text}>
+              <CircleAlert size={16} />
+              <span>
+                {notice.text}
+                {notice.count > 1 ? ` (×${notice.count})` : ""}
+              </span>
+              <button
+                onClick={() => onDismissNotice(notice.text)}
+                aria-label="Dismiss insights notice"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -427,7 +572,7 @@ export function InsightsView({
                         <li key={milestone.id}>
                           <strong>{milestone.label}</strong>
                           <span>
-                            {milestone.achievedOnDay} — {milestone.evidence}
+                            {formatDayKey(milestone.achievedOnDay)} — {milestone.evidence}
                           </span>
                         </li>
                       ))}
@@ -496,6 +641,13 @@ export function InsightsView({
                   inputMode="numeric"
                   value={baselineDraft}
                   onChange={(event) => changeBaseline(event.target.value)}
+                  onBlur={commitBaselineDraft}
+                  onKeyDown={(event) => {
+                    // Enter commits like the goal input: the draft would
+                    // otherwise wait for a blur the keyboard flow never
+                    // issues, and an unblurred draft never persists.
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
                   placeholder="not set"
                   aria-describedby="proxy-assumptions"
                 />
@@ -569,18 +721,42 @@ export function InsightsView({
               Weekly word goal (optional)
               <input
                 inputMode="numeric"
-                value={consent.weeklyGoalWords ?? ""}
-                onChange={(event) => {
-                  const parsed = Number.parseInt(event.target.value, 10);
-
-                  toggleConsent({
-                    weeklyGoalWords: Number.isInteger(parsed) && parsed > 0 ? parsed : null,
-                  });
+                maxLength={10}
+                value={goalDraft}
+                onChange={(event) => setGoalDraft(event.target.value)}
+                onFocus={() => setGoalFocused(true)}
+                onBlur={() => {
+                  setGoalFocused(false);
+                  commitGoalDraft();
+                }}
+                onKeyDown={(event) => {
+                  // Enter commits like a single-field form: the draft would
+                  // otherwise wait for a blur the keyboard flow never issues.
+                  if (event.key === "Enter") event.currentTarget.blur();
                 }}
                 placeholder="no goal"
+                aria-describedby={goalIssue === undefined ? undefined : "weekly-goal-issue"}
               />
+              {goalIssue !== undefined && (
+                <small id="weekly-goal-issue" className="goal-issue" role="alert">
+                  {goalIssue}
+                </small>
+              )}
             </label>
           </div>
+
+          {SETTINGS_ORDER.map((which) => {
+            const notice = settingsRefusals[which];
+
+            // role="alert", like the goal issue: a storage refusal is a
+            // failure the user did not navigate to, so it announces itself
+            // assertively instead of waiting for a live-region read.
+            return notice === undefined ? null : (
+              <p key={which} className="storage-issue" role="alert">
+                {notice}
+              </p>
+            );
+          })}
 
           {!consent.recurringPhrases && !consent.vocabularyPatterns ? (
             <NotEnoughData note="no content-derived analysis is enabled — enable one above; nothing is read or retained while both are off" />
@@ -629,15 +805,20 @@ export function InsightsView({
 
           <pre className="share-card-preview">{renderShareCard(shareCard)}</pre>
 
+          {shareCard.withheld.length > 0 && (
+            <p className="share-card-withheld">
+              Withheld by default: {shareCard.withheld.join(", ")} — preview note only; it never
+              travels with the copied or saved text.
+            </p>
+          )}
+
           <div className="share-card-fields">
             {SHARE_CARD_FIELDS.map((field) => (
               <label key={field}>
                 <input
                   type="checkbox"
                   checked={shareIncludes.has(field)}
-                  disabled={
-                    field === "topPhrase" && voice.ok && voice.value.phraseCards.length === 0
-                  }
+                  disabled={field === "topPhrase" && !topPhraseAvailable}
                   onChange={(event) => toggleShareField(field, event.target.checked)}
                 />
                 {field === "topPhrase" ? "top phrase (content-derived)" : field}
@@ -806,6 +987,22 @@ function VoiceCardTile({
       </button>
     </div>
   );
+}
+
+/**
+ * The one download path both exports share: object URL, anchor click,
+ * deferred revoke. One helper, so the aggregate export and the share-card
+ * save cannot drift apart on lifecycle handling.
+ */
+function downloadText(content: string, filename: string, mime: string): void {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+
+  const anchor = document.createElement("a");
+
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 interface CalendarCell {
