@@ -567,15 +567,26 @@ class DemoNegativeControlTests(unittest.TestCase):
         # Worst-case coordinated jitter: a noise window that slows ONE arm
         # uniformly across every repeat (the whole interleaved run). The
         # paired CI may sit well inside improvement territory, but the demo's
-        # 12% bar must keep it below a win.
+        # 12% bar must keep it below a win. The improvement assertion pins
+        # the mechanism (the min_improvement_pct gate is what rejects these
+        # sub-bar windows, not the halfwidth/regression gates).
+        # A sufficiently LARGE uniform slowdown (measured: a coordinated 15%
+        # one-arm window at seed 7 passes with ~21% improvement) CAN win —
+        # that is the comparator's documented residual false-pass path, and
+        # the demo's protection is that interleaved fresh-process arms cannot
+        # plausibly produce a coordinated supra-bar window; see the
+        # DemoNegativeControlTests class comment and run_experiment.py.
         world = random.Random(7)
         for slowdown_pct in (4.0, 8.0):
             b, c = self._records(world)
             for s in b["samples"]:
                 s["wall_ms"] = round(s["wall_ms"] * (1.0 + slowdown_pct / 100.0), 4)
-            verdict = compare_mod.compare(self.spec, b, c)["verdict"]
-            self.assertNotEqual(verdict, "pass",
+            result = compare_mod.compare(self.spec, b, c)
+            self.assertNotEqual(result["verdict"], "pass",
                                 f"a uniform {slowdown_pct}% one-arm slowdown must not win")
+            self.assertLess(result["effect"]["improvement_pct"],
+                            self.spec["acceptance"]["min_improvement_pct"],
+                            f"a uniform {slowdown_pct}% slowdown must stay below the bar")
 
     def test_real_improvement_still_passes_the_demo_bar(self):
         # Positive control: with a genuinely 30% faster candidate the same
