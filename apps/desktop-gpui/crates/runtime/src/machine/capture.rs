@@ -581,9 +581,16 @@ impl V2CaptureStore {
             // The commit_marked doc names this caller: a failure before
             // the promoting rename leaves the take's whole sealed audio in
             // staging, which reconcile would salvage as an interrupted
-            // duplicate. Best-effort discard under the same lock, then
+            // duplicate. Best-effort discard — pure filesystem work, so it
+            // runs off the store lock like the bulk writes above — then
             // the commit's error is the answer.
-            if let Err(discard_err) = store.discard_staging(&staged_id) {
+            drop(store);
+            if let Err(discard_err) = self
+                .store
+                .lock()
+                .expect("v2 store lock")
+                .discard_staging(&staged_id)
+            {
                 report_divergence(format!(
                     "staging journal {staged_id} leaked after the commit failure ({discard_err})"
                 ));

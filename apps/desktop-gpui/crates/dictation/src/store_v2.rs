@@ -1808,9 +1808,11 @@ impl StoreV2 {
         Ok(true)
     }
 
-    /// Rewrite the heartbeat. The heartbeat file carries no lock (the
-    /// ownership flock lives on the identity file's inode), so it is
-    /// replaced atomically: unique temp, write, fsync, rename. A crash
+    /// Rewrite the heartbeat. The published heartbeat file carries no
+    /// lock (the ownership flock lives on the identity file's inode; the
+    /// temp that publishes it holds one only between create and the
+    /// rename — see [`Self::write_heartbeat`]), so it is replaced
+    /// atomically: unique temp, write, fsync, rename. A crash
     /// mid-renewal leaves the *previous* heartbeat — which then ages out
     /// past the TTL, the correct staleness answer — and can never tear
     /// the identity record the pid/boot-id ladder reads.

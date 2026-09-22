@@ -2451,6 +2451,12 @@ fn the_samples_row_carries_the_take_ids_and_content_hash_in_extra() {
     );
 }
 
+// Permission-based fault injection: Unix directory write bits, which a
+// root process ignores (CAP_DAC_OVERRIDE) and Windows does not enforce
+// for entries created inside a "read-only" directory — so the test is
+// unix-only and probes that the denial genuinely bites before asserting
+// anything.
+#[cfg(unix)]
 #[test]
 fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     // The samples path's rollback covers its LAST failure arm too: when
@@ -2471,6 +2477,19 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     let mut denied = perms.clone();
     denied.set_readonly(true);
     std::fs::set_permissions(&audio, denied).expect("deny audio writes");
+
+    // A privileged process ignores directory write bits — verify the
+    // injection bites instead of asserting a rollback that never ran.
+    let probe = audio.join(".write_probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::set_permissions(&audio, perms);
+        eprintln!(
+            "skipping: this process ignores directory write bits; the \
+             permission-based injection cannot bite"
+        );
+        return;
+    }
 
     let result = store.commit_take(&take_record("take_commitfail", &samples, None));
 
