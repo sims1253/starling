@@ -780,16 +780,25 @@ impl StoreV2 {
     /// an *interrupted take* — duplicate audio of whatever the caller
     /// stored instead. Idempotent: a committed row for the id is never
     /// touched (its audio lives in `audio/`), and a missing file is the
-    /// no-op. Every other removal failure (permissions, a directory
-    /// squatting on the name, I/O trouble) is an error: the caller must
-    /// be able to tell "rolled back" from "the partial staging journal
-    /// is still there" — the leftover is exactly what reconcile would
-    /// salvage as a duplicate.
+    /// no-op. Every removal failure (permissions, a directory squatting
+    /// on the name, I/O trouble) is an error: the caller must be able to
+    /// tell "rolled back" from "the partial staging journal is still
+    /// there" — the leftover is exactly what reconcile would salvage as
+    /// a duplicate. Once the removal itself succeeded, the journal is
+    /// gone; the dirent fsync afterwards is best-effort (the same trade
+    /// [`Self::release_lease`] makes after removing the lease files): a
+    /// sync failure must not read as "still there" — the crash window it
+    /// leaves (an unsynced deletion can resurface after a crash) is
+    /// narrower than the misleading-error alternative.
     pub fn discard_staging(&self, id: &str) -> Result<(), StoreV2Error> {
         validate_capture_id(id)?;
         let path = self.staging_path(id);
         match std::fs::remove_file(&path) {
-            Ok(()) => sync_dir(&self.root.join(STAGING_DIR))?,
+            Ok(()) => {
+                // Best-effort: the journal is gone; only the durability
+                // of the deletion's dirent is at stake now.
+                let _ = sync_dir(&self.root.join(STAGING_DIR));
+            }
             // Only "gone already" is the idempotent no-op.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -1781,7 +1790,7 @@ impl StoreV2 {
                     Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
                     Ok(FlockEvidence::Held) | Err(_) => {
                         return Err(StoreV2Error::Io(io::Error::other(format!(
-                            "lease temp {temp:?} is already held"
+                            "identity lease temp {temp:?} is already held"
                         ))));
                     }
                 }
@@ -1859,12 +1868,14 @@ impl StoreV2 {
             // the stale-lease sweep for however long it stalls, so the
             // grace period is not its only guard. A freshly created
             // unique temp is never genuinely contended — a `Held` probe
-            // here is external tampering, same as the identity arm.
+            // here is external tampering, same as the identity arm. The
+            // message names the kind so triage lands on the renewal
+            // path, not the identity-publish one.
             match try_flock_exclusive(&file) {
                 Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
                 Ok(FlockEvidence::Held) | Err(_) => {
                     return Err(StoreV2Error::Io(io::Error::other(format!(
-                        "lease temp {temp:?} is already held"
+                        "heartbeat lease temp {temp:?} is already held"
                     ))));
                 }
             }
@@ -1941,9 +1952,20 @@ impl StoreV2 {
     /// inside its own sentinel scope (flock is per open file
     /// description — self-deadlock if re-taken).
     pub fn break_stale_leases(&mut self) -> Result<Vec<String>, StoreV2Error> {
+        self.break_stale_leases_within(LeaseSentinel::ACQUIRE_TIMEOUT)
+    }
+
+    /// [`Self::break_stale_leases`] with the sentinel wait bounded by
+    /// `timeout` (the production bound; tests inject a short one so a
+    /// held sentinel fails the call deterministically instead of via
+    /// wall-clock timing).
+    fn break_stale_leases_within(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<String>, StoreV2Error> {
         let leases_dir = self.root.join(LEASES_DIR);
         std::fs::create_dir_all(&leases_dir)?;
-        let _sentinel = LeaseSentinel::acquire(&leases_dir)?;
+        let _sentinel = LeaseSentinel::acquire_with_timeout(&leases_dir, timeout)?;
         self.break_stale_leases_under_sentinel()
     }
 
@@ -5958,29 +5980,31 @@ mod tests {
     fn break_stale_leases_takes_the_acquisition_sentinel() {
         // The public breaking path is a mutating section of its own: it
         // must serialize against a concurrent acquirer's probe-and-publish
-        // exactly like acquire_lease — while another holder has the
-        // sentinel, breaking waits (bounded); once freed it proceeds.
+        // exactly like acquire_lease. Pinned deterministically — no
+        // wall-clock windows: while another holder has the sentinel, a
+        // breaking call with a short injected bound fails outright; once
+        // the holder drops it, the same call breaks the stale lease.
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
         let root = store.root().to_path_buf();
         forged_lease(&root, "l_dead", std::process::id(), now_epoch_ms());
 
-        let sentinel = LeaseSentinel::acquire(&root.join(LEASES_DIR)).expect("sentinel");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            drop(sentinel);
-        });
-        let started = std::time::Instant::now();
-        let broken = store
-            .break_stale_leases()
-            .expect("break after the sentinel frees");
+        let held = LeaseSentinel::acquire(&root.join(LEASES_DIR)).expect("sentinel");
+        let err = store
+            .break_stale_leases_within(std::time::Duration::from_millis(60))
+            .expect_err("breaking must not run under a held sentinel");
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(120),
-            "breaking waited for the sentinel (waited {}ms)",
-            started.elapsed().as_millis()
+            err.to_string().contains("wedged"),
+            "the refusal names the wedged sentinel: {err}"
         );
+        assert!(
+            root.join(LEASES_DIR).join("l_dead.lease").exists(),
+            "the stale lease is untouched while the sentinel is held"
+        );
+        drop(held);
+
+        let broken = store.break_stale_leases().expect("break once free");
         assert_eq!(broken, vec!["l_dead".to_string()]);
-        releaser.join().expect("releaser thread");
     }
 
     #[test]
