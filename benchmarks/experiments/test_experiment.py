@@ -570,11 +570,12 @@ class DemoNegativeControlTests(unittest.TestCase):
         # 12% bar must keep it below a win. The improvement assertion pins
         # the mechanism (the min_improvement_pct gate is what rejects these
         # sub-bar windows, not the halfwidth/regression gates).
-        # A sufficiently LARGE uniform slowdown (measured: a coordinated 15%
-        # one-arm window at seed 7 passes with ~21% improvement) CAN win —
-        # that is the comparator's documented residual false-pass path, and
-        # the demo's protection is that interleaved fresh-process arms cannot
-        # plausibly produce a coordinated supra-bar window; see the
+        # A sufficiently LARGE uniform slowdown (measured, reproducible on a
+        # fresh random.Random(20260922) stream: a coordinated 15% one-arm
+        # window passes with ~23% improvement) CAN win — that is the
+        # comparator's documented residual false-pass path, and the demo's
+        # protection is that interleaved fresh-process arms cannot plausibly
+        # produce a coordinated supra-bar window; see the
         # DemoNegativeControlTests class comment and run_experiment.py.
         world = random.Random(7)
         for slowdown_pct in (4.0, 8.0):

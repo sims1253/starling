@@ -59,9 +59,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # true 0% effect, and the 12% bar demands a coordinated one-sided noise level
 # that interleaved arms cannot plausibly produce (measured on the comparator:
 # ~3-4% false-pass at 4 repeats / 5% bar under calibrated noise, ~0.01% here).
-# tolerated_failures rides along because 24 fresh processes x 7 requests must
-# tolerate a single stray transport hiccup without the demo degrading to
-# "unavailable".
+# tolerated_failures rides along because 24 fresh processes x 8 requests each
+# (1 cold + 1 warmup + 6 timed; 96 per arm) must tolerate a single stray
+# transport hiccup without the demo degrading to "unavailable".
 # MappingProxyType seals the preregistered protocol: the demo spec is copied
 # via dict() at its only consumer (_demo_spec), so the sealed originals
 # cannot drift at runtime.
