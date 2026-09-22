@@ -404,9 +404,20 @@ function purgedRecord(
     phrases: kinds.has("phrases") ? [] : record.phrases,
   };
 
-  const retained = emptied.derived_kinds ?? evidencedKinds(emptied);
+  // A stamped record narrows its own stamp. An unstamped one is stamped
+  // only from what the purge left behind — and when no evidence survives,
+  // it stays unstamped: an unknown, never a fabricated "analyzed, found
+  // nothing" stamp the labels never supported.
+  if (emptied.derived_kinds === undefined) {
+    const evidenced = evidencedKinds(emptied).filter((kind) => !kinds.has(kind));
 
-  return { ...emptied, derived_kinds: retained.filter((kind) => !kinds.has(kind)) };
+    return evidenced.length === 0 ? emptied : { ...emptied, derived_kinds: evidenced };
+  }
+
+  return {
+    ...emptied,
+    derived_kinds: emptied.derived_kinds.filter((kind) => !kinds.has(kind)),
+  };
 }
 
 export class MemoryInsightTermStore implements InsightTermStore {

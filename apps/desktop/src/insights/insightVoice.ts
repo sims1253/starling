@@ -233,7 +233,11 @@ export interface VoicePanel {
   readonly vocabularyCards: readonly VoicePatternCard[];
   /** Distinct, non-deleted takes with a selected recognition in the window. */
   readonly windowTakes: number;
-  /** Takes in the window whose aggregates exist under the current grants. */
+  /**
+   * Takes in the window analyzed under the current grants: a stamped
+   * analyzed-but-empty take (a real zero) counts; purged, never-granted
+   * and legacy-unstamped unknowns do not.
+   */
   readonly analyzedTakes: number;
 }
 
@@ -258,9 +262,14 @@ export function voicePanel(
     if (isCaptureDeleted(event)) tombstonedCaptures.add(event.capture_id);
   }
 
+  // A caller-supplied excludeCaptures set is UNIONED with the log's
+  // tombstones, never a replacement: a narrowed set must not silently
+  // resurrect captures the event log says were deleted.
   const resolved = resolveOptions({
     ...options,
-    excludeCaptures: options.excludeCaptures ?? tombstonedCaptures,
+    excludeCaptures: options.excludeCaptures
+      ? new Set([...options.excludeCaptures, ...tombstonedCaptures])
+      : tombstonedCaptures,
   });
 
   const since = resolved.now - resolved.windowDays * 24 * 60 * 60 * 1000;

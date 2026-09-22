@@ -201,7 +201,9 @@ export function InsightsView({
     // the last commit, not the in-progress draft — blur re-evaluates it.
   }
 
-  const parsedBaseline = Number.parseInt(baselineDraft, 10);
+  // Parsed only when the boundary admits the draft: a value like "1e3"
+  // must not drive the live comparison while storage rightly refuses it.
+  const parsedBaseline = isBaselineDraft(baselineDraft) ? Number.parseInt(baselineDraft, 10) : NaN;
   const baseline = Number.isInteger(parsedBaseline) && parsedBaseline > 0 ? parsedBaseline : null;
 
   const usage = useMemo(() => compute(() => aggregate(events, baseline)), [events, baseline]);
@@ -242,6 +244,14 @@ export function InsightsView({
    * draft is the proxy line's own message, not a storage failure.
    */
   function commitBaselineDraft() {
+    // An unchanged draft is a no-op — blur alone must not rewrite storage
+    // (the goal input's commit guards the same way).
+    if (readTypingBaseline(localStorage) === baselineDraft) {
+      noteSettingsSave("baseline", undefined);
+
+      return;
+    }
+
     noteSettingsSave(
       "baseline",
       isBaselineDraft(baselineDraft) && !writeTypingBaseline(localStorage, baselineDraft)

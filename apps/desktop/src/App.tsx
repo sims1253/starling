@@ -334,9 +334,11 @@ export default function App() {
    * finalize into the mirror; waiting for the registered promise (when
    * one exists) reads the true finalization anchor instead of falling
    * back to the write clock. Entries remove themselves once settled — or
-   * after the anchor bound, so a wedged chain cannot leak them.
+   * after the anchor bound, so a wedged chain cannot leak them. Each
+   * promise resolves with whether the finalize event actually landed,
+   * because the never-rejecting chain cannot say so any other way.
    */
-  const pendingFinalizesRef = useRef(new Map<string, Promise<void>>());
+  const pendingFinalizesRef = useRef(new Map<string, Promise<boolean>>());
 
   // The Insights consent state (E29 phase 2): read once from local settings
   // and thereafter changed only through applyInsightConsent, which persists
@@ -731,13 +733,19 @@ export default function App() {
    * keep the recording's own sequencing without handling errors.
    */
   const recordInsight = useCallback(
-    (action: () => Promise<void>): Promise<void> =>
+    (action: () => Promise<void>): Promise<boolean> =>
       insights
         .load()
         .then(action)
-        .then(() => setInsightEvents(insights.snapshot()))
+        .then(() => {
+          setInsightEvents(insights.snapshot());
+
+          return true;
+        })
         .catch((caught) => {
           addInsightNotice(`Insights could not record an event: ${messageFrom(caught)}`);
+
+          return false;
         }),
     [addInsightNotice],
   );
@@ -757,8 +765,15 @@ export default function App() {
    * "record". The returned promise never rejects.
    */
   const recordInsightTerms = useCallback(
-    (what: "record" | "delete" | "reset", action: () => Promise<InsightTermWrite>): Promise<void> =>
-      action()
+    (
+      what: "record" | "delete" | "reset",
+      action: () => Promise<InsightTermWrite>,
+    ): Promise<void> => {
+      // This delta's chain link, captured as it is appended so the return
+      // below can wait on exactly this delta's landing.
+      let landed = Promise.resolve();
+
+      const attempted = action()
         .then((write) => {
           // Serialized on the mirror chain, behind the mount-time load:
           // each delta applies only after every earlier delta AND after the
@@ -768,7 +783,7 @@ export default function App() {
           // the store. A "none" write touched nothing — the recorder's
           // contract (see InsightTermWrite): no kind granted, nothing
           // written — so it arms no guard and applies no delta.
-          termMirrorChainRef.current = termMirrorChainRef.current
+          const link = termMirrorChainRef.current
             .then(() => termLoadOnceRef.current ?? Promise.resolve())
             .then(() => {
               // Arming tracks the delta actually landing, not the write
@@ -783,6 +798,9 @@ export default function App() {
                 `Insights could not apply a term-aggregate update: ${messageFrom(caught)}`,
               );
             });
+
+          termMirrorChainRef.current = link;
+          landed = link;
 
           if (write.kind === "purge" && write.skippedInvalid > 0) {
             // Quarantined records the withdrawal could not rewrite: their
@@ -799,7 +817,13 @@ export default function App() {
           addInsightNotice(
             `Insights could not ${what} the term aggregates: ${messageFrom(caught)}`,
           );
-        }),
+        });
+
+      // The caller's promise settles only when the delta has actually
+      // landed on the mirror (or its write failed loudly): a hang bound
+      // watching this promise cannot be defeated by the detached chain.
+      return attempted.then(() => landed);
+    },
     [addInsightNotice],
   );
 
@@ -814,7 +838,7 @@ export default function App() {
     (what: string, wait: Promise<unknown>) => {
       let settled = false;
 
-      const timer = window.setTimeout(() => {
+      const timer = setTimeout(() => {
         if (!settled) {
           addInsightNotice(
             `Insights has not confirmed ${what} within ${
@@ -826,7 +850,7 @@ export default function App() {
 
       void Promise.resolve(wait).finally(() => {
         settled = true;
-        window.clearTimeout(timer);
+        clearTimeout(timer);
       });
     },
     [addInsightNotice],
@@ -867,9 +891,10 @@ export default function App() {
         // are precision-only and bounded (withAnchorBound): the promises
         // never reject, a failure or a HUNG store (a wedged transaction)
         // costs only the anchor — never the term write — and a missing
-        // finalize entry means none is in flight for this take yet, so
-        // the anchor falls back to the write clock, which is safe by
-        // design rather than a lost write.
+        // finalize entry means none is in flight for this take yet (or it
+        // already settled and removed itself, in which case the anchor is
+        // in the mirror the load wait reads), so the fallback to the
+        // write clock is safe by design rather than a lost write.
         withAnchorBound(pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
           .then(() => withAnchorBound(insights.load()))
           .then(() =>
@@ -891,7 +916,7 @@ export default function App() {
    * incomplete audio is parked or discarded before a session owns it.
    */
   const recordCaptureFinalized = useCallback(
-    (session: DictationSession): Promise<void> => {
+    (session: DictationSession): Promise<boolean> => {
       // Assigned after `settled` exists: both closures below read bindings
       // declared before them, so no callback can ever observe a TDZ.
       let discardTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1676,12 +1701,13 @@ export default function App() {
 
       setStreamingFinalize(true);
 
-      // Set the moment the settle callback emits capture_finalized. The
-      // finalize's event id is fixed (`cf-<captureId>`) but its payload
-      // carries a fresh occurred_at, so a second emit under the same id is
-      // a conflict error, never an idempotent replay — this flag is what
-      // keeps the post-finalize emit below from firing the duplicate.
-      let settleEmitted = false;
+      // The settle path's finalize emit, claimed when the settle callback
+      // runs. Its LANDING — not the attempt — is what suppresses the
+      // post-finalize emit below: the emit chain never rejects, so whether
+      // it landed travels as the resolved boolean, and a failed emit (which
+      // wrote nothing under the fixed `cf-<captureId>` id) is retried once
+      // instead of costing the take its capture_finalized event forever.
+      let settleEmit: Promise<boolean> | undefined;
 
       try {
         const finalized = await finalizeStreamingTake(
@@ -1703,11 +1729,20 @@ export default function App() {
               // the settlement clock. The wait is precision-only — the
               // promise never rejects (an event-store failure costs the
               // anchor, never the term write).
-              settleEmitted = true;
+              settleEmit = recordCaptureFinalized(session);
 
-              void recordCaptureFinalized(session).then(() =>
-                recordRecognitionSelected(session.id, transcript.text),
-              );
+              void settleEmit
+                .then(async (landed) => {
+                  // The settle emit failed and wrote nothing: one retry
+                  // through the same fixed id, so a transient store failure
+                  // cannot leave the take without its finalize event. A
+                  // still-broken store fails loudly (another notice),
+                  // never silently.
+                  if (!landed) await recordCaptureFinalized(session);
+
+                  return recordRecognitionSelected(session.id, transcript.text);
+                })
+                .then(() => undefined);
             },
           },
           store,
@@ -1720,7 +1755,7 @@ export default function App() {
         // stream-note fallback transcribed on the session) — a batch
         // fallback's recorder capture is emitted by the batch path's own
         // save instead.
-        if (finalized.session !== undefined && !settleEmitted) {
+        if (finalized.session !== undefined && settleEmit === undefined) {
           void recordCaptureFinalized(finalized.session);
         }
 
@@ -1927,13 +1962,22 @@ export default function App() {
     if (!bridge) return;
 
     const dispose = bridge.onToggleRecording(() => {
+      // The Insights view hides the recorder, and a hotkey START there
+      // would begin dictation nobody can see — the exact "unnoticed
+      // recording" the toggle's guard exists for — so a start returns to
+      // the capture pane first. Stopping stays view-agnostic: the take
+      // settles in the background either way.
+      if (view === "insights" && lifecycle.current() !== "recording") {
+        setView("capture");
+      }
+
       void toggleRecording();
     });
 
     bridge.ready();
 
     return dispose;
-  }, [toggleRecording]);
+  }, [lifecycle, toggleRecording, view]);
 
   async function importAudio(file?: File) {
     if (!file) return;

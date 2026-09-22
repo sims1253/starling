@@ -46,6 +46,10 @@ export function pluralWord(count: number, singular: string): string {
 }
 
 /** The count with its pluralized noun — one wording across every surface. */
-export function plural(count: number, singularWord: string, pluralForm = `${singularWord}s`) {
+export function plural(
+  count: number,
+  singularWord: string,
+  pluralForm = pluralWord(count, singularWord),
+) {
   return `${count} ${count === 1 ? singularWord : pluralForm}`;
 }

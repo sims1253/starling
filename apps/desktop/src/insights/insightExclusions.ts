@@ -33,7 +33,7 @@ const LABEL_PATTERN = /^(?:[^\p{White_Space}\p{C}]{1,64})(?: [^\p{White_Space}\p
 /** The longest label the boundary admits: three 64-code-unit tokens. */
 export const MAX_EXCLUSION_LABEL_LENGTH = 3 * 64 + 2;
 
-/** Years of excluded labels; more is damage, not preference. */
+/** Roughly a year's worth of daily excluded labels; more is damage, not preference. */
 export const MAX_EXCLUSIONS = 256;
 
 /** A stored entry is a label only if it fits the shape the cards can show. */
