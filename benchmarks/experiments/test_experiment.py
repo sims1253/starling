@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ import compare as compare_mod  # noqa: E402
 import record as record_mod  # noqa: E402
 import runner as runner_mod   # noqa: E402
 import stats as stats_mod     # noqa: E402
+import run_experiment as cli_mod  # noqa: E402
 
 V1_SPEC = {
     "schema": "starling-experiment-spec/1",
@@ -479,6 +481,110 @@ class RunnerTests(unittest.TestCase):
         orders = {tuple(runner_mod.arm_order(spec, r)) for r in range(8)}
         self.assertTrue(all(o in {("baseline", "candidate"),
                                   ("candidate", "baseline")} for o in orders))
+
+
+class DemoNegativeControlTests(unittest.TestCase):
+    """Issue #256: the CI demo runs IDENTICAL arms as a statistical negative
+    control — a 'pass' verdict there is a false win manufactured from runner
+    noise. These tests pin the demo's preregistered protocol and acceptance
+    bar (run_experiment.DEMO_PROTOCOL / DEMO_ACCEPTANCE) to the property
+    "identical arms + shared-runner noise => never pass", with a positive
+    control proving the same bar still passes a genuinely faster candidate.
+    Fully deterministic: synthetic timings, seeded worlds, seeded bootstrap."""
+
+    # Noise calibrated against measurements from the fixture binary
+    # (per-request paired improvements ~±10%, per-process repeat clusters
+    # ~±7% on a QUIET box), then inflated: shared CI runners are noisier.
+    CLUSTER_SD_PCT = 10.0
+    REQUEST_SD_PCT = 15.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        # The real demo spec (protocol, acceptance, seed) — only the arms'
+        # timings are synthetic. Binary path is inert: no process runs here.
+        self.spec = cli_mod._demo_spec(self.dir / "demo", Path("/bin/true"))
+
+    def _records(self, world, cand_gain_pct=0.0):
+        """Two valid same-seal records for the demo spec with synthetic
+        timings: independent per-(arm, repeat) process effects (the dominant
+        shared-runner noise term), per-request jitter, and an optional true
+        candidate gain (positive control)."""
+        proto = self.spec["protocol"]
+        repeats = proto["repeats"]
+        timed = proto["requests_per_repeat"]
+        per_process = 1 + proto["warmup_requests"] + timed
+
+        def samples(role, gain_pct):
+            out = []
+            for r in range(repeats):
+                cluster = world.gauss(0.0, self.CLUSTER_SD_PCT)
+                for q in range(per_process):
+                    noise = cluster + world.gauss(0.0, self.REQUEST_SD_PCT)
+                    factor = (1.0 + noise / 100.0) * (1.0 - gain_pct / 100.0)
+                    out.append({
+                        "arm": role, "repeat": r, "request": q,
+                        "cold": q == 0, "warmup": 0 < q <= proto["warmup_requests"],
+                        "wall_ms": round(0.94 * factor, 4),
+                    })
+            return out
+
+        seal = record_mod.spec_sha256(self.spec)
+        recs = []
+        for role, gain in (("baseline", 0.0), ("candidate", cand_gain_pct)):
+            recs.append({
+                "schema": "starling-experiment-record/1", "role": role,
+                "experiment_id": self.spec["experiment_id"], "spec_sha256": seal,
+                "provenance": {
+                    "repo_revision": "x", "ggml_revision": "x",
+                    "binary_sha256": "b" * 64,
+                    "runtime": {"hardware": "cpu-only-host", "driver": "d"},
+                    "workload_sha256": self.spec["workload"]["sha256"],
+                    "normalizer": "none-raw-wall-time",
+                    "model_claim": {"model": None, "model_sha256": None},
+                    "metric_identity": {"tool": "starling-experiments",
+                                        "metric": self.spec["metric"],
+                                        "normalizer": "none-raw-wall-time"},
+                    "commands": ["run"],
+                },
+                "samples": samples(role, gain), "failures": [], "status": "ok",
+            })
+        return recs
+
+    def test_identical_arms_never_pass_under_runner_noise(self):
+        # 40 seeded noise worlds; every world must refuse the win (inconclusive
+        # or an honest noise-tipped fail — the demo accepts both, never pass).
+        world = random.Random(20260922)
+        verdicts = []
+        for _ in range(40):
+            b, c = self._records(world)
+            verdicts.append(compare_mod.compare(self.spec, b, c)["verdict"])
+        self.assertNotIn("pass", verdicts)
+        self.assertIn("inconclusive", verdicts)  # the honest verdict dominates
+
+    def test_one_sided_noise_window_never_passes(self):
+        # Worst-case coordinated jitter: a noise window that slows ONE arm
+        # uniformly across every repeat (the whole interleaved run). The
+        # paired CI may sit well inside improvement territory, but the demo's
+        # 12% bar must keep it below a win.
+        world = random.Random(7)
+        for slowdown_pct in (4.0, 8.0):
+            b, c = self._records(world)
+            for s in b["samples"]:
+                s["wall_ms"] = round(s["wall_ms"] * (1.0 + slowdown_pct / 100.0), 4)
+            verdict = compare_mod.compare(self.spec, b, c)["verdict"]
+            self.assertNotEqual(verdict, "pass",
+                                f"a uniform {slowdown_pct}% one-arm slowdown must not win")
+
+    def test_real_improvement_still_passes_the_demo_bar(self):
+        # Positive control: with a genuinely 30% faster candidate the same
+        # protocol and bar MUST produce 'pass' — the negative control above
+        # is a two-sided gate, not a comparator that refuses everything.
+        world = random.Random(11)
+        b, c = self._records(world, cand_gain_pct=30.0)
+        result = compare_mod.compare(self.spec, b, c)
+        self.assertEqual(result["verdict"], "pass")
 
 
 if __name__ == "__main__":

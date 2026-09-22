@@ -29,7 +29,11 @@ point estimate can look like several percent "improvement", and the
 comparator still refuses it unless the CI clears the preregistered bar.
 (With a zero regression tolerance, noise can also tip the verdict to
 `fail` — an honest "too noisy to call", never a win.) That refusal is the
-product.
+product. The negative control is sized for shared CI runners (#256):
+12 fresh-process repeats and a 12% improvement bar keep scheduler jitter
+from tipping every repeat's paired improvement past the bar at once
+(the regression tests in `test_experiment.py` pin this property under
+calibrated noise, with a positive control for real wins).
 
 ## Real experiments
 
