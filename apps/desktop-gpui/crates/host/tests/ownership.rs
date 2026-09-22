@@ -27,13 +27,16 @@ struct ChildHost {
 
 impl ChildHost {
     fn spawn(root: &Path) -> ChildHost {
+        // Stdio::null: nothing here reads the child's streams, and piped
+        // streams nobody drains can deadlock a chatty child on the OS
+        // pipe buffer.
         let child = Command::new(BIN)
             .arg("--root")
             .arg(root)
             .arg("--runtime-dir")
             .arg(root.join("endpoints"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("host binary spawns");
         ChildHost { child }
@@ -68,6 +71,18 @@ impl Drop for ChildHost {
 
 fn socket_of(root: &Path) -> std::path::PathBuf {
     HostConfig::new(root, root.join("endpoints")).socket_path()
+}
+
+/// The config every in-process test here boots: transport defaults, an
+/// idle fake source and provider. One place, so a config-field change
+/// does not drift across four copies.
+fn plain_config(root: &Path) -> HostConfig {
+    let mut config = HostConfig::new(root, root.join("endpoints"));
+    config.runtime = config
+        .runtime
+        .with_capture_source(FakeCaptureSource::new(vec![]))
+        .with_provider(FakeProvider::new(vec![]));
+    config
 }
 
 /// The full ladder: host A owns and serves; a hard kill (SIGKILL — no
@@ -138,17 +153,7 @@ fn a_killed_host_is_taken_over_by_the_next_one() {
 #[test]
 fn a_second_host_binary_reports_already_running_and_exits_zero() {
     let root = tempfile::tempdir().unwrap();
-    let source = FakeCaptureSource::new(vec![]);
-    let provider = FakeProvider::new(vec![]);
-    let config = {
-        let mut config = HostConfig::new(root.path(), root.path().join("endpoints"));
-        config.runtime = config
-            .runtime
-            .with_capture_source(source)
-            .with_provider(provider);
-        config
-    };
-    let mut owner = serve(config).expect("in-process owner serves");
+    let mut owner = serve(plain_config(root.path())).expect("in-process owner serves");
     let client = HostClient::connect(owner.socket_path()).expect("owner reachable");
 
     let output = Command::new(BIN)
@@ -197,9 +202,8 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
 #[test]
 fn a_live_foreign_server_without_the_lease_is_refused() {
     let root = tempfile::tempdir().unwrap();
-    let other_root = tempfile::tempdir().unwrap();
 
-    // A live host on `other_root`... but pointed at `root`'s endpoint
+    // A live host on another root... but pointed at `root`'s endpoint
     // directory? Ownership is per data root; the endpoint derives from
     // the root, so a foreign server on OUR endpoint requires a host on
     // our root — which the lease already refuses. Construct the
@@ -212,37 +216,21 @@ fn a_live_foreign_server_without_the_lease_is_refused() {
     // Host with the same root + endpoint: it acquires the lease (no
     // owner), probes the endpoint, finds the squatter live, refuses —
     // and releases the lease it briefly held.
-    let source = FakeCaptureSource::new(vec![]);
-    let provider = FakeProvider::new(vec![]);
-    let config = {
-        let mut config = HostConfig::new(root.path(), root.path().join("endpoints"));
-        config.runtime = config
-            .runtime
-            .with_capture_source(source)
-            .with_provider(provider);
-        config
-    };
-    match serve(config) {
+    match serve(plain_config(root.path())) {
         Err(HostError::ForeignServer(path)) => assert_eq!(path, socket),
         Err(other) => panic!("expected ForeignServer, got {other}"),
-        Ok(host) => panic!("expected ForeignServer, a host bound over a squatter"),
+        Ok(host) => {
+            drop(host);
+            panic!("expected ForeignServer, a host bound over a squatter")
+        }
     }
 
     // And the lease it held was released: a clean serve on the same root
     // (with the squatter gone) now owns.
     drop(squatter);
     let _ = std::fs::remove_file(&socket);
-    let source = FakeCaptureSource::new(vec![]);
-    let provider = FakeProvider::new(vec![]);
-    let config = {
-        let mut config = HostConfig::new(root.path(), root.path().join("endpoints"));
-        config.runtime = config
-            .runtime
-            .with_capture_source(source)
-            .with_provider(provider);
-        config
-    };
-    let mut successor = serve(config).expect("serves once the endpoint is free");
+    let mut successor =
+        serve(plain_config(root.path())).expect("serves once the endpoint is free");
     successor.shutdown();
 }
 
@@ -262,17 +250,7 @@ fn a_non_socket_file_at_the_endpoint_is_refused_not_crashed() {
     // connect(2) to a non-socket file: ECONNREFUSED on Linux ("the
     // socket is not listening") reads as Dead, the file is removed, and
     // the host binds cleanly — the takeover path handles the residue.
-    let source = FakeCaptureSource::new(vec![]);
-    let provider = FakeProvider::new(vec![]);
-    let config = {
-        let mut config = HostConfig::new(root.path(), root.path().join("endpoints"));
-        config.runtime = config
-            .runtime
-            .with_capture_source(source)
-            .with_provider(provider);
-        config
-    };
-    let mut host = match serve(config) {
+    let mut host = match serve(plain_config(root.path())) {
         Ok(host) => host,
         Err(err) => panic!("residue must be taken over, refused with {err}"),
     };
@@ -281,12 +259,20 @@ fn a_non_socket_file_at_the_endpoint_is_refused_not_crashed() {
     host.shutdown();
 }
 
-/// Reads the binary's `--help` so the usage surface stays greppable.
+/// Reads the binary's `--help` so the usage surface stays greppable:
+/// help prints to stdout and exits 0 (the convention scripts probing the
+/// interface rely on); an unknown argument is the error path (stderr,
+/// exit 2).
 #[test]
 fn the_binary_documents_its_interface() {
     let output = Command::new(BIN).arg("--help").output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(0), "--help is not an error");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--root"), "{help}");
+    assert!(help.contains("--runtime-dir"), "{help}");
+
+    let output = Command::new(BIN).arg("--bogus").output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "a usage error exits 2");
     let usage = String::from_utf8_lossy(&output.stderr);
-    assert!(usage.contains("--root"), "{usage}");
-    assert!(usage.contains("--runtime-dir"), "{usage}");
+    assert!(usage.contains("--bogus"), "{usage}");
 }

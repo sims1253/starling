@@ -222,8 +222,12 @@ fn invalid_fixtures() -> Vec<(String, serde_json::Value)> {
 /// by the in-process oracle replay.)
 #[test]
 fn invalid_fixture_rejections_over_ipc_match_the_in_process_runtime() {
-    assert_eq!(invalid_fixtures().len(), 9, "nine invalid fixtures");
-    for (name, fixture) in invalid_fixtures() {
+    // No exact-count pin: the corpus is a sibling crate's frozen test
+    // tree; adding a fixture there must not break this test from the
+    // outside. Empty would mean the borrow broke — that is the pin.
+    let fixtures = invalid_fixtures();
+    assert!(!fixtures.is_empty(), "invalid fixture corpus is empty");
+    for (name, fixture) in fixtures {
         let root = tempfile::tempdir().unwrap();
         let source = FakeCaptureSource::new(vec![]);
         let provider = FakeProvider::new(vec![]);
@@ -376,12 +380,23 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
     .into_iter()
     .collect();
 
+    /// Monotonic fallback id for the (unexpected) seq-less send: a
+    /// static counter can never collide, where a constant "c0" could
+    /// (two seq-less commands, or a replay that checks id uniqueness).
     fn command_of(client: &HostClient, corr: &str, command: Command) -> serde_json::Value {
+        static ANON: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let type_name = command.type_name();
         let payload = command.payload_value();
         let (_, seq) = client.send_and_seq(Some(corr), command).expect("accepted");
+        let id = match seq {
+            Some(seq) => format!("c{seq}"),
+            None => format!(
+                "c-anon-{}",
+                ANON.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        };
         serde_json::json!({
-            "v": 1, "id": format!("c{}", seq.unwrap_or(0)), "ts": "2026-09-20T10:00:00Z",
+            "v": 1, "id": id, "ts": "2026-09-20T10:00:00Z",
             "corr": corr, "seq": seq,
             "type": type_name, "payload": payload
         })
@@ -779,6 +794,20 @@ fn a_job_survives_its_submitting_clients_death() {
 // The slow-consumer posture
 // --------------------------------------------------------------------- //
 
+/// Events the fan-out must offer before a stalled peer is considered
+/// provably overflowed: an order of magnitude more frame bytes than the
+/// test's 8-frame outbound queue plus both kernel socket buffers (the
+/// shrunk receiver and the host-side sender) can absorb — so the
+/// conclusion holds at any event rate, not at one measured one.
+const FILL_EVENTS: usize = 4096;
+
+/// Failure bound for the fill phase. Generous on purpose (slow CI): the
+/// fill argument is the event count above, never this clock.
+const FILL_BUDGET: Duration = Duration::from_secs(60);
+
+/// Failure bound for draining the backlog down to the host-planted EOF.
+const DRAIN_BUDGET: Duration = Duration::from_secs(12);
+
 /// A renderer that stops reading is closed (`slow_consumer`) while the
 /// runtime and the other client continue untouched — the Mode B answer
 /// to "the UI is not a durability dependency".
@@ -789,10 +818,10 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
     let provider = FakeProvider::new(vec![]);
     let mut config = ipc_config(root.path(), source, provider);
     config = config.with_outbound_capacity(8);
-    // A 1ms poll makes the fake produce ~1000 progress events a second:
-    // the default ~212 KiB unix send buffer (what the host's writer
-    // thread fills against) is exhausted in a couple of seconds, which
-    // is what backs the queue up to its cap.
+    // A 1ms poll keeps progress events flowing; how *fast* does not
+    // matter — the fill trigger below counts the events the fan-out
+    // offered (an observable condition), not seconds on the wall, so a
+    // slow box merely takes longer instead of failing.
     config.runtime = std::mem::take(&mut config.runtime).with_capture_config(CaptureConfig {
         journals_dir: root.path().join("journals"),
         poll_interval: Duration::from_millis(1),
@@ -805,7 +834,12 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
     // events.
     use std::os::fd::AsRawFd;
     let stalled = std::os::unix::net::UnixStream::connect(host.socket_path()).unwrap();
-    unsafe {
+    // SAFETY: `size` is a valid, initialized `c_int` on the stack for
+    // the duration of the call, and `stalled` is an open fd. SO_RCVBUF
+    // is advisory (Linux doubles it, rmem_min clamps it) — the assert
+    // keeps a silent no-op shrink from quietly invalidating the fill
+    // timing assumptions below.
+    let rc = unsafe {
         let size: libc::c_int = 2048;
         libc::setsockopt(
             stalled.as_raw_fd(),
@@ -813,8 +847,12 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
             libc::SO_RCVBUF,
             &size as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "failed to shrink the receive buffer; the timing below relies on it"
+    );
     let mut stalled = stalled;
 
     freeze_route(&healthy, "ctx-1");
@@ -833,9 +871,9 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
         Duration::from_secs(5),
     );
 
-    // Progress events (~100/s at a 10ms poll) pour into both sockets;
-    // the stalled one fills its kernel buffer, its outbound queue, and
-    // is closed by the host. Meanwhile the healthy client sees progress.
+    // Progress events pour into both connections (one fan-out); the
+    // healthy one drains them here, the stalled one absorbs what its
+    // kernel buffers can hold and is closed by the host.
     until(
         &healthy,
         "capture.progress",
@@ -843,24 +881,28 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
         Duration::from_secs(5),
     );
 
-    // Phase 1 — do not touch the stalled socket at all. At ~1000
-    // progress events a second, the kernel's per-socket buffer (~40 KiB
-    // against a shrunk receiver, measured) fills within a second; the
-    // host's writer parks, the 8-frame outbound queue fills behind it,
-    // and the event pump evicts the connection. Meanwhile the healthy
-    // client keeps receiving (its queue is drained here only so it
-    // stays out of the picture — it is not the client under test).
-    let evict_by = Instant::now() + Duration::from_secs(4);
-    while Instant::now() < evict_by {
-        while let Ok(_event) = healthy.try_recv_event() {}
-        // EOF cannot be observed yet: ~40 KiB of backlog sits ahead of
-        // it. Poll the healthy path for continued service instead; the
-        // stalled side is proven by phase 2.
-        if let Ok(last) = healthy.try_recv_event() {
-            let _ = last;
+    // Phase 1 — do not touch the stalled socket at all. The fill
+    // trigger is an observable condition, not a wall-clock guess: every
+    // event this healthy client drains was also offered to the stalled
+    // connection (same fan-out), so once FILL_EVENTS have been produced
+    // — an order of magnitude more frame bytes than the 8-frame queue
+    // plus both kernel socket buffers can absorb, whatever the event
+    // rate — the stalled side's writer must have parked and the event
+    // pump evicted the connection. A slower box simply takes longer;
+    // FILL_BUDGET is the failure bound, never the fill assumption.
+    let fill_deadline = Instant::now() + FILL_BUDGET;
+    let mut offered = 0usize;
+    while offered < FILL_EVENTS && Instant::now() < fill_deadline {
+        while let Ok(_event) = healthy.try_recv_event() {
+            offered += 1;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    assert!(
+        offered >= FILL_EVENTS,
+        "only {offered} events in {FILL_BUDGET:?} — this box produces events too \
+         slowly for the fill argument to hold"
+    );
     // Phase 2 — the eviction happened while nothing drained the socket;
     // draining it now can only reveal the backlog and then the EOF the
     // host's close planted behind it. A healthy (never-evicted)
@@ -868,7 +910,7 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
     stalled
         .set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
-    let drained_deadline = Instant::now() + Duration::from_secs(6);
+    let drained_deadline = Instant::now() + DRAIN_BUDGET;
     loop {
         let mut scratch = [0u8; 4096];
         match std::io::Read::read(&mut stalled, &mut scratch) {
@@ -881,7 +923,7 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
             {
                 assert!(
                     Instant::now() < drained_deadline,
-                    "the stalled socket drained no EOF in 6s — the host never closed it"
+                    "the stalled socket drained no EOF in {DRAIN_BUDGET:?} — the host never closed it"
                 );
                 // Keep the healthy client alive-side checked too.
                 while let Ok(_event) = healthy.try_recv_event() {}
@@ -1027,14 +1069,23 @@ fn oversized_frames_are_refused_without_being_read() {
     let (code, detail) = read_transport_error(&mut stream);
     assert_eq!(code, TransportErrorCode::MessageTooLarge);
     assert!(detail.contains("4096"), "{detail}");
-    // The connection is closed after the error.
+    // The connection is closed after the error. The read poll makes the
+    // WouldBlock branch below actually reachable (the stream otherwise
+    // blocks forever on the first read instead of failing at the
+    // deadline — a regression would hang, not fail).
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     let mut scratch = [0u8; 16];
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match std::io::Read::read(&mut stream, &mut scratch) {
             Ok(0) => break,
             Ok(_) => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 assert!(Instant::now() < deadline, "socket never closed");
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1224,4 +1275,354 @@ fn graceful_shutdown_releases_the_lease_and_the_endpoint() {
         serve(ipc_config(root.path(), source, provider)).expect("re-serve after shutdown");
     assert_ne!(successor.owner_id(), host.owner_id());
     successor.shutdown();
+}
+
+// ---------------------------------------------------------------------
+// Startup reconciliation (the host is the §4 recovering owner)
+// ---------------------------------------------------------------------
+
+/// The §4 recovery caller: the host is the Mode B owner, so a crashed
+/// predecessor's staging journal (a verified-prefix take that never
+/// finalized — what a SIGKILL mid-take leaves) is salvaged by *host
+/// startup*, before any client connects, and the report is surfaced on
+/// the handle. #257's client-mode deferral names the owner as the
+/// salvager; this is that owner running it.
+#[test]
+fn startup_reconcile_salvages_a_crashed_predecessors_staging_journal() {
+    use starling_dictation::store_v2::{StoreV2, TakeMeta};
+
+    let root = tempfile::tempdir().unwrap();
+    // Fabricate the crash residue exactly as store_v2's own kill tests
+    // do: frames + an fsynced boundary (the verified prefix), then an
+    // unconfirmed tail, then "crash" (drop without finalize/promote).
+    let crashed_id = {
+        let store = StoreV2::open(root.path()).expect("store opens");
+        let mut take = store
+            .begin_take(TakeMeta::for_device("mic"))
+            .expect("begin the interrupted take");
+        let confirmed: Vec<f32> = (0..800).map(|i| i as f32 * 0.01).collect();
+        take.append_frames(&confirmed).expect("append");
+        take.write_boundary().expect("boundary");
+        take.append_frames(&[0.5f32; 120]).expect("unconfirmed tail");
+        let id = take.id().to_string();
+        drop(take); // "crash"
+        id
+    };
+    assert!(
+        root.path().join("staging").join(format!("{crashed_id}.sj")).exists(),
+        "the residue is in place before the host starts"
+    );
+
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, client) = boot(ipc_config(root.path(), source, provider));
+
+    // The report says the take was recovered with a torn tail.
+    let report = host.startup_reconciliation();
+    assert_eq!(report.recovered_torn.len(), 1, "{report:?}");
+    assert_eq!(report.recovered_torn[0].id, crashed_id);
+    assert!(report.recovered_torn[0].torn_tail_bytes > 0);
+
+    // And the salvage is durable, not just reported: sealed audio in
+    // audio/, an interrupted row, staging empty.
+    let store = StoreV2::open(root.path()).expect("store opens for verification");
+    let record = store
+        .get_capture(&crashed_id)
+        .expect("get")
+        .expect("the interrupted row exists");
+    assert_eq!(
+        record.status,
+        starling_dictation::store_v2::CaptureStatus::Interrupted
+    );
+    assert!(
+        root.path().join("audio").join(format!("{crashed_id}.sj")).exists(),
+        "promoted out of staging into audio/"
+    );
+
+    // The host serves normally on top of the recovered state.
+    assert_eq!(client.snapshot().unwrap()["capture"]["state"], "Idle");
+
+    drop(client);
+    host.shutdown();
+}
+
+/// The clean root is the normal case: startup reconcile runs owner-mode
+/// and finds nothing (the report is surfaced, empty).
+#[test]
+fn startup_reconcile_on_a_clean_root_reports_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, _client) = boot(ipc_config(root.path(), source, provider));
+    let report = host.startup_reconciliation();
+    assert!(!report.has_findings(), "{report:?}");
+    host.shutdown();
+}
+
+// ---------------------------------------------------------------------
+// Bounded shutdown against a wedged peer
+// ---------------------------------------------------------------------
+
+/// A raw client that never reads, with a shrunk receive buffer, parks
+/// the host's writer mid-frame while its outbound queue still has room
+/// (the runtime is idle — no further event arrives to evict the
+/// connection). Graceful shutdown must still complete: after the drain
+/// bound the host kills the socket, joins its threads, releases the
+/// lease and removes the endpoint. Before the bound this join hung
+/// forever on exactly this shape.
+#[test]
+fn shutdown_completes_despite_a_writer_parked_on_a_silent_peer() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, healthy) = boot(ipc_config(root.path(), source, provider));
+    drop(healthy); // only the wedged connection remains
+
+    // Raw socket with a 2 KiB receive buffer (armed before connect so
+    // the kernel allocates it small), then never read from again.
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let mut wedged = UnixStream::connect(host.socket_path()).unwrap();
+    {
+        // SAFETY: `size` is a valid, initialized `c_int` for the
+        // duration of the call, and the socket is an open fd. SO_RCVBUF
+        // is a hint (the kernel doubles and clamps it) — the assert
+        // keeps a silent no-op from undermining the parking below.
+        let size: libc::c_int = 2048;
+        let rc = unsafe {
+            libc::setsockopt(
+                wedged.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "failed to shrink the receive buffer");
+    }
+
+    // A burst of snapshot requests: each reply is queued for the writer.
+    // The unix sender-side buffer (~212 KiB) plus the shrunk receive
+    // buffer absorbs only the first few hundred KiB of replies, so the
+    // writer parks mid-write with the queue (capacity 1024) still far
+    // under its cap — no delivery failure, no eviction, just a wedged
+    // connection nobody rescues.
+    let request =
+        serde_json::to_vec(&Frame::GetSnapshot { req: "wedged".into() }).expect("serializes");
+    for _ in 0..512 {
+        write_raw_frame(&mut wedged, &request);
+    }
+    // Give the host's reader a moment to answer them all.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let socket = host.socket_path().to_path_buf();
+    let started = Instant::now();
+    host.shutdown();
+    let elapsed = started.elapsed();
+
+    // The bound ended the drain (the writer was parked for the whole
+    // window), and shutdown finished in bounded time overall.
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "the drain window elapsed ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "shutdown completed within the bound ({elapsed:?})"
+    );
+    // And it completed *fully*: endpoint removed, lease released (a
+    // successor owns the root), nothing left serving.
+    assert!(!socket.exists(), "the endpoint is removed despite the wedge");
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let mut successor =
+        serve(ipc_config(root.path(), source, provider)).expect("the lease was released");
+    successor.shutdown();
+}
+
+// ---------------------------------------------------------------------
+// Receipts must not wait behind an undrained event stream
+// ---------------------------------------------------------------------
+
+#[test]
+fn receipts_flow_while_the_application_stops_draining_events() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let provider = FakeProvider::new(vec![]);
+    let mut config = ipc_config(root.path(), source, provider);
+    config.runtime = std::mem::take(&mut config.runtime).with_capture_config(CaptureConfig {
+        journals_dir: root.path().join("journals"),
+        poll_interval: Duration::from_millis(1),
+        ..CaptureConfig::default()
+    });
+    let (mut host, client) = boot(config);
+
+    freeze_route(&client, "ctx-drain");
+    client
+        .send(
+            Some("take_drain"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
+        .expect("start accepted");
+    until(
+        &client,
+        "capture.started",
+        |e| e.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
+
+    // Stop draining events entirely while the runtime keeps producing
+    // (~1000 progress events a second). The client-side backlog grows;
+    // the host side stays healthy because the reader keeps consuming the
+    // socket. Two seconds ≈ 2000 events — under the channel and backlog
+    // caps, so the connection must stay honestly healthy.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // The receipt arrives immediately — not after a 10 s reply timeout.
+    assert!(!client.is_closed(), "no starvation-induced close");
+    let sent_at = Instant::now();
+    client
+        .send(
+            Some("take_drain"),
+            Command::CaptureStop { drain: Some(true) },
+        )
+        .expect("the receipt arrived while events went undrained");
+    assert!(
+        sent_at.elapsed() < Duration::from_secs(2),
+        "the receipt waited {}s behind undrained events",
+        sent_at.elapsed().as_secs_f32()
+    );
+
+    // And draining resumes cleanly: the backlog (not just new events)
+    // keeps flowing — the delayed events were retained, not dropped.
+    until(
+        &client,
+        "capture.stopped",
+        |e| e.type_name() == "capture.stopped",
+        Duration::from_secs(10),
+    );
+    drop(client);
+    host.shutdown();
+}
+
+// ---------------------------------------------------------------------
+// Command shape validation and outbound-overflow close
+// ---------------------------------------------------------------------
+
+/// A command envelope that is not an object, or an object without a
+/// string `id`, is refused with `malformed_frame` instead of routed (the
+/// command would execute while its receipt could match no pending
+/// request — the client would sit out its reply timeout for an executed
+/// command).
+#[test]
+fn a_command_envelope_without_a_string_id_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, _client) = boot(ipc_config(root.path(), source, provider));
+
+    for bad in [
+        serde_json::json!([1, 2, 3]),
+        serde_json::json!("a string"),
+        serde_json::json!({ "v": 1, "type": "jobs.setLimits" }),
+        serde_json::json!({ "v": 1, "id": 7, "type": "jobs.setLimits" }),
+    ] {
+        let mut stream = raw_connect(&host);
+        let frame = serde_json::to_vec(&Frame::Command { envelope: bad }).unwrap();
+        write_raw_frame(&mut stream, &frame);
+        let (code, detail) = read_transport_error(&mut stream);
+        assert_eq!(code, TransportErrorCode::MalformedFrame, "{detail}");
+    }
+
+    host.shutdown();
+}
+
+/// An outbound queue that overflows closes the connection — the
+/// terminate-on-overflow machinery the snapshot and receipt paths share.
+/// A burst of snapshot replies against a non-reading peer (shrunk
+/// receive buffer) fills the small queue while the writer is parked, and
+/// the next reply cannot be queued: the connection is killed. The
+/// terminal `slow_consumer` frame is best-effort (a peer that stopped
+/// reading cannot be handed an explanation through a full kernel
+/// buffer), so the deterministic assertion is the prompt close itself:
+/// the client learns the connection ended — never a silent wedge, and
+/// never a bare reply timeout for a command that already ran.
+#[test]
+fn an_outbound_queue_overflow_closes_with_slow_consumer() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let mut config = ipc_config(root.path(), source, provider);
+    config = config.with_outbound_capacity(2);
+    let mut host = serve(config).expect("host serves");
+
+    use std::os::fd::AsRawFd;
+    let mut stalled = std::os::unix::net::UnixStream::connect(host.socket_path()).unwrap();
+    {
+        // SAFETY: as in the shutdown test — valid c_int, open fd; the
+        // assert keeps the shrink honest.
+        let size: libc::c_int = 2048;
+        let rc = unsafe {
+            libc::setsockopt(
+                stalled.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "failed to shrink the receive buffer");
+    }
+    let request =
+        serde_json::to_vec(&Frame::GetSnapshot { req: "flood".into() }).expect("serializes");
+    for _ in 0..16 {
+        write_raw_frame(&mut stalled, &request);
+    }
+
+    // The replies fill the 2-frame queue while the writer parks against
+    // the unreading peer; the next reply cannot be queued and the
+    // connection is torn down. Drain raw bytes (a frame-aware read would
+    // desync on a frame that straddles a poll timeout — read_exact
+    // discards partial progress on WouldBlock): the assertion is that
+    // the host ENDS the connection, as EOF, as ECONNRESET (the peer had
+    // unread inbound data at close time), or as EPIPE — and that a
+    // best-effort slow_consumer explanation rode along when the kernel
+    // buffer still had room for it.
+    stalled
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut drained = Vec::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the wedged connection was never closed in 15s"
+        );
+        let mut chunk = [0u8; 4096];
+        match std::io::Read::read(&mut stalled, &mut chunk) {
+            Ok(0) => break,                                    // clean EOF
+            Ok(n) => drained.extend_from_slice(&chunk[..n]),   // keep draining
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue // idle poll slice
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ConnectionReset
+                    || err.kind() == std::io::ErrorKind::BrokenPipe =>
+            {
+                break
+            }
+            Err(err) => panic!("draining the wedged connection: {err}"),
+        }
+    }
+    // The connection was real (hello and replies were drained) — what
+    // the close carried as an explanation is best-effort by design and
+    // not asserted (see the terminate-on-overflow docs in server.rs).
+    assert!(!drained.is_empty(), "the connection served before it closed");
+
+    host.shutdown();
 }

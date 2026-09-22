@@ -467,6 +467,47 @@ mod tests {
             let back: Receipt = serde_json::from_value(wire).unwrap();
             assert_eq!(back, value);
         }
+        // Pin the wire form explicitly for the externally-observed
+        // rejections too: the derives ARE the IPC protocol (the host
+        // serializes Frame::Receipt verbatim), so an accidental
+        // representation change — a newtype here, a field rename there —
+        // must fail here, not at the first IPC client. A bare round trip
+        // would only prove serde's self-consistency.
+        let rejection_pairs = vec![
+            (
+                Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
+                serde_json::json!({ "UnsupportedVersion": { "id": "cmd_9" } }),
+            ),
+            (
+                Rejection::IllegalInState {
+                    command: "capture.stop".into(),
+                    state: "Idle".into(),
+                    detail: "not legal".into(),
+                },
+                serde_json::json!({
+                    "IllegalInState": {
+                        "command": "capture.stop",
+                        "state": "Idle",
+                        "detail": "not legal"
+                    }
+                }),
+            ),
+            (
+                Rejection::SeqNotMonotonic { detail: "seq 4 follows 4".into() },
+                serde_json::json!({ "SeqNotMonotonic": { "detail": "seq 4 follows 4" } }),
+            ),
+            (Rejection::Closed, serde_json::json!("Closed")),
+        ];
+        for (value, wire) in rejection_pairs {
+            assert_eq!(
+                serde_json::to_value(&value).unwrap(),
+                wire,
+                "the rejection wire form changed; every IPC client's \
+                 pattern match rides on it"
+            );
+            let back: Rejection = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, value);
+        }
         let rejections = vec![
             Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
             Rejection::InvalidEnvelope("missing 'ts'".into()),

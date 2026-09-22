@@ -638,6 +638,15 @@ impl RuntimeClient {
     /// reconnecting client cannot collide with the stream positions a dead
     /// connection already consumed (host-assigned numbering continues
     /// monotonically across renderer restarts).
+    ///
+    /// Caller contract: call once per envelope, immediately before
+    /// [`Self::send_raw`], and only when the envelope carries no `seq` of
+    /// its own — the assignment is spent either way. Do not mix
+    /// host-assigned seqs with client-supplied ones on the same
+    /// correlation stream: the router's per-stream `command_frontier`
+    /// (a separate map from the bus frontier this method draws on) is
+    /// what enforces monotonicity, and interleaving the two numberings
+    /// can trip [`crate::machine::Rejection::SeqNotMonotonic`].
     pub fn assign_seq(&self, corr: Option<&str>) -> u64 {
         self.bus.next_seq(corr)
     }
