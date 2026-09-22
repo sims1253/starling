@@ -613,11 +613,31 @@ impl V2CaptureStore {
             //   divergence report — reconcile heals it as an orphaned
             //   session, never silently.
             match store.get_capture(&staged_id) {
-                Ok(Some(_)) => {
-                    report_divergence(format!(
-                        "commit_marked errored after the row for {staged_id} landed ({err}) — \
+                Ok(Some(record)) => {
+                    // The row landed anyway (an error after the transaction
+                    // committed — a failed WAL checkpoint or gc pass):
+                    // answer Ok, never Err — Err would invite a retry that
+                    // collides with the row. But the failure is named
+                    // twice: stderr for the live operator, and merged into
+                    // the row's extra_json (the `recovery` note seam) so
+                    // the trace survives process exit — stderr does not.
+                    let note = format!(
+                        "commit_marked errored after the row landed ({err}); \
                          the take is durably persisted"
+                    );
+                    report_divergence(format!(
+                        "the row for {staged_id} landed, but {note}"
                     ));
+                    if let Err(note_err) = store.update_capture_status(
+                        &staged_id,
+                        record.status,
+                        Some(&note),
+                    ) {
+                        report_divergence(format!(
+                            "recording the post-commit divergence on {staged_id} failed \
+                             ({note_err}) — the row keeps its committed contents"
+                        ));
+                    }
                     return Ok(());
                 }
                 Err(read_err) => {

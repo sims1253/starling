@@ -2502,7 +2502,8 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
 
     let result = store.commit_take(&take_record("take_commitfail", &samples, None));
 
-    std::fs::set_permissions(&audio, perms).expect("restore audio writes");
+    // The PermRestore drop is the canonical restore path — it covers this
+    // return and every panic below alike, so there is exactly one.
     let err = result.expect_err("the commit must fail while audio is unwritable");
     assert!(!err.is_empty());
 

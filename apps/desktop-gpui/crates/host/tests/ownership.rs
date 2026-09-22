@@ -270,7 +270,8 @@ fn an_unanswerable_lease_refuses_ownership_and_names_the_wedge() {
 /// (fast): a live foreign owner makes the second serve() a client, and a
 /// socket answering without the lease makes binding refuse.
 #[test]
-fn a_live_foreign_server_without_the_lease_is_refused() {    let root = tempfile::tempdir().unwrap();
+fn a_live_foreign_server_without_the_lease_is_refused() {
+    let root = tempfile::tempdir().unwrap();
 
     // A live host on another root... but pointed at `root`'s endpoint
     // directory? Ownership is per data root; the endpoint derives from

@@ -801,7 +801,14 @@ impl StoreV2 {
             }
             // Only "gone already" is the idempotent no-op.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+            // Context over kind-matching: nothing matches on the kind
+            // (the runtime callers only report the message), and a bare
+            // `IsADirectory` without the path sends triage nowhere.
+            Err(err) => {
+                return Err(StoreV2Error::Io(io::Error::other(format!(
+                    "removing staging journal {path:?}: {err}"
+                ))))
+            }
         }
         Ok(())
     }
