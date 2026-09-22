@@ -107,6 +107,17 @@ class SpecValidationTests(unittest.TestCase):
         del bad["workload"]["sha256"]
         self.assertTrue(any("sha256" in p for p in record_mod.validate_spec(bad)))
 
+    def test_tolerated_failures_sealed_when_present(self):
+        # Optional (runner defaults to 0) but sealed like the rest of the
+        # preregistered protocol: no int()-coercible junk, no negatives.
+        for bad_value in ("2", 1.5, -1, True):
+            bad = dict(V1_SPEC, tolerated_failures=bad_value)
+            self.assertTrue(
+                any("tolerated_failures" in p for p in record_mod.validate_spec(bad)),
+                f"tolerated_failures={bad_value!r} must be rejected",
+            )
+        self.assertEqual(record_mod.validate_spec(dict(V1_SPEC, tolerated_failures=2)), [])
+
 
 class RecordValidationTests(unittest.TestCase):
     def test_malformed_samples_are_rejected(self):

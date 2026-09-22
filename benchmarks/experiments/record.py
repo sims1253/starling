@@ -135,6 +135,15 @@ def validate_spec(spec: dict) -> list[str]:
             v = acceptance.get(key)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
                 problems.append(f"acceptance.{key} must be a number >= 0")
+    # Optional (the runner defaults to 0), but when present it must be a
+    # sealed non-negative int: the runner's int(spec.get(...)) coercion would
+    # silently accept "2"/1.5, and a negative value fails every repeat into
+    # the "failed" arm and an "unavailable" verdict.
+    tolerated = spec.get("tolerated_failures")
+    if tolerated is not None and (
+        not isinstance(tolerated, int) or isinstance(tolerated, bool) or tolerated < 0
+    ):
+        problems.append("tolerated_failures must be an integer >= 0 when present")
     if not isinstance(spec.get("objective"), str) or not spec["objective"]:
         problems.append("objective (the declared hypothesis) must be a non-empty string")
     workload = spec.get("workload")
