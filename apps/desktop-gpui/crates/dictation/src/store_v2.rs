@@ -801,13 +801,15 @@ impl StoreV2 {
             }
             // Only "gone already" is the idempotent no-op.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            // Context over kind-matching: nothing matches on the kind
-            // (the runtime callers only report the message), and a bare
-            // `IsADirectory` without the path sends triage nowhere.
+            // Context over structure: nothing walks the source chain (the
+            // runtime callers report the message), but the ErrorKind stays
+            // inspectable and a bare `IsADirectory` without the path
+            // sends triage nowhere.
             Err(err) => {
-                return Err(StoreV2Error::Io(io::Error::other(format!(
-                    "removing staging journal {path:?}: {err}"
-                ))))
+                return Err(StoreV2Error::Io(io::Error::new(
+                    err.kind(),
+                    format!("removing staging journal {path:?}: {err}"),
+                )))
             }
         }
         Ok(())
@@ -1785,22 +1787,7 @@ impl StoreV2 {
             // path.
             let temp = unique_lease_temp(leases_dir, owner_id);
             let result = (|| -> Result<File, StoreV2Error> {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp)?;
-                // A freshly created file is never contended; a probe that
-                // says otherwise means someone else's temp collided into
-                // this unique name (external tampering) — abort.
-                match try_flock_exclusive(&file) {
-                    Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
-                    Ok(FlockEvidence::Held) | Err(_) => {
-                        return Err(StoreV2Error::Io(io::Error::other(format!(
-                            "identity lease temp {temp:?} is already held"
-                        ))));
-                    }
-                }
+                let mut file = open_flocked_lease_temp(&temp, "identity")?;
                 write_lease_identity_content(&mut file, started_utc)?;
                 match std::fs::rename(&temp, self.lease_path(owner_id)) {
                     Ok(()) => Ok(file),
@@ -1865,27 +1852,7 @@ impl StoreV2 {
         let temp = unique_lease_temp(leases_dir, owner_id);
         let result = (|| -> Result<(), StoreV2Error> {
             use std::io::Write;
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            // The heartbeat temp is flocked like the identity temp: a
-            // writer stalled mid-renewal (a hung fsync) answers `Held` to
-            // the stale-lease sweep for however long it stalls, so the
-            // grace period is not its only guard. A freshly created
-            // unique temp is never genuinely contended — a `Held` probe
-            // here is external tampering, same as the identity arm. The
-            // message names the kind so triage lands on the renewal
-            // path, not the identity-publish one.
-            match try_flock_exclusive(&file) {
-                Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
-                Ok(FlockEvidence::Held) | Err(_) => {
-                    return Err(StoreV2Error::Io(io::Error::other(format!(
-                        "heartbeat lease temp {temp:?} is already held"
-                    ))));
-                }
-            }
+            let mut file = open_flocked_lease_temp(&temp, "heartbeat")?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             // Rename first, drop after: the flock covers the temp from
@@ -3383,6 +3350,40 @@ impl LeaseSentinel {
     }
 }
 
+/// Open a freshly created unique lease temp and flock it — the shared
+/// create-and-probe step of the identity publish and the heartbeat
+/// replacement (both temps carry the flock from create through the
+/// rename that publishes them, so a stalled writer answers `Held` to
+/// the stale-lease sweep however long it stalls). A freshly created
+/// unique temp is never genuinely contended: a `Held` probe means
+/// someone else's temp collided into the unique name (external
+/// tampering) — abort; a probe that itself *failed* is reported as the
+/// probe failure it is, never as a phantom holder. `kind` names the
+/// temp ("identity"/"heartbeat") so triage lands on the right path.
+fn open_flocked_lease_temp(temp: &Path, kind: &str) -> Result<File, StoreV2Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(temp)?;
+    match try_flock_exclusive(&file) {
+        Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => Ok(file),
+        Ok(FlockEvidence::Held) => {
+            drop(file);
+            Err(StoreV2Error::Io(io::Error::other(format!(
+                "{kind} lease temp {temp:?} is already held"
+            ))))
+        }
+        Err(err) => {
+            drop(file);
+            Err(StoreV2Error::Io(io::Error::new(
+                err.kind(),
+                format!("{kind} lease temp {temp:?}: flock probe failed: {err}"),
+            )))
+        }
+    }
+}
+
 /// Write the immutable identity record onto the acquisition temp (the
 /// file is published by rename immediately after; nothing rewrites it).
 fn write_lease_identity_content(file: &mut File, started_utc: &str) -> Result<(), StoreV2Error> {
@@ -3478,9 +3479,11 @@ fn now_epoch_ms() -> u64 {
 /// fresh.
 fn epoch_ms(now: std::time::SystemTime) -> u64 {
     now.duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
+        // The Ok arm clamps too: an exactly-epoch (or sub-millisecond
+        // past it) clock yields 0 ms, which is just as much the
+        // "no heartbeat parsed" sentinel as the pre-epoch Err arm.
+        .map(|since| (since.as_millis() as u64).max(1))
         .unwrap_or(1)
-        .max(1)
 }
 
 /// Whether a heartbeat recorded at `heartbeat_ms` is still fresh under
