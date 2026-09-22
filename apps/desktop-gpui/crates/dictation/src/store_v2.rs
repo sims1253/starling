@@ -716,7 +716,14 @@ impl StoreV2 {
                 "audio for capture {id} already exists; refusing to overwrite"
             )));
         }
-        std::fs::rename(&staging, &audio)?;
+        // Path context on the rename: a bare Permission-denied must name
+        // the move it refused (callers chain this into their errors).
+        std::fs::rename(&staging, &audio).map_err(|err| {
+            StoreV2Error::Io(io::Error::new(
+                err.kind(),
+                format!("promoting staging journal {staging:?} to {audio:?}: {err}"),
+            ))
+        })?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
         sync_dir(&self.root.join(STAGING_DIR))?;
         Ok(())

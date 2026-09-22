@@ -381,6 +381,8 @@ pub struct V2CaptureStore {
 /// must capture stderr (or adopt a durable side-channel as follow-up
 /// work) or those states surface only at the next startup reconcile.
 fn report_divergence(message: String) {
+    // TODO: prefix a UTC timestamp/level once the workspace adopts a
+    // logging facade — until then this stays the one channel.
     eprintln!("v2 capture store: {message}");
 }
 
@@ -627,10 +629,16 @@ impl V2CaptureStore {
                     // twice: stderr for the live operator, and merged into
                     // the row's extra_json (the `recovery` note seam) so
                     // the trace survives process exit — stderr does not.
-                    let note = format!(
-                        "commit_marked errored after the row landed ({err}); \
-                         the take is durably persisted"
-                    );
+                    let note = match &adoption_error {
+                        Some(reason) => format!(
+                            "commit_marked errored after the row landed ({err}); the take is \
+                             durably persisted from its samples ({reason})"
+                        ),
+                        None => format!(
+                            "commit_marked errored after the row landed ({err}); \
+                             the take is durably persisted"
+                        ),
+                    };
                     if let Err(note_err) = store.update_capture_status(
                         &staged_id,
                         record.status,

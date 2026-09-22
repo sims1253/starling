@@ -2495,8 +2495,8 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
         // Best-effort cleanup; the tempdir removes any leftover anyway.
         let _ = std::fs::remove_file(&probe);
         eprintln!(
-            "skipping: this process ignores directory write bits; the \
-             permission-based injection cannot bite"
+            "SKIP a_failed_commit_rolls_the_sealed_staging_journal_back: this process \
+             ignores directory write bits; the permission-based injection cannot bite"
         );
         return; // the PermRestore drop puts the directory back
     }
@@ -2506,7 +2506,10 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     // The PermRestore drop is the canonical restore path — it covers this
     // return and every panic below alike, so there is exactly one.
     let err = result.expect_err("the commit must fail while audio is unwritable");
-    assert!(!err.is_empty());
+    assert!(
+        err.contains("promoting"),
+        "the error must name the failing promote step, not an earlier arm: {err}"
+    );
 
     let staging: Vec<_> = std::fs::read_dir(dir.path().join("staging"))
         .expect("staging dir")
