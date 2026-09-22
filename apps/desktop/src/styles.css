@@ -1110,6 +1110,9 @@ kbd {
   .topbar {
     grid-template-columns: 1fr auto;
   }
+  .topbar-actions {
+    grid-column: 2;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

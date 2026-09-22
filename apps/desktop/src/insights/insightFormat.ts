@@ -23,13 +23,29 @@ export function formatMinutes(totalMinutes: number): string {
  * One local-day rendering for every user-facing surface: the metric layer's
  * day keys ("2026-09-22") become the runtime locale's short date, the same
  * shape the calendar and the history rows use, so no surface shows the same
- * day in a different dress. An unparseable key is shown verbatim — the
- * metric contract guarantees keys, so this is belt-and-braces.
+ * day in a different dress. `withYear` adds the year — the shape a share
+ * card's range line uses, because a saved plain-text artifact must stay
+ * unambiguous when it is re-read a year later. An unparseable key is shown
+ * verbatim — the metric contract guarantees keys, so this is belt-and-braces.
  */
-export function formatDayKey(dayKey: string): string {
+export function formatDayKey(dayKey: string, options?: { readonly withYear?: boolean }): string {
   const date = new Date(`${dayKey}T00:00:00`);
 
-  return Number.isNaN(date.getTime())
-    ? dayKey
-    : date.toLocaleDateString([], { month: "short", day: "numeric" });
+  if (Number.isNaN(date.getTime())) return dayKey;
+
+  return date.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+    ...(options?.withYear === true ? { year: "numeric" } : {}),
+  });
+}
+
+/** "take"/"takes", "day"/"days" — the word alone, pluralized by its count. */
+export function pluralWord(count: number, singular: string): string {
+  return `${singular}${count === 1 ? "" : "s"}`;
+}
+
+/** The count with its pluralized noun — one wording across every surface. */
+export function plural(count: number, singularWord: string, pluralForm = `${singularWord}s`) {
+  return `${count} ${count === 1 ? singularWord : pluralForm}`;
 }

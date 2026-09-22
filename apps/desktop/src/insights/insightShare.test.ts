@@ -101,8 +101,12 @@ describe("renderShareCard", () => {
     expect(text.startsWith(SHARE_CARD_TITLE)).toBe(true);
     // The range reads through the shared day formatter, like every other
     // user-facing surface — asserted against the same helper so the test
-    // stays locale-independent.
-    expect(text).toContain(`${formatDayKey("2026-09-14")} – ${formatDayKey("2026-09-21")}`);
+    // stays locale-independent, and with the years a saved card must state.
+    expect(text).toContain(
+      `${formatDayKey("2026-09-14", { withYear: true })} – ${formatDayKey("2026-09-21", {
+        withYear: true,
+      })}`,
+    );
     expect(text).toContain("312 words recognized from speech");
     expect(text).toContain("silence included");
     expect(text).not.toContain("deploy the server");

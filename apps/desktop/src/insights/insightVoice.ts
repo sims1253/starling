@@ -247,7 +247,11 @@ export function voicePanel(
   // options can carry it to the card denominators too: any capture_deleted
   // removes the capture's events regardless of arrival order, and its term
   // record counts nowhere even while the term store's own deletion is
-  // still catching up.
+  // still catching up. The pre-pass is REQUIRED, not a stylistic choice:
+  // dominance is order-independent only because tombstonedCaptures is
+  // complete before the recognition pass checks membership — a fused
+  // single pass would let a recognition that precedes its tombstone in
+  // the log sneak into the window.
   const tombstonedCaptures = new Set<string>();
 
   for (const event of events) {

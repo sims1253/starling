@@ -29,7 +29,7 @@ import {
 } from "./insightShare";
 import { milestonePanel } from "./insightMilestones";
 import { weeklyRecap } from "./insightRecap";
-import { formatDayKey, formatMinutes } from "./insightFormat";
+import { formatDayKey, formatMinutes, plural } from "./insightFormat";
 
 /**
  * The Insights surface (E29): Usage and Quality panels computed from the
@@ -105,10 +105,6 @@ function formatSeconds(seconds: number): string {
   const sign = seconds < 0 ? "−" : "";
 
   return `${sign}${body}`;
-}
-
-function plural(count: number, singularWord: string, pluralWord = `${singularWord}s`) {
-  return `${count} ${count === 1 ? singularWord : pluralWord}`;
 }
 
 /** One wording for every settings-storage refusal, so the copies cannot drift. */
@@ -280,10 +276,10 @@ export function InsightsView({
 
     if (parsed === null) {
       setGoalIssue(
-        // Runtime locale, matching every other number on the surface (the
-        // milestone labels format their thresholds the same way) — one
-        // number style across the Insights views.
-        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
+        // Runtime locale for both bounds, matching every other number on
+        // the surface (the milestone labels format their thresholds the
+        // same way) — one number style across the Insights views.
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN.toLocaleString()} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
       );
 
       return;
@@ -308,12 +304,21 @@ export function InsightsView({
     setShareCopyFailed(undefined);
   }
 
+  /**
+   * Both exports name their file from one clock — the local reporting day
+   * the card content and calendar use — so a save around local midnight is
+   * never dated the day the card itself says it is not.
+   */
+  function exportFilename(kind: string, extension: string): string {
+    return `starling-${kind}-${localDayKey(Date.now(), timezone)}.${extension}`;
+  }
+
   function exportAggregate() {
     if (!usage.ok) return;
 
     downloadText(
       JSON.stringify(usage.value, null, 2),
-      `starling-insights-${new Date().toISOString().slice(0, 10)}.json`,
+      exportFilename("insights", "json"),
       "application/json",
     );
   }
@@ -379,11 +384,7 @@ export function InsightsView({
   function saveShareCard() {
     if (shareCard === undefined) return;
 
-    downloadText(
-      renderShareCard(shareCard),
-      `starling-share-card-${new Date().toISOString().slice(0, 10)}.txt`,
-      "text/plain",
-    );
+    downloadText(renderShareCard(shareCard), exportFilename("share-card", "txt"), "text/plain");
   }
 
   function resetInsights() {
@@ -696,6 +697,7 @@ export function InsightsView({
               Weekly word goal (optional)
               <input
                 inputMode="numeric"
+                maxLength={10}
                 value={goalDraft}
                 onChange={(event) => setGoalDraft(event.target.value)}
                 onFocus={() => setGoalFocused(true)}

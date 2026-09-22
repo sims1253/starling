@@ -1,5 +1,6 @@
 import { isCaptureFinalized, type InsightEvent } from "./insightEvents";
 import { aggregate, localDayKey, parseInsightTimestamp } from "./insightMetrics";
+import { plural, pluralWord } from "./insightFormat";
 import type { InsightConsent } from "./insightConsent";
 
 /**
@@ -49,11 +50,6 @@ const MINUTE_MILESTONES = [60, 600] as const;
  * mangle; every other threshold reads as its plain minute count.
  */
 const MINUTE_MILESTONE_LABELS = new Map<number, string>([[60, "An hour of captured audio"]]);
-
-/** "take"/"takes", "day"/"days" — the one pluralizer the strings share. */
-function pluralWord(count: number, singular: string): string {
-  return `${singular}${count === 1 ? "" : "s"}`;
-}
 
 /** The streak's own line: the live run, or the honest absence of one. */
 function streakDescription(currentDays: number, longestDays: number): string {
@@ -158,7 +154,7 @@ export function milestones(
     id: "first-take",
     label: "First voice note",
     achievedOnDay: first.day,
-    evidence: `The earliest local day with a retained take (${first.takes} ${pluralWord(first.takes, "take")}).`,
+    evidence: `The earliest local day with a retained take (${plural(first.takes, "take")}).`,
   });
 
   // "First week of voice notes": the seventh distinct day with a take.

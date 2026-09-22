@@ -794,10 +794,11 @@ export default function App() {
    * kinds the current consent grants, and a failure there is its own notice,
    * never a take error and never a stale event mirror. The term record
    * anchors to the take's own finalization instant from the event log, so a
-   * delayed retranscription cannot move the take across a card window — the
-   * anchor is read from a mirror known to be loaded, never a possibly-empty
-   * one, and a load failure costs only the anchor's precision, never the
-   * write itself.
+   * delayed retranscription cannot move the take across a card window. The
+   * anchor waits are bounded and precision-only: when the load or finalize
+   * wait fails or times out, the anchor reads a possibly-empty mirror and
+   * `anchorableFinalizedAt` falls back to the write clock — a degraded
+   * anchor, never a lost write.
    */
   const recordRecognitionSelected = useCallback(
     (sessionId: string, transcriptText: string) => {

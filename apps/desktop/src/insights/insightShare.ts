@@ -183,7 +183,9 @@ export function milestoneInRange(
 export function renderShareCard(card: ShareCard): string {
   const parts = [
     card.title,
-    `${formatDayKey(card.rangeStartDay)} – ${formatDayKey(card.rangeEndDay)}`,
+    // With years: a saved plain-text card must stay unambiguous about its
+    // own range whenever it is re-read.
+    `${formatDayKey(card.rangeStartDay, { withYear: true })} – ${formatDayKey(card.rangeEndDay, { withYear: true })}`,
     ...card.lines,
     card.definitions,
   ];

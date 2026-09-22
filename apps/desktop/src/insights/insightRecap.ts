@@ -1,6 +1,6 @@
 import type { InsightEvent } from "./insightEvents";
 import { aggregate, localDayKey, parseInsightTimestamp } from "./insightMetrics";
-import { formatMinutes } from "./insightFormat";
+import { formatMinutes, plural } from "./insightFormat";
 
 /**
  * The weekly recap (E29 phase 2), derived entirely from the existing
@@ -98,7 +98,7 @@ export function weeklyRecap(
   const changeWords = previousWeek === null ? null : thisWeek.words - previousWeek.words;
 
   const lines = [
-    `This week: ${thisWeek.words} words recognized from speech · ${thisWeek.takes} takes · ${formatMinutes(thisWeek.capturedSeconds / 60)} captured`,
+    `This week: ${plural(thisWeek.words, "word")} recognized from speech · ${plural(thisWeek.takes, "take")} · ${formatMinutes(thisWeek.capturedSeconds / 60)} captured`,
   ];
 
   if (previousWeek === null) {
@@ -109,7 +109,7 @@ export function weeklyRecap(
     const direction = wordDeltaDirection(changeWords);
 
     lines.push(
-      `Last week: ${previousWeek.words} words · ${previousWeek.takes} takes · ${formatMinutes(previousWeek.capturedSeconds / 60)} captured`,
+      `Last week: ${plural(previousWeek.words, "word")} · ${plural(previousWeek.takes, "take")} · ${formatMinutes(previousWeek.capturedSeconds / 60)} captured`,
     );
     lines.push(`Words this week were ${direction} last week.`);
   }
