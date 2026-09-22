@@ -59,10 +59,17 @@ export function readExclusions(storage: ExclusionStorage): ReadonlySet<string> {
 }
 
 /**
- * Persist the whole exclusion set. False means storage refused the write and
- * the exclusions are session-only — the caller surfaces that, because a
- * silent refusal reads as "never shown again" while actually lasting until
- * the app closes.
+ * Persist the whole exclusion set. Callers must pass a set that already
+ * satisfies the read boundary — every label conforming to the label shape,
+ * at most MAX_EXCLUSIONS entries; writes are not re-validated, so an
+ * out-of-bounds set would persist but be silently truncated by the next
+ * read. The in-memory set cannot violate this (it is seeded from
+ * readExclusions and extended only with card labels the term record's own
+ * schema already bounds), which is why the asymmetry is a documented
+ * contract rather than a second validation pass.
+ * False means storage refused the write and the exclusions are
+ * session-only — the caller surfaces that, because a silent refusal reads
+ * as "never shown again" while actually lasting until the app closes.
  */
 export function writeExclusions(storage: ExclusionStorage, labels: ReadonlySet<string>): boolean {
   try {

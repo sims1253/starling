@@ -736,6 +736,12 @@ export type InsightTermWrite =
  * (a capture keeps its position, a new capture appends), a tombstone drops
  * its capture, a purge upserts the records the store rewrote, and a clear
  * empties the mirror. Pure — the caller's state update stays functional.
+ *
+ * Deltas are recorder output, and the recorder owns the tombstone
+ * invariant: `put` refuses a tombstoned capture before any delta exists, so
+ * a "record" delta for a capture whose "tombstone" delta already ran cannot
+ * be produced (the write rejects to its caller instead). A caller applying
+ * raw writes from anywhere else takes custody of that invariant itself.
  */
 export function applyTermWrite(
   records: readonly InsightTermRecord[],

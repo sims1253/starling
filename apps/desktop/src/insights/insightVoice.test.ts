@@ -315,6 +315,33 @@ describe("voicePanel denominators", () => {
     );
   });
 
+  it("drops a deleted capture's still-present record from the per-kind cards too", () => {
+    // The two stores delete on separate chains: the event tombstone may
+    // already dominate while the term record still sits in the mirror (its
+    // deletion in flight, or failed with a notice). The card denominators
+    // must agree with windowTakes about that capture instead of counting
+    // a take every other surface has dropped.
+    const records = [
+      recordOf("take-1", "deploy the server and deploy the server again"),
+      recordOf("take-2", "please deploy the server once more"),
+    ];
+
+    const live: readonly InsightEvent[] = [recognitionOf("take-1"), recognitionOf("take-2")];
+    const deleted: readonly InsightEvent[] = [...live, deletionOf("take-2")];
+    const consent = { recurringPhrases: true, vocabularyPatterns: false };
+
+    const before = voicePanel(live, records, consent, { now: NOW });
+    const after = voicePanel(deleted, records, consent, { now: NOW });
+
+    expect(before.phraseCards.find((card) => card.label === "deploy the server")?.takes).toBe(2);
+
+    expect(after.windowTakes).toBe(1);
+    expect(after.analyzedTakes).toBe(1);
+    // The still-present record of the deleted take contributes neither a
+    // denominator share nor its labels: the phrase no longer recurs.
+    expect(labelsOf(after.phraseCards)).toEqual([]);
+  });
+
   it("counts analyzedTakes by the derived_kinds stamp, not by label lists", () => {
     const events: readonly InsightEvent[] = [
       recognitionOf("take-1"),

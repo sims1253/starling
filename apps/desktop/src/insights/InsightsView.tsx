@@ -16,7 +16,7 @@ import {
   type InsightConsent,
 } from "./insightConsent";
 import { readExclusions, writeExclusions } from "./insightExclusions";
-import { readTypingBaseline, writeTypingBaseline } from "./insightBaseline";
+import { isBaselineDraft, readTypingBaseline, writeTypingBaseline } from "./insightBaseline";
 import type { InsightTermRecord } from "./insightTerms";
 import { voicePanel, type VoicePatternCard } from "./insightVoice";
 import {
@@ -230,16 +230,24 @@ export function InsightsView({
   const recap = useMemo(() => compute(() => weeklyRecap(events, { timezone })), [events, timezone]);
 
   function changeBaseline(value: string) {
+    // The draft persists on blur (commitBaselineDraft), like the goal
+    // input: a transient invalid shape ("1e3", a pasted sentence) is the
+    // field's own validation story, never a per-keystroke "storage
+    // refused" mislabel for something storage was never asked to keep.
     setBaselineDraft(value);
+  }
 
-    // The boundary reports its own refusal (quota, privacy mode, a value
-    // too large to be a draft); the baseline then holds for this session
-    // only and the next mount starts from what was last saved.
+  /**
+   * Commit the baseline draft: persist what fits, and report a refusal
+   * only when a storable draft met a refusing storage — an inadmissible
+   * draft is the proxy line's own message, not a storage failure.
+   */
+  function commitBaselineDraft() {
     noteSettingsSave(
       "baseline",
-      writeTypingBaseline(localStorage, value)
-        ? undefined
-        : storageRefusalMessage("the typing baseline"),
+      isBaselineDraft(baselineDraft) && !writeTypingBaseline(localStorage, baselineDraft)
+        ? storageRefusalMessage("the typing baseline")
+        : undefined,
     );
   }
 
@@ -614,6 +622,7 @@ export function InsightsView({
                   inputMode="numeric"
                   value={baselineDraft}
                   onChange={(event) => changeBaseline(event.target.value)}
+                  onBlur={commitBaselineDraft}
                   placeholder="not set"
                   aria-describedby="proxy-assumptions"
                 />
@@ -713,8 +722,11 @@ export function InsightsView({
           {SETTINGS_ORDER.map((which) => {
             const notice = settingsRefusals[which];
 
+            // role="alert", like the goal issue: a storage refusal is a
+            // failure the user did not navigate to, so it announces itself
+            // assertively instead of waiting for a live-region read.
             return notice === undefined ? null : (
-              <p key={which} className="storage-issue" role="status">
+              <p key={which} className="storage-issue" role="alert">
                 {notice}
               </p>
             );

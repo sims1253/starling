@@ -432,7 +432,9 @@ export class InsightRecorder {
    * insertion-ordered, so the LAST match wins — later events supersede
    * earlier ones everywhere else in this contract, and the id scheme
    * (`cf-<captureId>`) currently makes replays idempotent rather than
-   * appended; this stays correct if that ever changes.
+   * appended; this stays correct if that ever changes. One exception is
+   * structural: a capture_deleted tombstone dominates, so a finalize that
+   * lands after its own tombstone never re-establishes the anchor.
    */
   captureFinalizedAt(captureId: string): string | undefined {
     return this.finalizedAt.get(captureId);
@@ -494,10 +496,14 @@ export class InsightRecorder {
   /** Maintain the anchor index as one event enters the mirror. */
   private applyFinalizedAt(event: InsightEvent): void {
     if (isCaptureFinalized(event)) {
+      // A finalize landing after its tombstone (an in-flight crossing: the
+      // delete confirmed while the finalize emit was still queued) must not
+      // re-establish the anchor — the tombstone dominates here exactly as
+      // it does in every other read of this contract.
+      if (this.tombstoneFor(event.capture_id) !== undefined) return;
+
       this.finalizedAt.set(event.capture_id, event.occurred_at);
     } else if (isCaptureDeleted(event)) {
-      // Replay order: a deletion drops the anchor a later finalized event
-      // could re-establish, mirroring the tombstone's own dominance.
       this.finalizedAt.delete(event.capture_id);
     }
   }

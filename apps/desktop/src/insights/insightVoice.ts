@@ -38,6 +38,14 @@ export interface VoiceCardOptions {
   readonly limit?: number;
   /** User exclusions: labels never shown and never counted into descriptions. */
   readonly exclude?: ReadonlySet<string>;
+  /**
+   * Captures the event log says were deleted. Their records count nowhere —
+   * not in the per-kind denominators, not in the labels — even while the
+   * term store's own deletion is still in flight or has failed with a
+   * notice; the event tombstone dominates, as it does in every other
+   * surface. `voicePanel` derives this from the events it is given.
+   */
+  readonly excludeCaptures?: ReadonlySet<string>;
   /** Injectable clock for deterministic tests (epoch ms). */
   readonly now?: number;
   /**
@@ -81,7 +89,7 @@ interface WindowedTotals {
 function windowTotals(
   records: readonly InsightTermRecord[],
   kind: InsightTermKind,
-  options: Required<Pick<VoiceCardOptions, "windowDays" | "now">>,
+  options: Required<Pick<VoiceCardOptions, "windowDays" | "now" | "excludeCaptures">>,
 ): WindowedTotals {
   const since = options.now - options.windowDays * 24 * 60 * 60 * 1000;
   const byLabel = new Map<string, { takes: number; occurrences: number }>();
@@ -89,6 +97,11 @@ function windowTotals(
 
   for (const record of records) {
     if (parseInsightTimestamp(record.occurred_at) < since) continue;
+
+    // The event log's tombstone dominates the records the term store has
+    // not caught up on: a deleted capture counts nowhere, so the per-kind
+    // denominator and windowTakes cannot disagree about it.
+    if (options.excludeCaptures.has(record.capture_id)) continue;
 
     // Only analyzed-for-this-kind records contribute — to the denominator
     // AND to the labels. Counting labels from an unanalyzed record could
@@ -190,6 +203,7 @@ function resolveOptions(options: VoiceCardOptions): Required<VoiceCardOptions> {
     minTakes: options.minTakes ?? DEFAULT_MIN_TAKES,
     limit: options.limit ?? DEFAULT_LIMIT,
     exclude: options.exclude ?? new Set<string>(),
+    excludeCaptures: options.excludeCaptures ?? new Set<string>(),
     now: options.now ?? Date.now(),
     minTermLength: options.minTermLength ?? DEFAULT_MIN_TERM_LENGTH,
   };
@@ -229,19 +243,23 @@ export function voicePanel(
   consent: { readonly recurringPhrases: boolean; readonly vocabularyPatterns: boolean },
   options: VoiceCardOptions = {},
 ): VoicePanel {
-  const resolved = resolveOptions(options);
-
-  const since = resolved.now - resolved.windowDays * 24 * 60 * 60 * 1000;
-
-  // The metric contract's tombstone rule: any capture_deleted removes the
-  // capture's events regardless of arrival order. A deleted take's events
-  // stay in the log, so the denominator must skip them explicitly or it
-  // would keep counting takes every other surface has dropped.
+  // The metric contract's tombstone rule, computed first so the resolved
+  // options can carry it to the card denominators too: any capture_deleted
+  // removes the capture's events regardless of arrival order, and its term
+  // record counts nowhere even while the term store's own deletion is
+  // still catching up.
   const tombstonedCaptures = new Set<string>();
 
   for (const event of events) {
     if (isCaptureDeleted(event)) tombstonedCaptures.add(event.capture_id);
   }
+
+  const resolved = resolveOptions({
+    ...options,
+    excludeCaptures: options.excludeCaptures ?? tombstonedCaptures,
+  });
+
+  const since = resolved.now - resolved.windowDays * 24 * 60 * 60 * 1000;
 
   const windowCaptures = new Set<string>();
 

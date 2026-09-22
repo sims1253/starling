@@ -159,6 +159,23 @@ describe("InsightRecorder", () => {
     expect(second.recorder.captureFinalizedAt("take-2")).toBeUndefined();
   });
 
+  it("keeps a deleted capture anchorless when its finalize lands after the delete", async () => {
+    // The in-flight crossing: the delete confirms while the finalize emit
+    // is still queued, so the finalize append finds no same-id event to
+    // dedupe against — the tombstone must still dominate the anchor.
+    const { recorder: insights } = recorder();
+
+    await insights.captureDeleted("take-3");
+    await insights.captureFinalized({
+      captureId: "take-3",
+      sampleCount: 320_000,
+      sampleRate: 16_000,
+      completeAudio: true,
+    });
+
+    expect(insights.captureFinalizedAt("take-3")).toBeUndefined();
+  });
+
   it("emits schema-valid events for the full lifecycle", async () => {
     const { recorder: insights } = recorder();
 

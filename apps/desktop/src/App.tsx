@@ -763,10 +763,18 @@ export default function App() {
           // Serialized on the mirror chain: the delta applies only after
           // every earlier write's delta has applied, so the mirror cannot
           // diverge from the recorder's store order when two writes'
-          // surrounding waits settle out of order.
-          termMirrorChainRef.current = termMirrorChainRef.current.then(() => {
-            setTermRecords((current) => applyTermWrite(current, write));
-          });
+          // surrounding waits settle out of order. The catch keeps the
+          // chain alive and notices instead of letting one bad delta
+          // strand every later one.
+          termMirrorChainRef.current = termMirrorChainRef.current
+            .then(() => {
+              setTermRecords((current) => applyTermWrite(current, write));
+            })
+            .catch((caught) => {
+              addInsightNotice(
+                `Insights could not apply a term-aggregate update: ${messageFrom(caught)}`,
+              );
+            });
         })
         .catch((caught) => {
           addInsightNotice(
@@ -835,16 +843,9 @@ export default function App() {
    */
   const recordCaptureFinalized = useCallback(
     (session: DictationSession): Promise<void> => {
-      // Bounded registration: a wedged store transaction would otherwise
-      // leave this entry pending forever, with every later recognition for
-      // the same take waiting on it. The same anchor bound that bounds
-      // their wait releases the entry here — a released entry costs only
-      // anchor precision, never a write.
-      const discardTimer = setTimeout(() => {
-        if (pendingFinalizesRef.current.get(session.id) === settled) {
-          pendingFinalizesRef.current.delete(session.id);
-        }
-      }, ANCHOR_LOAD_TIMEOUT_MS);
+      // Assigned after `settled` exists: both closures below read bindings
+      // declared before them, so no callback can ever observe a TDZ.
+      let discardTimer: ReturnType<typeof setTimeout> | undefined;
 
       const settled = recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
@@ -856,7 +857,7 @@ export default function App() {
           completeAudio: true,
         });
       }).finally(() => {
-        clearTimeout(discardTimer);
+        if (discardTimer !== undefined) clearTimeout(discardTimer);
 
         // Delete only OUR registration — a second finalize for the same
         // session may already have replaced it, and removing that newer
@@ -865,6 +866,17 @@ export default function App() {
           pendingFinalizesRef.current.delete(session.id);
         }
       });
+
+      // Bounded registration: a wedged store transaction would otherwise
+      // leave this entry pending forever, with every later recognition for
+      // the same take waiting on it. The same anchor bound that bounds
+      // their wait releases the entry here — a released entry costs only
+      // anchor precision, never a write.
+      discardTimer = setTimeout(() => {
+        if (pendingFinalizesRef.current.get(session.id) === settled) {
+          pendingFinalizesRef.current.delete(session.id);
+        }
+      }, ANCHOR_LOAD_TIMEOUT_MS);
 
       pendingFinalizesRef.current.set(session.id, settled);
 
@@ -2313,212 +2325,216 @@ export default function App() {
   // visible from either view.
   const takeInFlight = recording || takePhase === "starting" || takePhase === "stopping";
 
-  // The capture pane and history, kept in one named element so the view
+  // The capture pane and history, kept in one named function so the view
   // switch stays one line and edits to the capture workspace never have to
-  // thread through the Insights branch's ternary.
-  const captureWorkspace = (
-    <main className="workspace">
-      <section className="capture-pane">
-        <div className="capture-copy">
-          <p className="eyebrow">LOCAL DICTATION</p>
-          <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
-          <p className="lede">
-            Your recording is saved locally, sent only to your selected server, and shown exactly as
-            the model returned it.
-          </p>
-        </div>
-
-        <div className={`recorder ${recording ? "is-recording" : ""}`}>
-          <div className="waveform" aria-hidden="true">
-            {levels.map((level, index) => (
-              <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
-            ))}
+  // thread through the Insights branch's ternary — and so the tree is only
+  // built when the view actually shows it, not eagerly on every Insights
+  // render that would discard it.
+  function renderCaptureWorkspace() {
+    return (
+      <main className="workspace">
+        <section className="capture-pane">
+          <div className="capture-copy">
+            <p className="eyebrow">LOCAL DICTATION</p>
+            <h1>{recording ? "Listening closely." : "Say it as you mean it."}</h1>
+            <p className="lede">
+              Your recording is saved locally, sent only to your selected server, and shown exactly
+              as the model returned it.
+            </p>
           </div>
-          <button
-            className="record-button"
-            onClick={() => void toggleRecording()}
-            disabled={takePhase === "starting" || takePhase === "stopping"}
-            aria-label={recording ? "Stop recording" : "Start recording"}
-          >
-            <span className="record-button-inner">
-              {recording ? <span className="stop-glyph" /> : <Mic size={34} strokeWidth={1.7} />}
-            </span>
-          </button>
-          <div className="record-meta">
-            <span>
-              {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Click to record"}
-            </span>
-            <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
-          </div>
-        </div>
 
-        {recording && streamStatus && (
-          <div className={`live-stream ${streamStatus.state}`}>
-            {streamStatus.state === "live" && (
-              <p className="live-text" aria-live="polite">
-                {partialText || <em>Listening for the first words…</em>}
-              </p>
-            )}
-            {streamStatus.state === "connecting" && (
-              <p className="live-note">
-                <Radio size={15} /> Connecting live transcription…
-              </p>
-            )}
-            {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
-              <p className="live-note" role="status">
-                <CircleAlert size={15} />
-                {streamStatus.detail ?? "Live transcription is unavailable."} The recording is still
-                saved and will be transcribed when you stop.
-              </p>
-            )}
-          </div>
-        )}
-
-        <button
-          className="import-button"
-          aria-describedby="import-format"
-          onClick={() => fileRef.current?.click()}
-        >
-          <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
-        </button>
-        <span id="import-format" className="visually-hidden">
-          WAV files only
-        </span>
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".wav,audio/wav,audio/x-wav"
-          hidden
-          onChange={(event) => void importAudio(event.target.files?.[0])}
-        />
-
-        {(error || unsavedWavs.length > 0) && (
-          <div className="error-banner" role="alert">
-            <CircleAlert size={18} />
-            <div>
-              <strong>{error ? "Action failed" : "Recording not saved"}</strong>
-              {error && <span>{error}</span>}
-              <small>
-                {unsavedWavs.length > 0
-                  ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
-                  : "Starling keeps audio in history after a successful local save."}
-              </small>
+          <div className={`recorder ${recording ? "is-recording" : ""}`}>
+            <div className="waveform" aria-hidden="true">
+              {levels.map((level, index) => (
+                <i key={index} style={{ height: `${Math.max(5, level * 106)}px` }} />
+              ))}
             </div>
-            {unsavedWavs.length > 0 && (
-              <div className="recovery-actions">
-                {unsavedWavs.map((capture, index) => (
-                  <button
-                    key={capture.id}
-                    className="recover-audio"
-                    onClick={() => exportUnsavedAudio(capture.id)}
-                  >
-                    Download WAV {index + 1}
-                  </button>
-                ))}
-                <button className="recover-audio" onClick={discardUnsavedAudio}>
-                  Discard unsaved
-                </button>
-              </div>
-            )}
-            {unsavedWavs.length === 0 && (
-              <button onClick={() => setError(undefined)} aria-label="Dismiss error">
-                <X size={16} />
-              </button>
-            )}
+            <button
+              className="record-button"
+              onClick={() => void toggleRecording()}
+              disabled={takePhase === "starting" || takePhase === "stopping"}
+              aria-label={recording ? "Stop recording" : "Start recording"}
+            >
+              <span className="record-button-inner">
+                {recording ? <span className="stop-glyph" /> : <Mic size={34} strokeWidth={1.7} />}
+              </span>
+            </button>
+            <div className="record-meta">
+              <span>
+                {recording ? formatDuration(elapsedMs) : busy ? "Transcribing…" : "Click to record"}
+              </span>
+              <kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} Shift Space</kbd>
+            </div>
           </div>
-        )}
-      </section>
 
-      <aside className="history-pane">
-        <div className="history-head">
-          <div>
-            <p className="eyebrow">ARCHIVE</p>
-            <h2>Recent takes</h2>
-          </div>
-          <Clock3 size={18} />
-        </div>
-        {activeThread && (
-          <div className="thread-strip">
-            <span>Active thread: {activeThread.slice(0, 8)}</span>
-            <button onClick={startNewThread}>start new thread</button>
-          </div>
-        )}
-        <div className="history-list">
-          {damaged.length > 0 && (
-            <div className="history-warning" role="status">
-              <CircleAlert size={16} />
+          {recording && streamStatus && (
+            <div className={`live-stream ${streamStatus.state}`}>
+              {streamStatus.state === "live" && (
+                <p className="live-text" aria-live="polite">
+                  {partialText || <em>Listening for the first words…</em>}
+                </p>
+              )}
+              {streamStatus.state === "connecting" && (
+                <p className="live-note">
+                  <Radio size={15} /> Connecting live transcription…
+                </p>
+              )}
+              {(streamStatus.state === "unavailable" || streamStatus.state === "interrupted") && (
+                <p className="live-note" role="status">
+                  <CircleAlert size={15} />
+                  {streamStatus.detail ?? "Live transcription is unavailable."} The recording is
+                  still saved and will be transcribed when you stop.
+                </p>
+              )}
+            </div>
+          )}
+
+          <button
+            className="import-button"
+            aria-describedby="import-format"
+            onClick={() => fileRef.current?.click()}
+          >
+            <FileAudio size={17} /> Import an audio file <small aria-hidden="true">.wav</small>
+          </button>
+          <span id="import-format" className="visually-hidden">
+            WAV files only
+          </span>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".wav,audio/wav,audio/x-wav"
+            hidden
+            onChange={(event) => void importAudio(event.target.files?.[0])}
+          />
+
+          {(error || unsavedWavs.length > 0) && (
+            <div className="error-banner" role="alert">
+              <CircleAlert size={18} />
               <div>
-                <strong>
-                  {damaged.length === 1
-                    ? "1 saved recording could not be read"
-                    : `${damaged.length} saved recordings could not be read`}
-                </strong>
+                <strong>{error ? "Action failed" : "Recording not saved"}</strong>
+                {error && <span>{error}</span>}
                 <small>
-                  Damaged entries are kept until you delete them; the list below shows every
-                  recording that is still readable.
+                  {unsavedWavs.length > 0
+                    ? `${unsavedWavs.length} recording${unsavedWavs.length === 1 ? "" : "s"} could not be saved. Download ${unsavedWavs.length === 1 ? "it" : "them"} before you close Starling.`
+                    : "Starling keeps audio in history after a successful local save."}
                 </small>
+              </div>
+              {unsavedWavs.length > 0 && (
                 <div className="recovery-actions">
-                  {damaged.map((entry, index) => {
-                    const wav = invalidSessionWav(entry);
+                  {unsavedWavs.map((capture, index) => (
+                    <button
+                      key={capture.id}
+                      className="recover-audio"
+                      onClick={() => exportUnsavedAudio(capture.id)}
+                    >
+                      Download WAV {index + 1}
+                    </button>
+                  ))}
+                  <button className="recover-audio" onClick={discardUnsavedAudio}>
+                    Discard unsaved
+                  </button>
+                </div>
+              )}
+              {unsavedWavs.length === 0 && (
+                <button onClick={() => setError(undefined)} aria-label="Dismiss error">
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+          )}
+        </section>
 
-                    return (
-                      <span key={`${entry.id}-${index}`} className="damaged-entry">
-                        {wav ? (
-                          <button
-                            className="recover-audio"
-                            onClick={() => exportDamagedAudio(index)}
-                          >
-                            Download WAV {index + 1}
-                          </button>
-                        ) : null}
-                        {entry.key !== undefined ? (
-                          <button
-                            className="recover-audio dismiss-damaged"
-                            onClick={() => void dismissDamagedEntry(index)}
-                            aria-label={`Delete damaged recording ${index + 1}`}
-                          >
-                            Delete entry {index + 1}
-                          </button>
-                        ) : null}
-                      </span>
-                    );
-                  })}
+        <aside className="history-pane">
+          <div className="history-head">
+            <div>
+              <p className="eyebrow">ARCHIVE</p>
+              <h2>Recent takes</h2>
+            </div>
+            <Clock3 size={18} />
+          </div>
+          {activeThread && (
+            <div className="thread-strip">
+              <span>Active thread: {activeThread.slice(0, 8)}</span>
+              <button onClick={startNewThread}>start new thread</button>
+            </div>
+          )}
+          <div className="history-list">
+            {damaged.length > 0 && (
+              <div className="history-warning" role="status">
+                <CircleAlert size={16} />
+                <div>
+                  <strong>
+                    {damaged.length === 1
+                      ? "1 saved recording could not be read"
+                      : `${damaged.length} saved recordings could not be read`}
+                  </strong>
+                  <small>
+                    Damaged entries are kept until you delete them; the list below shows every
+                    recording that is still readable.
+                  </small>
+                  <div className="recovery-actions">
+                    {damaged.map((entry, index) => {
+                      const wav = invalidSessionWav(entry);
+
+                      return (
+                        <span key={`${entry.id}-${index}`} className="damaged-entry">
+                          {wav ? (
+                            <button
+                              className="recover-audio"
+                              onClick={() => exportDamagedAudio(index)}
+                            >
+                              Download WAV {index + 1}
+                            </button>
+                          ) : null}
+                          {entry.key !== undefined ? (
+                            <button
+                              className="recover-audio dismiss-damaged"
+                              onClick={() => void dismissDamagedEntry(index)}
+                              aria-label={`Delete damaged recording ${index + 1}`}
+                            >
+                              Delete entry {index + 1}
+                            </button>
+                          ) : null}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
-          {sessions.length === 0 && (
-            <div className="history-empty">
-              Your recordings will collect here, ready to retry or export.
-            </div>
-          )}
-          {sessions.map((session) => (
-            <button
-              key={session.id}
-              className={`history-row ${session.id === selectedId ? "active" : ""}`}
-              onClick={() => setSelectedId(session.id)}
-              aria-label={historyRowLabel(session)}
-            >
-              <span className={`take-state ${session.status}`}>
-                {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
-              </span>
-              <span className="take-copy">
-                <strong>{sessionTitle(session)}</strong>
-                <small>
-                  {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
-                  {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
-                </small>
-                {session.threadId && (
-                  <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
-                )}
-              </span>
-              <ChevronRight size={16} />
-            </button>
-          ))}
-        </div>
-      </aside>
-    </main>
-  );
+            )}
+            {sessions.length === 0 && (
+              <div className="history-empty">
+                Your recordings will collect here, ready to retry or export.
+              </div>
+            )}
+            {sessions.map((session) => (
+              <button
+                key={session.id}
+                className={`history-row ${session.id === selectedId ? "active" : ""}`}
+                onClick={() => setSelectedId(session.id)}
+                aria-label={historyRowLabel(session)}
+              >
+                <span className={`take-state ${session.status}`}>
+                  {session.status === "transcribing" ? <LoaderCircle size={14} /> : <span />}
+                </span>
+                <span className="take-copy">
+                  <strong>{sessionTitle(session)}</strong>
+                  <small>
+                    {formatWhen(session.createdAt)} · {formatDuration(session.durationMs)}
+                    {session.attemptCount > 1 ? ` · ${session.attemptCount} attempts` : ""}
+                  </small>
+                  {session.threadId && (
+                    <span className="thread-badge">thread {session.threadId.slice(0, 8)}</span>
+                  )}
+                </span>
+                <ChevronRight size={16} />
+              </button>
+            ))}
+          </div>
+        </aside>
+      </main>
+    );
+  }
 
   return (
     <div className={`app-shell ${selected ? "has-transcript" : ""}`}>
@@ -2572,7 +2588,7 @@ export default function App() {
           />
         </main>
       ) : (
-        captureWorkspace
+        renderCaptureWorkspace()
       )}
 
       {selected && (

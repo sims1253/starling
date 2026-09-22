@@ -33,15 +33,16 @@ export const MAX_BASELINE_DRAFT_LENGTH = 16;
  */
 const BASELINE_DRAFT_PATTERN = /^-?\d{0,9}$/;
 
+/** Whether a draft could persist as a baseline: the shape and the bound. */
+export function isBaselineDraft(value: string): boolean {
+  return value.length <= MAX_BASELINE_DRAFT_LENGTH && BASELINE_DRAFT_PATTERN.test(value);
+}
+
 /** Read the stored draft; anything unreadable or out of shape reads unset. */
 export function readTypingBaseline(storage: BaselineStorage): string {
   const stored = storage.getItem(TYPING_BASELINE_KEY);
 
-  return stored !== null &&
-    stored.length <= MAX_BASELINE_DRAFT_LENGTH &&
-    BASELINE_DRAFT_PATTERN.test(stored)
-    ? stored
-    : "";
+  return stored !== null && isBaselineDraft(stored) ? stored : "";
 }
 
 /**
@@ -51,9 +52,7 @@ export function readTypingBaseline(storage: BaselineStorage): string {
  * the app closes.
  */
 export function writeTypingBaseline(storage: BaselineStorage, value: string): boolean {
-  if (value.length > MAX_BASELINE_DRAFT_LENGTH || !BASELINE_DRAFT_PATTERN.test(value)) {
-    return false;
-  }
+  if (!isBaselineDraft(value)) return false;
 
   try {
     storage.setItem(TYPING_BASELINE_KEY, value);
