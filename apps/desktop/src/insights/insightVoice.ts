@@ -66,12 +66,18 @@ interface WindowedTotals {
  * `derived_kinds` and no withdrawal purge has removed the stamp since.
  * The stamp is what makes the distinction an empty label list cannot: a
  * take that analyzed but yielded zero of the kind still counts as analyzed
- * — "no findings" is a real result — while a purged or never-granted kind,
- * and a legacy record written before the stamp existed, are unknowns the
- * denominator must not guess about.
+ * — "no findings" is a real result — while a purged or never-granted kind
+ * is an unknown the denominator must not guess about. A record from
+ * before the stamp existed falls back to label evidence: labels of the
+ * kind present prove the take was analyzed for it (the writer derives
+ * only granted kinds), which beats treating pre-stamp data as unknown.
  */
 function analyzedForKind(record: InsightTermRecord, kind: InsightTermKind): boolean {
-  return record.derived_kinds?.includes(kind) === true;
+  const stamped = record.derived_kinds;
+
+  if (stamped !== undefined) return stamped.includes(kind);
+
+  return kind === "terms" ? record.terms.length > 0 : record.phrases.length > 0;
 }
 
 /**
@@ -99,7 +105,13 @@ function windowTotals(
   for (const record of records) {
     if (parseInsightTimestamp(record.occurred_at) < since) continue;
 
-    if (analyzedForKind(record, kind)) takes += 1;
+    // Only analyzed-for-this-kind records contribute — to the denominator
+    // AND to the labels. Counting labels from an unanalyzed record could
+    // push a card's numerator past its own denominator ("N of M" with
+    // N > M); an unanalyzed take is an unknown for both.
+    if (!analyzedForKind(record, kind)) continue;
+
+    takes += 1;
 
     for (const entry of kind === "terms" ? record.terms : record.phrases) {
       const tally = byLabel.get(entry.text) ?? { takes: 0, occurrences: 0 };
@@ -259,7 +271,11 @@ export function voicePanel(
   }
 
   const analyzedTakes = records.filter(
-    (record) => windowCaptures.has(record.capture_id) && (record.derived_kinds?.length ?? 0) > 0,
+    (record) =>
+      windowCaptures.has(record.capture_id) &&
+      ((record.derived_kinds?.length ?? 0) > 0 ||
+        record.terms.length > 0 ||
+        record.phrases.length > 0),
   ).length;
 
   return {

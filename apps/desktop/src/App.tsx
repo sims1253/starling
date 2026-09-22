@@ -89,6 +89,9 @@ import { InsightsView, type InsightNotice } from "./insights/InsightsView";
 
 type Connection = "checking" | "ready" | "busy" | "offline";
 
+/** How long a term write waits on the event log before anchoring to its own clock. */
+const ANCHOR_LOAD_TIMEOUT_MS = 5_000;
+
 /** Unresolved Insights notices kept at once; more is a failing store, not news. */
 const MAX_INSIGHT_NOTICES = 8;
 
@@ -777,20 +780,28 @@ export default function App() {
         // term write.
         (pendingFinalizesRef.current.get(sessionId) ?? Promise.resolve())
           .catch(() => undefined)
+          // The event log's health must not gate the term write, and
+          // neither may its liveness: a failed load only means the anchor
+          // falls back to the write clock, and a HUNG load (a wedged
+          // store transaction) must not hold the term write hostage — the
+          // load wait is bounded, precision-only.
           .then(() =>
-            insights
-              .load()
-              // The event log's health must not gate the term write: a
-              // failed load only means the anchor falls back to the write
-              // clock.
-              .catch(() => undefined)
-              .then(() =>
-                insightTerms.recognitionSelected({
-                  captureId: sessionId,
-                  transcriptText,
-                  finalizedAt: insights.captureFinalizedAt(sessionId),
-                }),
+            Promise.race([
+              insights.load().then(
+                () => undefined,
+                () => undefined,
               ),
+              new Promise<void>((resolve) => {
+                setTimeout(resolve, ANCHOR_LOAD_TIMEOUT_MS);
+              }),
+            ]),
+          )
+          .then(() =>
+            insightTerms.recognitionSelected({
+              captureId: sessionId,
+              transcriptText,
+              finalizedAt: insights.captureFinalizedAt(sessionId),
+            }),
           ),
       );
     },
@@ -805,7 +816,9 @@ export default function App() {
    */
   const recordCaptureFinalized = useCallback(
     (session: DictationSession): Promise<void> => {
-      const done = recordInsight(async () => {
+      let settled: Promise<void>;
+
+      settled = recordInsight(async () => {
         const stats = await wavCaptureStats(session.wav);
 
         await insights.captureFinalized({
@@ -814,11 +827,18 @@ export default function App() {
           sampleRate: stats.sampleRate,
           completeAudio: true,
         });
-      }).finally(() => pendingFinalizesRef.current.delete(session.id));
+      }).finally(() => {
+        // Delete only OUR registration — a second finalize for the same
+        // session may already have replaced it, and removing that newer
+        // entry would strand its recognition without an anchor wait.
+        if (pendingFinalizesRef.current.get(session.id) === settled) {
+          pendingFinalizesRef.current.delete(session.id);
+        }
+      });
 
-      pendingFinalizesRef.current.set(session.id, done);
+      pendingFinalizesRef.current.set(session.id, settled);
 
-      return done;
+      return settled;
     },
     [recordInsight],
   );

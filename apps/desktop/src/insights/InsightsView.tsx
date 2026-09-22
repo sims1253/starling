@@ -272,7 +272,9 @@ export function InsightsView({
 
     if (parsed === null) {
       setGoalIssue(
-        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
+        // Pinned en-US to agree with the milestone labels' formatting
+        // (insightMilestones.ts) — one number style across the surface.
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString("en-US")}.`,
       );
 
       return;

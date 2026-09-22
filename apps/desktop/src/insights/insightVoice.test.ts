@@ -130,22 +130,27 @@ describe("recurringPhraseCards", () => {
     expect(card?.description).toContain("2 of 3 analyzed takes");
   });
 
-  it("treats a legacy unstamped record as an unknown for every kind", () => {
+  it("counts a legacy unstamped record only through its label evidence", () => {
     // A record written before derived_kinds existed decodes fine but says
-    // nothing about what it analyzed — no denominator may guess.
+    // nothing about what it analyzed. Labels of a kind present are the
+    // evidence it was analyzed for that kind (the writer derives only
+    // granted kinds); absent labels stay an unknown — no guessing.
     const { derived_kinds: _stamp, ...legacy } = recordOf("take-3", "deploy the server");
+    const { derived_kinds: _noStamp, ...emptyLegacy } = recordOf("take-4", "quiet");
 
     const records = [
       recordOf("take-1", "deploy the server and deploy the server again"),
       recordOf("take-2", "please deploy the server once more"),
       legacy,
+      emptyLegacy,
     ];
 
     const card = recurringPhraseCards(records, { now: NOW }).find(
       (candidate) => candidate.label === "deploy the server",
     );
 
-    expect(card?.windowTakes).toBe(2);
+    expect(card?.windowTakes).toBe(3);
+    expect(card?.takes).toBeLessThanOrEqual(card?.windowTakes ?? 0);
   });
 
   it("requires the phrase to recur across takes, not within one", () => {
@@ -328,12 +333,18 @@ describe("voicePanel denominators", () => {
       2,
     );
 
-    // A legacy unstamped record decodes but says nothing about what it
-    // analyzed — analyzedTakes must not guess it into the coverage number.
+    // A legacy unstamped record counts only through label evidence:
+    // one holding aggregates joins the coverage, an empty one does not.
     const { derived_kinds: _stamp, ...legacy } = recordOf("take-2", "rotate the keys");
+    const { derived_kinds: _noStamp, ...emptyLegacy } = recordOf("take-4", "quiet");
 
     expect(
       voicePanel(events, [...stamped, legacy], DEFAULT_INSIGHT_CONSENT, { now: NOW }).analyzedTakes,
+    ).toBe(3);
+
+    expect(
+      voicePanel(events, [...stamped, emptyLegacy], DEFAULT_INSIGHT_CONSENT, { now: NOW })
+        .analyzedTakes,
     ).toBe(2);
   });
 });
