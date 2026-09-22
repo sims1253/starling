@@ -477,7 +477,15 @@ impl V2CaptureStore {
                                         CaptureStatus::Interrupted,
                                         None,
                                     ) {
-                                        report_status_flip_failure(&existing.id, flip_err);
+                                        // The row being flipped is the
+                                        // pre-existing occupant of the
+                                        // journal id, not a take this call
+                                        // adopted — say so.
+                                        report_divergence(format!(
+                                            "existing capture {} committed; the interrupted \
+                                             status flip failed ({flip_err})",
+                                            existing.id
+                                        ));
                                     }
                                 }
                                 return Ok(());
@@ -623,7 +631,10 @@ impl V2CaptureStore {
                 Ok(None) => {}
             }
             let err = chain_adoption_failure(&adoption_error, err.to_string());
-            let promoted = store.load_audio(&staged_id).is_ok();
+            // Metadata-only probe (one stat; load_audio would read and
+            // verify the whole journal under the lock): which side of the
+            // promoting rename did the failure leave the bytes on?
+            let promoted = store.audio_journal_exists(&staged_id).unwrap_or(false);
             drop(store); // the filesystem work below runs off the lock
             if promoted {
                 report_divergence(format!(

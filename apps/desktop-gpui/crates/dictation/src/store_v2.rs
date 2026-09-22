@@ -1086,8 +1086,7 @@ impl StoreV2 {
     /// file is gone. Deliberately split out so a caller sharing the store
     /// behind a lock can resolve the path under the guard and do the heavy
     /// read + verify + WAV encode (via [`read_audio_journal`]) without it.
-    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {
-        validate_capture_id(id)?;
+    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {        validate_capture_id(id)?;
         if self.get_capture(id)?.is_none() {
             return Err(StoreV2Error::NotFound(id.to_string()));
         }
@@ -1106,6 +1105,17 @@ impl StoreV2 {
     pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
         let path = self.audio_journal_path(id)?;
         read_audio_journal(&path)
+    }
+
+    /// Whether `audio/` holds the journal for `id` — one metadata probe,
+    /// no row read, no journal parse. The rollback seam for a caller that
+    /// failed between promotion and commit and must learn which side of
+    /// the rename the bytes sit on ([`audio_journal_path`] cannot answer
+    /// that: it resolves through the row, which in exactly that shape
+    /// does not exist yet).
+    pub fn audio_journal_exists(&self, id: &str) -> Result<bool, StoreV2Error> {
+        validate_capture_id(id)?;
+        Ok(self.audio_path(id).exists())
     }
 
     // ------------------------------------------------------------------
@@ -6004,5 +6014,39 @@ mod tests {
         let skewed = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(86_400);
         assert_eq!(epoch_ms(skewed), 1);
         assert_eq!(epoch_ms(std::time::SystemTime::UNIX_EPOCH), 1);
+    }
+
+    #[test]
+    fn audio_journal_exists_answers_for_rowless_promoted_audio() {
+        // The promoted-but-uncommitted shape (a failure between the
+        // promoting rename and the row commit): no row, but the bytes sit
+        // in audio/. audio_journal_path cannot answer — it resolves
+        // through the row — this probe is what rollback callers need to
+        // tell which side of the rename the bytes are on.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let mut take = store
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin");
+        take.append_frames(&ramp(10, 0)).expect("append");
+        let id = take.id().to_string();
+        drop(take.finalize().expect("finalize"));
+        assert!(
+            !store.audio_journal_exists(&id).expect("probe in staging"),
+            "still in staging: nothing promoted"
+        );
+        store.promote_from_staging(&id).expect("promote, no commit");
+        assert!(
+            store.audio_journal_exists(&id).expect("probe promoted"),
+            "the bytes are in audio/ though no row exists"
+        );
+        assert!(
+            store.get_capture(&id).expect("row read").is_none(),
+            "no row — exactly the shape the probe exists for"
+        );
+        assert!(
+            !store.audio_journal_exists("c_never").expect("probe unknown"),
+            "an unknown id has no audio"
+        );
     }
 }
