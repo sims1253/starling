@@ -2537,24 +2537,26 @@ export default function App() {
             Match.orElse((status) => status),
           )}
         </div>
-        <button
-          className="icon-button"
-          onClick={() => setView(view === "insights" ? "capture" : "insights")}
-          aria-pressed={view === "insights"}
-          aria-label={view === "insights" ? "Back to dictation" : "Open Insights"}
-          disabled={takeInFlight}
-          title={takeInFlight ? "Insights opens when no recording is in progress" : undefined}
-        >
-          <BarChart3 size={19} />
-        </button>
-        <button
-          ref={settingsGearRef}
-          className="icon-button"
-          onClick={openSettings}
-          aria-label="Open server settings"
-        >
-          <Settings2 size={19} />
-        </button>
+        <div className="topbar-actions">
+          <button
+            className="icon-button"
+            onClick={() => setView(view === "insights" ? "capture" : "insights")}
+            aria-pressed={view === "insights"}
+            aria-label={view === "insights" ? "Back to dictation" : "Open Insights"}
+            disabled={takeInFlight}
+            title={takeInFlight ? "Insights opens when no recording is in progress" : undefined}
+          >
+            <BarChart3 size={19} />
+          </button>
+          <button
+            ref={settingsGearRef}
+            className="icon-button"
+            onClick={openSettings}
+            aria-label="Open server settings"
+          >
+            <Settings2 size={19} />
+          </button>
+        </div>
       </header>
 
       {view === "insights" ? (

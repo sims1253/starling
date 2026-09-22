@@ -186,9 +186,9 @@ export function milestones(
       if (words >= threshold && !reached.some((item) => item.id === `words-${threshold}`)) {
         reached.push({
           id: `words-${threshold}`,
-          label: `${threshold.toLocaleString("en-US")} words recognized from speech`,
+          label: `${threshold.toLocaleString()} words recognized from speech`,
           achievedOnDay: day.day,
-          evidence: `Cumulative recognized words (selected final transcripts) crossed ${threshold.toLocaleString("en-US")} on this day.`,
+          evidence: `Cumulative recognized words (selected final transcripts) crossed ${threshold.toLocaleString()} on this day.`,
         });
       }
     }

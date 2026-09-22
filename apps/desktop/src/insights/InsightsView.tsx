@@ -29,7 +29,7 @@ import {
 } from "./insightShare";
 import { milestonePanel } from "./insightMilestones";
 import { weeklyRecap } from "./insightRecap";
-import { formatMinutes } from "./insightFormat";
+import { formatDayKey, formatMinutes } from "./insightFormat";
 
 /**
  * The Insights surface (E29): Usage and Quality panels computed from the
@@ -272,9 +272,10 @@ export function InsightsView({
 
     if (parsed === null) {
       setGoalIssue(
-        // Pinned en-US to agree with the milestone labels' formatting
-        // (insightMilestones.ts) — one number style across the surface.
-        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString("en-US")}.`,
+        // Runtime locale, matching every other number on the surface (the
+        // milestone labels format their thresholds the same way) — one
+        // number style across the Insights views.
+        `A weekly goal is a whole number from ${WEEKLY_GOAL_MIN} to ${WEEKLY_GOAL_MAX.toLocaleString()}.`,
       );
 
       return;
@@ -544,7 +545,7 @@ export function InsightsView({
                         <li key={milestone.id}>
                           <strong>{milestone.label}</strong>
                           <span>
-                            {milestone.achievedOnDay} — {milestone.evidence}
+                            {formatDayKey(milestone.achievedOnDay)} — {milestone.evidence}
                           </span>
                         </li>
                       ))}

@@ -1,5 +1,5 @@
 import type { VoicePatternCard } from "./insightVoice";
-import { formatMinutes } from "./insightFormat";
+import { formatDayKey, formatMinutes } from "./insightFormat";
 
 /**
  * Share cards (E29 phase 2): a local artifact the user previews before
@@ -175,13 +175,15 @@ export function milestoneInRange(
  * a copy or save action places on the clipboard or disk. The withheld list
  * is preview-only metadata and deliberately has no line here: what the
  * artifact discloses is exactly the fields the user included, nothing about
- * the ones they did not. Pure and local: no network primitive is reachable
- * from this module by construction.
+ * the ones they did not. The range reads through the shared day formatter
+ * (`formatDayKey`), so the card's dates dress like every other surface's
+ * instead of raw ISO keys. Pure and local: no network primitive is
+ * reachable from this module by construction.
  */
 export function renderShareCard(card: ShareCard): string {
   const parts = [
     card.title,
-    `${card.rangeStartDay} – ${card.rangeEndDay}`,
+    `${formatDayKey(card.rangeStartDay)} – ${formatDayKey(card.rangeEndDay)}`,
     ...card.lines,
     card.definitions,
   ];

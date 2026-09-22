@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import { recurringPhraseCards } from "./insightVoice";
+import { formatDayKey } from "./insightFormat";
 import {
   DEFAULT_SHARE_INCLUDES,
   SHARE_CARD_TITLE,
@@ -98,7 +99,10 @@ describe("renderShareCard", () => {
     const text = renderShareCard(buildShareCard(INPUT));
 
     expect(text.startsWith(SHARE_CARD_TITLE)).toBe(true);
-    expect(text).toContain("2026-09-14 – 2026-09-21");
+    // The range reads through the shared day formatter, like every other
+    // user-facing surface — asserted against the same helper so the test
+    // stays locale-independent.
+    expect(text).toContain(`${formatDayKey("2026-09-14")} – ${formatDayKey("2026-09-21")}`);
     expect(text).toContain("312 words recognized from speech");
     expect(text).toContain("silence included");
     expect(text).not.toContain("deploy the server");
