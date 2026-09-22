@@ -631,6 +631,38 @@ impl RuntimeClient {
         self.bus.subscribe()
     }
 
+    /// Allocates the next `seq` on `corr`'s stream from the same frontier
+    /// [`Self::send`] and the event side use. The I4 service host calls
+    /// this for IPC clients that sent their envelope without a `seq`:
+    /// sequence assignment stays at the point that owns the frontier, so a
+    /// reconnecting client cannot collide with the stream positions a dead
+    /// connection already consumed (host-assigned numbering continues
+    /// monotonically across renderer restarts).
+    ///
+    /// Caller contract: call once per envelope, immediately before
+    /// [`Self::send_raw`], and only when the envelope carries no `seq` of
+    /// its own — the assignment is spent either way. Do not mix
+    /// host-assigned seqs with client-supplied ones on the same
+    /// correlation stream: the router's per-stream `command_frontier`
+    /// (a separate map from the bus frontier this method draws on) is
+    /// what enforces monotonicity, and interleaving the two numberings
+    /// can trip [`crate::machine::Rejection::SeqNotMonotonic`].
+    ///
+    /// The pairing is **not atomic**: between this call and
+    /// [`Self::send_raw`], another sender on the same corr stream may
+    /// consume the next seq and route it first, so the raced envelope
+    /// arrives out of allocation order and is rejected with
+    /// `SeqNotMonotonic`. A caller bridging multiple upstream
+    /// connections (the I4 host does) must therefore serialize
+    /// assign-then-send per corr stream — one in-flight assignment per
+    /// stream at a time keeps allocation order and submission order
+    /// identical. The rejection itself is the diagnostic for a caller
+    /// that skips that discipline or mixes the two numbering forms on
+    /// one stream.
+    pub fn assign_seq(&self, corr: Option<&str>) -> u64 {
+        self.bus.next_seq(corr)
+    }
+
     /// The runtime projection snapshot.
     pub fn snapshot(&self) -> RuntimeSnapshot {
         snapshot_of(&self.views, &self.frozen_routes)

@@ -15,6 +15,7 @@ pub mod delivery;
 pub mod docs;
 pub mod jobs;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::protocol::replay::{TransitionKind, TransitionRecord, Violation};
@@ -326,7 +327,15 @@ pub fn view_slot(spec: &'static MachineSpec) -> ViewSlot {
 /// The receipt a client receives for a command: `Ok` once the owning
 /// machine accepted it (any outcome event follows asynchronously on the
 /// event stream), `Err` with the machine- or envelope-level rejection.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` (external tagging — `"Accepted"` /
+/// `{"Served": …}` / `{"IllegalInState": {…}}`) are the I4 service host's
+/// receipt wire form: the host bridges an IPC command to
+/// [`crate::RuntimeClient::send_raw`] and returns the resulting
+/// `Result<Receipt, Rejection>` verbatim over the transport, so the IPC
+/// client observes exactly the in-process rejection, not a stringly
+/// re-telling of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Receipt {
     /// The command was accepted; state transitions are visible via events
     /// and the snapshot.
@@ -340,7 +349,12 @@ pub enum Receipt {
 /// `runtime.nack` only for unsupported versions and `jobs.rejected` only
 /// for the three admission reasons, so every other rejection surfaces here
 /// — synchronously, never silently.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Like [`Receipt`], the serde derives are the I4 IPC receipt's wire form
+/// (external tagging; every variant round-trips exactly, so a client
+/// across the transport can pattern-match the same rejection an embedded
+/// client would).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Rejection {
     /// The envelope version is unsupported; the runtime additionally
     /// emitted `runtime.nack{unsupported_version}` on the event stream with
@@ -436,6 +450,108 @@ impl Inbound {
 mod tests {
     use super::*;
     use crate::protocol::tables::CAPTURE;
+
+    #[test]
+    fn receipt_and_rejection_round_trip_the_ipc_wire_form() {
+        // The I4 host serializes these across its transport; every variant
+        // must survive the external-tagged JSON round trip exactly.
+        let pairs = vec![
+            (Receipt::Accepted, serde_json::json!("Accepted")),
+            (
+                Receipt::Served(serde_json::json!({ "docId": "notes" })),
+                serde_json::json!({ "Served": { "docId": "notes" } }),
+            ),
+        ];
+        for (value, wire) in pairs {
+            assert_eq!(serde_json::to_value(&value).unwrap(), wire);
+            let back: Receipt = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, value);
+        }
+        // Pin the wire form explicitly for the externally-observed
+        // rejections too: the derives ARE the IPC protocol (the host
+        // serializes Frame::Receipt verbatim), so an accidental
+        // representation change — a newtype here, a field rename there —
+        // must fail here, not at the first IPC client. A bare round trip
+        // would only prove serde's self-consistency. Every variant is
+        // pinned (all fourteen), including the Option-absence shape of
+        // UnsupportedVersion and every unit/newtype variant.
+        let rejection_pairs = vec![
+            (
+                Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
+                serde_json::json!({ "UnsupportedVersion": { "id": "cmd_9" } }),
+            ),
+            (
+                Rejection::UnsupportedVersion { id: None },
+                serde_json::json!({ "UnsupportedVersion": { "id": null } }),
+            ),
+            (
+                Rejection::InvalidEnvelope("missing 'ts'".into()),
+                serde_json::json!({ "InvalidEnvelope": "missing 'ts'" }),
+            ),
+            (
+                Rejection::UnknownMessageType("bogus.type".into()),
+                serde_json::json!({ "UnknownMessageType": "bogus.type" }),
+            ),
+            (
+                Rejection::InvalidPayload("payload is invalid".into()),
+                serde_json::json!({ "InvalidPayload": "payload is invalid" }),
+            ),
+            (
+                Rejection::IllegalInState {
+                    command: "capture.stop".into(),
+                    state: "Idle".into(),
+                    detail: "not legal".into(),
+                },
+                serde_json::json!({
+                    "IllegalInState": {
+                        "command": "capture.stop",
+                        "state": "Idle",
+                        "detail": "not legal"
+                    }
+                }),
+            ),
+            (
+                Rejection::PendingUnresolved { detail: "waiting".into() },
+                serde_json::json!({ "PendingUnresolved": { "detail": "waiting" } }),
+            ),
+            (
+                Rejection::SeqNotMonotonic { detail: "seq 4 follows 4".into() },
+                serde_json::json!({ "SeqNotMonotonic": { "detail": "seq 4 follows 4" } }),
+            ),
+            (
+                Rejection::RouteNotFrozen { route: "local-default".into() },
+                serde_json::json!({ "RouteNotFrozen": { "route": "local-default" } }),
+            ),
+            (
+                Rejection::UnknownCaptureRef { capture_ref: "take_x".into() },
+                serde_json::json!({ "UnknownCaptureRef": { "capture_ref": "take_x" } }),
+            ),
+            (
+                Rejection::UnknownJob { job_id: "job-1".into() },
+                serde_json::json!({ "UnknownJob": { "job_id": "job-1" } }),
+            ),
+            (
+                Rejection::UnknownRevision { revision_id: "rev-1".into() },
+                serde_json::json!({ "UnknownRevision": { "revision_id": "rev-1" } }),
+            ),
+            (
+                Rejection::UnknownDelivery { delivery_id: "d-1".into() },
+                serde_json::json!({ "UnknownDelivery": { "delivery_id": "d-1" } }),
+            ),
+            (Rejection::InboxFull, serde_json::json!("InboxFull")),
+            (Rejection::Closed, serde_json::json!("Closed")),
+        ];
+        for (value, wire) in rejection_pairs {
+            assert_eq!(
+                serde_json::to_value(&value).unwrap(),
+                wire,
+                "the rejection wire form changed; every IPC client's \
+                 pattern match rides on it"
+            );
+            let back: Rejection = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, value);
+        }
+    }
 
     #[test]
     fn core_reproduces_the_capture_happy_path() {

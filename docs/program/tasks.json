@@ -503,9 +503,10 @@
     "design note e576a7a reviewed by coordinator; DECISIONS D6/D7 recorded",
     "I0 integrated: envelope+16 commands+22 events+10 valid/9 invalid traces+oracle; coordinator rerun 125/125 across contract suites (35ab7c8)",
     "I3 COMPLETE: coordinator rerun cargo test --workspace = 161+42+50 (02b4a03); oracle tables ported as data, 10/10 valid traces + 9/9 invalid rejections through the live runtime; five actors + bounded channels + NACK; honest stubs (delivery never fake-confirms)",
-    "runtime-side store integration (E02 tails, 0940726): capture machine persists through StoreV2 only (V2CaptureStore adopt-or-samples), v1 seam + flag deleted; #249 responsiveness regression re-proven on the v2 samples path"
+    "runtime-side store integration (E02 tails, 0940726): capture machine persists through StoreV2 only (V2CaptureStore adopt-or-samples), v1 seam + flag deleted; #249 responsiveness regression re-proven on the v2 samples path",
+    "I4 host shipped (feat/runtime-220-service-host): starling-runtime-host crate \u2014 lease-ladder ownership (StoreV2::acquire_lease; Client => already-running exit 0), UDS transport with SO_PEERCRED/LOCAL_PEERCRED same-user auth (fail-closed on absent creds), length-prefixed framing over the I3 envelope with per-connection size/rate limits, host-assigned seq (RuntimeClient::assign_seq) so reconnects continue streams, SIGKILL takeover proven with the real binary (flock releases, stale socket taken over), renderer-kill mid-take survival + reconnect proven over the socket with storage-v2 row as the durable witness; 39 host tests (15 unit + 19 ipc + 5 ownership); Receipt/Rejection serde = the receipt wire form"
    ],
-   "notes": "Mode A proven against its own contract; GPUI switchover + I4 host remain",
+   "notes": "Mode A proven against its own contract; Mode B host proven over IPC. Remaining: GPUI + Electron adapter switch to HostClient (neither embeds the runtime today), Windows named-pipe path compile/runtime-unverified (no target on this box), engine worker processes have no attach interface yet (recorded in the crate docs), I5 machine wiring",
    "github_issue": 220
   },
   {
