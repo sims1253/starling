@@ -223,9 +223,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
               "manufactured a win from noise; see comparison.json", file=sys.stderr)
         return 1
     if result["verdict"] == "unavailable":
-        # The demo spec tolerates zero failures, so an unusable run means a
-        # request actually failed — a defect signal, not noise. Green only
-        # on completed-run verdicts (inconclusive, or a noise-tipped fail).
+        # The demo spec tolerates 2 failures per arm, so an unusable run
+        # means an arm accumulated 3+ failed requests — a defect signal,
+        # not runner noise. Green only on completed-run verdicts
+        # (inconclusive, or a noise-tipped fail).
         print(f"[demo] run unusable: {result.get('reason')} — the demo must "
               "complete both arms to demonstrate the no-false-win contract",
               file=sys.stderr)
