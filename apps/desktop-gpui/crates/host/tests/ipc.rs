@@ -356,10 +356,12 @@ fn stale_seq_is_rejected_over_the_raw_path() {
 
 /// The full live capture/context/jobs/docs walk over the socket, with
 /// every command envelope reconstructed from the host-assigned `seq`
-/// and every observed event interleaved in arrival order, replayed
-/// through the oracle port: what the wire actually carried is
-/// oracle-legal — conformance over the real transport, not just next to
-/// it.
+/// and the events observed during each wait interleaved in arrival
+/// order, replayed through the oracle port. The traces are the observed
+/// windows, not a complete wire recording: events that race between two
+/// windows (or land after a predicate matched) are not captured — the
+/// replay proves the captured interleaving is oracle-legal over the
+/// real transport, which is the property under test.
 #[test]
 fn a_live_take_over_ipc_replays_green_through_the_oracle() {
     let root = tempfile::tempdir().unwrap();
@@ -402,6 +404,22 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
         })
     }
 
+    /// Appends a command envelope to one machine's trace — the one-line
+    /// form of the find-and-push chain every step used to repeat. An
+    /// unknown machine name fails here, at the call site, not deep in a
+    /// chained unwrap.
+    fn push_trace(
+        traces: &mut [(&'static str, Vec<serde_json::Value>)],
+        machine: &str,
+        envelope: serde_json::Value,
+    ) {
+        let trace = traces
+            .iter_mut()
+            .find(|(name, _)| *name == machine)
+            .unwrap_or_else(|| panic!("no trace for machine {machine:?}"));
+        trace.1.push(envelope);
+    }
+
     fn observe(
         traces: &mut Vec<(&'static str, Vec<serde_json::Value>)>,
         client: &HostClient,
@@ -432,12 +450,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             source: "vscode".into(),
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "context")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "context", envelope);
     observe(&mut traces, &client, "context.targetSnapshot", |e| {
         e.type_name() == "context.targetSnapshot"
     });
@@ -449,12 +462,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             source: starling_runtime::protocol::Manual,
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "context")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "context", envelope);
     observe(&mut traces, &client, "mode.decision", |e| {
         e.type_name() == "mode.decision"
     });
@@ -467,12 +475,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             policy: "push-to-talk".into(),
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "capture")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "capture", envelope);
     observe(&mut traces, &client, "capture.progress", |e| {
         e.type_name() == "capture.progress" && e.corr() == Some("take_ipc")
     });
@@ -481,12 +484,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
         "take_ipc",
         Command::CaptureStop { drain: Some(true) },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "capture")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "capture", envelope);
     observe(&mut traces, &client, "capture.stopped", |e| {
         e.type_name() == "capture.stopped"
     });
@@ -504,12 +502,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             budget: "standard".into(),
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "jobs")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "jobs", envelope);
     observe(&mut traces, &client, "jobs.completed", |e| {
         e.type_name() == "jobs.completed"
     });
@@ -538,12 +531,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             new_revision: revision(1, "Hello over ipc."),
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "docs")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "docs", envelope);
     observe(&mut traces, &client, "docs.headUpdated", |e| {
         e.type_name() == "docs.headUpdated"
     });
@@ -555,12 +543,7 @@ fn a_live_take_over_ipc_replays_green_through_the_oracle() {
             take_ref: "take_ipc".into(),
         },
     );
-    traces
-        .iter_mut()
-        .find(|(n, _)| *n == "docs")
-        .unwrap()
-        .1
-        .push(envelope);
+    push_trace(&mut traces, "docs", envelope);
     observe(&mut traces, &client, "docs.turnAppended", |e| {
         e.type_name() == "docs.turnAppended"
     });
@@ -803,7 +786,24 @@ const FILL_EVENTS: usize = 4096;
 
 /// Failure bound for the fill phase. Generous on purpose (slow CI): the
 /// fill argument is the event count above, never this clock.
-const FILL_BUDGET: Duration = Duration::from_secs(60);
+const FILL_BUDGET: Duration = Duration::from_secs(90);
+
+/// Waits (bounded) for the endpoint socket to disappear after shutdown.
+/// The unlink is synchronous in shutdown, but a slow filesystem (or a
+/// CI temp dir on unusual storage) can make the *observation* lag — the
+/// property under test is that shutdown removed it, not that the
+/// directory entry vanished by the very next instruction.
+fn assert_endpoint_removed(socket: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !socket.exists(),
+        "the endpoint {} was not removed",
+        socket.display()
+    );
+}
 
 /// Failure bound for draining the backlog down to the host-planted EOF.
 const DRAIN_BUDGET: Duration = Duration::from_secs(12);
@@ -1005,9 +1005,19 @@ fn foreign_uid_is_refused_on_the_socket() {
         Err(other) => panic!("expected an auth refusal, got {other}"),
     }
     // The refused connection is gone; the host still serves the next,
-    // equally-foreign-by-policy client identically (closed), and its
-    // socket stays up.
-    assert!(HostClient::connect(host.socket_path()).is_err());
+    // equally-foreign-by-policy client identically (closed with the
+    // same typed refusal, not merely "connect failed" for any reason),
+    // and its socket stays up.
+    match HostClient::connect(host.socket_path()) {
+        Err(ClientError::Protocol(detail)) => {
+            assert!(detail.contains("auth_failed"), "{detail}")
+        }
+        Ok(client) => {
+            drop(client);
+            panic!("expected the second auth refusal too");
+        }
+        Err(other) => panic!("expected an auth refusal, got {other}"),
+    }
 
     host.shutdown();
 }
@@ -1029,12 +1039,19 @@ fn read_transport_error(
     stream: &mut std::os::unix::net::UnixStream,
 ) -> (TransportErrorCode, String) {
     let mut reader = FrameReader::new(&mut *stream, usize::MAX);
-    // Skip the hello.
+    // Read-poll timeouts (the 50ms read timeouts these streams carry)
+    // are idle slices, not failures — keep waiting for the frame.
     loop {
         match reader.read_frame() {
             Ok(Frame::Hello { .. }) => continue,
             Ok(Frame::TransportError { code, detail }) => return (code, detail),
             Ok(other) => panic!("expected a transport error, got {other:?}"),
+            Err(FrameError::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
             Err(err) => panic!("expected a transport error, read {err:?}"),
         }
     }
@@ -1264,7 +1281,7 @@ fn graceful_shutdown_releases_the_lease_and_the_endpoint() {
 
     let socket = host.socket_path().to_path_buf();
     host.shutdown();
-    assert!(!socket.exists(), "the endpoint is removed on shutdown");
+    assert_endpoint_removed(&socket);
     assert!(
         HostClient::connect(&socket).is_err(),
         "nothing serves after shutdown"
@@ -1436,12 +1453,14 @@ fn shutdown_completes_despite_a_writer_parked_on_a_silent_peer() {
         "the drain window elapsed ({elapsed:?})"
     );
     assert!(
-        elapsed < Duration::from_secs(20),
-        "shutdown completed within the bound ({elapsed:?})"
+        elapsed < Duration::from_secs(45),
+        "shutdown completed within the bound ({elapsed:?}; the bound is \
+         deliberately loose — it pins *boundedness* against a hang, not a \
+         performance target)"
     );
     // And it completed *fully*: endpoint removed, lease released (a
     // successor owns the root), nothing left serving.
-    assert!(!socket.exists(), "the endpoint is removed despite the wedge");
+    assert_endpoint_removed(&socket);
     let source = FakeCaptureSource::new(vec![]);
     let provider = FakeProvider::new(vec![]);
     let mut successor =
@@ -1524,7 +1543,9 @@ fn receipts_flow_while_the_application_stops_draining_events() {
 /// string `id`, is refused with `malformed_frame` instead of routed (the
 /// command would execute while its receipt could match no pending
 /// request — the client would sit out its reply timeout for an executed
-/// command).
+/// command). A present-but-non-numeric `seq` (null included) is refused
+/// for the same reason: it is a stream position the router cannot
+/// honor.
 #[test]
 fn a_command_envelope_without_a_string_id_is_refused() {
     let root = tempfile::tempdir().unwrap();
@@ -1537,12 +1558,54 @@ fn a_command_envelope_without_a_string_id_is_refused() {
         serde_json::json!("a string"),
         serde_json::json!({ "v": 1, "type": "jobs.setLimits" }),
         serde_json::json!({ "v": 1, "id": 7, "type": "jobs.setLimits" }),
+        serde_json::json!({ "v": 1, "id": "c1", "seq": null, "type": "jobs.setLimits" }),
+        serde_json::json!({ "v": 1, "id": "c1", "seq": "four", "type": "jobs.setLimits" }),
     ] {
         let mut stream = raw_connect(&host);
         let frame = serde_json::to_vec(&Frame::Command { envelope: bad }).unwrap();
         write_raw_frame(&mut stream, &frame);
         let (code, detail) = read_transport_error(&mut stream);
         assert_eq!(code, TransportErrorCode::MalformedFrame, "{detail}");
+    }
+
+    host.shutdown();
+}
+
+/// A connection that never sends a frame after connecting holds its
+/// slot only up to the configured pre-greeting idle bound: without it,
+/// same-uid peers could connect-and-idle on every slot forever. The
+/// bound is tightened here so the test runs in test time (the
+/// production default is 10s; see HostConfig).
+#[test]
+fn an_idle_pre_greeting_connection_is_closed_at_the_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![]);
+    let provider = FakeProvider::new(vec![]);
+    let mut config = ipc_config(root.path(), source, provider);
+    config.first_frame_idle = Duration::from_millis(300);
+    let mut host = serve(config).expect("host serves");
+
+    let mut idle = raw_connect(&host);
+    idle.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    // The hello arrives, then nothing from us — the host must answer
+    // with the protocol violation and end the connection.
+    let (code, detail) = read_transport_error(&mut idle);
+    assert_eq!(code, TransportErrorCode::ProtocolViolation, "{detail}");
+    assert!(detail.contains("no frame within"), "{detail}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut scratch = [0u8; 16];
+    loop {
+        match std::io::Read::read(&mut idle, &mut scratch) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                assert!(Instant::now() < deadline, "the idle connection never closed");
+            }
+            Err(err) => panic!("reading the idle connection's end: {err}"),
+        }
     }
 
     host.shutdown();

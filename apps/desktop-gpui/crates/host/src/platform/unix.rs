@@ -29,10 +29,15 @@ use crate::auth::PeerCredentials;
 ///
 /// The socket is bound under a unique temporary name in the same
 /// directory, set to 0600, and then renamed onto `path`: the endpoint is
-/// never reachable under its final name with anything looser than 0600.
-/// (`UnixListener::bind` alone would create the file with umask-default
-/// permissions first — a window another local user could connect in when
-/// the runtime dir is not this process's own 0700 creation.)
+/// never reachable under its **final** name with anything looser than
+/// 0600. The temp name itself exists briefly with umask-default
+/// permissions between `bind` and the `set_permissions` that follows —
+/// that window is closed by the caller's contract, not here: `serve`
+/// only binds inside a runtime dir `ensure_runtime_dir` has already
+/// tightened to 0700, and a caller of this function directly owes the
+/// same containment. (A pre-bind `chmod` is not possible for filesystem
+/// sockets: the file's mode is fixed at creation from the process
+/// umask, which is process-global and not safely flippable here.)
 pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -51,10 +56,16 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         ));
         match UnixListener::bind(&candidate) {
             Ok(bound) => {
-                std::fs::set_permissions(
-                    &candidate,
-                    std::fs::Permissions::from_mode(0o600),
-                )?;
+                if let Err(err) =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                {
+                    // Same cleanup discipline as the rename path below:
+                    // drop the listener (closing the socket) and remove
+                    // the temp file — no residue for the next boot.
+                    drop(bound);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(err);
+                }
                 listener = Some(bound);
                 temp = Some(candidate);
                 break;
@@ -262,6 +273,10 @@ impl TransportConn for UdsConn {
 
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
     }
 }
 

@@ -472,11 +472,29 @@ mod tests {
         // serializes Frame::Receipt verbatim), so an accidental
         // representation change — a newtype here, a field rename there —
         // must fail here, not at the first IPC client. A bare round trip
-        // would only prove serde's self-consistency.
+        // would only prove serde's self-consistency. Every variant is
+        // pinned (all fourteen), including the Option-absence shape of
+        // UnsupportedVersion and every unit/newtype variant.
         let rejection_pairs = vec![
             (
                 Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
                 serde_json::json!({ "UnsupportedVersion": { "id": "cmd_9" } }),
+            ),
+            (
+                Rejection::UnsupportedVersion { id: None },
+                serde_json::json!({ "UnsupportedVersion": { "id": null } }),
+            ),
+            (
+                Rejection::InvalidEnvelope("missing 'ts'".into()),
+                serde_json::json!({ "InvalidEnvelope": "missing 'ts'" }),
+            ),
+            (
+                Rejection::UnknownMessageType("bogus.type".into()),
+                serde_json::json!({ "UnknownMessageType": "bogus.type" }),
+            ),
+            (
+                Rejection::InvalidPayload("payload is invalid".into()),
+                serde_json::json!({ "InvalidPayload": "payload is invalid" }),
             ),
             (
                 Rejection::IllegalInState {
@@ -493,9 +511,34 @@ mod tests {
                 }),
             ),
             (
+                Rejection::PendingUnresolved { detail: "waiting".into() },
+                serde_json::json!({ "PendingUnresolved": { "detail": "waiting" } }),
+            ),
+            (
                 Rejection::SeqNotMonotonic { detail: "seq 4 follows 4".into() },
                 serde_json::json!({ "SeqNotMonotonic": { "detail": "seq 4 follows 4" } }),
             ),
+            (
+                Rejection::RouteNotFrozen { route: "local-default".into() },
+                serde_json::json!({ "RouteNotFrozen": { "route": "local-default" } }),
+            ),
+            (
+                Rejection::UnknownCaptureRef { capture_ref: "take_x".into() },
+                serde_json::json!({ "UnknownCaptureRef": { "capture_ref": "take_x" } }),
+            ),
+            (
+                Rejection::UnknownJob { job_id: "job-1".into() },
+                serde_json::json!({ "UnknownJob": { "job_id": "job-1" } }),
+            ),
+            (
+                Rejection::UnknownRevision { revision_id: "rev-1".into() },
+                serde_json::json!({ "UnknownRevision": { "revision_id": "rev-1" } }),
+            ),
+            (
+                Rejection::UnknownDelivery { delivery_id: "d-1".into() },
+                serde_json::json!({ "UnknownDelivery": { "delivery_id": "d-1" } }),
+            ),
+            (Rejection::InboxFull, serde_json::json!("InboxFull")),
             (Rejection::Closed, serde_json::json!("Closed")),
         ];
         for (value, wire) in rejection_pairs {
@@ -507,31 +550,6 @@ mod tests {
             );
             let back: Rejection = serde_json::from_value(wire).unwrap();
             assert_eq!(back, value);
-        }
-        let rejections = vec![
-            Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
-            Rejection::InvalidEnvelope("missing 'ts'".into()),
-            Rejection::UnknownMessageType("bogus.type".into()),
-            Rejection::InvalidPayload("payload is invalid".into()),
-            Rejection::IllegalInState {
-                command: "capture.stop".into(),
-                state: "Idle".into(),
-                detail: "not legal".into(),
-            },
-            Rejection::PendingUnresolved { detail: "waiting".into() },
-            Rejection::SeqNotMonotonic { detail: "seq 4 follows 4".into() },
-            Rejection::RouteNotFrozen { route: "local-default".into() },
-            Rejection::UnknownCaptureRef { capture_ref: "take_x".into() },
-            Rejection::UnknownJob { job_id: "job-1".into() },
-            Rejection::UnknownRevision { revision_id: "rev-1".into() },
-            Rejection::UnknownDelivery { delivery_id: "d-1".into() },
-            Rejection::InboxFull,
-            Rejection::Closed,
-        ];
-        for rejection in rejections {
-            let wire = serde_json::to_value(&rejection).unwrap();
-            let back: Rejection = serde_json::from_value(wire).unwrap();
-            assert_eq!(back, rejection);
         }
     }
 

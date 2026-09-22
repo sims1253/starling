@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE,
     ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -122,6 +123,18 @@ fn current_user_sid() -> io::Result<String> {
             CloseHandle(token);
             return Err(err);
         }
+        // The cast below dereferences a TOKEN_USER out of `buffer`; a
+        // short buffer would make that an out-of-bounds read. The API
+        // contract says the user's TOKEN_USER is at least
+        // size_of::<TOKEN_USER>() — refuse anything smaller rather than
+        // trust it.
+        if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
+            CloseHandle(token);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GetTokenInformation returned a truncated TOKEN_USER",
+            ));
+        }
         // TOKEN_USER is repr(C): { SID_AND_ATTRIBUTES { Sid: PSID, .. } }
         // — the SID pointer rides at the buffer's start.
         let user = &*(buffer.as_ptr() as *const TOKEN_USER);
@@ -132,6 +145,10 @@ fn current_user_sid() -> io::Result<String> {
             CloseHandle(token);
             return Err(err);
         }
+        // SAFETY (the wide_to_string scan): ConvertSidToStringSidW's
+        // contract is an allocated, NUL-terminated wide string — the
+        // scan walks exactly up to that terminator and stops; the
+        // allocation is released by the LocalFree below.
         let text = wide_to_string(sid_wstr);
         LocalFree(sid_wstr as _);
         CloseHandle(token);
@@ -156,12 +173,23 @@ fn to_wide(text: &str) -> Vec<u16> {
         .collect()
 }
 
-/// The pipe endpoint path (`\\.\pipe\<stem>`) for one data root. The
-/// `runtime_dir` does not select the endpoint on Windows — the pipe
-/// namespace is per-machine, and the stem already encodes the root.
+/// The pipe endpoint path (`\\.\pipe\<stem>-<user>`) for one data root.
+/// The `runtime_dir` does not select the endpoint on Windows — the pipe
+/// namespace is per-machine — so the stem encodes the root **and the
+/// creating user's SID**: two local users whose data roots resolve to
+/// the same path (a shared checkout) must never contend for one pipe
+/// name (the DACL would already keep them off each other's pipes, but
+/// the first-instance claim would make the second user's bind fail).
+/// Both host and client derive the name in-process, so the SID is
+/// stable for the pair that matters.
 pub fn pipe_path(runtime_dir: &Path, root: &Path) -> PathBuf {
     let _ = runtime_dir;
-    PathBuf::from(format!("\\\\.\\pipe\\{}", super::endpoint_stem(root)))
+    let user = current_user_sid().unwrap_or_default();
+    PathBuf::from(format!(
+        "\\\\.\\pipe\\{}-{}",
+        super::endpoint_stem(root),
+        super::endpoint_stem(Path::new(&user))
+    ))
 }
 
 /// Builds the SECURITY_ATTRIBUTES for `CreateNamedPipeW`: a security
@@ -214,9 +242,13 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         // Hand the created-but-unconnected first instance to the acceptor
         // thread, which will block in ConnectNamedPipe on it. The handle
         // crosses as a SendHandle — wrapped *before* the closure so the
-        // closure captures the (Send) wrapper, not the raw pointer.
+        // closure captures the (Send) wrapper, not the raw pointer. The
+        // handoff channel is bounded: a burst of clients completing
+        // ConnectNamedPipe faster than the host's accept loop polls must
+        // park the acceptor in `send` (backpressure at connection time)
+        // rather than accumulate unbounded connected instances.
         let first = SendHandle(handle);
-        let (tx, rx) = mpsc::channel::<io::Result<SendHandle>>();
+        let (tx, rx) = mpsc::sync_channel::<io::Result<SendHandle>>(4);
         let name_for_thread = name.clone();
         let acceptor = std::thread::Builder::new()
             .name("starling-host-pipe-accept".into())
@@ -243,7 +275,7 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
 fn acceptor_loop(
     name: Vec<u16>,
     mut current: SendHandle,
-    tx: mpsc::Sender<io::Result<SendHandle>>,
+    tx: mpsc::SyncSender<io::Result<SendHandle>>,
 ) {
     loop {
         let connected = unsafe { ConnectNamedPipe(current.0, std::ptr::null_mut()) } != 0;
@@ -264,7 +296,15 @@ fn acceptor_loop(
                     }
                     current = match unsafe { create_instance(&name) } {
                         Ok(next) => next,
-                        Err(_) => return,
+                        Err(err) => {
+                            // Terminal: without a listening instance the
+                            // pipe name stops existing. Log it — on a
+                            // path that is compile-verified but has never
+                            // run, the first failure must be diagnosable,
+                            // not a silent BrokenPipe one accept later.
+                            eprintln!("starling-host-pipe-accept: terminating: {err}");
+                            return;
+                        }
                     };
                     continue;
                 }
@@ -284,7 +324,10 @@ fn acceptor_loop(
                 }
                 current = match unsafe { create_instance(&name) } {
                     Ok(next) => next,
-                    Err(_) => return,
+                    Err(err) => {
+                        eprintln!("starling-host-pipe-accept: terminating: {err}");
+                        return;
+                    }
                 };
                 continue;
             }
@@ -306,7 +349,10 @@ fn acceptor_loop(
         }
         current = match unsafe { create_instance(&name) } {
             Ok(next) => next,
-            Err(_) => return,
+            Err(err) => {
+                eprintln!("starling-host-pipe-accept: terminating: {err}");
+                return;
+            }
         };
     }
 }
@@ -348,11 +394,17 @@ fn connect_with_wait(path: &Path, wait: u32) -> io::Result<Box<dyn TransportConn
         // that is creating its next instance.
         if WaitNamedPipeW(name.as_ptr(), wait) == 0 {
             let err = GetLastError();
-            if err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND {
+            // Not-found and busy-timeout fall through to CreateFileW,
+            // which gives the canonical decisive answer for both (not
+            // found; busy with ERROR_PIPE_BUSY). Returning early on
+            // SEM_TIMEOUT would rob the probe of its Live answer for a
+            // busy-but-healthy server.
+            if err != ERROR_FILE_NOT_FOUND
+                && err != ERROR_PATH_NOT_FOUND
+                && err != ERROR_SEM_TIMEOUT
+            {
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
-            // Not found: fall through to CreateFileW, which reports the
-            // canonical error for a name no server created.
         }
         let handle = CreateFileW(
             name.as_ptr(),
@@ -454,6 +506,13 @@ impl Drop for PipeListener {
         // (3) Bounded wait: a wake that cannot reach the acceptor
         // (create_instance failed, the name is gone) must not hang the
         // dropping thread — the acceptor is left detached instead.
+        //
+        // A detached acceptor may still hold a claimed pipe instance,
+        // but only until this process exits: pipe handles are kernel
+        // objects the OS closes at exit, and a listener is only ever
+        // dropped on the host's shutdown path (there is no in-process
+        // re-listen after this in the host's lifetime — the lease ladder
+        // restarts serving in a new process).
         let deadline = Instant::now() + Duration::from_secs(2);
         while !self._acceptor.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -461,17 +520,34 @@ impl Drop for PipeListener {
     }
 }
 
-/// A connected pipe instance. `server` marks instances this process
-/// created with `CreateNamedPipeW` — only those may be passed to
-/// `DisconnectNamedPipe` (client-side handles from `CreateFileW` are
-/// closed, never disconnected).
+/// A connected pipe instance. `server` marks handles whose instance
+/// this process created with `CreateNamedPipeW` — only those may be
+/// passed to `DisconnectNamedPipe` (client-side handles from
+/// `CreateFileW` are closed, never disconnected).
+///
+/// Duplicates keep the flag, on purpose: `DisconnectNamedPipe` is an
+/// **instance-wide** operation reachable from any handle of the
+/// instance, and the host's force-close paths (the eviction, the
+/// bounded shutdown drain, overflow closes) run on the `closer`
+/// duplicate precisely because that is the one call that unblocks a
+/// writer parked in a synchronous `WriteFile` on this instance. The
+/// truncation that disconnects mid-write is the designed bound, not an
+/// accident: every such close runs only after the peer was given its
+/// bounded chance to drain (see `SHUTDOWN_DRAIN` and the
+/// close-on-overflow docs in `server.rs`).
 pub struct PipeConn {
     handle: SendHandle,
     server: bool,
 }
 
-// SAFETY: the handle is a kernel object identifier, not a pointer into
-// this process's memory; Win32 calls on one handle are thread-safe.
+// SAFETY (Send and Sync): the handle is a kernel object identifier, not
+// a pointer into this process's memory. Send: Win32 calls on one handle
+// are thread-safe. Sync: `PipeConn` is shared across the host's
+// reader/writer/closer threads through *duplicated* handle values, and
+// concurrent synchronous ReadFile/WriteFile on distinct duplicates of
+// one pipe instance is documented-safe; DisconnectNamedPipe/CancelIoEx
+// racing in-flight I/O is likewise documented to fail those operations,
+// not corrupt state.
 unsafe impl Send for PipeConn {}
 unsafe impl Sync for PipeConn {}
 
@@ -527,10 +603,19 @@ impl TransportConn for PipeConn {
         // (FlushFileBuffers) BLOCKS on a full pipe — the exact stall the
         // callers (the event pump's eviction, bounded shutdown) must
         // never cause. Server instances: DisconnectNamedPipe forces the
-        // disconnect; pending operations on other handles to the same
-        // instance complete with an error, which is what unblocks a
-        // parked writer. Client handles: CancelIoEx cancels this handle's
-        // pending synchronous I/O (the reader's ReadFile) best-effort.
+        // disconnect; it is instance-wide, so pending operations on
+        // every handle of the instance (a writer parked in a
+        // synchronous WriteFile among them) complete with an error —
+        // which is what unblocks them.
+        //
+        // Client handles: CancelIoEx cancels I/O issued on THIS handle
+        // value only — it does not reach the reader's separately
+        // duplicated handle, so a parked client-side ReadFile is NOT
+        // unblocked here (recorded gap: converting the client read side
+        // to overlapped I/O, or reading through one shared handle, is
+        // the prerequisite). The client reader does end when the host
+        // closes its end (broken pipe), which is the normal teardown
+        // path; only the hostile-host wedge relies on this gap.
         unsafe {
             if self.server {
                 if DisconnectNamedPipe(self.handle.0) == 0 {
@@ -549,6 +634,16 @@ impl TransportConn for PipeConn {
         // prerequisite. Until then the client library's event backlog
         // flushes on inbound frames instead of on an idle tick (see
         // `client.rs`).
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        // Recorded gap, same class as set_read_timeout: a synchronous
+        // WriteFile cannot be bounded. The design compensates — the
+        // host's writers live on dedicated connection threads (a parked
+        // write costs its own connection, never the accept loop), and
+        // the force-close paths unblock them via the instance-wide
+        // DisconnectNamedPipe above.
         Ok(())
     }
 }

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use starling_runtime::machine::capture::V2CaptureStore;
 use starling_runtime::RuntimeConfig;
@@ -36,6 +37,11 @@ pub struct HostConfig {
     pub max_connections: usize,
     /// Per-connection outbound event queue before `slow_consumer`.
     pub outbound_capacity: usize,
+    /// How long a freshly-admitted connection may hold its slot without
+    /// sending a frame — the pre-greeting idle bound (see
+    /// `server::connection_reader` for the posture). A field so tests
+    /// tighten it instead of waiting out the production deadline.
+    pub first_frame_idle: std::time::Duration,
     /// Who may connect.
     pub peer_policy: Arc<dyn PeerPolicy>,
     /// The runtime this host owns. Production builds pass
@@ -59,6 +65,7 @@ impl HostConfig {
             command_rate: RateLimit::default(),
             max_connections: crate::limits::DEFAULT_MAX_CONNECTIONS,
             outbound_capacity: crate::limits::DEFAULT_OUTBOUND_CAPACITY,
+            first_frame_idle: Duration::from_secs(10),
             peer_policy: crate::auth::default_policy(),
             runtime: RuntimeConfig::default(),
         }

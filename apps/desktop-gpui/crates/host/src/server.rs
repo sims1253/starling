@@ -173,19 +173,24 @@ impl HostHandle {
         // (which unblocks a writer parked in write_all) and join. The
         // join after a forced close is prompt by construction — every
         // connection loop treats a socket error as its exit condition.
+        // The force-close walks the (handle, state) pairs, not the
+        // registry snapshot above: a connection whose reader already
+        // exited (and unregistered itself) is still owed its kill — its
+        // writer may be parked — and a connection accepted between the
+        // two steps must not escape the bound either.
         let conn_threads = lock_registry(&self.shared.conn_threads)
             .drain(..)
             .collect::<Vec<_>>();
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
-        for thread in &conn_threads {
+        for (thread, _) in &conn_threads {
             while !thread.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(POLL);
             }
         }
-        for conn in &conns {
-            conn.close();
+        for (_, state) in &conn_threads {
+            state.close();
         }
-        for thread in conn_threads {
+        for (thread, _) in conn_threads {
             let _ = thread.join();
         }
 
@@ -221,22 +226,43 @@ impl Drop for HostHandle {
 }
 
 /// State shared by the accept loop, the event pump and every connection.
+///
+/// Every atomic here runs at `SeqCst` as a deliberate blanket choice:
+/// these are low-frequency flags and counters (shutdown polls, one
+/// admission per connection) where the strongest ordering costs nothing
+/// measurable, and picking per-field orderings would document
+/// synchronization intent the host does not actually depend on beyond
+/// "this store is visible to the next load".
 pub struct HostShared {
     shutdown: AtomicBool,
     client: RuntimeClient,
     owner_id: String,
     max_frame_bytes: usize,
     command_rate: RateLimit,
-    /// Live connections (readers unregister themselves on exit).
+    /// How long a freshly-admitted connection may hold its slot without
+    /// sending a frame (the pre-greeting idle bound; the production
+    /// default and the posture's rationale live on
+    /// [`crate::config::HostConfig`]'s field).
+    first_frame_idle: Duration,
+    /// Live, **authenticated and greeted** connections — the event
+    /// pump's fan-out set (see `connection_reader` for why registration
+    /// waits until the hello is queued).
     conns: Mutex<Vec<Arc<ConnState>>>,
-    /// Connection threads to join at shutdown.
-    conn_threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Every connection's threads, paired with the connection's state
+    /// so shutdown's force-close can reach a connection whose reader
+    /// already exited and unregistered (a parked writer must never
+    /// escape the drain bound by leaving the registry first).
+    conn_threads: Mutex<Vec<(JoinHandle<()>, Arc<ConnState>)>>,
     live_connections: AtomicUsize,
 }
 
 struct ConnState {
     outbound: Sender<Frame>,
     closed: AtomicBool,
+    /// Set exactly once by `unregister` (the reader's exit path, also
+    /// armed as a panic guard) so the live-connection count is
+    /// decremented once per admission even if the reader panics.
+    unregistered: AtomicBool,
     /// A handle to the connection for immediate shutdown of both
     /// directions (the reader owns the original; the writer a clone).
     closer: Box<dyn TransportConn>,
@@ -320,7 +346,15 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     //     A crashed predecessor's interrupted takes are salvaged, and the
     //     report is surfaced (logged here, held on the handle for
     //     status).
-    let startup_reconciliation = match lease.lock().expect("lease store").reconcile() {
+    let startup_reconciliation = match lease
+        .lock()
+        // Poison-tolerant like the registries: the only other locker
+        // (the heartbeat thread) panicking must not turn startup into a
+        // panic cascade; reconcile on intact-but-poisoned data reports
+        // its own errors through the Result.
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reconcile()
+    {
         Ok(report) => report,
         Err(source) => {
             release_lease_now(&lease);
@@ -347,8 +381,15 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     }
 
     // 2. The endpoint.
-    platform::ensure_runtime_dir(&config.runtime_dir)
-        .map_err(|err| HostError::RuntimeDir(config.runtime_dir.clone(), err.to_string()))?;
+    if let Err(err) = platform::ensure_runtime_dir(&config.runtime_dir) {
+        // Every post-acquisition failure releases the lease before
+        // returning; this one is no exception.
+        release_lease_now(&lease);
+        return Err(HostError::RuntimeDir(
+            config.runtime_dir.clone(),
+            err.to_string(),
+        ));
+    }
     let socket_path = config.socket_path();
     match platform::probe(&socket_path) {
         Probe::Live => {
@@ -397,6 +438,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         owner_id: owner_id.clone(),
         max_frame_bytes: config.max_frame_bytes,
         command_rate: config.command_rate,
+        first_frame_idle: config.first_frame_idle,
         conns: Mutex::new(Vec::new()),
         conn_threads: Mutex::new(Vec::new()),
         live_connections: AtomicUsize::new(0),
@@ -469,14 +511,20 @@ fn accept_loop(
                 if live >= max_connections {
                     shared.live_connections.fetch_sub(1, Ordering::SeqCst);
                     // Answer honestly, then close: the client learns why.
+                    // The write is bounded: a peer that connected with a
+                    // full receive buffer must not park the one accept
+                    // thread — the error is dropped after the timeout,
+                    // the connection dies either way.
                     let error = Frame::TransportError {
                         code: TransportErrorCode::TooManyConnections,
                         detail: format!("{live} connections already live (cap {max_connections})"),
                     };
                     if let Ok(wire) = encode(&error, shared.max_frame_bytes) {
+                        let _ = conn.set_write_timeout(Some(POLL * 4));
                         let sink = conn.as_mut();
                         let _ = sink.write_all(&wire);
                         let _ = sink.flush();
+                        let _ = conn.set_write_timeout(None);
                     }
                     let _ = conn.shutdown_both();
                     continue;
@@ -503,31 +551,57 @@ fn accept_loop(
                 let state = Arc::new(ConnState {
                     outbound: outbound_tx,
                     closed: AtomicBool::new(false),
+                    unregistered: AtomicBool::new(false),
                     closer,
                 });
-                lock_registry(&shared.conns).push(Arc::clone(&state));
 
-                let reader = spawn_conn_thread("starling-host-conn-read", {
+                // Spawn failures are survived, not fatal: a transient
+                // thread exhaustion must cost this one connection, never
+                // the accept loop (whose panic would silently stop all
+                // future serving).
+                let reader = match spawn_conn_thread("starling-host-conn-read", {
                     let shared = Arc::clone(&shared);
                     let state = Arc::clone(&state);
                     let policy = Arc::clone(&policy);
                     let conn = conn;
                     move || connection_reader(shared, state, policy, conn)
-                });
-                let writer = spawn_conn_thread("starling-host-conn-write", {
+                }) {
+                    Ok(reader) => reader,
+                    Err(err) => {
+                        eprintln!("starling-runtime-host: reader spawn failed: {err}");
+                        // The reader never runs, so its unregister never
+                        // will: give the slot back here.
+                        shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+                        let _ = state.close();
+                        continue;
+                    }
+                };
+                let writer = match spawn_conn_thread("starling-host-conn-write", {
                     let shared = Arc::clone(&shared);
                     let state = Arc::clone(&state);
                     move || connection_writer(shared, state, writer_conn, outbound_rx)
-                });
-                // Register, then reap: every accept sweeps the handles
+                }) {
+                    Ok(writer) => writer,
+                    Err(err) => {
+                        eprintln!("starling-runtime-host: writer spawn failed: {err}");
+                        // Kill the socket; the (running) reader observes
+                        // the error and unregisters — the slot is
+                        // returned exactly once, by the reader.
+                        state.close();
+                        lock_registry(&shared.conn_threads)
+                            .push((reader, Arc::clone(&state)));
+                        continue;
+                    }
+                };
+                // Register, then reap: every accept sweeps the pairs
                 // whose threads already exited, so the registry stays
                 // bounded on a long-lived host serving many short-lived
                 // clients (a crashlooping renderer reconnecting once a
                 // second must not grow it forever).
                 let mut threads = lock_registry(&shared.conn_threads);
-                threads.retain(|thread| !thread.is_finished());
-                threads.push(reader);
-                threads.push(writer);
+                threads.retain(|(thread, _)| !thread.is_finished());
+                threads.push((reader, Arc::clone(&state)));
+                threads.push((writer, Arc::clone(&state)));
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(POLL);
@@ -540,20 +614,35 @@ fn accept_loop(
     }
 }
 
-fn spawn_conn_thread(name: &str, run: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+fn spawn_conn_thread(
+    name: &str,
+    run: impl FnOnce() + Send + 'static,
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(run)
-        .expect("host connection thread spawn")
 }
 
 /// One connection's inbound side: auth, hello, then frames.
+///
+/// The connection joins the event fan-out only **after** authentication
+/// succeeded and the hello is queued: registering earlier would let the
+/// pump enqueue events ahead of the greeting (and, on an auth failure,
+/// leak runtime events to a peer that was never admitted).
 fn connection_reader(
     shared: Arc<HostShared>,
     state: Arc<ConnState>,
     policy: Arc<dyn PeerPolicy>,
     mut conn: Box<dyn TransportConn>,
 ) {
+    // Panic-proof bookkeeping: exactly once per admitted connection,
+    // whether the reader returns or panics, the registry entry goes and
+    // the reserved slot is returned.
+    let guard = UnregisterOnDrop {
+        shared: &shared,
+        state: &state,
+    };
+
     // Fail closed: a credential read failure is an auth failure.
     let credentials = conn.peer_credentials().unwrap_or_default();
     if let Err(refused) = policy.authenticate(credentials) {
@@ -562,17 +651,21 @@ fn connection_reader(
             detail: refused.to_string(),
         };
         // Best-effort direct write: the writer thread has nothing queued
-        // (no hello was sent), so the two never race.
+        // (no hello was sent), so the two never race. Bounded, so a
+        // peer that connected with a full buffer cannot park this
+        // reader before it even starts.
         if let Ok(wire) = encode(&error, shared.max_frame_bytes) {
+            let _ = conn.set_write_timeout(Some(POLL * 4));
             let sink = conn.as_mut();
             let _ = sink.write_all(&wire);
             let _ = sink.flush();
+            let _ = conn.set_write_timeout(None);
         }
         // The frame went out on our own handle; the writer (with nothing
         // queued — no hello was ever sent) shuts the socket down after
         // the queue closes.
         state.mark_closed();
-        unregister(&shared, &state);
+        guard.run();
         return;
     }
 
@@ -589,15 +682,22 @@ fn connection_reader(
         .is_err()
     {
         state.close();
-        unregister(&shared, &state);
+        guard.run();
         return;
     }
+    // Authenticated and greeted: the connection may now receive events.
+    // The hello is already queued, so nothing the pump enqueues from
+    // here on can overtake it.
+    lock_registry(&shared.conns).push(Arc::clone(&state));
 
     let mut reader = FrameReader::new(conn, shared.max_frame_bytes);
     let mut rate = SlidingWindow::new(shared.command_rate);
+    let admitted_at = Instant::now();
+    let mut first_frame = true;
     while !shared.shutdown.load(Ordering::SeqCst) && !state.closed.load(Ordering::SeqCst) {
         match reader.read_frame() {
             Ok(frame) => {
+                first_frame = false;
                 if !rate.allow(Instant::now()) {
                     terminate(
                         &state,
@@ -670,13 +770,61 @@ fn connection_reader(
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
+                // The pre-greeting idle bound: a connection that has
+                // sent nothing since admit may not hold its slot past
+                // the configured deadline (see HostConfig's field docs
+                // for the posture — the credential gate, not this
+                // deadline, is the security boundary).
+                let idle_bound = shared.first_frame_idle;
+                if first_frame && admitted_at.elapsed() > idle_bound {
+                    terminate(
+                        &state,
+                        TransportErrorCode::ProtocolViolation,
+                        format!(
+                            "no frame within {idle_bound:?} of connect; connection closed"
+                        ),
+                    );
+                    break;
+                }
                 continue;
             }
             Err(FrameError::Io(_)) => break,
         }
     }
     state.mark_closed();
-    unregister(&shared, &state);
+    guard.run();
+}
+
+/// Returns a connection's registry entry and reserved slot exactly
+/// once, from the reader's exit — including a panic exit (a panicking
+/// reader must not leak the cap slot its admission consumed).
+struct UnregisterOnDrop<'a> {
+    shared: &'a HostShared,
+    state: &'a Arc<ConnState>,
+}
+
+impl UnregisterOnDrop<'_> {
+    /// The normal exit path.
+    fn run(self) {
+        self.once();
+    }
+
+    /// Idempotent on the connection's own flag, so run() followed by
+    /// drop (and a panic followed by drop) both count once.
+    fn once(&self) {
+        if !self.state.unregistered.swap(true, Ordering::SeqCst) {
+            lock_registry(&self.shared.conns)
+                .retain(|registered| !Arc::ptr_eq(registered, self.state));
+            self.shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for UnregisterOnDrop<'_> {
+    fn drop(&mut self) {
+        // Panic path: run() was never reached; do its work now.
+        self.once();
+    }
 }
 
 /// Bridges one command envelope into the runtime and returns the receipt
@@ -713,10 +861,26 @@ fn handle_command(
         .and_then(|object| object.get("corr"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    if envelope
+    let client_supplied_seq = envelope
         .as_object()
-        .is_some_and(|object| !object.contains_key("seq"))
-    {
+        .is_some_and(|object| object.contains_key("seq"));
+    if client_supplied_seq {
+        // A present-but-non-numeric seq (null, string, …) is the same
+        // unanswerable/mis-sequenced shape as a missing id: refuse it
+        // rather than route a malformed stream position.
+        if !envelope
+            .as_object()
+            .and_then(|object| object.get("seq"))
+            .is_some_and(serde_json::Value::is_u64)
+        {
+            terminate(
+                state,
+                TransportErrorCode::MalformedFrame,
+                "seq, when present, must be an unsigned number".to_string(),
+            );
+            return Err(());
+        }
+    } else {
         let seq = shared.client.assign_seq(corr.as_deref());
         if let Some(object) = envelope.as_object_mut() {
             object.insert("seq".to_string(), serde_json::Value::from(seq));
@@ -726,7 +890,9 @@ fn handle_command(
         .as_object()
         .and_then(|object| object.get("seq"))
         .and_then(serde_json::Value::as_u64);
-    let result = shared.client.send_raw(envelope.clone());
+    // The envelope is consumed here (nothing reads it after); moving it
+    // avoids a full JSON deep-clone on the per-command hot path.
+    let result = shared.client.send_raw(std::mem::take(envelope));
     if state
         .try_deliver(Frame::Receipt {
             req: id,
@@ -837,16 +1003,17 @@ fn terminate(state: &ConnState, code: TransportErrorCode, detail: String) {
     state.mark_closed();
 }
 
-fn unregister(shared: &HostShared, state: &Arc<ConnState>) {
-    lock_registry(&shared.conns).retain(|registered| !Arc::ptr_eq(registered, state));
-    shared.live_connections.fetch_sub(1, Ordering::SeqCst);
-}
-
 /// Fans runtime events out to every live connection. This decouples the
 /// runtime's EventBus (whose backpressure semantics are in-process:
 /// machines stall on a full subscriber) from IPC clients (whose policy
 /// is the opposite: a stopped reader is dropped, machines never stall —
 /// §1 Mode B's renderer-kill posture).
+///
+/// Cost note: the registry is a Mutex<Vec<..>> and each event clones
+/// the Vec (Arc bumps, one allocation). At the documented connection
+/// cap and event rates this is noise; if the cap ever grows by orders
+/// of magnitude, switch to a map keyed by connection id or reuse a
+/// scratch Vec here.
 fn event_pump(shared: Arc<HostShared>, events: EventSub) {
     loop {
         if shared.shutdown.load(Ordering::SeqCst) {

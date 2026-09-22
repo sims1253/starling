@@ -43,11 +43,19 @@ impl ChildHost {
     }
 
     /// Waits for the socket to accept a client handshake; returns it.
+    /// A child that has already exited fails fast with its status —
+    /// spinning to the deadline first only delays the diagnosis.
     fn wait_serving(&mut self, socket: &Path) -> HostClient {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(client) = HostClient::connect(socket) {
                 return client;
+            }
+            if let Some(status) = self.child.try_wait().expect("try_wait the child") {
+                panic!(
+                    "host binary exited before serving at {} ({status})",
+                    socket.display()
+                );
             }
             if Instant::now() > deadline {
                 panic!(
@@ -156,16 +164,34 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
     let mut owner = serve(plain_config(root.path())).expect("in-process owner serves");
     let client = HostClient::connect(owner.socket_path()).expect("owner reachable");
 
-    let output = Command::new(BIN)
+    // Bounded: a regression that makes the second host *block* (instead
+    // of reporting already-running and exiting) must fail this test at
+    // the deadline, not hang the suite until the job timeout.
+    let mut child = Command::new(BIN)
         .arg("--root")
         .arg(root.path())
         .arg("--runtime-dir")
         .arg(root.path().join("endpoints"))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("second host runs");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().expect("try_wait the second host") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the second host did not exit within 15s");
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let output = child.wait_with_output().expect("drain the pipes");
 
     assert!(
-        output.status.success(),
+        status.success(),
         "a live owner means client mode, not failure: {}",
         String::from_utf8_lossy(&output.stderr)
     );

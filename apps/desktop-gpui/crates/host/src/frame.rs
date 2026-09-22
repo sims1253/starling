@@ -215,6 +215,12 @@ impl<R: Read> FrameReader<R> {
         Ok(frame)
     }
 
+    /// Returns the underlying reader (any partial frame is discarded —
+    /// for the mid-frame rebuild case, do it between frames).
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     /// Grows [`FrameReader::partial`] to `want` bytes. A clean EOF or an
     /// I/O error mid-frame truncates `partial` back to what is really
     /// held and propagates — on the *timeout* path the caller's next

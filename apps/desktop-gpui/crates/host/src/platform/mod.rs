@@ -66,6 +66,15 @@ pub trait TransportConn: Read + Write + Send + Sync {
     /// read (Windows' synchronous `ReadFile`; recorded gap there — see
     /// `platform::windows`).
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()>;
+    /// Bounds a blocking write the same way: past the deadline a write
+    /// parked against a peer that stopped reading fails with
+    /// [io::ErrorKind::WouldBlock]/[io::ErrorKind::TimedOut] instead of
+    /// blocking the caller indefinitely. The accept path's direct
+    /// writes (rejection and auth-failure frames) arm this so a stalled
+    /// peer cannot park the one accept thread. A no-op where the
+    /// platform cannot bound a synchronous write (recorded gap — see
+    /// `platform::windows`).
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()>;
 }
 
 /// What a probe of an endpoint found.
@@ -146,17 +155,31 @@ pub fn socket_path(runtime_dir: &Path, root: &Path) -> PathBuf {
 /// 0700 assumption the endpoint's security docs rely on must hold, not
 /// be presumed. A directory this user cannot tighten (owned by someone
 /// else) is an error — fail closed rather than serve from a shared dir.
+/// A symlink at the path is rejected outright (`symlink_metadata`, no
+/// following): the 0700 guarantee must hold on the directory itself,
+/// not on whatever a swapped link points at.
+///
+/// Non-unix note: the tightening branch is unix-only. On Windows the
+/// pipe namespace (not this directory) is the endpoint, so the mode is
+/// moot there today — but any future non-unix, non-Windows target must
+/// not inherit this function's unix-docs unchanged: the 0700 boundary
+/// would be a silent no-op there.
 pub fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     use std::fs::DirBuilder;
     if dir.exists() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(dir)?;
+            // symlink_metadata: do not follow — a symlinked runtime dir
+            // is someone else's path wearing our name.
+            let metadata = std::fs::symlink_metadata(dir)?;
             if !metadata.is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotADirectory,
-                    format!("runtime dir {dir:?} exists and is not a directory"),
+                    format!(
+                        "runtime dir {dir:?} exists and is not a directory \
+                         (symlinks are refused)"
+                    ),
                 ));
             }
             let mode = metadata.permissions().mode();
@@ -285,5 +308,22 @@ mod tests {
         ensure_runtime_dir(&fresh).expect("fresh dir is created");
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_runtime_dir_is_refused() {
+        // Even a symlink to a properly 0700 directory: the guarantee
+        // must hold on the path itself, not on the link's target —
+        // someone else's directory wearing our runtime dir's name is
+        // exactly the substitution this function exists to refuse.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-runtime");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("linked-runtime")).unwrap();
+        let refused = ensure_runtime_dir(&dir.path().join("linked-runtime"));
+        assert!(refused.is_err(), "a symlinked runtime dir must be refused");
     }
 }

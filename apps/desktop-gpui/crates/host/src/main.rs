@@ -71,8 +71,18 @@ fn main() {
     unsafe {
         // SAFETY: `on_signal` only stores to a static atomic; `signal`
         // registers it. This is the standard no-dependency Ctrl-C path.
-        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        // SIG_ERR would leave the default disposition in place — the
+        // exact abrupt-SIGTERM-with-lease-held death the early
+        // registration exists to prevent — so it is checked, not
+        // ignored.
+        if libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t)
+            == libc::SIG_ERR
+            || libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t)
+                == libc::SIG_ERR
+        {
+            eprintln!("starling-runtime-host: could not install signal handlers");
+            std::process::exit(1);
+        }
     }
     #[cfg(not(unix))]
     {

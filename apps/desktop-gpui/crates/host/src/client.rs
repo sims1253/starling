@@ -71,6 +71,13 @@ const READ_POLL: Duration = Duration::from_millis(250);
 /// resynchronization is the designed answer, not a degraded one.
 const EVENT_BACKLOG_CAP: usize = 1024;
 
+/// The frame cap while reading the handshake, before the host has
+/// advertised its own. Generous for a hello (which is a few hundred
+/// bytes) and tiny next to a forged `u32::MAX` header — the point is
+/// that the pre-advertisement window cannot be turned into a
+/// remote-controlled allocation.
+const HELLO_PHASE_CAP: usize = 64 * 1024;
+
 /// What the host told us at connect time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostInfo {
@@ -139,6 +146,12 @@ pub enum ClientError {
 /// the caller's thread (GPUI's update loop, a test loop).
 pub struct HostClient {
     writer: Mutex<Box<dyn TransportConn>>,
+    /// A third handle reserved for teardown. `Drop` ends the connection
+    /// through it *without* taking the writer lock: a send parked in a
+    /// blocking write against a wedged host holds that lock, and
+    /// shutdown through a duplicate unblocks the socket (unix) just as
+    /// well — the dropping thread must never wait out a stalled send.
+    closer: Box<dyn TransportConn>,
     pending: Arc<Mutex<HashMap<String, Sender<Reply>>>>,
     events: Receiver<EventWire>,
     closed: Arc<AtomicBool>,
@@ -156,6 +169,12 @@ impl HostClient {
             source,
         })?;
         let writer = conn.try_clone().map_err(|source| ClientError::Connect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        // The teardown handle: Drop's shutdown_both runs on this one so
+        // a send parked in the writer never blocks teardown.
+        let closer = conn.try_clone().map_err(|source| ClientError::Connect {
             path: path.to_path_buf(),
             source,
         })?;
@@ -210,6 +229,7 @@ impl HostClient {
 
         Ok(HostClient {
             writer: Mutex::new(writer),
+            closer,
             pending,
             events,
             closed,
@@ -380,10 +400,12 @@ impl HostClient {
 impl Drop for HostClient {
     fn drop(&mut self) {
         // End both directions so the detached reader thread's blocking
-        // read returns; it then drops the original handle.
-        if let Ok(writer) = self.writer.lock() {
-            let _ = writer.shutdown_both();
-        }
+        // read returns; it then drops the original handle. Through the
+        // dedicated `closer` handle, NOT the writer lock: a send parked
+        // in a blocking write holds that lock, and teardown must not
+        // wait behind a wedged host (the shutdown on the duplicate
+        // unblocks the parked write too — same socket).
+        let _ = self.closer.shutdown_both();
     }
 }
 
@@ -402,7 +424,13 @@ fn client_reader(
         // Wake every waiter with the closed flag set.
         pending.lock().expect("pending map").clear();
     };
-    let mut reader = FrameReader::new(conn, usize::MAX);
+    // The handshake is read under a small fixed cap; the hello is tiny.
+    // After it, the reader is rebuilt with the host-advertised cap so a
+    // hostile or corrupted peer cannot drive a multi-gigabyte buffer
+    // allocation through a forged 4-byte length header — the advertised
+    // cap is also what the host itself enforces on its own outbound
+    // frames, so honest traffic always fits it.
+    let mut reader = FrameReader::new(conn, HELLO_PHASE_CAP);
     let mut hello_done = false;
     // Events the application has not made room for yet. Delivering from
     // this backlog instead of parking on a full channel is what keeps
@@ -437,6 +465,11 @@ fn client_reader(
                     rate_max,
                     rate_window_ms,
                 }));
+                // Between frames by construction (this one just decoded):
+                // rebuild the reader under the advertised cap.
+                let cap = usize::try_from(max_frame_bytes).unwrap_or(HELLO_PHASE_CAP);
+                let conn = reader.into_inner();
+                reader = FrameReader::new(conn, cap.max(HELLO_PHASE_CAP));
             }
             Ok(Frame::Receipt { req, seq, result }) => {
                 deliver(&pending, &req, Reply::Receipt(result, seq));

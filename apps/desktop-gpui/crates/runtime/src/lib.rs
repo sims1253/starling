@@ -647,6 +647,18 @@ impl RuntimeClient {
     /// (a separate map from the bus frontier this method draws on) is
     /// what enforces monotonicity, and interleaving the two numberings
     /// can trip [`crate::machine::Rejection::SeqNotMonotonic`].
+    ///
+    /// The pairing is **not atomic**: between this call and
+    /// [`Self::send_raw`], another sender on the same corr stream may
+    /// consume the next seq and route it first, so the raced envelope
+    /// arrives out of allocation order and is rejected with
+    /// `SeqNotMonotonic`. A caller bridging multiple upstream
+    /// connections (the I4 host does) must therefore serialize
+    /// assign-then-send per corr stream — one in-flight assignment per
+    /// stream at a time keeps allocation order and submission order
+    /// identical. The rejection itself is the diagnostic for a caller
+    /// that skips that discipline or mixes the two numbering forms on
+    /// one stream.
     pub fn assign_seq(&self, corr: Option<&str>) -> u64 {
         self.bus.next_seq(corr)
     }

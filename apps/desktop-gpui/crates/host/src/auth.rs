@@ -86,9 +86,10 @@ pub struct SameUser {
 
 impl SameUser {
     /// The policy for this process. On unix the host's uid is its
-    /// effective uid; the Windows transport uses
-    /// [`PeerPolicy`](this trait)'s DACL-backed variant instead (see
-    /// `platform::windows` — there is no uid to compare there).
+    /// effective uid; the Windows transport uses the DACL-backed
+    /// `AdmittedByAcl` policy instead (see `platform::windows` —
+    /// there is no uid to compare there; the type is cfg(windows),
+    /// hence no link here).
     #[cfg(unix)]
     pub fn for_this_process() -> SameUser {
         SameUser {

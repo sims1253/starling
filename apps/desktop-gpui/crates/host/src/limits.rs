@@ -126,9 +126,10 @@ mod tests {
     #[test]
     fn a_window_longer_than_clock_history_admits_freshly() {
         // `now - per` underflows only when the process just booted with a
-        // huge window; the limiter must not wedge (clear-and-admit is the
-        // conservative reading: nothing has provably expired, but nothing
-        // has been counted either).
+        // huge window; the limiter must not wedge. The None branch clears
+        // nothing — it skips expiry (nothing predates the cutoff because
+        // the cutoff does not exist) and admits under `max` like any
+        // other fresh window, which the counting below pins.
         let mut window = SlidingWindow::new(RateLimit::new(2, Duration::from_secs(10_000)));
         let t0 = Instant::now();
         assert!(window.allow(t0));
