@@ -1086,7 +1086,8 @@ impl StoreV2 {
     /// file is gone. Deliberately split out so a caller sharing the store
     /// behind a lock can resolve the path under the guard and do the heavy
     /// read + verify + WAV encode (via [`read_audio_journal`]) without it.
-    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {        validate_capture_id(id)?;
+    pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {
+        validate_capture_id(id)?;
         if self.get_capture(id)?.is_none() {
             return Err(StoreV2Error::NotFound(id.to_string()));
         }
@@ -1112,10 +1113,11 @@ impl StoreV2 {
     /// failed between promotion and commit and must learn which side of
     /// the rename the bytes sit on ([`audio_journal_path`] cannot answer
     /// that: it resolves through the row, which in exactly that shape
-    /// does not exist yet).
+    /// does not exist yet). A probe that itself errors (`try_exists`, not
+    /// `exists`) propagates instead of reading as "not promoted".
     pub fn audio_journal_exists(&self, id: &str) -> Result<bool, StoreV2Error> {
         validate_capture_id(id)?;
-        Ok(self.audio_path(id).exists())
+        Ok(self.audio_path(id).try_exists()?)
     }
 
     // ------------------------------------------------------------------

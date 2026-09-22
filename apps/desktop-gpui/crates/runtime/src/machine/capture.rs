@@ -633,8 +633,21 @@ impl V2CaptureStore {
             let err = chain_adoption_failure(&adoption_error, err.to_string());
             // Metadata-only probe (one stat; load_audio would read and
             // verify the whole journal under the lock): which side of the
-            // promoting rename did the failure leave the bytes on?
-            let promoted = store.audio_journal_exists(&staged_id).unwrap_or(false);
+            // promoting rename did the failure leave the bytes on? A
+            // probe that itself errors is reported — never silently
+            // read as "not promoted" — and falls through to the discard
+            // attempt, the safer default (removing a not-yet-promoted
+            // partial is correct; the discard no-ops if it was wrong).
+            let promoted = match store.audio_journal_exists(&staged_id) {
+                Ok(promoted) => promoted,
+                Err(probe_err) => {
+                    report_divergence(format!(
+                        "the promotion probe for {staged_id} failed ({probe_err}) — \
+                         attempting the staging rollback anyway"
+                    ));
+                    false
+                }
+            };
             drop(store); // the filesystem work below runs off the lock
             if promoted {
                 report_divergence(format!(

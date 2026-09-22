@@ -2474,6 +2474,16 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     // can genuinely succeed.
     let audio = dir.path().join("audio");
     let perms = std::fs::metadata(&audio).expect("audio dir").permissions();
+    // Drop-based restore: any panic between the denial and the assertions
+    // (every expect below) still gives the tempdir cleanup a writable
+    // directory instead of confusing secondary errors.
+    struct PermRestore(std::path::PathBuf, std::fs::Permissions);
+    impl Drop for PermRestore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = PermRestore(audio.clone(), perms.clone());
     let mut denied = perms.clone();
     denied.set_readonly(true);
     std::fs::set_permissions(&audio, denied).expect("deny audio writes");
@@ -2483,12 +2493,11 @@ fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
     let probe = audio.join(".write_probe");
     if std::fs::write(&probe, b"x").is_ok() {
         let _ = std::fs::remove_file(&probe);
-        let _ = std::fs::set_permissions(&audio, perms);
         eprintln!(
             "skipping: this process ignores directory write bits; the \
              permission-based injection cannot bite"
         );
-        return;
+        return; // the PermRestore drop puts the directory back
     }
 
     let result = store.commit_take(&take_record("take_commitfail", &samples, None));
