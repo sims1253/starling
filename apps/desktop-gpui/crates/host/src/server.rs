@@ -626,11 +626,12 @@ fn connection_reader(
                             })
                             .is_err()
                         {
-                            terminate(
-                                &state,
-                                TransportErrorCode::SlowConsumer,
-                                "snapshot reply would overflow the outbound queue".to_string(),
-                            );
+                            // Same posture as an overflowing receipt
+                            // above: a full queue means a peer that is
+                            // not reading; kill the socket, never park
+                            // the writer behind an undeliverable
+                            // explanation.
+                            state.close();
                             break;
                         }
                     }
@@ -735,14 +736,14 @@ fn handle_command(
         .is_err()
     {
         // The command already ran; the client must never sit out a bare
-        // reply timeout for an executed command (a timeout reads as "safe
-        // to resend" and a resend would duplicate it). Close with the
-        // reason so the client resynchronizes from the snapshot instead.
-        terminate(
-            state,
-            TransportErrorCode::SlowConsumer,
-            "receipt would overflow the outbound queue".to_string(),
-        );
+        // reply timeout for an executed command (a timeout reads as
+        // "safe to resend" and a resend would duplicate it). The queue
+        // being full means the peer is not reading — an explanation
+        // frame would sit behind frames it has not read either — so the
+        // connection is killed outright (unblocking the writer parked
+        // in write_all against the full kernel buffer); the client
+        // reconnects and resynchronizes from the snapshot.
+        state.close();
         return Err(());
     }
     Ok(())
@@ -816,12 +817,21 @@ fn connection_writer(
 
 /// Ends a connection with a final transport-error frame: the frame is
 /// queued, the connection is marked closed, and the writer thread
-/// delivers the frame and then ends the stream. Ordering caveat, by
-/// construction: the error frame shares the outbound queue with event
-/// deliveries from the pump, so a concurrent event may be written after
-/// it — the terminal frame is best-effort-last, not guaranteed-last. The
-/// client treats any close after a transport error as terminal either
-/// way (it reconnects and resynchronizes from the snapshot).
+/// delivers the frame and then ends the stream. For **reader-side
+/// violations only** — the peer just sent a frame, so it is
+/// demonstrably still reading and the explanation will reach it.
+/// Queue-overflow paths (receipt/snapshot delivery in
+/// [`handle_command`], the event pump's eviction) must instead use
+/// [`ConnState::close`]: the queue being full means the peer is not
+/// reading, so a queued explanation would never arrive and the socket
+/// must be killed to unblock the writer parked against it.
+///
+/// Ordering caveat, by construction: the error frame shares the
+/// outbound queue with event deliveries from the pump, so a concurrent
+/// event may be written after it — the terminal frame is
+/// best-effort-last, not guaranteed-last. The client treats any close
+/// after a transport error as terminal either way (it reconnects and
+/// resynchronizes from the snapshot).
 fn terminate(state: &ConnState, code: TransportErrorCode, detail: String) {
     let _ = state.try_deliver(Frame::TransportError { code, detail });
     state.mark_closed();

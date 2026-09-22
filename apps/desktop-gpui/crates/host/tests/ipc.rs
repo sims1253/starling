@@ -1049,6 +1049,15 @@ fn write_raw_frame(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
     stream.flush().unwrap();
 }
 
+/// [`write_raw_frame`] for floods that expect the host to tear the
+/// connection down mid-stream: `false` when a write failed (the socket
+/// ended under us), which callers treat as "already answered".
+fn write_raw_frame_lossy(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) -> bool {
+    use std::io::Write;
+    let wire = (body.len() as u32).to_be_bytes();
+    stream.write_all(&wire).is_ok() && stream.write_all(body).is_ok()
+}
+
 #[test]
 fn oversized_frames_are_refused_without_being_read() {
     let root = tempfile::tempdir().unwrap();
@@ -1540,15 +1549,16 @@ fn a_command_envelope_without_a_string_id_is_refused() {
 }
 
 /// An outbound queue that overflows closes the connection — the
-/// terminate-on-overflow machinery the snapshot and receipt paths share.
-/// A burst of snapshot replies against a non-reading peer (shrunk
-/// receive buffer) fills the small queue while the writer is parked, and
-/// the next reply cannot be queued: the connection is killed. The
-/// terminal `slow_consumer` frame is best-effort (a peer that stopped
-/// reading cannot be handed an explanation through a full kernel
-/// buffer), so the deterministic assertion is the prompt close itself:
-/// the client learns the connection ended — never a silent wedge, and
-/// never a bare reply timeout for a command that already ran.
+/// close-on-overflow machinery the snapshot and receipt paths share. A
+/// flood of snapshot replies against a non-reading peer (shrunk receive
+/// buffer) parks the host's writer mid-reply; the next reply cannot be
+/// queued, and the connection is killed outright — socket and all, so a
+/// writer parked in write_all can never wedge the connection open. No
+/// explanation frame is owed through a full kernel buffer (a peer that
+/// stopped reading cannot be handed one), so the deterministic
+/// assertion is the prompt close itself: the client learns the
+/// connection ended — never a silent wedge, and never a bare reply
+/// timeout for a command that already ran.
 #[test]
 fn an_outbound_queue_overflow_closes_with_slow_consumer() {
     let root = tempfile::tempdir().unwrap();
@@ -1577,19 +1587,30 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
     }
     let request =
         serde_json::to_vec(&Frame::GetSnapshot { req: "flood".into() }).expect("serializes");
-    for _ in 0..16 {
-        write_raw_frame(&mut stalled, &request);
+    // The flood must decisively exceed every kernel buffer in front of
+    // the host's writer: 512 snapshot replies are a few hundred KiB
+    // against a ~212 KiB sender buffer plus the shrunk receive window,
+    // so the writer parks mid-reply and the 2-frame queue overflows on
+    // the very next reply — the eviction under test. (A short flood is
+    // nondeterministic: a runner whose socket buffers happen to hold it
+    // all never parks the writer, never overflows, and never closes.)
+    // A failed write mid-flood is the early branch — the host already
+    // ended the connection, which is exactly the assertion.
+    let mut sent = 0usize;
+    for _ in 0..512 {
+        if !write_raw_frame_lossy(&mut stalled, &request) {
+            break;
+        }
+        sent += 1;
     }
+    assert!(sent > 0, "the flood never reached the host");
 
-    // The replies fill the 2-frame queue while the writer parks against
-    // the unreading peer; the next reply cannot be queued and the
-    // connection is torn down. Drain raw bytes (a frame-aware read would
-    // desync on a frame that straddles a poll timeout — read_exact
-    // discards partial progress on WouldBlock): the assertion is that
-    // the host ENDS the connection, as EOF, as ECONNRESET (the peer had
-    // unread inbound data at close time), or as EPIPE — and that a
-    // best-effort slow_consumer explanation rode along when the kernel
-    // buffer still had room for it.
+    // The flood parks the writer mid-reply; the next reply cannot be
+    // queued and the connection is torn down (socket and all — the
+    // parked writer must be unblocked, not left wedged). Drain raw
+    // bytes: the assertion is that the host ENDS the connection, as
+    // EOF, as ECONNRESET (the peer had unread inbound data at close
+    // time), or as EPIPE.
     stalled
         .set_read_timeout(Some(Duration::from_millis(50)))
         .unwrap();
