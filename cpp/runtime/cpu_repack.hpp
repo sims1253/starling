@@ -14,17 +14,23 @@
 // would read the interleaved bytes as plain rows and compute garbage. So
 // the decision is made from observed usage, never from names:
 //
-//   * prepare_graph() runs before every CPU graph is allocated. A weight is
+//   * prepare_graph() runs before every graph whose primary backend is the
+//     CPU is allocated, whichever allocator then runs it (gallocr, or the
+//     sched route imatrix collection takes); GPU backends never attach
+//     weights, so nothing there is ever repacked. A weight is
 //     repacked the first time a graph uses it, and only if every use in that
 //     graph is a supported MUL_MAT; any other use marks it never-repack.
 //   * A graph that uses an already-repacked weight any other way throws
-//     (std::runtime_error) instead of computing wrong results.
+//     (std::runtime_error) instead of computing wrong results, and a host
+//     readback of a repacked weight (ggml_backend_tensor_get/copy) aborts
+//     with the same diagnosis instead of calling a null hook.
 //
 // Repacking is idempotent per tensor and survives release/re-realize cycles
 // of the loader (the host bytes stay repacked, so re-attached tensors are
 // re-pointed at the alias immediately).
 //
-// Gate: STARLING_GGML_CPU_REPACK=1 enables, =0 disables. Default: enabled on
+// Gate: STARLING_GGML_CPU_REPACK=1/true/on/yes enables, =0/false/off/no
+// disables (anything else warns and keeps the default). Default: enabled on
 // Android (phones are CPU-only and gain the most), disabled elsewhere.
 #pragma once
 

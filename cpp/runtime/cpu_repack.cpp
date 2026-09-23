@@ -10,8 +10,9 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 
-#include <cstdio>
+#include <cstdio>  // std::fprintf (unrecognized gate value)
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -45,16 +46,38 @@ State& state() {
     return s;
 }
 
-bool env_enabled() {
-    if (const char* v = std::getenv("STARLING_GGML_CPU_REPACK")) {
-        if (v[0] == '1') return true;
-        if (v[0] == '0') return false;
-    }
+bool platform_default() {
 #if defined(__ANDROID__)
     return true;
 #else
     return false;
 #endif
+}
+
+bool env_enabled() {
+    const char* v = std::getenv("STARLING_GGML_CPU_REPACK");
+    if (!v || !*v) return platform_default();
+    std::string value(v);
+    for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (value == "1" || value == "true" || value == "on" || value == "yes") return true;
+    if (value == "0" || value == "false" || value == "off" || value == "no") return false;
+    // The gate latches on first use; a typo would otherwise be invisible.
+    std::fprintf(stderr, "[starling] STARLING_GGML_CPU_REPACK=%s not understood (use 1 or 0); keeping the default (%s)\n",
+                 v, platform_default() ? "on" : "off");
+    return platform_default();
+}
+
+// A repacked weight cannot be read back as plain rows. ggml's own
+// CPU_REPACK buffers leave these hooks null, which ggml_backend_tensor_get
+// would call unconditionally; fail with the diagnosis instead.
+void alias_get_tensor(ggml_backend_buffer_t, const ggml_tensor* tensor, void*, size_t, size_t) {
+    GGML_ABORT("cpu_repack: weight '%s' is repacked for MUL_MAT and cannot be read back to the host; "
+               "set STARLING_GGML_CPU_REPACK=0", tensor->name);
+}
+
+bool alias_cpy_tensor(ggml_backend_buffer_t, const ggml_tensor* src, ggml_tensor*) {
+    GGML_ABORT("cpu_repack: weight '%s' is repacked for MUL_MAT and cannot be copied as plain rows; "
+               "set STARLING_GGML_CPU_REPACK=0", src->name);
 }
 
 ggml_backend_buffer_type_t repack_buffer_type() {
@@ -77,6 +100,11 @@ ggml_backend_buffer_type_t repack_buffer_type() {
 // init/set hooks. Mirrors ggml_backend_cpu_repack_buffer_type_alloc_buffer,
 // which derives a repack buffer from a plain CPU buffer the same way; the
 // hooks are taken from a probe buffer of the real type rather than copied.
+//
+// Safety of borrowing the probe's hooks after freeing it: at the pinned ggml
+// (repack.cpp) init_tensor and set_tensor are static functions that only read
+// the tensor (type, shape, ->extra) and never buffer->context, so they do not
+// depend on the probe's lifetime. Re-check when bumping the ggml pin.
 ggml_backend_buffer_t make_alias(ggml_backend_buffer_t plain) {
     ggml_backend_buffer_type_t buft = repack_buffer_type();
     if (!buft) return nullptr;
@@ -88,8 +116,8 @@ ggml_backend_buffer_t make_alias(ggml_backend_buffer_t plain) {
         alias->buft = buft;
         alias->iface.init_tensor = probe->iface.init_tensor;
         alias->iface.set_tensor = probe->iface.set_tensor;
-        alias->iface.get_tensor = probe->iface.get_tensor;
-        alias->iface.cpy_tensor = probe->iface.cpy_tensor;
+        alias->iface.get_tensor = alias_get_tensor;
+        alias->iface.cpy_tensor = alias_cpy_tensor;
     }
     ggml_backend_buffer_free(probe);
     return alias;
@@ -114,6 +142,8 @@ bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* we
     if (ggml_n_dims(weight) != 2) return false;
     const ggml_tensor* x = node->src[1];
     if (!x || x->type != GGML_TYPE_F32 || x->ne[3] != 1) return false;
+    // forward_mul_mat asserts both separately (an F32 result can still be a
+    // permuted view), so both are checked here too.
     if (node->type != GGML_TYPE_F32 || node->nb[0] != sizeof(float)) return false;
     return true;
 }
@@ -132,6 +162,8 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
     // Dispatches to the CPU_REPACK set_tensor: rewrites w->data in place.
     ggml_backend_tensor_set(w, original.data(), 0, n);
     s.repacked[w] = w->extra;
+    // In place: CPU_REPACK's get_alloc_size is ggml_nbytes, so the repacked
+    // footprint is exactly the plain one.
     s.repacked_bytes += static_cast<int64_t>(n);
     return true;
 }
@@ -173,7 +205,8 @@ void detach(ggml_backend_buffer* buffer) {
         if (r.plain != buffer) continue;
         // The loader is about to reset every tensor's buffer; the repack
         // decision itself stays in `repacked` (the bytes are still repacked).
-        for (auto& [t, traits] : s.repacked) {
+        for (auto& entry : s.repacked) {
+            ggml_tensor* t = entry.first;
             if (t->buffer == r.alias) t->buffer = r.plain;
         }
         ggml_backend_buffer_free(r.alias);

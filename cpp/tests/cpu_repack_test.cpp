@@ -74,6 +74,13 @@ void free_weights(Weights& w) {
     ggml_free(w.ctx);
 }
 
+// Frees on every exit path, so a throwing check cannot leak bookkeeping
+// into later tests (or the final "forget() drops all bookkeeping" check).
+struct WeightsGuard {
+    Weights& w;
+    ~WeightsGuard() { free_weights(w); }
+};
+
 std::vector<float> random_input(size_t n, uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -133,6 +140,7 @@ void test_type(ggml_backend_t backend, ggml_type type) {
     const int K = 512, N = 64;
     const std::string tag = ggml_type_name(type);
     Weights w = make_weights(type, K, N, 7);
+    WeightsGuard guard{w};
     const auto x_batch = random_input((size_t)K * 37, 11);  // 37 rows: not a multiple of 4/8
     const auto x_single = random_input((size_t)K, 13);
 
@@ -171,7 +179,6 @@ void test_type(ggml_backend_t backend, ggml_type type) {
         }
         check(threw, tag + " view of a repacked weight throws");
     }
-    free_weights(w);
 }
 
 // A weight whose first graph reads it with get_rows is never repacked, so
@@ -179,6 +186,7 @@ void test_type(ggml_backend_t backend, ggml_type type) {
 void test_non_matmul_use_blocks_repacking(ggml_backend_t backend) {
     const int K = 512, N = 64;
     Weights w = make_weights(GGML_TYPE_Q4_K, K, N, 21);
+    WeightsGuard guard{w};
     const auto x = random_input((size_t)K * 16, 23);
     const auto ref = mul_mat(backend, w.w, x, K, 16);
     const int32_t ids[3] = {0, 5, 63};
@@ -199,14 +207,17 @@ void test_non_matmul_use_blocks_repacking(ggml_backend_t backend) {
     check(repack::stats().tensors == before, "a get_rows weight is never repacked");
     check(max_rel_diff(rows_ref, rows) == 0.0, "get_rows reads the untouched layout");
     check(max_rel_diff(ref, got) == 0.0, "its later MUL_MAT stays on the plain path");
-    free_weights(w);
 }
 
 }  // namespace
 
 int main() {
     // Opt in before the first enabled() query (the gate latches per process).
+#ifdef _WIN32
+    _putenv_s("STARLING_GGML_CPU_REPACK", "1");
+#else
     setenv("STARLING_GGML_CPU_REPACK", "1", 1);
+#endif
     check(repack::enabled(), "STARLING_GGML_CPU_REPACK=1 enables repacking");
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, 4);

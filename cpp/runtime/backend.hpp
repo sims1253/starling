@@ -85,7 +85,10 @@ public:
     // no_alloc=true context (register host inputs via add_graph_input; reference
     // loader weights directly as leaves), Backend allocates it on the persistent
     // gallocr, pushes the registered inputs, runs it, and reads the output
-    // tensor's f32 contents into `out`. Returns true on success.
+    // tensor's f32 contents into `out`. Returns true on success. Throws
+    // std::runtime_error (from cpu_repack::prepare_graph) when a CPU graph
+    // reads a repacked weight other than through MUL_MAT; the C API entry
+    // points turn that into an error result like any other exception.
     bool compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                  std::vector<float>& out);
 

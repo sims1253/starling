@@ -42,6 +42,14 @@ on:
         type: boolean
         default: false
 
+# Build/test only: no job needs more than a read-only token.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-starling-serve-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Real arm64 hardware for the NEON kernels phones run: the dotprod build is
   # the standard Android APK's target (8x4 repack kernels), the +i8mm build
@@ -180,12 +188,24 @@ jobs:
 
       # In-place CPU weight repacking (cpp/runtime/cpu_repack.hpp): the unit
       # test compares repacked vs plain MUL_MAT per type and pins the
-      # usage guard; the engine regression then runs with repacking forced
-      # on through the real Backend/ReplayGraph hooks.
+      # usage guard; the engine regressions then run with repacking forced
+      # on through the real Backend/ReplayGraph hooks. The quantized Parakeet
+      # test repacks real weights; the others (F32/F16 synthetic weights)
+      # pin that the eligibility scan never trips on their graph shapes
+      # (views, get_rows, conv, replayed graphs).
       - name: CPU weight repacking
+        env:
+          STARLING_GGML_CPU_REPACK: '1'
         run: |
           ./build/cpu_repack_test
-          STARLING_GGML_CPU_REPACK=1 ./build/parakeet_compact_engine_test
+          ./build/parakeet_compact_engine_test
+          ./build/granite_stage_test
+          ./build/model_lifetime_test
+          ./build/replay_graph_support_test
+          ./build/granite_trace_test
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
+            if [ -x "build/$t" ]; then "./build/$t"; fi
+          done
 
       - name: Model lifetime and quantized decoding sanitizers
         env:

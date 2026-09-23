@@ -700,10 +700,11 @@ bool ReplayGraph::alloc_internal() {
     // assert. (A fully-supported graph still takes the imatrix sched route
     // below — that configuration is unchanged.)
     need_sched_ = ImatrixCollector::enabled();
-    // Captured CPU graphs replay without rebuilding, so this is the one
-    // point where their weights can be opted into the repacked kernels.
-    if (!backend_.is_gpu()) cpu_repack::prepare_graph(gf_);
-    if (backend_.is_gpu()) {
+    if (!backend_.is_gpu()) {
+        // Captured CPU graphs replay without rebuilding, so this is the one
+        // point where their weights can be opted into the repacked kernels.
+        cpu_repack::prepare_graph(gf_);
+    } else {
         ggml_backend_t backend = backend_.handle();
         check_no_unsupported_graph_nodes(
             gf_, [backend](const ggml_tensor* n) {
