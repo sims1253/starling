@@ -5,15 +5,17 @@
 //      the plain layout (batched GEMM rows and the M=1 GEMV path).
 //   2. A weight read by any other op (get_rows) is never repacked, and stays
 //      correct for both uses.
-//   3. A graph that reads an already-repacked weight through a view throws
-//      instead of computing garbage.
+//   3. A graph that reads an already-repacked weight through a view, or
+//      multiplies it with a transposed activation, throws instead of
+//      computing garbage.
 //   4. detach/attach (loader release + re-realize) keeps repacked weights
 //      working; forget drops the bookkeeping.
 //
-// Whether a type repacks depends on the CPU's kernels (x86 AVX2: Q4_K;
-// arm64 dotprod/i8mm: Q4_K, Q6_K, Q8_0). Correctness is checked either way;
-// STARLING_REPACK_TEST_EXPECT=Q4_K,Q6_K,... additionally requires those types
-// to have been repacked (set by the arm64 CI job).
+// Whether a type repacks depends on the CPU's kernels (x86 AVX2: q4_0,
+// q4_K; arm64 dotprod/i8mm: q4_0, q4_K, q6_K, q8_0). Correctness is checked
+// either way; STARLING_REPACK_TEST_EXPECT=q4_0,q4_K,... (ggml_type_name
+// spelling) additionally requires those types to have been repacked (set
+// by the CI jobs).
 #include "runtime/cpu_repack.hpp"
 
 #include "ggml-alloc.h"
@@ -22,6 +24,8 @@
 #include "ggml.h"
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -192,6 +196,20 @@ void test_type(ggml_backend_t backend, ggml_type type) {
             threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
         }
         check(threw, tag + " view of a repacked weight throws");
+
+        // The repacked kernel reads activation rows as contiguous floats; a
+        // transposed activation must be refused too.
+        threw = false;
+        try {
+            run(backend, [&](ggml_context* ctx, auto& inputs) {
+                ggml_tensor* xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 37, K);
+                inputs.emplace_back(xt, x_batch.data());
+                return ggml_mul_mat(ctx, w.w, ggml_transpose(ctx, xt));
+            });
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
+        }
+        check(threw, tag + " transposed activation with a repacked weight throws");
     }
 }
 

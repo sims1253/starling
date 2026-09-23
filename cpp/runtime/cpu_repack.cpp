@@ -62,7 +62,7 @@ bool env_enabled() {
     if (value == "1" || value == "true" || value == "on" || value == "yes") return true;
     if (value == "0" || value == "false" || value == "off" || value == "no") return false;
     // The gate latches on first use; a typo would otherwise be invisible.
-    std::fprintf(stderr, "[starling] STARLING_GGML_CPU_REPACK=%s not understood (use 1 or 0); keeping the default (%s)\n",
+    std::fprintf(stderr, "[starling] STARLING_GGML_CPU_REPACK=%s not understood (use 1/true/on/yes or 0/false/off/no); keeping the default (%s)\n",
                  v, platform_default() ? "on" : "off");
     return platform_default();
 }
@@ -144,9 +144,14 @@ bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* we
     if (ggml_n_dims(weight) != 2) return false;
     const ggml_tensor* x = node->src[1];
     if (!x || x->type != GGML_TYPE_F32 || x->ne[3] != 1) return false;
+    // The kernel quantizes each activation row as ne10 consecutive floats
+    // (any row/plane stride is fine), so a transposed activation would be
+    // read wrong without an assert.
+    if (x->nb[0] != sizeof(float)) return false;
     // forward_mul_mat asserts both separately (an F32 result can still be a
-    // permuted view), so both are checked here too.
+    // permuted view), so both are checked here too, with its stride order.
     if (node->type != GGML_TYPE_F32 || node->nb[0] != sizeof(float)) return false;
+    if (node->nb[0] > node->nb[1] || node->nb[1] > node->nb[2]) return false;
     return true;
 }
 
