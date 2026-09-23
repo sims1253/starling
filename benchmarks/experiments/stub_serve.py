@@ -1,7 +1,7 @@
 """Deterministic stub server for the experiment-runner TESTS only.
 
 A minimal starling-serve HTTP double: GET /health reports loaded, POST
-/inference sleeps STUB_DELAY_MS and returns a fixed transcript. It exists
+/v1/audio/transcriptions sleeps STUB_DELAY_MS and returns a fixed transcript. It exists
 to exercise the runner's protocol (fresh processes, cold/warm split,
 timeouts, records) in CI without models or GPUs. It is NOT benchmark
 evidence: the demo command refuses to use it, and any record produced
@@ -38,7 +38,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/inference":
+        if self.path != "/v1/audio/transcriptions":
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", "0"))

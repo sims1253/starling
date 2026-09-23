@@ -252,7 +252,7 @@ class ArmServer:
                 f"\r\n--{boundary}--\r\n".encode("ascii"),
             ])
             req = urllib.request.Request(
-                f"{self.base}/inference",
+                f"{self.base}/v1/audio/transcriptions",
                 data=body,
                 method="POST",
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
