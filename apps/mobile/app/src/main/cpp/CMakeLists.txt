@@ -29,6 +29,17 @@ set(STARLING_GGML_TESTS OFF CACHE BOOL "" FORCE)
 set(STARLING_QUANTIZE OFF CACHE BOOL "" FORCE)
 set(STARLING_SERVE OFF CACHE BOOL "" FORCE)
 
+# Without GGML_NATIVE, ggml's arm64 baseline is plain armv8-a: no dot-product
+# or FP16 vector kernels, several times slower for quantized models. Every
+# mainstream arm64 phone core since 2018 has both; NativeSupport.kt refuses
+# the on-device engine on older CPUs before this library is ever loaded.
+# Gradle passes STARLING_ANDROID_ARM_ARCH (see app/build.gradle.kts), e.g.
+# the +i8mm variant whose 2-row SMMLA kernels speed up Q4_K/Q6_K/Q8_0.
+set(STARLING_ANDROID_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "arm64 -march for ggml")
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(GGML_CPU_ARM_ARCH "${STARLING_ANDROID_ARM_ARCH}" CACHE STRING "" FORCE)
+endif()
+
 add_subdirectory(${STARLING_NATIVE_DIR} starling_native)
 
 add_library(starling_jni SHARED starling_jni.cpp)
