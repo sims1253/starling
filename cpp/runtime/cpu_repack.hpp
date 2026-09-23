@@ -65,7 +65,8 @@ void forget(const void* base, size_t size);
 // Throws std::runtime_error when a repacked weight has an unsupported use.
 void prepare_graph(ggml_cgraph* gf);
 
-// Observability (tests, logs): weights and bytes currently repacked.
+// Observability (tests, logs): repack decisions, including detached weights
+// whose interleaved bytes will be re-pointed at the alias on re-attach.
 struct Stats {
     int64_t tensors = 0;
     int64_t bytes = 0;

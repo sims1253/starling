@@ -11,6 +11,7 @@
 #include "ggml-impl.h"
 
 #include <cstdio>  // std::fprintf (unrecognized gate value)
+#include <cstdint>
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
@@ -128,12 +129,19 @@ ggml_backend_buffer_t make_alias(ggml_backend_buffer_t plain) {
     return alias;
 }
 
+bool tensor_within(const ggml_tensor* t, const char* base, size_t size) {
+    if (!t || !t->data || !base) return false;
+    const auto p = reinterpret_cast<std::uintptr_t>(t->data);
+    const auto b = reinterpret_cast<std::uintptr_t>(base);
+    if (p < b || p - b > size) return false;
+    return ggml_nbytes(t) <= size - (p - b);
+}
+
 Region* region_of(State& s, const ggml_tensor* t) {
-    if (!t || !t->buffer || !t->data) return nullptr;
-    const char* p = static_cast<const char*>(t->data);
+    if (!t || !t->buffer) return nullptr;
     for (Region& r : s.regions) {
-        if ((t->buffer == r.plain || t->buffer == r.alias) && p >= r.base &&
-            p + ggml_nbytes(t) <= r.base + r.size) {
+        if ((t->buffer == r.plain || t->buffer == r.alias) &&
+            tensor_within(t, r.base, r.size)) {
             return &r;
         }
     }
@@ -232,8 +240,7 @@ void attach(ggml_backend_buffer* buffer) {
     }
     // Bytes repacked before an earlier release are still repacked.
     for (auto& [t, traits] : s.repacked) {
-        const char* p = static_cast<const char*>(t->data);
-        if (t->buffer == buffer && p >= r.base && p + ggml_nbytes(t) <= r.base + r.size) {
+        if (t->buffer == buffer && tensor_within(t, r.base, r.size)) {
             t->buffer = r.alias;
             t->extra = traits;
         }
@@ -267,11 +274,11 @@ void forget(const void* base, size_t size) {
     if (!base) return;
     State& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
-    const char* lo = static_cast<const char*>(base);
-    const char* hi = lo + size;
+    const auto lo = reinterpret_cast<std::uintptr_t>(base);
     auto inside = [&](const ggml_tensor* t) {
-        const char* p = static_cast<const char*>(t->data);
-        return p >= lo && p < hi;
+        if (!t->data) return false;
+        const auto p = reinterpret_cast<std::uintptr_t>(t->data);
+        return p >= lo && p - lo < size;
     };
     for (auto it = s.repacked.begin(); it != s.repacked.end();) {
         if (inside(it->first)) {
