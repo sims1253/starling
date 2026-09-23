@@ -94,7 +94,13 @@ mod embedder_recipe {
 
     impl XdgRedirect {
         fn to(dir: &std::path::Path) -> Self {
-            let _env_lock = ENV_LOCK.lock().expect("env lock not poisoned");
+            // Recover from poisoning rather than propagate it: the lock
+            // orders set_var/remove_var between tests, it guards no data
+            // invariant, and a panic in one test body must not cascade
+            // into every later env-dependent test's lock acquisition.
+            let _env_lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let prior = std::env::var_os("XDG_DATA_HOME");
             std::env::set_var("XDG_DATA_HOME", dir);
             Self { prior, _env_lock }
@@ -140,14 +146,18 @@ mod embedder_recipe {
         let root: PathBuf = xdg.path().join("starling-gpui");
 
         // Construct + identify: the durable store, not the fallback.
-        // The root gate runs BEFORE any commit: if the redirect were
-        // ever broken, the freshly-created redirected root would not
-        // exist and the test aborts before a take could be written
-        // anywhere but under the tempdir.
+        // The root gate runs BEFORE any commit, and it discriminates on
+        // its own: `root` is a path inside a freshly-made tempdir that
+        // nothing but a working redirect would create, so a broken one
+        // fails here — before a take could be written anywhere but
+        // under the tempdir. (No `starts_with` prefix check: `root` is
+        // derived from `xdg.path()` three lines up, so such a clause
+        // could never fail and would only read like a second checked
+        // invariant.)
         let store = default_capture_store();
         assert_eq!(store.describe(), "storage-v2", "the default root opened");
         assert!(
-            root.is_dir() && root.starts_with(xdg.path()),
+            root.is_dir(),
             "the no-argument contract resolved the redirected root {}",
             root.display()
         );
