@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -164,9 +165,9 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
         return false;
     }
     const size_t n = ggml_nbytes(w);
-    std::vector<uint8_t> original;
+    std::unique_ptr<uint8_t[]> original;
     try {
-        original.resize(n);
+        original.reset(new uint8_t[n]);
         // Publish the decision before the in-place rewrite: a map allocation
         // failure must also leave the original bytes and buffer intact.
         s.repacked.emplace(w, w->extra);
@@ -177,9 +178,9 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
         w->extra = nullptr;
         throw;
     }
-    std::memcpy(original.data(), w->data, n);
+    std::memcpy(original.get(), w->data, n);
     // Dispatches to the CPU_REPACK set_tensor: rewrites w->data in place.
-    ggml_backend_tensor_set(w, original.data(), 0, n);
+    ggml_backend_tensor_set(w, original.get(), 0, n);
     // In place: CPU_REPACK's get_alloc_size is ggml_nbytes, so the repacked
     // footprint is exactly the plain one.
     s.repacked_bytes += static_cast<int64_t>(n);
