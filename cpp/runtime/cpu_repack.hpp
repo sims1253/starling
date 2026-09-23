@@ -4,7 +4,7 @@
 //
 // On CPU, ModelLoader borrows the GGUF weights zero-copy in a plain CPU
 // buffer, so ggml's repacked kernels never engage. This module opts weights
-// into them without extra memory: the weight bytes are rewritten in place
+// into them without extra persistent weight memory: bytes are rewritten in place
 // and the tensor is re-pointed at an alias buffer over the same memory that
 // carries the CPU_REPACK buffer type, which is what ggml's CPU backend
 // dispatches on.

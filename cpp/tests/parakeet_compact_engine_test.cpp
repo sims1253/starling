@@ -3,6 +3,7 @@
 #include "parakeet/prediction.hpp"
 #include "parakeet/joint.hpp"
 #include "runtime/backend.hpp"
+#include "runtime/cpu_repack.hpp"
 #include "runtime/graph.hpp"
 #include "ggml.h"
 #include "gguf.h"
@@ -224,6 +225,9 @@ void exercise(int rows) {
         };
         check(token_argmax == winner(0, VOCAB + 1), "token argmax");
         check(duration_argmax == winner(VOCAB + 1, VOCAB + 1 + DURATIONS), "duration argmax");
+    }
+    if (cpu_repack::enabled()) {
+        check(cpu_repack::stats().tensors > 0, "forced-on Parakeet run must repack a weight");
     }
     std::printf("rows=%d: max state error %.7f, max logit error %.7f\n", rows, state_error, logit_error);
 }
