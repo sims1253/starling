@@ -143,6 +143,7 @@ Region* region_of(State& s, const ggml_tensor* t) {
 bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* weight) {
     if (node->op != GGML_OP_MUL_MAT || src_index != 0 || node->src[0] != weight) return false;
     if (ggml_n_dims(weight) != 2) return false;
+    if (!ggml_is_contiguous(weight)) return false;
     const ggml_tensor* x = node->src[1];
     if (!x || x->type != GGML_TYPE_F32 || x->ne[3] != 1) return false;
     // The kernel quantizes each activation row as ne10 consecutive floats

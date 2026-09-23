@@ -194,12 +194,11 @@ jobs:
       - name: CPU weight repacking
         env:
           STARLING_GGML_CPU_REPACK: '1'
-          STARLING_EXPECT_ENGINE_REPACK: '1'
           # The AVX2 repack kernels at the pinned ggml (q5_K/q6_K/q8_0 have none).
           STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,iq4_nl'
         run: |
           ./build/cpu_repack_test
-          ./build/parakeet_compact_engine_test
+          STARLING_EXPECT_ENGINE_REPACK=1 ./build/parakeet_compact_engine_test
           ./build/granite_stage_test
           ./build/model_lifetime_test
           ./build/replay_graph_support_test
