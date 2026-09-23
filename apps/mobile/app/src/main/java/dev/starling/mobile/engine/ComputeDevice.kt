@@ -42,13 +42,17 @@ interface NativeCallPolicy {
  * would then crash again on every dictation. While the GPU is in use, every
  * native call runs with [markerFile] present; a crash leaves it behind, and
  * the next process start finds it, switches the preference back to CPU, and
- * reports it through [recoveredFromGpuCrash].
+ * reports it through [recoveredFromGpuCrash]. The marker has to bracket each
+ * call rather than the whole GPU session: a marker that stayed for the
+ * process lifetime would also survive ordinary deaths (low-memory kills, the
+ * user swiping the app away) and wrongly disable the GPU on the next start.
  */
 class ComputeDeviceSelector(
     private val gpuBuild: Boolean,
     private val preferences: DevicePreferenceStore,
     private val markerFile: File,
     private val setEnv: (name: String, value: String) -> Unit,
+    private val warn: (String) -> Unit = {},
 ) : NativeCallPolicy {
     @Volatile
     var applied: ComputeDevice? = null
@@ -91,6 +95,7 @@ class ComputeDeviceSelector(
         // Written before the call and removed after it returns or throws; a
         // process that dies inside the call leaves it for the next start.
         runCatching { markerFile.writeText("native GPU call in progress\n") }
+            .onFailure { warn("cannot write the GPU crash marker (${it.message}); a driver crash here would not fall back to the CPU") }
         try {
             return block()
         } finally {

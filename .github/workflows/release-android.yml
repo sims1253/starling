@@ -174,8 +174,11 @@ jobs:
               echo "::error::variant '${suffix:-standard}' was not built for $arch"
               exit 1
             fi
+            # Listing captured first: `unzip -l | grep -q` under pipefail can
+            # report a match as a miss when grep exits early (SIGPIPE).
+            listing="$(unzip -l "$built")"
             has_vulkan=false
-            unzip -l "$built" | grep -q 'lib/arm64-v8a/libggml-vulkan.so' && has_vulkan=true
+            if grep -q 'lib/arm64-v8a/libggml-vulkan.so' <<< "$listing"; then has_vulkan=true; fi
             if [ "$has_vulkan" != "$vulkan" ]; then
               echo "::error::variant '${suffix:-standard}': Vulkan backend present=$has_vulkan, expected $vulkan"
               exit 1

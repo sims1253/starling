@@ -5,6 +5,7 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.system.Os
+import android.util.Log
 import dev.starling.mobile.engine.ComputeDevice
 import dev.starling.mobile.engine.ComputeDeviceSelector
 import dev.starling.mobile.engine.DevicePreferenceStore
@@ -44,6 +45,7 @@ class StarlingApplication : Application() {
             preferences = DevicePreferences(this),
             markerFile = File(filesDir, "gpu_call.marker"),
             setEnv = { name, value -> Os.setenv(name, value, true) },
+            warn = { message -> Log.w("StarlingGpu", message) },
         )
         onDeviceEngine = OnDeviceEngine(
             File(filesDir, "models"),
@@ -106,8 +108,9 @@ class StarlingApplication : Application() {
         private val preferences = context.getSharedPreferences("engine_settings", Context.MODE_PRIVATE)
 
         override fun get(): ComputeDevice =
-            runCatching { ComputeDevice.valueOf(preferences.getString(KEY_DEVICE, null) ?: "") }
-                .getOrDefault(ComputeDevice.CPU)
+            preferences.getString(KEY_DEVICE, null)
+                ?.let { name -> ComputeDevice.entries.firstOrNull { it.name == name } }
+                ?: ComputeDevice.CPU
 
         override fun set(device: ComputeDevice) {
             // commit, not apply: the crash guard's fallback must be durable

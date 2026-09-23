@@ -301,12 +301,13 @@ class OnDeviceEngine(
         ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
         val started = System.nanoTime()
         val text = nativePolicy.guard { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
-        recordRun(samples.size, started)
         if (text == null) {
             return OnDeviceStreamSession.WindowResult.Failed(
                 "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
             )
         }
+        // Only successful runs: a failure partway would read as a fast run.
+        recordRun(samples.size, started)
         OnDeviceStreamSession.WindowResult.Text(text)
     }
 

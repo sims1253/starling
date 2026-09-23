@@ -128,7 +128,10 @@ jobs:
           ./gradlew --no-daemon assembleRelease
           -PstarlingArmArch=armv8.2-a+dotprod+fp16+i8mm -PstarlingVulkan=true
       - name: Check the Vulkan backend is packaged
-        run: unzip -l apps/mobile/app/build/outputs/apk/release/app-release-unsigned.apk | grep 'lib/arm64-v8a/libggml-vulkan.so'
+        run: |
+          listing="$(unzip -l apps/mobile/app/build/outputs/apk/release/app-release-unsigned.apk)"
+          grep -q 'lib/arm64-v8a/libggml-vulkan.so' <<< "$listing" \
+            || { echo '::error::libggml-vulkan.so is missing from the i8mm + Vulkan release APK'; exit 1; }
 
   ios:
     runs-on: macos-latest

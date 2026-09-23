@@ -18,8 +18,16 @@ class ComputeDeviceSelectorTest {
     private val env = mutableMapOf<String, String>()
     private fun marker(): File = File(Files.createTempDirectory("starling-gpu").toFile(), "gpu_call.marker")
 
+    private val warnings = mutableListOf<String>()
+
     private fun selector(gpuBuild: Boolean, store: DevicePreferenceStore, marker: File) =
-        ComputeDeviceSelector(gpuBuild, store, marker) { name, value -> env[name] = value }
+        ComputeDeviceSelector(
+            gpuBuild,
+            store,
+            marker,
+            setEnv = { name, value -> env[name] = value },
+            warn = { warnings += it },
+        )
 
     @Test
     fun theDeviceIsAlwaysSetExplicitlySoAGpuIsNeverAutoPicked() {
@@ -89,6 +97,20 @@ class ComputeDeviceSelectorTest {
         runCatching { selector.guard { throw IllegalStateException("load failed") } }
 
         assertFalse(marker.exists())
+    }
+
+    @Test
+    fun anUnwritableMarkerIsReportedInsteadOfSilentlyDroppingTheGuard() {
+        val marker = marker()
+        val selector = selector(gpuBuild = true, store = MemoryStore(ComputeDevice.GPU), marker = marker)
+        selector.beforeFirstLoad()
+        // A directory where the marker file should be: the write fails.
+        marker.mkdirs()
+
+        val result = selector.guard { 42 }
+
+        assertEquals(42, result)
+        assertTrue(warnings.single().contains("GPU crash marker"))
     }
 
     @Test
