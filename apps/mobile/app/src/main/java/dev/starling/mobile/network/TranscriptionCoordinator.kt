@@ -54,12 +54,13 @@ class TranscriptionCoordinator(
     }
 
     /**
-     * Opens a live `WS /stream` session for a capture that is about to
-     * start, when the configuration supports one: the Starling protocol on a
-     * remote server whose endpoint passes the trusted-host policy. Returns
-     * null otherwise (OpenAI-shaped endpoints, the on-device engine, or a
-     * rejected endpoint) and the caller records exactly as before, without
-     * streaming.
+     * Opens a live session for a capture that is about to start, when the
+     * configuration supports one: on-device live transcription when the
+     * on-device engine is selected and a model is imported, or a `WS /stream`
+     * session for the Starling protocol on a remote server whose endpoint
+     * passes the trusted-host policy. Returns null otherwise (OpenAI-shaped
+     * endpoints, no imported model, or a rejected endpoint) and the caller
+     * records exactly as before, without streaming.
      *
      * [onEvent] is invoked on the main thread: [StreamEvent.Live] once audio
      * is accepted, growing [StreamEvent.Partial] transcripts while
@@ -73,11 +74,11 @@ class TranscriptionCoordinator(
         config: BackendConfig = settings.load(),
         onEvent: (StreamEvent) -> Unit = {},
     ): StreamSession? {
+        val post: (StreamEvent) -> Unit = { event -> mainHandler.post { onEvent(event) } }
+        if (config.engine == TranscriptionEngine.ON_DEVICE) return onDevice.beginStreaming(post)
         if (!streamingEligible(config)) return null
         val url = streamUrl(config.endpoint, config.allowTrustedLanHttp) ?: return null
-        return streamClient.connect(url) { event ->
-            mainHandler.post { onEvent(event) }
-        }
+        return streamClient.connect(url, post)
     }
 
     /**
@@ -165,9 +166,9 @@ class TranscriptionCoordinator(
 
     companion object {
         /**
-         * Only the Starling protocol's `WS /stream` is streamed. OpenAI-shaped
-         * endpoints have no streaming route, and the on-device engine
-         * transcribes from the file by design.
+         * Whether a remote configuration streams over `WS /stream`: only the
+         * Starling protocol has that route; OpenAI-shaped endpoints do not.
+         * The on-device engine streams locally instead (see [beginStreaming]).
          */
         internal fun streamingEligible(config: BackendConfig): Boolean =
             config.engine == TranscriptionEngine.REMOTE && config.protocol == BackendProtocol.STARLING

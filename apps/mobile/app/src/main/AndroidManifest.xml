@@ -23,6 +23,22 @@
             </intent-filter>
         </activity>
 
+        <!-- Speech input for apps that call startActivityForResult with
+             RecognizerIntent.ACTION_RECOGNIZE_SPEECH (E22). Handles its own
+             rotation so a configuration change never restarts the capture. -->
+        <activity
+            android:name=".RecognizeSpeechActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="@string/recognition_service_name"
+            android:theme="@style/Theme.StarlingMobile.Dialog">
+            <intent-filter>
+                <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".VoiceInputService"
             android:exported="true"

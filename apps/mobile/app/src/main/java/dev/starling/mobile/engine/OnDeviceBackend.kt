@@ -2,6 +2,8 @@ package dev.starling.mobile.engine
 
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.InferenceResult
+import dev.starling.mobile.network.StreamEvent
+import dev.starling.mobile.network.StreamSession
 import java.io.File
 
 /**
@@ -18,4 +20,13 @@ class OnDeviceBackend(private val engine: OnDeviceEngine) {
                 false,
             )
         }
+
+    /**
+     * Starts live on-device transcription for a capture that is about to
+     * begin, or null when no model is imported (the recording then goes
+     * through [transcribe] after Stop, which reports the missing model).
+     * [events] is invoked on the session's worker thread.
+     */
+    fun beginStreaming(events: (StreamEvent) -> Unit): StreamSession? =
+        if (engine.hasModel()) OnDeviceStreamSession(engine, events).start() else null
 }

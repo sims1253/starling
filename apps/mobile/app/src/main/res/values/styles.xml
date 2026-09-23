@@ -11,4 +11,10 @@
         <item name="android:navigationBarColor">@color/starling_surface</item>
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
+
+    <!-- The RECOGNIZE_SPEECH popup floats over the calling app. -->
+    <style name="Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Light.Dialog.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/starling_accent</item>
+    </style>
 </resources>
