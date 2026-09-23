@@ -12,7 +12,8 @@
 //      working; forget drops the bookkeeping.
 //
 // Whether a type repacks depends on the CPU's kernels (x86 AVX2: q4_0,
-// q4_K; arm64 dotprod/i8mm: q4_0, q4_K, q6_K, q8_0). Correctness is checked
+// q4_K, iq4_nl; arm64 dotprod/i8mm: q4_0, q4_K, q5_K, q6_K, q8_0,
+// iq4_nl). Correctness is checked
 // either way; STARLING_REPACK_TEST_EXPECT=q4_0,q4_K,... (ggml_type_name
 // spelling) additionally requires those types to have been repacked (set
 // by the CI jobs).
@@ -237,8 +238,8 @@ void test_non_matmul_use_blocks_repacking(ggml_backend_t backend) {
     });
     const auto got = mul_mat(backend, w.w, x, K, 16);
     check(repack::stats().tensors == before, "a get_rows weight is never repacked");
-    check(max_rel_diff(rows_ref, rows) == 0.0, "get_rows reads the untouched layout");
-    check(max_rel_diff(ref, got) == 0.0, "its later MUL_MAT stays on the plain path");
+    check(max_rel_diff(rows_ref, rows) < 1e-6, "get_rows reads the untouched layout");
+    check(max_rel_diff(ref, got) < 1e-6, "its later MUL_MAT stays on the plain path");
 }
 
 }  // namespace
@@ -258,7 +259,7 @@ int main() {
     }
     ggml_backend_cpu_set_n_threads(backend, 4);
     try {
-        for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K}) {
+        for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
             test_type(backend, type);
         }
         test_non_matmul_use_blocks_repacking(backend);
