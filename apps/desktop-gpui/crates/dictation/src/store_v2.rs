@@ -716,7 +716,14 @@ impl StoreV2 {
                 "audio for capture {id} already exists; refusing to overwrite"
             )));
         }
-        std::fs::rename(&staging, &audio)?;
+        // Path context on the rename: a bare Permission-denied must name
+        // the move it refused (callers chain this into their errors).
+        std::fs::rename(&staging, &audio).map_err(|err| {
+            StoreV2Error::Io(io::Error::new(
+                err.kind(),
+                format!("promoting staging journal {staging:?} to {audio:?}: {err}"),
+            ))
+        })?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
         sync_dir(&self.root.join(STAGING_DIR))?;
         Ok(())
@@ -778,16 +785,45 @@ impl StoreV2 {
     /// [`FinalizedTake::commit_marked`]: without this, a failed write
     /// would leave a partial staging journal for reconcile to salvage as
     /// an *interrupted take* — duplicate audio of whatever the caller
-    /// stored instead. Best-effort and idempotent: a committed row for
-    /// the id is never touched (its audio lives in `audio/`), and a
-    /// missing file is not an error.
-    pub fn discard_staging(&self, id: &str) -> Result<(), StoreV2Error> {
+    /// stored instead. Returns whether **this call removed** the
+    /// journal: `Ok(false)` is the idempotent "already gone" (promoted
+    /// past the rename, or raced) — callers report that shape
+    /// distinctly, never as a rollback that ran. A committed row for the
+    /// id is never touched (its audio lives in `audio/`). Removal
+    /// failures (permissions, a directory squatting on the name, I/O
+    /// trouble) are errors: the caller must be able to tell "rolled
+    /// back" from "the partial staging journal is still there" — the
+    /// leftover is exactly what reconcile would salvage as a duplicate.
+    /// Once the removal itself succeeded, the journal is gone; the
+    /// dirent fsync afterwards is best-effort (the same trade
+    /// [`Self::release_lease`] makes after removing the lease files): a
+    /// sync failure must not read as "still there" — the crash window it
+    /// leaves (an unsynced deletion can resurface after a crash) is
+    /// narrower than the misleading-error alternative.
+    pub fn discard_staging(&self, id: &str) -> Result<bool, StoreV2Error> {
         validate_capture_id(id)?;
         let path = self.staging_path(id);
-        if path.is_file() && std::fs::remove_file(&path).is_ok() {
-            sync_dir(&self.root.join(STAGING_DIR))?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                // Best-effort: the journal is gone; only the durability
+                // of the deletion's dirent is at stake now.
+                let _ = sync_dir(&self.root.join(STAGING_DIR));
+                Ok(true)
+            }
+            // Already gone: promoted past the rename, or raced — the
+            // idempotent no-op, reported as such.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            // Context over structure: nothing walks the source chain (the
+            // runtime callers report the message), but the ErrorKind stays
+            // inspectable and a bare `IsADirectory` without the path
+            // sends triage nowhere.
+            Err(err) => {
+                return Err(StoreV2Error::Io(io::Error::new(
+                    err.kind(),
+                    format!("removing staging journal {path:?}: {err}"),
+                )))
+            }
         }
-        Ok(())
     }
 
     /// Runs a passive WAL checkpoint now, resetting the policy counter.
@@ -1099,6 +1135,18 @@ impl StoreV2 {
     pub fn load_audio(&self, id: &str) -> Result<JournalAudio, StoreV2Error> {
         let path = self.audio_journal_path(id)?;
         read_audio_journal(&path)
+    }
+
+    /// Whether `audio/` holds the journal for `id` — one metadata probe,
+    /// no row read, no journal parse. The rollback seam for a caller that
+    /// failed between promotion and commit and must learn which side of
+    /// the rename the bytes sit on ([`audio_journal_path`] cannot answer
+    /// that: it resolves through the row, which in exactly that shape
+    /// does not exist yet). A probe that itself errors (`try_exists`, not
+    /// `exists`) propagates instead of reading as "not promoted".
+    pub fn audio_journal_exists(&self, id: &str) -> Result<bool, StoreV2Error> {
+        validate_capture_id(id)?;
+        Ok(self.audio_path(id).try_exists()?)
     }
 
     // ------------------------------------------------------------------
@@ -1651,10 +1699,20 @@ impl StoreV2 {
     ///   in-flight state ([`Self::reconcile`] already defers them), and
     ///   per-attempt recognition ownership stays guarded by the #213
     ///   markers as before.
+    /// - [`LeaseAcquisition::UnanswerableLeases`] — a lease file exists
+    ///   that can be neither probed nor broken (it will not open or
+    ///   parse, and no evidence proves its owner dead). It reads as an
+    ///   unanswerable owner — [`Self::reconcile`] would defer to it
+    ///   forever — so this instance does **not** publish alongside it:
+    ///   becoming a second writer whose own reconciles then defer
+    ///   indefinitely is the recovery-disabling state the unreadable
+    ///   surface exists to prevent, self-inflicted. The caller surfaces
+    ///   the state (repair, warn, or wait) exactly like
+    ///   [`ReconciliationReport::unreadable_leases`].
     ///
     /// The probe-and-publish critical section is serialized by the
-    /// `leases/.lock` sentinel (a blocking flock; never renamed, so it is
-    /// not the fixed-`.tmp` collision this design removes), so two
+    /// `leases/.lock` sentinel (a bounded-wait flock, never renamed, so it
+    /// is not the fixed-`.tmp` collision this design removes), so two
     /// concurrent acquirers cannot both observe "no live owner" and both
     /// publish. On hosts where flock cannot serialize, a post-publish
     /// tie-break re-check closes the remainder deterministically: if a
@@ -1682,9 +1740,19 @@ impl StoreV2 {
         // sentinel is dropped — lock released — when this scope ends).
         let _sentinel = LeaseSentinel::acquire(&leases_dir)?;
 
-        let broke = self.break_stale_leases()?;
-        if let Some(owner) = self.live_foreign_lease()?.live {
+        let broke = self.break_stale_leases_under_sentinel()?;
+        let ownership = self.live_foreign_lease()?;
+        if let Some(owner) = ownership.live {
             return Ok(LeaseAcquisition::Client { owner });
+        }
+        if !ownership.unreadable.is_empty() {
+            // An unanswerable lease is never broken and still defers
+            // recovery in reconcile; becoming owner on top of it would
+            // leave this process writing while its own reconciles defer
+            // forever. Surface it instead of publishing a second owner.
+            return Ok(LeaseAcquisition::UnanswerableLeases {
+                unreadable: ownership.unreadable,
+            });
         }
 
         let owner_id = format!("l_{}", uuid::Uuid::new_v4().simple());
@@ -1730,37 +1798,26 @@ impl StoreV2 {
             // path.
             let temp = unique_lease_temp(leases_dir, owner_id);
             let result = (|| -> Result<File, StoreV2Error> {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp)?;
-                // A freshly created file is never contended; a probe that
-                // says otherwise means someone else's temp collided into
-                // this unique name (external tampering) — abort without
-                // leaving the file.
-                match try_flock_exclusive(&file) {
-                    Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => {}
-                    Ok(FlockEvidence::Held) | Err(_) => {
-                        drop(file);
-                        let _ = std::fs::remove_file(&temp);
-                        return Err(StoreV2Error::Io(io::Error::other(format!(
-                            "lease temp {temp:?} is already held"
-                        ))));
-                    }
-                }
+                let mut file = open_flocked_lease_temp(&temp, "identity")?;
                 write_lease_identity_content(&mut file, started_utc)?;
                 match std::fs::rename(&temp, self.lease_path(owner_id)) {
                     Ok(()) => Ok(file),
-                    Err(err) => {
-                        drop(file);
-                        Err(err.into())
-                    }
+                    Err(err) => Err(err.into()),
                 }
             })();
             match result {
                 Ok(file) => return Ok(file),
-                Err(err) => last_err = Some(err),
+                Err(err) => {
+                    // The attempt never published, so its scratch file (if
+                    // it survived the failure — a refused write, a failed
+                    // rename) is garbage: remove it here so a persistent
+                    // failure leaves zero temps behind instead of one per
+                    // attempt for the grace-period sweep to collect. The
+                    // handle (and its flock) went with the closure's
+                    // return.
+                    let _ = std::fs::remove_file(&temp);
+                    last_err = Some(err);
+                }
             }
         }
         Err(last_err.expect("two attempts always set the error"))
@@ -1777,9 +1834,11 @@ impl StoreV2 {
         Ok(true)
     }
 
-    /// Rewrite the heartbeat. The heartbeat file carries no lock (the
-    /// ownership flock lives on the identity file's inode), so it is
-    /// replaced atomically: unique temp, write, fsync, rename. A crash
+    /// Rewrite the heartbeat. The published heartbeat file carries no
+    /// lock (the ownership flock lives on the identity file's inode; the
+    /// temp that publishes it holds one only between create and the
+    /// rename — see [`Self::write_heartbeat`]), so it is replaced
+    /// atomically: unique temp, write, fsync, rename. A crash
     /// mid-renewal leaves the *previous* heartbeat — which then ages out
     /// past the TTL, the correct staleness answer — and can never tear
     /// the identity record the pid/boot-id ladder reads.
@@ -1804,14 +1863,14 @@ impl StoreV2 {
         let temp = unique_lease_temp(leases_dir, owner_id);
         let result = (|| -> Result<(), StoreV2Error> {
             use std::io::Write;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
+            let mut file = open_flocked_lease_temp(&temp, "heartbeat")?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            drop(file);
+            // Rename first, drop after: the flock covers the temp from
+            // create through the rename that publishes it — the same
+            // coverage window the identity temp gets.
             std::fs::rename(&temp, self.heartbeat_path(owner_id))?;
+            drop(file);
             Ok(())
         })();
         if result.is_err() {
@@ -1865,7 +1924,40 @@ impl StoreV2 {
     /// than that by construction, so a concurrent sweep can never delete
     /// it out from under the rename that publishes it. Returns the broken
     /// owner ids.
+    ///
+    /// Serialized by the same `leases/.lock` sentinel as
+    /// [`Self::acquire_lease`] (this is a public mutating path of its
+    /// own): without the sentinel, a direct call racing a concurrent
+    /// acquirer's publish window — identity renamed, heartbeat not yet
+    /// written, the acquirer holding the sentinel there — could probe the
+    /// fresh lease as ancient-hearted and delete it while its flock is
+    /// genuinely held, leaving two owners: exactly what the lease design
+    /// prevents. [`Self::acquire_lease`] reaches the breaking half
+    /// through [`Self::break_stale_leases_under_sentinel`], already
+    /// inside its own sentinel scope (flock is per open file
+    /// description — self-deadlock if re-taken).
     pub fn break_stale_leases(&mut self) -> Result<Vec<String>, StoreV2Error> {
+        self.break_stale_leases_within(LeaseSentinel::ACQUIRE_TIMEOUT)
+    }
+
+    /// [`Self::break_stale_leases`] with the sentinel wait bounded by
+    /// `timeout` (the production bound; tests inject a short one so a
+    /// held sentinel fails the call deterministically instead of via
+    /// wall-clock timing).
+    fn break_stale_leases_within(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<String>, StoreV2Error> {
+        let leases_dir = self.root.join(LEASES_DIR);
+        std::fs::create_dir_all(&leases_dir)?;
+        let _sentinel = LeaseSentinel::acquire_with_timeout(&leases_dir, timeout)?;
+        self.break_stale_leases_under_sentinel()
+    }
+
+    /// The breaking half of [`Self::break_stale_leases`], for callers
+    /// already inside the acquisition sentinel's critical section
+    /// (only [`Self::acquire_lease`]).
+    fn break_stale_leases_under_sentinel(&mut self) -> Result<Vec<String>, StoreV2Error> {
         let own = self.lease.as_ref().map(|handle| handle.owner_id.clone());
         let mut broken = Vec::new();
         let mut removed_any = false;
@@ -1904,7 +1996,11 @@ impl StoreV2 {
             if let Ok(mut file) = OpenOptions::new().read(true).open(&temp) {
                 match try_flock_exclusive(&file) {
                     // A live writer holds its flock between create and
-                    // rename — never touched, however old.
+                    // rename — never touched, however old. Both temp
+                    // kinds carry it: the identity temp from
+                    // `publish_identity`, the heartbeat temp from
+                    // `write_heartbeat` (the grace period below is the
+                    // second guard, not the only one).
                     Ok(FlockEvidence::Held) => continue,
                     Ok(FlockEvidence::Free) => {}
                     // Where flock cannot answer, only a record-less temp
@@ -3043,6 +3139,11 @@ pub enum LeaseAcquisition {
     /// A live foreign owner holds the root: this process is a client, not
     /// a competitor. `owner` identifies the live lease.
     Client { owner: LeaseInfo },
+    /// Lease files exist that can be neither probed nor broken (see
+    /// [`StoreV2::acquire_lease`]): no ownership was taken. `unreadable`
+    /// names each with the reason, the same shape
+    /// [`ReconciliationReport::unreadable_leases`] reports.
+    UnanswerableLeases { unreadable: Vec<(String, String)> },
 }
 
 /// One lease as `leases/` shows it. `pid`, `boot_id` and the heartbeat
@@ -3260,6 +3361,40 @@ impl LeaseSentinel {
     }
 }
 
+/// Open a freshly created unique lease temp and flock it — the shared
+/// create-and-probe step of the identity publish and the heartbeat
+/// replacement (both temps carry the flock from create through the
+/// rename that publishes them, so a stalled writer answers `Held` to
+/// the stale-lease sweep however long it stalls). A freshly created
+/// unique temp is never genuinely contended: a `Held` probe means
+/// someone else's temp collided into the unique name (external
+/// tampering) — abort; a probe that itself *failed* is reported as the
+/// probe failure it is, never as a phantom holder. `kind` names the
+/// temp ("identity"/"heartbeat") so triage lands on the right path.
+fn open_flocked_lease_temp(temp: &Path, kind: &str) -> Result<File, StoreV2Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(temp)?;
+    match try_flock_exclusive(&file) {
+        Ok(FlockEvidence::Free) | Ok(FlockEvidence::Unknown) => Ok(file),
+        Ok(FlockEvidence::Held) => {
+            drop(file);
+            Err(StoreV2Error::Io(io::Error::other(format!(
+                "{kind} lease temp {temp:?} is already held"
+            ))))
+        }
+        Err(err) => {
+            drop(file);
+            Err(StoreV2Error::Io(io::Error::new(
+                err.kind(),
+                format!("{kind} lease temp {temp:?}: flock probe failed: {err}"),
+            )))
+        }
+    }
+}
+
 /// Write the immutable identity record onto the acquisition temp (the
 /// file is published by rename immediately after; nothing rewrites it).
 fn write_lease_identity_content(file: &mut File, started_utc: &str) -> Result<(), StoreV2Error> {
@@ -3339,12 +3474,27 @@ fn boot_matches(recorded: &str) -> Option<bool> {
     }
 }
 
-/// Unix epoch milliseconds (0 only if the clock is before 1970).
+/// Unix epoch milliseconds; never 0 (0 is the "no heartbeat parsed"
+/// sentinel — a pre-epoch or exactly-epoch clock saturates to 1, see
+/// [`epoch_ms`]).
 fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis() as u64)
-        .unwrap_or(0)
+    epoch_ms(std::time::SystemTime::now())
+}
+
+/// A clock reading as epoch milliseconds. A clock before 1970 saturates
+/// to 1 ms past the epoch, never 0 (and an exactly-epoch clock clamps to
+/// the same 1): `0` is the "no heartbeat parsed" sentinel (a missing
+/// `.hb` reads as `heartbeat_ms = 0` — ancient), so a skewed-but-live
+/// owner must not write a heartbeat indistinguishable from "never";
+/// against a peer reading the same skewed clock, 1-vs-1 still reads
+/// fresh.
+fn epoch_ms(now: std::time::SystemTime) -> u64 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        // The Ok arm clamps too: an exactly-epoch (or sub-millisecond
+        // past it) clock yields 0 ms, which is just as much the
+        // "no heartbeat parsed" sentinel as the pre-epoch Err arm.
+        .map(|since| (since.as_millis() as u64).max(1))
+        .unwrap_or(1)
 }
 
 /// Whether a heartbeat recorded at `heartbeat_ms` is still fresh under
@@ -5755,8 +5905,20 @@ mod tests {
             store_root_has_staging(&store, &other_id),
             "an unrelated in-flight take is untouched"
         );
-        // Idempotent.
-        store.discard_staging(&id).expect("discard again");
+        // The Ok(bool) contract: this call removed it...
+        assert!(
+            store
+                .discard_staging(&other_id)
+                .expect("discard other"),
+            "a present journal reports removed-by-this-call"
+        );
+        // ...and a second discard of the now-missing id reports the
+        // idempotent already-gone shape, not another removal — the two
+        // sides rollback reporting distinguishes.
+        assert!(
+            !store.discard_staging(&id).expect("discard again"),
+            "an already-gone journal reports already-gone, not removed"
+        );
         drop(take);
 
         // A committed row is never touched: its audio lives in `audio/`,
@@ -5779,6 +5941,176 @@ mod tests {
                 .expect("row")
                 .is_some(),
             "the committed row survives a late discard"
+        );
+    }
+
+    // ---- issue #259: PR #257 review round 2 follow-ups ---------------------
+
+    #[test]
+    fn discard_staging_surfaces_a_real_removal_failure() {
+        // The rollback contract must be honest: a missing file is the
+        // idempotent no-op, but a removal that genuinely fails (here: a
+        // directory squatting on the staging name) is an error the caller
+        // can act on — otherwise the partial journal that reconcile would
+        // salvage as a duplicate survives, silently.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let squat = store.root().join(STAGING_DIR).join("c_squat.sj");
+        std::fs::create_dir(&squat).expect("directory on the staging name");
+
+        assert!(
+            store.discard_staging("c_squat").is_err(),
+            "a real removal failure must surface, not read as rolled back"
+        );
+        assert!(squat.exists(), "the failed removal left it in place");
+        // The idempotent no-op stays Ok — and reports already-gone.
+        assert!(
+            !store
+                .discard_staging("c_missing")
+                .expect("a missing staging file is the no-op"),
+            "a missing file reports already-gone, not removed"
+        );
+    }
+
+    #[test]
+    fn an_unanswerable_lease_blocks_acquisition_instead_of_dual_ownership() {
+        // A lease that can be neither probed nor broken is an unanswerable
+        // owner: reconcile would defer to it forever, so acquisition must
+        // not publish a second owner alongside it — this process would
+        // keep writing while its own reconciles defer, the
+        // recovery-disabling state self-inflicted on the root's owner.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        // A directory squatting on a lease name: present, unprobeable.
+        std::fs::create_dir(store.root().join(LEASES_DIR).join("l_wedge.lease"))
+            .expect("wedge lease");
+
+        match store.acquire_lease().expect("acquisition answers") {
+            LeaseAcquisition::UnanswerableLeases { unreadable } => {
+                assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+                assert_eq!(unreadable[0].0, "l_wedge");
+            }
+            other => panic!("no ownership on top of an unanswerable lease: {other:?}"),
+        }
+        let mut remaining: Vec<String> = std::fs::read_dir(store.root().join(LEASES_DIR))
+            .expect("leases dir")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".lease"))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["l_wedge.lease".to_string()],
+            "no second owner's lease file was published"
+        );
+
+        // The wedge repaired: acquisition proceeds normally.
+        std::fs::remove_dir(store.root().join(LEASES_DIR).join("l_wedge.lease"))
+            .expect("remove the wedge");
+        assert!(matches!(
+            store.acquire_lease().expect("acquire after repair"),
+            LeaseAcquisition::Owner { .. }
+        ));
+    }
+
+    #[test]
+    fn break_stale_leases_takes_the_acquisition_sentinel() {
+        // The public breaking path is a mutating section of its own: it
+        // must serialize against a concurrent acquirer's probe-and-publish
+        // exactly like acquire_lease. Pinned deterministically — no
+        // wall-clock windows: while another holder has the sentinel, a
+        // breaking call with a short injected bound fails outright; once
+        // the holder drops it, the same call breaks the stale lease.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let root = store.root().to_path_buf();
+        forged_lease(&root, "l_dead", std::process::id(), now_epoch_ms());
+
+        let held = LeaseSentinel::acquire(&root.join(LEASES_DIR)).expect("sentinel");
+        let err = store
+            .break_stale_leases_within(std::time::Duration::from_millis(60))
+            .expect_err("breaking must not run under a held sentinel");
+        assert!(
+            err.to_string().contains("wedged"),
+            "the refusal names the wedged sentinel: {err}"
+        );
+        assert!(
+            root.join(LEASES_DIR).join("l_dead.lease").exists(),
+            "the stale lease is untouched while the sentinel is held"
+        );
+        drop(held);
+
+        let broken = store.break_stale_leases().expect("break once free");
+        assert_eq!(broken, vec!["l_dead".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_identity_publish_leaves_no_temporaries_behind() {
+        // The publish retry loop must clean its scratch file on EVERY
+        // failure arm, not only the flocked-temp arm: a persistent rename
+        // failure used to accumulate one orphaned temp per attempt until
+        // the grace-period sweep collected them — the failure's footprint
+        // is now zero.
+        let dir = TempDir::new().expect("tempdir");
+        let store = store_in(&dir);
+        let leases = store.root().join(LEASES_DIR);
+        // A directory where the identity must land: rename(file, dir)
+        // fails on every attempt.
+        std::fs::create_dir(leases.join("l_stuck.lease")).expect("destination wedge");
+
+        let published = store.publish_identity(&leases, "l_stuck", "2026-09-22T00:00:00.000Z");
+
+        assert!(published.is_err(), "the wedged destination must fail");
+        assert!(
+            lease_temps_in(&leases).is_empty(),
+            "no scratch temp survives the failed attempts"
+        );
+    }
+
+    #[test]
+    fn a_pre_1970_clock_saturates_to_one_not_the_missing_heartbeat_sentinel() {
+        // heartbeat_ms = 0 means "no heartbeat parsed" (ancient, stale);
+        // a pre-epoch clock must not write its fresh heartbeat as that
+        // sentinel — it saturates to 1 ms past the epoch, which still
+        // reads fresh against a peer reading the same skewed clock. An
+        // exactly-epoch clock clamps to the same 1 for the same reason.
+        let skewed = std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(86_400);
+        assert_eq!(epoch_ms(skewed), 1);
+        assert_eq!(epoch_ms(std::time::SystemTime::UNIX_EPOCH), 1);
+    }
+
+    #[test]
+    fn audio_journal_exists_answers_for_rowless_promoted_audio() {
+        // The promoted-but-uncommitted shape (a failure between the
+        // promoting rename and the row commit): no row, but the bytes sit
+        // in audio/. audio_journal_path cannot answer — it resolves
+        // through the row — this probe is what rollback callers need to
+        // tell which side of the rename the bytes are on.
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let mut take = store
+            .begin_take(TakeMeta::for_device("test-device"))
+            .expect("begin");
+        take.append_frames(&ramp(10, 0)).expect("append");
+        let id = take.id().to_string();
+        drop(take.finalize().expect("finalize"));
+        assert!(
+            !store.audio_journal_exists(&id).expect("probe in staging"),
+            "still in staging: nothing promoted"
+        );
+        store.promote_from_staging(&id).expect("promote, no commit");
+        assert!(
+            store.audio_journal_exists(&id).expect("probe promoted"),
+            "the bytes are in audio/ though no row exists"
+        );
+        assert!(
+            store.get_capture(&id).expect("row read").is_none(),
+            "no row — exactly the shape the probe exists for"
+        );
+        assert!(
+            !store.audio_journal_exists("c_never").expect("probe unknown"),
+            "an unknown id has no audio"
         );
     }
 }

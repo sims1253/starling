@@ -222,6 +222,50 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
     owner.shutdown();
 }
 
+/// An unanswerable lease file (present, unprobeable — here a directory
+/// squatting on a lease name) blocks ownership instead of the host
+/// serving beside it: reconcile would defer to the unanswerable owner
+/// forever, so a second writer on that root is exactly the
+/// recovery-disabling state the lease exists to prevent. The refusal
+/// names the wedged file so it can be repaired, and the root serves
+/// cleanly once it is.
+#[test]
+fn an_unanswerable_lease_refuses_ownership_and_names_the_wedge() {
+    let root = tempfile::tempdir().unwrap();
+    let wedge = root.path().join("leases").join("l_wedge.lease");
+    std::fs::create_dir_all(&wedge).expect("wedge lease");
+
+    match serve(plain_config(root.path())) {
+        Err(HostError::LeaseUnanswerable { unreadable, .. }) => {
+            assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+            assert_eq!(unreadable[0].0, "l_wedge", "{unreadable:?}");
+        }
+        Err(other) => panic!("expected LeaseUnanswerable, got {other}"),
+        Ok(mut host) => {
+            host.shutdown();
+            panic!("expected LeaseUnanswerable, served beside the wedge");
+        }
+    }
+
+    // No lease of ours was left behind by the refusal, and the repaired
+    // root serves normally.
+    let lease_names: Vec<String> = std::fs::read_dir(root.path().join("leases"))
+        .expect("leases dir")
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".lease"))
+        .collect();
+    assert_eq!(
+        lease_names,
+        vec!["l_wedge.lease".to_string()],
+        "the refused host published no lease of its own"
+    );
+    std::fs::remove_dir(&wedge).expect("repair the wedge");
+    let mut successor =
+        serve(plain_config(root.path())).expect("serves once the wedge is repaired");
+    successor.shutdown();
+}
+
 /// The ownership-ladder refusal the binary encodes, exercised in-process
 /// (fast): a live foreign owner makes the second serve() a client, and a
 /// socket answering without the lease makes binding refuse.

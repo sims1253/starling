@@ -2413,6 +2413,121 @@ fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
     }
 }
 
+#[test]
+fn the_samples_row_carries_the_take_ids_and_content_hash_in_extra() {
+    // The row-keying contract on V2CaptureStore: the samples-fallback row
+    // is keyed by the staging journal's minted id, NOT take.capture_id —
+    // the take's own ids (and its FNV content hash, the forensic bridge
+    // to journal evidence the store could not adopt) ride in extra_json
+    // so a consumer can still bridge row ↔ take.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..60).map(|i| (i % 13) as f32 * 0.02).collect();
+
+    let record = take_record("take_ids", &samples, None);
+    let capture_id = record.capture_id.clone();
+    let content_hash = record.journal_hash();
+    store.commit_take(&record).expect("commit");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 1, "{rows:?}");
+    let starling_dictation::store_v2::ListedCapture::Capture(listing) = &rows.records[0] else {
+        panic!("expected a readable capture, got {:?}", rows.records[0]);
+    };
+    assert_ne!(
+        listing.record.id, capture_id,
+        "the row is keyed by the staged id, not the take's capture id"
+    );
+    let extra: serde_json::Value =
+        serde_json::from_str(listing.record.extra_json.as_deref().unwrap_or_default())
+            .expect("extra json parses");
+    assert_eq!(extra["captureId"].as_str(), Some(capture_id.as_str()));
+    assert_eq!(extra["takeCorr"].as_str(), Some("take_ids"));
+    assert_eq!(
+        extra["journalHash"].as_str(),
+        Some(content_hash.as_str()),
+        "the take's content hash survives in extra_json"
+    );
+}
+
+// Permission-based fault injection: Unix directory write bits, which a
+// root process ignores (CAP_DAC_OVERRIDE) and Windows does not enforce
+// for entries created inside a "read-only" directory — so the test is
+// unix-only and probes that the denial genuinely bites before asserting
+// anything.
+#[cfg(unix)]
+#[test]
+fn a_failed_commit_rolls_the_sealed_staging_journal_back() {
+    // The samples path's rollback covers its LAST failure arm too: when
+    // commit_marked fails before the promoting rename (here: the audio
+    // tree refuses the move), the take's whole sealed journal is still in
+    // staging, and reconcile would salvage it as an interrupted duplicate
+    // of whatever a retry stores — the exact shape discard_staging exists
+    // to prevent (its doc names this caller). No row and no audio land.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..90).map(|i| (i % 19) as f32 * 0.01).collect();
+
+    // Deny the staging→audio rename (read-only audio directory) while
+    // staging stays writable, so the rollback after the failed commit
+    // can genuinely succeed.
+    let audio = dir.path().join("audio");
+    let perms = std::fs::metadata(&audio).expect("audio dir").permissions();
+    // Drop-based restore: any panic between the denial and the assertions
+    // (every expect below) still gives the tempdir cleanup a writable
+    // directory instead of confusing secondary errors.
+    struct PermRestore(std::path::PathBuf, std::fs::Permissions);
+    impl Drop for PermRestore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = PermRestore(audio.clone(), perms.clone());
+    let mut denied = perms.clone();
+    denied.set_readonly(true);
+    std::fs::set_permissions(&audio, denied).expect("deny audio writes");
+
+    // A privileged process ignores directory write bits — verify the
+    // injection bites instead of asserting a rollback that never ran.
+    let probe = audio.join(".write_probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        // Best-effort cleanup; the tempdir removes any leftover anyway.
+        let _ = std::fs::remove_file(&probe);
+        // TODO(#259 follow-up): a privilege-independent injection seam
+        // (a fault-injectable promote step) would exercise this arm on
+        // root CI runners too; the SKIP marker below keeps the gap
+        // visible in the meantime.
+        eprintln!(
+            "SKIP a_failed_commit_rolls_the_sealed_staging_journal_back: this process \
+             ignores directory write bits; the permission-based injection cannot bite"
+        );
+        return; // the PermRestore drop puts the directory back
+    }
+
+    let result = store.commit_take(&take_record("take_commitfail", &samples, None));
+
+    // The PermRestore drop is the canonical restore path — it covers this
+    // return and every panic below alike, so there is exactly one.
+    let err = result.expect_err("the commit must fail while audio is unwritable");
+    assert!(
+        err.contains("promoting"),
+        "the error must name the failing promote step, not an earlier arm: {err}"
+    );
+
+    let staging: Vec<_> = std::fs::read_dir(dir.path().join("staging"))
+        .expect("staging dir")
+        .flatten()
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "the sealed staging journal was rolled back, not left for reconcile to salvage"
+    );
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 0, "no row landed: {rows:?}");
+}
+
 /// A store whose commits take a fixed while — a deterministic stand-in
 /// for the v1 store's encode window, for the interleavings only the
 /// off-actor persist makes reachable. `failing` names takes whose
