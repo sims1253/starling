@@ -94,9 +94,9 @@ gh secret set STARLING_ANDROID_KEY_ALIAS --body starling
 gh secret set STARLING_ANDROID_KEY_PASSWORD   # same as the store password for PKCS12
 ```
 
-Without these secrets the workflow signs with a throwaway key per release, so
-installing a later release needs an uninstall first (which deletes the app's
-recordings and model).
+Without these secrets, `v*` releases fail to build, and `android-v*` test
+builds are signed with a throwaway key per release, so installing a later one
+needs an uninstall first (which deletes the app's recordings and model).
 
 Local release builds read the same four values from `STARLING_ANDROID_*`
 environment variables (`STARLING_ANDROID_KEYSTORE` is the keystore path);
