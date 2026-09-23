@@ -11,23 +11,23 @@ allowBuilds:
 # pnpm holds back releases younger than a day; list only locked versions that need it.
 minimumReleaseAgeExclude:
   - lucide-react@1.46.0
-  - vite-plus@0.3.2
-  - "@voidzero-dev/vite-plus-core@0.3.2"
-  - '@voidzero-dev/vite-plus-darwin-arm64@0.3.2'
-  - '@voidzero-dev/vite-plus-darwin-x64@0.3.2'
-  - '@voidzero-dev/vite-plus-linux-arm64-gnu@0.3.2'
-  - '@voidzero-dev/vite-plus-linux-arm64-musl@0.3.2'
-  - '@voidzero-dev/vite-plus-linux-x64-gnu@0.3.2'
-  - '@voidzero-dev/vite-plus-linux-x64-musl@0.3.2'
-  - '@voidzero-dev/vite-plus-win32-arm64-msvc@0.3.2'
-  - '@voidzero-dev/vite-plus-win32-x64-msvc@0.3.2'
+  - vite-plus@0.3.3
+  - "@voidzero-dev/vite-plus-core@0.3.3"
+  - '@voidzero-dev/vite-plus-darwin-arm64@0.3.3'
+  - '@voidzero-dev/vite-plus-darwin-x64@0.3.3'
+  - '@voidzero-dev/vite-plus-linux-arm64-gnu@0.3.3'
+  - '@voidzero-dev/vite-plus-linux-arm64-musl@0.3.3'
+  - '@voidzero-dev/vite-plus-linux-x64-gnu@0.3.3'
+  - '@voidzero-dev/vite-plus-linux-x64-musl@0.3.3'
+  - '@voidzero-dev/vite-plus-win32-arm64-msvc@0.3.3'
+  - '@voidzero-dev/vite-plus-win32-x64-msvc@0.3.3'
 
 catalog:
   '@types/node': 24.13.4
   effect: 4.0.0-rc.116
   typescript: 7.0.2
-  vite: npm:@voidzero-dev/vite-plus-core@0.3.2
-  vite-plus: 0.3.2
+  vite: npm:@voidzero-dev/vite-plus-core@0.3.3
+  vite-plus: 0.3.3
 overrides:
   vite@*: 'catalog:'
 peerDependencyRules:
