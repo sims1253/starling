@@ -92,6 +92,16 @@ jobs:
       - name: Build and test Android
         working-directory: apps/mobile
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Upload the debug APK
+        # Installable build of every PR/push for on-device testing. Debug
+        # builds are signed with the runner's ephemeral debug key, so switching
+        # between artifacts from different runs needs an uninstall first.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-mobile-debug-apk
+          path: apps/mobile/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
 
   ios:
     runs-on: macos-latest

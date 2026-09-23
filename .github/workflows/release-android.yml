@@ -1,0 +1,190 @@
+# Build the Starling Mobile Android APKs and attach them to a GitHub release:
+#   starling-mobile-<version>.apk       every arm64 phone since ~2018 (dotprod+fp16)
+#   starling-mobile-<version>-i8mm.apk  adds int8 matrix-multiply kernels for the
+#                                       on-device engine: Pixel 8+ (Tensor G3+),
+#                                       Snapdragon 8 Gen 1+, Dimensity 9000+
+# Both share the application id and signing key, so either installs over the
+# other; the i8mm build refuses on-device transcription on a CPU without i8mm.
+#
+# Triggers:
+#   - a `v*` tag: the APK joins the starling-serve release for that tag
+#     (release-starling-serve.yml uploads the server binaries alongside it);
+#   - an `android-v*` tag: an APK-only prerelease, for trying the app without
+#     cutting a full server release;
+#   - workflow_dispatch with an existing tag.
+#
+# Signing: configure these repository secrets once so every release is
+# signed with the same key (Android only updates an installed app from an
+# APK signed by the same key):
+#   STARLING_ANDROID_KEYSTORE_BASE64    base64 of the .jks/.keystore file
+#   STARLING_ANDROID_KEYSTORE_PASSWORD
+#   STARLING_ANDROID_KEY_ALIAS
+#   STARLING_ANDROID_KEY_PASSWORD
+# Without them the APK is signed with a throwaway key generated for this run.
+# It installs fine, but each such release has a different key, so moving to
+# another release means uninstalling first (which deletes app data).
+
+name: Release Android app
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'android-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach the APK to (e.g. android-v0.1.0)'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.name }}
+      signing: ${{ steps.keystore.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Derive version from the tag
+        id: version
+        run: |
+          name="${RELEASE_TAG#android-}"
+          name="${name#v}"
+          if ! grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$' <<< "$name"; then
+            echo "::error::Tag $RELEASE_TAG does not carry a semantic version (vX.Y.Z or android-vX.Y.Z)"
+            exit 1
+          fi
+          # versionCode must grow with every installable build; the run
+          # number is monotonic for this workflow.
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$((GITHUB_RUN_NUMBER + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the signing keystore
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.STARLING_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.STARLING_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.STARLING_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.STARLING_ANDROID_KEY_PASSWORD }}
+        run: |
+          keystore="$RUNNER_TEMP/starling-release.jks"
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            base64 --decode <<< "$KEYSTORE_BASE64" > "$keystore"
+            echo "mode=release-key" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Android signing secrets are not configured; signing with a throwaway key. Installs from different releases will not update each other."
+            KEYSTORE_PASSWORD="$(openssl rand -hex 16)"
+            KEY_PASSWORD="$KEYSTORE_PASSWORD"
+            KEY_ALIAS=starling-throwaway
+            keytool -genkeypair -noprompt -keystore "$keystore" -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 3072 -validity 3650 \
+              -dname "CN=Starling Mobile throwaway ${RELEASE_TAG}"
+            echo "mode=throwaway-key" >> "$GITHUB_OUTPUT"
+          fi
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          echo "::add-mask::$KEY_PASSWORD"
+          {
+            echo "STARLING_ANDROID_KEYSTORE=$keystore"
+            echo "STARLING_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "STARLING_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+            echo "STARLING_ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Test and build the release APKs
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)/apksigner"
+          built=apps/mobile/app/build/outputs/apk/release/app-release.apk
+          mkdir -p dist
+          # suffix|arm64 target; each target rebuilds the native engine.
+          for variant in "|armv8.2-a+dotprod+fp16" "-i8mm|armv8.2-a+dotprod+fp16+i8mm"; do
+            suffix="${variant%%|*}"
+            arch="${variant#*|}"
+            tests=()
+            [ -z "$suffix" ] && tests=(testDebugUnitTest)
+            (cd apps/mobile && ./gradlew --no-daemon "${tests[@]}" assembleRelease \
+              -PstarlingVersionName="$VERSION_NAME" -PstarlingVersionCode="$VERSION_CODE" \
+              -PstarlingArmArch="$arch")
+            test -f "$built" || { echo "::error::$built missing (unsigned builds are named app-release-unsigned.apk)"; exit 1; }
+            "$apksigner" verify --verbose --print-certs "$built"
+            apk="dist/starling-mobile-${VERSION_NAME}${suffix}.apk"
+            mv "$built" "$apk"
+          done
+          (cd dist && sha256sum ./*.apk | sed 's| \./| |' > SHA256SUMS-android.txt && cat SHA256SUMS-android.txt)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-mobile-apk
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: apk
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: starling-mobile-apk
+          path: dist
+
+      - name: Attach the APKs to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.apk.outputs.version }}
+          SIGNING: ${{ needs.apk.outputs.signing }}
+        run: |
+          # release-starling-serve.yml may create the release for a v* tag
+          # at the same time; whichever side loses the create race uploads
+          # into the release the other one made.
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            prerelease=()
+            case "$RELEASE_TAG" in
+              android-v*|*-*) prerelease=(--prerelease) ;;
+            esac
+            if [ "$SIGNING" = throwaway-key ]; then
+              signing_note="Signed with a throwaway key: uninstall any previous Starling Mobile build before installing this one."
+            else
+              signing_note="Signed with the Starling Mobile release key; installs over earlier releases signed with the same key."
+            fi
+            printf '%s\n' \
+              "## Starling Mobile $VERSION (Android)" \
+              "" \
+              "Download \`starling-mobile-$VERSION.apk\` on the phone and open it to install (allow installs from your browser or file manager when Android asks). Android 8.0+ on arm64 or x86_64." \
+              "" \
+              "\`starling-mobile-$VERSION-i8mm.apk\` is the same app with faster on-device inference for phones with int8 matrix-multiply support: Pixel 8 or newer (Tensor G3+), Snapdragon 8 Gen 1 or newer, Dimensity 9000 or newer. On other phones it cannot run the on-device engine; use the standard APK there." \
+              "" \
+              "$signing_note" \
+              "" \
+              "Setup: see apps/mobile/README.md. The app needs a reachable starling-serve (run it with \`--host 0.0.0.0\` for LAN access) or an imported Parakeet GGUF for on-device transcription." \
+              > notes.md
+            gh release create "$RELEASE_TAG" --verify-tag "${prerelease[@]}" \
+              --title "$RELEASE_TAG" --notes-file notes.md \
+              || gh release view "$RELEASE_TAG" > /dev/null
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.apk dist/SHA256SUMS-android.txt --clobber

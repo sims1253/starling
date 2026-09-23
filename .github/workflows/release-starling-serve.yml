@@ -613,6 +613,7 @@ jobs:
             | `starling-serve-windows-cpu.zip` | Windows x86_64 | CPU | No GPU required (static application CRT) |
             | `starling-serve-macos-metal.tar.gz` | macOS arm64 | Metal | Apple Silicon |
             | `starling-serve-macos-cpu.tar.gz` | macOS arm64 | CPU | Apple Silicon, no GPU needed |
+            | `starling-mobile-*.apk` | Android 8.0+ (arm64, x86_64) | Server or on-device CPU | Attached by the Release Android app workflow; `-i8mm` variant for Pixel 8+ / Snapdragon 8 Gen 1+ |
 
             ### Runtime requirements
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
