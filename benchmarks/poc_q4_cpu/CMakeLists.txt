@@ -1,0 +1,75 @@
+cmake_minimum_required(VERSION 3.21)
+project(starling_q4_cpu_poc LANGUAGES C CXX)
+option(POC_WITH_GGML_BASELINE "Build the ggml comparison executable" ON)
+option(POC_ARM_DOTPROD "Require the AArch64 dot-product extension" OFF)
+option(POC_REFERENCE_NUMERICS "Use ggml-compatible AVX2 numeric order for parity experiments" OFF)
+
+set(POC_CPU_ARCH_FLAGS "")
+if(POC_ARM_DOTPROD AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set(POC_CPU_ARCH_FLAGS -march=armv8.2-a+dotprod)
+elseif(NOT CMAKE_CROSSCOMPILING)
+  set(POC_CPU_ARCH_FLAGS -march=native)
+endif()
+
+add_library(independent_q4k STATIC independent_q4k.cpp gguf_q4k.cpp)
+if(POC_REFERENCE_NUMERICS)
+  target_compile_definitions(independent_q4k PRIVATE POC_REFERENCE_NUMERICS)
+endif()
+target_compile_features(independent_q4k PUBLIC cxx_std_17)
+target_include_directories(independent_q4k PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(independent_q4k PRIVATE ${POC_CPU_ARCH_FLAGS} -Wall -Wextra -Wpedantic)
+endif()
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(independent_q4k PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+add_executable(standalone_q4k standalone_q4k.cpp)
+target_compile_features(standalone_q4k PRIVATE cxx_std_17)
+target_link_libraries(standalone_q4k PRIVATE independent_q4k)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(standalone_q4k PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(standalone_parakeet standalone_parakeet.cpp engine_gguf.cpp
+  engine_math.cpp engine_audio.cpp engine_encoder.cpp engine_decoder.cpp)
+if(POC_REFERENCE_NUMERICS)
+  target_compile_definitions(standalone_parakeet PRIVATE POC_REFERENCE_NUMERICS)
+endif()
+target_compile_features(standalone_parakeet PRIVATE cxx_std_17)
+target_link_libraries(standalone_parakeet PRIVATE independent_q4k)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(standalone_parakeet PRIVATE -O3 ${POC_CPU_ARCH_FLAGS} -Wall -Wextra -Wpedantic)
+endif()
+
+if(POC_WITH_GGML_BASELINE)
+  # Baseline build is CPU-only, even if this host has an accelerator SDK.
+  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  set(GGML_METAL OFF CACHE BOOL "" FORCE)
+  set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+  set(GGML_HIP OFF CACHE BOOL "" FORCE)
+  set(GGML_SYCL OFF CACHE BOOL "" FORCE)
+  set(GGML_NATIVE ON CACHE BOOL "" FORCE)
+  set(GGML_LLAMAFILE ON CACHE BOOL "" FORCE)
+
+  get_filename_component(STARLING_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+  find_program(BASH_EXECUTABLE bash REQUIRED)
+  execute_process(
+    COMMAND "${BASH_EXECUTABLE}" "${STARLING_ROOT}/scripts/apply_ggml_patches.sh"
+    WORKING_DIRECTORY "${STARLING_ROOT}"
+    RESULT_VARIABLE _patch_result
+    OUTPUT_VARIABLE _patch_output
+    ERROR_VARIABLE _patch_error)
+  if(NOT _patch_result EQUAL 0)
+    message(FATAL_ERROR "ggml patch validation failed:\n${_patch_output}${_patch_error}")
+  endif()
+  add_subdirectory("${STARLING_ROOT}/third_party/ggml" "${CMAKE_BINARY_DIR}/ggml")
+
+  add_executable(poc_q4_cpu poc_q4_cpu.cpp)
+  target_compile_features(poc_q4_cpu PRIVATE cxx_std_17)
+  target_link_libraries(poc_q4_cpu PRIVATE independent_q4k ggml)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(poc_q4_cpu PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endif()
