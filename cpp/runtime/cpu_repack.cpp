@@ -73,12 +73,12 @@ bool env_enabled() {
 // would call unconditionally; fail with the diagnosis instead.
 void alias_get_tensor(ggml_backend_buffer_t, const ggml_tensor* tensor, void*, size_t, size_t) {
     GGML_ABORT("cpu_repack: weight '%s' is repacked for MUL_MAT and cannot be read back to the host; "
-               "set STARLING_GGML_CPU_REPACK=0", tensor->name);
+               "restart with STARLING_GGML_CPU_REPACK=0", tensor->name);
 }
 
 bool alias_cpy_tensor(ggml_backend_buffer_t, const ggml_tensor* src, ggml_tensor*) {
     GGML_ABORT("cpu_repack: weight '%s' is repacked for MUL_MAT and cannot be copied as plain rows; "
-               "set STARLING_GGML_CPU_REPACK=0", src->name);
+               "restart with STARLING_GGML_CPU_REPACK=0", src->name);
 }
 
 ggml_backend_buffer_type_t repack_buffer_type() {
@@ -232,7 +232,10 @@ void detach(ggml_backend_buffer* buffer) {
         // this detach-to-attach window; the repack decision and bytes remain.
         for (auto& entry : s.repacked) {
             ggml_tensor* t = entry.first;
-            if (t->buffer == r.alias) t->buffer = r.plain;
+            if (t->buffer == r.alias) {
+                t->buffer = r.plain;
+                t->extra = nullptr;  // attach restores the saved traits
+            }
         }
         ggml_backend_buffer_free(r.alias);
         s.regions.erase(s.regions.begin() + static_cast<std::ptrdiff_t>(i));
@@ -300,7 +303,7 @@ void prepare_graph(ggml_cgraph* gf) {
                     std::string("cpu_repack: weight '") + weight->name +
                     "' is repacked for MUL_MAT but this graph reads it through op " +
                     ggml_op_name(use.bad_node->op) +
-                    " (node '" + use.bad_node->name + "'); set STARLING_GGML_CPU_REPACK=0");
+                    " (node '" + use.bad_node->name + "'); restart with STARLING_GGML_CPU_REPACK=0");
             }
             s.never.insert(weight);
             continue;

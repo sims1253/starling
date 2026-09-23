@@ -27,7 +27,9 @@
 //
 // Repacking is idempotent per tensor and survives release/re-realize cycles
 // of the loader (the host bytes stay repacked, so re-attached tensors are
-// re-pointed at the alias immediately).
+// re-pointed at the alias immediately). The plain bytes are not retained;
+// disabling repacking after a weight has changed requires a fresh process
+// and a model reload.
 //
 // Gate: STARLING_GGML_CPU_REPACK=1/true/on/yes enables, =0/false/off/no
 // disables (anything else warns and keeps the default). Default: enabled on
