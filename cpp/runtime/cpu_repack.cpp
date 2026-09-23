@@ -43,8 +43,10 @@ struct State {
 };
 
 State& state() {
-    static State s;
-    return s;
+    // Loaders can have static lifetime in another translation unit. Keep the
+    // bookkeeping available until their destructors call forget() at exit.
+    static State* s = new State;
+    return *s;
 }
 
 bool platform_default() {

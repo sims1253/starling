@@ -206,6 +206,8 @@ void check_no_unsupported_graph_nodes(
 // data each call via set_input.
 class ReplayGraph {
 public:
+    // Construction can throw std::runtime_error if a captured CPU graph reads
+    // an already-repacked weight through an unsupported operation.
     ReplayGraph(Backend& backend,
                 const std::function<ggml_tensor*(ggml_context*)>& build);
     ~ReplayGraph();

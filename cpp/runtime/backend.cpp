@@ -349,7 +349,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     // direct C++ callers with loader release and captured graph execution;
     // run_graph/C API callers already hold this recursive mutex.
     std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
-    if (!is_gpu()) runtime_lock.lock();
+    if (!is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     // 1. Build in a no_alloc=true metadata context.
     //    ggml_graph_overhead_custom(kGraphSize, ...) reserves node/leaf slot
     //    capacity matching the cgraph allocated below (ggml_new_graph_custom);
@@ -601,7 +601,7 @@ ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
     std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
-    if (!backend_.is_gpu()) runtime_lock.lock();
+    if (!backend_.is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     // graph_build spans construction + allocation of one captured shape (the
     // one-time cost a replay-cache miss pays). Includes the build lambda and
     // alloc_internal(); the gated F1 histogram below is inside the window.
@@ -805,7 +805,7 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     // Match the CPU build/loader lock through execution and readback so a
     // different graph cannot repack a weight while this one reads it.
     std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
-    if (!backend_.is_gpu()) runtime_lock.lock();
+    if (!backend_.is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     if (!gf_ || !out_) return false;
     Backend::Impl* impl = backend_.impl_.get();
     // Fast path: graph_compute_async (skip the sync-wrapping graph_compute so the
