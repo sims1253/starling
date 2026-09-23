@@ -210,9 +210,26 @@ void attach(ggml_backend_buffer* buffer) {
     Region r;
     r.plain = buffer;
     r.alias = make_alias(buffer);
-    if (!r.alias) return;  // CPU_REPACK not compiled in: nothing to do
+    if (!r.alias) {
+        // The first attach may simply have no CPU_REPACK support. After a
+        // detach, however, these tensors still contain interleaved bytes and
+        // must never run through the plain buffer when alias creation fails.
+        for (const auto& entry : s.repacked) {
+            if (entry.first->buffer == buffer) {
+                throw std::runtime_error(
+                    "cpu_repack: cannot reattach already-repacked weights; restart with STARLING_GGML_CPU_REPACK=0");
+            }
+        }
+        return;
+    }
     r.base = static_cast<const char*>(ggml_backend_buffer_get_base(buffer));
     r.size = ggml_backend_buffer_get_size(buffer);
+    try {
+        s.regions.push_back(r);
+    } catch (...) {
+        ggml_backend_buffer_free(r.alias);
+        throw;
+    }
     // Bytes repacked before an earlier release are still repacked.
     for (auto& [t, traits] : s.repacked) {
         const char* p = static_cast<const char*>(t->data);
@@ -221,7 +238,6 @@ void attach(ggml_backend_buffer* buffer) {
             t->extra = traits;
         }
     }
-    s.regions.push_back(r);
 }
 
 void detach(ggml_backend_buffer* buffer) {

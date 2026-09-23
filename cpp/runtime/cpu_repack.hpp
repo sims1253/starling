@@ -50,7 +50,8 @@ bool enabled();
 
 // ModelLoader::realize_weights (CPU path): `buffer` borrows the weight memory
 // [base, base + size). Tensors in that range already repacked by an earlier
-// attach are re-pointed at the repack alias right away.
+// attach are re-pointed at the repack alias right away. Throws if an alias
+// cannot be recreated for weights whose bytes were already repacked.
 void attach(ggml_backend_buffer* buffer);
 
 // Before `buffer` is freed (ModelLoader::release_runtime_resources).

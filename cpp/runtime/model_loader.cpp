@@ -265,7 +265,15 @@ bool ModelLoader::realize_weights(Backend& backend) {
         }
         // Opt the weights into ggml's repacked CPU kernels as graphs use
         // them (no-op unless enabled; see cpu_repack.hpp).
-        cpu_repack::attach(buf);
+        try {
+            cpu_repack::attach(buf);
+        } catch (const std::exception& e) {
+            error_ = std::string("realize_weights: ") + e.what();
+            ggml_backend_buffer_free(buf);
+            weight_buffer_ = nullptr;
+            for (const auto& kv : tensors_) kv.second->buffer = nullptr;
+            return false;
+        }
     } else {
         // GPU: allocate a no_alloc device context, mirror tensors, upload.
         struct ggml_init_params params = {
