@@ -6,7 +6,8 @@ plugins {
 // as Gradle properties; local builds keep the defaults below.
 val starlingVersionName = providers.gradleProperty("starlingVersionName").orElse("0.1.0").get()
 val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
-    raw.toIntOrNull()?.takeIf { it > 0 } ?: throw GradleException("starlingVersionCode must be a positive integer: $raw")
+    raw.toIntOrNull()?.takeIf { it > 0 }
+        ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
 }
 
 // arm64 codegen target of the native engine. The default runs on every
@@ -18,6 +19,9 @@ val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse
 val starlingArmArch = providers.gradleProperty("starlingArmArch").orElse("armv8.2-a+dotprod+fp16").get()
 val cpuFeatureNames = mapOf("dotprod" to "asimddp", "fp16" to "asimdhp", "i8mm" to "i8mm")
 val starlingArmExtensions = starlingArmArch.split('+').drop(1)
+require(starlingArmExtensions.none(String::isBlank)) {
+    "starlingArmArch has an empty '+' extension (malformed): $starlingArmArch"
+}
 require(starlingArmExtensions.all { it in cpuFeatureNames }) {
     "starlingArmArch may only enable ${cpuFeatureNames.keys}: $starlingArmArch"
 }
@@ -32,18 +36,29 @@ val starlingVulkan = providers.gradleProperty("starlingVulkan").orElse("false").
 // `assembleRelease` without them still works and produces an unsigned APK.
 // The keystore must stay the same across releases: Android refuses to update
 // an installed app with an APK signed by a different key.
-val releaseSigning = listOf(
+val signingEnv = listOf(
     "STARLING_ANDROID_KEYSTORE",
     "STARLING_ANDROID_KEYSTORE_PASSWORD",
     "STARLING_ANDROID_KEY_ALIAS",
     "STARLING_ANDROID_KEY_PASSWORD",
 ).associateWith { providers.environmentVariable(it).orNull?.takeIf(String::isNotEmpty) }
-    .takeIf { vars -> vars.values.all { it != null } }
-    ?.mapValues { requireNotNull(it.value) }
-    ?.also { vars ->
-        val keystore = file(vars.getValue("STARLING_ANDROID_KEYSTORE"))
-        if (!keystore.isFile) throw GradleException("STARLING_ANDROID_KEYSTORE does not exist: $keystore")
+val missingSigningEnv = signingEnv.filterValues { it == null }.keys
+// Some but not all set is a misconfiguration, not "no signing": say which.
+if (missingSigningEnv.isNotEmpty() && missingSigningEnv.size < signingEnv.size) {
+    throw GradleException("Release signing is partially configured; also set: ${missingSigningEnv.joinToString()}")
+}
+val releaseSigning = signingEnv.takeIf { missingSigningEnv.isEmpty() }?.mapValues { requireNotNull(it.value) }
+
+// A bad keystore path only matters when a release build will sign with it;
+// checked once the task graph is known so debug builds are never blocked.
+if (releaseSigning != null) {
+    val keystore = file(releaseSigning.getValue("STARLING_ANDROID_KEYSTORE"))
+    gradle.taskGraph.whenReady {
+        if (allTasks.any { it.name.contains("Release") } && !keystore.isFile) {
+            throw GradleException("STARLING_ANDROID_KEYSTORE does not exist: $keystore")
+        }
     }
+}
 
 android {
     namespace = "dev.starling.mobile"

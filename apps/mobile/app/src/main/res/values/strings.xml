@@ -33,6 +33,7 @@
     <string name="device_cpu">CPU</string>
     <string name="device_gpu">GPU</string>
     <string name="on_device_last_run">Last run on %1$s: %2$.1f s of audio in %3$.2f s (%4$.1fx real time).</string>
+    <string name="on_device_memory_error">not enough free memory (the model needs about %1$d MB, %2$d MB are available). Close other apps or import a smaller model.</string>
     <string name="record_heading">Record</string>
     <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before transcription.</string>
     <string name="start_recording">Start recording</string>

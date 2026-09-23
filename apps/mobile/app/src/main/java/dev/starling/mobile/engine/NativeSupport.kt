@@ -51,11 +51,14 @@ object NativeSupport {
         val text = cpuinfo ?: return null
         val featureLines = text.lineSequence()
             .filter { it.trimStart().startsWith("Features", ignoreCase = true) }
-            .map { line -> line.substringAfter(':').trim().split(Regex("\\s+")).toSet() }
+            .map { line -> line.substringAfter(':').trim().split(Regex("\\s+")).filter(String::isNotEmpty).toSet() }
+            .filter { it.isNotEmpty() }
             .toList()
+        // An empty or missing Features field proves nothing; do not block on it.
         if (featureLines.isEmpty()) return null
-        // Big.LITTLE parts list every core; the engine's threads can land on
-        // any of them, so every core must have the features.
+        // arm64 kernels print the system-wide (all-core intersection) hwcaps
+        // on every processor line, so one line already covers big.LITTLE
+        // parts; every listed line is still checked in case a kernel differs.
         val missing = required.filter { feature -> featureLines.any { feature !in it } }
         if (missing.isEmpty()) return null
         val remedy = if ("i8mm" in missing && missing.size == 1) {

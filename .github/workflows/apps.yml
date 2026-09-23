@@ -95,9 +95,11 @@ jobs:
         working-directory: apps/mobile
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
       - name: Upload the debug APK
-        # Installable build of every PR/push for on-device testing. Debug
-        # builds are signed with the runner's ephemeral debug key, so switching
-        # between artifacts from different runs needs an uninstall first.
+        # Installable build of every push and same-repository PR for
+        # on-device testing; fork PRs (unreviewed code) get no installable
+        # artifact. Debug builds are signed with the runner's ephemeral debug
+        # key, so switching between artifacts needs an uninstall first.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: starling-mobile-debug-apk

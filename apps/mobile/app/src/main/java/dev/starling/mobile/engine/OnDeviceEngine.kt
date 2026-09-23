@@ -70,6 +70,11 @@ class OnDeviceEngine(
     var lastRun: RunStats? = null
         private set
 
+    // Guarded by [lock]: live sessions in progress, and a memory-pressure
+    // release that waits for them to end.
+    private var liveSessions = 0
+    private var releasePending = false
+
     fun hasModel(): Boolean = modelFile.isFile && modelFile.length() >= ModelFiles.MIN_MODEL_BYTES
 
     fun modelSizeBytes(): Long = if (modelFile.isFile) modelFile.length() else 0L
@@ -310,13 +315,29 @@ class OnDeviceEngine(
      * in-flight transcription). Blocking; call off the main thread. The
      * next transcription reloads the model from disk.
      *
-     * A live [OnDeviceStreamSession] is not protected: its next window
-     * reloads the model, which can take long enough for the session to fall
-     * behind and hand the recording to the batch path. That is deliberate:
-     * this is only called under memory pressure, where keeping hundreds of
-     * MB resident risks the process being killed mid-recording.
+     * While a live [OnDeviceStreamSession] runs, the release is deferred
+     * until the last session ends: unloading between its windows would force
+     * a multi-hundred-MB reload mid-recording, likely pushing the stream
+     * past its live-buffer cap. A recording is minutes at most, and the
+     * release follows it immediately.
      */
-    fun releaseWhenIdle() = synchronized(lock) { unload() }
+    fun releaseWhenIdle() = synchronized(lock) {
+        if (liveSessions > 0) releasePending = true else unload()
+    }
+
+    override fun liveSessionStarted() {
+        synchronized(lock) { liveSessions++ }
+    }
+
+    override fun liveSessionEnded() {
+        synchronized(lock) {
+            liveSessions = maxOf(0, liveSessions - 1)
+            if (liveSessions == 0 && releasePending) {
+                releasePending = false
+                unload()
+            }
+        }
+    }
 
     /** Blocking transcription of a finalized WAV recording. */
     fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {

@@ -107,9 +107,11 @@ jobs:
         run: |
           set -euo pipefail
           for value in "$KEYSTORE_BASE64" "$KEYSTORE_PASSWORD" "$KEY_PASSWORD"; do
-            [ -n "$value" ] && echo "::add-mask::$value"
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
           done
           keystore="$RUNNER_TEMP/starling-release.jks"
+          # The decoded or generated key never outlives this step, whatever fails.
+          trap 'rm -f "$keystore"' EXIT
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
             base64 --decode <<< "$KEYSTORE_BASE64" > "$keystore"
             keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null \
@@ -145,7 +147,7 @@ jobs:
           for variant in "|armv8.2-a+dotprod+fp16|no|false" "-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes|true"; do
             IFS='|' read -r suffix arch want_smmla vulkan <<< "$variant"
             tests=()
-            [ -z "$suffix" ] && tests=(testDebugUnitTest)
+            if [ -z "$suffix" ]; then tests=(testDebugUnitTest); fi
             # A stale APK from the previous variant must never be relabelled.
             rm -f "$built"
             (cd apps/mobile && ./gradlew --no-daemon "${tests[@]}" assembleRelease \
@@ -158,9 +160,17 @@ jobs:
             rm -rf "$unpacked"
             unzip -q "$built" 'lib/arm64-v8a/libggml-cpu.so' -d "$unpacked"
             objdump="$(find "$ANDROID_HOME/ndk" -path '*/bin/llvm-objdump' | sort -V | tail -1)"
-            smmla="$("$objdump" -d "$unpacked/lib/arm64-v8a/libggml-cpu.so" | grep -c smmla || true)"
-            echo "variant '${suffix:-standard}' ($arch): $smmla smmla instructions"
-            if { [ "$want_smmla" = yes ] && [ "$smmla" -eq 0 ]; } || { [ "$want_smmla" = no ] && [ "$smmla" -ne 0 ]; }; then
+            test -x "$objdump" || { echo "::error::no llvm-objdump in the NDK; cannot verify the variant"; exit 1; }
+            # Disassemble to a file first so a failing objdump fails the step
+            # instead of reading as "zero instructions" (grep -c exits 1 on 0).
+            "$objdump" -d "$unpacked/lib/arm64-v8a/libggml-cpu.so" > "$unpacked/libggml-cpu.dis"
+            sdot="$(grep -c sdot "$unpacked/libggml-cpu.dis" || true)"
+            smmla="$(grep -c smmla "$unpacked/libggml-cpu.dis" || true)"
+            echo "variant '${suffix:-standard}' ($arch): $sdot sdot, $smmla smmla instructions"
+            # Every variant targets dotprod; only the i8mm one may use SMMLA.
+            if [ "$sdot" -eq 0 ] \
+                || { [ "$want_smmla" = yes ] && [ "$smmla" -eq 0 ]; } \
+                || { [ "$want_smmla" = no ] && [ "$smmla" -ne 0 ]; }; then
               echo "::error::variant '${suffix:-standard}' was not built for $arch"
               exit 1
             fi
@@ -172,7 +182,6 @@ jobs:
             fi
             mv "$built" "dist/starling-mobile-${VERSION_NAME}${suffix}.apk"
           done
-          rm -f "$keystore"
           (cd dist && sha256sum ./*.apk | sed 's| \./| |' > SHA256SUMS-android.txt && cat SHA256SUMS-android.txt)
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

@@ -37,6 +37,10 @@ class OnDeviceStreamSession(
 
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
+
+        /** Brackets a session so the engine never unloads under a live recording. */
+        fun liveSessionStarted() = Unit
+        fun liveSessionEnded() = Unit
     }
 
     sealed interface WindowResult {
@@ -112,6 +116,7 @@ class OnDeviceStreamSession(
     }
 
     private fun run() {
+        engine.liveSessionStarted()
         try {
             runLoop()
         } catch (t: Throwable) {
@@ -119,6 +124,7 @@ class OnDeviceStreamSession(
             // fallback so the saved WAV goes through the batch path.
             lock.withLock { failLocked(t.message ?: t::class.java.simpleName, bufferLimitReached = false) }
         } finally {
+            engine.liveSessionEnded()
             emitInterruption()
         }
     }
@@ -137,7 +143,10 @@ class OnDeviceStreamSession(
         var lastPartial: String? = null
         var windowFailure: String? = null
         val tx = ChunkStreamer.Transcriber { samples, start, length ->
-            when (val result = runCatching { engine.transcribeWindow(samples.copyOfRange(start, start + length)) }
+            // The snapshot is exactly the live tail, so a window that spans all
+            // of it (every flush, most partials) is passed without a copy.
+            val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
+            when (val result = runCatching { engine.transcribeWindow(window) }
                 .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
                 is WindowResult.Text -> result.text
                 is WindowResult.Failed -> {
@@ -190,12 +199,12 @@ class OnDeviceStreamSession(
     }
 
     /**
-     * Drops finalized audio from the buffer front so memory stays bounded
-     * by the live tail. Returns the number of samples dropped.
+     * Drops finalized audio from the buffer front after every step, so the
+     * next snapshot copies only the live tail. Returns the samples dropped.
      */
     private fun trimFinalized(): Int {
         val dropped = streamer.boundary
-        if (dropped < ChunkStreamer.SAMPLE_RATE) return 0
+        if (dropped == 0) return 0
         lock.withLock {
             System.arraycopy(buffer, dropped, buffer, 0, size - dropped)
             size -= dropped

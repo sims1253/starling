@@ -14,6 +14,7 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 
@@ -29,6 +30,17 @@ import dev.starling.mobile.network.StreamSession
  * Saved recordings (including failures, for retry), and Cancel keeps the
  * audio without transcribing it. The caller's identity and extras other than
  * the prompt are not read or stored.
+ *
+ * Supported subset of the RecognizerIntent contract: EXTRA_PROMPT is shown
+ * (bounded, since any app can start this exported activity); EXTRA_LANGUAGE,
+ * EXTRA_LANGUAGE_MODEL, EXTRA_MAX_RESULTS and EXTRA_PARTIAL_RESULTS are not
+ * honored. The result is always the single verbatim final transcript, and
+ * the language is whatever the configured model detects.
+ *
+ * Threading: every method here runs on the main thread (capture stop
+ * callbacks and TranscriptionCoordinator callbacks are delivered there), so
+ * the plain fields need no synchronization; only [streamSession] is read
+ * by the capture worker.
  */
 class RecognizeSpeechActivity : Activity() {
     private val application by lazy { starlingApplication() }
@@ -48,6 +60,9 @@ class RecognizeSpeechActivity : Activity() {
     /** Set once a result has been delivered; later outcomes are store-only. */
     private var resultDelivered = false
 
+    /** The configuration this capture started with; its outcome is classified by it. */
+    private var captureConfig: BackendConfig? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_recognize_speech)
@@ -58,7 +73,10 @@ class RecognizeSpeechActivity : Activity() {
         doneButton = findViewById(R.id.recognize_done_button)
         cancelButton = findViewById(R.id.recognize_cancel_button)
         findViewById<TextView>(R.id.recognize_prompt).text =
-            intent?.getStringExtra(RecognizerIntent.EXTRA_PROMPT)?.takeIf { it.isNotBlank() }
+            intent?.getStringExtra(RecognizerIntent.EXTRA_PROMPT)
+                ?.filterNot(Char::isISOControl)
+                ?.take(MAX_PROMPT_CHARS)
+                ?.takeIf { it.isNotBlank() }
                 ?: getString(R.string.recognize_prompt)
 
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
@@ -111,6 +129,7 @@ class RecognizeSpeechActivity : Activity() {
             return
         }
         val config = application.backendSettings.load()
+        captureConfig = config
         var session: StreamSession? = null
         session = application.transcription.beginStreaming(config) { event ->
             if (streamSession === session) onStreamEvent(event)
@@ -179,7 +198,7 @@ class RecognizeSpeechActivity : Activity() {
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_finalize_error)
             return
         }
-        val config = application.backendSettings.load()
+        val config = captureConfig ?: application.backendSettings.load()
         val settled: (Recording) -> Unit = { done ->
             val outcome = RecognizeSpeechOutcome.settled(done, config.engine)
             val message = when (outcome.resultCode) {
@@ -206,8 +225,12 @@ class RecognizeSpeechActivity : Activity() {
             // transcription, and drop any live session.
             session?.close()
             capture.stop { result ->
-                if (result is CaptureResult.Completed) {
-                    runCatching { application.recordings.commitAudio(recording, result.durationSeconds) }
+                when (result) {
+                    is CaptureResult.Completed ->
+                        runCatching { application.recordings.commitAudio(recording, result.durationSeconds) }
+                    is CaptureResult.Failed ->
+                        runCatching { application.recordings.markFailed(recording.id, result.message) }
+                    CaptureResult.AlreadyStopped -> Unit
                 }
             }
         }
@@ -248,5 +271,6 @@ class RecognizeSpeechActivity : Activity() {
 
     companion object {
         private const val REQUEST_RECORD_AUDIO = 4101
+        private const val MAX_PROMPT_CHARS = 200
     }
 }
