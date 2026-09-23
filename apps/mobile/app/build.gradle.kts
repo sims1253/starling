@@ -60,7 +60,7 @@ if (releaseSigning != null) {
 
 android {
     namespace = "dev.starling.mobile"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.starling.mobile"
@@ -130,12 +130,10 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core:1.16.0")
+    implementation("androidx.core:core:1.19.0")
     // WebSocket client for the /stream live-dictation protocol; the batch
-    // upload path stays on HttpURLConnection. OkHttp 4.x is used because
-    // the 5.x Android artifact requires a newer compileSdk than this app;
-    // MockWebServer is pinned to the same line so tests exercise one
-    // implementation, not two stitched versions.
+    // upload path stays on HttpURLConnection. Keep OkHttp and MockWebServer
+    // on the same version so tests exercise one implementation.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20260814")
