@@ -16,10 +16,21 @@ import java.util.UUID
 /**
  * Owns the on-device Parakeet engine: the imported GGUF, the native model
  * context, and its warmup. The model loads lazily on first use and then
- * stays resident (hundreds of MB for a 0.6B q4 model). All calls are
- * serialized; the engine additionally mutexes inside the C API.
+ * stays resident (hundreds of MB for a 0.6B q4 model) until
+ * [releaseWhenIdle] drops it under memory pressure; the next use reloads it.
+ * All calls are serialized; the engine additionally mutexes inside the C API.
+ *
+ * [memoryGate] is consulted before each load with the model's size and
+ * returns a reason to refuse it (not enough free memory), so a load that
+ * cannot fit fails with an explanation instead of the process being killed.
+ * [nativeSupport] decides whether this CPU can run the native library at all
+ * (see [NativeSupport]); it is checked before the library is first loaded.
  */
-class OnDeviceEngine(modelDir: File) {
+class OnDeviceEngine(
+    modelDir: File,
+    private val memoryGate: (modelBytes: Long) -> String? = { null },
+    private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+) : OnDeviceStreamSession.LiveEngine {
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
 
@@ -44,6 +55,11 @@ class OnDeviceEngine(modelDir: File) {
 
     private var handle: Long = 0L
     private var loadError: String? = null
+
+    // Guarded by [lock]: live sessions in progress, and a memory-pressure
+    // release that waits for them to end.
+    private var liveSessions = 0
+    private var releasePending = false
 
     fun hasModel(): Boolean = modelFile.isFile && modelFile.length() >= ModelFiles.MIN_MODEL_BYTES
 
@@ -226,32 +242,86 @@ class OnDeviceEngine(modelDir: File) {
         }
     }
 
+    /**
+     * Loads the model when it is not resident. Caller holds [lock]. Returns
+     * null when the engine is ready, else the user-facing reason it is not.
+     */
+    private fun ensureLoadedLocked(): String? {
+        if (!hasModel()) return "Import a Parakeet model first to transcribe on this device."
+        if (handle != 0L) return null
+        nativeSupport()?.let { reason ->
+            loadError = reason
+            return "The on-device engine cannot run here: $reason"
+        }
+        memoryGate(modelSizeBytes())?.let { reason ->
+            loadError = reason
+            return "The on-device model was not loaded: $reason"
+        }
+        NativeSupport.applyThreadDefault()
+        val abi = StarlingNative.abiVersion()
+        if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
+            loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
+            return "The on-device engine is incompatible: $loadError"
+        }
+        val loaded = StarlingNative.load(modelFile.absolutePath)
+        if (loaded == 0L) {
+            val reason = StarlingNative.lastError(0L) ?: "the model could not be loaded"
+            loadError = reason
+            return "The on-device model failed to load: $reason"
+        }
+        handle = loaded
+        loadError = null
+        // Absorb lazy graph construction before the first real request,
+        // mirroring starling-serve's warmup.
+        StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE)
+        return null
+    }
+
+    /** Loads the model ahead of a live session; null when ready. Blocking. */
+    override fun prepare(): String? = synchronized(lock) { ensureLoadedLocked() }
+
+    /** One live-stream window of 16 kHz mono samples. Blocking. */
+    override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
+        ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
+        val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            ?: return OnDeviceStreamSession.WindowResult.Failed(
+                "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
+            )
+        OnDeviceStreamSession.WindowResult.Text(text)
+    }
+
+    /**
+     * Frees the resident model once no call is using it (waits for an
+     * in-flight transcription). Blocking; call off the main thread. The
+     * next transcription reloads the model from disk.
+     *
+     * While a live [OnDeviceStreamSession] runs, the release is deferred
+     * until the last session ends: unloading between its windows would force
+     * a multi-hundred-MB reload mid-recording, likely pushing the stream
+     * past its live-buffer cap. A recording is minutes at most, and the
+     * release follows it immediately.
+     */
+    fun releaseWhenIdle() = synchronized(lock) {
+        if (liveSessions > 0) releasePending = true else unload()
+    }
+
+    override fun liveSessionStarted() {
+        synchronized(lock) { liveSessions++ }
+    }
+
+    override fun liveSessionEnded() {
+        synchronized(lock) {
+            liveSessions = maxOf(0, liveSessions - 1)
+            if (liveSessions == 0 && releasePending) {
+                releasePending = false
+                unload()
+            }
+        }
+    }
+
     /** Blocking transcription of a finalized WAV recording. */
     fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
-        if (!hasModel()) {
-            return InferenceResult.Failure(
-                "Import a Parakeet model first to transcribe on this device.",
-                false,
-            )
-        }
-        if (handle == 0L) {
-            val abi = StarlingNative.abiVersion()
-            if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
-                loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
-                return InferenceResult.Failure("The on-device engine is incompatible: $loadError", false)
-            }
-            val loaded = StarlingNative.load(modelFile.absolutePath)
-            if (loaded == 0L) {
-                val reason = StarlingNative.lastError(0L) ?: "the model could not be loaded"
-                loadError = reason
-                return InferenceResult.Failure("The on-device model failed to load: $reason", false)
-            }
-            handle = loaded
-            loadError = null
-            // Absorb lazy graph construction before the first real request,
-            // mirroring starling-serve's warmup.
-            StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE)
-        }
+        ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
             ?: return InferenceResult.Failure("The recording audio could not be decoded.", false)

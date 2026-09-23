@@ -11,4 +11,7 @@
         <item name="android:navigationBarColor">@color/starling_surface</item>
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
+
+    <!-- Dark parent for the RECOGNIZE_SPEECH popup; its items live in values/styles.xml. -->
+    <style name="Base.Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Dialog.NoActionBar" />
 </resources>

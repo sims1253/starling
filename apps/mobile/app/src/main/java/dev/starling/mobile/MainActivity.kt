@@ -195,7 +195,10 @@ class MainActivity : Activity() {
     private fun importModel() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/octet-stream"
+            // No registered MIME type exists for .gguf, and providers label
+            // it inconsistently (octet-stream, empty, or a guess), so any
+            // file is offered; the import validates the GGUF itself.
+            type = "*/*"
         }
         startActivityForResult(intent, REQUEST_IMPORT_MODEL)
     }

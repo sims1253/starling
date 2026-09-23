@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
+      - uses: voidzero-dev/setup-vp@24d870228786dc83ae73482406bdd1e7befaec14 # v1.21.0
         with:
           node-version: 24
           cache: true
@@ -41,7 +41,7 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: voidzero-dev/setup-vp@9fd26ff49f9b5e6276c2b493da4454ad4527f7f4 # v1.20.0
+      - uses: voidzero-dev/setup-vp@24d870228786dc83ae73482406bdd1e7befaec14 # v1.21.0
         with:
           node-version: 24
           cache: true
@@ -80,6 +80,7 @@ jobs:
 
   android:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -89,9 +90,22 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
       - name: Build and test Android
         working-directory: apps/mobile
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Upload the debug APK
+        # Installable build of every push and same-repository PR for
+        # on-device testing; fork PRs (unreviewed code) get no installable
+        # artifact. Debug builds are signed with the runner's ephemeral debug
+        # key, so switching between artifacts needs an uninstall first.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-mobile-debug-apk
+          path: apps/mobile/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
 
   ios:
     runs-on: macos-latest

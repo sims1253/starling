@@ -7,14 +7,15 @@ request. The exact `text` returned by the server is stored as the raw
 transcript. Nothing in the client fixes numbering, removes filler words, or
 silently rewrites words such as `not`, `like`, or `auth`.
 
-While recording, the same 16 kHz chunks can also stream live over the native
-server's `WS /stream` protocol: growing partial transcripts appear in the
-recorder, become composing text in the voice keyboard, and are delivered as
-partial results through the system recognizer, and Stop commits the stream
-for the final transcript. Streaming only engages for the Starling protocol on
-a remote server (never the OpenAI-compatible route or the on-device engine)
-and under the same trusted-host rules as the batch client; otherwise the app
-records exactly as before.
+While recording, the same 16 kHz chunks are also transcribed live: growing
+partial transcripts appear in the recorder, become composing text in the voice
+keyboard, and are delivered as partial results through the system recognizer,
+and Stop finalizes the stream for the final transcript. Live transcription
+runs either on this device (the on-device engine with an imported model) or
+over the native server's `WS /stream` protocol (the Starling protocol on a
+remote server, under the same trusted-host rules as the batch client). The
+OpenAI-compatible route has no streaming; it records exactly as before and
+transcribes after Stop.
 
 The same capture flow is available from the standalone app and the optional
 Starling Voice Input keyboard. The keyboard shows a transcript first; it only
@@ -37,14 +38,69 @@ response from being inserted into a field that has changed.
 
 No Python or GPU runtime is bundled. An optional **on-device engine**
 (experimental) embeds the repository's native Parakeet engine
-(`libstarling_ggml`) for offline transcription: import a Parakeet-TDT GGUF
-(for example `models/parakeet-tdt-0.6b-v3-q4_0.gguf`) through
-**Import model (.gguf)**, then select **This device** under *Transcribe on*.
-The model stays in app-private storage and is loaded on first use; no server
-or network is needed. Server transcription remains the default. When a
-transcription fails — unreachable server or missing model — the failure is
-surfaced and the local recording remains available for retry. Building the
-app additionally requires the Android NDK and CMake SDK packages.
+(`libstarling_ggml`) for offline transcription: download a Parakeet-TDT GGUF
+from [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf)
+(`parakeet-tdt-0.6b-v3-q4_k_m.gguf`, 704 MB, is a good default), import it
+through **Import model (.gguf)**, then select **This device** under
+*Transcribe on*. The model stays in app-private storage and is loaded on first
+use; no server or network is needed. Server transcription remains the
+default. When a transcription fails — unreachable server or missing model —
+the failure is surfaced and the local recording remains available for retry.
+Building the app additionally requires the Android NDK and CMake SDK packages.
+
+The arm64 engine is built for ARMv8.2 with the dot-product and FP16
+extensions (every mainstream phone core since 2018). On older CPUs the
+on-device option reports that it cannot run instead of loading the library;
+server transcription still works there. The engine uses the performance
+cores only, and the loaded model is released when Android reports memory
+pressure (it reloads on the next use); a load that clearly cannot fit in free
+memory is refused with an explanation.
+
+## Install a release build
+
+Tagged releases carry two signed APKs, built by
+`.github/workflows/release-android.yml`:
+
+- `starling-mobile-<version>.apk` runs on every arm64 phone since about 2018.
+- `starling-mobile-<version>-i8mm.apk` is the same app whose on-device engine
+  also uses the int8 matrix-multiply instructions (faster Q4_K/Q6_K/Q8_0
+  matmuls): Pixel 8 or newer (Tensor G3+), Snapdragon 8 Gen 1 or newer,
+  Dimensity 9000 or newer. On other phones it refuses on-device
+  transcription with an explanation; use the standard APK there. Both share
+  the application id and key, so either installs over the other. Build it
+  locally with `-PstarlingArmArch=armv8.2-a+dotprod+fp16+i8mm`.
+ Open the release page on the phone,
+download the APK, and open it; Android asks once to allow installs from the
+browser or file manager. A `v*` tag attaches the APK to the regular release;
+an `android-v*` tag (for example `android-v0.1.0`) makes an APK-only
+prerelease without building the server binaries. Every CI run of the
+*Portable apps and contracts* workflow also uploads a debug APK as the
+`starling-mobile-debug-apk` artifact; its native engine is unoptimized, so use
+a release APK to judge on-device speed.
+
+Releases are signed with the key in the repository secrets
+`STARLING_ANDROID_KEYSTORE_BASE64`, `STARLING_ANDROID_KEYSTORE_PASSWORD`,
+`STARLING_ANDROID_KEY_ALIAS`, and `STARLING_ANDROID_KEY_PASSWORD`. Create the
+key once and keep it: Android only installs an update over an app signed by
+the same key.
+
+```bash
+keytool -genkeypair -keystore starling-release.jks -storetype PKCS12 \
+  -alias starling -keyalg RSA -keysize 3072 -validity 10000 \
+  -dname "CN=Starling Mobile"
+gh secret set STARLING_ANDROID_KEYSTORE_BASE64 < <(base64 -w0 starling-release.jks)
+gh secret set STARLING_ANDROID_KEYSTORE_PASSWORD
+gh secret set STARLING_ANDROID_KEY_ALIAS --body starling
+gh secret set STARLING_ANDROID_KEY_PASSWORD   # same as the store password for PKCS12
+```
+
+Without these secrets, `v*` releases fail to build, and `android-v*` test
+builds are signed with a throwaway key per release, so installing a later one
+needs an uninstall first (which deletes the app's recordings and model).
+
+Local release builds read the same four values from `STARLING_ANDROID_*`
+environment variables (`STARLING_ANDROID_KEYSTORE` is the keystore path);
+without them `assembleRelease` produces an unsigned APK.
 
 ## Build and run
 
@@ -57,7 +113,9 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Open **Starling Mobile**, grant microphone access, enter the server URL, choose
-the API protocol, and tap **Save connection**. The default protocol is the
+the API protocol, and tap **Save connection**. `starling-serve` binds to
+`127.0.0.1` by default; start it with `--host 0.0.0.0` (or the machine's LAN
+or Tailscale address) so the phone can reach it. The default protocol is the
 legacy Starling route. OpenAI-compatible mode requires the model slug served by
 the process (the native `/v1/models` response shows it). The default transport
 is HTTPS. For a local development server using the documented default HTTP
@@ -121,6 +179,13 @@ batch transcription of the saved WAV completes. Every dictation stays visible
 in Saved recordings, including failed transcriptions, so it can be retried or
 deleted there.
 
+Apps that ask the system for speech input with
+`RecognizerIntent.ACTION_RECOGNIZE_SPEECH` (a microphone button that opens a
+"speak now" popup) can pick Starling too: a small dialog starts listening at
+once, shows live partials, and returns the verbatim transcript when you tap
+**Done**. **Cancel** keeps the audio in Saved recordings without transcribing
+it.
+
 ## API compatibility
 
 Starling legacy mode sends a multipart field named `file` to `/inference`,
@@ -143,8 +208,9 @@ adapter without sending OpenAI fields to the legacy route.
 This directory contains the Android app. The sibling standalone iOS recorder is
 at `../ios`, and the desktop client is at `../desktop`. The
 Android app does not provide an iOS keyboard extension; its system-wide voice
-keyboard is Android-specific. Background recording, push-to-talk hardware
-integration, and embedded native inference remain future extensions. Live
-streaming follows the `WS /stream` contract in `../../docs/native-serving.md`;
-it requires a native Starling server. The app does not ship model weights or
+keyboard is Android-specific. Background recording and push-to-talk hardware
+integration remain future extensions. Server live streaming follows the
+`WS /stream` contract in `../../docs/native-serving.md` and requires a native
+Starling server; on-device live transcription uses the same window geometry
+(12 s windows, 3 s overlap, word stitching) with partials about every second. The app does not ship model weights or
 third-party/copyrighted application code.

@@ -3,6 +3,7 @@ package dev.starling.mobile.network
 import android.os.Handler
 import android.os.Looper
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
@@ -44,7 +45,7 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val completed = transcribeAudio(queued, config)
+                val completed = settleOrFail(id) { transcribeAudio(queued, config) }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
@@ -54,12 +55,13 @@ class TranscriptionCoordinator(
     }
 
     /**
-     * Opens a live `WS /stream` session for a capture that is about to
-     * start, when the configuration supports one: the Starling protocol on a
-     * remote server whose endpoint passes the trusted-host policy. Returns
-     * null otherwise (OpenAI-shaped endpoints, the on-device engine, or a
-     * rejected endpoint) and the caller records exactly as before, without
-     * streaming.
+     * Opens a live session for a capture that is about to start, when the
+     * configuration supports one: on-device live transcription when the
+     * on-device engine is selected and a model is imported, or a `WS /stream`
+     * session for the Starling protocol on a remote server whose endpoint
+     * passes the trusted-host policy. Returns null otherwise (OpenAI-shaped
+     * endpoints, no imported model, or a rejected endpoint) and the caller
+     * records exactly as before, without streaming.
      *
      * [onEvent] is invoked on the main thread: [StreamEvent.Live] once audio
      * is accepted, growing [StreamEvent.Partial] transcripts while
@@ -73,11 +75,11 @@ class TranscriptionCoordinator(
         config: BackendConfig = settings.load(),
         onEvent: (StreamEvent) -> Unit = {},
     ): StreamSession? {
+        val post: (StreamEvent) -> Unit = { event -> mainHandler.post { onEvent(event) } }
+        if (config.engine == TranscriptionEngine.ON_DEVICE) return onDevice.beginStreaming(post)
         if (!streamingEligible(config)) return null
         val url = streamUrl(config.endpoint, config.allowTrustedLanHttp) ?: return null
-        return streamClient.connect(url) { event ->
-            mainHandler.post { onEvent(event) }
-        }
+        return streamClient.connect(url, post)
     }
 
     /**
@@ -104,7 +106,7 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val completed = when (val outcome = session.finish()) {
+                val completed = settleOrFail(id) { when (val outcome = session.finish()) {
                     is CommitOutcome.Final -> runCatching {
                         store.markTranscribed(id, outcome.text, TranscriptionProvenance.LIVE_STREAM)
                     }.getOrElse {
@@ -114,7 +116,7 @@ class TranscriptionCoordinator(
                         // The stream is unusable; the durable WAV is the
                         // source of truth, so batch-upload it like a retry.
                         transcribeAudio(queued, config)
-                }
+                } }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
@@ -156,6 +158,33 @@ class TranscriptionCoordinator(
         }
     }
 
+    /**
+     * Runs one transcription attempt so that the caller's callback always
+     * fires: an unexpected exception (unreadable audio, an engine that throws
+     * instead of returning a failure) settles the recording as failed and
+     * retryable instead of leaving the caller waiting forever.
+     */
+    private inline fun settleOrFail(id: String, attempt: () -> Recording): Recording =
+        try {
+            attempt()
+        } catch (e: Throwable) {
+            // Throwable, not Exception: an OutOfMemoryError while decoding a
+            // long recording must still settle the recording and the callback.
+            val message = "Transcription failed unexpectedly: ${e.message ?: e::class.java.simpleName}"
+            runCatching { store.markFailed(id, message) }
+                .recoverCatching { store.get(id).copy(errorMessage = message) }
+                .getOrElse {
+                    // The store itself is failing; the callback still gets a failed recording.
+                    Recording(
+                        id = id,
+                        createdAtMillis = 0L,
+                        wavName = "",
+                        status = RecordingStatus.FAILED,
+                        errorMessage = message,
+                    )
+                }
+        }
+
     private fun callbackFailure(id: String, message: String, callback: (Recording) -> Unit) {
         val failed = runCatching { store.markFailed(id, message) }.getOrNull()
         if (failed != null) {
@@ -165,9 +194,9 @@ class TranscriptionCoordinator(
 
     companion object {
         /**
-         * Only the Starling protocol's `WS /stream` is streamed. OpenAI-shaped
-         * endpoints have no streaming route, and the on-device engine
-         * transcribes from the file by design.
+         * Whether a remote configuration streams over `WS /stream`: only the
+         * Starling protocol has that route; OpenAI-shaped endpoints do not.
+         * The on-device engine streams locally instead (see [beginStreaming]).
          */
         internal fun streamingEligible(config: BackendConfig): Boolean =
             config.engine == TranscriptionEngine.REMOTE && config.protocol == BackendProtocol.STARLING
