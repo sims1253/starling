@@ -43,9 +43,11 @@ class StarlingApplication : Application() {
 
     /**
      * Resource budget for the on-device model (E13): the resident model is
-     * hundreds of MB of native memory, so it is released when the system
-     * reports real pressure or the app's UI has gone to the background for
-     * long enough to be trimmed. The next transcription reloads it.
+     * hundreds of MB of native memory, so it is released under real pressure
+     * (TRIM_MEMORY_RUNNING_CRITICAL) or once the process is in the background
+     * LRU list (TRIM_MEMORY_BACKGROUND and above). Merely hiding the UI
+     * (TRIM_MEMORY_UI_HIDDEN) keeps it, so switching apps mid-dictation does
+     * not force a reload. The next transcription reloads it.
      */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)

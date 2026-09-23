@@ -75,10 +75,11 @@ class ChunkStreamer(
         if (!finalized && (throttled || tailLength < min)) return null
 
         if (tailLength > 0 && tailLength >= min) {
-            // Only a tail transcription starts the throttle interval; a step
-            // that merely finalized a window must not delay the next partial.
-            lastEmit = now
             val text = tx.transcribe(samples, boundary, tailLength) ?: return committedText
+            // Only a successful tail transcription starts the throttle
+            // interval; a step that merely finalized a window must not delay
+            // the next partial.
+            lastEmit = now
             return join(ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords))
         }
         return committedText
@@ -89,7 +90,9 @@ class ChunkStreamer(
         finalizeFullWindows(samples, size, tx)
         val tailLength = size - boundary
         if (tailLength == 0) return join(committed)
-        if (tailLength < 0 || tailLength >= chunk) return null
+        // A full window still in the tail means finalizeFullWindows stopped on
+        // an engine failure (it never advances past a failed window).
+        if (tailLength >= chunk) return null
         val text = tx.transcribe(samples, boundary, tailLength) ?: return null
         committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)
         boundary = size

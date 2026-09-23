@@ -24,7 +24,10 @@ object RecognizeSpeechOutcome {
             completed.status == RecordingStatus.TRANSCRIBED && text != null ->
                 if (text.isBlank()) Outcome(RecognizerIntent.RESULT_NO_MATCH) else Outcome(Activity.RESULT_OK, text)
             // A local engine problem (missing model, load failure) is the
-            // client's; everything on the server path is reported as network.
+            // client's. Every failure on the server path is reported as
+            // RESULT_NETWORK_ERROR: the app has no finer server error model
+            // (the batch client retries transient failures itself), and the
+            // recording stays retryable in Starling Mobile either way.
             engine == TranscriptionEngine.ON_DEVICE -> Outcome(RecognizerIntent.RESULT_CLIENT_ERROR)
             else -> Outcome(RecognizerIntent.RESULT_NETWORK_ERROR)
         }

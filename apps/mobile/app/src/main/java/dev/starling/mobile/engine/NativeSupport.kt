@@ -78,15 +78,20 @@ object NativeSupport {
      */
     fun applyThreadDefault() {
         if (threadsApplied) return
-        threadsApplied = true
-        if (!System.getenv(THREADS_ENV).isNullOrEmpty()) return
+        if (!System.getenv(THREADS_ENV).isNullOrEmpty()) {
+            threadsApplied = true
+            return
+        }
         val maxFrequencies = (0 until Runtime.getRuntime().availableProcessors()).mapNotNull { cpu ->
             runCatching {
                 File("/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq").readText().trim().toLong()
             }.getOrNull()
         }
         val threads = performanceCores(maxFrequencies, Runtime.getRuntime().availableProcessors())
+        // Marked applied only once the variable is really set, so a failed
+        // setenv is retried before the next load instead of skipped forever.
         runCatching { Os.setenv(THREADS_ENV, threads.toString(), false) }
+            .onSuccess { threadsApplied = true }
     }
 
     /**
