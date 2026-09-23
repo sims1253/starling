@@ -101,10 +101,12 @@ ggml_backend_buffer_type_t repack_buffer_type() {
 // which derives a repack buffer from a plain CPU buffer the same way; the
 // hooks are taken from a probe buffer of the real type rather than copied.
 //
-// Safety of borrowing the probe's hooks after freeing it: at the pinned ggml
-// (repack.cpp) init_tensor and set_tensor are static functions that only read
-// the tensor (type, shape, ->extra) and never buffer->context, so they do not
-// depend on the probe's lifetime. Re-check when bumping the ggml pin.
+// Borrowing the probe's hooks after freeing it is safe: the hooks are always
+// invoked with the alias itself (`alias->iface.init_tensor(alias, t)`), so
+// anything they read from `buffer` is the alias's own state, and a CPU
+// buffer's context is its data pointer (exactly as in ggml's own repack
+// buffers, which are CPU buffers too). The probe only donates function
+// pointers. At the pinned ggml the hooks read only the tensor anyway.
 ggml_backend_buffer_t make_alias(ggml_backend_buffer_t plain) {
     ggml_backend_buffer_type_t buft = repack_buffer_type();
     if (!buft) return nullptr;
