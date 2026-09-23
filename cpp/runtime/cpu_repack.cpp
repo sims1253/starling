@@ -156,6 +156,11 @@ bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* we
 }
 
 bool try_repack(State& s, Region& r, ggml_tensor* w) {
+    // Allocate the temporary copy before changing the tensor. If allocation
+    // fails, the plain buffer and bytes are still usable by the caller.
+    const size_t n = ggml_nbytes(w);
+    std::vector<uint8_t> original(n);
+    std::memcpy(original.data(), w->data, n);
     w->buffer = r.alias;
     w->extra = nullptr;
     if (r.alias->iface.init_tensor) r.alias->iface.init_tensor(r.alias, w);
@@ -163,9 +168,6 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
         w->buffer = r.plain;
         return false;
     }
-    const size_t n = ggml_nbytes(w);
-    std::vector<uint8_t> original(n);
-    std::memcpy(original.data(), w->data, n);
     // Dispatches to the CPU_REPACK set_tensor: rewrites w->data in place.
     ggml_backend_tensor_set(w, original.data(), 0, n);
     s.repacked[w] = w->extra;
@@ -215,8 +217,9 @@ void detach(ggml_backend_buffer* buffer) {
     for (size_t i = 0; i < s.regions.size(); ++i) {
         Region& r = s.regions[i];
         if (r.plain != buffer) continue;
-        // The loader is about to reset every tensor's buffer; the repack
-        // decision itself stays in `repacked` (the bytes are still repacked).
+        // Called under runtime_mutex immediately before the loader frees the
+        // plain buffer and clears its tensor buffers. No graph can run in
+        // this detach-to-attach window; the repack decision and bytes remain.
         for (auto& entry : s.repacked) {
             ggml_tensor* t = entry.first;
             if (t->buffer == r.alias) t->buffer = r.plain;

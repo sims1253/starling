@@ -90,7 +90,7 @@ jobs:
 
       - name: Repacked vs plain MUL_MAT on arm64
         env:
-          STARLING_REPACK_TEST_EXPECT: q4_0,q4_K,q5_K,q6_K,q8_0,iq4_nl
+          STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,q5_K,q6_K,q8_0,iq4_nl'
         run: ./build/cpu_repack_test
 
       - name: Quantized Parakeet regression with repacking forced on
@@ -111,15 +111,6 @@ jobs:
       - name: Build (CPU)
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          # The engine-contract targets (device_cache_clear_test,
-          # greedy_termination_test, ...) land with the optimization-program
-          # branches; build them only where their sources exist so this
-          # workflow stays green on branches without them.
-          ENGINE_TESTS=""
-          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -f "cpp/tests/$t.cpp" ]; then ENGINE_TESTS="$ENGINE_TESTS $t"; fi
-          done
-          # shellcheck disable=SC2086
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
             audex_loader_guard_test granite_stage_test model_lifetime_test \
@@ -127,7 +118,8 @@ jobs:
             parakeet_compact_engine_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
-            replay_graph_support_test cpu_repack_test$ENGINE_TESTS
+            replay_graph_support_test cpu_repack_test \
+            device_cache_clear_test greedy_termination_test tdt_graph_budget_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -144,12 +136,11 @@ jobs:
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01) and EOS/budget termination semantics (S03). Both are
-      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed);
-      # run them only where their binaries were built (see Build (CPU)).
+      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed).
       - name: Engine contract tests (KV clearing, termination semantics)
         run: |
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -x "build/$t" ]; then "./build/$t"; fi
+            "./build/$t"
           done
 
       # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
@@ -203,7 +194,7 @@ jobs:
         env:
           STARLING_GGML_CPU_REPACK: '1'
           # The AVX2 repack kernels at the pinned ggml (q5_K/q6_K/q8_0 have none).
-          STARLING_REPACK_TEST_EXPECT: q4_0,q4_K,iq4_nl
+          STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,iq4_nl'
         run: |
           ./build/cpu_repack_test
           ./build/parakeet_compact_engine_test
@@ -212,10 +203,7 @@ jobs:
           ./build/replay_graph_support_test
           ./build/granite_trace_test
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -f "cpp/tests/$t.cpp" ]; then
-              test -x "build/$t" || { echo "::error::missing test binary: $t"; exit 1; }
-              "./build/$t"
-            fi
+            "./build/$t"
           done
 
       - name: Model lifetime and quantized decoding sanitizers
