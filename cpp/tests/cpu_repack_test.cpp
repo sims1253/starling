@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -94,21 +95,23 @@ std::vector<float> random_input(size_t n, uint32_t seed) {
 std::vector<float> run(ggml_backend_t backend,
                        const std::function<ggml_tensor*(ggml_context*, std::vector<std::pair<ggml_tensor*, const void*>>&)>& build) {
     ggml_init_params params = {ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true};
-    ggml_context* ctx = ggml_init(params);
+    // Owned so the expected-throw paths (a guarded view) release them too.
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_owner(ggml_init(params), ggml_free);
+    ggml_context* ctx = ctx_owner.get();
     std::vector<std::pair<ggml_tensor*, const void*>> inputs;
     ggml_tensor* out = build(ctx, inputs);
     ggml_set_output(out);
     ggml_cgraph* gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
     repack::prepare_graph(gf);  // the Backend::compute hook
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> galloc_owner(
+        ggml_gallocr_new(ggml_backend_cpu_buffer_type()), ggml_gallocr_free);
+    ggml_gallocr_t galloc = galloc_owner.get();
     if (!ggml_gallocr_alloc_graph(galloc, gf)) throw std::runtime_error("alloc failed");
     for (auto& [t, host] : inputs) ggml_backend_tensor_set(t, host, 0, ggml_nbytes(t));
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("compute failed");
     std::vector<float> result((size_t)ggml_nelements(out));
     ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx);
     return result;
 }
 
@@ -144,6 +147,19 @@ void test_type(ggml_backend_t backend, ggml_type type) {
     const auto x_batch = random_input((size_t)K * 37, 11);  // 37 rows: not a multiple of 4/8
     const auto x_single = random_input((size_t)K, 13);
 
+    // Negative control for the view guard below: before anything is
+    // attached, a view of the same weight computes normally.
+    const auto view_graph = [&](ggml_context* ctx, auto&) {
+        return ggml_cont(ctx, ggml_view_2d(ctx, w.w, K, 1, w.w->nb[1], 0));
+    };
+    bool plain_view_ok = true;
+    try {
+        run(backend, view_graph);
+    } catch (const std::exception&) {
+        plain_view_ok = false;
+    }
+    check(plain_view_ok, tag + " view of a plain (unattached) weight computes");
+
     // Reference: the weight's buffer is not attached, so nothing repacks.
     const auto ref_batch = mul_mat(backend, w.w, x_batch, K, 37);
     const auto ref_single = mul_mat(backend, w.w, x_single, K, 1);
@@ -171,9 +187,7 @@ void test_type(ggml_backend_t backend, ggml_type type) {
         // A view of a repacked weight must be refused, not computed.
         bool threw = false;
         try {
-            run(backend, [&](ggml_context* ctx, auto&) {
-                return ggml_cont(ctx, ggml_view_2d(ctx, w.w, K, 1, w.w->nb[1], 0));
-            });
+            run(backend, view_graph);
         } catch (const std::runtime_error& e) {
             threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
         }
@@ -220,6 +234,10 @@ int main() {
 #endif
     check(repack::enabled(), "STARLING_GGML_CPU_REPACK=1 enables repacking");
     ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        std::printf("FAIL ggml_backend_cpu_init returned null\n");
+        return 1;
+    }
     ggml_backend_cpu_set_n_threads(backend, 4);
     try {
         for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K}) {

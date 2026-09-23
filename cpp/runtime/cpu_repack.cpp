@@ -179,6 +179,11 @@ void attach(ggml_backend_buffer* buffer) {
     if (!enabled() || !buffer) return;
     State& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
+    // Idempotent per buffer: a second attach without a detach in between
+    // must not stack a second alias over the same memory.
+    for (const Region& existing : s.regions) {
+        if (existing.plain == buffer) return;
+    }
     Region r;
     r.plain = buffer;
     r.alias = make_alias(buffer);
