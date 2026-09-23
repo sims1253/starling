@@ -12,9 +12,6 @@
         <item name="android:windowBackground">@color/starling_surface</item>
     </style>
 
-    <!-- The RECOGNIZE_SPEECH popup floats over the calling app. -->
-    <style name="Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Dialog.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">@color/starling_accent</item>
-    </style>
+    <!-- Dark parent for the RECOGNIZE_SPEECH popup; its items live in values/styles.xml. -->
+    <style name="Base.Theme.StarlingMobile.Dialog" parent="android:style/Theme.Material.Dialog.NoActionBar" />
 </resources>

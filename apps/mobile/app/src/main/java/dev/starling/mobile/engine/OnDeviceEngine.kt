@@ -278,7 +278,7 @@ class OnDeviceEngine(
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-        val text = StarlingNative.transcribe(handle, samples, WavWriterContract.SAMPLE_RATE)
+        val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
             ?: return OnDeviceStreamSession.WindowResult.Failed(
                 "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
             )
@@ -289,6 +289,12 @@ class OnDeviceEngine(
      * Frees the resident model once no call is using it (waits for an
      * in-flight transcription). Blocking; call off the main thread. The
      * next transcription reloads the model from disk.
+     *
+     * A live [OnDeviceStreamSession] is not protected: its next window
+     * reloads the model, which can take long enough for the session to fall
+     * behind and hand the recording to the batch path. That is deliberate:
+     * this is only called under memory pressure, where keeping hundreds of
+     * MB resident risks the process being killed mid-recording.
      */
     fun releaseWhenIdle() = synchronized(lock) { unload() }
 

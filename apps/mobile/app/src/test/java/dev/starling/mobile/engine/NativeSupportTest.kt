@@ -45,6 +45,7 @@ class NativeSupportTest {
     @Test
     fun otherArchitecturesAndUnreadableCpuinfoAreNotBlocked() {
         assertNull(NativeSupport.unsupportedReason("x86_64", cortexA53, required))
+        assertNotNull(NativeSupport.unsupportedReason("armv8l", modern, required))
         assertNull(NativeSupport.unsupportedReason("aarch64", null, required))
         assertNull(NativeSupport.unsupportedReason("aarch64", "processor\t: 0\n", required))
     }

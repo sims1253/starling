@@ -57,6 +57,12 @@ class OnDeviceStreamSession(
     private var failure: String? = null
     private var outcome: CommitOutcome? = null
 
+    // The Interrupted event of a failure, emitted once by the worker thread:
+    // a failure noticed on the capture thread (the buffer cap) is recorded
+    // there but reported from the worker, so every event comes from one thread.
+    private var interruption: StreamEvent.Interrupted? = null
+    private var interruptionEmitted = false
+
     private val worker = Thread(::run, "starling-on-device-stream").apply { isDaemon = true }
 
     fun start(): OnDeviceStreamSession = apply { worker.start() }
@@ -94,7 +100,7 @@ class OnDeviceStreamSession(
             changed.signalAll()
         }
         settled.await()
-        return lock.withLock { outcome!! }
+        return lock.withLock { requireNotNull(outcome) { "stream settled without an outcome" } }
     }
 
     override fun close() {
@@ -106,6 +112,18 @@ class OnDeviceStreamSession(
     }
 
     private fun run() {
+        try {
+            runLoop()
+        } catch (t: Throwable) {
+            // Whatever broke, finish() must never block forever: settle as a
+            // fallback so the saved WAV goes through the batch path.
+            lock.withLock { failLocked(t.message ?: t::class.java.simpleName, bufferLimitReached = false) }
+        } finally {
+            emitInterruption()
+        }
+    }
+
+    private fun runLoop() {
         val loadError = runCatching { engine.prepare() }.getOrElse { it.message ?: it::class.java.simpleName }
         if (loadError != null) {
             lock.withLock { failLocked(loadError, bufferLimitReached = false) }
@@ -117,6 +135,17 @@ class OnDeviceStreamSession(
 
         var steppedSize = -1
         var lastPartial: String? = null
+        var windowFailure: String? = null
+        val tx = ChunkStreamer.Transcriber { samples, start, length ->
+            when (val result = runCatching { engine.transcribeWindow(samples.copyOfRange(start, start + length)) }
+                .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
+                is WindowResult.Text -> result.text
+                is WindowResult.Failed -> {
+                    windowFailure = result.reason
+                    null
+                }
+            }
+        }
         while (true) {
             val snapshot: FloatArray
             val snapshotSize: Int
@@ -131,18 +160,7 @@ class OnDeviceStreamSession(
                 snapshotSize = size
             }
             steppedSize = snapshotSize
-
-            var windowFailure: String? = null
-            val tx = ChunkStreamer.Transcriber { samples, start, length ->
-                when (val result = runCatching { engine.transcribeWindow(samples.copyOfRange(start, start + length)) }
-                    .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
-                    is WindowResult.Text -> result.text
-                    is WindowResult.Failed -> {
-                        windowFailure = result.reason
-                        null
-                    }
-                }
-            }
+            windowFailure = null
 
             if (ending) {
                 val text = streamer.flush(snapshot, snapshotSize, tx)
@@ -194,12 +212,23 @@ class OnDeviceStreamSession(
 
     private fun acceptsAudioLocked(): Boolean = !closed && !inputEnded && failure == null
 
+    /** Records a failure and wakes the worker, which reports it (see [emitInterruption]). */
     private fun failLocked(reason: String, bufferLimitReached: Boolean) {
         if (failure != null || outcome != null) return
         failure = reason
+        if (!closed) interruption = StreamEvent.Interrupted(reason, bufferLimitReached)
         settleLocked(CommitOutcome.Fallback(reason))
         changed.signalAll()
-        if (!closed) events(StreamEvent.Interrupted(reason, bufferLimitReached))
+    }
+
+    /** Worker thread only, outside the lock: reports a recorded failure once. */
+    private fun emitInterruption() {
+        val event = lock.withLock {
+            if (interruptionEmitted || closed) return
+            interruptionEmitted = true
+            interruption
+        } ?: return
+        events(event)
     }
 
     private fun settleLocked(result: CommitOutcome) {

@@ -80,6 +80,7 @@ jobs:
 
   android:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -89,6 +90,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
       - name: Build and test Android
         working-directory: apps/mobile
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug

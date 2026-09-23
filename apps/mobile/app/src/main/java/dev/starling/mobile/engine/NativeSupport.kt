@@ -37,7 +37,16 @@ object NativeSupport {
         cpuinfo: String?,
         required: List<String> = REQUIRED_ARM64_FEATURES,
     ): String? {
-        if (osArch != "aarch64") return null
+        when (osArch) {
+            "aarch64" -> Unit
+            // The x86_64 library (emulators, Chromebooks) is built without
+            // extra ISA requirements.
+            "x86_64", "amd64" -> return null
+            // The APK ships arm64-v8a and x86_64 only; anything else cannot
+            // load the engine at all.
+            else -> return "the on-device engine is built for 64-bit ARM and x86_64 only " +
+                "(this device reports $osArch). Use a Starling server instead."
+        }
         // Unreadable cpuinfo proves nothing either way; do not block on it.
         val text = cpuinfo ?: return null
         val featureLines = text.lineSequence()

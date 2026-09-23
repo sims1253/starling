@@ -10,6 +10,8 @@ import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.TranscriptionCoordinator
 import dev.starling.mobile.storage.RecordingStore
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class StarlingApplication : Application() {
     lateinit var recordings: RecordingStore
@@ -20,6 +22,12 @@ class StarlingApplication : Application() {
         private set
     lateinit var onDeviceEngine: OnDeviceEngine
         private set
+
+    // One worker for releases: repeated trims while a transcription holds the
+    // engine queue behind each other instead of stacking waiting threads.
+    private val releaseExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "starling-model-release").apply { isDaemon = true }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -56,13 +64,15 @@ class StarlingApplication : Application() {
 
     // releaseWhenIdle waits for an in-flight transcription; never on the main thread.
     private fun releaseOnDeviceModel() {
-        Thread({ onDeviceEngine.releaseWhenIdle() }, "starling-model-release").apply { isDaemon = true }.start()
+        releaseExecutor.execute { onDeviceEngine.releaseWhenIdle() }
     }
 
     /**
-     * Refuses a model load that cannot fit: the model's file size is a lower
-     * bound on its resident size, so loading it with less memory available
-     * would only end with the process killed mid-load.
+     * Refuses a model load that clearly cannot fit: the model's file size is
+     * a lower bound on its resident size, so loading it with less memory
+     * available would only end with the process killed mid-load. Advisory
+     * only: free memory can still drop between this check and the load, and
+     * the working-set allowance is an estimate for the Parakeet 0.6B class.
      */
     private fun memoryGate(modelBytes: Long): String? {
         val manager = getSystemService(ActivityManager::class.java) ?: return null

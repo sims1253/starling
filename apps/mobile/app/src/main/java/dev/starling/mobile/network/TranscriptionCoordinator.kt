@@ -3,6 +3,7 @@ package dev.starling.mobile.network
 import android.os.Handler
 import android.os.Looper
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
@@ -44,7 +45,7 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val completed = transcribeAudio(queued, config)
+                val completed = settleOrFail(id) { transcribeAudio(queued, config) }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
@@ -105,7 +106,7 @@ class TranscriptionCoordinator(
         }
         executor.execute {
             try {
-                val completed = when (val outcome = session.finish()) {
+                val completed = settleOrFail(id) { when (val outcome = session.finish()) {
                     is CommitOutcome.Final -> runCatching {
                         store.markTranscribed(id, outcome.text, TranscriptionProvenance.LIVE_STREAM)
                     }.getOrElse {
@@ -115,7 +116,7 @@ class TranscriptionCoordinator(
                         // The stream is unusable; the durable WAV is the
                         // source of truth, so batch-upload it like a retry.
                         transcribeAudio(queued, config)
-                }
+                } }
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
@@ -156,6 +157,25 @@ class TranscriptionCoordinator(
             }
         }
     }
+
+    /**
+     * Runs one transcription attempt so that the caller's callback always
+     * fires: an unexpected exception (unreadable audio, an engine that throws
+     * instead of returning a failure) settles the recording as failed and
+     * retryable instead of leaving the caller waiting forever.
+     */
+    private inline fun settleOrFail(id: String, attempt: () -> Recording): Recording =
+        try {
+            attempt()
+        } catch (e: Exception) {
+            val message = "Transcription failed unexpectedly: ${e.message ?: e::class.java.simpleName}"
+            runCatching { store.markFailed(id, message) }
+                .recoverCatching { store.get(id).copy(errorMessage = message) }
+                .getOrElse {
+                    // The store itself is failing; the callback still gets a failed recording.
+                    Recording(id, 0L, "", RecordingStatus.FAILED, errorMessage = message)
+                }
+        }
 
     private fun callbackFailure(id: String, message: String, callback: (Recording) -> Unit) {
         val failed = runCatching { store.markFailed(id, message) }.getOrNull()

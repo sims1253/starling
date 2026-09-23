@@ -73,9 +73,11 @@ class ChunkStreamer(
         if (tailLength >= chunk) return committedText()
         val throttled = (now - lastEmit) < partialIntervalSeconds
         if (!finalized && (throttled || tailLength < min)) return null
-        lastEmit = now
 
         if (tailLength > 0 && tailLength >= min) {
+            // Only a tail transcription starts the throttle interval; a step
+            // that merely finalized a window must not delay the next partial.
+            lastEmit = now
             val text = tx.transcribe(samples, boundary, tailLength) ?: return committedText()
             return join(ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords))
         }

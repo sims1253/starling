@@ -118,6 +118,38 @@ class OnDeviceStreamSessionTest {
     }
 
     @Test
+    fun aCrashOutsideTheEngineStillSettlesFinish() {
+        val session = OnDeviceStreamSession(
+            engine = FakeEngine(),
+            events = { events += it },
+            streamer = ChunkStreamer(minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            clock = { throw IllegalStateException("clock broke") },
+        ).start()
+        val chunk = pcm(1.0)
+        session.onAudio(chunk, chunk.size)
+
+        val interrupted = awaitEvent { it is StreamEvent.Interrupted } as StreamEvent.Interrupted
+        assertEquals("clock broke", interrupted.reason)
+        assertEquals(CommitOutcome.Fallback("clock broke"), session.finish())
+    }
+
+    @Test
+    fun aBufferCapTrippedOnTheCaptureThreadIsReportedFromTheWorker() {
+        val threads = CopyOnWriteArrayList<String>()
+        val session = OnDeviceStreamSession(
+            engine = FakeEngine(),
+            events = { events += it; threads += Thread.currentThread().name },
+            maxLiveSamples = ChunkStreamer.SAMPLE_RATE,
+        ).start()
+        val chunk = pcm(2.0)
+        session.onAudio(chunk, chunk.size)
+
+        awaitEvent { it is StreamEvent.Interrupted }
+        assertTrue(threads.all { it == "starling-on-device-stream" })
+        assertEquals(1, events.count { it is StreamEvent.Interrupted })
+    }
+
+    @Test
     fun closeSettlesAPendingFinishWithoutAFinal() {
         val session = session(FakeEngine())
         session.close()

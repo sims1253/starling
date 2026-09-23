@@ -89,8 +89,10 @@ class RecognizeSpeechActivity : Activity() {
 
     override fun onStop() {
         // Never keep the microphone open behind another app. Leaving counts
-        // as Done: the audio is saved and transcribed into Saved recordings,
-        // and the result still reaches the caller if it is still waiting.
+        // as Done: the audio is saved and transcribed into Saved recordings.
+        // The caller only gets the transcript if this dialog is still alive
+        // when it settles; otherwise it sees RESULT_CANCELED and the
+        // transcript stays retrievable in Starling Mobile.
         if (activeRecording != null) stopAndTranscribe()
         super.onStop()
     }
@@ -101,6 +103,9 @@ class RecognizeSpeechActivity : Activity() {
     }
 
     private fun beginCapture() {
+        // A permission grant can land after Cancel already finished the
+        // dialog; never open the microphone behind a dead dialog.
+        if (isFinishing || isDestroyed || resultDelivered) return
         val recording = runCatching { application.recordings.create() }.getOrElse {
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_storage_error)
             return
@@ -127,7 +132,7 @@ class RecognizeSpeechActivity : Activity() {
     }
 
     private fun onStreamEvent(event: StreamEvent) {
-        if (isDestroyed) return
+        if (isDestroyed || isFinishing) return
         when (event) {
             StreamEvent.Live -> Unit
             is StreamEvent.Partial -> {
@@ -206,8 +211,12 @@ class RecognizeSpeechActivity : Activity() {
                 }
             }
         }
-        resultDelivered = true
-        setResult(RESULT_CANCELED)
+        // Dismissing an error screen keeps the error code already set for
+        // the caller; RESULT_CANCELED is only for a genuine user cancel.
+        if (!resultDelivered) {
+            resultDelivered = true
+            setResult(RESULT_CANCELED)
+        }
         finish()
     }
 
@@ -218,15 +227,18 @@ class RecognizeSpeechActivity : Activity() {
     private fun deliver(outcome: RecognizeSpeechOutcome.Outcome, messageRes: Int?, detail: String? = null) {
         if (resultDelivered) return
         resultDelivered = true
-        if (outcome.resultCode == RESULT_OK && outcome.transcript != null) {
+        val transcript = outcome.transcript
+        if (outcome.resultCode == RESULT_OK && !transcript.isNullOrBlank()) {
             setResult(
                 RESULT_OK,
-                Intent().putStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS, arrayListOf(outcome.transcript)),
+                Intent().putStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS, arrayListOf(transcript)),
             )
             if (!isFinishing) finish()
             return
         }
-        setResult(outcome.resultCode)
+        // RESULT_OK is never sent without a transcript.
+        val code = if (outcome.resultCode == RESULT_OK) RecognizerIntent.RESULT_NO_MATCH else outcome.resultCode
+        setResult(code)
         if (isDestroyed || isFinishing) return
         statusView.text = listOfNotNull(messageRes?.let(::getString), detail).joinToString(" ")
         doneButton.isEnabled = true

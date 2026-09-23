@@ -5,7 +5,9 @@ plugins {
 // Release builds (the release-android workflow) pass the tag-derived version
 // as Gradle properties; local builds keep the defaults below.
 val starlingVersionName = providers.gradleProperty("starlingVersionName").orElse("0.1.0").get()
-val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().toInt()
+val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
+    raw.toIntOrNull()?.takeIf { it > 0 } ?: throw GradleException("starlingVersionCode must be a positive integer: $raw")
+}
 
 // arm64 codegen target of the native engine. The default runs on every
 // mainstream arm64 phone core since 2018; `-PstarlingArmArch=armv8.2-a+dotprod+fp16+i8mm`
@@ -32,7 +34,11 @@ val releaseSigning = listOf(
     "STARLING_ANDROID_KEY_PASSWORD",
 ).associateWith { providers.environmentVariable(it).orNull?.takeIf(String::isNotEmpty) }
     .takeIf { vars -> vars.values.all { it != null } }
-    ?.mapValues { it.value!! }
+    ?.mapValues { requireNotNull(it.value) }
+    ?.also { vars ->
+        val keystore = file(vars.getValue("STARLING_ANDROID_KEYSTORE"))
+        if (!keystore.isFile) throw GradleException("STARLING_ANDROID_KEYSTORE does not exist: $keystore")
+    }
 
 android {
     namespace = "dev.starling.mobile"
