@@ -19,6 +19,9 @@ val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse
 val starlingArmArch = providers.gradleProperty("starlingArmArch").orElse("armv8.2-a+dotprod+fp16").get()
 val cpuFeatureNames = mapOf("dotprod" to "asimddp", "fp16" to "asimdhp", "i8mm" to "i8mm")
 val starlingArmExtensions = starlingArmArch.split('+').drop(1)
+require(Regex("armv[89]\\.[0-9]+-a").matches(starlingArmArch.substringBefore('+'))) {
+    "starlingArmArch must start with an arm64 base such as armv8.2-a: $starlingArmArch"
+}
 require(starlingArmExtensions.none(String::isBlank)) {
     "starlingArmArch has an empty '+' extension (malformed): $starlingArmArch"
 }
@@ -54,7 +57,7 @@ val releaseSigning = signingEnv.takeIf { missingSigningEnv.isEmpty() }?.mapValue
 if (releaseSigning != null) {
     val keystore = file(releaseSigning.getValue("STARLING_ANDROID_KEYSTORE"))
     gradle.taskGraph.whenReady {
-        if (allTasks.any { it.name.contains("Release") } && !keystore.isFile) {
+        if (allTasks.any { it.project == project && it.name.contains("Release") } && !keystore.isFile) {
             throw GradleException("STARLING_ANDROID_KEYSTORE does not exist: $keystore")
         }
     }

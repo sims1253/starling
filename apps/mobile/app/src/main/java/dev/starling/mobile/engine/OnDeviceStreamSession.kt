@@ -54,7 +54,7 @@ class OnDeviceStreamSession(
 
     // Guarded by [lock]. The capture thread appends; the worker snapshots
     // and trims finalized audio from the front.
-    private var buffer = FloatArray(ChunkStreamer.SAMPLE_RATE * 4)
+    private var buffer = FloatArray(INITIAL_BUFFER_SAMPLES)
     private var size = 0
     private var inputEnded = false
     private var closed = false
@@ -69,7 +69,17 @@ class OnDeviceStreamSession(
 
     private val worker = Thread(::run, "starling-on-device-stream").apply { isDaemon = true }
 
-    fun start(): OnDeviceStreamSession = apply { worker.start() }
+    fun start(): OnDeviceStreamSession = apply {
+        // Counted before the worker exists, so a memory-pressure release can
+        // never slip in between start() and the worker's first instruction.
+        engine.liveSessionStarted()
+        try {
+            worker.start()
+        } catch (t: Throwable) {
+            engine.liveSessionEnded()
+            throw t
+        }
+    }
 
     override fun acceptsAudio(): Boolean = lock.withLock { acceptsAudioLocked() }
 
@@ -103,7 +113,12 @@ class OnDeviceStreamSession(
             inputEnded = true
             changed.signalAll()
         }
-        settled.await()
+        // The worker settles on every path, including crashes; the bound only
+        // guards against a native call that never returns, so Stop cannot
+        // hang forever (the WS client caps its wait the same way).
+        if (!settled.await(FINISH_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+            lock.withLock { settleLocked(CommitOutcome.Fallback("the on-device engine did not finish in time")) }
+        }
         return lock.withLock { requireNotNull(outcome) { "stream settled without an outcome" } }
     }
 
@@ -116,7 +131,6 @@ class OnDeviceStreamSession(
     }
 
     private fun run() {
-        engine.liveSessionStarted()
         try {
             runLoop()
         } catch (t: Throwable) {
@@ -208,6 +222,10 @@ class OnDeviceStreamSession(
         lock.withLock {
             System.arraycopy(buffer, dropped, buffer, 0, size - dropped)
             size -= dropped
+            // Give back a peak-sized array once the live tail is small again.
+            if (buffer.size > INITIAL_BUFFER_SAMPLES && buffer.size > size * 4) {
+                buffer = buffer.copyOf(maxOf(INITIAL_BUFFER_SAMPLES, size * 2))
+            }
         }
         streamer.rebase(dropped)
         return dropped
@@ -249,6 +267,8 @@ class OnDeviceStreamSession(
     companion object {
         /** Live (unfinalized) audio bound, like the server's 60 s stream buffer cap. */
         const val MAX_LIVE_SECONDS = 60
+        private const val INITIAL_BUFFER_SAMPLES = ChunkStreamer.SAMPLE_RATE * 4
+        private const val FINISH_TIMEOUT_MINUTES = 10L
         private const val IDLE_WAIT_MILLIS = 250L
         private const val STEP_BACKOFF_MILLIS = 100L
     }

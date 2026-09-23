@@ -75,7 +75,11 @@ class RecognizeSpeechActivity : Activity() {
         findViewById<TextView>(R.id.recognize_prompt).text =
             intent?.getStringExtra(RecognizerIntent.EXTRA_PROMPT)
                 ?.filterNot(Char::isISOControl)
-                ?.take(MAX_PROMPT_CHARS)
+                ?.let { prompt ->
+                    // Truncate on code points so a surrogate pair is never split.
+                    if (prompt.codePointCount(0, prompt.length) <= MAX_PROMPT_CHARS) prompt
+                    else prompt.substring(0, prompt.offsetByCodePoints(0, MAX_PROMPT_CHARS))
+                }
                 ?.takeIf { it.isNotBlank() }
                 ?: getString(R.string.recognize_prompt)
 
@@ -263,6 +267,8 @@ class RecognizeSpeechActivity : Activity() {
         val code = if (outcome.resultCode == RESULT_OK) RecognizerIntent.RESULT_NO_MATCH else outcome.resultCode
         setResult(code)
         if (isDestroyed || isFinishing) return
+        // A leftover live partial next to "failed" would read as a result.
+        partialView.visibility = View.GONE
         statusView.text = listOfNotNull(messageRes?.let(::getString), detail).joinToString(" ")
         doneButton.isEnabled = true
         doneButton.setText(R.string.recognize_close)

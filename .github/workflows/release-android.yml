@@ -83,15 +83,17 @@ jobs:
             exit 1
           fi
           major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))
-          if (( minor > 999 || patch > 999 || major > 2000 )); then
-            echo "::error::$name does not fit the versionCode scheme (minor/patch <= 999, major <= 2000)"
+          # major*1e6 + minor*1e3 + patch stays below Android's 2^31-1 cap and
+          # is > 0 for every tag except 0.0.0, which is refused.
+          if (( minor > 999 || patch > 999 || major > 2000 )) || (( major + minor + patch == 0 )); then
+            echo "::error::$name does not fit the versionCode scheme (minor/patch <= 999, major <= 2000, not 0.0.0)"
             exit 1
           fi
           # versionCode follows the version, not the run: a later build of an
           # older tag must never outrank a newer release. Prereleases of the
           # same X.Y.Z share its code (same key: they install over each other).
           echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "code=$(( major * 1000000 + minor * 1000 + patch > 0 ? major * 1000000 + minor * 1000 + patch : 1 ))" >> "$GITHUB_OUTPUT"
+          echo "code=$(( major * 1000000 + minor * 1000 + patch ))" >> "$GITHUB_OUTPUT"
 
       # Signing secrets live only in this step's environment; nothing is
       # exported to later steps through GITHUB_ENV.
@@ -112,10 +114,24 @@ jobs:
           keystore="$RUNNER_TEMP/starling-release.jks"
           # The decoded or generated key never outlives this step, whatever fails.
           trap 'rm -f "$keystore"' EXIT
-          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+          configured=0
+          for value in "$KEYSTORE_BASE64" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
+            if [ -n "$value" ]; then configured=$((configured + 1)); fi
+          done
+          # A partial set is a mistake, never "use the throwaway key": that
+          # would ship an APK later release-key builds cannot update.
+          if (( configured > 0 && configured < 4 )); then
+            echo "::error::Only $configured of the 4 STARLING_ANDROID_* signing secrets are set"
+            exit 1
+          fi
+          if (( configured == 4 )); then
             base64 --decode <<< "$KEYSTORE_BASE64" > "$keystore"
-            keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null \
-              || { echo "::error::The signing secrets do not open the keystore (bad base64, password, or alias)"; exit 1; }
+            # certreq needs the private key: this checks the store password
+            # and alias, and for JKS stores the key password too, before any
+            # build (PKCS12 keys are protected by the store password itself).
+            keytool -certreq -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" \
+              -alias "$KEY_ALIAS" -keypass "$KEY_PASSWORD" -file /dev/null > /dev/null \
+              || { echo "::error::The signing secrets do not open the key (bad base64, store password, alias, or key password)"; exit 1; }
             echo "mode=release-key" >> "$GITHUB_OUTPUT"
           else
             case "$RELEASE_TAG" in
@@ -164,8 +180,10 @@ jobs:
             # Disassemble to a file first so a failing objdump fails the step
             # instead of reading as "zero instructions" (grep -c exits 1 on 0).
             "$objdump" -d "$unpacked/lib/arm64-v8a/libggml-cpu.so" > "$unpacked/libggml-cpu.dis"
-            sdot="$(grep -c sdot "$unpacked/libggml-cpu.dis" || true)"
-            smmla="$(grep -c smmla "$unpacked/libggml-cpu.dis" || true)"
+            # Count mnemonics (tab-delimited instruction column), not symbol
+            # names or other text that merely contains the letters.
+            sdot="$(grep -cP '\tsdot\s' "$unpacked/libggml-cpu.dis" || true)"
+            smmla="$(grep -cP '\tsmmla\s' "$unpacked/libggml-cpu.dis" || true)"
             echo "variant '${suffix:-standard}' ($arch): $sdot sdot, $smmla smmla instructions"
             # Every variant targets dotprod; only the i8mm one may use SMMLA.
             if [ "$sdot" -eq 0 ] \

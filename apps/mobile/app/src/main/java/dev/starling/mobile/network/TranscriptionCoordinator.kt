@@ -175,7 +175,13 @@ class TranscriptionCoordinator(
                 .recoverCatching { store.get(id).copy(errorMessage = message) }
                 .getOrElse {
                     // The store itself is failing; the callback still gets a failed recording.
-                    Recording(id, 0L, "", RecordingStatus.FAILED, errorMessage = message)
+                    Recording(
+                        id = id,
+                        createdAtMillis = 0L,
+                        wavName = "",
+                        status = RecordingStatus.FAILED,
+                        errorMessage = message,
+                    )
                 }
         }
 
