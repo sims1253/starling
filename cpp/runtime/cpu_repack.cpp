@@ -167,6 +167,9 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
     std::vector<uint8_t> original;
     try {
         original.resize(n);
+        // Publish the decision before the in-place rewrite: a map allocation
+        // failure must also leave the original bytes and buffer intact.
+        s.repacked.emplace(w, w->extra);
     } catch (...) {
         // Keep an allocation failure recoverable without copying weights
         // that have no repack kernel on this CPU.
@@ -177,7 +180,6 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
     std::memcpy(original.data(), w->data, n);
     // Dispatches to the CPU_REPACK set_tensor: rewrites w->data in place.
     ggml_backend_tensor_set(w, original.data(), 0, n);
-    s.repacked[w] = w->extra;
     // In place: CPU_REPACK's get_alloc_size is ggml_nbytes, so the repacked
     // footprint is exactly the plain one.
     s.repacked_bytes += static_cast<int64_t>(n);
