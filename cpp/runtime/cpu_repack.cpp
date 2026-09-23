@@ -152,7 +152,8 @@ bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* we
     // forward_mul_mat asserts both separately (an F32 result can still be a
     // permuted view), so both are checked here too, with its stride order.
     if (node->type != GGML_TYPE_F32 || node->nb[0] != sizeof(float)) return false;
-    if (node->nb[0] > node->nb[1] || node->nb[1] > node->nb[2]) return false;
+    if (node->nb[0] > node->nb[1] || node->nb[1] > node->nb[2] ||
+        node->nb[2] > node->nb[3]) return false;
     return true;
 }
 

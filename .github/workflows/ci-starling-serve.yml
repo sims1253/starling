@@ -72,6 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Build (CPU, ${{ matrix.arch }})
+        shell: bash
         env:
           ARCH: ${{ matrix.arch }}
         run: |

@@ -233,11 +233,13 @@ void test_type(ggml_backend_t backend, ggml_type type) {
 
         // The pinned ggml CPU_REPACK kernel accepts F32 activations only.
         // A later F16/BF16 graph must fail before reading interleaved bytes.
+        const std::vector<uint16_t> zero_activation(K, 0);
         for (ggml_type activation_type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
             threw = false;
             try {
-                run(backend, [&](ggml_context* ctx, auto&) {
+                run(backend, [&](ggml_context* ctx, auto& inputs) {
                     ggml_tensor* xt = ggml_new_tensor_2d(ctx, activation_type, K, 1);
+                    inputs.emplace_back(xt, zero_activation.data());
                     return ggml_mul_mat(ctx, w.w, xt);
                 });
             } catch (const std::runtime_error& e) {
