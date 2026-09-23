@@ -1,0 +1,56 @@
+cmake_minimum_required(VERSION 3.18)
+project(starling_parakeet_poc LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+set(GGML_METAL OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+set(GGML_HIP OFF CACHE BOOL "" FORCE)
+set(GGML_SYCL OFF CACHE BOOL "" FORCE)
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA_FA OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
+set(GIT_EXE /bin/true CACHE FILEPATH "" FORCE)
+
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../third_party/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
+
+add_library(parakeet_poc STATIC engine.cpp cpu_kernels.cpp)
+target_include_directories(parakeet_poc PUBLIC
+  "${CMAKE_CURRENT_LIST_DIR}"
+  "${CMAKE_CURRENT_LIST_DIR}/../../third_party/ggml/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../third_party/ggml/src")
+target_link_libraries(parakeet_poc PUBLIC ggml)
+target_compile_options(parakeet_poc PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(parakeet_poc_cli main.cpp)
+target_link_libraries(parakeet_poc_cli PRIVATE parakeet_poc)
+target_compile_options(parakeet_poc_cli PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(parakeet_kernel_bench kernel_bench.cpp)
+target_link_libraries(parakeet_kernel_bench PRIVATE parakeet_poc)
+target_compile_options(parakeet_kernel_bench PRIVATE -Wall -Wextra -Wpedantic)
+include(CheckIncludeFileCXX)
+check_include_file_cxx("valgrind/callgrind.h" PARAKEET_HAVE_CALLGRIND)
+if(PARAKEET_HAVE_CALLGRIND)
+  target_compile_definitions(parakeet_kernel_bench PRIVATE PARAKEET_HAVE_CALLGRIND=1)
+endif()
+
+if(STARLING_POC_TESTS)
+  enable_testing()
+  add_executable(parakeet_poc_test engine_test.cpp)
+  target_link_libraries(parakeet_poc_test PRIVATE parakeet_poc)
+  target_compile_options(parakeet_poc_test PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME parakeet_poc_test COMMAND parakeet_poc_test)
+  add_executable(parakeet_cpu_kernel_test cpu_kernels_test.cpp)
+  target_link_libraries(parakeet_cpu_kernel_test PRIVATE parakeet_poc)
+  target_compile_options(parakeet_cpu_kernel_test PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME parakeet_cpu_kernel_test COMMAND parakeet_cpu_kernel_test)
+endif()
