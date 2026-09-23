@@ -167,7 +167,9 @@ class TranscriptionCoordinator(
     private inline fun settleOrFail(id: String, attempt: () -> Recording): Recording =
         try {
             attempt()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // Throwable, not Exception: an OutOfMemoryError while decoding a
+            // long recording must still settle the recording and the callback.
             val message = "Transcription failed unexpectedly: ${e.message ?: e::class.java.simpleName}"
             runCatching { store.markFailed(id, message) }
                 .recoverCatching { store.get(id).copy(errorMessage = message) }

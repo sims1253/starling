@@ -25,7 +25,8 @@ class OnDeviceBackend(private val engine: OnDeviceEngine) {
      * Starts live on-device transcription for a capture that is about to
      * begin, or null when no model is imported (the recording then goes
      * through [transcribe] after Stop, which reports the missing model).
-     * [events] is invoked on the session's worker thread.
+     * [events] is invoked on the session's worker thread; callers that need
+     * main-thread delivery repost it (TranscriptionCoordinator does).
      */
     fun beginStreaming(events: (StreamEvent) -> Unit): StreamSession? =
         if (engine.hasModel()) OnDeviceStreamSession(engine, events).start() else null

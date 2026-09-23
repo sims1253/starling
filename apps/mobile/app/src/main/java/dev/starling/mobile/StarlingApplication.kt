@@ -79,8 +79,11 @@ class StarlingApplication : Application() {
         val info = ActivityManager.MemoryInfo().also(manager::getMemoryInfo)
         if (info.availMem >= modelBytes + MODEL_WORKING_SET_BYTES) return null
         val mb = 1024 * 1024
-        return "not enough free memory (the model needs about ${(modelBytes + MODEL_WORKING_SET_BYTES) / mb} MB, " +
-            "${info.availMem / mb} MB are available). Close other apps or import a smaller model."
+        return getString(
+            R.string.on_device_memory_error,
+            (modelBytes + MODEL_WORKING_SET_BYTES) / mb,
+            info.availMem / mb,
+        )
     }
 
     private companion object {

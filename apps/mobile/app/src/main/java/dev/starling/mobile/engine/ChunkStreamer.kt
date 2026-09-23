@@ -66,11 +66,11 @@ class ChunkStreamer(
      */
     fun step(samples: FloatArray, size: Int, now: Double, tx: Transcriber): String? {
         val finalized = finalizeFullWindows(samples, size, tx)
-        val committedText = { if (finalized) join(committed) else null }
+        val committedText: String? = if (finalized) join(committed) else null
 
         val tailLength = size - boundary
         // A full window is still waiting: it failed, and the session stops.
-        if (tailLength >= chunk) return committedText()
+        if (tailLength >= chunk) return committedText
         val throttled = (now - lastEmit) < partialIntervalSeconds
         if (!finalized && (throttled || tailLength < min)) return null
 
@@ -78,10 +78,10 @@ class ChunkStreamer(
             // Only a tail transcription starts the throttle interval; a step
             // that merely finalized a window must not delay the next partial.
             lastEmit = now
-            val text = tx.transcribe(samples, boundary, tailLength) ?: return committedText()
+            val text = tx.transcribe(samples, boundary, tailLength) ?: return committedText
             return join(ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords))
         }
-        return committedText()
+        return committedText
     }
 
     /** Finalizes all remaining audio; the full text, or null when the engine failed. */
