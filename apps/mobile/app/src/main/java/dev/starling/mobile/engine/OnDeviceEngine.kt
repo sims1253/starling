@@ -117,7 +117,12 @@ class OnDeviceEngine(
                 }
                 if (copied.isFailure) {
                     deleteFile(staged, "staging file")
-                    return ImportResult.Rejected("The model could not be copied to private storage.", ImportStage.COPY)
+                    val detail = copied.exceptionOrNull()?.localizedMessage?.takeIf(String::isNotBlank)
+                    return ImportResult.Rejected(
+                        "The model could not be copied to private storage" +
+                            (detail?.let { ": $it" } ?: "."),
+                        ImportStage.COPY,
+                    )
                 }
                 val size = staged.length()
 

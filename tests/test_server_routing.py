@@ -154,6 +154,13 @@ def test_create_app_reuses_existing_server_without_startup_load() -> None:
     app = create_app(server=server, load_on_startup=False)
 
     assert app.state.starling_server is server
+    routes = {route.path for route in app.routes}
+    assert "/v1/models" in routes
+    assert "/v1/audio/transcriptions" in routes
+    assert "/stream" in routes
+    assert "/inference" not in routes
+    assert "/transcribe" not in routes
+    assert "/" not in routes
 
 
 @pytest.mark.parametrize("backend_cls", [MossBackend, Qwen3Backend, ArkBackend, Ark06Backend, HiggsBackend])

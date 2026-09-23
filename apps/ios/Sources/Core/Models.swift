@@ -1,39 +1,17 @@
 import Foundation
 
-public enum ServerProtocol: String, Codable, CaseIterable, Sendable {
-    case openAI = "openai"
-    case starling
-
-    public var title: String {
-        switch self {
-        case .openAI: "OpenAI compatible"
-        case .starling: "Starling legacy"
-        }
-    }
-
-    public var route: String {
-        switch self {
-        case .openAI: "/v1/audio/transcriptions"
-        case .starling: "/inference"
-        }
-    }
-}
-
 public struct ServerConfiguration: Codable, Equatable, Sendable {
     public var endpoint: String
     public var model: String
-    public var apiProtocol: ServerProtocol
     public var allowsInsecureLocalHTTP: Bool
 
     public init(
         endpoint: String = "https://starling.local:8181",
         model: String = "parakeet",
-        apiProtocol: ServerProtocol = .openAI,
         allowsInsecureLocalHTTP: Bool = false
     ) {
         self.endpoint = endpoint
         self.model = model
-        self.apiProtocol = apiProtocol
         self.allowsInsecureLocalHTTP = allowsInsecureLocalHTTP
     }
 
@@ -61,7 +39,7 @@ public struct ServerConfiguration: Codable, Equatable, Sendable {
             }
         }
         let cleanModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard apiProtocol != .openAI || (!cleanModel.isEmpty && !model.contains("\r") && !model.contains("\n")) else {
+        guard !cleanModel.isEmpty && !model.contains("\r") && !model.contains("\n") else {
             throw ConfigurationError.emptyModel
         }
         guard let url = components.url else { throw ConfigurationError.invalidEndpoint }
@@ -77,25 +55,15 @@ public struct ServerConfiguration: Codable, Equatable, Sendable {
         while path.hasSuffix("/") { path.removeLast() }
         let normalizedPath = path.lowercased()
 
-        switch apiProtocol {
-        case .openAI:
-            if normalizedPath.hasSuffix("/audio/transcriptions") {
-                components.path = path
-                guard let url = components.url else { throw ConfigurationError.invalidEndpoint }
-                return url
-            }
-            if normalizedPath == "/v1" || normalizedPath.hasSuffix("/v1") {
-                path += "/audio/transcriptions"
-            } else {
-                path += apiProtocol.route
-            }
-        case .starling:
-            if normalizedPath.hasSuffix("/inference") || normalizedPath.hasSuffix("/transcribe") {
-                components.path = path
-                guard let url = components.url else { throw ConfigurationError.invalidEndpoint }
-                return url
-            }
-            path += apiProtocol.route
+        if normalizedPath.hasSuffix("/v1/audio/transcriptions") {
+            components.path = path
+            guard let url = components.url else { throw ConfigurationError.invalidEndpoint }
+            return url
+        }
+        if normalizedPath == "/v1" || normalizedPath.hasSuffix("/v1") {
+            path += "/audio/transcriptions"
+        } else {
+            path += "/v1/audio/transcriptions"
         }
 
         components.path = path

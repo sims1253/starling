@@ -11,8 +11,7 @@ final class ClientTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: file) }
         let client = StarlingClient(configuration: ServerConfiguration(
             endpoint: "https://voice.example.test",
-            model: "parakeet",
-            apiProtocol: .openAI
+            model: "parakeet"
         ))
         let request = try client.makeRequest(recordingURL: file, requestID: "request-1")
         let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
@@ -22,22 +21,6 @@ final class ClientTests: XCTestCase {
         XCTAssertTrue(body.contains("name=\"file\"; filename=\"recording.wav\""))
         XCTAssertTrue(body.contains("name=\"model\"\r\n\r\nparakeet"))
         XCTAssertTrue(body.contains("name=\"response_format\"\r\n\r\njson"))
-    }
-
-    func testLegacyRequestOmitsOpenAIControlFields() throws {
-        let file = try temporaryRecording()
-        defer { try? FileManager.default.removeItem(at: file) }
-        let client = StarlingClient(configuration: ServerConfiguration(
-            endpoint: "https://voice.example.test",
-            model: "ignored",
-            apiProtocol: .starling
-        ))
-        let request = try client.makeRequest(recordingURL: file, requestID: "request-2")
-        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
-
-        XCTAssertEqual(request.url?.path, "/inference")
-        XCTAssertFalse(body.contains("name=\"model\""))
-        XCTAssertFalse(body.contains("name=\"response_format\""))
     }
 
     func testRawTextAndOptionalTimingAreDecodedWithoutRewriting() throws {

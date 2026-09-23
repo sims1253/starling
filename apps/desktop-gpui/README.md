@@ -12,7 +12,7 @@ the Electron version. See [COMPARISON.md](COMPARISON.md) for measurements and
 
 - `crates/dictation` (`starling-dictation`) — logic + IO, no UI: WAV prep
   (PCM16 16 kHz mono, byte-faithful port of `@starling/dictation`'s audio
-  module), the transcription HTTP client (starling + OpenAI protocols, mirrors
+  module), the transcription HTTP client (the `/v1` batch API, mirrors
   the Electron native request path), a file-backed session store replacing
   IndexedDB (same manifest schema), settings persistence replacing
   `localStorage`, the fidelity analyzer, an FFT for the live waveform, cpal mic
@@ -46,10 +46,9 @@ Data locations (both created on demand):
 - sessions: `~/.local/share/starling-gpui/sessions/<uuid>/{manifest.json,recording.wav}`
 - settings: `~/.config/starling-gpui/settings.json`
 
-The app talks to the same servers as the Electron app: a native
-`starling-serve` (ggml) endpoint (`GET /health`, `POST /transcribe` with raw
-`audio/wav`, `x-request-id` honored) or an OpenAI-compatible endpoint
-(`GET /v1/models`, `POST /v1/audio/transcriptions` multipart). Start the
+The app uses `GET /v1/models`, streams live recording chunks through
+`WS /stream`, and falls back to multipart `POST /v1/audio/transcriptions`
+if the stream fails. Start the
 native server from a checkout with built binaries (the Python serving path is
 deprecated):
 
@@ -58,10 +57,8 @@ build-cpu/starling-serve --model ark \
   --gguf models/ark-asr-0.6b-bf16-exact.gguf   # binds 127.0.0.1:8181
 ```
 
-Verified end-to-end in this configuration: health flips the topbar to
-`ark ready`, and `POST /transcribe` returns
-`{text, segments: [{text, start_s, end_s}], duration_s, request_id}` —
-the exact wire shape this client normalizes.
+The model list supplies the topbar's model name. Batch transcription returns
+`{text}` and echoes a request ID in the response header.
 
 ## Hotkeys
 

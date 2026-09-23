@@ -62,14 +62,12 @@ public struct StarlingClient: Sendable {
             data: wav,
             boundary: boundary
         )
-        if configuration.apiProtocol == .openAI {
-            body.appendMultipart(
-                name: "model",
-                value: configuration.model.trimmingCharacters(in: .whitespacesAndNewlines),
-                boundary: boundary
-            )
-            body.appendMultipart(name: "response_format", value: "json", boundary: boundary)
-        }
+        body.appendMultipart(
+            name: "model",
+            value: configuration.model.trimmingCharacters(in: .whitespacesAndNewlines),
+            boundary: boundary
+        )
+        body.appendMultipart(name: "response_format", value: "json", boundary: boundary)
         body.append(Data("--\(boundary)--\r\n".utf8))
 
         var request = URLRequest(url: try configuration.transcriptionURL())

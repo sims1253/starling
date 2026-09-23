@@ -28,8 +28,7 @@ import java.util.concurrent.TimeUnit
  * here once Starling is selected as the voice input service, so dictation
  * works inside a normal keyboard without switching IMEs.
  *
- * When the configuration supports it (Starling protocol on a remote
- * server), the capture streams live and growing partials are delivered
+ * With a Starling server, capture streams live and growing partials are delivered
  * through [RecognitionService.Callback.partialResults]; the final result
  * still arrives once, in [RecognitionService.Callback.results], after the
  * stream commits or — on any streaming failure — after the batch

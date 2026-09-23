@@ -51,7 +51,7 @@ curl http://127.0.0.1:8181/v1/audio/transcriptions \
 The initial compatible subset accepts 16 kHz WAV and returns `{"text":"…"}`.
 `GET /v1/models` lists the configured model. Unsupported features return errors;
 read the [API contract](docs/api.md) before pointing a third-party client at it.
-Existing `/inference`, `/transcribe`, and `/stream` routes remain available.
+Live dictation uses Starling's `WS /stream` route.
 
 ## Run the apps
 

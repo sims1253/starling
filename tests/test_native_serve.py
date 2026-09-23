@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Integration tests for starling-serve (native HTTP/WS API).
 
-Tests the native serving binary's HTTP/WebSocket API for compatibility with the
-Python server contract. Runs against live server instances.
+Tests the native serving binary's HTTP and WebSocket API against live server instances.
 
 This is a standalone script, NOT a pytest module: the test_* functions below
 take live-server arguments, so pytest collection is skipped explicitly.
@@ -91,6 +90,19 @@ def _default_binary() -> Path:
 
 BINARY = _default_binary()
 DEFAULT_PORT = 18181
+ACTIVE_MODEL = "parakeet"
+
+
+def post_transcription(base_url: str, wav: bytes, *, request_id: str | None = None,
+                       timeout: float = 30) -> requests.Response:
+    headers = {"X-Request-Id": request_id} if request_id else None
+    return requests.post(
+        f"{base_url}/v1/audio/transcriptions",
+        data={"model": ACTIVE_MODEL, "response_format": "json"},
+        files={"file": ("clip.wav", wav, "audio/wav")},
+        headers=headers,
+        timeout=timeout,
+    )
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
@@ -320,7 +332,7 @@ def test_normalize_endpoints(binary: Path, tr: TestResults):
                  r.status_code == 503, f"{r.status_code} {r.text[:120]}")
 
         # '#' request ids are reserved for internal queue tickets (same rule
-        # as /transcribe).
+        # as the batch transcription route).
         r = post({"transcript": "um hi"}, headers={"X-Request-Id": "#123"})
         tr.check("normalize '#' request id -> 400",
                  r.status_code == 400 and "invalid request id" in r.json().get("error", ""),
@@ -361,219 +373,59 @@ def test_health(base_url: str, tr: TestResults):
     tr.check("health has queue_depth", "queue_depth" in data, str(data))
 
 
-def test_health_alias(base_url: str, tr: TestResults):
-    """GET / returns the same health response."""
-    r1 = requests.get(f"{base_url}/health", timeout=5)
-    r2 = requests.get(f"{base_url}/", timeout=5)
-    tr.check("root is health alias", r1.json() == r2.json())
+def test_models(base_url: str, tr: TestResults):
+    r = requests.get(f"{base_url}/v1/models", timeout=5)
+    tr.check("models lists the configured model",
+             r.status_code == 200 and r.json().get("data", [{}])[0].get("id") == ACTIVE_MODEL,
+             f"{r.status_code}: {r.text[:120]}")
 
 
 def test_warmup(base_url: str, tr: TestResults):
-    """POST /warmup returns 202."""
     r = requests.post(f"{base_url}/warmup", timeout=5)
     tr.check("warmup returns 202", r.status_code == 202, f"got {r.status_code}")
 
 
-def test_transcribe_empty(base_url: str, tr: TestResults):
-    """POST /transcribe with empty body returns 400."""
-    r = requests.post(f"{base_url}/transcribe", data=b"", timeout=5)
-    tr.check("empty transcribe returns 400", r.status_code == 400,
-             f"got {r.status_code}")
+def test_batch_contract(base_url: str, tr: TestResults):
+    path = f"{base_url}/v1/audio/transcriptions"
+    empty = requests.post(path, data=b"", timeout=5)
+    tr.check("batch requires multipart file and model", empty.status_code == 400,
+             f"{empty.status_code}: {empty.text[:120]}")
+
+    wrong_model = requests.post(path, data={"model": "other"},
+                                files={"file": ("clip.wav", make_wav(np.zeros(160, dtype=np.float32)))},
+                                timeout=5)
+    tr.check("unknown model returns 404", wrong_model.status_code == 404,
+             f"{wrong_model.status_code}: {wrong_model.text[:120]}")
+
+    wrong_rate = post_transcription(base_url, make_wav(np.zeros(800, dtype=np.float32), sr=8000),
+                                    timeout=10)
+    tr.check("8 kHz WAV is refused", wrong_rate.status_code == 400 and
+             "sample rate mismatch" in wrong_rate.text, wrong_rate.text[:160])
+
+    no_model = post_transcription(base_url, make_wav(np.zeros(1600, dtype=np.float32)),
+                                  request_id="placeholder", timeout=30)
+    tr.check("valid WAV reaches the unloaded model", no_model.status_code == 503 and
+             "model not loaded" in no_model.text, no_model.text[:160])
+
+    non_wav = post_transcription(base_url, b"ID3 not a WAV", timeout=5)
+    tr.check("compressed or raw audio is refused", non_wav.status_code == 400,
+             non_wav.text[:160])
+
+    # A claimed RF64 sample count must be bounded by actual payload bytes.
+    w = b"RF64" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+    w += b"ds64" + struct.pack("<IQQQI", 28, 100, 8, 0x100000000, 0)
+    w += b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+    w += b"data" + struct.pack("<I", 0xFFFFFFFF) + b"\x01" * 8
+    started = time.monotonic()
+    malformed = post_transcription(base_url, w, timeout=10)
+    tr.check("truncated RF64 is refused quickly", malformed.status_code == 400 and
+             time.monotonic() - started < 5.0, malformed.text[:160])
 
 
 def test_cancel_notfound(base_url: str, tr: TestResults):
-    """DELETE /inference/nonexistent returns 404."""
-    r = requests.delete(f"{base_url}/inference/nonexistent", timeout=5)
+    r = requests.delete(f"{base_url}/v1/audio/transcriptions/nonexistent", timeout=5)
     tr.check("cancel nonexistent returns 404", r.status_code == 404,
              f"got {r.status_code}")
-
-
-def test_transcribe_wrong_sample_rate(base_url: str, tr: TestResults):
-    """Non-16 kHz WAV is rejected with 400 + sample-rate mismatch error."""
-    samples = np.zeros(800, dtype=np.float32)
-    wav = make_wav(samples, sr=8000)
-    r = requests.post(f"{base_url}/transcribe", data=wav,
-                      headers={"Content-Type": "application/octet-stream"},
-                      timeout=10)
-    tr.check("8kHz wav returns 400", r.status_code == 400, f"got {r.status_code}")
-    tr.check("8kHz error mentions sample rate",
-             "sample rate mismatch" in r.text, r.text)
-
-
-def test_transcribe_model_not_loaded(base_url: str, tr: TestResults):
-    """Valid 16 kHz WAV with an unloadable model returns a structured 503.
-
-    The test server runs --no-eager-load with a placeholder --gguf, so the
-    lazy load fails and the request must surface 'model not loaded' as JSON,
-    not a crash or a dead socket.
-    """
-    samples = np.zeros(1600, dtype=np.float32)
-    wav = make_wav(samples, sr=16000)
-    r = requests.post(f"{base_url}/transcribe", data=wav,
-                      headers={"Content-Type": "application/octet-stream"},
-                      timeout=30)
-    tr.check("16kHz wav on unloaded model returns 503", r.status_code == 503,
-             f"got {r.status_code}")
-    data = r.json()
-    tr.check("503 error is model not loaded",
-             data.get("error") == "model not loaded", str(data))
-
-
-def test_transcribe_pcm16_fallback(base_url: str, tr: TestResults):
-    """A non-WAV payload is treated as raw mono PCM16 @ 16 kHz.
-
-    Raw PCM16 of silence is not valid WAV; if the fallback works, the request
-    passes payload decoding and reaches inference (here: the 503 lazy-load
-    failure, same as the WAV path) instead of a 400 malformed-audio error.
-    """
-    pcm16 = (np.zeros(1600, dtype=np.float32) * 32768).astype("<i2").tobytes()
-    r = requests.post(f"{base_url}/transcribe", data=pcm16,
-                      headers={"Content-Type": "application/octet-stream"},
-                      timeout=30)
-    tr.check("raw PCM16 reaches inference (not 400 malformed)",
-             r.status_code != 400, f"got {r.status_code}")
-    data = r.json()
-    tr.check("raw PCM16 error is model not loaded",
-             data.get("error") == "model not loaded", str(data))
-
-
-def test_transcribe_wav(base_url: str, tr: TestResults):
-    """POST /transcribe with a real WAV file returns proper JSON shape.
-
-    Note: without a loaded model this will fail at inference; we test the
-    error handling path (the server should return a structured error, not crash).
-    """
-    # 1 second of silence.
-    samples = np.zeros(16000, dtype=np.float32)
-    wav = make_wav(samples)
-    r = requests.post(f"{base_url}/transcribe", data=wav,
-                      headers={"Content-Type": "application/octet-stream"},
-                      timeout=30)
-    # Without a real model, the response should be a structured error (not a crash).
-    tr.check("transcribe returns JSON", r.headers.get("content-type", "").startswith("application/json"),
-             f"got {r.headers.get('content-type')}")
-    data = r.json()
-    if r.status_code == 200:
-        tr.check("transcribe has text", "text" in data, str(data))
-        tr.check("transcribe has duration_s", "duration_s" in data, str(data))
-        tr.check("transcribe has request_id", "request_id" in data, str(data))
-    else:
-        tr.check("transcribe error is structured", "error" in data, str(data))
-
-
-def test_request_id_passthrough(base_url: str, tr: TestResults):
-    """X-Request-Id header is echoed back in the response."""
-    rid = "test-rid-12345"
-    samples = np.zeros(1600, dtype=np.float32)
-    wav = make_wav(samples)
-    r = requests.post(f"{base_url}/transcribe", data=wav,
-                      headers={"Content-Type": "application/octet-stream",
-                               "X-Request-Id": rid},
-                      timeout=30)
-    data = r.json()
-    tr.check("request_id echoed", data.get("request_id") == rid,
-             f"got {data.get('request_id')}")
-
-
-def test_multipart_wav_decodes(base_url: str, tr: TestResults, endpoint: str):
-    """multipart/form-data WAV uploads get parsed as WAV, not PCM16 garbage.
-
-    Regression for the separator bug (issue #12): every multipart payload used
-    to come out prefixed with a stray "\\r\\n", so WAV RIFF sniffing failed and
-    the payload silently fell through to the raw-PCM16 fallback. An 8 kHz WAV
-    can only produce the 400 sample-rate-mismatch response if the WAV header
-    was actually parsed.
-    """
-    samples = np.zeros(800, dtype=np.float32)
-    wav = make_wav(samples, sr=8000)
-    r = requests.post(f"{base_url}/{endpoint}",
-                      files={"audio": ("clip.wav", wav, "audio/wav")},
-                      timeout=10)
-    tr.check(f"multipart 8kHz wav on /{endpoint} returns 400",
-             r.status_code == 400, f"got {r.status_code}: {r.text[:120]}")
-    tr.check(f"multipart 8kHz wav on /{endpoint} mentions sample rate",
-             "sample rate mismatch" in r.text, r.text[:200])
-
-
-def test_multipart_wav_reaches_inference(base_url: str, tr: TestResults,
-                                         endpoint: str):
-    """A well-formed 16 kHz multipart WAV passes parsing and reaches inference.
-
-    On the placeholder model that means the structured 503 'model not loaded'
-    (identical to the raw-upload path) — proving the multipart payload was
-    extracted byte-exact and decoded as WAV.
-    """
-    samples = np.zeros(1600, dtype=np.float32)
-    wav = make_wav(samples, sr=16000)
-    r = requests.post(f"{base_url}/{endpoint}",
-                      files={"audio": ("clip.wav", wav, "audio/wav")},
-                      timeout=30)
-    data = r.json()
-    tr.check(f"multipart 16kHz wav on /{endpoint} reaches inference",
-             r.status_code == 503 and data.get("error") == "model not loaded",
-             f"got {r.status_code}: {data}")
-
-
-def test_multipart_filenameless_part(base_url: str, tr: TestResults):
-    """A part named "audio" with NO filename is accepted (Python parity).
-
-    cpp-httplib routes filename-less parts to form.fields, not form.files;
-    the Python server scores them like named file parts, so the native
-    handler must pick them up too (regression from PR review).
-    """
-    samples = np.zeros(1600, dtype=np.float32)
-    wav = make_wav(samples, sr=16000)
-    r = requests.post(f"{base_url}/transcribe",
-                      files={"audio": (None, wav)},  # no filename
-                      timeout=30)
-    data = r.json()
-    tr.check("filename-less 'audio' part reaches inference",
-             r.status_code == 503 and data.get("error") == "model not loaded",
-             f"got {r.status_code}: {data}")
-
-
-def test_multipart_empty_named_part_shadowing(base_url: str, tr: TestResults):
-    """An EMPTY "audio" part must not shadow a populated "file" part.
-
-    Mirrors test_multipart_blank_part in the C++ parser suite: selection
-    requires non-empty content (regression from PR review).
-    """
-    samples = np.zeros(1600, dtype=np.float32)
-    wav = make_wav(samples, sr=16000)
-    r = requests.post(f"{base_url}/transcribe",
-                      files={"audio": ("empty.wav", b"", "audio/wav"),
-                             "file": ("clip.wav", wav, "audio/wav")},
-                      timeout=30)
-    data = r.json()
-    tr.check("empty 'audio' part does not shadow 'file' part",
-             r.status_code == 503 and data.get("error") == "model not loaded",
-             f"got {r.status_code}: {data}")
-
-
-def test_malformed_wav_huge_frame_count(base_url: str, tr: TestResults):
-    """A WAV header claiming billions of frames fails fast with 400.
-
-    Crafted RF64: the ds64 sampleCount (0x100000000) is reported verbatim by
-    dr_wav over an 8-byte payload. The decoder derives the frame cap from the
-    payload, rejects the file, and the RIFF/RF64 magic keeps it out of the
-    raw-PCM16 fallback (issue #12: no gigabyte allocations, no garbage 200s).
-    """
-    def put(fmt, *vals):
-        return struct.pack(fmt, *vals)
-
-    w = b"RF64" + put("<I", 0xFFFFFFFF) + b"WAVE"
-    w += b"ds64" + put("<I", 28) + put("<QQQ", 100, 8, 0x100000000) + put("<I", 0)
-    w += b"fmt " + put("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
-    w += b"data" + put("<I", 0xFFFFFFFF) + b"\x01" * 8
-
-    t0 = time.monotonic()
-    r = requests.post(f"{base_url}/transcribe", data=w,
-                      headers={"Content-Type": "application/octet-stream"},
-                      timeout=10)
-    dt = time.monotonic() - t0
-    tr.check("huge-frame-count WAV returns 400", r.status_code == 400,
-             f"got {r.status_code}: {r.text[:120]}")
-    tr.check("huge-frame-count WAV rejected fast", dt < 5.0, f"took {dt:.2f}s")
 
 
 # ---- WebSocket tests (default mode) -----------------------------------------
@@ -818,14 +670,11 @@ def test_websocket_stream_audio_rejection(binary: Path, model: str,
 
 def test_real_roundtrip(base_url: str, tr: TestResults, samples: np.ndarray,
                         expected: str | None):
-    """True round trip: 200 + transcript + duration + request id echo."""
+    """True round trip: 200 + transcript + request id echo."""
     rid = "e2e-roundtrip-1"
     wav = make_wav(samples)
     t0 = time.monotonic()
-    r = requests.post(f"{base_url}/transcribe", data=wav,
-                      headers={"Content-Type": "application/octet-stream",
-                               "X-Request-Id": rid},
-                      timeout=300)
+    r = post_transcription(base_url, wav, request_id=rid, timeout=300)
     dt = time.monotonic() - t0
     tr.check("roundtrip returns 200", r.status_code == 200,
              f"got {r.status_code}: {r.text[:200]}")
@@ -835,39 +684,11 @@ def test_real_roundtrip(base_url: str, tr: TestResults, samples: np.ndarray,
     text = data.get("text", "")
     print(f"    ({dt:.1f}s) text: {text[:100]!r}")
     tr.check("roundtrip text non-empty", len(text.strip()) > 0, repr(text))
-    tr.check("roundtrip request_id echoed", data.get("request_id") == rid,
-             str(data.get("request_id")))
-    dur = data.get("duration_s", -1.0)
-    want = len(samples) / 16000.0
-    tr.check("roundtrip duration_s matches audio",
-             abs(dur - want) < 0.1, f"got {dur}, want {want:.2f}")
+    tr.check("roundtrip request id echoed", r.headers.get("X-Request-Id") == rid,
+             str(r.headers.get("X-Request-Id")))
     if expected:
         sim = text_similarity(text, expected)
         tr.check(f"roundtrip text matches expected (sim={sim:.2f})",
-                 sim >= TEXT_SIMILARITY_MIN,
-                 f"\n    got:      {text!r}\n    expected: {expected!r}")
-
-
-def test_real_multipart_roundtrip(base_url: str, tr: TestResults,
-                                  samples: np.ndarray, expected: str | None,
-                                  endpoint: str):
-    """multipart upload round-trips on /transcribe AND /inference (issue #22)."""
-    wav = make_wav(samples)
-    r = requests.post(f"{base_url}/{endpoint}",
-                      files={"audio": ("clip.wav", wav, "audio/wav")},
-                      headers={"X-Request-Id": f"e2e-mp-{endpoint}"},
-                      timeout=300)
-    tr.check(f"multipart roundtrip on /{endpoint} returns 200",
-             r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
-    if r.status_code != 200:
-        return
-    data = r.json()
-    text = data.get("text", "")
-    tr.check(f"multipart text non-empty on /{endpoint}",
-             len(text.strip()) > 0, repr(text))
-    if expected:
-        sim = text_similarity(text, expected)
-        tr.check(f"multipart text matches on /{endpoint} (sim={sim:.2f})",
                  sim >= TEXT_SIMILARITY_MIN,
                  f"\n    got:      {text!r}\n    expected: {expected!r}")
 
@@ -882,9 +703,7 @@ def test_real_duplicate_request_id(base_url: str, tr: TestResults,
     def post():
         barrier.wait()
         try:
-            r = requests.post(f"{base_url}/transcribe", data=wav,
-                              headers={"X-Request-Id": "dup-rid-1"},
-                              timeout=300)
+            r = post_transcription(base_url, wav, request_id="dup-rid-1", timeout=300)
             results.append(r.status_code)
         except Exception as e:
             results.append(-1)
@@ -915,9 +734,8 @@ def test_real_server_busy(base_url: str, tr: TestResults, samples: np.ndarray):
     def post():
         barrier.wait()
         try:
-            r = requests.post(f"{base_url}/transcribe", data=wav,
-                              headers={"X-Request-Id": f"barrage-{time.time_ns()}"},
-                              timeout=600)
+            r = post_transcription(base_url, wav,
+                                   request_id=f"barrage-{time.time_ns()}", timeout=600)
             with lock:
                 results.append(r.status_code)
         except Exception as e:
@@ -949,24 +767,20 @@ def test_real_server_busy(base_url: str, tr: TestResults, samples: np.ndarray):
 
 def test_real_cancel_queued(base_url: str, tr: TestResults,
                             anchor: np.ndarray):
-    """DELETE /inference/<id> cancels a QUEUED request (499)."""
+    """DELETE /v1/audio/transcriptions/<id> cancels a queued request (499)."""
     anchor_wav = make_wav(anchor)
     victim_wav = make_wav(anchor[: 16000])
     victim_result: dict = {}
 
     def post_anchor():
         try:
-            requests.post(f"{base_url}/transcribe", data=anchor_wav,
-                          headers={"X-Request-Id": "cancel-anchor"},
-                          timeout=600)
+            post_transcription(base_url, anchor_wav, request_id="cancel-anchor", timeout=600)
         except Exception:
             pass
 
     def post_victim():
         try:
-            r = requests.post(f"{base_url}/transcribe", data=victim_wav,
-                              headers={"X-Request-Id": "cancel-victim"},
-                              timeout=600)
+            r = post_transcription(base_url, victim_wav, request_id="cancel-victim", timeout=600)
             victim_result["status"] = r.status_code
             victim_result["body"] = r.text[:200]
         except Exception as e:
@@ -979,7 +793,7 @@ def test_real_cancel_queued(base_url: str, tr: TestResults,
     # then queue the victim behind it.
     if not _wait_busy_via_health(base_url, 30.0):
         tr.check("cancel test: anchor in flight", False, "server never busy")
-        requests.delete(f"{base_url}/inference/cancel-anchor", timeout=5)
+        requests.delete(f"{base_url}/v1/audio/transcriptions/cancel-anchor", timeout=5)
         t_anchor.join(timeout=120)
         return
     t_victim = threading.Thread(target=post_victim)
@@ -987,11 +801,11 @@ def test_real_cancel_queued(base_url: str, tr: TestResults,
     if not _wait_queued_via_health(base_url, 10.0):
         tr.check("cancel test: victim queued", False,
                  "queue_depth never reached 1")
-        requests.delete(f"{base_url}/inference/cancel-anchor", timeout=5)
+        requests.delete(f"{base_url}/v1/audio/transcriptions/cancel-anchor", timeout=5)
         t_anchor.join(timeout=120)
         t_victim.join(timeout=120)
         return
-    r = requests.delete(f"{base_url}/inference/cancel-victim", timeout=5)
+    r = requests.delete(f"{base_url}/v1/audio/transcriptions/cancel-victim", timeout=5)
     tr.check("DELETE queued request returns 200 cancelled",
              r.status_code == 200 and r.json().get("status") == "cancelled",
              f"got {r.status_code}: {r.text[:120]}")
@@ -1001,7 +815,7 @@ def test_real_cancel_queued(base_url: str, tr: TestResults,
              and "cancelled" in victim_result.get("body", ""),
              f"got {victim_result.get('status')}: {victim_result.get('body')}")
     # Reap the anchor (cancel it too so the queue drains fast).
-    requests.delete(f"{base_url}/inference/cancel-anchor", timeout=5)
+    requests.delete(f"{base_url}/v1/audio/transcriptions/cancel-anchor", timeout=5)
     t_anchor.join(timeout=120)
 
 
@@ -1052,9 +866,8 @@ def test_real_queue_timeout(binary: Path, model: str, gguf: str,
 
         def post_anchor():
             try:
-                requests.post(f"{server.base_url}/transcribe", data=anchor_wav,
-                              headers={"X-Request-Id": "timeout-anchor"},
-                              timeout=600)
+                post_transcription(server.base_url, anchor_wav,
+                                   request_id="timeout-anchor", timeout=600)
             except Exception:
                 pass
 
@@ -1067,10 +880,8 @@ def test_real_queue_timeout(binary: Path, model: str, gguf: str,
 
         def post_victim():
             try:
-                r = requests.post(f"{server.base_url}/transcribe",
-                                  data=make_wav(anchor[: 16000]),
-                                  headers={"X-Request-Id": "timeout-victim"},
-                                  timeout=30)
+                r = post_transcription(server.base_url, make_wav(anchor[: 16000]),
+                                       request_id="timeout-victim", timeout=30)
                 victim["status"] = r.status_code
                 victim["body"] = r.text[:200]
             except Exception as e:
@@ -1233,6 +1044,7 @@ def test_real_idle_timeout_not_firing(binary: Path, model: str, gguf: str,
 # ---- main -------------------------------------------------------------------
 
 def main():
+    global ACTIVE_MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -1251,6 +1063,7 @@ def main():
                     help="Expected transcript for --audio (default: the "
                          "parakeet short golden)")
     args = ap.parse_args()
+    ACTIVE_MODEL = args.model
 
     gguf = args.gguf or (Path(os.environ["STARLING_SERVE_TEST_GGUF"])
                          if os.environ.get("STARLING_SERVE_TEST_GGUF")
@@ -1300,23 +1113,10 @@ def main():
 
         print("\nTesting HTTP endpoints (placeholder model):")
         test_health(base_url, tr)
-        test_health_alias(base_url, tr)
+        test_models(base_url, tr)
         test_warmup(base_url, tr)
-        test_transcribe_empty(base_url, tr)
         test_cancel_notfound(base_url, tr)
-        test_transcribe_wrong_sample_rate(base_url, tr)
-        test_transcribe_model_not_loaded(base_url, tr)
-        test_transcribe_pcm16_fallback(base_url, tr)
-        test_transcribe_wav(base_url, tr)
-        test_request_id_passthrough(base_url, tr)
-        print("\nTesting multipart WAV uploads (issue #12 regression):")
-        for endpoint in ("transcribe", "inference"):
-            test_multipart_wav_decodes(base_url, tr, endpoint)
-        for endpoint in ("transcribe", "inference"):
-            test_multipart_wav_reaches_inference(base_url, tr, endpoint)
-        test_multipart_filenameless_part(base_url, tr)
-        test_multipart_empty_named_part_shadowing(base_url, tr)
-        test_malformed_wav_huge_frame_count(base_url, tr)
+        test_batch_contract(base_url, tr)
         if not args.no_server:
             print("\nTesting POST /normalize (text-path transport, placeholders):")
             test_normalize_endpoints(args.binary, tr)
@@ -1356,9 +1156,6 @@ def main():
                 anchor = np.tile(samples,
                                  max(1, int(np.ceil(60.0 * 16000 / len(samples)))))
                 test_real_roundtrip(base_url, tr, samples, expected)
-                for endpoint in ("transcribe", "inference"):
-                    test_real_multipart_roundtrip(base_url, tr, samples,
-                                                  expected, endpoint)
                 test_real_duplicate_request_id(base_url, tr, samples)
                 test_real_server_busy(base_url, tr, anchor[: 4 * 16000])
                 test_real_cancel_queued(base_url, tr, anchor)

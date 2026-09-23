@@ -23,17 +23,13 @@ export interface ServerHealth {
   readonly queueDepth?: number;
 }
 
-export const ProtocolSchema = Schema.Literals(["starling", "openai"]);
-
 export const HealthInputSchema = Schema.Struct({
   endpoint: Schema.String,
-  protocol: ProtocolSchema,
   timeoutMs: Schema.optionalKey(Schema.Finite),
 });
 
 export const TranscribeInputSchema = Schema.Struct({
   endpoint: Schema.String,
-  protocol: ProtocolSchema,
   model: Schema.String,
   requestId: Schema.String,
   audio: Schema.instanceOf(ArrayBuffer),

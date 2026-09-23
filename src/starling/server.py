@@ -3,15 +3,14 @@
 This replaces the former granite-only ``starling.granite.server``. One process
 serves ONE model at a time, selected by ``--model`` (default ``granite``). The
 model is kept resident in VRAM and exposed via a
-parakeet-server-compatible interface:
+HTTP/WebSocket interface:
 
-  * ``GET  /``                - health check (reports ``model``, ``phase``, ``queue_depth``)
-  * ``GET  /health``          - health alias
-  * ``POST /inference``       - multipart/raw WAV upload -> ``{text, segments, duration_s, request_id}``
-  * ``POST /transcribe``      - raw WAV bytes -> same shape as /inference
+  * ``GET  /health``          - health check (reports ``model``, ``phase``, ``queue_depth``)
+  * ``POST /v1/audio/transcriptions`` - multipart WAV and model -> ``{text}``
+  * ``GET  /v1/models``      - configured model slug
   * ``POST /warmup``          - pre-capture CUDA graphs on a silent clip (idempotent;
                                 202, or 409 when the model is not loaded)
-  * ``DELETE /inference/<id>``- cancel a queued request by ``X-Request-Id``
+  * ``DELETE /v1/audio/transcriptions/<id>`` - cancel a queued request
   * ``WS   /stream``          - real-time streaming dictation
 
 The model pipelines have incompatible ``transcribe`` signatures, so the
@@ -793,7 +792,7 @@ class ServerConfig:
     # it, so the server picks per request mode:
     #   * ``/stream`` (fixed stream_chunk_seconds windows -> one recurring shape)
     #     uses the graphed path.
-    #   * ``/inference`` / ``/transcribe`` (one-shot file) uses eager, unless the
+    #   * ``/v1/audio/transcriptions`` (one-shot file) uses eager, unless the
     #     file is long enough to be chunked into many same-size windows
     #     (``duration >= file_graph_min_seconds``), in which case graphed wins.
     # ``graph_mode`` overrides the auto policy: "auto" (default) | "graphed" |
@@ -1424,7 +1423,7 @@ def create_app(
     # grow without bound.
     _background_tasks: set = set()
 
-    async def _decode_inference_body(request: "Request") -> bytes:
+    async def _read_bounded_body(request: "Request") -> bytes:
         declared = request.headers.get("content-length")
         if declared is not None:
             try:
@@ -1439,13 +1438,7 @@ def create_app(
             if size > server.config.max_upload_bytes:
                 raise HTTPException(status_code=413, detail="request body too large")
             chunks.append(chunk)
-        body = b"".join(chunks)
-        if not body:
-            return b""
-        ctype = request.headers.get("content-type", "")
-        if "multipart/form-data" in ctype:
-            return _extract_multipart_payload(body, ctype)
-        return body
+        return b"".join(chunks)
 
     def _request_id(request: "Request") -> str:
         rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id")
@@ -1461,13 +1454,9 @@ def create_app(
             "queue_depth": server.queue_depth(),
         }
 
-    @app.get("/")
+    @app.get("/health")
     async def health() -> JSONResponse:
         return JSONResponse(_health_body())
-
-    @app.get("/health")
-    async def health_alias() -> JSONResponse:
-        return await health()
 
     @app.post("/warmup")
     async def warmup_route() -> JSONResponse:
@@ -1485,18 +1474,77 @@ def create_app(
             {"status": "warmup started", "phase": server.phase()}, status_code=202
         )
 
-    async def _inference(request):  # noqa: ANN001
-        payload = await _decode_inference_body(request)
-        if not payload:
-            raise HTTPException(
-                status_code=400,
-                detail="empty upload" if request.url.path == "/inference" else "empty request body",
+    @app.get("/v1/models")
+    async def models() -> JSONResponse:
+        return JSONResponse({
+            "object": "list",
+            "data": [{"id": server.model_slug, "object": "model", "created": 0, "owned_by": "starling"}],
+        })
+
+    async def _transcriptions(request):  # noqa: ANN001
+        def fail(message: str, param: Optional[str], status: int = 400) -> JSONResponse:
+            return JSONResponse(
+                {"error": {"message": message,
+                           "type": "server_error" if status >= 500 else "invalid_request_error",
+                           "param": param, "code": None}},
+                status_code=status,
             )
+
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("multipart/form-data;"):
+            return fail("Expected multipart/form-data with file and model", "file")
+        body = await _read_bounded_body(request)
+        message = BytesParser(policy=email.policy.HTTP).parsebytes(
+            f"Content-Type: {content_type}\r\n\r\n".encode() + body
+        )
+        if not message.is_multipart():
+            return fail("Malformed multipart body", "file")
+        fields: dict[str, list[str]] = {}
+        files: list[tuple[str, bytes]] = []
+        for part in message.iter_parts():
+            if part.get_content_disposition() != "form-data":
+                return fail("Expected form-data parts", "file")
+            name = part.get_param("name", header="content-disposition")
+            if not isinstance(name, str):
+                return fail("Part name is required", "file")
+            value = part.get_payload(decode=True) or b""
+            if part.get_filename() is not None:
+                files.append((name, value))
+            else:
+                fields.setdefault(name, []).append(value.decode("utf-8", errors="replace"))
+        if len(fields.get("model", [])) != 1 or not fields["model"][0]:
+            return fail("Exactly one model field is required; use GET /v1/models", "model")
+        if fields["model"][0] != server.model_slug:
+            return fail("Requested model is not served by this process; use GET /v1/models", "model", 404)
+        for name, values in fields.items():
+            if len(values) != 1:
+                return fail("Duplicate field", name)
+            if name in {"model", "response_format"}:
+                continue
+            if name == "stream" and values[0] == "false":
+                continue
+            if name == "temperature" and values[0] in {"0", "0.0"}:
+                continue
+            return fail("Unsupported transcription option", name)
+        response_format = fields.get("response_format", ["json"])[0]
+        if response_format not in {"json", "text"}:
+            return fail("Supported response formats are json and text", "response_format")
+        if len(files) != 1 or files[0][0] != "file":
+            return fail("Exactly one audio file named file is required", "file")
+        payload = files[0][1]
+        if len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WAVE":
+            return fail("This backend accepts WAV files", "file")
         rid = _request_id(request)
         status, response = await asyncio.to_thread(
             _transcribe_payload_sync, server, payload, rid
         )
-        return JSONResponse(response, status_code=status)
+        if status != 200:
+            return fail(str(response.get("error", "Transcription failed")), None, status)
+        headers = {"X-Request-Id": rid}
+        if response_format == "text":
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(response["text"], headers=headers)
+        return JSONResponse({"text": response["text"]}, headers=headers)
 
     async def _abort(request):  # noqa: ANN001
         rid = request.path_params.get("id")
@@ -1508,11 +1556,10 @@ def create_app(
             status_code=200 if cancelled else 404,
         )
 
-    _inference.__annotations__["request"] = Request
+    _transcriptions.__annotations__["request"] = Request
     _abort.__annotations__["request"] = Request
-    app.add_api_route("/inference", _inference, methods=["POST"])
-    app.add_api_route("/transcribe", _inference, methods=["POST"])
-    app.add_api_route("/inference/{id}", _abort, methods=["DELETE"])
+    app.add_api_route("/v1/audio/transcriptions", _transcriptions, methods=["POST"])
+    app.add_api_route("/v1/audio/transcriptions/{id}", _abort, methods=["DELETE"])
 
     async def _stream(ws):  # noqa: ANN001
         await ws.accept()
@@ -1673,86 +1720,6 @@ def create_app(
     app.add_api_websocket_route("/stream", _stream)
 
     return app
-
-
-# ===========================================================================
-# Multipart uploads
-# ===========================================================================
-def _extract_multipart_payload(body: bytes, content_type: str) -> bytes:
-    """Pull the audio bytes out of a ``multipart/form-data`` upload.
-
-    Handles the convention where the file is the last part AND where it is named
-    explicitly: parts are scored and the best match is returned. Selection order
-    (most specific to least):
-
-      1. a part named ``audio`` or ``file`` (explicit audio field), then
-      2. a part with a non-empty ``filename``, then
-      3. a part whose ``Content-Type`` starts with ``audio/``, then
-      4. the last non-empty part (multipart form convention puts the file last).
-
-    Parsing uses the stdlib :mod:`email` module (RFC 2231/5987-aware), so quoted
-    parameters containing semicolons and ``filename*`` extended values survive.
-
-    If no boundary is present the body is returned unchanged (callers may post
-    raw WAV with ``Content-Type: application/octet-stream`` -- that path is
-    valid and must keep working).
-    """
-    boundary = None
-    for tok in content_type.split(";"):
-        tok = tok.strip()
-        if tok.lower().startswith("boundary="):
-            boundary = tok[len("boundary="):].strip().strip('"')
-            break
-    if not boundary:
-        return body
-
-    # Prepend the Content-Type as a header so the parser can split on the
-    # boundary; email.policy.HTTP gives RFC-compliant multipart handling.
-    header_blob = (f"Content-Type: {content_type}\r\n\r\n").encode()
-    msg = BytesParser(policy=email.policy.HTTP).parsebytes(header_blob + body)
-    if not msg.is_multipart():
-        return body
-
-    # (name, filename, content_type, payload) per candidate part.
-    candidates: list[tuple[Optional[str], Optional[str], Optional[str], bytes]] = []
-    last_payload: Optional[bytes] = None
-    for part in msg.iter_parts():
-        disp = part.get_content_disposition()
-        name: Optional[str] = None
-        filename: Optional[str] = None
-        if disp == "form-data":
-            params = dict(part.get_params(header="content-disposition") or [])
-            name = params.get("name")
-        # get_filename() honours RFC 2231/5987 filename* automatically.
-        filename = part.get_filename()
-        ctype = part.get_content_type()
-        payload = part.get_payload(decode=True) or b""
-        # Preserve the previous non-empty payload across trailing empty parts:
-        # the fallback ("last non-empty part") must not be clobbered by a blank
-        # trailing part.
-        if payload:
-            last_payload = payload
-        candidates.append((name, filename, ctype, payload))
-
-    if not candidates:
-        return body
-
-    def _score(c: tuple[Optional[str], Optional[str], Optional[str], bytes]) -> int:
-        name, filename, ctype, _payload = c
-        if name is not None and name.lower() in ("audio", "file"):
-            return 4
-        if filename:
-            return 3
-        if ctype and ctype.lower().startswith("audio/"):
-            return 2
-        return 0
-
-    best = max(candidates, key=_score)
-    # If nothing scored (only bare text fields), fall back to the last part.
-    if _score(best) == 0:
-        return last_payload if last_payload is not None else body
-    return best[3]
-
 
 
 # ===========================================================================

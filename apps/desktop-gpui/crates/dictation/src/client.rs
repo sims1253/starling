@@ -15,7 +15,7 @@ use reqwest::{Client, RequestBuilder, Url};
 use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
 
-use crate::storage::{TranscriptionResult, TranscriptionSegment};
+use crate::storage::TranscriptionResult;
 
 const DEFAULT_TIMEOUT_MS: u64 = 180_000;
 const MIN_TIMEOUT_MS: u64 = 1;
@@ -29,14 +29,6 @@ const MAX_AUDIO_BYTES: usize = 256 * 1024 * 1024;
 /// client buffer. Override per client with
 /// [`StarlingClient::with_max_response_bytes`].
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-
-/// Transcription backend wire protocol.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    Starling,
-    OpenAi,
-}
 
 /// Health snapshot mirroring the desktop bridge's `ServerHealth`.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -148,7 +140,6 @@ impl CancelToken {
 /// something the blocking API cannot do.
 pub struct StarlingClient {
     base_url: String,
-    protocol: Protocol,
     model: String,
     timeout_ms: u64,
     max_response_bytes: usize,
@@ -166,10 +157,9 @@ impl StarlingClient {
     /// `cleanEndpoint`, default timeout 180 s, redirects refused, model
     /// trimmed (`client.ts`) with the OpenAI fallback to `parakeet`
     /// (`main.ts`).
-    pub fn new(endpoint: &str, protocol: Protocol, model: &str) -> Result<Self, ClientError> {
+    pub fn new(endpoint: &str, model: &str) -> Result<Self, ClientError> {
         Self::build(
             clean_endpoint(endpoint)?,
-            protocol,
             model,
             DEFAULT_TIMEOUT_MS,
             DEFAULT_MAX_RESPONSE_BYTES,
@@ -194,14 +184,12 @@ impl StarlingClient {
 
     fn build(
         base_url: String,
-        protocol: Protocol,
         model: &str,
         timeout_ms: u64,
         max_response_bytes: usize,
     ) -> Result<Self, ClientError> {
         Ok(Self {
             base_url,
-            protocol,
             model: model.trim().to_string(),
             timeout_ms,
             max_response_bytes,
@@ -210,18 +198,10 @@ impl StarlingClient {
         })
     }
 
-    /// `healthProgram`: `GET {base}/health` (starling) or `GET {base}/v1/models`
-    /// (openai, mapped to a ready health snapshot).
+    /// Probe the configured server's model list.
     pub fn health(&self) -> Result<ServerHealth, ClientError> {
-        let route = match self.protocol {
-            Protocol::OpenAi => "/v1/models",
-            Protocol::Starling => "/health",
-        };
-        let response = self.execute(self.http.get(format!("{}{route}", self.base_url)), None)?;
-        match self.protocol {
-            Protocol::OpenAi => parse_models_health(&response.body),
-            Protocol::Starling => parse_starling_health(&response.body),
-        }
+        let response = self.execute(self.http.get(format!("{}/v1/models", self.base_url)), None)?;
+        parse_models_health(&response.body)
     }
 
     /// `transcribeProgram` without cancellation: runs to the timeout.
@@ -256,18 +236,7 @@ impl StarlingClient {
             ));
         }
 
-        let response = match self.protocol {
-            Protocol::Starling => {
-                let url = format!("{}/transcribe", self.base_url);
-                let request = self
-                    .http
-                    .post(&url)
-                    .header("x-request-id", sent_request_id.as_str())
-                    .header("content-type", "audio/wav")
-                    .body(wav_bytes(&wav));
-                self.execute(request, cancel)?
-            }
-            Protocol::OpenAi => {
+        let response = {
                 let url = format!("{}/v1/audio/transcriptions", self.base_url);
                 let model = if self.model.is_empty() {
                     "parakeet"
@@ -288,7 +257,6 @@ impl StarlingClient {
                     .header("x-request-id", sent_request_id.as_str())
                     .multipart(form);
                 self.execute(request, cancel)?
-            }
         };
 
         parse_transcription(
@@ -565,57 +533,6 @@ fn required_string(
     }
 }
 
-fn optional_string(
-    map: &Map<String, Value>,
-    key: &str,
-    label: &'static str,
-) -> Result<Option<String>, ClientError> {
-    match map.get(key) {
-        None => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(_) => Err(ClientError::Protocol(label)),
-    }
-}
-
-fn optional_bool(
-    map: &Map<String, Value>,
-    key: &str,
-    label: &'static str,
-) -> Result<Option<bool>, ClientError> {
-    match map.get(key) {
-        None => Ok(None),
-        Some(Value::Bool(flag)) => Ok(Some(*flag)),
-        Some(_) => Err(ClientError::Protocol(label)),
-    }
-}
-
-fn optional_number(
-    map: &Map<String, Value>,
-    key: &str,
-    label: &'static str,
-) -> Result<Option<f64>, ClientError> {
-    match map.get(key) {
-        None => Ok(None),
-        Some(Value::Number(number)) => Ok(number.as_f64()),
-        Some(_) => Err(ClientError::Protocol(label)),
-    }
-}
-
-/// `WireHealthSchema` + `normalizeHealth`: strict field types (present fields
-/// must be strings/bools/finite numbers as declared).
-fn parse_starling_health(body: &str) -> Result<ServerHealth, ClientError> {
-    const LABEL: &str = "health";
-    let map = decode_object(body, LABEL)?;
-    Ok(ServerHealth {
-        status: required_string(&map, "status", LABEL)?,
-        phase: optional_string(&map, "phase", LABEL)?,
-        model: optional_string(&map, "model", LABEL)?,
-        loaded: optional_bool(&map, "loaded", LABEL)?,
-        busy: optional_bool(&map, "busy", LABEL)?,
-        queue_depth: optional_number(&map, "queue_depth", LABEL)?,
-    })
-}
-
 /// `OpenAiModelsSchema` + `normalizeModels`: `{data: [{id}, …]}` (the `object`
 /// key, when present, must be `"list"`) mapped to a ready health snapshot.
 fn parse_models_health(body: &str) -> Result<ServerHealth, ClientError> {
@@ -653,10 +570,7 @@ fn parse_models_health(body: &str) -> Result<ServerHealth, ClientError> {
     })
 }
 
-/// `WireTranscriptionSchema` + `normalizeTranscription`: strict field types;
-/// `start_s`/`end_s` win over `start`/`end`; both timestamps required with
-/// `0 <= start <= end`; `duration >= 0`. Request id preference:
-/// body `request_id` -> `x-request-id` header -> the id we sent.
+/// The batch API returns raw text; the request id is a response header.
 fn parse_transcription(
     body: &str,
     header_request_id: Option<&str>,
@@ -665,52 +579,15 @@ fn parse_transcription(
     const LABEL: &str = "transcription";
     let map = decode_object(body, LABEL)?;
     let text = required_string(&map, "text", LABEL)?;
-    let wire_segments: &[Value] = match map.get("segments") {
-        Some(Value::Array(items)) => items,
-        Some(_) => return Err(ClientError::Protocol(LABEL)),
-        None => &[],
-    };
-    let mut segments = Vec::with_capacity(wire_segments.len());
-    for item in wire_segments {
-        segments.push(parse_segment(item, LABEL)?);
-    }
-
-    let duration =
-        optional_number(&map, "duration_s", LABEL)?.or(optional_number(&map, "duration", LABEL)?);
-    if duration.is_some_and(|value| value < 0.0) {
-        return Err(ClientError::Protocol(LABEL));
-    }
-
-    let request_id = optional_string(&map, "request_id", LABEL)?
-        .or_else(|| header_request_id.map(str::to_string))
+    let request_id = header_request_id
+        .map(str::to_string)
         .unwrap_or_else(|| sent_request_id.to_string());
 
     Ok(TranscriptionResult {
         text,
-        segments,
-        duration_seconds: duration,
+        segments: Vec::new(),
+        duration_seconds: None,
         request_id: Some(request_id),
-    })
-}
-
-fn parse_segment(item: &Value, label: &'static str) -> Result<TranscriptionSegment, ClientError> {
-    let map = match item {
-        Value::Object(map) => map,
-        _ => return Err(ClientError::Protocol(label)),
-    };
-    let text = required_string(map, "text", label)?;
-    let start = optional_number(map, "start_s", label)?.or(optional_number(map, "start", label)?);
-    let end = optional_number(map, "end_s", label)?.or(optional_number(map, "end", label)?);
-    let (Some(start), Some(end)) = (start, end) else {
-        return Err(ClientError::Protocol(label));
-    };
-    if start < 0.0 || end < start {
-        return Err(ClientError::Protocol(label));
-    }
-    Ok(TranscriptionSegment {
-        text,
-        start_seconds: start,
-        end_seconds: end,
     })
 }
 
@@ -855,8 +732,8 @@ mod tests {
         wav
     }
 
-    fn client_at(addr: SocketAddr, protocol: Protocol) -> StarlingClient {
-        StarlingClient::new(&format!("http://{addr}"), protocol, "").expect("valid client")
+    fn client_at(addr: SocketAddr) -> StarlingClient {
+        StarlingClient::new(&format!("http://{addr}"), "").expect("valid client")
     }
 
     fn expect_input(error: ClientError, message: &str) {
@@ -867,33 +744,11 @@ mod tests {
     }
 
     #[test]
-    fn starling_health_happy_path() {
-        let body = r#"{"status":"ok","phase":"ready","model":"parakeet","loaded":true,"busy":false,"queue_depth":2}"#;
-        let (addr, recorded) = spawn_server(vec![ok_json(body)]);
-        let health = client_at(addr, Protocol::Starling)
-            .health()
-            .expect("health");
-
-        let request = recorded.lock().expect("recorded lock");
-        assert_eq!(request.len(), 1);
-        assert_eq!(request[0].method, "GET");
-        assert_eq!(request[0].path, "/health");
-        drop(request);
-
-        assert_eq!(health.status, "ok");
-        assert_eq!(health.phase.as_deref(), Some("ready"));
-        assert_eq!(health.model.as_deref(), Some("parakeet"));
-        assert_eq!(health.loaded, Some(true));
-        assert_eq!(health.busy, Some(false));
-        assert_eq!(health.queue_depth, Some(2.0));
-    }
-
-    #[test]
     fn openai_health_maps_models_to_ready() {
         let (addr, recorded) = spawn_server(vec![ok_json(
             r#"{"object":"list","data":[{"id":"parakeet"},{"id":"whisper"}]}"#,
         )]);
-        let health = client_at(addr, Protocol::OpenAi).health().expect("health");
+        let health = client_at(addr).health().expect("health");
 
         let request = recorded.lock().expect("recorded lock");
         assert_eq!(request[0].method, "GET");
@@ -909,48 +764,10 @@ mod tests {
     }
 
     #[test]
-    fn starling_transcribe_sends_raw_wav_and_normalizes() {
-        let body = r#"{"text":"hello world","segments":[{"text":"hello","start_s":0,"end_s":0.5},{"text":"world","start":0.5,"end":1}],"duration_s":1,"request_id":"from-body"}"#;
-        let (addr, recorded) = spawn_server(vec![ok_json(body)]);
-        let wav = fake_wav();
-        let result = client_at(addr, Protocol::Starling)
-            .transcribe(Arc::new(wav.clone()), "req-1")
-            .expect("transcription");
-
-        let request = recorded.lock().expect("recorded lock");
-        assert_eq!(request.len(), 1);
-        assert_eq!(request[0].method, "POST");
-        assert_eq!(request[0].path, "/transcribe");
-        assert_eq!(request[0].header("x-request-id"), Some("req-1"));
-        assert_eq!(request[0].header("content-type"), Some("audio/wav"));
-        // The zero-copy body (issue #235) keeps the plain framing: the
-        // length is declared up front, the upload is not chunked, and the
-        // bytes arrive whole.
-        assert_eq!(
-            request[0].header("content-length"),
-            Some(wav.len().to_string().as_str())
-        );
-        assert_eq!(request[0].header("transfer-encoding"), None);
-        assert_eq!(request[0].body, wav);
-        drop(request);
-
-        assert_eq!(result.text, "hello world");
-        assert_eq!(result.segments.len(), 2);
-        assert_eq!(result.segments[0].text, "hello");
-        assert_eq!(result.segments[0].start_seconds, 0.0);
-        assert_eq!(result.segments[0].end_seconds, 0.5);
-        assert_eq!(result.segments[1].text, "world");
-        assert_eq!(result.segments[1].start_seconds, 0.5);
-        assert_eq!(result.segments[1].end_seconds, 1.0);
-        assert_eq!(result.duration_seconds, Some(1.0));
-        assert_eq!(result.request_id.as_deref(), Some("from-body"));
-    }
-
-    #[test]
     fn openai_transcribe_sends_multipart_form() {
         let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"hi"}"#)]);
         let wav = fake_wav();
-        let result = client_at(addr, Protocol::OpenAi)
+        let result = client_at(addr)
             .transcribe(Arc::new(wav.clone()), "req-2")
             .expect("transcription");
 
@@ -1007,7 +824,7 @@ mod tests {
             &[],
             r#"{"detail":"model is loading"}"#,
         )]);
-        match client_at(addr, Protocol::Starling).health() {
+        match client_at(addr).health() {
             Err(ClientError::Http { status, message }) => {
                 assert_eq!(status, 500);
                 assert_eq!(message, "model is loading");
@@ -1020,7 +837,7 @@ mod tests {
             &[],
             "boom",
         )]);
-        match client_at(addr, Protocol::Starling).health() {
+        match client_at(addr).health() {
             Err(ClientError::Http { status, message }) => {
                 assert_eq!(status, 503);
                 assert_eq!(message, "Server returned 503: boom");
@@ -1037,7 +854,7 @@ mod tests {
             "",
         )]);
         assert!(matches!(
-            client_at(addr, Protocol::Starling).health(),
+            client_at(addr).health(),
             Err(ClientError::Redirect(302))
         ));
     }
@@ -1046,44 +863,24 @@ mod tests {
     fn malformed_json_is_a_protocol_error() {
         let (addr, _) = spawn_server(vec![ok_json("this is not json")]);
         assert!(matches!(
-            client_at(addr, Protocol::Starling).health(),
-            Err(ClientError::Protocol("health"))
+            client_at(addr).health(),
+            Err(ClientError::Protocol("models"))
         ));
 
         let (addr, _) = spawn_server(vec![ok_json("{")]);
         assert!(matches!(
-            client_at(addr, Protocol::Starling).transcribe(Arc::new(fake_wav()), "req"),
+            client_at(addr).transcribe(Arc::new(fake_wav()), "req"),
             Err(ClientError::Protocol("transcription"))
         ));
     }
 
     #[test]
     fn wrong_typed_health_fields_are_rejected() {
-        let (addr, _) = spawn_server(vec![ok_json(r#"{"status":"ok","busy":"nope"}"#)]);
+        let (addr, _) = spawn_server(vec![ok_json(r#"{"object":"list","data":[{"id":42}]}"#)]);
         assert!(matches!(
-            client_at(addr, Protocol::Starling).health(),
-            Err(ClientError::Protocol("health"))
+            client_at(addr).health(),
+            Err(ClientError::Protocol("models"))
         ));
-    }
-
-    #[test]
-    fn invalid_segment_timestamps_are_protocol_errors() {
-        let cases = [
-            r#"{"text":"x","segments":[{"text":"a","start_s":2,"end_s":1}]}"#,
-            r#"{"text":"x","segments":[{"text":"a","start":-0.5,"end":1}]}"#,
-            r#"{"text":"x","segments":[{"text":"a","start_s":1}]}"#,
-            r#"{"text":"x","duration_s":-1}"#,
-        ];
-        for body in cases {
-            let (addr, _) = spawn_server(vec![ok_json(body)]);
-            let error = client_at(addr, Protocol::Starling)
-                .transcribe(Arc::new(fake_wav()), "req")
-                .unwrap_err();
-            assert!(
-                matches!(&error, ClientError::Protocol("transcription")),
-                "expected Protocol(transcription) for {body}, got {error:?}"
-            );
-        }
     }
 
     fn expect_client_input_error(result: Result<StarlingClient, ClientError>, message: &str) {
@@ -1097,34 +894,34 @@ mod tests {
     #[test]
     fn endpoint_validation_mirrors_clean_endpoint() {
         expect_client_input_error(
-            StarlingClient::new("not a url", Protocol::Starling, ""),
+            StarlingClient::new("not a url", ""),
             "Invalid server endpoint.",
         );
         expect_client_input_error(
-            StarlingClient::new("ftp://example.com/models", Protocol::OpenAi, ""),
+            StarlingClient::new("ftp://example.com/models", ""),
             "Server endpoint must use http or https.",
         );
         expect_client_input_error(
-            StarlingClient::new("http://user:pass@example.com:9000", Protocol::Starling, ""),
+            StarlingClient::new("http://user:pass@example.com:9000", ""),
             "Put credentials in a trusted proxy, not the endpoint URL.",
         );
     }
 
     #[test]
     fn trailing_slash_is_trimmed_from_endpoint() {
-        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"status":"ok"}"#)]);
+        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"object":"list","data":[]}"#)]);
         let endpoint = format!("http://{addr}/");
-        StarlingClient::new(&endpoint, Protocol::Starling, "")
+        StarlingClient::new(&endpoint, "")
             .expect("valid client")
             .health()
             .expect("health");
         let request = recorded.lock().expect("recorded lock");
-        assert_eq!(request[0].path, "/health");
+        assert_eq!(request[0].path, "/v1/models");
     }
 
     #[test]
     fn transcribe_validates_request_id_and_payload() {
-        let client = StarlingClient::new("http://127.0.0.1:9", Protocol::Starling, "")
+        let client = StarlingClient::new("http://127.0.0.1:9", "")
             .expect("valid client");
         expect_input(
             client.transcribe(Arc::new(fake_wav()), "").unwrap_err(),
@@ -1159,10 +956,10 @@ mod tests {
                 let mut stream = stream;
                 let _ = read_request(&mut stream);
                 std::thread::sleep(Duration::from_millis(300));
-                let _ = stream.write_all(&ok_json(r#"{"status":"ok"}"#));
+                let _ = stream.write_all(&ok_json(r#"{"object":"list","data":[]}"#));
             }
         });
-        let client = StarlingClient::new(&format!("http://{addr}"), Protocol::Starling, "")
+        let client = StarlingClient::new(&format!("http://{addr}"), "")
             .expect("valid client")
             .with_timeout_ms(50)
             .expect("valid timeout");
@@ -1178,7 +975,7 @@ mod tests {
     #[test]
     fn oversized_declared_response_is_refused() {
         let (addr, _) = spawn_server(vec![canned_response("200 OK", &[], &"x".repeat(65))]);
-        let client = client_at(addr, Protocol::Starling)
+        let client = client_at(addr)
             .with_max_response_bytes(64)
             .expect("valid limit");
         match client.health() {
@@ -1193,7 +990,7 @@ mod tests {
     #[test]
     fn oversized_chunked_response_is_refused_while_streaming() {
         let (addr, _) = spawn_server(vec![chunked_response(&[&"a".repeat(40), &"b".repeat(40)])]);
-        let client = client_at(addr, Protocol::Starling)
+        let client = client_at(addr)
             .with_max_response_bytes(64)
             .expect("valid limit");
         match client.health() {
@@ -1207,10 +1004,10 @@ mod tests {
     /// already exercises the under-the-cap path).
     #[test]
     fn response_exactly_at_the_limit_is_accepted() {
-        let padded = format!("{:<64}", r#"{"status":"ok"}"#);
+        let padded = format!("{:<64}", r#"{"object":"list","data":[]}"#);
         assert_eq!(padded.len(), 64);
         let (addr, _) = spawn_server(vec![ok_json(&padded)]);
-        let client = client_at(addr, Protocol::Starling)
+        let client = client_at(addr)
             .with_max_response_bytes(64)
             .expect("valid limit");
         assert_eq!(client.health().expect("health").status, "ok");
@@ -1218,7 +1015,7 @@ mod tests {
 
     #[test]
     fn response_limit_must_be_positive() {
-        let client = StarlingClient::new("http://127.0.0.1:9", Protocol::Starling, "")
+        let client = StarlingClient::new("http://127.0.0.1:9", "")
             .expect("valid client");
         expect_client_input_error(
             client.with_max_response_bytes(0),
@@ -1256,7 +1053,7 @@ mod tests {
                 }
             }
         });
-        let client = StarlingClient::new(&format!("http://{addr}"), Protocol::Starling, "")
+        let client = StarlingClient::new(&format!("http://{addr}"), "")
             .expect("valid client")
             .with_timeout_ms(30_000)
             .expect("valid timeout");
@@ -1299,7 +1096,7 @@ mod tests {
         let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"too late"}"#)]);
         let token = CancelToken::new();
         token.cancel();
-        let client = client_at(addr, Protocol::Starling);
+        let client = client_at(addr);
         match client.transcribe_with_cancel(Arc::new(fake_wav()), "req-precancel", Some(&token)) {
             Err(ClientError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),

@@ -58,9 +58,9 @@ class TranscriptionCoordinator(
      * Opens a live session for a capture that is about to start, when the
      * configuration supports one: on-device live transcription when the
      * on-device engine is selected and a model is imported, or a `WS /stream`
-     * session for the Starling protocol on a remote server whose endpoint
-     * passes the trusted-host policy. Returns null otherwise (OpenAI-shaped
-     * endpoints, no imported model, or a rejected endpoint) and the caller
+     * session for a remote server whose endpoint passes the trusted-host
+     * policy. Returns null otherwise (no imported model or a rejected
+     * endpoint) and the caller
      * records exactly as before, without streaming.
      *
      * [onEvent] is invoked on the main thread: [StreamEvent.Live] once audio
@@ -194,11 +194,11 @@ class TranscriptionCoordinator(
 
     companion object {
         /**
-         * Whether a remote configuration streams over `WS /stream`: only the
-         * Starling protocol has that route; OpenAI-shaped endpoints do not.
-         * The on-device engine streams locally instead (see [beginStreaming]).
+         * Remote configurations attempt `WS /stream` and fall back to batch
+         * transcription if the endpoint does not support live dictation.
+         * The on-device engine streams locally (see [beginStreaming]).
          */
         internal fun streamingEligible(config: BackendConfig): Boolean =
-            config.engine == TranscriptionEngine.REMOTE && config.protocol == BackendProtocol.STARLING
+            config.engine == TranscriptionEngine.REMOTE
     }
 }

@@ -112,9 +112,9 @@ The servers share audio routes and streaming messages. Clients must account
 for these differences:
 
 - **Inputs**: this server requires 16 kHz audio (below); the Python server
-  resamples non-16 kHz WAVs via scipy instead of rejecting them. Native HTTP
-  uploads also accept raw mono PCM16; Python HTTP uploads require WAV. Both
-  WebSocket endpoints accept PCM16 and WAV.
+  resamples non-16 kHz WAVs via scipy instead of rejecting them. HTTP uploads
+  require WAV on both servers. Both WebSocket endpoints accept PCM16
+  and WAV.
 - **Models**: both serve `parakeet`, `moss`, `ark`, `higgs`, `granite`, `qwen3`,
   and `audex`. Native serving also supports `hojo` and `s1`; Python serving
   also supports `parakeet_unified` and `cohere`. Native `s1` exposes the
@@ -135,19 +135,19 @@ for these differences:
 
 Phase drives the UI: `unloaded → loading → ready → busy`.
 
-### `POST /transcribe` / `POST /inference`
+### `POST /v1/audio/transcriptions`
 
-Accepts raw WAV bytes (or multipart/form-data). **Audio must be 16 kHz**. The native server has no resampler, so WAVs at other
+Accepts multipart/form-data with one `file` WAV part and one `model` field.
+**Audio must be 16 kHz**. The native server has no resampler, so WAVs at other
 sample rates are rejected with
 `400` and a `sample rate mismatch` error (the Python server resamples via
 scipy instead). WAV parsing is bounded by the actual payload size: a header
 whose claimed frame count exceeds what the payload can hold (crafted or
 truncated) is rejected with `400` and a `malformed audio payload` error: it
-is never reinterpreted as raw PCM. Payloads without RIFF/WAVE magic are
-treated as raw mono PCM16 @ 16 kHz little-endian. Returns:
+is never reinterpreted as raw PCM. Returns:
 
 ```json
-{"text":"hello world","segments":[{"text":"hello world","start_s":0.0,"end_s":2.5}],"duration_s":2.5,"request_id":"..."}
+{"text":"hello world"}
 ```
 
 Uses `X-Request-Id` header for tracking. Errors map to: `400` malformed
@@ -179,9 +179,9 @@ first. Returns:
 {"text":"So I need to send the report by Friday.","request_id":"..."}
 ```
 
-Audio models answer `400` ("model has no text path"): use `/transcribe`.
+Audio models answer `400` ("model has no text path"): use `/v1/audio/transcriptions`.
 
-### `DELETE /inference/<id>`
+### `DELETE /v1/audio/transcriptions/<id>`
 
 Cancels a queued or in-flight request by request ID.
 

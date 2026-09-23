@@ -13,116 +13,247 @@
   ],
   "type": "object",
   "additionalProperties": false,
-  "required": ["name", "route", "protocol", "sources", "cases"],
+  "required": [
+    "name",
+    "route",
+    "protocol",
+    "sources",
+    "cases"
+  ],
   "properties": {
-    "name": { "type": "string", "minLength": 1 },
-    "route": { "type": "string", "pattern": "^/" },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^/"
+    },
     "protocol": {
-      "enum": ["openai-subset", "starling-legacy", "starling-extension", "starling-streaming"]
+      "enum": [
+        "openai-subset",
+        "starling-extension",
+        "starling-streaming"
+      ]
     },
     "sources": {
       "type": "array",
       "minItems": 1,
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "cases": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/case" }
+      "items": {
+        "$ref": "#/$defs/case"
+      }
     }
   },
   "$defs": {
     "case": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "request", "response"],
+      "required": [
+        "name",
+        "request",
+        "response"
+      ],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "request": { "$ref": "#/$defs/request" },
-        "response": { "$ref": "#/$defs/response" },
-        "note": { "type": "string" }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request": {
+          "$ref": "#/$defs/request"
+        },
+        "response": {
+          "$ref": "#/$defs/response"
+        },
+        "note": {
+          "type": "string"
+        }
       }
     },
     "audioSpec": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["format"],
+      "required": [
+        "format"
+      ],
       "properties": {
-        "format": { "enum": ["wav", "pcm16le", "mp3", "other"] },
-        "sample_rate_hz": { "type": "integer", "minimum": 1 },
-        "channels": { "type": "integer", "minimum": 1 },
-        "bytes": { "type": "integer", "minimum": 0 },
-        "duration_s": { "type": "number", "minimum": 0 },
-        "note": { "type": "string" }
+        "format": {
+          "enum": [
+            "wav",
+            "pcm16le",
+            "mp3",
+            "other"
+          ]
+        },
+        "sample_rate_hz": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "channels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "note": {
+          "type": "string"
+        }
       }
     },
     "request": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["method"],
+      "required": [
+        "method"
+      ],
       "properties": {
-        "method": { "enum": ["GET", "POST", "DELETE", "WS"] },
-        "path": { "type": "string", "pattern": "^/" },
-        "headers": { "type": "object" },
+        "method": {
+          "enum": [
+            "GET",
+            "POST",
+            "DELETE",
+            "WS"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "headers": {
+          "type": "object"
+        },
         "multipart_fields": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["name", "value"],
+            "required": [
+              "name",
+              "value"
+            ],
             "properties": {
-              "name": { "type": "string", "minLength": 1 },
-              "value": { "type": "string" }
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": "string"
+              }
             }
           }
         },
         "multipart_file": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["name", "audio"],
+          "required": [
+            "name",
+            "audio"
+          ],
           "properties": {
-            "name": { "type": "string", "minLength": 1 },
-            "filename": { "type": "string" },
-            "audio": { "$ref": "#/$defs/audioSpec" }
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "filename": {
+              "type": "string"
+            },
+            "audio": {
+              "$ref": "#/$defs/audioSpec"
+            }
           }
         },
         "body_json": {},
-        "body_text": { "type": "string" },
-        "body_audio": { "$ref": "#/$defs/audioSpec" },
-        "body_bytes_hex": { "type": "string" },
+        "body_text": {
+          "type": "string"
+        },
+        "body_audio": {
+          "$ref": "#/$defs/audioSpec"
+        },
+        "body_bytes_hex": {
+          "type": "string"
+        },
         "ws_frames": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind"],
+            "required": [
+              "kind"
+            ],
             "properties": {
-              "kind": { "enum": ["text", "binary"] },
+              "kind": {
+                "enum": [
+                  "text",
+                  "binary"
+                ]
+              },
               "message_json": {},
-              "audio": { "$ref": "#/$defs/audioSpec" },
-              "bytes_hex": { "type": "string" },
-              "note": { "type": "string" }
+              "audio": {
+                "$ref": "#/$defs/audioSpec"
+              },
+              "bytes_hex": {
+                "type": "string"
+              },
+              "note": {
+                "type": "string"
+              }
             }
           }
         },
-        "then_disconnect": { "type": "boolean" },
-        "note": { "type": "string" }
+        "then_disconnect": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string"
+        }
       }
     },
     "response": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status"],
+      "required": [
+        "status"
+      ],
       "properties": {
-        "status": { "type": "integer", "minimum": 100 },
-        "content_type": { "type": "string" },
-        "headers": { "type": "object" },
+        "status": {
+          "type": "integer",
+          "minimum": 100
+        },
+        "content_type": {
+          "type": "string"
+        },
+        "headers": {
+          "type": "object"
+        },
         "body_json": {},
-        "body_text": { "type": "string" },
-        "body_non_json": { "type": "boolean" },
-        "ws_messages": { "type": "array" },
-        "after_disconnect": { "type": "string" },
-        "note": { "type": "string" }
+        "body_text": {
+          "type": "string"
+        },
+        "body_non_json": {
+          "type": "boolean"
+        },
+        "ws_messages": {
+          "type": "array"
+        },
+        "after_disconnect": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
       }
     }
   }

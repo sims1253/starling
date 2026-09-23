@@ -104,6 +104,15 @@ pub fn render_capture(
                 ),
         )
         .child(render_recorder(app, cx, recording, has_transcript))
+        .when(recording && !app.live_partial.is_empty(), |pane| {
+            pane.child(
+                div()
+                    .max_w(px(620.))
+                    .text_size(px(18.))
+                    .text_color(theme::INK)
+                    .child(app.live_partial.clone()),
+            )
+        })
         .child(render_import_button(cx))
         .children(render_banner(app, cx))
 }

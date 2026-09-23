@@ -2,7 +2,6 @@ package dev.starling.mobile
 
 import dev.starling.mobile.network.EndpointPolicy
 import dev.starling.mobile.network.EndpointValidation
-import dev.starling.mobile.network.BackendProtocol
 import dev.starling.mobile.network.inferenceUrl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -35,7 +34,7 @@ class EndpointPolicyTest {
     @Test
     fun credentialsAndFragmentsAreRejected() {
         assertTrue(EndpointPolicy.validate("https://user:secret@server.example", false) is EndpointValidation.Invalid)
-        assertTrue(EndpointPolicy.validate("https://server.example/inference?token=secret", false) is EndpointValidation.Invalid)
+        assertTrue(EndpointPolicy.validate("https://server.example/v1/audio/transcriptions?token=secret", false) is EndpointValidation.Invalid)
     }
 
     @Test
@@ -46,22 +45,18 @@ class EndpointPolicyTest {
     }
 
     @Test
-    fun routeSelectionKeepsDocumentedAliasesAndBasePaths() {
+    fun routeSelectionUsesTheSingleTranscriptionApi() {
         assertEquals(
-            "https://server.example/inference",
-            inferenceUrl("https://server.example", BackendProtocol.STARLING),
-        )
-        assertEquals(
-            "https://server.example/transcribe",
-            inferenceUrl("https://server.example/transcribe", BackendProtocol.STARLING),
+            "https://server.example/v1/audio/transcriptions",
+            inferenceUrl("https://server.example"),
         )
         assertEquals(
             "https://server.example/v1/audio/transcriptions",
-            inferenceUrl("https://server.example/v1", BackendProtocol.OPENAI),
+            inferenceUrl("https://server.example/v1"),
         )
         assertEquals(
             "https://server.example/v1/audio/transcriptions",
-            inferenceUrl("https://server.example/v1/audio/transcriptions", BackendProtocol.OPENAI),
+            inferenceUrl("https://server.example/v1/audio/transcriptions"),
         )
     }
 }

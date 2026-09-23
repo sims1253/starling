@@ -4,14 +4,14 @@ import java.io.File
 import java.io.OutputStream
 
 /**
- * Dependency-free multipart encoder shared by the legacy and OpenAI-shaped
- * Starling requests. Keeping this separate makes the wire fields testable on
+ * Dependency-free multipart encoder for Starling transcription requests.
+ * Keeping this separate makes the wire fields testable on
  * the JVM without trying to execute Android's mocked JSON classes.
  */
 internal class MultipartRequest(
     private val boundary: String,
     private val audioFile: File,
-    private val fields: List<Pair<String, String>> = emptyList(),
+    private val fields: List<Pair<String, String>>,
 ) {
     private val prefix: ByteArray = buildString {
         fields.forEach { (name, value) ->

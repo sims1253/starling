@@ -7,15 +7,9 @@ import java.net.URI
 data class BackendConfig(
     val endpoint: String,
     val allowTrustedLanHttp: Boolean,
-    val protocol: BackendProtocol = BackendProtocol.STARLING,
     val model: String = "parakeet",
     val engine: TranscriptionEngine = TranscriptionEngine.REMOTE,
 )
-
-enum class BackendProtocol {
-    STARLING,
-    OPENAI,
-}
 
 enum class TranscriptionEngine {
     REMOTE,
@@ -32,9 +26,6 @@ class BackendSettings(context: Context) {
     fun load(): BackendConfig = BackendConfig(
         endpoint = preferences.getString(KEY_ENDPOINT, DEFAULT_ENDPOINT) ?: DEFAULT_ENDPOINT,
         allowTrustedLanHttp = preferences.getBoolean(KEY_ALLOW_HTTP, false),
-        protocol = preferences.getString(KEY_PROTOCOL, BackendProtocol.STARLING.name)
-            ?.let { value -> runCatching { BackendProtocol.valueOf(value) }.getOrDefault(BackendProtocol.STARLING) }
-            ?: BackendProtocol.STARLING,
         model = preferences.getString(KEY_MODEL, DEFAULT_MODEL) ?: DEFAULT_MODEL,
         engine = preferences.getString(KEY_ENGINE, TranscriptionEngine.REMOTE.name)
             ?.let { value -> runCatching { TranscriptionEngine.valueOf(value) }.getOrDefault(TranscriptionEngine.REMOTE) }
@@ -45,13 +36,12 @@ class BackendSettings(context: Context) {
         val validated = EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp)
         require(validated is EndpointValidation.Valid) { (validated as EndpointValidation.Invalid).message }
         val model = config.model.trim()
-        require(config.protocol != BackendProtocol.OPENAI || model.isNotEmpty()) {
+        require(config.engine != TranscriptionEngine.REMOTE || model.isNotEmpty()) {
             "Enter the model name served by the backend"
         }
         preferences.edit()
             .putString(KEY_ENDPOINT, validated.endpoint)
             .putBoolean(KEY_ALLOW_HTTP, config.allowTrustedLanHttp)
-            .putString(KEY_PROTOCOL, config.protocol.name)
             .putString(KEY_MODEL, model)
             .putString(KEY_ENGINE, config.engine.name)
             .apply()
@@ -61,7 +51,6 @@ class BackendSettings(context: Context) {
         private const val PREFS_NAME = "backend_settings"
         private const val KEY_ENDPOINT = "endpoint"
         private const val KEY_ALLOW_HTTP = "allow_trusted_lan_http"
-        private const val KEY_PROTOCOL = "protocol"
         private const val KEY_MODEL = "model"
         private const val KEY_ENGINE = "engine"
         const val DEFAULT_MODEL = "parakeet"

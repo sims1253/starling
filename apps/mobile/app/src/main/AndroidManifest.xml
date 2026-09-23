@@ -59,6 +59,7 @@
             android:permission="android.permission.BIND_RECOGNITION_SERVICE">
             <intent-filter>
                 <action android:name="android.speech.RecognitionService" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <meta-data
                 android:name="android.speech"

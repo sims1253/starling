@@ -1,6 +1,6 @@
 //! Persistent app settings, replacing the `localStorage` keys used by
-//! `apps/desktop/src/App.tsx` (`starling:endpoint`, `starling:protocol`,
-//! `starling:model`, `starling:terms`) with a JSON file. See
+//! `apps/desktop/src/App.tsx` (`starling:endpoint`, `starling:model`,
+//! `starling:terms`) with a JSON file. See
 //! `apps/desktop-gpui/PORT.md`.
 
 //! # The dropped `storageBackend` key (D14, deliberate)
@@ -17,11 +17,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The transcription backend wire protocol. One enum for the whole crate
-/// (R11): the client routes requests by it, the settings file persists it
-/// (`"starling"` / `"openai"`, lowercase, unchanged on disk).
-pub use crate::client::Protocol;
-
 /// The platform config directory could not be resolved (on Linux,
 /// `$XDG_CONFIG_HOME` and `$HOME` are both unset). Returned instead of
 /// silently reading/writing settings in an arbitrary working directory.
@@ -33,7 +28,6 @@ pub struct ConfigDirUnavailable;
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub endpoint: String,
-    pub protocol: Protocol,
     pub model: String,
     pub expected_terms: Vec<String>,
     /// Whether the user explicitly chose the model (R02). While false, the
@@ -45,12 +39,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Defaults mirroring `App.tsx`: `DEFAULT_ENDPOINT`, the starling protocol,
-    /// the `parakeet` model, and the "auth" expected-terms input.
+    /// Defaults mirroring `App.tsx`: `DEFAULT_ENDPOINT`, the `parakeet`
+    /// model, and the "auth" expected-terms input.
     pub fn default_settings() -> Self {
         Self {
             endpoint: "http://127.0.0.1:8181".to_string(),
-            protocol: Protocol::Starling,
             model: "parakeet".to_string(),
             expected_terms: vec!["auth".to_string()],
             user_set_model: false,
@@ -142,28 +135,10 @@ mod tests {
         let settings = Settings::default_settings();
 
         assert_eq!(settings.endpoint, "http://127.0.0.1:8181");
-        assert_eq!(settings.protocol, Protocol::Starling);
         assert_eq!(settings.model, "parakeet");
         assert_eq!(settings.expected_terms, vec!["auth".to_string()]);
         assert_eq!(settings.expected_terms_input(), "auth");
         assert!(!settings.user_set_model);
-    }
-
-    #[test]
-    fn protocol_serializes_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&Protocol::Starling).unwrap(),
-            "\"starling\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Protocol::OpenAi).unwrap(),
-            "\"openai\""
-        );
-
-        let starling: Protocol = serde_json::from_str("\"starling\"").unwrap();
-        let openai: Protocol = serde_json::from_str("\"openai\"").unwrap();
-        assert_eq!(starling, Protocol::Starling);
-        assert_eq!(openai, Protocol::OpenAi);
     }
 
     #[test]
@@ -173,7 +148,6 @@ mod tests {
 
         let settings = Settings {
             endpoint: "http://127.0.0.1:9999/".to_string(),
-            protocol: Protocol::OpenAi,
             model: "whisper-large-v3".to_string(),
             expected_terms: vec!["auth".to_string(), "Starling".to_string()],
             user_set_model: true,
@@ -182,11 +156,10 @@ mod tests {
         settings.save(&path).expect("save");
         assert_eq!(Settings::load(&path), settings);
 
-        // camelCase keys on disk, protocol lowercase.
+        // camelCase keys on disk.
         let raw = std::fs::read_to_string(&path).expect("read settings file");
         let value: serde_json::Value = serde_json::from_str(&raw).expect("parse settings");
         assert_eq!(value["endpoint"], "http://127.0.0.1:9999/");
-        assert_eq!(value["protocol"], "openai");
         assert_eq!(value["model"], "whisper-large-v3");
         assert_eq!(
             value["expectedTerms"],
@@ -206,7 +179,7 @@ mod tests {
         // still loads, and saving drops the key.
         std::fs::write(
             &path,
-            r#"{"endpoint":"http://127.0.0.1:8181","protocol":"starling","model":"parakeet","expectedTerms":["auth"],"storageBackend":"v1"}"#,
+            r#"{"endpoint":"http://127.0.0.1:8181","model":"parakeet","expectedTerms":["auth"],"storageBackend":"v1"}"#,
         )
         .expect("write legacy settings");
         let settings = Settings::load(&path);
@@ -227,7 +200,7 @@ mod tests {
         // the missing flag must not be sniffed out of the text.
         std::fs::write(
             &path,
-            r#"{"endpoint":"http://10.0.0.5:8181","protocol":"openai","model":"whisper-large-v3","expectedTerms":["auth"]}"#,
+            r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"]}"#,
         )
         .expect("write legacy settings");
 
@@ -254,7 +227,7 @@ mod tests {
         assert_eq!(Settings::load(&path), Settings::default_settings());
 
         // Wrong field types are corrupt too, not a panic.
-        std::fs::write(&path, r#"{"endpoint":42,"protocol":"bogus"}"#)
+        std::fs::write(&path, r#"{"endpoint":42}"#)
             .expect("write mistyped settings");
         assert_eq!(Settings::load(&path), Settings::default_settings());
     }

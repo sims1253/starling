@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use starling_dictation::client::{ClientError, Protocol, StarlingClient};
+use starling_dictation::client::{ClientError, StarlingClient};
 
 /// The cancellation signal the jobs scheduler hands a provider (issue
 /// #251): [`crate::machine::jobs`] creates one per job, `jobs.cancel`
@@ -87,16 +87,16 @@ pub trait TranscriptionProvider: Send + Sync {
 }
 
 /// The production provider: `starling-dictation`'s `StarlingClient`
-/// (PR #193's protocol enum, endpoint validation, bounded timeouts, error
+/// (endpoint validation, bounded timeouts, error
 /// taxonomy) behind the runtime's adapter trait.
 pub struct StarlingProvider {
     client: StarlingClient,
 }
 
 impl StarlingProvider {
-    pub fn new(endpoint: &str, protocol: Protocol, model: &str) -> Result<Self, ClientError> {
+    pub fn new(endpoint: &str, model: &str) -> Result<Self, ClientError> {
         Ok(StarlingProvider {
-            client: StarlingClient::new(endpoint, protocol, model)?,
+            client: StarlingClient::new(endpoint, model)?,
         })
     }
 }

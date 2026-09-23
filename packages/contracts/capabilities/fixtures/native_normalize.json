@@ -1,7 +1,7 @@
 {
   "name": "Native text normalization (s1 text models)",
   "route": "/normalize",
-  "protocol": "starling-legacy",
+  "protocol": "starling-extension",
   "sources": [
     "cpp/serve/main.cpp:826-922",
     "tests/test_native_serve.py:test_normalize_endpoints",
@@ -14,13 +14,20 @@
       "request": {
         "method": "POST",
         "path": "/normalize",
-        "headers": { "Content-Type": "application/json" },
-        "body_json": { "transcript": "hi 😀 𠮷 bye" }
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body_json": {
+          "transcript": "hi 😀 𠮷 bye"
+        }
       },
       "response": {
         "status": 200,
         "content_type": "application/json",
-        "body_json": { "text": "hi 😀 𠮷 bye", "request_id": "<generated>" }
+        "body_json": {
+          "text": "hi 😀 𠮷 bye",
+          "request_id": "<generated>"
+        }
       },
       "note": "The contract fixture engine double-echoes the decoded transcript (raw UTF-8 and \\u-escaped surrogate pairs decode identically), pinning \\u decoding byte-for-byte. A real s1 model returns normalized text; optional control fields are styling/structure/context."
     },
@@ -29,13 +36,19 @@
       "request": {
         "method": "POST",
         "path": "/normalize",
-        "headers": { "Content-Type": "application/json" },
-        "body_json": { "transcript": "hi" }
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body_json": {
+          "transcript": "hi"
+        }
       },
       "response": {
         "status": 400,
         "content_type": "application/json",
-        "body_json": { "error": "model has no text path (audio models use /transcribe)" }
+        "body_json": {
+          "error": "model has no text path (audio models use /v1/audio/transcriptions)"
+        }
       },
       "note": "When the resident model is an audio model."
     },
@@ -44,13 +57,19 @@
       "request": {
         "method": "POST",
         "path": "/normalize",
-        "headers": { "Content-Type": "application/json" },
-        "body_json": { "styling": "casual" }
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body_json": {
+          "styling": "casual"
+        }
       },
       "response": {
         "status": 400,
         "content_type": "application/json",
-        "body_json": { "error": "missing or malformed 'transcript' field" }
+        "body_json": {
+          "error": "missing or malformed 'transcript' field"
+        }
       }
     },
     {
@@ -63,7 +82,9 @@
       "response": {
         "status": 400,
         "content_type": "application/json",
-        "body_json": { "error": "empty request body" }
+        "body_json": {
+          "error": "empty request body"
+        }
       }
     },
     {
@@ -71,13 +92,17 @@
       "request": {
         "method": "POST",
         "path": "/normalize",
-        "headers": { "Content-Type": "application/json" },
+        "headers": {
+          "Content-Type": "application/json"
+        },
         "body_text": "{\"transcript\": \"bad \\uZZZZ\"}"
       },
       "response": {
         "status": 400,
         "content_type": "application/json",
-        "body_json": { "error": "missing or malformed 'transcript' field" }
+        "body_json": {
+          "error": "missing or malformed 'transcript' field"
+        }
       },
       "note": "A malformed \\u escape fails field decoding; an unpaired surrogate half instead decodes to U+FFFD and the request succeeds."
     },
@@ -86,13 +111,20 @@
       "request": {
         "method": "POST",
         "path": "/normalize",
-        "headers": { "Content-Type": "application/json", "X-Request-Id": "#123" },
-        "body_json": { "transcript": "um hi" }
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Request-Id": "#123"
+        },
+        "body_json": {
+          "transcript": "um hi"
+        }
       },
       "response": {
         "status": 400,
         "content_type": "application/json",
-        "body_json": { "error": "invalid request id" }
+        "body_json": {
+          "error": "invalid request id"
+        }
       }
     }
   ]

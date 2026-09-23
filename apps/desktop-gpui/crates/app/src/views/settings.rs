@@ -1,5 +1,5 @@
 //! The settings modal: dark scrim over the workspace, light centered card
-//! with endpoint/model/terms fields, protocol toggle, callout and footer.
+//! with endpoint/model/terms fields, callout and footer.
 
 use std::time::Duration;
 
@@ -7,11 +7,9 @@ use gpui::{
     Animation, AnimationExt, Context, Div, FontWeight, MouseButton, Window, div, prelude::*, px,
     rgba,
 };
-use starling_dictation::settings;
-
 use crate::app::{ConnectionProbe, StarlingApp, settings_callout_view};
 use crate::theme;
-use crate::views::{SETTINGS_CALLOUT_DOT_ID, icon, protocol_option_id, status_dot};
+use crate::views::{SETTINGS_CALLOUT_DOT_ID, icon, status_dot};
 
 pub fn render_settings_modal(
     app: &mut StarlingApp,
@@ -26,7 +24,6 @@ pub fn render_settings_modal(
     let draft_endpoint = app.draft_endpoint.clone();
     let draft_model = app.draft_model.clone();
     let draft_terms = app.draft_terms.clone();
-    let selected_protocol = app.settings_protocol;
 
     let card = div()
         .id("settings-card")
@@ -93,26 +90,7 @@ pub fn render_settings_modal(
                 ),
         )
         .child(field_label("Server endpoint").child(draft_endpoint))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(px(12.))
-                .child(
-                    field_label("API format")
-                        .flex_1()
-                        .min_w_0()
-                        .mt(px(0.))
-                        .child(protocol_toggle(selected_protocol, cx)),
-                )
-                .child(
-                    field_label("Model")
-                        .flex_1()
-                        .min_w_0()
-                        .mt(px(0.))
-                        .child(draft_model),
-                ),
-        )
+        .child(field_label("Model").child(draft_model))
         .child(
             field_label("Words to watch").child(draft_terms).child(
                 div()
@@ -244,53 +222,4 @@ fn field_label(label: &str) -> Div {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::SETTINGS_INK)
         .child(label.to_string())
-}
-
-fn protocol_toggle(selected: settings::Protocol, cx: &mut Context<StarlingApp>) -> Div {
-    let options = [
-        (settings::Protocol::Starling, "Starling native"),
-        (settings::Protocol::OpenAi, "OpenAI compatible"),
-    ];
-    let mut toggle = div()
-        .flex()
-        .flex_row()
-        .w_full()
-        .rounded(px(3.))
-        .border_1()
-        .border_color(theme::SETTINGS_LINE)
-        .overflow_hidden();
-    for (protocol, label) in options {
-        let is_selected = selected == protocol;
-        toggle = toggle.child(
-            div()
-                // R04: the id names the option and nothing else — the old
-                // "protocol-selected"/"protocol-option" pair flipped both
-                // options' identities on every click.
-                .id(protocol_option_id(protocol))
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .py(px(11.))
-                .font(theme::mono_font())
-                .text_size(px(11.))
-                .text_color(if is_selected {
-                    theme::SETTINGS_PRIMARY_TEXT
-                } else {
-                    theme::SETTINGS_INK
-                })
-                .bg(if is_selected {
-                    theme::SETTINGS_INK
-                } else {
-                    theme::SETTINGS_FIELD_BG
-                })
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.settings_protocol = protocol;
-                    cx.notify();
-                }))
-                .child(label),
-        );
-    }
-    toggle
 }

@@ -19,11 +19,12 @@ use starling_dictation::{
     fidelity::{self, TranscriptAnalysisOptions},
     player::Player,
     recorder::RecorderHandle,
-    settings::{self, Settings},
+    settings::Settings,
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
 use crate::{input::TextField, store::Store, theme, upload::refresh_sessions, views};
+use crate::live_stream::LiveStream;
 
 actions!(starling, [ToggleRecording]);
 
@@ -43,7 +44,7 @@ pub(crate) const EMPTY_ENDPOINT_REASON: &str = "Enter a server endpoint before s
 /// ported from `connectionProbe.ts`'s `CheckSequencer`): every check
 /// claims a token before awaiting anything and may report its outcome
 /// only while its token is still the newest. A slower, older check —
-/// against an endpoint or protocol that has since been replaced —
+/// against an endpoint that has since been replaced —
 /// resolves after a newer one and is dropped instead of overwriting its
 /// result. `cancel_all` retires every in-flight token at once, so
 /// closing the settings dialog leaves a stray probe with nothing to land
@@ -116,7 +117,7 @@ pub(crate) enum ConnectionProbe {
 /// it owns its own outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HealthCheckPurpose {
-    /// Startup and settings-save checks against the committed pair: they
+    /// Startup and settings-save checks against the committed endpoint: they
     /// own the badge, the server model, the model auto-sync (R02), and
     /// the global error banner.
     Live,
@@ -232,7 +233,6 @@ pub(crate) struct LiveCheckWrites {
 
 pub(crate) fn live_check_writes(
     purpose: HealthCheckPurpose,
-    protocol: client::Protocol,
     user_set_model: bool,
     result: &Result<client::ServerHealth, String>,
 ) -> LiveCheckWrites {
@@ -248,7 +248,6 @@ pub(crate) fn live_check_writes(
             // resolved once, with no dead fallback for the case the
             // filter already excluded (#207 review).
             model_sync: if purpose == HealthCheckPurpose::Live
-                && protocol == client::Protocol::OpenAi
                 && !user_set_model
             {
                 health
@@ -333,13 +332,11 @@ pub struct StarlingApp {
     pub root_focus: FocusHandle,
 
     pub endpoint: String,
-    pub protocol: settings::Protocol,
     pub model: String,
     pub expected_terms_input: String,
     pub user_set_model: bool,
 
     pub settings_open: bool,
-    pub settings_protocol: settings::Protocol,
     pub draft_endpoint: Entity<TextField>,
     pub draft_model: Entity<TextField>,
     pub draft_terms: Entity<TextField>,
@@ -410,6 +407,10 @@ pub struct StarlingApp {
     pub playback_generation: u64,
 
     pub recorder: Option<RecorderHandle>,
+    pub(crate) live_stream: Option<LiveStream>,
+    pub(crate) live_partial: String,
+    pub(crate) streamed_samples: Vec<f32>,
+    pub(crate) stream_sent_samples: usize,
     pub levels: Vec<f32>,
     pub elapsed_ms: f64,
 
@@ -771,7 +772,6 @@ impl StarlingApp {
     pub fn new(started: Instant, diagnostics: bool, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load_or_default();
         let endpoint = settings.endpoint.clone();
-        let protocol = settings.protocol;
         let model = settings.model.clone();
         let terms_input = settings.expected_terms_input();
 
@@ -805,12 +805,10 @@ impl StarlingApp {
             player,
             root_focus: cx.focus_handle(),
             endpoint,
-            protocol,
             model,
             expected_terms_input: terms_input,
             user_set_model: settings.user_set_model,
             settings_open: false,
-            settings_protocol: settings.protocol,
             draft_endpoint,
             draft_model,
             draft_terms,
@@ -833,6 +831,10 @@ impl StarlingApp {
             playing_id: None,
             playback_generation: 0,
             recorder: None,
+            live_stream: None,
+            live_partial: String::new(),
+            streamed_samples: Vec::new(),
+            stream_sent_samples: 0,
             levels: vec![0.06; 52],
             elapsed_ms: 0.0,
             diagnostics: diagnostics.then_some((started, false)),
@@ -879,7 +881,6 @@ impl StarlingApp {
         self.check_health(
             HealthCheckPurpose::Live,
             self.endpoint.clone(),
-            self.protocol,
             cx,
         );
     }
@@ -935,8 +936,8 @@ impl StarlingApp {
         }
     }
 
-    /// Check the health of the COMMITTED endpoint and protocol (#207,
-    /// B06). The pair is passed in explicitly — never captured from
+    /// Check the health of the committed endpoint (#207,
+    /// B06). The endpoint is passed explicitly — never captured from
     /// drafts — so a caller cannot hand the live-state writer a
     /// configuration the user has not saved. The probe behind Test
     /// Connection never routes through here: it owns its own outcome, so
@@ -948,17 +949,14 @@ impl StarlingApp {
         &mut self,
         purpose: HealthCheckPurpose,
         endpoint: String,
-        protocol: settings::Protocol,
         cx: &mut Context<Self>,
     ) {
-        // R11: one Protocol enum — the persisted setting is the client's
-        // wire protocol; no conversion layer.
         let model = self.model.clone();
         let token = self.health_sequencer.begin();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let client = StarlingClient::new(&endpoint, protocol, &model)
+                    let client = StarlingClient::new(&endpoint, &model)
                         .and_then(|client| client.with_timeout_ms(5_000))
                         .map_err(|err| err.to_string())?;
                     client.health().map_err(|err| err.to_string())
@@ -967,11 +965,11 @@ impl StarlingApp {
             this.update(cx, |app, cx| {
                 if !app.health_sequencer.is_current(token) {
                     // A newer live check already landed (a saved endpoint
-                    // replaced this one): this result is against a pair
+                    // replaced this one): this result is against an endpoint
                     // that is no longer current and must not overwrite it.
                     return;
                 }
-                let writes = live_check_writes(purpose, protocol, app.user_set_model, &result);
+                let writes = live_check_writes(purpose, app.user_set_model, &result);
                 app.connection = writes.connection;
                 if let Some(server_model) = writes.server_model {
                     app.server_model = server_model;
@@ -997,7 +995,6 @@ impl StarlingApp {
         // user tests again.
         self.probe_sequencer.cancel_all();
         self.probe = None;
-        self.settings_protocol = self.protocol;
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let terms = self.expected_terms_input.clone();
@@ -1025,9 +1022,8 @@ impl StarlingApp {
     }
 
     /// Test the DRAFT configuration without touching committed state
-    /// (#207, B06). The probe runs against the draft endpoint AND the
-    /// draft protocol — the combination about to be saved — and its
-    /// outcome lands in the dialog's own probe state: the live connection
+    /// (#207, B06). The probe runs against the draft endpoint. Its outcome
+    /// lands in the dialog's own probe state: the live connection
     /// status, the server model, the committed model, and the global
     /// error banner are never written from here. Only the newest probe
     /// may report, so a slow earlier probe cannot overwrite a newer
@@ -1040,7 +1036,6 @@ impl StarlingApp {
             // state-layer twin of the disabled button (#207 review).
             return;
         };
-        let protocol = self.settings_protocol;
         let model = self.draft_model.read(cx).value();
 
         if clean.is_empty() {
@@ -1068,7 +1063,7 @@ impl StarlingApp {
             let request_endpoint = clean.clone();
             let result = cx
                 .background_spawn(async move {
-                    let client = StarlingClient::new(&request_endpoint, protocol, &model)
+                    let client = StarlingClient::new(&request_endpoint, &model)
                         .and_then(|client| client.with_timeout_ms(5_000))
                         .map_err(|err| err.to_string())?;
                     client.health().map_err(|err| err.to_string())
@@ -1115,7 +1110,6 @@ impl StarlingApp {
             return;
         }
         self.endpoint = clean;
-        self.protocol = self.settings_protocol;
         // R02: only a save that changes the model marks it user-set, so an
         // endpoint-only edit keeps the server's health auto-sync alive.
         let draft_model = self.draft_model.read(cx).value();
@@ -1126,7 +1120,6 @@ impl StarlingApp {
 
         let mut settings = Settings {
             endpoint: self.endpoint.clone(),
-            protocol: self.protocol,
             model: self.model.clone(),
             expected_terms: Vec::new(),
             user_set_model: self.user_set_model,
@@ -1161,13 +1154,12 @@ impl StarlingApp {
         // in-flight probe with the dialog it belonged to (#207).
         self.close_settings(cx);
         // Re-check health from the saved configuration, as saves always
-        // did — now explicitly against the committed pair, and sequenced
+        // did — explicitly against the committed endpoint, and sequenced
         // so a check against an endpoint an earlier save committed is
         // dropped when this one supersedes it (#207).
         self.check_health(
             HealthCheckPurpose::Live,
             self.endpoint.clone(),
-            self.protocol,
             cx,
         );
     }
@@ -1721,6 +1713,37 @@ impl Render for StarlingApp {
         }
 
         if let Some(handle) = self.recorder.as_mut() {
+            if let Some(stream) = self.live_stream.as_ref() {
+                let mut stream_failed = false;
+                for chunk in handle.drain_chunks() {
+                    self.streamed_samples.extend(chunk);
+                }
+                let quantum = crate::live_stream::exact_input_quantum(handle.sample_rate());
+                let acknowledged = (handle.acknowledged_samples() as usize)
+                    .min(self.streamed_samples.len()) / quantum * quantum;
+                if acknowledged > self.stream_sent_samples {
+                    if let Ok(wav) = starling_dictation::audio::encode_wav_16k_parts(
+                        &self.streamed_samples[self.stream_sent_samples..acknowledged],
+                        handle.sample_rate(), 1
+                    ) {
+                        if stream.send_audio(wav) {
+                            self.stream_sent_samples = acknowledged;
+                        } else {
+                            stream_failed = true;
+                        }
+                    } else {
+                        stream_failed = true;
+                    }
+                }
+                match stream.poll_partial() {
+                    Ok(Some(text)) => self.live_partial = text,
+                    Err(_) => stream_failed = true,
+                    Ok(None) => {}
+                }
+                if stream_failed {
+                    self.live_stream = None;
+                }
+            }
             let window_samples = handle.latest_window(1024);
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);
@@ -2536,7 +2559,6 @@ mod tests {
     fn a_live_check_success_clears_the_banner_and_syncs_an_openai_model() {
         let writes = live_check_writes(
             HealthCheckPurpose::Live,
-            client::Protocol::OpenAi,
             false,
             &Ok(health(Some("parakeet"), Some(false), None)),
         );
@@ -2554,7 +2576,6 @@ mod tests {
     fn a_live_check_failure_owns_the_banner_with_the_failure() {
         let writes = live_check_writes(
             HealthCheckPurpose::Live,
-            client::Protocol::Starling,
             false,
             &Err("connection refused".to_string()),
         );
@@ -2577,7 +2598,6 @@ mod tests {
         // transcript must survive both a successful and a failed probe.
         let success = live_check_writes(
             HealthCheckPurpose::Diagnostic,
-            client::Protocol::Starling,
             false,
             &Ok(health(None, Some(false), None)),
         );
@@ -2590,7 +2610,6 @@ mod tests {
 
         let failure = live_check_writes(
             HealthCheckPurpose::Diagnostic,
-            client::Protocol::Starling,
             false,
             &Err("connection refused".to_string()),
         );
@@ -2599,42 +2618,34 @@ mod tests {
     }
 
     #[test]
-    fn the_model_auto_sync_needs_openai_a_reported_model_and_no_user_choice() {
-        // R02: a user-set model, a Starling server, or a health response
-        // without a model all leave the committed model alone.
-        let cases = [
-            (client::Protocol::Starling, false, Some("parakeet")),
-            (client::Protocol::OpenAi, true, Some("parakeet")),
-            (client::Protocol::OpenAi, false, None),
-        ];
-        for (protocol, user_set, model) in cases {
+    fn the_model_auto_sync_needs_a_reported_model_and_no_user_choice() {
+        // A user-set model or a response without a model leaves the
+        // committed model alone.
+        let cases = [(true, Some("parakeet")), (false, None)];
+        for (user_set, model) in cases {
             let writes = live_check_writes(
                 HealthCheckPurpose::Live,
-                protocol,
                 user_set,
                 &Ok(health(model, None, None)),
             );
             assert_eq!(
                 writes.model_sync,
                 None,
-                "no auto-sync for {protocol:?} user_set={user_set} model={model:?}"
+                "no auto-sync for user_set={user_set} model={model:?}"
             );
         }
     }
 
     #[test]
-
     fn busyness_comes_from_the_flag_or_a_queue_depth() {
         let flagged = live_check_writes(
             HealthCheckPurpose::Live,
-            client::Protocol::Starling,
             false,
             &Ok(health(None, Some(true), None)),
         );
         assert_eq!(flagged.connection, Connection::Busy);
         let queued = live_check_writes(
             HealthCheckPurpose::Live,
-            client::Protocol::Starling,
             false,
             &Ok(health(None, None, Some(2.0))),
         );

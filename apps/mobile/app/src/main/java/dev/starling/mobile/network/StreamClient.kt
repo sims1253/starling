@@ -53,8 +53,6 @@ private val STREAM_ROUTE_SUFFIXES = listOf(
     "/v1/audio/transcriptions",
     "/audio/transcriptions",
     "/transcriptions",
-    "/inference",
-    "/transcribe",
 )
 
 /** One live `WS /stream` dictation session handed to the recording UI. */

@@ -16,24 +16,12 @@ sealed interface InferenceResult {
 }
 
 /** Minimal platform transport for the Starling multipart HTTP contract. */
-internal fun inferenceUrl(endpoint: String, protocol: BackendProtocol): String {
+internal fun inferenceUrl(endpoint: String): String {
     val base = endpoint.trimEnd('/')
-    // A full route is useful with the repository's optional OpenAI-shaped
-    // adapter. A plain server URL continues to use the documented route.
-    return when (protocol) {
-        BackendProtocol.STARLING -> if (
-            base.endsWith("/inference", ignoreCase = true) ||
-            base.endsWith("/transcribe", ignoreCase = true)
-        ) {
-            base
-        } else {
-            "$base/inference"
-        }
-        BackendProtocol.OPENAI -> when {
-            base.endsWith("/transcriptions", ignoreCase = true) -> base
-            base.endsWith("/v1", ignoreCase = true) -> "$base/audio/transcriptions"
-            else -> "$base/v1/audio/transcriptions"
-        }
+    return when {
+        base.endsWith("/v1/audio/transcriptions", ignoreCase = true) -> base
+        base.endsWith("/v1", ignoreCase = true) -> "$base/audio/transcriptions"
+        else -> "$base/v1/audio/transcriptions"
     }
 }
 
@@ -51,7 +39,7 @@ class InferenceClient {
                 false,
             )
         }
-        if (config.protocol == BackendProtocol.OPENAI && config.model.trim().isEmpty()) {
+        if (config.model.trim().isEmpty()) {
             return InferenceResult.Failure("Enter the model name served by the backend", false)
         }
 
@@ -79,13 +67,9 @@ class InferenceClient {
 
     private fun transcribeOnce(audioFile: File, endpoint: String, config: BackendConfig): InferenceResult {
         val boundary = "----StarlingMobile${UUID.randomUUID()}"
-        val fields = if (config.protocol == BackendProtocol.OPENAI) {
-            listOf("model" to config.model.trim(), "response_format" to "json")
-        } else {
-            emptyList()
-        }
+        val fields = listOf("model" to config.model.trim(), "response_format" to "json")
         val multipart = MultipartRequest(boundary, audioFile, fields)
-        val url = URL(inferenceUrl(endpoint, config.protocol))
+        val url = URL(inferenceUrl(endpoint))
         val connection = (url.openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = false
             requestMethod = "POST"

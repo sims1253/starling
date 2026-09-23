@@ -1,7 +1,7 @@
 {
   "name": "Native request cancellation",
-  "route": "/inference/{request_id}",
-  "protocol": "starling-legacy",
+  "route": "/v1/audio/transcriptions/{request_id}",
+  "protocol": "starling-extension",
   "sources": [
     "cpp/serve/main.cpp:925-940",
     "cpp/serve/server.cpp:212-219 (cancel_request)",
@@ -12,37 +12,46 @@
       "name": "cancel a queued or in-flight request",
       "request": {
         "method": "DELETE",
-        "path": "/inference/cancel-victim"
+        "path": "/v1/audio/transcriptions/cancel-victim"
       },
       "response": {
         "status": 200,
         "content_type": "application/json",
-        "body_json": { "status": "cancelled", "request_id": "cancel-victim" }
+        "body_json": {
+          "status": "cancelled",
+          "request_id": "cancel-victim"
+        }
       },
-      "note": "The cancelled POST answers 499 (see native_transcribe.json)."
+      "note": "The cancelled POST answers 499 (see openai_transcriptions.json)."
     },
     {
       "name": "cancel an unknown request id",
       "request": {
         "method": "DELETE",
-        "path": "/inference/nonexistent"
+        "path": "/v1/audio/transcriptions/nonexistent"
       },
       "response": {
         "status": 404,
         "content_type": "application/json",
-        "body_json": { "status": "not_found", "request_id": "nonexistent" }
+        "body_json": {
+          "status": "not_found",
+          "request_id": "nonexistent"
+        }
       }
     },
     {
       "name": "cancel after completion is a no-op",
       "request": {
         "method": "DELETE",
-        "path": "/inference/already-done"
+        "path": "/v1/audio/transcriptions/already-done"
       },
       "response": {
         "status": 404,
         "content_type": "application/json",
-        "body_json": { "status": "not_found", "request_id": "already-done" }
+        "body_json": {
+          "status": "not_found",
+          "request_id": "already-done"
+        }
       },
       "note": "Completion claims the request context; a late cancel cannot retroactively discard a delivered result."
     }

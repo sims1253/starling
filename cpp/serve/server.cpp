@@ -49,13 +49,6 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Format a double with the same rounding as Python's round(x, 3).
-std::string fmt_double(double v, int precision = 3) {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.*f", precision, v);
-    return buf;
-}
-
 const char* phase_str(Phase p) {
     switch (p) {
     case Phase::Unloaded: return "unloaded";
@@ -101,21 +94,6 @@ std::string supported_models_str() {
         s += regs[i].slug;
     }
     return s;
-}
-
-// ---- TranscribeResult::to_json -------------------------------------------
-std::string TranscribeResult::to_json() const {
-    std::ostringstream ss;
-    ss << "{\"text\":\"" << json_escape(text) << "\","
-       << "\"segments\":[";
-    for (size_t i = 0; i < segments.size(); ++i) {
-        if (i) ss << ",";
-        ss << "{\"text\":\"" << json_escape(segments[i].text) << "\","
-           << "\"start_s\":" << fmt_double(segments[i].start_s) << ","
-           << "\"end_s\":" << fmt_double(segments[i].end_s) << "}";
-    }
-    ss << "],\"duration_s\":" << fmt_double(duration_s) << "}";
-    return ss.str();
 }
 
 // ---- StarlingServer -------------------------------------------------------
@@ -250,8 +228,6 @@ TranscribeResult StarlingServer::do_transcribe(
     const auto t_resp0 = std::chrono::steady_clock::now();
     TranscribeResult result;
     result.text = std::move(text);
-    result.duration_s = static_cast<double>(n) / kSampleRate;
-    result.segments.push_back({result.text, 0.0, result.duration_s});
     if (tr_on) {
         trace::response_event(
             std::chrono::duration<double, std::milli>(

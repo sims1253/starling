@@ -83,22 +83,6 @@ class MultipartRequestTest {
         }
     }
 
-    @Test
-    fun legacyMultipartOmitsOpenAiControlFields() {
-        val audio = Files.createTempFile("starling-mobile", ".wav").toFile()
-        try {
-            audio.writeBytes(byteArrayOf(0, 1))
-            val output = ByteArrayOutputStream()
-            MultipartRequest("LegacyBoundary", audio).writeTo(output)
-            val body = output.toByteArray().toString(Charsets.UTF_8)
-            assertTrue(body.contains("name=\"file\"; filename=\"recording.wav\""))
-            assertTrue(!body.contains("name=\"model\""))
-            assertTrue(!body.contains("name=\"response_format\""))
-        } finally {
-            audio.delete()
-        }
-    }
-
     private fun readUntilHeaderEnd(input: BufferedInputStream): ByteArray {
         val output = ByteArrayOutputStream()
         var matched = 0

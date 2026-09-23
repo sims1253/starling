@@ -74,17 +74,4 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(try exact.transcriptionURL().path, "/v1/audio/transcriptions")
     }
 
-    func testLegacyRouteIsSelectable() throws {
-        let configuration = ServerConfiguration(
-            endpoint: "https://voice.example.test",
-            apiProtocol: .starling
-        )
-        XCTAssertEqual(try configuration.transcriptionURL().path, "/inference")
-
-        let alias = ServerConfiguration(
-            endpoint: "https://voice.example.test/transcribe",
-            apiProtocol: .starling
-        )
-        XCTAssertEqual(try alias.transcriptionURL().path, "/transcribe")
-    }
 }

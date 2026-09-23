@@ -96,10 +96,13 @@ final class AudioRecorder: NSObject, ObservableObject {
     var onForcedStop: (@MainActor (CapturedAudio, String) -> Void)?
 
     private let coordinator: AudioSessionCoordinator
-    private var recorder: AVAudioRecorder?
+    private var engine: AVAudioEngine?
+    private var sink: CaptureSink?
+    private var recordingURL: URL?
     private var interruptionObserver: (any NSObjectProtocol)?
     private var routeChangeObserver: (any NSObjectProtocol)?
     private var mediaServicesResetObserver: (any NSObjectProtocol)?
+    private var engineChangeObserver: (any NSObjectProtocol)?
 
     init(coordinator: AudioSessionCoordinator) {
         self.coordinator = coordinator
@@ -115,24 +118,30 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         do {
             try coordinator.beginRecording()
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: 16_000.0,
-                AVNumberOfChannelsKey: 1,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsFloatKey: false,
-                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-            ]
-            let recorder = try AVAudioRecorder(url: url, settings: settings)
-            recorder.delegate = self
-            recorder.prepareToRecord()
-            guard recorder.record() else { throw AudioRecorderError.couldNotStart }
-            self.recorder = recorder
+            let engine = AVAudioEngine()
+            let input = engine.inputNode
+            let format = input.outputFormat(forBus: 0)
+            guard format.commonFormat == .pcmFormatFloat32,
+                  !format.isInterleaved, format.channelCount > 0,
+                  format.sampleRate.isFinite, format.sampleRate > 0
+            else { throw AudioRecorderError.couldNotStart }
+            let sink = try CaptureSink(url: url, sampleRate: format.sampleRate)
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+                sink.append(buffer)
+            }
+            engine.prepare()
+            try engine.start()
+            self.engine = engine
+            self.sink = sink
+            recordingURL = url
             startedAt = Date()
             isRecording = true
             observeSessionState()
         } catch {
+            engine?.inputNode.removeTap(onBus: 0)
+            engine?.stop()
+            engine = nil
+            sink = nil
             coordinator.endRecording()
             try? FileManager.default.removeItem(at: url)
             throw error
@@ -147,14 +156,20 @@ final class AudioRecorder: NSObject, ObservableObject {
         return capture
     }
 
+    /// Returns ordered PCM16 frames that were also written to the staged WAV.
+    func drainStreamChunks() -> [Data] {
+        sink?.drain() ?? []
+    }
+
     /// Stop the recorder and collect whatever was captured so far. Shared by
     /// the user-initiated stop and every forced stop.
     private func finishCapture() -> CapturedAudio? {
-        guard let recorder else { return nil }
-        let duration = max(0, Int((recorder.currentTime * 1_000).rounded()))
-        let url = recorder.url
-        recorder.stop()
-        self.recorder = nil
+        guard let engine, let sink, let url = recordingURL else { return nil }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        let duration = sink.finish()
+        self.engine = nil
+        recordingURL = nil
         stopObservingSessionState()
         isRecording = false
         startedAt = nil
@@ -205,6 +220,17 @@ final class AudioRecorder: NSObject, ObservableObject {
                 self?.handleMediaServicesReset()
             }
         }
+        engineChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.forcedStop(
+                    message: "The microphone configuration changed. The audio captured so far was saved to history."
+                )
+            }
+        }
     }
 
     private func stopObservingSessionState() {
@@ -217,9 +243,13 @@ final class AudioRecorder: NSObject, ObservableObject {
         if let mediaServicesResetObserver {
             NotificationCenter.default.removeObserver(mediaServicesResetObserver)
         }
+        if let engineChangeObserver {
+            NotificationCenter.default.removeObserver(engineChangeObserver)
+        }
         interruptionObserver = nil
         routeChangeObserver = nil
         mediaServicesResetObserver = nil
+        engineChangeObserver = nil
     }
 
     private func handleInterruption(_ type: AVAudioSession.InterruptionType?) {
@@ -252,17 +282,95 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 }
 
-extension AudioRecorder: AVAudioRecorderDelegate {
-    nonisolated func audioRecorderEncodeErrorDidOccur(
-        _ recorder: AVAudioRecorder,
-        error: (any Error)?
-    ) {
-        let reason = error?.localizedDescription ?? "the microphone stopped unexpectedly"
-        Task { @MainActor [weak self] in
-            self?.forcedStop(
-                message: "Recording stopped: \(reason). The audio captured so far was saved to history."
-            )
+/// The tap owns one sink. The lock orders file writes and stream frames, and
+/// stop removes the tap before finalizing the WAV header.
+private final class CaptureSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private let file: FileHandle
+    private let inputRate: Double
+    private var inputIndex = 0
+    private var outputIndex = 0
+    private var lastSample: Float = 0
+    private var frames: [Data] = []
+    private var byteCount = 0
+    private var finished = false
+
+    init(url: URL, sampleRate: Double) throws {
+        inputRate = sampleRate
+        guard FileManager.default.createFile(
+            atPath: url.path, contents: Data(repeating: 0, count: 44)
+        ) else {
+            throw AudioRecorderError.couldNotStart
         }
+        file = try FileHandle(forWritingTo: url)
+        try file.seekToEnd()
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        let count = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        var mono = [Float](repeating: 0, count: count)
+        for channel in 0..<channelCount {
+            for i in 0..<count { mono[i] += channels[channel][i] / Float(channelCount) }
+        }
+        // Carry the output clock across tap boundaries; every source frame
+        // contributes once, including when the hardware runs at 44.1 kHz.
+        var bytes = Data()
+        let end = inputIndex + count
+        while Double(outputIndex) * inputRate / 16_000 < Double(end) {
+            let source = Double(outputIndex) * inputRate / 16_000 - Double(inputIndex)
+            let lower = Int(floor(source))
+            let fraction = Float(source - Double(lower))
+            let a = lower < 0 ? lastSample : mono[min(lower, count - 1)]
+            let b = mono[min(max(lower + 1, 0), count - 1)]
+            let value = max(-1, min(1, a + (b - a) * fraction))
+            let sample = Int16(max(-32768, min(32767, Int((value * 32768).rounded()))))
+            var little = sample.littleEndian
+            withUnsafeBytes(of: &little) { bytes.append(contentsOf: $0) }
+            outputIndex += 1
+        }
+        lastSample = mono[count - 1]
+        inputIndex = end
+        if !bytes.isEmpty {
+            file.write(bytes)
+            byteCount += bytes.count
+            frames.append(bytes)
+        }
+    }
+
+    func drain() -> [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        let result = frames
+        frames.removeAll(keepingCapacity: true)
+        return result
+    }
+
+    func finish() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        finished = true
+        var header = Data("RIFF".utf8)
+        var riffSize = UInt32(36 + byteCount).littleEndian
+        withUnsafeBytes(of: &riffSize) { header.append(contentsOf: $0) }
+        header.append(contentsOf: "WAVEfmt ".utf8)
+        let formatValues: [UInt32] = [16, 0x00010001, 16_000, 32_000, 0x00100002]
+        for value in formatValues {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { header.append(contentsOf: $0) }
+        }
+        header.append(contentsOf: "data".utf8)
+        var length = UInt32(byteCount).littleEndian
+        withUnsafeBytes(of: &length) { header.append(contentsOf: $0) }
+        file.seek(toFileOffset: 0)
+        file.write(header)
+        try? file.synchronize()
+        try? file.close()
+        return byteCount * 1_000 / 32_000
     }
 }
 

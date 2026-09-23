@@ -2,7 +2,9 @@
 
 Starling Voice is a standalone SwiftUI recorder for a Starling server. It
 records mono 16 kHz, 16-bit PCM WAV, saves the WAV in the app's Application
-Support directory, and only then starts a transcription request. Raw server
+Support directory, and streams PCM16 frames to `WS /stream` during capture.
+The final transcript is saved after the WAV is committed; if streaming fails,
+the app retries the saved WAV through the batch endpoint. Raw server
 text is saved without cleanup. Recordings remain available for playback,
 retry, and export until the user explicitly deletes them.
 
@@ -22,13 +24,8 @@ a capture ended by the system — a call, Siri, or a disconnected microphone —
 is finalized with the audio gathered so far saved to history instead of
 continuing to show a running timer.
 
-The app supports the primary OpenAI-compatible endpoint and the legacy
-Starling endpoint:
-
-- `POST /v1/audio/transcriptions` sends `file`, `model`, and
-  `response_format=json`;
-- `POST /inference` sends the same WAV and reads Starling's optional segments
-  and duration.
+Batch retries send `file`, `model`, and `response_format=json` to
+`POST /v1/audio/transcriptions` and read the returned raw `text`.
 
 HTTPS is the default. Plain HTTP must be enabled in Settings and is accepted
 only for loopback, `.local`, private IPv4, link-local, or private/link-local

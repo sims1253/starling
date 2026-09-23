@@ -38,7 +38,6 @@ from starling.server import (  # noqa: E402
     StarlingServer,
     StreamSession,
     TranscribeResult,
-    _extract_multipart_payload,
     _pcm16_bytes_to_float32,
     _transcribe_payload_sync,
     _wav_bytes_to_float32,
@@ -215,141 +214,6 @@ def test_wav_bytes_to_float32_raises_on_truncated_body() -> None:
 # ---------------------------------------------------------------------------
 # B. Multipart parsing respects field names
 # ---------------------------------------------------------------------------
-def _mp_part(headers: list[tuple[str, str]], payload: bytes) -> bytes:
-    """Build one multipart part body (headers + blank line + payload)."""
-    head = "".join(f"{k}: {v}\r\n" for k, v in headers)
-    return head.encode() + b"\r\n" + payload
-
-
-def test_multipart_picks_named_audio_field_over_preceding_text() -> None:
-    """A leading ``metadata`` text field must NOT shadow the ``audio`` part."""
-    boundary = "----boundary"
-    meta = _mp_part(
-        [("Content-Disposition", 'form-data; name="metadata"')],
-        b'{"lang":"en"}',
-    )
-    audio = _mp_part(
-        [
-            ("Content-Disposition", 'form-data; name="audio"; filename="x.wav"'),
-            ("Content-Type", "application/octet-stream"),
-        ],
-        b"AUDIO-BYTES",
-    )
-    body = b"--" + boundary.encode() + b"\r\n" + meta + b"\r\n" \
-        + b"--" + boundary.encode() + b"\r\n" + audio + b"\r\n" \
-        + b"--" + boundary.encode() + b"--\r\n"
-    ctype = f'multipart/form-data; boundary="{boundary}"'
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == b"AUDIO-BYTES"
-
-
-def test_multipart_picks_file_field_by_name() -> None:
-    """A single part named ``file`` with a filename is selected by name."""
-    boundary = "----b"
-    part = _mp_part(
-        [("Content-Disposition", 'form-data; name="file"; filename="a.wav"')],
-        b"FILE-PAYLOAD",
-    )
-    body = b"--" + boundary.encode() + b"\r\n" + part + b"\r\n" \
-        + b"--" + boundary.encode() + b"--\r\n"
-    ctype = f"multipart/form-data; boundary={boundary}"
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == b"FILE-PAYLOAD"
-
-
-def test_multipart_selects_part_by_audio_content_type() -> None:
-    """A part whose Content-Type is ``audio/wav`` is preferred over plain text."""
-    boundary = "----b"
-    text_part = _mp_part(
-        [("Content-Disposition", 'form-data; name="note"')],
-        b"just a note",
-    )
-    audio_part = _mp_part(
-        [
-            ("Content-Disposition", 'form-data; name="clip"'),
-            ("Content-Type", "audio/wav"),
-        ],
-        b"WAVDATA",
-    )
-    body = b"--" + boundary.encode() + b"\r\n" + text_part + b"\r\n" \
-        + b"--" + boundary.encode() + b"\r\n" + audio_part + b"\r\n" \
-        + b"--" + boundary.encode() + b"--\r\n"
-    ctype = f"multipart/form-data; boundary={boundary}"
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == b"WAVDATA"
-
-
-def test_multipart_without_boundary_returns_raw_body() -> None:
-    """No boundary in Content-Type -> the raw body is returned (raw-WAV path)."""
-    raw = _wav_bytes(np.zeros(8, dtype=np.float32))
-
-    out = _extract_multipart_payload(raw, "application/octet-stream")
-
-    assert out == raw
-
-
-def test_multipart_all_zero_score_parts_returns_last_part() -> None:
-    """Multiple parts that all score 0 (no audio/file name, no filename, no
-    audio content-type) fall back to the LAST non-empty part."""
-    boundary = "----b"
-    part_a = _mp_part(
-        [("Content-Disposition", 'form-data; name="note"')],
-        b"first note",
-    )
-    part_b = _mp_part(
-        [("Content-Disposition", 'form-data; name="note2"')],
-        b"second note",
-    )
-    body = b"--" + boundary.encode() + b"\r\n" + part_a + b"\r\n" \
-        + b"--" + boundary.encode() + b"\r\n" + part_b + b"\r\n" \
-        + b"--" + boundary.encode() + b"--\r\n"
-    ctype = f"multipart/form-data; boundary={boundary}"
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == b"second note"  # last part wins
-
-
-def test_multipart_boundary_with_no_usable_parts_returns_original_body() -> None:
-    """A Content-Type carrying a boundary whose body yields no candidate parts
-    returns the original body unchanged."""
-    boundary = "----b"
-    body = b"--" + boundary.encode() + b"--\r\n"
-    ctype = f"multipart/form-data; boundary={boundary}"
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == body
-
-
-def test_multipart_zero_score_fallback_ignores_trailing_empty_part() -> None:
-    """The all-zero-score fallback returns the last NON-EMPTY part, not a
-    trailing empty part (regression: last_payload was clobbered by empties)."""
-    boundary = "----b"
-    note_part = _mp_part(
-        [("Content-Disposition", 'form-data; name="note"')],
-        b"the real payload",
-    )
-    empty_part = _mp_part(
-        [("Content-Disposition", 'form-data; name="trailer"')],
-        b"",  # trailing empty part -- must not become the fallback
-    )
-    body = b"--" + boundary.encode() + b"\r\n" + note_part + b"\r\n" \
-        + b"--" + boundary.encode() + b"\r\n" + empty_part + b"\r\n" \
-        + b"--" + boundary.encode() + b"--\r\n"
-    ctype = f"multipart/form-data; boundary={boundary}"
-
-    out = _extract_multipart_payload(body, ctype)
-
-    assert out == b"the real payload"  # last non-empty, not the empty trailer
-
-
 # ---------------------------------------------------------------------------
 # D. Streaming buffer is bounded
 # ---------------------------------------------------------------------------
@@ -841,21 +705,18 @@ def test_warmup_noop_when_not_loaded(monkeypatch) -> None:  # noqa: ANN001
     server.warmup()  # must short-circuit before touching the GPU lock
 
 
-@pytest.mark.parametrize("path", ["/inference", "/transcribe"])
-@pytest.mark.parametrize("multipart", [False, True])
-def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
+def test_http_transcriptions_accept_wav_uploads(monkeypatch):
     import asyncio
     import json
     from starling import server as module
 
     wav = _wav_bytes(np.zeros(160, dtype=np.float32))
-    body = wav
-    content_type = "audio/wav"
-    if multipart:
-        body = (b'--audio-boundary\r\n'
-                b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
-                b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
-        content_type = "multipart/form-data; boundary=audio-boundary"
+    body = (b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="model"\r\n\r\ngranite\r\n'
+            b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+            b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
+    content_type = "multipart/form-data; boundary=audio-boundary"
     server = StarlingServer()
     monkeypatch.setattr(server, "_ensure_loaded", lambda: None)
 
@@ -873,6 +734,7 @@ def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
 
+    path = "/v1/audio/transcriptions"
     request = fastapi.Request({"type": "http", "method": "POST", "path": path,
                                "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
                               receive)
@@ -881,7 +743,7 @@ def test_http_aliases_accept_wav_uploads(path, multipart, monkeypatch):
     status, response = result.status_code, json.loads(result.body)
     assert status == 200
     assert response["text"] == "accepted"
-    assert response["request_id"] == "upload-id"
+    assert result.headers["x-request-id"] == "upload-id"
 
 
 @pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
@@ -898,8 +760,13 @@ def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
         raise error_type("private engine details")
 
     monkeypatch.setattr(server, stage, fail)
-    body = _wav_bytes(np.zeros(160, dtype=np.float32))
-    headers = {"content-type": "audio/wav", "content-length": str(len(body)),
+    wav = _wav_bytes(np.zeros(160, dtype=np.float32))
+    body = (b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="model"\r\n\r\ngranite\r\n'
+            b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+            b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
+    headers = {"content-type": "multipart/form-data; boundary=audio-boundary", "content-length": str(len(body)),
                "x-request-id": "failed-request"}
     pytest.importorskip("fastapi")
     app = module.create_app(server=server, load_on_startup=False)
@@ -913,7 +780,7 @@ def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
 
     asyncio.run(app({"type": "http", "asgi": {"version": "3.0"},
                      "http_version": "1.1", "method": "POST", "scheme": "http",
-                     "path": "/inference", "query_string": b"", "root_path": "",
+                     "path": "/v1/audio/transcriptions", "query_string": b"", "root_path": "",
                      "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
                     receive, send))
     status = messages[0]["status"]
@@ -921,7 +788,8 @@ def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):
     payload = b"".join(message.get("body", b"") for message in messages[1:])
     assert status == 500
     assert content_type == "application/json"
-    assert json.loads(payload) == {"error": "transcription failed", "text": "",
-                                   "request_id": "failed-request"}
+    assert json.loads(payload) == {"error": {"message": "transcription failed",
+                                                "type": "server_error", "param": None,
+                                                "code": None}}
     record = next(record for record in caplog.records if "failed-request" in record.message)
     assert record.exc_info[1].args == ("private engine details",)

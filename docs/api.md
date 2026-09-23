@@ -42,7 +42,7 @@ proxy for access from another device. The apps do not expose the server for you.
 - `stream=false` and `temperature=0` or `0.0` may be sent as compatibility
   defaults. No configurable sampling behavior is exposed.
 - Successful responses carry `X-Request-Id`. A caller can supply that header
-  and use the legacy cancellation route if needed.
+  and cancel a queued request with `DELETE /v1/audio/transcriptions/{id}`.
 
 Language selection, vocabulary prompts, nonzero temperature, `verbose_json`,
 SRT/VTT, word timestamps, diarization, and server-sent transcription events are
@@ -56,35 +56,14 @@ error response. Clients must tolerate non-JSON errors and always check status.
 
 The [OpenAPI document](../packages/contracts/openapi.json) records this subset.
 
-## Existing Starling routes
+## App configuration
 
-`POST /inference` and `/transcribe` remain unchanged. They return `text`,
-`segments` with `start_s`/`end_s`, `duration_s`, and `request_id`. Their error
-bodies and acceptance of raw PCM differ from the standard adapter.
-
-The [shared client](../packages/dictation/README.md) selects either `starling`
-or `openai` protocol explicitly. Missing timestamps or durations in a standard
-response stay absent. The recorder can display its independently measured audio
-duration without claiming that the server covered every second.
-
+Configure the apps with the server root, such as `http://127.0.0.1:8181`, and
+use the model slug returned by `GET /v1/models`. Send mono PCM16 WAV at 16 kHz.
+The native server rejects other sample rates, while the Python server resamples
+them. The apps also use Starling's `WS /stream` for live dictation where supported.
 Read [native serving](native-serving.md) for queueing, cancellation, streaming,
-and model loading. The [deprecated Python server](python-serving.md) continues
-to support the existing Starling protocol only.
-
-## Move a client from the Python server
-
-Existing clients can keep using `POST /inference` while you replace the server.
-The native route keeps the same response shape and cancellation path. Before the
-cutover, convert the model to a supported GGUF and confirm its slug with
-`GET /v1/models`. Some model names differ between the two servers; see the
-[native compatibility table](native-serving.md#api-contract).
-
-New clients should use the OpenAI-compatible route. Configure the apps with the
-server root, such as `http://127.0.0.1:8181`, select the OpenAI protocol, and use
-the model slug returned by `GET /v1/models`. Send mono PCM16 WAV at 16 kHz. The
-native server rejects other sample rates, while the Python server resamples
-them. Test both success and error responses before removing the legacy route
-from your client.
+and model loading.
 
 ## Fidelity and recovery
 

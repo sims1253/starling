@@ -6,13 +6,14 @@ use std::sync::Arc;
 use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
-    client::{ClientError, Protocol, StarlingClient},
+    client::{ClientError, StarlingClient},
     journal,
     recorder,
     storage,
 };
 
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
+use crate::live_stream::LiveStream;
 use crate::store::Store;
 
 /// What a failed job says about retrying it (R13).
@@ -178,6 +179,10 @@ impl StarlingApp {
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
+            let mut stream = self.live_stream.take();
+            self.live_partial.clear();
+            let streamed_samples = std::mem::take(&mut self.streamed_samples);
+            let sent_samples = std::mem::take(&mut self.stream_sent_samples);
             // G03: clipping is measured on the raw captured samples (before
             // the attenuation-only auto gain), so an already-clipped source
             // stays visible even when its attenuated copy peaks below
@@ -187,8 +192,28 @@ impl StarlingApp {
             // error before `stop` consumes the handle — a successful take
             // must not swallow a journal fault that froze acknowledgment.
             let capture_fault = handle.capture_error();
+            if capture_fault.is_some() {
+                stream = None;
+            }
             match handle.stop() {
-                Ok(take) => {
+                Ok(mut take) => {
+                    take.audio.samples.splice(0..0, streamed_samples);
+                    if !matches!(take.journal.as_ref(), Some(report) if report.finalized && report.fault.is_none()) {
+                        stream = None;
+                    }
+                    if let Some(ref live) = stream {
+                        if sent_samples < take.audio.samples.len() {
+                            if let Ok(wav) = audio::encode_wav_16k_parts(
+                                &take.audio.samples[sent_samples..], take.audio.sample_rate, 1
+                            ) {
+                                if !live.send_audio(wav) {
+                                    stream = None;
+                                }
+                            } else {
+                                stream = None;
+                            }
+                        }
+                    }
                     self.levels = vec![0.06; 52];
                     self.capture_warning = recorder::clipping_warning(source_clip_ratio);
                     if let Some(fault) = capture_fault {
@@ -205,7 +230,7 @@ impl StarlingApp {
                         match encoded {
                             Ok(wav) => {
                                 this.update(cx, |app, cx| {
-                                    app.save_and_transcribe(Arc::new(wav), journal_report, cx);
+                                    app.save_and_transcribe(Arc::new(wav), journal_report, stream, cx);
                                 })
                                 .ok();
                             }
@@ -222,9 +247,10 @@ impl StarlingApp {
                 }
                 Err(recorder::RecorderError::QuiesceTimeout {
                     acknowledged_samples,
-                    audio,
+                    mut audio,
                     journal,
                 }) => {
+                    audio.samples.splice(0..0, streamed_samples);
                     // R17 / I1 phase 2: a device hiccup must not silently
                     // discard acknowledged audio. The salvaged samples are
                     // persisted as an interrupted-but-usable take, linked
@@ -280,6 +306,10 @@ impl StarlingApp {
             // acknowledged (see recorder::start_recording_with_journal).
             match recorder::start_recording_with_journal(&journal::default_journals_root()) {
                 Ok(handle) => {
+                    self.live_stream = LiveStream::start(&self.endpoint).ok();
+                    self.live_partial.clear();
+                    self.streamed_samples.clear();
+                    self.stream_sent_samples = 0;
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
@@ -298,6 +328,7 @@ impl StarlingApp {
         &mut self,
         wav: Arc<Vec<u8>>,
         journal: Option<recorder::JournalReport>,
+        stream: Option<LiveStream>,
         cx: &mut Context<Self>,
     ) {
         // Deliberately no `self.error = None` here: every caller clears the
@@ -332,7 +363,7 @@ impl StarlingApp {
                         // stored evidence itself when the journal was
                         // adopted (the same bytes a retry loads), the
                         // caller's WAV otherwise.
-                        app.transcribe(saved.id, saved.wav, cx);
+                        app.transcribe_with_stream(saved.id, saved.wav, stream, cx);
                     })
                     .ok();
                 }
@@ -412,6 +443,16 @@ impl StarlingApp {
     }
 
     pub fn transcribe(&mut self, id: String, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
+        self.transcribe_with_stream(id, wav, None, cx);
+    }
+
+    fn transcribe_with_stream(
+        &mut self,
+        id: String,
+        wav: Arc<Vec<u8>>,
+        stream: Option<LiveStream>,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_ids.contains(&id) {
             return;
         }
@@ -424,19 +465,10 @@ impl StarlingApp {
         cx.notify();
 
         let endpoint = self.endpoint.clone();
-        // R11: one Protocol enum — the persisted setting is the client's
-        // wire protocol; no conversion layer.
-        let protocol = self.protocol;
         let model = self.model.clone();
         // The attempt row's backend label (v2 keeps it on the recognition
         // attempt; v1 ignores it).
-        let backend = format!(
-            "{}:{model}",
-            match protocol {
-                Protocol::Starling => "starling",
-                Protocol::OpenAi => "openai",
-            }
-        );
+        let backend = format!("openai:{model}");
         let store_for_job = store.clone();
 
         cx.spawn(async move |this, cx| {
@@ -464,7 +496,14 @@ impl StarlingApp {
                         let wav = wav.clone();
                         let id = id.clone();
                         cx.background_spawn(async move {
-                            let client = StarlingClient::new(&endpoint, protocol, &model)?;
+                            let client = StarlingClient::new(&endpoint, &model)?;
+                            if let Some(stream) = stream {
+                                if stream.commit() {
+                                    if let Ok(result) = stream.final_result() {
+                                        return Ok(result);
+                                    }
+                                }
+                            }
                             // Shares the upload buffer with the client by
                             // reference count (issue #235): the WAV bytes
                             // are never duplicated for this request.
@@ -607,7 +646,6 @@ impl StarlingApp {
                             app.check_health(
                                 HealthCheckPurpose::Diagnostic,
                                 app.endpoint.clone(),
-                                app.protocol,
                                 cx,
                             );
                         }
@@ -670,7 +708,7 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(Arc::new(prepared.wav), None, cx);
+                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, cx);
                             })
                             .ok();
                         }
@@ -810,7 +848,7 @@ mod tests {
         // networks all arrive as these two variants.
         assert_eq!(
             failure_class(&ClientError::Transport(
-                "error sending request for url (http://127.0.0.1:8181/transcribe): Connection \
+                "error sending request for url (http://127.0.0.1:8181/v1/audio/transcriptions): Connection \
                  refused (os error 111)"
                     .to_string()
             )),

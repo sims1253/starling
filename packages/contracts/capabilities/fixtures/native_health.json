@@ -1,10 +1,10 @@
 {
-  "name": "Native health, health alias, and warmup",
+  "name": "Native health and warmup",
   "route": "/health",
-  "protocol": "starling-legacy",
+  "protocol": "starling-extension",
   "sources": [
     "cpp/serve/main.cpp:528-563 (routes), cpp/serve/server.cpp:463-474 (health_json)",
-    "tests/test_native_serve.py:test_health, test_health_alias, test_warmup",
+    "tests/test_native_serve.py:test_health, test_warmup",
     "docs/native-serving.md#api-contract"
   ],
   "cases": [
@@ -47,26 +47,6 @@
         }
       },
       "note": "--no-eager-load defers the model load to the first request."
-    },
-    {
-      "name": "root path is a health alias",
-      "request": {
-        "method": "GET",
-        "path": "/"
-      },
-      "response": {
-        "status": 200,
-        "content_type": "application/json",
-        "body_json": {
-          "status": "ok",
-          "model": "parakeet",
-          "loaded": false,
-          "busy": false,
-          "phase": "unloaded",
-          "queue_depth": 0
-        }
-      },
-      "note": "GET / returns the same body as GET /health."
     },
     {
       "name": "warmup is asynchronous and idempotent",

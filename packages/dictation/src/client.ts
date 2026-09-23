@@ -10,8 +10,6 @@ import {
 
 export type StarlingBackend = "auto" | "python" | "native";
 
-export type TranscriptionProtocol = "starling" | "openai";
-
 export interface BearerAuth {
   readonly token: string;
   readonly scheme?: string;
@@ -25,7 +23,6 @@ interface StringHeaders {
 export interface StarlingClientOptions {
   readonly baseUrl: string;
   readonly backend?: StarlingBackend;
-  readonly protocol?: TranscriptionProtocol;
   readonly endpoint?: string;
   readonly model?: string;
   readonly auth?: BearerAuth | (() => BearerAuth | Promise<BearerAuth>);
@@ -78,29 +75,8 @@ export const ServerHealthSchema = Schema.Struct({
 
 export type ServerHealth = Schema.Schema.Type<typeof ServerHealthSchema>;
 
-const TranscriptionSegmentResponseSchema = Schema.Struct({
-  text: Schema.String,
-  start_s: Schema.optionalKey(NonNegativeFinite),
-  end_s: Schema.optionalKey(NonNegativeFinite),
-  start: Schema.optionalKey(NonNegativeFinite),
-  end: Schema.optionalKey(NonNegativeFinite),
-});
-
 export const TranscriptionResponseSchema = Schema.Struct({
   text: Schema.String,
-  segments: Schema.optionalKey(Schema.Array(TranscriptionSegmentResponseSchema)),
-  duration_s: Schema.optionalKey(NonNegativeFinite),
-  duration: Schema.optionalKey(NonNegativeFinite),
-  request_id: Schema.optionalKey(Schema.String),
-});
-
-export const ServerHealthResponseSchema = Schema.Struct({
-  status: Schema.String,
-  phase: Schema.optionalKey(Schema.String),
-  model: Schema.optionalKey(Schema.String),
-  loaded: Schema.optionalKey(Schema.Boolean),
-  busy: Schema.optionalKey(Schema.Boolean),
-  queue_depth: Schema.optionalKey(NonNegativeFinite),
 });
 
 const OpenAiModelResponseSchema = Schema.Struct({ id: Schema.String });
@@ -442,63 +418,22 @@ const decodeTranscriptionResponse = Schema.decodeEffect(
   Schema.fromJsonString(TranscriptionResponseSchema),
 );
 
-const decodeHealthResponse = Schema.decodeEffect(Schema.fromJsonString(ServerHealthResponseSchema));
-
 const decodeModelsResponse = Schema.decodeEffect(Schema.fromJsonString(OpenAiModelsResponseSchema));
 
 function normalizeTranscription(
   wire: Schema.Schema.Type<typeof TranscriptionResponseSchema>,
   headerRequestId: string | null,
 ): Effect.Effect<TranscriptionResult, DictationProtocolError> {
-  const segments: Array<TranscriptionSegment> = [];
-
-  for (const segment of wire.segments ?? []) {
-    const start = segment.start_s ?? segment.start;
-    const end = segment.end_s ?? segment.end;
-
-    if (start === undefined || end === undefined || end < start) {
-      return Effect.fail(
-        new DictationProtocolError("transcription segment has missing or invalid timestamps"),
-      );
-    }
-
-    segments.push(Object.freeze({ text: segment.text, startSeconds: start, endSeconds: end }));
-  }
-
-  const durationSeconds = wire.duration_s ?? wire.duration;
-  const responseRequestId = wire.request_id || undefined;
-  const requestId = responseRequestId ?? headerRequestId ?? undefined;
+  const requestId = headerRequestId ?? undefined;
 
   const normalized: MutableTranscriptionResult = {
     text: wire.text,
-    segments: Object.freeze(segments),
+    segments: Object.freeze([]),
   };
-
-  if (durationSeconds !== undefined) normalized.durationSeconds = durationSeconds;
 
   if (requestId !== undefined) normalized.requestId = requestId;
 
   return Effect.succeed(Object.freeze(normalized));
-}
-
-function normalizeHealth(
-  wire: Schema.Schema.Type<typeof ServerHealthResponseSchema>,
-): ServerHealth {
-  const health: MutableServerHealth = {
-    status: wire.status,
-  };
-
-  if (wire.phase !== undefined) health.phase = wire.phase;
-
-  if (wire.model !== undefined) health.model = wire.model;
-
-  if (wire.loaded !== undefined) health.loaded = wire.loaded;
-
-  if (wire.busy !== undefined) health.busy = wire.busy;
-
-  if (wire.queue_depth !== undefined) health.queueDepth = wire.queue_depth;
-
-  return Object.freeze(health);
 }
 
 function normalizeModels(
@@ -550,7 +485,6 @@ function withTimeout<A, E>(
 
 export class StarlingClient {
   readonly backend: StarlingBackend;
-  readonly protocol: TranscriptionProtocol;
   private readonly auth: StarlingClientOptions["auth"] | undefined;
   private readonly baseUrl: string;
   private readonly endpoint: string;
@@ -563,10 +497,8 @@ export class StarlingClient {
   constructor(options: StarlingClientOptions) {
     this.baseUrl = cleanBaseUrl(options.baseUrl);
     this.backend = options.backend ?? "auto";
-    this.protocol = options.protocol ?? "starling";
-    this.endpoint =
-      options.endpoint ?? (this.protocol === "openai" ? "/v1/audio/transcriptions" : "/inference");
-    this.model = options.model?.trim() ?? "";
+    this.endpoint = options.endpoint ?? "/v1/audio/transcriptions";
+    this.model = (options.model ?? "parakeet").trim();
     this.auth = options.auth;
     this.headers = options.headers ?? {};
     this.timeoutMs = options.timeoutMs ?? 120_000;
@@ -593,7 +525,7 @@ export class StarlingClient {
     const prepare = prepareSource(source);
 
     return Effect.fnUntraced(function* (client: StarlingClient) {
-      if (client.protocol === "openai" && !client.model) {
+      if (!client.model) {
         return yield* new DictationInputError("Enter the model name served by the backend");
       }
 
@@ -612,10 +544,8 @@ export class StarlingClient {
       const form = new FormData();
       form.append("file", prepared.blob, "recording.wav");
 
-      if (client.protocol === "openai") {
-        form.append("model", client.model);
-        form.append("response_format", "json");
-      }
+      form.append("model", client.model);
+      form.append("response_format", "json");
 
       const headers = yield* client.requestHeadersEffect({ "X-Request-Id": requestId });
       headers.delete("Content-Type");
@@ -647,26 +577,17 @@ export class StarlingClient {
   healthEffect(): Effect.Effect<ServerHealth, DictationClientError> {
     return Effect.fnUntraced(function* (client: StarlingClient) {
       const headers = yield* client.requestHeadersEffect();
-      const path = client.protocol === "openai" ? "/v1/models" : "/health";
 
-      const response = yield* client.requestEffect(`${client.baseUrl}${path}`, {
+      const response = yield* client.requestEffect(`${client.baseUrl}/v1/models`, {
         method: "GET",
         headers,
       });
 
-      if (client.protocol === "openai") {
-        const wire = yield* decodeModelsResponse(response.body).pipe(
-          Effect.mapError(() => protocolError("models response")),
-        );
-
-        return normalizeModels(wire);
-      }
-
-      const wire = yield* decodeHealthResponse(response.body).pipe(
-        Effect.mapError(() => protocolError("health response")),
+      const wire = yield* decodeModelsResponse(response.body).pipe(
+        Effect.mapError(() => protocolError("models response")),
       );
 
-      return normalizeHealth(wire);
+      return normalizeModels(wire);
     })(this);
   }
 
@@ -685,10 +606,13 @@ export class StarlingClient {
 
     return Effect.fnUntraced(function* (client: StarlingClient) {
       const headers = yield* client.requestHeadersEffect();
-      yield* client.requestEffect(`${client.baseUrl}/inference/${encodeURIComponent(requestId)}`, {
-        method: "DELETE",
-        headers,
-      });
+      yield* client.requestEffect(
+        `${client.baseUrl}/v1/audio/transcriptions/${encodeURIComponent(requestId)}`,
+        {
+          method: "DELETE",
+          headers,
+        },
+      );
     })(this);
   }
 

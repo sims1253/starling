@@ -11,7 +11,6 @@ import {
   type InvalidStoredSession,
   type RefinedDraft,
   type ServerHealth,
-  type TranscriptionProtocol,
   type TranscriptionResult,
 } from "@starling/dictation";
 import {
@@ -227,7 +226,6 @@ function unsavedWavId(): string {
 
 async function nativeTranscribe(
   endpoint: string,
-  protocol: TranscriptionProtocol,
   model: string,
   id: string,
   wav: Blob,
@@ -240,7 +238,6 @@ async function nativeTranscribe(
     endpoint,
     requestId: id,
     audio: await wav.arrayBuffer(),
-    protocol,
     model,
   });
 }
@@ -279,8 +276,6 @@ export default function App() {
   const [initialSettings] = useState(() => readCommittedSettings(localStorage, DEFAULT_ENDPOINT));
 
   const [endpoint, setEndpoint] = useState(initialSettings.endpoint);
-
-  const [protocol, setProtocol] = useState<TranscriptionProtocol>(initialSettings.protocol);
 
   const [model, setModel] = useState(initialSettings.model);
 
@@ -988,21 +983,16 @@ export default function App() {
   }, []);
 
   /** Shared health-check transport: the desktop bridge, else the browser client. */
-  const runHealthCheck = useCallback(
-    (target: string, targetProtocol: TranscriptionProtocol): Promise<ServerHealth> => {
-      const bridge = window.starlingDesktop;
+  const runHealthCheck = useCallback((target: string): Promise<ServerHealth> => {
+    const bridge = window.starlingDesktop;
 
-      return bridge
-        ? bridge.health({ endpoint: target, protocol: targetProtocol })
-        : Effect.runPromise(
-            new StarlingClient({ baseUrl: target, protocol: targetProtocol }).healthEffect(),
-          );
-    },
-    [],
-  );
+    return bridge
+      ? bridge.health({ endpoint: target })
+      : Effect.runPromise(new StarlingClient({ baseUrl: target }).healthEffect());
+  }, []);
 
   /**
-   * Check the health of the COMMITTED endpoint and protocol (B06). The probe
+   * Check the health of the committed endpoint (B06). The probe
    * behind Test Connection never routes through here: it owns its own
    * outcome, so a draft endpoint's failure cannot paint the live connection
    * offline. Each check claims a sequence token before awaiting anything, so
@@ -1012,17 +1002,13 @@ export default function App() {
   const checkHealth = useCallback(() => {
     const token = healthSequencer.begin();
 
-    return runHealthCheck(endpoint, protocol).then(
+    return runHealthCheck(endpoint).then(
       (health) => {
         if (!healthSequencer.isCurrent(token)) return;
 
         setServerModel(health.model ?? "server");
 
-        if (
-          protocol === "openai" &&
-          health.model !== undefined &&
-          !localStorage.getItem("starling:model")
-        )
+        if (health.model !== undefined && !localStorage.getItem("starling:model"))
           setModel(health.model);
         setConnection(health.busy || (health.queueDepth ?? 0) > 0 ? "busy" : "ready");
         setError(undefined);
@@ -1036,7 +1022,7 @@ export default function App() {
         setError(connectionFailureMessage(endpoint, failure));
       },
     );
-  }, [endpoint, healthSequencer, protocol, runHealthCheck]);
+  }, [endpoint, healthSequencer, runHealthCheck]);
 
   useEffect(() => {
     void (async () => {
@@ -1230,13 +1216,12 @@ export default function App() {
 
         const request = window.starlingDesktop
           ? Effect.tryPromise({
-              try: () => nativeTranscribe(endpoint, protocol, model, session.id, session.wav),
+              try: () => nativeTranscribe(endpoint, model, session.id, session.wav),
               catch: (cause) => new Error(messageFrom(cause)),
             })
-          : new StarlingClient({ baseUrl: endpoint, protocol, model }).transcribeEffect(
-              session.wav,
-              { requestId: session.id },
-            );
+          : new StarlingClient({ baseUrl: endpoint, model }).transcribeEffect(session.wav, {
+              requestId: session.id,
+            });
 
         const result = await Effect.runPromise(request);
 
@@ -1246,7 +1231,7 @@ export default function App() {
         // keeps it stays explainable.
         await store.saveTranscript(session.id, result, {
           model: model.trim() || undefined,
-          protocol,
+          protocol: "openai",
         });
         recordRecognitionSelected(session.id, result.text);
         setConnection("ready");
@@ -1272,7 +1257,7 @@ export default function App() {
         }
       }
     },
-    [endpoint, model, protocol, recordRecognitionSelected, refresh],
+    [endpoint, model, recordRecognitionSelected, refresh],
   );
 
   /**
@@ -1902,7 +1887,7 @@ export default function App() {
       const takeId = ++takeSeqRef.current;
       let onChunk: ((chunk: Float32Array, sampleRate: number) => void) | undefined;
 
-      if (streamLive && protocol === "starling") {
+      if (streamLive) {
         onChunk = await beginStreamingTake(takeId);
       } else {
         setPartialText(undefined);
@@ -1950,7 +1935,6 @@ export default function App() {
     discardStreamingTake,
     finishStreamingTake,
     lifecycle,
-    protocol,
     refresh,
     saveTake,
     start,
@@ -2250,7 +2234,7 @@ export default function App() {
   /**
    * Open the settings dialog on a complete draft of the committed
    * configuration (B06). Every field the dialog shows is drafted — endpoint,
-   * protocol, model, streaming, terms, and every refinement field — and the
+   * model, streaming, terms, and every refinement field — and the
    * draft exists only while the dialog is open.
    */
   function openSettings() {
@@ -2259,7 +2243,6 @@ export default function App() {
     setSettingsIssue(undefined);
     setDraft({
       endpoint,
-      protocol,
       model,
       streamLive,
       expectedTerms,
@@ -2276,8 +2259,8 @@ export default function App() {
 
   /**
    * Test the DRAFT configuration without touching committed state (B06). The
-   * probe runs against the draft endpoint AND the draft protocol — the
-   * combination about to be saved — and its outcome lands in the dialog's
+   * probe runs against the draft endpoint about to be saved. Its outcome
+   * lands in the dialog's
    * own probe state: the live connection status, the server model, the
    * committed model, and the global error banner are never written from
    * here. Only the newest probe may report, so a slow earlier probe cannot
@@ -2303,7 +2286,7 @@ export default function App() {
     setProbe({ state: "testing", endpoint: target });
 
     try {
-      const health = await runHealthCheck(target, draft.protocol);
+      const health = await runHealthCheck(target);
 
       if (!probeSequencer.isCurrent(token)) return;
 
@@ -2324,8 +2307,7 @@ export default function App() {
    * failed or blocked save leaves the dialog open with a clear error and
    * nothing partially applied; a save whose key stayed session-only keeps
    * the dialog open with the accurate protection status; the health-check
-   * effect re-probes on its own when the committed endpoint or protocol
-   * actually changed.
+   * effect re-probes on its own when the committed endpoint changes.
    */
   async function saveSettings() {
     if (!draft) return;
@@ -2377,7 +2359,6 @@ export default function App() {
     // the same normalized snapshot the transaction wrote, so state and
     // storage activate this configuration together or not at all.
     setEndpoint(committed.endpoint);
-    setProtocol(committed.protocol);
     setModel(committed.model);
     setStreamLive(committed.streamLive);
     setExpectedTerms(committed.expectedTerms);
@@ -2406,8 +2387,8 @@ export default function App() {
     }
 
     // Re-check health from the saved configuration, as saves always did. The
-    // call's closure may predate the commit above: when the endpoint or
-    // protocol changed it probes the older pair, and the effect that fires
+    // call's closure may predate the commit above: when the endpoint changed
+    // it probes the older value, and the effect that fires
     // on the new checkHealth identity supersedes it via the sequence token —
     // only the check against the committed values survives.
     void checkHealth();
@@ -2941,20 +2922,6 @@ export default function App() {
               </label>
               <div className="settings-grid">
                 <label>
-                  API format
-                  <select
-                    value={draft.protocol}
-                    onChange={(event) =>
-                      updateDraft({
-                        protocol: event.target.value === "openai" ? "openai" : "starling",
-                      })
-                    }
-                  >
-                    <option value="starling">Starling native</option>
-                    <option value="openai">OpenAI compatible</option>
-                  </select>
-                </label>
-                <label>
                   Model
                   <input
                     value={draft.model}
@@ -2967,15 +2934,13 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={draft.streamLive}
-                  disabled={draft.protocol === "openai"}
                   onChange={(event) => updateDraft({ streamLive: event.target.checked })}
                 />
                 <span>
                   Live streaming transcript
                   <small>
-                    Streams audio to a Starling native server while you speak. Requires the Starling
-                    API format; recordings always save locally first and fall back to a full upload
-                    if the stream fails.
+                    Streams audio to a Starling native server while you speak; recordings always
+                    save locally first and fall back to a full upload if the stream fails.
                   </small>
                 </span>
               </label>

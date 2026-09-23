@@ -12,11 +12,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var isStartingCapture = false
     @Published var selectedSession: SessionRecord?
     @Published var errorMessage: String?
+    @Published private(set) var livePartial = ""
 
     let recorder: AudioRecorder
     let playback: AudioPlayback
     private let repository: SessionRepository
     private(set) var audioURLs: [UUID: URL] = [:]
+    private var liveStream: LiveTranscription?
+    private var streamPump: Task<Void, Never>?
 
     init(repository: SessionRepository) {
         self.repository = repository
@@ -26,6 +29,11 @@ final class AppModel: ObservableObject {
         // Capture can end without the stop button (a call, Siri, a lost
         // microphone route). Keep the audio captured so far in history.
         recorder.onForcedStop = { [weak self] capture, message in
+            self?.streamPump?.cancel()
+            self?.liveStream?.close()
+            self?.streamPump = nil
+            self?.liveStream = nil
+            self?.livePartial = ""
             Task { await self?.preserveInterruptedRecording(capture, message: message) }
         }
         Task { await recoverAndReload() }
@@ -43,6 +51,25 @@ final class AppModel: ObservableObject {
                 playback.stop()
                 let stagingURL = try await repository.stagingRecordingURL()
                 try await recorder.start(at: stagingURL)
+                guard recorder.isRecording else { return }
+                livePartial = ""
+                liveStream = try? LiveTranscription(configuration: configuration) { [weak self] text in
+                    self?.livePartial = text
+                }
+                streamPump = Task { [weak self] in
+                    while let self, self.recorder.isRecording, !Task.isCancelled {
+                        let chunks = self.recorder.drainStreamChunks()
+                        if let stream = self.liveStream {
+                            do {
+                                try await stream.send(chunks)
+                            } catch {
+                                stream.close()
+                                self.liveStream = nil
+                            }
+                        }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -119,8 +146,21 @@ final class AppModel: ObservableObject {
     }
 
     private func finishRecording(configuration: ServerConfiguration) async {
+        var streamToClose: LiveTranscription?
         do {
             let capture = try recorder.stop()
+            await streamPump?.value
+            streamPump = nil
+            let stream = liveStream
+            streamToClose = stream
+            liveStream = nil
+            if let stream {
+                do {
+                    try await stream.send(recorder.drainStreamChunks())
+                } catch {
+                    stream.close()
+                }
+            }
             // The source is already app-private. Promotion deletes it only
             // after the durable audio copy and manifest have both succeeded.
             let record = try await repository.commitStagedRecording(
@@ -128,8 +168,12 @@ final class AppModel: ObservableObject {
                 durationMilliseconds: capture.durationMilliseconds
             )
             await reload()
-            await transcribe(record, configuration: configuration)
+            await transcribe(record, configuration: configuration, stream: stream)
+            streamToClose = nil
+            livePartial = ""
         } catch {
+            streamToClose?.close()
+            livePartial = ""
             errorMessage = error.localizedDescription
         }
     }
@@ -150,7 +194,11 @@ final class AppModel: ObservableObject {
         await reload()
     }
 
-    private func transcribe(_ record: SessionRecord, configuration: ServerConfiguration) async {
+    private func transcribe(
+        _ record: SessionRecord,
+        configuration: ServerConfiguration,
+        stream: LiveTranscription? = nil
+    ) async {
         guard !isWorking else { return }
         isWorking = true
         defer { isWorking = false }
@@ -158,8 +206,18 @@ final class AppModel: ObservableObject {
             let attempting = try await repository.markAttempt(record.id)
             await reload()
             let recordingURL = await repository.recordingURL(for: attempting)
-            let transcript = try await StarlingClient(configuration: configuration)
-                .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+            let transcript: Transcript
+            if let stream {
+                if let streamed = try? await stream.finish() {
+                    transcript = streamed
+                } else {
+                    transcript = try await StarlingClient(configuration: configuration)
+                        .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+                }
+            } else {
+                transcript = try await StarlingClient(configuration: configuration)
+                    .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+            }
             _ = try await repository.saveTranscript(transcript, for: attempting.id)
             await reload()
         } catch {

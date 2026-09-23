@@ -1,5 +1,3 @@
-import type { TranscriptionProtocol } from "@starling/dictation";
-
 /**
  * Every settings field the dialog edits, as one immutable configuration
  * (B06): a draft while the dialog is open, the committed values once a save
@@ -9,7 +7,6 @@ import type { TranscriptionProtocol } from "@starling/dictation";
  */
 export interface SettingsSnapshot {
   endpoint: string;
-  protocol: TranscriptionProtocol;
   model: string;
   streamLive: boolean;
   expectedTerms: string;
@@ -36,7 +33,6 @@ export interface SettingsStorage {
 /** Every localStorage key a settings transaction owns (B06). */
 const KEYS = {
   endpoint: "starling:endpoint",
-  protocol: "starling:protocol",
   model: "starling:model",
   streaming: "starling:streaming",
   terms: "starling:terms",
@@ -205,7 +201,7 @@ function messageFrom(cause: unknown): string {
  * (B06). The prior value of every affected key — including both refinement
  * key entries — is snapshotted first; if any write fails mid-way (quota,
  * private mode, disabled storage), the snapshot is restored so storage never
- * holds a half-applied endpoint/key/protocol combination. The caller commits
+ * holds a half-applied endpoint/key combination. The caller commits
  * React state only after this returns ok, so state and storage activate the
  * configuration together or not at all.
  */
@@ -226,7 +222,6 @@ export function persistSettings(
   // encrypted key or strand a half-applied key form (B10).
   const writes: ReadonlyArray<readonly [string, string | null]> = [
     [KEYS.endpoint, settings.endpoint],
-    [KEYS.protocol, settings.protocol],
     [KEYS.model, settings.model],
     [KEYS.streaming, settings.streamLive ? "1" : "0"],
     [KEYS.terms, settings.expectedTerms],
@@ -284,7 +279,6 @@ export function readCommittedSettings(
 ): SettingsSnapshot {
   return {
     endpoint: storage.getItem(KEYS.endpoint) ?? defaultEndpoint,
-    protocol: storage.getItem(KEYS.protocol) === "openai" ? "openai" : "starling",
     model: storage.getItem(KEYS.model) ?? DEFAULT_MODEL,
     streamLive: storage.getItem(KEYS.streaming) !== "0",
     expectedTerms: storage.getItem(KEYS.terms) ?? "",
