@@ -16,6 +16,12 @@ object StarlingNative {
 
     external fun abiVersion(): Int
 
+    /**
+     * The ggml device the engine runs on ("CPU", "Vulkan0", ...) once a model
+     * has loaded; before that, the compiled backend family.
+     */
+    external fun backendName(): String?
+
     /** Loads STARLING_GGML_PARAKEET_TDT from [ggufPath]; 0 on failure. */
     external fun load(ggufPath: String): Long
 

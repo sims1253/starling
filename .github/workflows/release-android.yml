@@ -1,8 +1,9 @@
 # Build the Starling Mobile Android APKs and attach them to a GitHub release:
 #   starling-mobile-<version>.apk       every arm64 phone since ~2018 (dotprod+fp16)
-#   starling-mobile-<version>-i8mm.apk  adds int8 matrix-multiply kernels for the
-#                                       on-device engine: Pixel 8+ (Tensor G3+),
-#                                       Snapdragon 8 Gen 1+, Dimensity 9000+
+#   starling-mobile-<version>-i8mm.apk  adds int8 matrix-multiply kernels and an
+#                                       opt-in Vulkan GPU backend for the on-device
+#                                       engine: Pixel 8+ (Tensor G3+), Snapdragon
+#                                       8 Gen 1+, Dimensity 9000+ (arm64, Android 9+)
 # Both share the application id and signing key, so either installs over the
 # other; the i8mm build refuses on-device transcription on a CPU without i8mm.
 #
@@ -139,17 +140,17 @@ jobs:
           apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)/apksigner"
           built=apps/mobile/app/build/outputs/apk/release/app-release.apk
           mkdir -p dist
-          # suffix|arm64 target|expected smmla presence; each target rebuilds
-          # the native engine.
-          for variant in "|armv8.2-a+dotprod+fp16|no" "-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes"; do
-            IFS='|' read -r suffix arch want_smmla <<< "$variant"
+          # suffix|arm64 target|expected smmla presence|Vulkan backend; each
+          # target rebuilds the native engine.
+          for variant in "|armv8.2-a+dotprod+fp16|no|false" "-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes|true"; do
+            IFS='|' read -r suffix arch want_smmla vulkan <<< "$variant"
             tests=()
             [ -z "$suffix" ] && tests=(testDebugUnitTest)
             # A stale APK from the previous variant must never be relabelled.
             rm -f "$built"
             (cd apps/mobile && ./gradlew --no-daemon "${tests[@]}" assembleRelease \
               -PstarlingVersionName="$VERSION_NAME" -PstarlingVersionCode="$VERSION_CODE" \
-              -PstarlingArmArch="$arch")
+              -PstarlingArmArch="$arch" -PstarlingVulkan="$vulkan")
             test -f "$built" || { echo "::error::$built missing (unsigned builds are named app-release-unsigned.apk)"; exit 1; }
             "$apksigner" verify --verbose --print-certs "$built"
             # Prove the arm64 engine was built for this variant's target.
@@ -161,6 +162,12 @@ jobs:
             echo "variant '${suffix:-standard}' ($arch): $smmla smmla instructions"
             if { [ "$want_smmla" = yes ] && [ "$smmla" -eq 0 ]; } || { [ "$want_smmla" = no ] && [ "$smmla" -ne 0 ]; }; then
               echo "::error::variant '${suffix:-standard}' was not built for $arch"
+              exit 1
+            fi
+            has_vulkan=false
+            unzip -l "$built" | grep -q 'lib/arm64-v8a/libggml-vulkan.so' && has_vulkan=true
+            if [ "$has_vulkan" != "$vulkan" ]; then
+              echo "::error::variant '${suffix:-standard}': Vulkan backend present=$has_vulkan, expected $vulkan"
               exit 1
             fi
             mv "$built" "dist/starling-mobile-${VERSION_NAME}${suffix}.apk"
@@ -206,7 +213,7 @@ jobs:
             "" \
             "Download \`starling-mobile-$VERSION.apk\` on the phone and open it to install (allow installs from your browser or file manager when Android asks). Android 8.0+ on arm64 or x86_64." \
             "" \
-            "\`starling-mobile-$VERSION-i8mm.apk\` is the same app with faster on-device inference for phones with int8 matrix-multiply support: Pixel 8 or newer (Tensor G3+), Snapdragon 8 Gen 1 or newer, Dimensity 9000 or newer. On other phones it cannot run the on-device engine; use the standard APK there." \
+            "\`starling-mobile-$VERSION-i8mm.apk\` is the same app with faster on-device inference for phones with int8 matrix-multiply support: Pixel 8 or newer (Tensor G3+), Snapdragon 8 Gen 1 or newer, Dimensity 9000 or newer. It also offers an experimental Vulkan GPU option for the on-device engine. On other phones it cannot run the on-device engine; use the standard APK there." \
             "" \
             "$signing_note" \
             "" \

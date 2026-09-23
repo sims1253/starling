@@ -23,6 +23,11 @@ require(starlingArmExtensions.all { it in cpuFeatureNames }) {
 }
 val requiredCpuFeatures = starlingArmExtensions.map(cpuFeatureNames::getValue)
 
+// Optional Vulkan GPU backend for the on-device engine (`-PstarlingVulkan=true`).
+// The release workflow enables it for the i8mm APK only (recent phones); the
+// app keeps the CPU as the default device and offers the GPU as an opt-in.
+val starlingVulkan = providers.gradleProperty("starlingVulkan").orElse("false").get().toBooleanStrict()
+
 // Release signing is configured only when all four variables are present, so
 // `assembleRelease` without them still works and produces an unsigned APK.
 // The keystore must stay the same across releases: Android refuses to update
@@ -46,11 +51,15 @@ android {
 
     defaultConfig {
         applicationId = "dev.starling.mobile"
-        minSdk = 26
+        // ggml-vulkan links four Vulkan 1.1 entry points directly
+        // (vkGetPhysicalDeviceFeatures2, ...), which libvulkan exports from
+        // API 28 on; every phone the Vulkan (i8mm) APK targets runs Android 12+.
+        minSdk = if (starlingVulkan) 28 else 26
         targetSdk = 35
         versionCode = starlingVersionCode
         versionName = starlingVersionName
         buildConfigField("String", "ARM64_ARCH", "\"$starlingArmArch\"")
+        buildConfigField("boolean", "VULKAN_BUILD", starlingVulkan.toString())
         buildConfigField(
             "String[]",
             "ARM64_REQUIRED_CPU_FEATURES",
@@ -59,10 +68,13 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += "-DSTARLING_ANDROID_ARM_ARCH=$starlingArmArch"
+                arguments += "-DSTARLING_ANDROID_VULKAN=${if (starlingVulkan) "ON" else "OFF"}"
             }
         }
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // The Vulkan backend embeds ~37 MB of SPIR-V per ABI; its APK
+            // targets arm64 phones only (emulators use the standard APK).
+            abiFilters += if (starlingVulkan) listOf("arm64-v8a") else listOf("arm64-v8a", "x86_64")
         }
     }
 

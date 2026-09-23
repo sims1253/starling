@@ -4,6 +4,10 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.system.Os
+import dev.starling.mobile.engine.ComputeDevice
+import dev.starling.mobile.engine.ComputeDeviceSelector
+import dev.starling.mobile.engine.DevicePreferenceStore
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendSettings
@@ -22,6 +26,8 @@ class StarlingApplication : Application() {
         private set
     lateinit var onDeviceEngine: OnDeviceEngine
         private set
+    lateinit var computeDevice: ComputeDeviceSelector
+        private set
 
     // One worker for releases: repeated trims while a transcription holds the
     // engine queue behind each other instead of stacking waiting threads.
@@ -33,7 +39,17 @@ class StarlingApplication : Application() {
         super.onCreate()
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
-        onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
+        computeDevice = ComputeDeviceSelector(
+            gpuBuild = BuildConfig.VULKAN_BUILD,
+            preferences = DevicePreferences(this),
+            markerFile = File(filesDir, "gpu_call.marker"),
+            setEnv = { name, value -> Os.setenv(name, value, true) },
+        )
+        onDeviceEngine = OnDeviceEngine(
+            File(filesDir, "models"),
+            memoryGate = ::memoryGate,
+            nativePolicy = computeDevice,
+        )
         transcription = TranscriptionCoordinator(
             recordings,
             backendSettings,
@@ -83,7 +99,23 @@ class StarlingApplication : Application() {
             "${info.availMem / mb} MB are available). Close other apps or import a smaller model."
     }
 
+    private class DevicePreferences(context: Context) : DevicePreferenceStore {
+        private val preferences = context.getSharedPreferences("engine_settings", Context.MODE_PRIVATE)
+
+        override fun get(): ComputeDevice =
+            runCatching { ComputeDevice.valueOf(preferences.getString(KEY_DEVICE, null) ?: "") }
+                .getOrDefault(ComputeDevice.CPU)
+
+        override fun set(device: ComputeDevice) {
+            // commit, not apply: the crash guard's fallback must be durable
+            // before the process can die again.
+            preferences.edit().putString(KEY_DEVICE, device.name).commit()
+        }
+    }
+
     private companion object {
+        const val KEY_DEVICE = "compute_device"
+
         /** Activations and graph buffers on top of the weights. */
         const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
     }

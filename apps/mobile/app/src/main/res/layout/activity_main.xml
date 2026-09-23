@@ -167,6 +167,15 @@
                 android:text="@string/engine_on_device" />
         </RadioGroup>
 
+        <!-- Only shown in builds with the Vulkan backend (the i8mm APK). -->
+        <CheckBox
+            android:id="@+id/gpu_input"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/gpu_option"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/on_device_status"
             android:layout_width="match_parent"

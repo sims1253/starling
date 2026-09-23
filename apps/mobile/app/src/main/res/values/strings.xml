@@ -27,6 +27,12 @@
     <string name="on_device_importing">Importing model…</string>
     <string name="on_device_imported">Model imported. On-device transcription is ready.</string>
     <string name="import_model">Import model (.gguf)</string>
+    <string name="gpu_option">Use the GPU (Vulkan, experimental)</string>
+    <string name="gpu_restart_needed">Restart Starling Mobile to switch the on-device engine to the %1$s.</string>
+    <string name="gpu_recovered">The GPU crashed the on-device engine last time, so it is back on the CPU.</string>
+    <string name="device_cpu">CPU</string>
+    <string name="device_gpu">GPU</string>
+    <string name="on_device_last_run">Last run on %1$s: %2$.1f s of audio in %3$.2f s (%4$.1fx real time).</string>
     <string name="record_heading">Record</string>
     <string name="ready_to_record">Ready. Audio is captured as 16 kHz mono PCM and kept privately before transcription.</string>
     <string name="start_recording">Start recording</string>

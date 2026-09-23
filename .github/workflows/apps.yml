@@ -105,6 +105,29 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The Vulkan GPU build only ships in the i8mm release APK; build it on every
+  # PR so a ggml/NDK/header change cannot break it silently until release.
+  android-vulkan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+      - name: Build the i8mm + Vulkan release variant (unsigned)
+        working-directory: apps/mobile
+        run: >-
+          ./gradlew --no-daemon assembleRelease
+          -PstarlingArmArch=armv8.2-a+dotprod+fp16+i8mm -PstarlingVulkan=true
+      - name: Check the Vulkan backend is packaged
+        run: unzip -l apps/mobile/app/build/outputs/apk/release/app-release-unsigned.apk | grep 'lib/arm64-v8a/libggml-vulkan.so'
+
   ios:
     runs-on: macos-latest
     steps:

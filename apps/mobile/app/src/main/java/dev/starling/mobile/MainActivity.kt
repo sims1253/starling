@@ -26,6 +26,7 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
+import dev.starling.mobile.engine.ComputeDevice
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendProtocol
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
     private lateinit var modelInput: EditText
     private lateinit var engineInput: RadioGroup
     private lateinit var engineOnDeviceInput: RadioButton
+    private lateinit var gpuInput: CheckBox
     private lateinit var onDeviceStatus: TextView
     private lateinit var endpointMessage: TextView
     private lateinit var recordingMessage: TextView
@@ -94,6 +96,7 @@ class MainActivity : Activity() {
         modelInput = findViewById(R.id.model_input)
         engineInput = findViewById(R.id.engine_input)
         engineOnDeviceInput = findViewById(R.id.engine_on_device)
+        gpuInput = findViewById(R.id.gpu_input)
         onDeviceStatus = findViewById(R.id.on_device_status)
         endpointMessage = findViewById(R.id.endpoint_message)
         recordingMessage = findViewById(R.id.recording_message)
@@ -115,6 +118,15 @@ class MainActivity : Activity() {
         updateProtocolFields()
         findViewById<Button>(R.id.save_endpoint_button).setOnClickListener { saveEndpoint() }
         findViewById<Button>(R.id.import_model_button).setOnClickListener { importModel() }
+        val device = application.computeDevice
+        if (device.gpuAvailable) {
+            gpuInput.visibility = View.VISIBLE
+            gpuInput.isChecked = device.preferred() == ComputeDevice.GPU
+            gpuInput.setOnCheckedChangeListener { _, checked ->
+                device.setPreferred(if (checked) ComputeDevice.GPU else ComputeDevice.CPU)
+                refreshOnDeviceStatus()
+            }
+        }
         recordButton.setOnClickListener {
             if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
         }
@@ -136,6 +148,7 @@ class MainActivity : Activity() {
         // keyboard, recognition service, a transcription that finished while
         // backgrounded), so the list is refreshed on every resume.
         refreshRecordings()
+        refreshOnDeviceStatus()
     }
 
     override fun onStop() {
@@ -237,13 +250,27 @@ class MainActivity : Activity() {
 
     private fun refreshOnDeviceStatus() {
         val engine = application.onDeviceEngine
-        onDeviceStatus.text = when {
-            engine.hasModel() -> {
-                val sizeMb = engine.modelSizeBytes() / (1024 * 1024)
-                getString(R.string.on_device_model_present, sizeMb)
-            }
-            else -> getString(R.string.on_device_status_no_model)
+        val device = application.computeDevice
+        val lines = mutableListOf(
+            if (engine.hasModel()) {
+                getString(R.string.on_device_model_present, engine.modelSizeBytes() / (1024 * 1024))
+            } else {
+                getString(R.string.on_device_status_no_model)
+            },
+        )
+        if (device.recoveredFromGpuCrash) lines += getString(R.string.gpu_recovered)
+        if (device.restartNeeded()) {
+            lines += getString(
+                R.string.gpu_restart_needed,
+                getString(if (device.preferred() == ComputeDevice.GPU) R.string.device_gpu else R.string.device_cpu),
+            )
         }
+        // Speed of the last run on this phone: the way to compare CPU and GPU.
+        engine.lastRun?.takeIf { it.elapsedMillis > 0 }?.let { run ->
+            val seconds = run.elapsedMillis / 1000.0
+            lines += getString(R.string.on_device_last_run, run.device, run.audioSeconds, seconds, run.audioSeconds / seconds)
+        }
+        onDeviceStatus.text = lines.joinToString("\n")
     }
 
     private fun requestOrStartRecording() {
@@ -403,6 +430,7 @@ class MainActivity : Activity() {
             recordingMessage.setText(R.string.transcription_failed_retry)
         }
         refreshRecordings()
+        refreshOnDeviceStatus()
     }
 
     /**

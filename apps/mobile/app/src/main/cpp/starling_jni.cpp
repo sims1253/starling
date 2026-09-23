@@ -29,6 +29,11 @@ Java_dev_starling_mobile_engine_StarlingNative_abiVersion(JNIEnv*, jclass) {
   return starling_ggml_abi_version();
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_starling_mobile_engine_StarlingNative_backendName(JNIEnv* env, jclass) {
+  return toJString(env, starling_ggml_backend_name(), /* owned = */ false);
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_dev_starling_mobile_engine_StarlingNative_load(JNIEnv* env, jclass,
                                                     jstring gguf_path) {

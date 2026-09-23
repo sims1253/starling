@@ -30,7 +30,11 @@ class OnDeviceEngine(
     modelDir: File,
     private val memoryGate: (modelBytes: Long) -> String? = { null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+    private val nativePolicy: NativeCallPolicy = NativeCallPolicy.None,
 ) : OnDeviceStreamSession.LiveEngine {
+    /** One native transcription: how much audio, how long, on which device. */
+    data class RunStats(val device: String, val audioSeconds: Double, val elapsedMillis: Long)
+
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
 
@@ -55,6 +59,16 @@ class OnDeviceEngine(
 
     private var handle: Long = 0L
     private var loadError: String? = null
+
+    /** The device the loaded engine runs on (from the native backend); null before the first load. */
+    @Volatile
+    var deviceName: String? = null
+        private set
+
+    /** The most recent transcription (a whole recording, or one live window). */
+    @Volatile
+    var lastRun: RunStats? = null
+        private set
 
     fun hasModel(): Boolean = modelFile.isFile && modelFile.length() >= ModelFiles.MIN_MODEL_BYTES
 
@@ -253,12 +267,13 @@ class OnDeviceEngine(
             return "The on-device model was not loaded: $reason"
         }
         NativeSupport.applyThreadDefault()
+        nativePolicy.beforeFirstLoad()
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"
             return "The on-device engine is incompatible: $loadError"
         }
-        val loaded = StarlingNative.load(modelFile.absolutePath)
+        val loaded = nativePolicy.guard { StarlingNative.load(modelFile.absolutePath) }
         if (loaded == 0L) {
             val reason = StarlingNative.lastError(0L) ?: "the model could not be loaded"
             loadError = reason
@@ -266,9 +281,10 @@ class OnDeviceEngine(
         }
         handle = loaded
         loadError = null
+        deviceName = StarlingNative.backendName()
         // Absorb lazy graph construction before the first real request,
         // mirroring starling-serve's warmup.
-        StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE)
+        nativePolicy.guard { StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE) }
         return null
     }
 
@@ -278,10 +294,14 @@ class OnDeviceEngine(
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-        val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
-            ?: return OnDeviceStreamSession.WindowResult.Failed(
+        val started = System.nanoTime()
+        val text = nativePolicy.guard { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
+        recordRun(samples.size, started)
+        if (text == null) {
+            return OnDeviceStreamSession.WindowResult.Failed(
                 "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
             )
+        }
         OnDeviceStreamSession.WindowResult.Text(text)
     }
 
@@ -315,13 +335,14 @@ class OnDeviceEngine(
         // quadratically with the recording length.
         val windows = ChunkedTranscription.planWindows(decoded.samples.size, decoded.sampleRate)
         val texts = ArrayList<String>(windows.size)
+        val started = System.nanoTime()
         for (window in windows) {
             val samples = if (window.start == 0 && window.endExclusive == decoded.samples.size) {
                 decoded.samples
             } else {
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
-            val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
+            val text = nativePolicy.guard { StarlingNative.transcribe(handle, samples, decoded.sampleRate) }
                 ?: return InferenceResult.Failure(
                     "The on-device engine returned an error: ${
                         StarlingNative.lastError(handle) ?: "unknown error"
@@ -330,9 +351,18 @@ class OnDeviceEngine(
                 )
             texts.add(text)
         }
+        recordRun(decoded.samples.size, started)
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
         InferenceResult.Success(text)
+    }
+
+    private fun recordRun(samples: Int, startedNanos: Long) {
+        lastRun = RunStats(
+            device = deviceName ?: "unknown",
+            audioSeconds = samples.toDouble() / ChunkStreamer.SAMPLE_RATE,
+            elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000,
+        )
     }
 
     private fun unload() {

@@ -56,6 +56,19 @@ cores only, and the loaded model is released when Android reports memory
 pressure (it reloads on the next use); a load that clearly cannot fit in free
 memory is refused with an explanation.
 
+The `-i8mm` APK also contains ggml's Vulkan backend. Check **Use the GPU
+(Vulkan, experimental)** under *Transcribe on* to run the on-device engine on
+the phone's GPU (it needs Vulkan 1.2; without it the engine stays on the CPU).
+The device is chosen once per app process, so switching takes effect after
+restarting Starling Mobile. The status line under the model shows the device
+and speed of the last run (audio length, time, real-time factor), so CPU and
+GPU can be compared on the same phone. If the process ever dies inside a GPU
+call (a driver fault), the next start switches back to the CPU and says so,
+so a faulty driver cannot crash-loop the voice keyboard. Mobile GPU drivers
+differ widely; on some phones the CPU (with the i8mm kernels) is faster. The
+Vulkan build is arm64-only and needs Android 9 or newer; build it locally
+with `-PstarlingVulkan=true`.
+
 ## Install a release build
 
 Tagged releases carry two signed APKs, built by
