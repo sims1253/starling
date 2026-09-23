@@ -96,7 +96,7 @@ jobs:
       - name: Quantized Parakeet regression with repacking forced on
         run: |
           ./build/parakeet_compact_engine_test
-          STARLING_GGML_CPU_REPACK=1 ./build/parakeet_compact_engine_test
+          STARLING_GGML_CPU_REPACK=1 STARLING_EXPECT_ENGINE_REPACK=1 ./build/parakeet_compact_engine_test
 
   build-cpu:
     runs-on: ubuntu-22.04
@@ -193,6 +193,7 @@ jobs:
       - name: CPU weight repacking
         env:
           STARLING_GGML_CPU_REPACK: '1'
+          STARLING_EXPECT_ENGINE_REPACK: '1'
           # The AVX2 repack kernels at the pinned ggml (q5_K/q6_K/q8_0 have none).
           STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,iq4_nl'
         run: |

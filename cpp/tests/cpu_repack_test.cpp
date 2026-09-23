@@ -157,6 +157,10 @@ void test_type(ggml_backend_t backend, ggml_type type) {
     const auto view_graph = [&](ggml_context* ctx, auto&) {
         return ggml_cont(ctx, ggml_view_2d(ctx, w.w, K, 1, w.w->nb[1], 0));
     };
+    const auto nested_view_graph = [&](ggml_context* ctx, auto&) {
+        ggml_tensor* first = ggml_view_2d(ctx, w.w, K, 1, w.w->nb[1], 0);
+        return ggml_cont(ctx, ggml_view_2d(ctx, first, K, 1, first->nb[1], 0));
+    };
     bool plain_view_ok = true;
     try {
         run(backend, view_graph);
@@ -164,6 +168,13 @@ void test_type(ggml_backend_t backend, ggml_type type) {
         plain_view_ok = false;
     }
     check(plain_view_ok, tag + " view of a plain (unattached) weight computes");
+    bool plain_nested_view_ok = true;
+    try {
+        run(backend, nested_view_graph);
+    } catch (const std::exception&) {
+        plain_nested_view_ok = false;
+    }
+    check(plain_nested_view_ok, tag + " nested view of a plain weight computes");
 
     // Reference: the weight's buffer is not attached, so nothing repacks.
     const auto ref_batch = mul_mat(backend, w.w, x_batch, K, 37);
@@ -198,6 +209,14 @@ void test_type(ggml_backend_t backend, ggml_type type) {
         }
         check(threw, tag + " view of a repacked weight throws");
 
+        threw = false;
+        try {
+            run(backend, nested_view_graph);
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
+        }
+        check(threw, tag + " nested view of a repacked weight throws");
+
         // The repacked kernel reads activation rows as contiguous floats; a
         // transposed activation must be refused too.
         threw = false;
@@ -211,6 +230,21 @@ void test_type(ggml_backend_t backend, ggml_type type) {
             threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
         }
         check(threw, tag + " transposed activation with a repacked weight throws");
+
+        // The pinned ggml CPU_REPACK kernel accepts F32 activations only.
+        // A later F16/BF16 graph must fail before reading interleaved bytes.
+        for (ggml_type activation_type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            threw = false;
+            try {
+                run(backend, [&](ggml_context* ctx, auto&) {
+                    ggml_tensor* xt = ggml_new_tensor_2d(ctx, activation_type, K, 1);
+                    return ggml_mul_mat(ctx, w.w, xt);
+                });
+            } catch (const std::runtime_error& e) {
+                threw = std::string(e.what()).find("cpu_repack") != std::string::npos;
+            }
+            check(threw, tag + " non-F32 activation with a repacked weight throws");
+        }
     }
 }
 

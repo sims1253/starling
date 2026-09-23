@@ -226,7 +226,12 @@ void exercise(int rows) {
         check(token_argmax == winner(0, VOCAB + 1), "token argmax");
         check(duration_argmax == winner(VOCAB + 1, VOCAB + 1 + DURATIONS), "duration argmax");
     }
-    if (cpu_repack::enabled()) {
+    // CI sets this only on runners whose IQ4_NL repack kernel is pinned by
+    // cpu_repack_test; a developer CPU without that kernel still runs the
+    // numerical regression with the gate enabled.
+    const char* expect_repack = std::getenv("STARLING_EXPECT_ENGINE_REPACK");
+    if (expect_repack && std::strcmp(expect_repack, "1") == 0) {
+        check(cpu_repack::enabled(), "expected Parakeet repacking requires the gate");
         check(cpu_repack::stats().tensors > 0, "forced-on Parakeet run must repack a weight");
     }
     std::printf("rows=%d: max state error %.7f, max logit error %.7f\n", rows, state_error, logit_error);
