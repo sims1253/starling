@@ -251,6 +251,12 @@ class MainActivity : Activity() {
     private fun refreshOnDeviceStatus() {
         val engine = application.onDeviceEngine
         val device = application.computeDevice
+        // The selector may have changed the preference outside this screen
+        // (crash recovery at process start); keep the checkbox truthful.
+        if (::gpuInput.isInitialized && device.gpuAvailable) {
+            val preferGpu = device.preferred() == ComputeDevice.GPU
+            if (gpuInput.isChecked != preferGpu) gpuInput.isChecked = preferGpu
+        }
         val lines = mutableListOf(
             if (engine.hasModel()) {
                 getString(R.string.on_device_model_present, engine.modelSizeBytes() / (1024 * 1024))

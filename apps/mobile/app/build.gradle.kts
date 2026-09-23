@@ -33,7 +33,9 @@ val requiredCpuFeatures = starlingArmExtensions.map(cpuFeatureNames::getValue)
 // Optional Vulkan GPU backend for the on-device engine (`-PstarlingVulkan=true`).
 // The release workflow enables it for the i8mm APK only (recent phones); the
 // app keeps the CPU as the default device and offers the GPU as an opt-in.
-val starlingVulkan = providers.gradleProperty("starlingVulkan").orElse("false").get().toBooleanStrict()
+val starlingVulkan = providers.gradleProperty("starlingVulkan").orElse("false").get().let { raw ->
+    raw.toBooleanStrictOrNull() ?: throw GradleException("starlingVulkan must be true or false: $raw")
+}
 
 // Release signing is configured only when all four variables are present, so
 // `assembleRelease` without them still works and produces an unsigned APK.

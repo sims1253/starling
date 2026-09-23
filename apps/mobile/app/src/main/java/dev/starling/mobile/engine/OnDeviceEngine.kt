@@ -307,7 +307,7 @@ class OnDeviceEngine(
             )
         }
         // Only successful runs: a failure partway would read as a fast run.
-        recordRun(samples.size, started)
+        recordRun(samples.size, ChunkStreamer.SAMPLE_RATE, started)
         OnDeviceStreamSession.WindowResult.Text(text)
     }
 
@@ -373,23 +373,25 @@ class OnDeviceEngine(
                 )
             texts.add(text)
         }
-        recordRun(decoded.samples.size, started)
+        recordRun(decoded.samples.size, decoded.sampleRate, started)
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
         InferenceResult.Success(text)
     }
 
-    private fun recordRun(samples: Int, startedNanos: Long) {
+    private fun recordRun(samples: Int, sampleRate: Int, startedNanos: Long) {
         lastRun = RunStats(
             device = deviceName ?: "unknown",
-            audioSeconds = samples.toDouble() / ChunkStreamer.SAMPLE_RATE,
+            audioSeconds = samples.toDouble() / sampleRate,
             elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000,
         )
     }
 
     private fun unload() {
         if (handle != 0L) {
-            StarlingNative.free(handle)
+            // Freeing runs driver code on the GPU too, so it is guarded like
+            // load and transcribe (a crash here must also fall back to CPU).
+            nativePolicy.guard { StarlingNative.free(handle) }
             handle = 0L
             loadError = null
         }
