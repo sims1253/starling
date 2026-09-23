@@ -238,8 +238,10 @@ void test_non_matmul_use_blocks_repacking(ggml_backend_t backend) {
     });
     const auto got = mul_mat(backend, w.w, x, K, 16);
     check(repack::stats().tensors == before, "a get_rows weight is never repacked");
-    check(max_rel_diff(rows_ref, rows) < 1e-6, "get_rows reads the untouched layout");
-    check(max_rel_diff(ref, got) < 1e-6, "its later MUL_MAT stays on the plain path");
+    // The never-repack decision leaves the same bytes and kernels in place,
+    // so these two plain-path results should be bit-identical.
+    check(max_rel_diff(rows_ref, rows) == 0.0, "get_rows reads the untouched layout");
+    check(max_rel_diff(ref, got) == 0.0, "its later MUL_MAT stays on the plain path");
 }
 
 }  // namespace
