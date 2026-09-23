@@ -47,7 +47,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core:1.16.0")
+    implementation("androidx.core:core:1.19.0")
     // WebSocket client for the /stream live-dictation protocol; the batch
     // upload path stays on HttpURLConnection. OkHttp 4.x is used because
     // the 5.x Android artifact requires a newer compileSdk than this app;
