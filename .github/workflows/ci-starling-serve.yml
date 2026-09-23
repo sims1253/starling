@@ -212,7 +212,10 @@ jobs:
           ./build/replay_graph_support_test
           ./build/granite_trace_test
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -x "build/$t" ]; then "./build/$t"; fi
+            if [ -f "cpp/tests/$t.cpp" ]; then
+              test -x "build/$t" || { echo "::error::missing test binary: $t"; exit 1; }
+              "./build/$t"
+            fi
           done
 
       - name: Model lifetime and quantized decoding sanitizers
