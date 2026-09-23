@@ -46,6 +46,9 @@ fn production_host_wires_the_durable_store_and_refuses_to_degrade() {
         Err(err) => err,
     };
     assert!(
+        // Couples to config.rs's error wording — `HostConfig::production`
+        // returns `String`, so a phrase is the only discriminator; if the
+        // message is rephrased, update this with it.
         err.contains("will not open"),
         "the refusal names the root: {err}"
     );
@@ -81,25 +84,29 @@ mod embedder_recipe {
     /// value (or unsets it) on drop — panic-safe. Holds [`ENV_LOCK`]
     /// until drop, so a future env-dependent test in this binary
     /// serializes against this one by construction, not convention.
-    struct XdgRedirect(
-        Option<std::ffi::OsString>,
-        std::sync::MutexGuard<'static, ()>,
-    );
+    struct XdgRedirect {
+        prior: Option<std::ffi::OsString>,
+        /// Never read — its Drop (releasing [`ENV_LOCK`]) is the whole
+        /// point. A named field, not a tuple position, so the never-read
+        /// lint and the intent agree.
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl XdgRedirect {
         fn to(dir: &std::path::Path) -> Self {
-            let guard = ENV_LOCK.lock().expect("env lock not poisoned");
+            let _env_lock = ENV_LOCK.lock().expect("env lock not poisoned");
             let prior = std::env::var_os("XDG_DATA_HOME");
             std::env::set_var("XDG_DATA_HOME", dir);
-            Self(prior, guard)
+            Self { prior, _env_lock }
         }
     }
 
     impl Drop for XdgRedirect {
         fn drop(&mut self) {
-            // Fields drop in order: the env is restored before the lock
-            // releases.
-            match self.0.take() {
+            // `Drop::drop` runs before any field drops, so the env is
+            // restored while the lock is still held — the release then
+            // happens in `_env_lock`'s own drop, after the restore.
+            match self.prior.take() {
                 Some(value) => std::env::set_var("XDG_DATA_HOME", value),
                 None => std::env::remove_var("XDG_DATA_HOME"),
             }
@@ -133,11 +140,15 @@ mod embedder_recipe {
         let root: PathBuf = xdg.path().join("starling-gpui");
 
         // Construct + identify: the durable store, not the fallback.
+        // The root gate runs BEFORE any commit: if the redirect were
+        // ever broken, the freshly-created redirected root would not
+        // exist and the test aborts before a take could be written
+        // anywhere but under the tempdir.
         let store = default_capture_store();
         assert_eq!(store.describe(), "storage-v2", "the default root opened");
         assert!(
-            root.is_dir(),
-            "the no-argument contract resolved the default root {}",
+            root.is_dir() && root.starts_with(xdg.path()),
+            "the no-argument contract resolved the redirected root {}",
             root.display()
         );
 
