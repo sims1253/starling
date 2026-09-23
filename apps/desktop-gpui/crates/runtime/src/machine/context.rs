@@ -21,16 +21,20 @@ use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
 use crate::protocol::tables::CONTEXT;
 use crate::protocol::{Command, DecisionData, DecisionSource, Event, TargetSnapshotData};
 
-/// Where target snapshots come from (E03 wiring is I5; the stub is
-/// clearly labeled and never fabricates authority).
+/// Where target snapshots come from. The seam is wired — the host
+/// crate's adapter suite proves an injected provider resolves snapshots
+/// end-to-end over the IPC transport — and the real platform adapters
+/// (the focused editor target) are E03's work (issue #221); the stub
+/// below is clearly labeled and never fabricates authority.
 pub trait ContextProvider: Send + Sync {
     /// Resolves `context.snapshot{source}` into
     /// `context.targetSnapshot` data.
     fn snapshot(&self, source: &str) -> Result<TargetSnapshotData, String>;
 }
 
-/// The Mode A stub: a synthetic, clearly-labeled snapshot for the named
-/// source. Real editor integration lands with I5.
+/// The unwired default: a synthetic, clearly-labeled snapshot for the
+/// named source. Real target adapters land with E03 (issue #221) on
+/// this same seam.
 pub struct StubContextProvider {
     ttl: Duration,
 }
@@ -75,8 +79,9 @@ impl ContextProvider for StubContextProvider {
 
 /// How a decided mode maps to the audio route token it freezes. Default:
 /// `verbatim` → `local-authoring-default`, everything else →
-/// `local-default` (the fixture corpus's two routes; a real policy catalog
-/// is I5).
+/// `local-default` (the fixture corpus's two routes; a real policy
+/// catalog rides the E18 mode-routing contract and lands with the E03
+/// adapters).
 pub trait RoutePolicy: Send + Sync {
     fn route_for_mode(&self, mode: &str) -> String;
 }
@@ -304,8 +309,9 @@ impl ContextActor {
                             source: DecisionSource::Manual,
                             matched_prefix_span: None,
                             explanation: format!(
-                                "Manual mode selection for {mode:?} (runtime Mode A; mode \
-                                 catalog wiring is I5)."
+                                "Manual mode selection for {mode:?} (the mode catalog \
+                                 lands with the E03 adapters; the route ids are the \
+                                 corpus's two)."
                             ),
                             payload_view: "raw-text-only".to_string(),
                         };
