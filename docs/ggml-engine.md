@@ -377,6 +377,20 @@ build. The recorded CPU checks reproduce the golden fixture transcripts.
 CPU inference is about 10-20 times slower than CUDA in the recorded benchmarks
 and is useful for correctness checks and machines without a supported GPU.
 
+`STARLING_GGML_CPU_REPACK=1` opts the CPU backend into ggml's repacked GEMM
+kernels (`cpp/runtime/cpu_repack.hpp`); `=0` turns them off. It is on by
+default on Android and off elsewhere. Weights are rewritten in place into the
+interleaved layouts the NEON dotprod/i8mm and AVX2 kernels read (Q4_0, Q4_K,
+Q6_K, Q8_0, IQ4_NL, ... depending on the CPU), so memory use is unchanged. A
+weight is repacked only when every graph use observed so far is a direct 2D
+`MUL_MAT` source with F32 activations; a weight read any other way (views,
+`get_rows`, convolutions) stays in the plain layout, and a graph that reads an
+already-repacked weight through another op fails with a `cpu_repack` error
+instead of computing on the interleaved bytes. On an x86 AVX2 desktop
+(Parakeet TDT 0.6B q4_k_m, 8 threads) it cut transcription time by 9-15% with
+byte-identical transcripts on the fixtures; only the Q4_K tensors have x86
+kernels, while arm64 also repacks Q6_K and Q8_0.
+
 ### Apple Metal
 
 Build for Apple Silicon with `-DSTARLING_GGML_METAL=ON` and select the device

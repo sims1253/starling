@@ -43,6 +43,48 @@ on:
         default: false
 
 jobs:
+  # Real arm64 hardware for the NEON kernels phones run: the dotprod build is
+  # the standard Android APK's target (8x4 repack kernels), the +i8mm build
+  # the Pixel 8+/Snapdragon 8 Gen 1+ APK's (8x8 SMMLA kernels). The repack
+  # test must actually repack every type those kernels cover.
+  build-cpu-arm64:
+    name: CPU repack kernels (arm64 ${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['armv8.2-a+dotprod+fp16', 'armv8.2-a+dotprod+fp16+i8mm']
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build (CPU, ${{ matrix.arch }})
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          grep -m1 -i features /proc/cpuinfo
+          if [[ "$ARCH" == *i8mm* ]] && ! grep -qw i8mm /proc/cpuinfo; then
+            echo "::error::this runner has no i8mm; the +i8mm kernels cannot be exercised"
+            exit 1
+          fi
+          cmake -B build -DSTARLING_SERVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+            -DGGML_LLAMAFILE=OFF -DGGML_CPU_ARM_ARCH="$ARCH"
+          cmake --build build -j --target cpu_repack_test parakeet_compact_engine_test
+
+      - name: Repacked vs plain MUL_MAT on arm64
+        env:
+          STARLING_REPACK_TEST_EXPECT: q4_0,q4_K,q6_K,q8_0
+        run: ./build/cpu_repack_test
+
+      - name: Quantized Parakeet regression with repacking forced on
+        run: |
+          ./build/parakeet_compact_engine_test
+          STARLING_GGML_CPU_REPACK=1 ./build/parakeet_compact_engine_test
+
   build-cpu:
     runs-on: ubuntu-22.04
     steps:
@@ -71,7 +113,7 @@ jobs:
             parakeet_compact_engine_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
-            replay_graph_support_test$ENGINE_TESTS
+            replay_graph_support_test cpu_repack_test$ENGINE_TESTS
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -135,6 +177,15 @@ jobs:
 
       - name: Quantized Parakeet prediction and joint CPU regression
         run: ./build/parakeet_compact_engine_test
+
+      # In-place CPU weight repacking (cpp/runtime/cpu_repack.hpp): the unit
+      # test compares repacked vs plain MUL_MAT per type and pins the
+      # usage guard; the engine regression then runs with repacking forced
+      # on through the real Backend/ReplayGraph hooks.
+      - name: CPU weight repacking
+        run: |
+          ./build/cpu_repack_test
+          STARLING_GGML_CPU_REPACK=1 ./build/parakeet_compact_engine_test
 
       - name: Model lifetime and quantized decoding sanitizers
         env:

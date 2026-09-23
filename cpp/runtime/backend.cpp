@@ -10,6 +10,7 @@
 // the public ggml.h on this pinned ggml version, no internal header needed).
 
 #include "backend.hpp"
+#include "cpu_repack.hpp"
 
 #include "graph.hpp"
 #include "imatrix.hpp"
@@ -381,6 +382,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     // Side-effect roots (decode-state write-backs): expand so they execute.
     for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
 
+    // CPU backend: opt weights this graph uses only as MUL_MAT src0 into
+    // ggml's repacked kernels before anything is planned (cpu_repack.hpp).
+    if (!impl_->use_sched) cpu_repack::prepare_graph(gf);
+
     // 3. Allocate (persistent gallocr path, or sched fallback if some op is
     // unsupported by the primary backend / imatrix collection is active).
     bool need_sched = ImatrixCollector::enabled();
@@ -695,6 +700,9 @@ bool ReplayGraph::alloc_internal() {
     // assert. (A fully-supported graph still takes the imatrix sched route
     // below — that configuration is unchanged.)
     need_sched_ = ImatrixCollector::enabled();
+    // Captured CPU graphs replay without rebuilding, so this is the one
+    // point where their weights can be opted into the repacked kernels.
+    if (!backend_.is_gpu()) cpu_repack::prepare_graph(gf_);
     if (backend_.is_gpu()) {
         ggml_backend_t backend = backend_.handle();
         check_no_unsupported_graph_nodes(
