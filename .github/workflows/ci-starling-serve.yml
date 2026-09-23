@@ -42,9 +42,66 @@ on:
         type: boolean
         default: false
 
+# Build/test only: no job needs more than a read-only token.
+permissions:
+  contents: read
+
+# Superseded PR pushes cancel; every master push runs to completion.
+concurrency:
+  group: ci-starling-serve-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Real arm64 hardware for the NEON kernels phones run: the dotprod build is
+  # the standard Android APK's target (8x4 repack kernels), the +i8mm build
+  # the Pixel 8+/Snapdragon 8 Gen 1+ APK's (8x8 SMMLA kernels). The repack
+  # test must actually repack every type those kernels cover.
+  build-cpu-arm64:
+    name: CPU repack kernels (arm64 ${{ matrix.arch }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['armv8.2-a+dotprod+fp16', 'armv8.2-a+dotprod+fp16+i8mm']
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build (CPU, ${{ matrix.arch }})
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          grep -m1 -i features /proc/cpuinfo
+          if ! grep -qw asimddp /proc/cpuinfo; then
+            echo "::error::this runner has no dotprod; the $ARCH kernels cannot be exercised"
+            exit 1
+          fi
+          if [[ "$ARCH" == *i8mm* ]] && ! grep -qw i8mm /proc/cpuinfo; then
+            echo "::error::this runner has no i8mm; the +i8mm kernels cannot be exercised"
+            exit 1
+          fi
+          cmake -B build -DSTARLING_SERVE=OFF -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+            -DGGML_LLAMAFILE=OFF -DGGML_CPU_ARM_ARCH="$ARCH"
+          cmake --build build -j --target cpu_repack_test parakeet_compact_engine_test
+
+      - name: Repacked vs plain MUL_MAT on arm64
+        env:
+          STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,q5_K,q6_K,q8_0,iq4_nl'
+        run: ./build/cpu_repack_test
+
+      - name: Quantized Parakeet regression with repacking forced on
+        run: |
+          ./build/parakeet_compact_engine_test
+          STARLING_GGML_CPU_REPACK=1 STARLING_EXPECT_ENGINE_REPACK=1 ./build/parakeet_compact_engine_test
+
   build-cpu:
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -55,15 +112,6 @@ jobs:
       - name: Build (CPU)
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          # The engine-contract targets (device_cache_clear_test,
-          # greedy_termination_test, ...) land with the optimization-program
-          # branches; build them only where their sources exist so this
-          # workflow stays green on branches without them.
-          ENGINE_TESTS=""
-          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -f "cpp/tests/$t.cpp" ]; then ENGINE_TESTS="$ENGINE_TESTS $t"; fi
-          done
-          # shellcheck disable=SC2086
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
             audex_loader_guard_test granite_stage_test model_lifetime_test \
@@ -71,7 +119,8 @@ jobs:
             parakeet_compact_engine_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
-            replay_graph_support_test$ENGINE_TESTS
+            replay_graph_support_test cpu_repack_test \
+            device_cache_clear_test greedy_termination_test tdt_graph_budget_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -88,12 +137,11 @@ jobs:
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01) and EOS/budget termination semantics (S03). Both are
-      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed);
-      # run them only where their binaries were built (see Build (CPU)).
+      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed).
       - name: Engine contract tests (KV clearing, termination semantics)
         run: |
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
-            if [ -x "build/$t" ]; then "./build/$t"; fi
+            "./build/$t"
           done
 
       # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
@@ -135,6 +183,29 @@ jobs:
 
       - name: Quantized Parakeet prediction and joint CPU regression
         run: ./build/parakeet_compact_engine_test
+
+      # In-place CPU weight repacking (cpp/runtime/cpu_repack.hpp): the unit
+      # test compares repacked vs plain MUL_MAT per type and pins the
+      # usage guard; the engine regressions then run with repacking forced
+      # on through the real Backend/ReplayGraph hooks. The quantized Parakeet
+      # test repacks real weights; the others (F32/F16 synthetic weights)
+      # pin that the eligibility scan never trips on their graph shapes
+      # (views, get_rows, conv, replayed graphs).
+      - name: CPU weight repacking
+        env:
+          STARLING_GGML_CPU_REPACK: '1'
+          # The AVX2 repack kernels at the pinned ggml (q5_K/q6_K/q8_0 have none).
+          STARLING_REPACK_TEST_EXPECT: 'q4_0,q4_K,iq4_nl'
+        run: |
+          ./build/cpu_repack_test
+          STARLING_EXPECT_ENGINE_REPACK=1 ./build/parakeet_compact_engine_test
+          ./build/granite_stage_test
+          ./build/model_lifetime_test
+          ./build/replay_graph_support_test
+          ./build/granite_trace_test
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
+            "./build/$t"
+          done
 
       - name: Model lifetime and quantized decoding sanitizers
         env:

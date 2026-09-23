@@ -10,6 +10,7 @@
 // the public ggml.h on this pinned ggml version, no internal header needed).
 
 #include "backend.hpp"
+#include "cpu_repack.hpp"
 
 #include "graph.hpp"
 #include "imatrix.hpp"
@@ -344,6 +345,11 @@ static void tensor_get_f32(ggml_backend_t backend, const ggml_tensor* t,
 
 bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                       std::vector<float>& out) {
+    // CPU weight repacking rewrites borrowed bytes on first use. Serialize
+    // direct C++ callers with loader release and captured graph execution;
+    // run_graph/C API callers already hold this recursive mutex.
+    std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
+    if (!is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     // 1. Build in a no_alloc=true metadata context.
     //    ggml_graph_overhead_custom(kGraphSize, ...) reserves node/leaf slot
     //    capacity matching the cgraph allocated below (ggml_new_graph_custom);
@@ -380,6 +386,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     for (const auto& c : pcap) ggml_build_forward_expand(gf, c.t);
     // Side-effect roots (decode-state write-backs): expand so they execute.
     for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
+
+    // CPU backend: opt weights this graph uses only as MUL_MAT src0 into
+    // ggml's repacked kernels before anything is planned (cpu_repack.hpp).
+    if (!impl_->use_sched) cpu_repack::prepare_graph(gf);
 
     // 3. Allocate (persistent gallocr path, or sched fallback if some op is
     // unsupported by the primary backend / imatrix collection is active).
@@ -590,6 +600,8 @@ void check_no_unsupported_graph_nodes(
 ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
+    std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
+    if (!backend_.is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     // graph_build spans construction + allocation of one captured shape (the
     // one-time cost a replay-cache miss pays). Includes the build lambda and
     // alloc_internal(); the gated F1 histogram below is inside the window.
@@ -695,7 +707,11 @@ bool ReplayGraph::alloc_internal() {
     // assert. (A fully-supported graph still takes the imatrix sched route
     // below — that configuration is unchanged.)
     need_sched_ = ImatrixCollector::enabled();
-    if (backend_.is_gpu()) {
+    if (!backend_.is_gpu()) {
+        // Captured CPU graphs replay without rebuilding, so this is the one
+        // point where their weights can be opted into the repacked kernels.
+        cpu_repack::prepare_graph(gf_);
+    } else {
         ggml_backend_t backend = backend_.handle();
         check_no_unsupported_graph_nodes(
             gf_, [backend](const ggml_tensor* n) {
@@ -786,6 +802,10 @@ void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
 }
 
 bool ReplayGraph::compute(std::vector<float>& out) {
+    // Match the CPU build/loader lock through execution and readback so a
+    // different graph cannot repack a weight while this one reads it.
+    std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
+    if (!backend_.is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
     if (!gf_ || !out_) return false;
     Backend::Impl* impl = backend_.impl_.get();
     // Fast path: graph_compute_async (skip the sync-wrapping graph_compute so the

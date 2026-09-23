@@ -8,6 +8,7 @@
 
 #include "model_loader.hpp"
 #include "backend.hpp"
+#include "cpu_repack.hpp"
 #include "graph.hpp"
 
 #include "ggml.h"
@@ -34,6 +35,7 @@ ModelLoader::ModelLoader() {
 
 void ModelLoader::release_runtime_resources() {
     while (!caches_.empty()) caches_.pop_back();
+    if (weight_buffer_) cpu_repack::detach(weight_buffer_);
     if (weight_buffer_) ggml_backend_buffer_free(weight_buffer_);
     weight_buffer_ = nullptr;
     if (device_ctx_) {
@@ -56,6 +58,7 @@ ModelLoader::~ModelLoader() {
     release_runtime_resources();
     live_loaders().erase(this);
     // The ggml context owns the weight tensors; freeing it frees them all.
+    if (ctx_) cpu_repack::forget(ggml_get_mem_buffer(ctx_), ggml_get_mem_size(ctx_));
     if (ctx_) ggml_free(ctx_);
     if (compat_ctx_) ggml_free(compat_ctx_);
     if (gguf_ctx_) gguf_free(gguf_ctx_);
@@ -259,6 +262,17 @@ bool ModelLoader::realize_weights(Backend& backend) {
             ggml_tensor* t = kv.second;
             t->buffer = buf;
             // data pointer already set by the GGUF allocation.
+        }
+        // Opt the weights into ggml's repacked CPU kernels as graphs use
+        // them (no-op unless enabled; see cpu_repack.hpp).
+        try {
+            cpu_repack::attach(buf);
+        } catch (const std::exception& e) {
+            error_ = std::string("realize_weights: ") + e.what();
+            ggml_backend_buffer_free(buf);
+            weight_buffer_ = nullptr;
+            for (const auto& kv : tensors_) kv.second->buffer = nullptr;
+            return false;
         }
     } else {
         // GPU: allocate a no_alloc device context, mirror tensors, upload.
