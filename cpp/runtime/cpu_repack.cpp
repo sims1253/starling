@@ -156,11 +156,6 @@ bool supported_use(const ggml_tensor* node, int src_index, const ggml_tensor* we
 }
 
 bool try_repack(State& s, Region& r, ggml_tensor* w) {
-    // Allocate the temporary copy before changing the tensor. If allocation
-    // fails, the plain buffer and bytes are still usable by the caller.
-    const size_t n = ggml_nbytes(w);
-    std::vector<uint8_t> original(n);
-    std::memcpy(original.data(), w->data, n);
     w->buffer = r.alias;
     w->extra = nullptr;
     if (r.alias->iface.init_tensor) r.alias->iface.init_tensor(r.alias, w);
@@ -168,6 +163,18 @@ bool try_repack(State& s, Region& r, ggml_tensor* w) {
         w->buffer = r.plain;
         return false;
     }
+    const size_t n = ggml_nbytes(w);
+    std::vector<uint8_t> original;
+    try {
+        original.resize(n);
+    } catch (...) {
+        // Keep an allocation failure recoverable without copying weights
+        // that have no repack kernel on this CPU.
+        w->buffer = r.plain;
+        w->extra = nullptr;
+        throw;
+    }
+    std::memcpy(original.data(), w->data, n);
     // Dispatches to the CPU_REPACK set_tensor: rewrites w->data in place.
     ggml_backend_tensor_set(w, original.data(), 0, n);
     s.repacked[w] = w->extra;
