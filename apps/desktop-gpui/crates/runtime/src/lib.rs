@@ -102,9 +102,10 @@ pub struct RuntimeConfig {
     pub capture_source: Arc<dyn CaptureSource>,
     /// Where finished/salvaged takes are persisted. The default is the
     /// in-memory store so that constructing a config — tests do it freely
-    /// — never touches the user's data root; the production embedder
-    /// overrides this with [`default_capture_store`] (storage v2 at the
-    /// default root).
+    /// — never touches the user's data root; a production embedder
+    /// overrides this with storage v2 (the I4 host opens it at its
+    /// explicit root; a root-less embedder uses
+    /// [`default_capture_store`]).
     pub capture_store: Arc<dyn CaptureStore>,
     /// The documents persistence seam.
     pub document_store: Arc<dyn DocumentStore>,
@@ -193,12 +194,18 @@ impl RuntimeConfig {
 /// accident; if that ever changes, the directive (not this seam) is what
 /// changes. This is not a migration entry point and must not grow one.
 ///
-/// Embedder-facing: nothing inside this workspace calls it yet —
-/// [`RuntimeConfig::default`] deliberately stays on the in-memory store
-/// so constructing a config (tests do it freely) never touches the
-/// user's data root. The production embedder (the GPUI switchover / the
-/// I4 service host) passes `.with_capture_store(default_capture_store())`
-/// at its entry point; that wiring is the consuming increment's work.
+/// Embedder-facing: nothing inside this workspace calls it in
+/// production, and the I4 service host deliberately never will — it owns
+/// an explicit data root (its `--root` CLI, its lease) and opens
+/// [`machine::capture::V2CaptureStore`] there directly, so a root that
+/// will not open is a startup refusal rather than a silent slide onto
+/// this function's in-memory fallback. The function remains the recipe
+/// for embedders *without* a root-ownership surface: the GPUI in-process
+/// switchover passes `.with_capture_store(default_capture_store())` at
+/// its entry point. It is pinned, not left to rot, by
+/// `starling-runtime-host`'s `tests/default_store.rs`, which constructs
+/// it through the public API, persists a take that survives a reopen of
+/// the default root, and boots a runtime configured with it (#259).
 pub fn default_capture_store() -> Arc<dyn CaptureStore> {
     if let Ok(root) = starling_dictation::store_v2::StoreV2::default_root() {
         if let Ok(store) = machine::capture::V2CaptureStore::open(root) {
