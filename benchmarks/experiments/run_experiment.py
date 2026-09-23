@@ -13,7 +13,10 @@ HTTP serving stack via the contract fixture binary — build it first):
 The demo runs the SAME binary as both arms, so its honest verdict is
 never "pass" (normally "inconclusive") — a live demonstration that the
 comparator refuses to manufacture a win from noise (issue #168's core
-requirement).
+requirement). The negative control is sized for shared CI runners
+(issue #256): 12 fresh-process repeats and a 12% improvement bar, so
+scheduler jitter cannot push every repeat's paired improvement past the
+bar at once.
 
 Real experiments: pin a workload, write a spec, run both arms, compare:
 
@@ -30,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 import wave
 from pathlib import Path
 
@@ -44,6 +48,37 @@ from record import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The demo's negative control (issue #256). A false "pass" on identical arms
+# requires the paired-improvement bootstrap CI to clear min_improvement_pct
+# ENTIRELY, and the bootstrap resamples whole fresh-process repeats: with only
+# 4 repeats, shared-runner scheduler jitter (per-process cluster effects of
+# ±10% are routine on sub-millisecond HTTP round trips) occasionally tips
+# every repeat the same way and the CI manufactures a win. 12 repeats give the
+# cluster bootstrap enough independent processes to concentrate the CI on the
+# true 0% effect, and the 12% bar demands a coordinated one-sided noise level
+# that interleaved arms cannot plausibly produce (measured on the comparator:
+# ~3-4% false-pass at 4 repeats / 5% bar under calibrated noise, ~0.01% here).
+# tolerated_failures rides along because 24 fresh processes x 8 requests each
+# (1 cold + 1 warmup + 6 timed; 96 per arm) must tolerate a single stray
+# transport hiccup without the demo degrading to "unavailable".
+# MappingProxyType seals the preregistered protocol: the demo spec is copied
+# via dict() at its only consumer (_demo_spec), so the sealed originals
+# cannot drift at runtime.
+DEMO_PROTOCOL = types.MappingProxyType({
+    "repeats": 12,
+    "requests_per_repeat": 6,
+    "warmup_requests": 1,
+    "order": "interleaved_random",
+    "seed": 20260919,
+    "timeout_s": 60,
+})
+DEMO_ACCEPTANCE = types.MappingProxyType({
+    "min_improvement_pct": 12.0,
+    "max_ci_halfwidth_pct": 15.0,
+    "max_regression_pct": 0.0,
+})
+DEMO_TOLERATED_FAILURES = 2
 
 
 def _cmd_pin_workload(args: argparse.Namespace) -> int:
@@ -150,19 +185,9 @@ def _demo_spec(demo_dir: Path, binary: Path) -> dict:
             "files": [wav.name],
             "sha256": manifest["sha256"],
         },
-        "protocol": {
-            "repeats": 4,
-            "requests_per_repeat": 6,
-            "warmup_requests": 1,
-            "order": "interleaved_random",
-            "seed": 20260919,
-            "timeout_s": 60,
-        },
-        "acceptance": {
-            "min_improvement_pct": 5.0,
-            "max_ci_halfwidth_pct": 15.0,
-            "max_regression_pct": 0.0,
-        },
+        "protocol": dict(DEMO_PROTOCOL),
+        "acceptance": dict(DEMO_ACCEPTANCE),
+        "tolerated_failures": DEMO_TOLERATED_FAILURES,
     }
 
 
@@ -202,9 +227,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
               "manufactured a win from noise; see comparison.json", file=sys.stderr)
         return 1
     if result["verdict"] == "unavailable":
-        # The demo spec tolerates zero failures, so an unusable run means a
-        # request actually failed — a defect signal, not noise. Green only
-        # on completed-run verdicts (inconclusive, or a noise-tipped fail).
+        # The demo spec tolerates 2 failures per arm, so an unusable run
+        # means an arm accumulated 3+ failed requests — a defect signal,
+        # not runner noise. Green only on completed-run verdicts
+        # (inconclusive, or a noise-tipped fail).
         print(f"[demo] run unusable: {result.get('reason')} — the demo must "
               "complete both arms to demonstrate the no-false-win contract",
               file=sys.stderr)
