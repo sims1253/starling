@@ -1063,16 +1063,18 @@ impl StoreV2 {
 
     /// Creates or updates one `documents` row. Idempotent on `doc_id`:
     /// a re-commit of the same head (a caller retrying after a crash
-    /// window) writes the same row rather than colliding.
+    /// window) writes the same row rather than colliding. The durable
+    /// head never moves backwards: an older `head_revision` than the
+    /// stored one is a no-op, reported as `Ok(false)`.
     pub fn upsert_document(
         &self,
         doc_id: &str,
         name: &str,
         head_revision: u64,
         turn_seq: u32,
-    ) -> Result<(), StoreV2Error> {
+    ) -> Result<bool, StoreV2Error> {
         validate_document_id(doc_id)?;
-        self.conn.execute(
+        let changed = self.conn.execute(
             "INSERT INTO documents(doc_id, name, head_revision, turn_seq)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(doc_id) DO UPDATE SET
@@ -1082,7 +1084,7 @@ impl StoreV2 {
              WHERE excluded.head_revision >= documents.head_revision",
             params![doc_id, name, int64(head_revision)?, int64(u64::from(turn_seq))?],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Inserts (or idempotently re-stores) one `revisions` row. The
@@ -1096,7 +1098,7 @@ impl StoreV2 {
     pub fn store_document_revision(&self, revision: &RevisionRow) -> Result<(), StoreV2Error> {
         validate_document_id(&revision.rev_id)?;
         validate_document_id(&revision.doc_id)?;
-        self.conn.execute(
+        let changed = self.conn.execute(
             "INSERT INTO revisions(rev_id, doc_id, base_rev, sources_json, text,
                                    status, provenance, disposition)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -1106,7 +1108,8 @@ impl StoreV2 {
                 text = excluded.text,
                 status = excluded.status,
                 provenance = excluded.provenance,
-                disposition = excluded.disposition",
+                disposition = excluded.disposition
+             WHERE revisions.doc_id = excluded.doc_id",
             params![
                 revision.rev_id,
                 revision.doc_id,
@@ -1118,6 +1121,12 @@ impl StoreV2 {
                 revision.disposition,
             ],
         )?;
+        if changed == 0 {
+            return Err(StoreV2Error::Invalid(format!(
+                "revision {} already belongs to another document",
+                revision.rev_id
+            )));
+        }
         Ok(())
     }
 
@@ -1134,7 +1143,14 @@ impl StoreV2 {
         revision: &RevisionRow,
     ) -> Result<(), StoreV2Error> {
         let tx = self.conn.unchecked_transaction()?;
-        self.upsert_document(&revision.doc_id, name, head_revision, turn_seq)?;
+        // A refused write returns before `commit`: dropping `tx` rolls
+        // the whole pair back.
+        if !self.upsert_document(&revision.doc_id, name, head_revision, turn_seq)? {
+            return Err(StoreV2Error::Invalid(format!(
+                "document {} head {head_revision} is older than the durable head",
+                revision.doc_id
+            )));
+        }
         self.store_document_revision(revision)?;
         tx.commit()?;
         Ok(())
@@ -6421,6 +6437,40 @@ mod tests {
         let doc = store.get_document("scratch").expect("get").expect("row");
         assert_eq!(doc.head_revision, 4);
         assert_eq!(doc.turn_seq, 2);
+    }
+
+    #[test]
+    fn the_durable_head_never_moves_backwards() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        assert!(store.upsert_document("doc", "doc", 2, 0).expect("head 2"));
+        assert!(!store.upsert_document("doc", "doc", 1, 0).expect("stale head is a no-op"));
+        assert_eq!(store.get_document("doc").expect("get").expect("row").head_revision, 2);
+        // A stale commit lands neither the head nor its revision row.
+        store
+            .commit_document_head("doc", 1, 0, &sample_revision("rev-stale", "doc", 0, "stale"))
+            .expect_err("a stale head commit is refused");
+        let doc = store.get_document("doc").expect("get").expect("row");
+        assert_eq!(doc.head_revision, 2);
+        assert!(doc.revisions.is_empty(), "the refused commit rolled back");
+    }
+
+    #[test]
+    fn a_revision_is_never_reparented_to_another_document() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        store.upsert_document("a", "a", 1, 0).expect("doc a");
+        store.upsert_document("b", "b", 0, 0).expect("doc b");
+        store
+            .store_document_revision(&sample_revision("r1", "a", 0, "A's text"))
+            .expect("a's revision");
+        store
+            .commit_document_head("b", 1, 0, &sample_revision("r1", "b", 0, "B's text"))
+            .expect_err("a colliding rev_id under another document is refused");
+        let a = store.get_document("a").expect("get").expect("row");
+        assert_eq!(a.revisions[0].text, "A's text");
+        let b = store.get_document("b").expect("get").expect("row");
+        assert_eq!(b.head_revision, 0, "the refused commit rolled the head back");
     }
 
     #[test]

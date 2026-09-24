@@ -220,7 +220,10 @@ impl V2DocumentStore {
             return (Vec::new(), String::new());
         };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            eprintln!("documents machine: unparsable sources_json, provenance lost: {text:?}");
+            eprintln!(
+                "documents machine: unparsable sources_json ({} bytes), provenance lost",
+                text.len()
+            );
             return (Vec::new(), String::new());
         };
         let attempts = value
@@ -285,6 +288,7 @@ impl DocumentStore for V2DocumentStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upsert_document(doc_id, name, head_revision, turn_seq)
+            .map(drop)
             .map_err(|err| err.to_string())
     }
     fn store_revision(
@@ -427,7 +431,7 @@ impl DocsActor {
                 // registry is the delivery actor's only lookup source).
                 self.revisions
                     .lock()
-                    .expect("revision registry lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .extend(
                         stored
                             .revisions

@@ -28,8 +28,8 @@ fn revision(rev_id: &str, base: u64, text: &str) -> Revision {
     }
 }
 
-/// Collects events until `type` arrives (bounded; panics with the types
-/// seen so far on timeout — the same shape the sibling suites use).
+/// Collects events until `type` arrives (bounded; panics on timeout —
+/// the same shape the sibling suites use).
 fn until(events: &EventSub, wanted: &str, deadline: Duration) -> Event {
     let started = std::time::Instant::now();
     loop {
@@ -249,4 +249,46 @@ fn the_durable_rows_are_readable_through_store_v2_itself() {
             .expect("sources parse");
     assert_eq!(sources["attempts"][0], "att-1");
     assert_eq!(sources["instructionTemplateId"], "tpl-none");
+}
+
+/// A restart republishes the durable committed revisions to the delivery
+/// registry when the document is first touched: `delivery.prepare`
+/// resolves a revision committed by a previous runtime instead of
+/// refusing it as unknown.
+#[test]
+fn delivery_prepares_a_revision_committed_before_the_restart() {
+    let root = tempfile::tempdir().expect("tempdir");
+    {
+        let (runtime, client) = boot(root.path());
+        let events = client.subscribe();
+        client
+            .send(
+                Some("doc-1"),
+                Command::DocsUpdateHead {
+                    doc_id: "notes".into(),
+                    expected_base: 0,
+                    new_revision: revision("rev-durable", 0, "Deliver me later."),
+                },
+            )
+            .expect("update accepted");
+        until(&events, "docs.headUpdated", Duration::from_secs(5));
+        runtime.shutdown();
+    }
+
+    let (runtime, client) = boot(root.path());
+    let events = client.subscribe();
+    client
+        .send(Some("doc-2"), Command::DocsGet { doc_id: "notes".into(), page: 0 })
+        .expect("get serves the durable document");
+    client
+        .send(
+            Some("dlv-1"),
+            Command::DeliveryPrepare {
+                revision_id: "rev-durable".into(),
+                target_ref: "some-editor-target".into(),
+            },
+        )
+        .expect("prepare resolves the durable revision");
+    until(&events, "delivery.prepared", Duration::from_secs(5));
+    runtime.shutdown();
 }
