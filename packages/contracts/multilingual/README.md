@@ -133,7 +133,7 @@ express a quality claim. Also out of scope, as declared gaps:
   (ARK-ASR-0.6B "19 languages", Voxtral-Mini "13 languages");
   parakeet-unified-en is English-only. These are card claims, not decoder
   language control.
-* `apps/desktop` — no language selector exists in the client today (the
+* `apps/desktop-gpui` — no language selector exists in the client today (the
   E24 finding); when one lands it should be driven by these descriptors
   plus capability flags, not a hardcoded list.
 * `s1-mini` normalizer (`/normalize`) — performs truecasing and number

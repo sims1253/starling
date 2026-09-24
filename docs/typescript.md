@@ -1,41 +1,45 @@
 # TypeScript workspace
 
-The desktop renderer, Electron main process, preload, development launcher, and
-shared dictation package use TypeScript 7.0.2. Effect is pinned to
-`4.0.0-rc.115`: this is the v4 release candidate, not the v3 stable release.
-Vite+ builds the React renderer; esbuild bundles the Electron entry points.
+The shared dictation package and the `starling-serve` npm launcher use
+TypeScript 7.0.2. Effect is pinned to `4.0.0-rc.115`: this is the v4 release
+candidate, not the v3 stable release. The desktop app is native Rust
+(`apps/desktop-gpui`); TypeScript owns the reference client library, the
+fidelity rules, and the prebuilt-binary launcher.
 
 ```text
-React UI
-  → typed preload bridge
-    → Effect request + Schema decoding
-      → Starling or OpenAI-compatible server
+packages/dictation
+  → Effect request + Schema decoding
+    → Starling or OpenAI-compatible server
 
-Browser preview
-  → shared Effect client
-    → development proxy → server
+packages/serve
+  → npm launcher for prebuilt starling-serve binaries
 ```
 
 Decode external data with Effect Schema before using it as a domain value.
 Keep asynchronous failures in the Effect error channel, pass interruption to
 network requests, and release resources when an operation ends. Promise methods
-remain available at React, Electron, and browser API boundaries. Pure audio and
+remain available at Node and browser API boundaries. Pure audio and
 text transformations can stay ordinary TypeScript functions.
 
-The renderer displays the returned text without cleanup. The optional transcript
+The library returns raw text without cleanup. The optional transcript
 refinement layer keeps that stance: it runs only on an explicit per-take action,
 stores its result in a separate labeled `refined` field beside the raw transcript,
 and never rewrites the raw transcript or its history. Changing the compiler,
 error handling, or schemas must not change transcripts or discard saved audio.
 
 Multi-turn threads (#117) keep the same stance. A take joins a thread only
-through the explicit "Refine in thread" action, which stores an optional
+through an explicit "Refine in thread" action, which stores an optional
 `threadId` label on the session — additive like `refined`, so no session-schema
 or database version bump. A threaded refine sends the thread's current text as
 an assistant turn before the new dictated turn; each turn keeps its own
 immutable raw transcript, and each turn's `refined` copy is the thread's state
-at that turn. Threading is visible in the history pane and escapable at any
-time: "start new thread" only clears a UI hint and never mutates sessions.
+at that turn. Threading is escapable at any time: "start new thread" only
+clears a UI hint and never mutates sessions.
+
+These stances were introduced by the Electron desktop app that this workspace
+used to build; they remain the contract every client of `packages/dictation`
+inherits, and the Rust desktop re-implements them at
+`apps/desktop-gpui/crates/dictation`.
 
 ## Checks
 
@@ -50,7 +54,7 @@ pnpm run check
 build. Vite+ (`vp`) provides Oxfmt, Oxlint, and Vitest; their settings live in
 the root `vite.config.ts`.
 `pnpm run lint:fix` applies supported lint fixes. `pnpm run fmt` formats the
-application and shared TypeScript source.
+shared TypeScript source.
 
 Keep `@oxlint/plugins` at the Oxlint version that Vite+ bundles (`vp --version`
 lists it; currently 1.82.0). The complete generic
@@ -64,29 +68,14 @@ comment explaining the invariant; do not disable a rule group to pass a build.
 Generated bundles and unchanged vendored code are excluded from lint and format
 checks.
 
-For changes to recording, persistence, HTTP, or IPC, build the native contract
-fixture and run the application workflows:
+For changes to the client contract, build the native contract fixture and run
+the native contract tests:
 
 ```bash
 cmake --preset native-cpu
 cmake --build build/native-cpu --target starling-serve-contract-fixture
-pnpm run test:apps
-pnpm run build
-xvfb-run -a pnpm run test:electron
+pnpm run test:api
 ```
 
-The last command uses Xvfb on Linux without a display. These tests need Playwright
-and a Chromium installation; install the matching browser with
-`uv run --no-project --with playwright python -m playwright install chromium`.
-
-## Electron build outputs
-
-```text
-apps/desktop/electron/*.ts
-  → dist-electron/main.mjs
-  → dist-electron/preload.cjs
-```
-
-The CommonJS preload is generated for Electron's sandbox. Maintain its TypeScript
-source. Packaging includes the compiled renderer and shell, without TypeScript,
-Effect source, lint tooling, or workspace dependencies as separate runtime files.
+The Rust mirror of the client (`apps/desktop-gpui/crates/dictation`) runs the
+identical PCM fixtures; keep both sides passing when touching audio handling.

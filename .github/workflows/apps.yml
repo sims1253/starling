@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  desktop:
-    name: Desktop (${{ matrix.os }})
+  typescript:
+    name: TypeScript workspace (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -31,10 +31,8 @@ jobs:
           cache: true
           run-install: true
       - run: vp run check
-      - name: Package Electron desktop app
-        run: vp run --filter @starling/desktop package --dir
 
-  browser-and-api:
+  api-contracts:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -65,18 +63,6 @@ jobs:
       - run: uv run --project quants --locked starling-quants check
       - name: Validate OpenAPI
         run: uv run --no-project --with openapi-spec-validator python -c "import json; from openapi_spec_validator import validate; validate(json.load(open('packages/contracts/openapi.json')))"
-      - name: Install browser
-        run: uv run --no-project --with playwright python -m playwright install --with-deps chromium
-      - name: Recording, recovery, and transcript UI
-        run: vp run test:apps
-      - name: Electron preload and OpenAI upload
-        env:
-          # Hosted Linux restricts Chromium user namespaces. This flag belongs
-          # to the test launcher; application defaults retain sandboxing.
-          STARLING_TEST_NO_SANDBOX: "1"
-        run: |
-          vp run build
-          xvfb-run -a vp run test:electron
 
   android:
     runs-on: ubuntu-24.04

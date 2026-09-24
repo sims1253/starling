@@ -1,16 +1,12 @@
 packages:
-  - apps/desktop
   - packages/*
 
 # true = allowed to run install scripts; everything else stays unbuilt.
 allowBuilds:
-  electron: true
-  electron-winstaller: false
   esbuild: true
 
 # pnpm holds back releases younger than a day; list only locked versions that need it.
 minimumReleaseAgeExclude:
-  - lucide-react@1.46.0
   - vite-plus@0.3.3
   - "@voidzero-dev/vite-plus-core@0.3.3"
   - '@voidzero-dev/vite-plus-darwin-arm64@0.3.3'

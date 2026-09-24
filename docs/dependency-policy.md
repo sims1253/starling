@@ -12,8 +12,8 @@ read or executed on that tree, not assumed.
 
 | Surface | Manifest(s) | Lockfile / pin | State (audited 2026-09-20) | Drift gate |
 | --- | --- | --- | --- | --- |
-| pnpm workspace: root, `apps/desktop`, `packages/dictation`, `packages/serve` | `package.json` x4, `pnpm-workspace.yaml` (catalog, overrides) | `pnpm-lock.yaml` (lockfileVersion 9.0, `pnpm@12.4.1`) | In sync; `pnpm install --frozen-lockfile` exits 0 in 44 ms. Most versions exact or `catalog:`; three floating ranges (see follow-ups) | `pnpm install --frozen-lockfile` in `apps.yml` `browser-and-api` (added with this doc) |
-| Python research backend (deprecated) | `pyproject.toml` | `uv.lock` (149 packages) | In sync; `uv lock --check --offline` exits 0. Ranges intentionally floating (research only, off the production path) | `uv lock --check` in `apps.yml` `browser-and-api` (added with this doc) |
+| pnpm workspace: root, `packages/dictation`, `packages/serve` | `package.json` x3, `pnpm-workspace.yaml` (catalog, overrides) | `pnpm-lock.yaml` (lockfileVersion 9.0, `pnpm@12.4.1`) | In sync; `pnpm install --frozen-lockfile` exits 0. Most versions exact or `catalog:`; three floating ranges (see follow-ups). The `apps/desktop` Electron importer left with that app's removal | `pnpm install --frozen-lockfile` in `apps.yml` `api-contracts` (added with this doc) |
+| Python research backend (deprecated) | `pyproject.toml` | `uv.lock` (149 packages) | In sync; `uv lock --check --offline` exits 0. Ranges intentionally floating (research only, off the production path) | `uv lock --check` in `apps.yml` `api-contracts` |
 | Quant catalog | `quants/pyproject.toml` | `quants/uv.lock` | Stdlib only; `uv lock --check --offline --project quants` exits 0 | existing `uv run --project quants --locked` in `apps.yml` |
 | SONAR harness | `benchmarks/sonar/pyproject.toml` | `benchmarks/sonar/uv.lock` | `psdn-sonar[ml]==0.1.2` exact with in-file rationale; `uv lock --check --offline --project benchmarks/sonar` exits 0 | existing `uv sync --locked --project benchmarks/sonar` in `test.yml` |
 | Native build | root `CMakeLists.txt`, `backends/native`, `cpp/`, `apps/mobile/src/main/cpp` | none needed | No `FetchContent` / `ExternalProject` / `file(DOWNLOAD)` in any Starling-owned CMake file; configure-time downloads do not exist | builds compile only from the submodule and vendored files below |
@@ -23,7 +23,7 @@ read or executed on that tree, not assumed.
 | GitHub Actions | `.github/workflows/*.yml` | commit-SHA pins | Every `uses:` is a 40-char SHA except `pullfrog/pullfrog@v0` (documented exception, below) | Dependabot, weekly, all workflows |
 | Android | `apps/mobile/build.gradle.kts`, `apps/mobile/app/build.gradle.kts` | none — dependency locking not enabled | Direct deps exact (`androidx.core 1.16.0`, `okhttp 4.12.0`, `mockwebserver 4.12.0`, `junit 4.13.2`, `org.json 20260814`); AGP `9.4.0`; wrapper `gradle-9.7.1`; NDK `28.2.13676358`; CMake `3.31.1`. Transitive deps float at build time (follow-up) | Dependabot gradle weekly; CI build in `apps.yml` `android` |
 | iOS | `apps/ios/Package.swift` | — | No external package declarations; local targets only | `swift test` in `apps.yml` `ios` |
-| Rust / GPUI port | not on `master` yet | — | PR #193 (`gpui-port`, open) adds `gpui 0.2.2` and ~17 direct cargo deps; no `Cargo.toml`/`Cargo.lock` exists on `master` today | on merge: commit `Cargo.lock`, same rules as pnpm |
+| Rust / GPUI desktop | `apps/desktop-gpui/Cargo.toml` (workspace, 4 crates) | `apps/desktop-gpui/Cargo.lock` (committed) | `gpui 0.2.2` plus direct cargo deps, exact via the lockfile | `desktop-gpui-rust.yml` cargo lanes |
 
 Notes verified during the audit:
 
@@ -80,8 +80,8 @@ buried in an unrelated refactor.
 - Regeneration: the lockfile is regenerated in the same PR by the commands
   below — never hand-edited.
 - Validation: the CI jobs from the inventory table must pass. Desktop-facing
-  changes must exercise the `apps.yml` `desktop` job (three-OS check plus
-  Electron packaging), not just unit tests.
+  changes must exercise the `desktop-gpui-rust.yml` lanes (ubuntu tests plus
+  the macOS/Windows package builds), not just unit tests.
 
 ## Lockfile regeneration per ecosystem
 
@@ -117,14 +117,15 @@ check, distinct from the socket-security bot.
 
 | Gate | Where | Notes |
 | --- | --- | --- |
-| pnpm manifest/lock drift | `apps.yml` `browser-and-api` | `pnpm install --frozen-lockfile` after `setup-vp` (which puts `pnpm` on `PATH`; the desktop scripts already invoke bare `pnpm` in green runs) |
-| Root uv drift | `apps.yml` `browser-and-api` | `uv lock --check` after `setup-uv`; previously only covered by the workflow_dispatch-only `test.yml` `cpu-tests` job |
-| quants lock | `apps.yml` `browser-and-api` | pre-existing `uv run --project quants --locked` |
+| pnpm manifest/lock drift | `apps.yml` `api-contracts` | `pnpm install --frozen-lockfile` after `setup-vp` (which puts `pnpm` on `PATH`; the scripts already invoke bare `pnpm` in green runs) |
+| Root uv drift | `apps.yml` `api-contracts` | `uv lock --check` after `setup-uv`; previously only covered by the workflow_dispatch-only `test.yml` `cpu-tests` job |
+| quants lock | `apps.yml` `api-contracts` | pre-existing `uv run --project quants --locked` |
 | sonar lock | `test.yml` `sonar-tests` | pre-existing `uv sync --locked --project benchmarks/sonar` |
 | Actions pins | Dependabot | weekly, `github-actions` ecosystem, all workflows |
 | npm bumps | Dependabot | weekly, with an `oxlint` + `@oxlint/plugins` group so they move together |
 | Gradle bumps | Dependabot | weekly, `/apps/mobile` |
-| Full desktop exercise | `apps.yml` `desktop` | `vp run check` + Electron packaging on ubuntu/windows/macos |
+| TypeScript workspace | `apps.yml` `typescript` | `vp run check` on ubuntu/windows/macos |
+| Rust desktop (gpui) | `desktop-gpui-rust.yml` | cargo test on ubuntu, windows host check, packaged macOS DMG + Windows zip builds |
 
 ## Exceptions register
 
@@ -136,7 +137,7 @@ added here in the same PR that introduces them.
 | `pullfrog/pullfrog@v0` moving tag (`pullfrog.yml`) | Vendor documents that a SHA pin *without* an updater freezes the action's `post:` cleanup step and later breaks every run; the tag is vendor-supported and the action runs with `id-token: write` | When pullfrog ships a pinned-SHA-plus-updater combination that its docs endorse |
 | `peerDependencyRules: allowAny: [vite]`, `allowedVersions: vite: '*'` (`pnpm-workspace.yaml`) | The `vite` alias resolves to `@voidzero-dev/vite-plus-core`, so plugins declaring a `vite` peer must be accepted at any version | When Vite+ no longer needs to impersonate the `vite` name |
 | `minimumReleaseAgeExclude` list (`pnpm-workspace.yaml`) | pnpm holds back releases younger than a day; the list names only locked versions that needed the escape | Entries age out — drop them when the next regeneration no longer needs them |
-| `allowBuilds: electron, esbuild` (`pnpm-workspace.yaml`) | Both need install scripts to place platform binaries; `electron-winstaller` stays `false` deliberately | If pnpm gains binary-only distribution for either |
+| `allowBuilds: esbuild` (`pnpm-workspace.yaml`) | esbuild (transitive of vite-plus) needs its install script to place platform binaries; the Electron entries left with the deleted `apps/desktop` | If pnpm gains binary-only distribution or vite-plus drops the esbuild dependency |
 | `effect` at `4.0.0-rc.115` (catalog) | Pinned exact, module-boundary decision: one async framework, reviewed per the E16 rule (reproducibility/defect isolation over prerelease status) | When Effect 4 stable lands and the migration is exercised through the desktop job |
 | Floating `>=` ranges in the root `pyproject.toml` | Deprecated research backend, kept independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When the research backend is retired or frozen |
 | CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`, `uv --with playwright`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
@@ -199,12 +200,11 @@ commit that says so.
 2. `apps/mobile/gradle/wrapper/gradle-wrapper.properties` pins the
    distribution URL (9.7.1) but has no `distributionSha256Sum`.
 3. CI-resolved tooling is unpinned: `brew install xcodegen` (`apps.yml`
-   `ios`), `uv --with openapi-spec-validator`, `uv --with playwright`
-   (`apps.yml` `browser-and-api`), and — in the gated-off
+   `ios`), `uv --with openapi-spec-validator` (`apps.yml` `api-contracts`),
+   and — in the gated-off
    `e2e-real-model` job — floating `pip install torch transformers`
    (`ci-starling-serve.yml`; its other pip installs are exact-pinned).
 4. Floating direct ranges where a lock exists, candidates for exact pinning:
-   `apps/desktop`: `electron-builder ^26.15.3`, `lucide-react ^1.46.0`;
    `packages/dictation`: `fake-indexeddb ^6.2.5`. (The root Python project's
    `>=` ranges are a documented exception, not candidates.)
 5. Several action SHAs carry no version comment (`setup-uv` in `apps.yml`,

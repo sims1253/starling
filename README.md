@@ -55,19 +55,19 @@ Live dictation uses Starling's `WS /stream` route.
 
 ## Run the apps
 
-For the desktop interface, install Node.js 24.13.1+ and pnpm, then run:
+The desktop app is the native Rust build in `apps/desktop-gpui`:
 
 ```bash
-pnpm install
-pnpm run dev
+cd apps/desktop-gpui
+cargo run -p starling-gpui --release
 ```
 
-This starts a browser preview connected through a development proxy to the
-server at `127.0.0.1:8181`. Microphone access requires localhost or HTTPS.
-Run `pnpm run desktop` for the Electron desktop app after installing its
-[platform prerequisites](apps/desktop/README.md).
+Linux needs a Wayland or X11 session plus the usual audio and font
+libraries; see [the app's README](apps/desktop-gpui/README.md) for
+prerequisites, data locations, and the packaging script CI uses. CI builds
+unsigned macOS and Windows artifacts on every push.
 
-- [Desktop: Windows, Linux, macOS](apps/desktop/README.md)
+- [Desktop: Windows, Linux, macOS](apps/desktop-gpui/README.md)
 - [Android recorder and voice keyboard](apps/mobile/README.md)
 - [iOS recorder](apps/ios/README.md)
 
@@ -82,7 +82,7 @@ against destructive processing; they cannot guarantee ASR accuracy.
 | --- | --- |
 | Native server and engine build | [`backends/native/`](backends/native/) · engine source in `cpp/` |
 | Quant recipes, catalog, artifact tooling | [`quants/`](quants/) |
-| Desktop app | [`apps/desktop/`](apps/desktop/) |
+| Desktop app (Rust, gpui) | [`apps/desktop-gpui/`](apps/desktop-gpui/) |
 | Android app and voice keyboard | [`apps/mobile/`](apps/mobile/) |
 | iOS app | [`apps/ios/`](apps/ios/) |
 | Shared TypeScript client and fidelity rules | [`packages/dictation/`](packages/dictation/) |

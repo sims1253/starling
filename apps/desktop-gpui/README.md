@@ -1,12 +1,22 @@
-# Starling desktop — gpui port
+# Starling desktop — gpui
 
-Native Rust port of the Electron desktop app (`apps/desktop`), built with
+The Starling desktop app, built natively in Rust with
 [Zed's gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui)
-(crates.io `gpui 0.2.2`). Exists to compare look, feel, and performance against
-the Electron version. See [COMPARISON.md](COMPARISON.md) for measurements and
-[PORT.md](PORT.md) for the ported behavior contract and module map.
+(crates.io `gpui 0.2.2`). It began as a port of the former Electron desktop
+app (`apps/desktop`, now removed) and is the only desktop app in the tree.
+[COMPARISON.md](COMPARISON.md) records the measurements taken while both apps
+existed; [PORT.md](PORT.md) documents the ported behavior contract and the
+module map back to the removed TypeScript sources.
 
 ![screenshot](screenshot.png)
+
+## Packaging
+
+`scripts/package-macos.sh` builds the universal (aarch64 + x86_64) binary,
+assembles `Starling.app`, and produces `target/package/Starling-macOS-universal.dmg`.
+CI runs it on every push (`desktop-gpui-rust.yml` `build-macos`) and pairs it
+with a portable Windows zip (`build-windows`). Both artifacts are unsigned
+development builds; notarized installers are a separate release task.
 
 ## Layout
 
@@ -38,8 +48,7 @@ STARLING_DIAGNOSTICS=1 cargo run -p starling-gpui --release  # startup + RSS on 
 ```
 
 Linux needs a Wayland or X11 session, Vulkan loader, fontconfig, and a
-PipeWire/PulseAudio microphone source for recording — the same classes of
-dependency the Electron app has.
+PipeWire/PulseAudio microphone source for recording.
 
 Data locations (both created on demand):
 

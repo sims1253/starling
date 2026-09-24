@@ -9,8 +9,6 @@ export default defineConfig({
     singleQuote: false,
     ignorePatterns: [
       "**/dist/**",
-      "**/dist-electron/**",
-      "**/release/**",
       "tools/oxlint/anti-slop/**",
       "pnpm-lock.yaml",
     ],
@@ -19,8 +17,6 @@ export default defineConfig({
     ignorePatterns: [
       "**/node_modules/**",
       "**/dist/**",
-      "**/dist-electron/**",
-      "**/release/**",
       "tools/oxlint/anti-slop/**",
       ".codex/**",
       ".agents/**",

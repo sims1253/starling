@@ -19,9 +19,9 @@ Three layers, all CPU-only file/JSON checks (no server, no model):
   compile-time/CLI defaults (anti-rot check against cpp/serve sources).
 * Adoption map — the README's who-consumes-what table is verified against the
   actual client code: today no client fetches /v1/starling/capabilities, the
-  Electron app hardcodes the 256 MiB cap that the descriptor states, and the
-  documented probes are /health and /v1/models. Wiring clients to consume the
-  descriptor is explicit follow-up work listed in the README.
+  Rust desktop client hardcodes the 256 MiB cap that the descriptor states, and
+  the documented probe is /v1/models. Wiring clients to consume
+  the descriptor is explicit follow-up work listed in the README.
 """
 
 from __future__ import annotations
@@ -361,31 +361,35 @@ def test_descriptor_defaults_match_the_cpp_server():
 # 3. Adoption map (verified against the actual client code)
 # --------------------------------------------------------------------------- #
 
-ELECTRON_TS_PATHS = [
+CLIENT_TS_PATHS = [
     REPO / "packages" / "dictation" / "src",
-    REPO / "apps" / "desktop" / "electron",
-    REPO / "apps" / "desktop" / "src",  # renderer; .tsx files live here
+]
+
+CLIENT_RS_PATHS = [
+    REPO / "apps" / "desktop-gpui" / "crates",
 ]
 
 
-def _ts_sources() -> list[Path]:
+def _client_sources() -> list[Path]:
     sources: list[Path] = []
-    for root in ELECTRON_TS_PATHS:
+    for root in CLIENT_TS_PATHS:
         if root.is_dir():
             sources.extend(root.rglob("*.ts"))
             sources.extend(root.rglob("*.tsx"))
+    for root in CLIENT_RS_PATHS:
+        if root.is_dir():
+            sources.extend(root.rglob("*.rs"))
     return sources
 
 
 def test_no_client_consumes_the_capability_route_yet():
-    """Today-state check behind the README adoption map: nothing in the
-    Electron TS/TSX clients (dictation package, main process, renderer —
-    .tsx included, e.g. apps/desktop/src/App.tsx) fetches
+    """Today-state check behind the README adoption map: nothing in the client
+    sources (TypeScript dictation package, Rust gpui crates) fetches
     /v1/starling/capabilities. When a client is wired to the descriptor
     (README follow-ups), update the adoption map and this assertion together."""
     offenders = [
         str(path.relative_to(REPO))
-        for path in _ts_sources()
+        for path in _client_sources()
         if "starling/capabilities" in path.read_text()
     ]
     assert not offenders, f"clients now consume the capability route: {offenders}"
@@ -397,22 +401,32 @@ def test_clients_probe_models_the_hardcoded_way():
     assert "/v1/models" in dictation_client
     assert '"/health"' not in dictation_client
     assert '"/v1/audio/transcriptions"' in dictation_client
+    rust_client = (
+        REPO / "apps" / "desktop-gpui" / "crates" / "dictation" / "src" / "client.rs"
+    ).read_text()
+    # The Rust client builds routes with format!("{}/v1/...", base_url).
+    assert "/v1/models" in rust_client
+    assert "/health" not in rust_client
+    assert "/v1/audio/transcriptions" in rust_client
 
 
-def test_electron_hardcoded_upload_cap_equals_descriptor_limit():
-    """apps/desktop/electron/main.ts hardcodes the 256 MiB audio cap instead
-    of reading it from the descriptor; the two must at least agree."""
-    main_ts = (REPO / "apps" / "desktop" / "electron" / "main.ts").read_text()
+def test_rust_client_hardcoded_upload_cap_equals_descriptor_limit():
+    """The Rust desktop client hardcodes the 256 MiB audio cap instead of
+    reading it from the descriptor; the two must at least agree."""
+    client_rs = (
+        REPO / "apps" / "desktop-gpui" / "crates" / "dictation" / "src" / "client.rs"
+    ).read_text()
     mb = DESCRIPTOR["audio"]["max_upload_mb"]
-    assert f"maximumAudioBytes = {mb} * 1024 * 1024" in main_ts
+    assert f"MAX_AUDIO_BYTES: usize = {mb} * 1024 * 1024" in client_rs
 
 
 def test_readme_documents_the_adoption_map():
     for anchor in (
         "packages/dictation/src/client.ts",
-        "apps/desktop/electron/main.ts",
+        "apps/desktop-gpui/crates/dictation/src/client.rs",
         "backends/python",
-        "Electron (TS) today",
+        "TypeScript client",
+        "Desktop (gpui, Rust)",
         "Android",
         "iOS",
         "Python backend",
