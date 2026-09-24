@@ -73,6 +73,10 @@ struct ParakeetEngine::Impl {
     std::vector<std::vector<float>> b_ih, b_hh;
     CpuQ8 jpred, jout;
     std::vector<float> jpred_b, jout_b;
+    // Layer-0 input projection W_ih0·embed[tok] + b_ih0 memoized per token id
+    // (row V1-1 doubles as the start-of-sequence zero input). Same GEMV, so
+    // bit-identical to computing it every step.
+    std::vector<std::vector<float>> in0_cache;
 
     // ---- runtime state ----
     int cap_T = 0, cap_Tp = 0;             // scratch capacity (mel frames / encoder frames)
@@ -621,13 +625,25 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     std::vector<int32_t> hyp;
 
     auto sigm = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+    if (in0_cache.size() != V1 + 1) in0_cache.assign(V1 + 1, {});
     auto pred_step = [&]() {
-        if (emitted_any) std::memcpy(xin.data(), &embed[(size_t)last_token * PH], PH * 4);
-        else std::fill(xin.begin(), xin.end(), 0.0f);
-        const float* layer_in = xin.data();
+        const float* layer_in = nullptr;
         for (uint32_t l = 0; l < PL; ++l) {
-            cpu::quantize(layer_in, PH, qx);
-            cpu::gemv(w_ih[l], qx, b_ih[l].data(), z1.data());
+            if (l == 0) {
+                const size_t key = emitted_any ? (size_t)last_token : V1;
+                std::vector<float>& z0 = in0_cache[key];
+                if (z0.empty()) {
+                    if (emitted_any) std::memcpy(xin.data(), &embed[(size_t)last_token * PH], PH * 4);
+                    else std::fill(xin.begin(), xin.end(), 0.0f);
+                    cpu::quantize(xin.data(), PH, qx);
+                    z0.resize(4 * PH);
+                    cpu::gemv(w_ih[0], qx, b_ih[0].data(), z0.data());
+                }
+                std::memcpy(z1.data(), z0.data(), 4 * PH * 4);
+            } else {
+                cpu::quantize(layer_in, PH, qx);
+                cpu::gemv(w_ih[l], qx, b_ih[l].data(), z1.data());
+            }
             cpu::quantize(hc[l].data(), PH, qx);
             cpu::gemv(w_hh[l], qx, b_hh[l].data(), z2.data());
             for (uint32_t i = 0; i < PH; ++i) {

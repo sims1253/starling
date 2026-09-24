@@ -23,6 +23,8 @@ object NativeSupport {
 
     private const val THREADS_ENV = "STARLING_GGML_THREADS"
 
+    private const val FAST_CACHE_ENV = "STARLING_FAST_CACHE_DIR"
+
     @Volatile
     private var threadsApplied = false
 
@@ -92,6 +94,16 @@ object NativeSupport {
         // setenv is retried before the next load instead of skipped forever.
         runCatching { Os.setenv(THREADS_ENV, threads.toString(), false) }
             .onSuccess { threadsApplied = true }
+    }
+
+    /**
+     * Points the fast (Vulkan) engine's pipeline cache at app-private storage
+     * so driver shader compilation is paid once, not on every process start.
+     * Must run before the first model load; an explicit environment wins.
+     */
+    fun applyFastEngineDefaults(cacheDir: File?) {
+        if (cacheDir == null || !System.getenv(FAST_CACHE_ENV).isNullOrEmpty()) return
+        runCatching { Os.setenv(FAST_CACHE_ENV, cacheDir.absolutePath, false) }
     }
 
     /**

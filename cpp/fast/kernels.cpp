@@ -3,6 +3,9 @@
 #include "kernels.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,9 +93,14 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // Packed-f16 products (f32 accumulation per 32-deep slice): opt-in until
     // validated per device (STARLING_FAST_F16=1).
     if (const char* e = std::getenv("STARLING_FAST_F16")) f16_math = ctx.info().f16 && e[0] == '1';
+    if (!autotune(err)) return false;
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
         if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) tile = TileCfg{bm, bn, tm, tn};
+    }
+    if (const char* e = std::getenv("STARLING_FAST_GEMV_ROWS")) {
+        unsigned r = (unsigned)std::atoi(e);
+        if (r >= 8 && r % 8 == 0) gemv_rows_max = r;
     }
     return true;
 }
@@ -205,6 +213,153 @@ bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x
     rec.dispatch(*p, {x, ar.ref(w.q), w.has_s ? ar.ref(w.s) : vk::Ref(dummy_), y, or_dummy(g),
                       or_dummy(state), or_dummy(bias)},
                  &a, sizeof(a), ceil_div(w.N, rows));
+    return true;
+}
+
+namespace {
+
+// Tuning results are process-wide: every engine on the device shares them.
+struct TuneResult { bool done = false; TileCfg tile; uint32_t gemv_rows = 32; };
+TuneResult& tune_result() { static TuneResult r; return r; }
+
+double time_ms(vk::Recording& rec, std::string& err) {
+    double best = 1e30;
+    for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!rec.submit_and_wait(err)) return -1.0;
+        best = std::min(best, std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count());
+    }
+    return best;
+}
+
+} // namespace
+
+bool Kernels::autotune(std::string& err) {
+    TuneResult& R = tune_result();
+    if (R.done) { tile = R.tile; gemv_rows_max = R.gemv_rows; return true; }
+    const auto& info = ctx_->info();
+    const char* dir = std::getenv("STARLING_FAST_CACHE_DIR");
+    const char* force = std::getenv("STARLING_FAST_TUNE");
+    const bool forced = force && force[0] == '1';
+    if ((!dir || !*dir) && !forced) return true;   // built-in defaults
+    char tag[160];
+    std::snprintf(tag, sizeof tag, "/starling-fast-tune-%08x-%08x-%08x-%s.txt", info.vendor_id,
+                  info.device_id, info.driver_version, f16_math ? "h" : "f");
+    const std::string path = std::string(dir && *dir ? dir : ".") + tag;
+    if (!forced) {
+        std::ifstream in(path);
+        TileCfg t;
+        uint32_t rows = 0;
+        if (in >> t.BM >> t.BN >> t.TM >> t.TN >> rows && rows >= 8) {
+            R = TuneResult{true, t, rows};
+            tile = t;
+            gemv_rows_max = rows;
+            return true;
+        }
+    }
+
+    // Synthetic problem at the encoder's dominant shapes: 256 frames through
+    // a 1024 -> 4096 W4 projection and a 4096 -> 1024 W8 projection, plus a
+    // 4096 x 1024 W4 decode GEMV.
+    const uint32_t M = 256, D = 1024, F = 4096;
+    std::mt19937 rng(1234);
+    auto rnd_words = [&](size_t n, bool halves) {
+        std::vector<uint32_t> w(n);
+        for (auto& v : w) {
+            if (halves) {
+                const float f[2] = {(float)(rng() % 2001) / 1000.0f - 1.0f,
+                                    (float)(rng() % 2001) / 1000.0f - 1.0f};
+                v = pack_f16(f, 2)[0];
+            } else {
+                v = (uint32_t)rng();
+            }
+        }
+        return w;
+    };
+    vk::Buffer a, wq4, ws4, wq8, ws8, c, x, y;
+    auto up = [&](vk::Buffer& b, const std::vector<uint32_t>& w) {
+        return ctx_->create_buffer(b, w.size() * 4, vk::Mem::Device, err) &&
+               ctx_->upload(b, 0, w.data(), w.size() * 4, err);
+    };
+    // x holds f32 values for the GEMV: small random floats.
+    std::vector<uint32_t> xw(D);
+    for (auto& v : xw) { const float f = (float)(rng() % 2001) / 1000.0f - 1.0f; std::memcpy(&v, &f, 4); }
+    if (!up(a, rnd_words((size_t)M * F / 2, true)) || !up(wq4, rnd_words((size_t)F * D / 8, false)) ||
+        !up(ws4, rnd_words((size_t)F * D / 32, true)) || !up(wq8, rnd_words((size_t)D * F / 4, false)) ||
+        !up(ws8, rnd_words((size_t)D * F / 32, true)) || !up(x, xw) ||
+        !ctx_->create_buffer(c, (size_t)M * F * 4, vk::Mem::Device, err) ||
+        !ctx_->create_buffer(y, (size_t)F * 4, vk::Mem::Device, err))
+        return false;
+
+    const TileCfg cands[] = {{64, 128, 4, 8}, {64, 64, 4, 4}, {128, 128, 8, 8}, {128, 64, 8, 4},
+                             {64, 64, 8, 8}, {32, 64, 4, 8}, {64, 128, 8, 8}, {128, 128, 8, 4},
+                             {32, 128, 4, 8}, {64, 32, 4, 4}};
+    TileCfg best_t = tile;
+    double best = 1e30;
+    const TileCfg saved = tile;
+    for (const TileCfg& t : cands) {
+        const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
+        const size_t shared = (size_t)32 * (t.BM + t.BN) * 2;
+        if (wg > info.max_wg_invocations || wg < 32 || shared > info.max_shared_bytes) continue;
+        tile = t;
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        for (int rep = 0; rep < 3; ++rep) {
+            GemmCall u;
+            u.b = BKind::W4; u.epi = Epi::F16; u.act = Act::Silu;
+            u.a.M = M; u.a.N = F; u.a.K = D; u.a.lda = D; u.a.ldb = D; u.a.ldc = F;
+            u.A = vk::Ref(a); u.Bq = vk::Ref(wq4); u.Bs = vk::Ref(ws4); u.C = vk::Ref(c);
+            GemmCall dn;
+            dn.b = BKind::W8; dn.epi = Epi::F32;
+            dn.a.M = M; dn.a.N = D; dn.a.K = F; dn.a.lda = F; dn.a.ldb = F; dn.a.ldc = D;
+            dn.A = vk::Ref(a); dn.Bq = vk::Ref(wq8); dn.Bs = vk::Ref(ws8); dn.C = vk::Ref(c);
+            if (!gemm(rec, u, err) || !gemm(rec, dn, err)) { tile = saved; return false; }
+            rec.barrier();
+        }
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) { tile = saved; return false; }
+        if (std::getenv("STARLING_FAST_VERBOSE"))
+            std::fprintf(stderr, "[fast-tune] gemm %u,%u,%u,%u: %.3f ms\n", t.BM, t.BN, t.TM, t.TN, ms);
+        if (ms < best) { best = ms; best_t = t; }
+    }
+    tile = best_t;
+
+    uint32_t best_rows = gemv_rows_max;
+    double best_g = 1e30;
+    for (uint32_t rows : {8u, 16u, 32u, 64u}) {
+        gemv_rows_max = rows;
+        const uint32_t r = gemv_rows(F);
+        const vk::Pipeline* p = ctx_->pipeline("gemv_w4", {D / 32, r, 0u, 0u, 0u}, err);
+        if (!p) return false;
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        GemvArgs ga;
+        ga.N = F;
+        ga.K = D;
+        for (int rep = 0; rep < 8; ++rep) {
+            rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq4), vk::Ref(ws4), vk::Ref(y), vk::Ref(dummy_),
+                              vk::Ref(dummy_), vk::Ref(dummy_)},
+                         &ga, sizeof(ga), ceil_div(F, r));
+            rec.barrier();
+        }
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        if (std::getenv("STARLING_FAST_VERBOSE"))
+            std::fprintf(stderr, "[fast-tune] gemv rows %u: %.3f ms\n", rows, ms);
+        if (ms < best_g) { best_g = ms; best_rows = rows; }
+    }
+    gemv_rows_max = best_rows;
+    R = TuneResult{true, tile, gemv_rows_max};
+    if (dir && *dir) {
+        std::ofstream out(path);
+        out << tile.BM << " " << tile.BN << " " << tile.TM << " " << tile.TN << " " << gemv_rows_max << "\n";
+    }
+    if (std::getenv("STARLING_FAST_VERBOSE"))
+        std::fprintf(stderr, "[fast-tune] chose gemm %u,%u,%u,%u gemv rows %u\n", tile.BM, tile.BN,
+                     tile.TM, tile.TN, gemv_rows_max);
     return true;
 }
 

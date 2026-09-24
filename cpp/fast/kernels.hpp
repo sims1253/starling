@@ -84,6 +84,13 @@ struct TileCfg { uint32_t BM = 64, BN = 128, TM = 4, TN = 8; };
 class Kernels {
 public:
     bool init(vk::Context& ctx, std::string& err);
+
+    // Pick GEMM tile and GEMV row counts for this device by timing the
+    // candidates on synthetic weights at the engines' real shapes. Results
+    // are cached in $STARLING_FAST_CACHE_DIR (per device + driver) and the
+    // search runs when that directory is set or STARLING_FAST_TUNE=1.
+    // Explicit STARLING_FAST_TILE / STARLING_FAST_GEMV_ROWS win.
+    bool autotune(std::string& err);
     vk::Context& ctx() { return *ctx_; }
 
     bool gemm(vk::Recording& rec, const GemmCall& c, std::string& err);
