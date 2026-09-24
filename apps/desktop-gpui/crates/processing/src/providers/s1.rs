@@ -11,10 +11,15 @@
 //! S1-mini was trained on prompts of at most 1000 tokens. Longer
 //! transcripts are split at sentence ends into chunks of at most
 //! [`CHUNK_CHARS`] and normalized one after another; the outputs are
-//! joined with a space. A cancel aborts the connection and also asks the
-//! server to stop the chunk it is decoding (`DELETE
-//! /v1/audio/transcriptions/<request id>`, which cancels any registered
-//! request id).
+//! joined with a space.
+//!
+//! Cancellation: the job returns at once (the connection is dropped) and
+//! no further chunk is sent. The provider also sends `DELETE
+//! /v1/audio/transcriptions/<request id>`, which drops the request if it
+//! is still queued and discards its result. starling-serve cannot
+//! interrupt a running S1-mini decode (the engine's normalize entry
+//! point has no cancel hook), so the server stays busy until the chunk in
+//! flight finishes; chunking bounds that to one chunk.
 
 use std::time::{Duration, Instant};
 
