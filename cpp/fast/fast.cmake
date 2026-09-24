@@ -54,6 +54,7 @@ set(STARLING_FAST_SHADERS
   "gemm_coop_f16|gemm_coop.comp|B_F16|7|--target-env=vulkan1.3"
   "gemm_coop_f16t|gemm_coop.comp|B_F16T|7|--target-env=vulkan1.3"
   "coop_probe|coop_probe.comp||3|--target-env=vulkan1.3"
+  "alu_probe|alu_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w8|gemv.comp|W_W8|7"
   "gemv_f16|gemv.comp|W_F16|7"

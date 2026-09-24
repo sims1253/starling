@@ -151,13 +151,14 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     if (!autotune(err)) return false;
     // Imagination (PowerVR): the synthetic ranking does not transfer to the
     // real encoders — isolated GEMM pairs rate 64,32,4,4 highest while the
-    // Parakeet/MOSS encoders run ~2x faster on 32,64,4,4, and short GEMV
-    // bursts rate rows 64 highest while real decode wants 8 (measured on a
-    // Pixel 10 Pro / Tensor G5 DXT-48-1536; see RESEARCH_LOG.md). Ship the
-    // measured values for this vendor; STARLING_FAST_TILE / _GEMV_ROWS /
-    // _TUNE=1 still override, and other vendors keep the tuner's pick.
+    // Parakeet/MOSS encoders run fastest on 32,128,4,8 (a full 128-thread
+    // subgroup with BN=128 halves weight re-reads), and short GEMV bursts
+    // rate rows 64 highest while real decode wants 8 (measured on a Pixel
+    // 10 Pro / Tensor G5 DXT-48-1536; see RESEARCH_LOG.md). Ship the measured
+    // values for this vendor; STARLING_FAST_TILE / _GEMV_ROWS / _TUNE=1 still
+    // override, and other vendors keep the tuner's pick.
     if (ctx.info().vendor_id == 0x1010) {
-        tile = TileCfg{32, 64, 4, 4};
+        tile = TileCfg{32, 128, 4, 8};
         gemv_rows_max = 8;
     }
     // Hardware cooperative matrices: the machinery exists (gemm_coop.comp)
@@ -349,6 +350,29 @@ bool Kernels::autotune(std::string& err) {
     // prints the achieved GB/s — the honest per-kernel signal on a GPU where
     // per-dispatch timestamps are misattributed.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
+        if (std::strncmp(mi, "alu", 3) == 0) {
+            // Pure-FMA issue-rate probe: STARLING_FAST_MICRO=alu[,groups[,iters]].
+            uint32_t groups = 48, iters = 4096;
+            std::sscanf(mi, "alu,%u,%u", &groups, &iters);
+            vk::Buffer ob;
+            std::vector<float> zeros(128 * groups, 0.0f);
+            if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
+                !ctx_->upload(ob, 0, zeros.data(), zeros.size() * 4, err))
+                return false;
+            const vk::Pipeline* p = ctx_->pipeline("alu_probe", {}, err);
+            if (!p) return false;
+            struct { uint32_t iters; } pc{iters};
+            vk::Recording rec(*ctx_);
+            rec.begin();
+            rec.dispatch(*p, {vk::Ref(ob)}, &pc, sizeof(pc), groups);
+            rec.end();
+            const double ms = time_ms(rec, err);
+            if (ms < 0) return false;
+            const double fma = (double)groups * 128 * iters * 32;
+            std::fprintf(stderr, "[fast-micro] alu: %.1f GFLOPS (%.3f ms)\n",
+                         2.0 * fma / (ms * 1e-3) / 1e9, ms);
+            return true;
+        }
         uint32_t bits = 4, n = 4096, k = 1024, reps = 64, rows = 0;
         const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
         if (got < 3) {
