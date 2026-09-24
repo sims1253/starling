@@ -13,7 +13,11 @@ data class ModelDownload(
     val label: String,
 ) {
     /** Installed under the file name it has upstream, so it is recognizable in the model list. */
-    val fileName: String get() = url.substringAfterLast('/')
+    val fileName: String = url.substringAfterLast('/')
+
+    init {
+        require(fileName.endsWith(".gguf")) { "A catalog model URL must end in a .gguf file name: $url" }
+    }
 }
 
 object ModelCatalog {

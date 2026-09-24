@@ -95,9 +95,9 @@ class OnDeviceEngine(
     fun selectModel(name: String): Boolean {
         val file = installedFile(name) ?: return false
         // The marker write (two fsyncs) stays outside the engine lock, so it
-        // never stalls a transcription. Checked under the marker lock: a
-        // concurrent deleteModel either ran first (the file is gone) or
-        // clears this marker after its unlink.
+        // never stalls a transcription. Checked under the marker lock, which
+        // deleteModel holds across its unlink and marker cleanup: either the
+        // delete ran first (the file is gone) or it clears this marker.
         synchronized(markerLock) {
             if (!file.isFile) return false
             writeActiveName(file.name)
@@ -112,19 +112,20 @@ class OnDeviceEngine(
      * live session keeps its already-loaded model until it ends.
      */
     fun deleteModel(name: String): Boolean = synchronized(importLock) {
-        // The unlink under the engine lock, so a load never races it; the
-        // marker and the fsync outside it.
-        val file = synchronized(lock) {
-            val file = installedFile(name) ?: return false
-            if (!file.delete()) return false
-            if (file == loadedFile) releaseLocked()
-            file
-        }
-        synchronized(markerLock) {
-            // Also drops a marker naming a model deleted earlier, so a later
-            // install under that name cannot silently become active.
-            val named = readActiveName()
-            if (named != null && installedFiles().none { it.name == named }) activeFile.delete()
+        // The unlink under the engine lock, so a load never races it, and
+        // under the marker lock, so a concurrent selectModel either sees the
+        // file gone or has written its marker before the cleanup below.
+        // (Order: lock, then markerLock; no path takes them the other way.)
+        synchronized(lock) {
+            synchronized(markerLock) {
+                val file = installedFile(name) ?: return false
+                if (!file.delete()) return false
+                if (file == loadedFile) releaseLocked()
+                // Also drops a marker naming a model deleted earlier, so a
+                // later install under that name cannot silently become active.
+                val named = readActiveName()
+                if (named != null && installedFiles().none { it.name == named }) activeFile.delete()
+            }
         }
         fsyncModelDirectory()
         true
@@ -403,14 +404,17 @@ class OnDeviceEngine(
     }
 
     /**
-     * Removes staging files left by interrupted imports.
+     * Removes staging files left by interrupted imports, and a marker
+     * temporary left by a crash mid-write.
      * Only ever called with [importLock] held, so no staging file can be in
      * use.
      */
     private fun sweepStaleStaging() {
         val stale = modelDir.listFiles { file ->
             file.isFile && file.name.endsWith(".importing")
-        } ?: return
+        }.orEmpty()
+        // A marker write in flight holds markerLock; only an orphan is removed.
+        synchronized(markerLock) { File(modelDir, "$ACTIVE_FILE_NAME.tmp").delete() }
         for (file in stale) deleteFile(file, "stale staging file")
     }
 
