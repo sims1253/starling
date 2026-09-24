@@ -100,6 +100,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
 bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     std::string name = c.b == BKind::W4 ? "gemm_w4" : c.b == BKind::W8 ? "gemm_w8"
                      : c.b == BKind::F16 ? "gemm_f16" : "gemm_f16t";
+    if (c.a_conv) {
+        if (c.b != BKind::F16 || c.a.cv_cin % 8) { err = "gemm: conv mode needs f16 weights and cin % 8 == 0"; return false; }
+        name = "gemm_conv";
+    }
     if (f16_math) name += "_h";
     const TileCfg t = tile;
     const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
@@ -172,6 +176,35 @@ bool Kernels::pk_conv(vk::Recording& rec, uint32_t op, const PkConvArgs& a, uint
     if (!p) return false;
     rec.dispatch(*p, {in, w, or_dummy(b), or_dummy(shift), out}, &a, sizeof(a),
                  ceil_div(a.C / 2, wg), gy, gz);
+    return true;
+}
+
+uint32_t Kernels::gemv_rows(uint32_t N) {
+    uint32_t rows = gemv_rows_max;
+    while (rows > 8 && N / rows < gemv_min_wgs) rows -= 8;
+    return rows;
+}
+
+bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y,
+                   vk::Ref g, vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a,
+                   std::string& err) {
+    const char* name = w.fmt == GpuFmt::W4 ? "gemv_w4" : w.fmt == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+    const uint32_t lanes = w.K / 32;      // one thread per 32-wide K group
+    if (w.K % 32 || a.x_off % 4 || lanes > ctx_->info().max_wg_invocations || lanes > 1024) {
+        err = "gemv: unsupported K / x offset";
+        return false;
+    }
+    // Enough workgroups to fill the GPU: fewer rows per workgroup for small N.
+    uint32_t rows = gemv_rows(w.N);
+    const vk::Pipeline* p = ctx_->pipeline(
+        name, {lanes, rows, g.buf ? 1u : 0u, epi, state.buf ? 1u : 0u}, err);
+    if (!p) return false;
+    a.N = w.N;
+    a.K = w.K;
+    a.has_bias = bias.buf ? 1u : 0u;
+    rec.dispatch(*p, {x, ar.ref(w.q), w.has_s ? ar.ref(w.s) : vk::Ref(dummy_), y, or_dummy(g),
+                      or_dummy(state), or_dummy(bias)},
+                 &a, sizeof(a), ceil_div(w.N, rows));
     return true;
 }
 

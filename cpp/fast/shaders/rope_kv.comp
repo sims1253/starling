@@ -1,0 +1,79 @@
+#version 450
+// rope_kv.comp — prefill-side Qwen3 attention prologue. One workgroup per
+// (token, head slot): slots [0, H) are query heads (RMSNorm·q_norm, RoPE ->
+// q_rot f16), slots [H, H+KVH) are KV heads (RMSNorm·k_norm, RoPE -> K cache;
+// V copied to the V cache). Input: the fused q|k|v projection, f16 [S][..].
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint D = 128;
+layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QKV { uint qkv[]; };
+layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 2) buffer VC { uint vc[]; };
+layout(std430, binding = 3) buffer QR { uint qr[]; };
+layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
+layout(std430, binding = 5) readonly buffer KN { float kn_w[]; };
+layout(std430, binding = 6) readonly buffer RT { float rope[]; };
+
+layout(push_constant) uniform PC {
+    uint H, KVH;
+    uint cache_off;
+    float eps;
+    uint pos0;
+} p;
+
+shared float red[D];
+shared float xs[D];
+
+float block_sum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = D / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+float ld(uint e) { return unpackHalf2x16(qkv[e >> 1])[e & 1u]; }
+
+void main() {
+    const uint d = gl_LocalInvocationID.x;
+    const uint s = gl_WorkGroupID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint W = (p.H + 2u * p.KVH) * D;          // row width of qkv
+    const bool is_q = slot < p.H;
+    const uint g = is_q ? slot : slot - p.H;
+    const uint col = is_q ? slot * D : p.H * D + g * D;
+    const uint pos = p.pos0 + s;
+
+    const float x = ld(s * W + col + d);
+    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    xs[d] = xn;
+    barrier();
+    const uint half_d = D / 2, i = d % half_d;
+    const float c = rope[pos * half_d + i], sn = rope[MAXPOS * half_d + pos * half_d + i];
+    const float partner = xs[d < half_d ? d + half_d : d - half_d];
+    const float y = d < half_d ? xn * c - partner * sn : partner * sn + xn * c;
+    barrier();
+    xs[d] = y;
+    barrier();
+    if (d >= D / 2) return;
+    const uint w = d;   // one packed word per thread
+    const vec2 pair = vec2(xs[2 * w], xs[2 * w + 1]);
+    if (is_q) {
+        qr[(s * p.H * D + slot * D) / 2 + w] = packHalf2x16(pair);
+    } else {
+        const uint e = p.cache_off + (g * MAXPOS + pos) * D;
+        kc[e / 2 + w] = packHalf2x16(pair);
+        const uint vcol = p.H * D + p.KVH * D + g * D;
+        vc[e / 2 + w] = packHalf2x16(vec2(ld(s * W + vcol + 2 * w), ld(s * W + vcol + 2 * w + 1)));
+    }
+}

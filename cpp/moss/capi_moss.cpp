@@ -17,12 +17,25 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#if defined(STARLING_HAVE_FAST)
+#include "engine_select.hpp"
+#include "moss_engine.hpp"
+#endif
+
 namespace {
 
-using MossCtx = starling::ggml::lib::EngineContext<starling::ggml::moss::MossModel, starling::ggml::moss::Tokenizer>;
+struct MossCtx : starling::ggml::lib::EngineContext<starling::ggml::moss::MossModel,
+                                                    starling::ggml::moss::Tokenizer> {
+#if defined(STARLING_HAVE_FAST)
+    // Model-specialized Vulkan engine (cpp/fast). When set it owns the
+    // weights; `model` is released after load and only the tokenizer stays.
+    std::unique_ptr<starling::fast::MossEngine> fast;
+#endif
+};
 using starling::ggml::lib::report;
 
 } // namespace
@@ -43,6 +56,41 @@ enum {
 extern "C" {
 
 void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out) {
+#if defined(STARLING_HAVE_FAST)
+    const auto choice = starling::fast::engine_choice();
+    if (choice != starling::fast::EngineChoice::Ggml && gguf_path && *gguf_path) {
+        static thread_local std::string load_error;
+        try {
+            auto ctx = std::make_unique<MossCtx>();
+            ctx->model = std::make_unique<starling::ggml::moss::MossModel>();
+            if (!ctx->model->load(gguf_path, ctx->err) ||
+                !ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err))
+                throw std::runtime_error(ctx->err);
+            std::string ferr;
+            ctx->fast = starling::fast::MossEngine::create(*ctx->model, ferr);
+            if (ctx->fast) {
+                if (std::getenv("STARLING_FAST_VERBOSE"))
+                    std::fprintf(stderr, "[fast] moss engine: %s\n", ctx->fast->describe().c_str());
+                ctx->model.reset();
+                if (err_out) *err_out = nullptr;
+                return ctx.release();
+            }
+            if (choice == starling::fast::EngineChoice::Fast)
+                throw std::runtime_error("fast engine unavailable: " + ferr);
+            if (std::getenv("STARLING_FAST_VERBOSE"))
+                std::fprintf(stderr, "[fast] moss falls back to ggml: %s\n", ferr.c_str());
+            starling::ggml::ensure_weights_realized(ctx->model->loader);
+            if (err_out) *err_out = nullptr;
+            return ctx.release();
+        } catch (const std::exception & e) {
+            load_error = e.what();
+        } catch (...) {
+            load_error = "unknown exception loading MOSS model";
+        }
+        if (err_out) *err_out = load_error.c_str();
+        return nullptr;
+    }
+#endif
     return starling::ggml::lib::load_engine<MossCtx>(gguf_path, "MOSS", err_out);
 }
 
@@ -66,6 +114,23 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
         using namespace starling::ggml::moss;
         // A new decode attempt invalidates any previous completion claim.
         c->last_completion = STARLING_MOSS_COMPLETION_NONE;
+#if defined(STARLING_HAVE_FAST)
+        if (c->fast) {
+            std::vector<int32_t> ids;
+            bool eos = false;
+            if (!c->fast->generate(pcm, static_cast<size_t>(n), ids, eos, c->err)) {
+                report(err_out, c->err); return nullptr;
+            }
+            c->last_completion = eos ? STARLING_MOSS_COMPLETION_EOS : STARLING_MOSS_COMPLETION_BUDGET;
+            const std::string text = c->tokenizer.decode(ids, true);
+            char * out = static_cast<char *>(std::malloc(text.size() + 1));
+            if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+            std::memcpy(out, text.data(), text.size());
+            out[text.size()] = '\0';
+            if (err_out) *err_out = nullptr;
+            return out;
+        }
+#endif
         const bool timing = std::getenv("STARLING_MOSS_TIMING") != nullptr;
         auto now = [&]() { return std::chrono::steady_clock::now(); };
         auto ms = [&](auto t0, auto t1) {

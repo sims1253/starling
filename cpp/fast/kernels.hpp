@@ -60,6 +60,8 @@ struct GemmArgs {
     float alpha = 1.0f;
     uint32_t mdiv = 0xffffffffu, ldc_mhi = 0;
     uint32_t ldc_n = 1;
+    uint32_t bias_mod = 1;
+    uint32_t cv_cin = 0, cv_ti = 0, cv_fi = 0, cv_to = 0, cv_fo = 0;
 };
 static_assert(sizeof(GemmArgs) <= vk::kPushBytes, "gemm push constants");
 
@@ -71,7 +73,8 @@ struct GemmCall {
     BKind b = BKind::F16;
     Epi epi = Epi::F32;
     Act act = Act::None;
-    uint32_t bias_mode = 0;      // 0 none, 1 per column, 2 per row
+    uint32_t bias_mode = 0;      // 0 none, 1 per column, 2 per row, 3 row-periodic table
+    bool a_conv = false;         // A is an implicit 3x3/s2 conv im2col (see gemm.comp)
     uint32_t batch = 1;
     vk::Ref A, Bq, Bs, C, bias, bias2, C2;
 };
@@ -107,14 +110,22 @@ public:
     bool pk_conv(vk::Recording& rec, uint32_t op, const PkConvArgs& a, uint32_t gy, uint32_t gz,
                  vk::Ref in, vk::Ref w, vk::Ref b, vk::Ref shift, vk::Ref out, std::string& err);
 
+    // gemv.comp (decode). `g` non-null fuses RMSNorm(x)·g; `state` non-null
+    // makes the dispatch a no-op once generation is done.
+    struct GemvArgs { uint32_t N = 0, K = 0, x_off = 0, y_off = 0; float eps = 0; uint32_t row0 = 0, has_bias = 0; };
+    bool gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y, vk::Ref g,
+              vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a, std::string& err);
+    uint32_t gemv_rows_max = 32, gemv_min_wgs = 256;
+    uint32_t gemv_rows(uint32_t N);    // rows per workgroup for an N-row GEMV
+
     const vk::Buffer& dummy() const { return dummy_; }
+    vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
     TileCfg tile;
     bool f16_math = false;
 
 private:
     vk::Context* ctx_ = nullptr;
     vk::Buffer dummy_;
-    vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
 };
 
 inline uint32_t round_up(uint32_t v, uint32_t m) { return (v + m - 1) / m * m; }

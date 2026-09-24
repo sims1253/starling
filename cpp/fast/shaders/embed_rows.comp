@@ -1,0 +1,27 @@
+#version 450
+// embed_rows.comp — dequantize embedding rows for a list of token ids into
+// f32 activations (prompt tokens of the LLM prefill). One workgroup per id.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint CHUNK_ROWS = 0x7fffffff;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer IDS { uint ids[]; };
+layout(std430, binding = 9) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint K;
+    uint ids_off;
+    uint out_row0;
+} p;
+
+#include "dequant_row.glsl"
+
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    const uint tok = ids[p.ids_off + i];
+    for (uint k = gl_LocalInvocationID.x; k < p.K; k += WG)
+        o[(p.out_row0 + i) * p.K + k] = dequant(tok, k, p.K);
+}

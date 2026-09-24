@@ -11,8 +11,13 @@
 //       the batch-norm fold and SiLU: out = silu(conv·scale + shift).
 //       in f16 [T][C]; w f32 [K][C]; scale/shift f32 [C]; out f16 [T][C].
 //
-// Kernel axes follow ggml's conv_2d on a time-major input: kw runs along
-// frequency (ne0), kh along time (ne1).
+// OP 3  MOSS encoder stage 1: Conv2d(1 -> C, 3x3, stride 2, pad 1) + bias +
+//       exact GELU per 100-frame chunk. in: f32 [chunk][F][Ti] (mel chunks,
+//       time fastest); w f32 [C][kf][kt]; out f16 [chunk][To][Fo][C].
+//
+// Kernel axes follow ggml's conv_2d: for Parakeet (time-major input) kw runs
+// along frequency and kh along time; MOSS feeds [time, freq] so there kw is
+// time and kh frequency.
 
 #include "common.glsl"
 
@@ -67,6 +72,22 @@ void main() {
             }
         }
         o[((t * p.Fo + f) * p.C + c) >> 1] = packHalf2x16(acc);
+    } else if (OP == 3u) {
+        const uint f = gl_WorkGroupID.y;
+        const uint chunk = gl_WorkGroupID.z / p.To, t = gl_WorkGroupID.z % p.To;
+        vec2 acc = vec2(bias[c], bias[c + 1]);
+        [[unroll]] for (uint kf = 0; kf < 3; ++kf) {
+            const int fi = int(2 * f + kf) - 1;
+            if (fi < 0 || fi >= int(p.Fi)) continue;
+            [[unroll]] for (uint kt = 0; kt < 3; ++kt) {
+                const int ti = int(2 * t + kt) - 1;
+                if (ti < 0 || ti >= int(p.Ti)) continue;
+                const float xv = uintBitsToFloat(in_w[(chunk * p.Fi + uint(fi)) * p.Ti + uint(ti)]);
+                acc += xv * vec2(w[c * 9 + kf * 3 + kt], w[(c + 1) * 9 + kf * 3 + kt]);
+            }
+        }
+        o[(((chunk * p.To + t) * p.Fo + f) * p.C + c) >> 1] =
+            packHalf2x16(vec2(gelu_erf_f(acc.x), gelu_erf_f(acc.y)));
     } else {
         const uint t = gl_WorkGroupID.y;
         const int pad = int(p.K - 1u) / 2;

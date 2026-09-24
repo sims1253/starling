@@ -4,6 +4,7 @@
 
 #include "cpu_kernels.hpp"
 #include "kernels.hpp"
+#include "pk_mel.hpp"
 #include "vk_runtime.hpp"
 #include "weights.hpp"
 
@@ -57,6 +58,7 @@ struct ParakeetEngine::Impl {
     Arena ar;
     pk::Config cfg;
     pk::MelConstants mel;
+    std::unique_ptr<PkMel> fmel;
 
     uint32_t D = 0, H = 0, dk = 0, FF = 0, L = 0, CK = 0, SC = 0, NM = 0, JH = 0;
     std::vector<Layer> layers;
@@ -120,6 +122,7 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
     const auto& ml = m.loader;
     cfg = m.config;
     mel.read_from(ml, cfg);
+    fmel = std::make_unique<PkMel>(mel);
     D = cfg.d_model; H = cfg.n_heads; dk = D / H; FF = cfg.ff_dim; L = cfg.n_layers;
     CK = cfg.conv_kernel; SC = cfg.subsampling_conv_channels; NM = cfg.n_mels;
     if (cfg.conv_norm_type != "batch_norm" || cfg.xscaling || NM != 128 || SC % 2 || D % 64) {
@@ -592,11 +595,8 @@ bool ParakeetEngine::Impl::run_encoder(const std::vector<float>& feats, int T,
         it = recs.emplace(T, std::move(r)).first;
     }
     it->second.used = ++tick;
-    // Mel arrives feat-major [n_mels][T]; the encoder reads time-major.
-    std::vector<float> tm((size_t)T * NM);
-    for (int t = 0; t < T; ++t)
-        for (uint32_t f = 0; f < NM; ++f) tm[(size_t)t * NM + f] = feats[(size_t)f * T + t];
-    if (!ctx->upload(mel_in, 0, tm.data(), tm.size() * 4, err)) return false;
+    // feats are time-major [T][n_mels] (PkMel), the layout the encoder reads.
+    if (!ctx->upload(mel_in, 0, feats.data(), (size_t)T * NM * 4, err)) return false;
     if (!it->second.rec->submit_and_wait(err)) return false;
     it->second.rec->report_profile("parakeet encoder");
     Tp = it->second.Tp;
@@ -678,11 +678,27 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     return hyp;
 }
 
+namespace {
+// STARLING_FAST_MEL_CHECK=1: verify the fast mel against the reference
+// frontend bit for bit (development aid).
+void check_mel(const pk::MelConstants& mc, const float* pcm, size_t n,
+               const std::vector<float>& tm, int T) {
+    std::vector<float> ref;
+    int Tr = 0;
+    pk::MelFrontend(mc).compute(pcm, n, ref, Tr);
+    size_t bad = 0;
+    for (int t = 0; t < T && Tr == T; ++t)
+        for (uint32_t f = 0; f < mc.n_mels; ++f)
+            if (std::memcmp(&ref[(size_t)f * T + t], &tm[(size_t)t * mc.n_mels + f], 4) != 0) ++bad;
+    std::fprintf(stderr, "[fast-parakeet] mel check: T=%d/%d mismatches=%zu\n", T, Tr, bad);
+}
+} // namespace
+
 bool ParakeetEngine::encode(const float* pcm, size_t n, std::vector<float>& enc, int& Tp, std::string& err) {
     Impl& I = *impl_;
     std::vector<float> feats;
     int T = 0;
-    pk::MelFrontend(I.mel).compute(pcm, n, feats, T);
+    I.fmel->compute(pcm, n, feats, T);
     return I.run_encoder(feats, T, enc, Tp, err);
 }
 
@@ -692,8 +708,9 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<float> feats;
     int T = 0;
-    pk::MelFrontend(I.mel).compute(pcm, n, feats, T);
+    I.fmel->compute(pcm, n, feats, T);
     const double t_mel = ms_since(t0);
+    if (env_on("STARLING_FAST_MEL_CHECK")) check_mel(I.mel, pcm, n, feats, T);
     std::vector<float> enc;
     int Tp = 0;
     if (!I.run_encoder(feats, T, enc, Tp, err)) return false;

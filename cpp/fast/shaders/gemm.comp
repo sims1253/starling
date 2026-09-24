@@ -31,7 +31,9 @@
 // 4 SwiGLU (interleaved (gate, up) pairs -> silu(gate)*up, f16),
 // 5 QUV (two f16 outputs: result + bias[n] and result + bias2[n]).
 // `alpha` scales the product; rows >= row_valid are zeroed before the bias.
-// HAS_BIAS: 0 none, 1 per column (bias[n]), 2 per row (bias[m]).
+// HAS_BIAS: 0 none, 1 per column (bias[n]), 2 per row (bias[m]),
+// 3 row-periodic table (bias[(m % bias_mod) * N + n]; positional embeddings).
+// A_CONV (-D): A is the implicit im2col matrix of a 3x3/stride-2 conv.
 
 #include "common.glsl"
 #ifdef F16MATH
@@ -71,6 +73,10 @@ layout(push_constant) uniform PC {
     float alpha;
     uint mdiv, ldc_mhi;           // row m -> (m / mdiv) * ldc_mhi + (m % mdiv) * ldc
     uint ldc_n;                   // column stride (f32 outputs only)
+    uint bias_mod;                // HAS_BIAS 3: bias row = m % bias_mod
+    // A_CONV: implicit-GEMM view of a 3x3 / stride-2 / pad-1 conv over an
+    // input laid out [chunk][t][f][cin]; row m = (chunk, to, fo), k = (kt*3+kf)*cin + ic.
+    uint cv_cin, cv_ti, cv_fi, cv_to, cv_fo;
 } p;
 
 // f16 pairs: As[k][r] = (A[2r][k], A[2r+1][k]); Bs[k][c] = (B[2c][k], B[2c+1][k]).
@@ -82,6 +88,17 @@ uint half_bits(uvec4 v, uint h) { return (v[h >> 1] >> (16u * (h & 1u))) & 0xfff
 
 // 8 consecutive f16 values (k..k+7) of A row `m`, as bits.
 uvec4 load8_a(uint m, uint k, uint base) {
+#ifdef A_CONV
+    // im2col on the fly: the 8 k's share one tap (cin % 8 == 0, host-checked).
+    if (m >= p.M || k >= p.K) return uvec4(0);
+    const uint per_chunk = p.cv_to * p.cv_fo;
+    const uint chunk = m / per_chunk, rem = m % per_chunk;
+    const uint to = rem / p.cv_fo, fo = rem % p.cv_fo;
+    const uint tap = k / p.cv_cin, ic = k % p.cv_cin;
+    const int ti = int(2u * to + tap / 3u) - 1, fi = int(2u * fo + tap % 3u) - 1;
+    if (ti < 0 || ti >= int(p.cv_ti) || fi < 0 || fi >= int(p.cv_fi)) return uvec4(0);
+    return a_w4[(base + ((chunk * p.cv_ti + uint(ti)) * p.cv_fi + uint(fi)) * p.cv_cin + ic) >> 3];
+#endif
     if (m < p.M && k + 8 <= p.K) return a_w4[(base + m * p.lda + k) >> 3];
     uvec4 r = uvec4(0);
     if (m < p.M)
@@ -251,6 +268,7 @@ void main() {
             float x = live ? acc[i * TN + j] * p.alpha : 0.0;
             if (HAS_BIAS == 1u && n < p.N) x += bias[n];
             if (HAS_BIAS == 2u) x += bias[m];
+            if (HAS_BIAS == 3u && n < p.N) x += bias[(m % p.bias_mod) * p.N + n];
             v[j] = x;
         }
         if (EPI == 0u) {
