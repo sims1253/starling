@@ -158,13 +158,13 @@ q4e8 7.87 % (ggml 7.92 %).
 
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |
 | --- | --- | --- | --- |
-| Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.30 s** (enc 2.06 s, dec 0.20 s) |
+| Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.28 s** (enc 2.05 s, dec 0.14–0.20 s) |
 | Parakeet, 74.4 s | — | 9.0 s | **7.6 s** |
-| MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **6.3–6.5 s** (decode 95–104 ms/tok) |
+| MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **6.0 s** (mel 0.13 s, decode 88.7 ms/tok) |
 
 Energy per transcription (batterystats power model, 40/20-run averages):
-Parakeet medium fast ≈ 1.4 mWh vs ggml ≈ 5.0 mWh (3.6×), MOSS short fast
-≈ 2.2 mWh vs ggml ≈ 5.2 mWh (2.4×).
+Parakeet medium fast ≈ 1.33 mWh vs ggml ≈ 5.0 mWh (3.8×), MOSS short fast
+≈ 2.05 mWh vs ggml ≈ 5.2 mWh (2.5×).
 
 The desktop-tuned GPU kernels now reach ~180 GFLOPS on the encoder GEMMs
 (peak f32 ≈ 500 GFLOPS); the remaining gap is shared-memory traffic, not
