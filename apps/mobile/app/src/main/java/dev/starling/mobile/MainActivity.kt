@@ -7,7 +7,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
+import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -46,6 +48,9 @@ class MainActivity : Activity() {
     private lateinit var engineOnDeviceInput: RadioButton
     private lateinit var onDeviceStatus: TextView
     private lateinit var downloadModelButton: Button
+    private lateinit var installedModelsHeading: TextView
+    private lateinit var installedModelsHelp: TextView
+    private lateinit var installedModelsContainer: LinearLayout
     private lateinit var endpointMessage: TextView
     private lateinit var recordingMessage: TextView
     private lateinit var liveTranscript: TextView
@@ -92,6 +97,9 @@ class MainActivity : Activity() {
         engineInput = findViewById(R.id.engine_input)
         engineOnDeviceInput = findViewById(R.id.engine_on_device)
         onDeviceStatus = findViewById(R.id.on_device_status)
+        installedModelsHeading = findViewById(R.id.installed_models_heading)
+        installedModelsHelp = findViewById(R.id.installed_models_help)
+        installedModelsContainer = findViewById(R.id.installed_models)
         endpointMessage = findViewById(R.id.endpoint_message)
         recordingMessage = findViewById(R.id.recording_message)
         liveTranscript = findViewById(R.id.live_transcript)
@@ -157,8 +165,12 @@ class MainActivity : Activity() {
     private fun renderDownload(state: ModelDownloadController.State) {
         val spec = ModelCatalog.RECOMMENDED_PARAKEET
         val totalMb = mb(spec.sizeBytes)
+        // Listed only once the download is not running: progress ticks
+        // never touch the model directory.
+        val models by lazy { application.onDeviceEngine.installedModels() }
         when (state) {
             is ModelDownloadController.State.Running -> {
+                downloadModelButton.visibility = View.VISIBLE
                 downloadModelButton.setText(R.string.cancel_download)
                 onDeviceStatus.text = if (state.verifying) {
                     getString(R.string.on_device_verifying)
@@ -170,7 +182,7 @@ class MainActivity : Activity() {
             }
             is ModelDownloadController.State.Finished -> when (val result = state.result) {
                 // Re-delivered on every onStart, so no one-shot message here.
-                is OnDeviceEngine.ImportResult.Imported -> refreshOnDeviceStatus()
+                is OnDeviceEngine.ImportResult.Imported -> renderOnDeviceStatus(models)
                 is OnDeviceEngine.ImportResult.Rejected -> {
                     Log.w(TAG, "downloaded model rejected at ${result.stage}: ${result.reason}")
                     onDeviceStatus.text = result.reason
@@ -180,8 +192,9 @@ class MainActivity : Activity() {
                 onDeviceStatus.text = getString(R.string.on_device_download_failed, state.reason)
             ModelDownloadController.State.Paused ->
                 onDeviceStatus.setText(R.string.on_device_download_paused)
-            ModelDownloadController.State.Idle -> Unit
+            ModelDownloadController.State.Idle -> renderOnDeviceStatus(models)
         }
+        renderInstalledModels(models)
         val partialMb = mb(application.modelDownloads.resumableBytes(spec))
         downloadModelButton.text = if (partialMb > 0) {
             getString(R.string.resume_download, partialMb, totalMb)
@@ -247,6 +260,11 @@ class MainActivity : Activity() {
         onDeviceStatus.setText(R.string.on_device_importing)
         val resolver = contentResolver
         thread {
+            val displayName = runCatching {
+                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+            }.getOrNull()
             val opened = runCatching { resolver.openInputStream(uri) }
             val input = opened.getOrNull()
             val result = if (input == null) {
@@ -257,7 +275,9 @@ class MainActivity : Activity() {
                     OnDeviceEngine.ImportStage.OPEN,
                 )
             } else {
-                runCatching { application.onDeviceEngine.importModel(input) }.getOrElse { error ->
+                runCatching {
+                    application.onDeviceEngine.importModel(input, OnDeviceEngine.sanitizeModelName(displayName))
+                }.getOrElse { error ->
                     Log.e(TAG, "model import failed unexpectedly", error)
                     OnDeviceEngine.ImportResult.Rejected(
                         "The model could not be imported: ${error.message ?: error::class.java.simpleName}",
@@ -288,17 +308,121 @@ class MainActivity : Activity() {
     }
 
     private fun refreshOnDeviceStatus() {
-        val engine = application.onDeviceEngine
+        // One snapshot, so the status line and the list always agree.
+        val models = application.onDeviceEngine.installedModels()
+        renderOnDeviceStatus(models)
+        renderInstalledModels(models)
+    }
+
+    private fun renderOnDeviceStatus(models: List<OnDeviceEngine.InstalledModel>) {
+        val active = models.firstOrNull { it.active }
         onDeviceStatus.text = when {
-            engine.hasModel() -> {
-                val sizeMb = mb(engine.modelSizeBytes())
-                if (engineOnDeviceInput.isChecked) {
-                    getString(R.string.on_device_model_in_use, sizeMb)
-                } else {
-                    getString(R.string.on_device_model_not_selected, sizeMb, getString(R.string.engine_on_device))
+            active == null -> getString(R.string.on_device_status_no_model)
+            engineOnDeviceInput.isChecked ->
+                getString(R.string.on_device_model_in_use, modelDisplayName(active), mb(active.sizeBytes))
+            else -> getString(
+                R.string.on_device_model_not_selected,
+                modelDisplayName(active),
+                mb(active.sizeBytes),
+                getString(R.string.engine_on_device),
+            )
+        }
+    }
+
+    /** Catalog file names are reserved for verified downloads (imports never take them). */
+    private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean =
+        model.name == ModelCatalog.RECOMMENDED_PARAKEET.fileName
+
+    /** Catalog models by their label; anything else by its file name. */
+    private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {
+        return if (isRecommended(model)) {
+            getString(R.string.recommended_model_name, ModelCatalog.RECOMMENDED_PARAKEET.label)
+        } else {
+            model.name
+        }
+    }
+
+    /**
+     * One row per installed model: tap to make it the active one, Delete to
+     * free its storage. The download button is hidden once the recommended
+     * model is installed (a running or paused download still shows it).
+     */
+    private fun renderInstalledModels(models: List<OnDeviceEngine.InstalledModel>) {
+        val recommended = ModelCatalog.RECOMMENDED_PARAKEET
+        val visibility = if (models.isEmpty()) View.GONE else View.VISIBLE
+        installedModelsHeading.visibility = visibility
+        installedModelsHelp.visibility = visibility
+        installedModelsContainer.removeAllViews()
+        // Each row is its own layout, so no RadioGroup keeps them exclusive.
+        val choices = mutableListOf<RadioButton>()
+        for (model in models) {
+            val displayName = modelDisplayName(model)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                // Baseline alignment measures the weighted label before it
+                // wraps, clipping long file names.
+                isBaselineAligned = false
+            }
+            val choice = RadioButton(this).apply {
+                text = getString(R.string.installed_model_row, displayName, mb(model.sizeBytes))
+                isChecked = model.active
+                setOnClickListener {
+                    if (model.active) return@setOnClickListener
+                    // Until the re-render after the change (which also
+                    // restores the real selection when it fails).
+                    for (other in choices) other.isChecked = other === this
+                    changeModels(R.string.select_model_error) { it.selectModel(model.name) }
                 }
             }
-            else -> getString(R.string.on_device_status_no_model)
+            choices += choice
+            row.addView(choice, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val delete = Button(this, null, android.R.attr.buttonBarButtonStyle).apply {
+                setText(R.string.delete_model)
+                setOnClickListener { confirmDeleteModel(model.name, displayName) }
+            }
+            row.addView(delete)
+            installedModelsContainer.addView(row)
+        }
+        val recommendedInstalled = models.any(::isRecommended)
+        val downloads = application.modelDownloads
+        downloadModelButton.visibility = if (
+            recommendedInstalled && !downloads.isRunning && downloads.resumableBytes(recommended) == 0L
+        ) {
+            View.GONE
+        } else {
+            View.VISIBLE
+        }
+    }
+
+    private fun confirmDeleteModel(name: String, displayName: String) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.delete_model_title)
+            .setMessage(getString(R.string.delete_model_message, displayName))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.delete_model) { _, _ ->
+                changeModels(R.string.delete_model_error) { it.deleteModel(name) }
+            }
+            .show()
+    }
+
+    /** Runs [change] off the main thread (it waits for an in-flight transcription), then re-renders. */
+    private fun changeModels(errorMessage: Int, change: (OnDeviceEngine) -> Boolean) {
+        val engine = application.onDeviceEngine
+        thread {
+            val changed = runCatching { change(engine) }.getOrElse { error ->
+                Log.w(TAG, "model change failed", error)
+                false
+            }
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                if (application.modelDownloads.isRunning) {
+                    renderInstalledModels(application.onDeviceEngine.installedModels())
+                } else {
+                    refreshOnDeviceStatus()
+                }
+                if (!changed) onDeviceStatus.setText(errorMessage)
+            }
         }
     }
 

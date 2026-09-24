@@ -39,6 +39,7 @@ class ModelDownloaderTest {
         url = server.url("/model.gguf").toString(),
         sizeBytes = payload.size.toLong(),
         sha256 = sha,
+        label = "test model",
     )
 
     private fun sha256(bytes: ByteArray): String =

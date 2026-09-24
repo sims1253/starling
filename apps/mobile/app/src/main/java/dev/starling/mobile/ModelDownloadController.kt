@@ -70,7 +70,7 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
         }
         val next = when (result) {
             is ModelDownloader.Result.Done -> State.Finished(
-                runCatching { engine.adoptDownloaded(result.file) }.getOrElse { error ->
+                runCatching { engine.adoptDownloaded(result.file, spec.fileName) }.getOrElse { error ->
                     Log.e(TAG, "downloaded model import failed unexpectedly", error)
                     OnDeviceEngine.ImportResult.Rejected(
                         "The downloaded model could not be imported: ${error.message}",

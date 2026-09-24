@@ -342,7 +342,7 @@ class OnDeviceEngineImportTest {
     }
 
     @Test
-    fun concurrentImportsSerializeAndPublishExactlyOneModel() {
+    fun concurrentImportsSerializeAndPublishEachModel() {
         val directory = tempDir()
         try {
             val engine = OnDeviceEngine(directory)
@@ -374,14 +374,15 @@ class OnDeviceEngineImportTest {
                 )
             }
 
-            val model = File(directory, "parakeet.gguf")
-            assertTrue("exactly one model must be published", model.isFile)
-            val published = prefix(model, 256)
-            val matchesFirst = published.contentEquals(prefix(first, 256))
-            val matchesSecond = published.contentEquals(prefix(second, 256))
-            assertTrue(
-                "the published model must be exactly one of the two imports",
-                matchesFirst || matchesSecond,
+            // Same name, so the second gets a numbered one; each must hold
+            // exactly its own bytes.
+            val installed = engine.installedModels().map { it.name }
+            assertEquals(listOf("parakeet-2.gguf", "parakeet.gguf"), installed)
+            val prefixes = installed.map { prefix(File(directory, it), 256).toList() }.toSet()
+            assertEquals(
+                "each import is published intact under its own name",
+                setOf(prefix(first, 256).toList(), prefix(second, 256).toList()),
+                prefixes,
             )
             assertEquals(
                 "no staging files may survive concurrent imports",
@@ -542,5 +543,176 @@ class OnDeviceEngineImportTest {
             directory.deleteRecursively()
             elsewhere.deleteRecursively()
         }
+    }
+
+    @Test
+    fun importsKeepTheirNamesAndTheLatestIsActive() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+
+            engine.importModel(source.inputStream(), "first.gguf")
+            val result = engine.importModel(source.inputStream(), "second.gguf")
+
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "second.gguf"), result)
+            assertEquals(listOf("first.gguf", "second.gguf"), engine.installedModels().map { it.name })
+            assertEquals("second.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun selectionPersistsAcrossEngineInstances() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "first.gguf")
+            engine.importModel(source.inputStream(), "second.gguf")
+
+            assertTrue(engine.selectModel("first.gguf"))
+            assertFalse("an unknown model cannot be selected", engine.selectModel("missing.gguf"))
+
+            assertEquals("first.gguf", OnDeviceEngine(directory).activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deletingTheActiveModelFallsBackToARemainingOne() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "first.gguf")
+            engine.importModel(source.inputStream(), "second.gguf")
+
+            assertTrue(engine.deleteModel("second.gguf"))
+            assertEquals("first.gguf", engine.activeModelName())
+            assertTrue(engine.deleteModel("first.gguf"))
+            assertFalse(engine.hasModel())
+            assertFalse("only installed models can be deleted", engine.deleteModel("source.part"))
+            assertTrue(File(directory, "source.part").exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun withoutAnActiveMarkerTheFirstInstalledModelIsActive() {
+        val directory = tempDir()
+        try {
+            sparseModelFile(directory, "b.gguf", parakeetPayload())
+            sparseModelFile(directory, "a.gguf", parakeetPayload())
+
+            val engine = OnDeviceEngine(directory)
+
+            assertEquals("a.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun anImportNeverReplacesAnInstalledModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+
+            engine.importModel(source.inputStream(), "model.gguf")
+            val second = engine.importModel(source.inputStream(), "model.gguf")
+
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "model-2.gguf"), second)
+            assertEquals(listOf("model-2.gguf", "model.gguf"), engine.installedModels().map { it.name })
+            assertEquals("model-2.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun anImportCannotTakeACatalogName() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            val catalogName = ModelCatalog.RECOMMENDED_PARAKEET.fileName
+
+            val result = engine.importModel(source.inputStream(), catalogName)
+
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "imported-$catalogName"), result)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deletingDropsAMarkerThatNamesAMissingModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "a.gguf")
+            engine.importModel(source.inputStream(), "b.gguf")
+            engine.importModel(source.inputStream(), "c.gguf")
+            // The marker names c; c vanishes behind the engine's back, so a
+            // is active by fallback.
+            File(directory, "c.gguf").delete()
+
+            assertTrue(engine.deleteModel("b.gguf"))
+            sparseModelFile(directory, "c.gguf", parakeetPayload())
+
+            assertEquals("a stale marker must not activate a new file of that name", "a.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aDownloadReplacesAnEarlierCopyOfItself() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            repeat(2) {
+                val download = sparseModelFile(directory, "download-test.part", parakeetPayload())
+                engine.adoptDownloaded(download, "catalog.gguf")
+            }
+
+            assertEquals(listOf("catalog.gguf"), engine.installedModels().map { it.name })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun downloadIsInstalledUnderItsCatalogName() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val download = sparseModelFile(directory, "download-test.part", parakeetPayload())
+
+            engine.adoptDownloaded(download, ModelCatalog.RECOMMENDED_PARAKEET.fileName)
+
+            assertEquals(ModelCatalog.RECOMMENDED_PARAKEET.fileName, engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun importNamesAreSanitized() {
+        assertEquals("model.gguf", OnDeviceEngine.sanitizeModelName("../x/model.gguf"))
+        assertEquals("my_model_v2.gguf", OnDeviceEngine.sanitizeModelName("my model v2"))
+        assertEquals("hidden.gguf", OnDeviceEngine.sanitizeModelName(".hidden.gguf"))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(null))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName("..."))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(".gguf"))
+        assertEquals("draft.gguf", OnDeviceEngine.sanitizeModelName("draft."))
+        assertEquals("a".repeat(120) + ".gguf", OnDeviceEngine.sanitizeModelName("a".repeat(200)))
+        assertEquals("a.gguf.importing.gguf", OnDeviceEngine.sanitizeModelName("a.gguf.importing"))
     }
 }
