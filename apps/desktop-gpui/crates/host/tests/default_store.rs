@@ -36,6 +36,14 @@ fn production_host_wires_the_durable_store_and_refuses_to_degrade() {
         "storage-v2",
         "the production entry point wires the durable store"
     );
+    // The I5 wiring (issue #220): the documents machine persists through
+    // the same root's `documents`/`revisions` tables — never the
+    // session-scoped in-memory default.
+    assert_eq!(
+        config.runtime.document_store.describe(),
+        "storage-v2",
+        "the production entry point wires the durable document store"
+    );
 
     // A root occupied by a regular file cannot open (create_dir_all
     // fails) — production must error, never fall back.

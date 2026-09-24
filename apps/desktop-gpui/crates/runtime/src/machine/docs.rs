@@ -7,15 +7,28 @@
 //! retains the candidate revision for explicit user choice (nothing is
 //! overwritten), and turn order is the explicit `turnSeq`.
 //!
-//! Persistence seam: [`DocumentStore`]. `store_v2` carries the
-//! `documents`/`revisions` tables but exposes no public API for them yet
-//! (I5 wiring), so the default store is in-memory and the trait is the
-//! seam a v2 implementation will plug into.
+//! Persistence seam: [`DocumentStore`]. The I5 wiring (issue #220) lands
+//! [`V2DocumentStore`] over storage v2's `documents`/`revisions` tables —
+//! the host's production config opens it at the data root — while
+//! [`crate::RuntimeConfig::default`] keeps the in-memory store so test
+//! construction stays side-effect-free (the same philosophy as the
+//! capture store's default). Writes go through on every transition and
+//! state is hydrated lazily on first touch per document, so a restarted
+//! machine answers `docs.get` from the durable rows and CASes against
+//! the durable head — a forgotten head would let `expectedBase: 0`
+//! "succeed" against a document whose durable head is 5 and silently
+//! rewind it. A persistence failure is reported on stderr (this crate's
+//! divergence channel — same posture as the capture store's
+//! `report_divergence`) and outrun by the session state: v1 defines no
+//! docs failure event, so the machine keeps its in-memory truth and the
+//! divergence surfaces at the next hydration.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
+
+use starling_dictation::store_v2::{DocumentRow, RevisionRow, StoreV2};
 
 use crate::bus::EventBus;
 use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
@@ -32,6 +45,30 @@ pub enum RevisionSlot {
     Committed,
     /// A conflict candidate retained for explicit user choice.
     Preserved,
+}
+
+impl RevisionSlot {
+    /// The storage-v2 `disposition` encoding (§4 `revisions`).
+    fn as_disposition(self) -> &'static str {
+        match self {
+            RevisionSlot::Committed => "committed",
+            RevisionSlot::Preserved => "preserved",
+        }
+    }
+
+    /// A disposition this build does not know (a newer writer's
+    /// vocabulary) reads as committed: the row belongs to the head side
+    /// of some future history, and hiding it would be the lossy choice.
+    fn from_disposition(text: &str) -> RevisionSlot {
+        match text {
+            "preserved" => RevisionSlot::Preserved,
+            "committed" => RevisionSlot::Committed,
+            other => {
+                eprintln!("documents machine: unknown disposition {other:?}, read as committed");
+                RevisionSlot::Committed
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,20 +89,52 @@ struct DocumentRecord {
 /// (`{docId → revision}`), runtime-owned.
 pub type RevisionRegistry = Arc<Mutex<HashMap<String, (String, Revision)>>>;
 
-/// The persistence seam for documents and revisions. `store_v2`'s
-/// document tables are not yet surfaced as a public API (I5); the
-/// in-memory default keeps the machine honest about that gap instead of
-/// faking rows.
+/// A document's durable state as [`DocumentStore::load_document`] returns
+/// it — the hydration shape a restarted documents machine rebuilds from.
+#[derive(Debug, Clone)]
+pub struct StoredDocument {
+    pub name: String,
+    pub head_revision: u64,
+    pub turn_seq: u32,
+    pub revisions: Vec<(Revision, RevisionSlot)>,
+}
+
+/// The persistence seam for documents and revisions: the write-through
+/// the actor performs on every transition, plus the lazy load a
+/// restarted machine hydrates from. The default `load_document` answers
+/// "no durable state", so the in-memory store needs no bookkeeping.
 pub trait DocumentStore: Send + Sync {
     fn upsert_document(&self, doc_id: &str, name: &str, head_revision: u64, turn_seq: u32)
         -> Result<(), String>;
     fn store_revision(&self, doc_id: &str, revision: &Revision, slot: RevisionSlot)
         -> Result<(), String>;
+    /// Advances the head and stores its committed revision. Stores that
+    /// can should do this atomically (see [`V2DocumentStore`]).
+    fn commit_head(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &Revision,
+    ) -> Result<(), String> {
+        self.upsert_document(doc_id, name, head_revision, turn_seq)?;
+        self.store_revision(doc_id, revision, RevisionSlot::Committed)
+    }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String>;
+    /// One document's durable rows; `Ok(None)` when this store has never
+    /// held the document. Hydration consults this exactly once per
+    /// document per session (the actor caches the answer).
+    fn load_document(&self, doc_id: &str) -> Result<Option<StoredDocument>, String> {
+        let _ = doc_id;
+        Ok(None)
+    }
     fn describe(&self) -> String;
 }
 
-/// The default in-memory document store (see [`DocumentStore`]).
+/// The default in-memory document store: session-scoped by design — a
+/// document it never saw answers "no durable state" on load, so a
+/// restarted runtime starts empty exactly as an ephemeral store should.
 #[derive(Default)]
 pub struct MemoryDocumentStore {
     state: Mutex<Vec<String>>,
@@ -113,6 +182,176 @@ impl DocumentStore for MemoryDocumentStore {
     fn describe(&self) -> String {
         "in-memory".to_string()
     }
+}
+
+/// The storage-v2 documents store (I5 wiring, issue #220): the I3 seam
+/// over `StoreV2`'s `documents`/`revisions` tables. `sources_json`
+/// carries the I3 [`Revision`] provenance the §4 schema has no column
+/// for — `sourceAttemptIds` + `instructionTemplateId` as one JSON
+/// object, parsed back defensively on load (a missing or malformed
+/// object reads as empty provenance, never as a row that cannot be
+/// served).
+pub struct V2DocumentStore {
+    store: Mutex<StoreV2>,
+}
+
+impl V2DocumentStore {
+    pub fn open(root: impl Into<std::path::PathBuf>) -> Result<Self, String> {
+        let store = StoreV2::open(root).map_err(|err| err.to_string())?;
+        Ok(V2DocumentStore {
+            store: Mutex::new(store),
+        })
+    }
+
+    /// The §4 provenance encoding of an I3 revision.
+    fn sources_json(revision: &Revision) -> String {
+        json!({
+            "attempts": revision.source_attempt_ids,
+            "instructionTemplateId": revision.instruction_template_id,
+        })
+        .to_string()
+    }
+
+    /// Parses [`Self::sources_json`] back; unknown shapes (a newer
+    /// writer's vocabulary) degrade to empty provenance rather than
+    /// failing the document.
+    fn parse_sources(text: Option<&str>) -> (Vec<String>, String) {
+        let Some(text) = text else {
+            return (Vec::new(), String::new());
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            eprintln!(
+                "documents machine: unparsable sources_json ({} bytes), provenance lost",
+                text.len()
+            );
+            return (Vec::new(), String::new());
+        };
+        let attempts = value
+            .get("attempts")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let template = value
+            .get("instructionTemplateId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (attempts, template)
+    }
+
+    fn revision_row(doc_id: &str, revision: &Revision, slot: RevisionSlot) -> RevisionRow {
+        RevisionRow {
+            rev_id: revision.rev_id.clone(),
+            doc_id: doc_id.to_string(),
+            base_revision: Some(revision.base_revision),
+            sources_json: Some(Self::sources_json(revision)),
+            text: revision.text.clone(),
+            status: revision.status.clone(),
+            provenance: Some(revision.provenance.clone()),
+            disposition: Some(slot.as_disposition().to_string()),
+        }
+    }
+
+    fn row_to_stored(row: &RevisionRow) -> (Revision, RevisionSlot) {
+        let (source_attempt_ids, instruction_template_id) =
+            Self::parse_sources(row.sources_json.as_deref());
+        (
+            Revision {
+                rev_id: row.rev_id.clone(),
+                base_revision: row.base_revision.unwrap_or(0),
+                source_attempt_ids,
+                instruction_template_id,
+                text: row.text.clone(),
+                status: row.status.clone(),
+                provenance: row.provenance.clone().unwrap_or_default(),
+            },
+            RevisionSlot::from_disposition(row.disposition.as_deref().unwrap_or("committed")),
+        )
+    }
+}
+
+impl DocumentStore for V2DocumentStore {
+    fn upsert_document(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+    ) -> Result<(), String> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upsert_document(doc_id, name, head_revision, turn_seq)
+            .map(drop)
+            .map_err(|err| err.to_string())
+    }
+    fn store_revision(
+        &self,
+        doc_id: &str,
+        revision: &Revision,
+        slot: RevisionSlot,
+    ) -> Result<(), String> {
+        let row = Self::revision_row(doc_id, revision, slot);
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store_document_revision(&row)
+            .map_err(|err| err.to_string())
+    }
+    fn commit_head(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &Revision,
+    ) -> Result<(), String> {
+        let row = Self::revision_row(doc_id, revision, RevisionSlot::Committed);
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_document_head(name, head_revision, turn_seq, &row)
+            .map_err(|err| err.to_string())
+    }
+    fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bump_document_turn(doc_id, turn_seq)
+            .map_err(|err| err.to_string())
+    }
+    fn load_document(&self, doc_id: &str) -> Result<Option<StoredDocument>, String> {
+        let document: Option<DocumentRow> = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_document(doc_id)
+            .map_err(|err| err.to_string())?;
+        Ok(document.map(|row| StoredDocument {
+            name: row.name,
+            head_revision: row.head_revision,
+            turn_seq: row.turn_seq,
+            revisions: row.revisions.iter().map(Self::row_to_stored).collect(),
+        }))
+    }
+    fn describe(&self) -> String {
+        "storage-v2".to_string()
+    }
+}
+
+/// The documents machine's divergence channel, same posture as the
+/// capture store's: a persistence failure the session already moved past
+/// is reported on stderr (this crate has no logging facade) and the
+/// in-memory state stays the session's truth; hydration after a restart
+/// surfaces what actually landed.
+fn report_store_failure(operation: &str, doc: &str, detail: String) {
+    eprintln!("documents machine: {operation} for {doc:?} failed durably: {detail}");
 }
 
 /// Messages the document actor receives.
@@ -173,6 +412,54 @@ impl DocsActor {
         }
     }
 
+    /// Hydrates `doc_id` from the durable store on its first touch this
+    /// session. A restarted machine must not answer `docs.get` from an
+    /// empty map, and — the sharper invariant — must not CAS against a
+    /// forgotten head: `expected_base: 0` would "succeed" against a
+    /// document whose durable head is 5 and silently rewind it. At most
+    /// one load per document per session; a load failure is reported and
+    /// treated as no durable state (the session's own writes still go
+    /// through; the divergence is diagnosable on stderr).
+    fn hydrate(&mut self, doc_id: &str) {
+        if self.documents.contains_key(doc_id) {
+            return;
+        }
+        match self.store.load_document(doc_id) {
+            Ok(Some(stored)) => {
+                // Re-publish the durable committed revisions so
+                // delivery.prepare resolves them after a restart (the
+                // registry is the delivery actor's only lookup source).
+                self.revisions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(
+                        stored
+                            .revisions
+                            .iter()
+                            .filter(|(_, slot)| *slot == RevisionSlot::Committed)
+                            .map(|(revision, _)| {
+                                (revision.rev_id.clone(), (doc_id.to_string(), revision.clone()))
+                            }),
+                    );
+                self.documents.insert(
+                    doc_id.to_string(),
+                    DocumentRecord {
+                        name: stored.name,
+                        head_revision: stored.head_revision,
+                        turn_seq: stored.turn_seq,
+                        revisions: stored
+                            .revisions
+                            .into_iter()
+                            .map(|(revision, slot)| StoredRevision { revision, slot })
+                            .collect(),
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(detail) => report_store_failure("load", doc_id, detail),
+        }
+    }
+
     fn handle_command(&mut self, inbound: Inbound) {
         let super::Inbound { corr, command, reply, .. } = inbound;
         let corr = corr.unwrap_or_else(|| "docs-anon".to_string());
@@ -180,6 +467,7 @@ impl DocsActor {
             Command::DocsGet { doc_id, page } => {
                 match self.core.commit_command("docs.get", Some(corr.clone())) {
                     Ok(_) => {
+                        self.hydrate(&doc_id);
                         let view = self.get_view(&doc_id, page);
                         let _ = reply.try_send(Ok(Receipt::Served(view)));
                     }
@@ -213,6 +501,7 @@ impl DocsActor {
                 match self.core.commit_command("docs.appendTurn", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
+                        self.hydrate(&doc_id);
                         let record = self
                             .documents
                             .entry(doc_id.clone())
@@ -224,7 +513,9 @@ impl DocsActor {
                             });
                         record.turn_seq += 1;
                         let turn_seq = record.turn_seq;
-                        let _ = self.store.bump_turn(&doc_id, turn_seq);
+                        if let Err(detail) = self.store.bump_turn(&doc_id, turn_seq) {
+                            report_store_failure("bump_turn", &doc_id, detail);
+                        }
                         // docs.turnAppended keeps the state (outcome target
                         // None): resolve the pending outcome (corr-checked,
                         // transition recorded by the core), then deliver.
@@ -260,6 +551,9 @@ impl DocsActor {
     /// mismatch retains the candidate (`docs.headConflict`,
     /// `candidatePreserved: true`).
     fn apply_cas(&mut self, corr: String, doc_id: String, expected_base: u64, revision: Revision) {
+        // The durable head is the CAS's truth for a document this session
+        // has not touched yet — hydrate before reading `actual`.
+        self.hydrate(&doc_id);
         let actual = self
             .documents
             .get(&doc_id)
@@ -283,8 +577,12 @@ impl DocsActor {
                 revision: committed.clone(),
                 slot: RevisionSlot::Committed,
             });
-            let _ = self.store.upsert_document(&doc_id, &record.name, new_head, record.turn_seq);
-            let _ = self.store.store_revision(&doc_id, &committed, RevisionSlot::Committed);
+            if let Err(detail) =
+                self.store
+                    .commit_head(&doc_id, &record.name, new_head, record.turn_seq, &committed)
+            {
+                report_store_failure("commit_head", &doc_id, detail);
+            }
             self.revisions
                 .lock()
                 .expect("revision registry lock")
@@ -322,9 +620,12 @@ impl DocsActor {
                 revision: candidate,
                 slot: RevisionSlot::Preserved,
             });
-            let _ = self
+            if let Err(detail) = self
                 .store
-                .store_revision(&doc_id, &revision, RevisionSlot::Preserved);
+                .store_revision(&doc_id, &revision, RevisionSlot::Preserved)
+            {
+                report_store_failure("store_revision(preserved)", &doc_id, detail);
+            }
             // headConflict is a free event from Validating.
             self.emit(
                 Event::DocsHeadConflict {

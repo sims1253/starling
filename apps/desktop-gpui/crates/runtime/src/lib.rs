@@ -34,15 +34,23 @@
 //! # What the stub adapters honestly do
 //!
 //! - [`machine::context::StubContextProvider`] synthesizes clearly-labeled
-//!   target snapshots (`descriptor` prefixed `stub:`) — real editor
-//!   integration is I5.
+//!   target snapshots (`descriptor` prefixed `stub:`) — the real target
+//!   adapters are E03's platform work (issue #221: IBus/Fcitx, TSF/UIA,
+//!   macOS accessibility), which plugs into the [`RuntimeConfig`]
+//!   `context_provider` seam landed with the machine itself (proven
+//!   end-to-end over the I4 transport by the host crate's adapter suite).
 //! - [`machine::delivery::StubDeliveryAdapter`] prepares and revalidates
 //!   (bookkeeping it can do honestly) but **never confirms**: `apply`
 //!   fails with `no_delivery_adapter` and suggests the copy fallback, and
 //!   every action is recorded in its public log. No fake confirmations.
-//! - [`machine::docs::MemoryDocumentStore`] keeps documents in memory:
-//!   `store_v2` carries the `documents`/`revisions` tables but exposes no
-//!   public API for them yet (I5); the trait is the seam.
+//!   The real insertion adapters are E03's, on the `delivery_adapter`
+//!   seam.
+//! - [`machine::docs::MemoryDocumentStore`] keeps documents in memory and
+//!   is the default so test construction stays side-effect-free; the I5
+//!   wiring (issue #220) adds [`machine::docs::V2DocumentStore`] over
+//!   storage v2's `documents`/`revisions` tables — the host's production
+//!   config opens it at the data root, and the machine hydrates from it
+//!   on first touch per document.
 
 pub mod bus;
 pub mod channel;
@@ -107,7 +115,11 @@ pub struct RuntimeConfig {
     /// explicit root; a root-less embedder uses
     /// [`default_capture_store`]).
     pub capture_store: Arc<dyn CaptureStore>,
-    /// The documents persistence seam.
+    /// The documents persistence seam. The default is the in-memory
+    /// store (test construction stays side-effect-free, same philosophy
+    /// as `capture_store`); the I5 wiring (issue #220) overrides it with
+    /// [`machine::docs::V2DocumentStore`] at the data root — the I4
+    /// host's production config does exactly that.
     pub document_store: Arc<dyn DocumentStore>,
     /// The external delivery seam (stub in Mode A).
     pub delivery_adapter: Arc<dyn DeliveryAdapter>,
@@ -152,6 +164,12 @@ impl RuntimeConfig {
     /// Overrides the capture persistence store.
     pub fn with_capture_store(mut self, store: Arc<dyn CaptureStore>) -> Self {
         self.capture_store = store;
+        self
+    }
+
+    /// Overrides the documents persistence store.
+    pub fn with_document_store(mut self, store: Arc<dyn DocumentStore>) -> Self {
+        self.document_store = store;
         self
     }
 

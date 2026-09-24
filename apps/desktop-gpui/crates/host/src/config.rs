@@ -72,14 +72,21 @@ impl HostConfig {
     }
 
     /// The production host at `data_root`: storage v2 is THE capture
-    /// persistence (D14 — no v1 seam, no second backend), the endpoint
-    /// directory is `runtime_dir` when given (else the per-user default),
-    /// and only that final directory is created here — so a missing
-    /// `$XDG_RUNTIME_DIR` surfaces at launch, not at first bind, and an
-    /// overridden dir never leaves the default behind as stray residue.
-    /// The inference provider stays unconfigured until the I5 adapter
-    /// wiring lands — an honest default that fails jobs with
-    /// `no_provider_configured` rather than inventing an endpoint.
+    /// persistence (D14 — no v1 seam, no second backend) **and** the
+    /// documents machine's persistence (I5 wiring, issue #220:
+    /// [`V2DocumentStore`] over the same root's `documents`/`revisions`
+    /// tables, its own SQLite connection like the capture store's). The
+    /// endpoint directory is `runtime_dir` when given (else the per-user
+    /// default), and only that final directory is created here — so a
+    /// missing `$XDG_RUNTIME_DIR` surfaces at launch, not at first bind,
+    /// and an overridden dir never leaves the default behind as stray
+    /// residue. The inference provider stays unconfigured — an honest
+    /// default that fails jobs with `no_provider_configured` rather than
+    /// inventing an endpoint — until a configuration surface (app
+    /// settings or the E03 engine attach) supplies one; the context and
+    /// delivery adapters likewise stay the honest stubs until E03's
+    /// platform adapters (issue #221) plug into the `RuntimeConfig`
+    /// seams.
     ///
     /// Errors when the root cannot open (the host is the designed lease
     /// acquirer; a root it cannot open is a host it must not be).
@@ -96,9 +103,14 @@ impl HostConfig {
             )
         })?;
         let store = V2CaptureStore::open(&data_root)
-            .map_err(|err| format!("storage v2 at {} will not open: {err}", data_root.display()))?;
+            .map_err(|err| format!("capture store at {} will not open: {err}", data_root.display()))?;
+        let documents = starling_runtime::machine::docs::V2DocumentStore::open(&data_root)
+            .map_err(|err| format!("documents store at {} will not open: {err}", data_root.display()))?;
         let mut config = HostConfig::new(&data_root, &runtime_dir);
-        config.runtime = config.runtime.with_capture_store(Arc::new(store));
+        config.runtime = config
+            .runtime
+            .with_capture_store(Arc::new(store))
+            .with_document_store(Arc::new(documents));
         Ok(config)
     }
 

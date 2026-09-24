@@ -14,9 +14,12 @@
 //! anything, `apply` is user-initiated and names its delivery; the stub
 //! adapter below never fabricates a confirmation.
 //!
-//! Real delivery adapters are I5 product wiring; [`StubDeliveryAdapter`]
-//! records what it did and fails apply honestly (`no_delivery_adapter`)
-//! instead of pretending text landed.
+//! Real delivery adapters are E03's platform work (issue #221) on the
+//! [`DeliveryAdapter`] seam — a seam the host crate's adapter suite
+//! proves end-to-end over the IPC transport with a real target;
+//! [`StubDeliveryAdapter`] stays the unwired default and records what it
+//! did, failing apply honestly (`no_delivery_adapter`) instead of
+//! pretending text landed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,8 +56,9 @@ pub struct InsertEvidence {
     pub level: String,
 }
 
-/// The external-target seam (E03 wiring is I5). `insert` is only ever
-/// called from the user-initiated `delivery.apply` path.
+/// The external-target seam (the adapters are E03's platform work,
+/// issue #221). `insert` is only ever called from the user-initiated
+/// `delivery.apply` path.
 pub trait DeliveryAdapter: Send + Sync {
     /// Freeze-time target validation; returns the compare token.
     fn prepare(&self, target_ref: &str) -> Result<String, String>;
@@ -121,7 +125,7 @@ impl DeliveryAdapter for StubDeliveryAdapter {
     ) -> Result<InsertEvidence, InsertionFailure> {
         self.record(format!(
             "apply attempted delivery={delivery_id} target={target_ref}: NOT delivered — no \
-             real delivery adapter is wired (I5); refusing to fake a confirmation"
+             real delivery adapter is wired (E03); refusing to fake a confirmation"
         ));
         Err(InsertionFailure {
             reason: "no_delivery_adapter".to_string(),
@@ -136,7 +140,9 @@ impl DeliveryAdapter for StubDeliveryAdapter {
 
 struct DeliveryState {
     core: MachineCore,
-    #[allow(dead_code)] // identifies the prepared revision; I5 surfaces it
+    #[allow(dead_code)] // identifies the prepared revision; no v1 wire
+                        // field carries it (the E21 documents product
+                        // surface decides how it surfaces)
     revision_id: String,
     target_ref: String,
     compare_token: String,
@@ -309,18 +315,24 @@ impl DeliveryActor {
             Ok(_) => {
                 let delivery_id = crate::bus::new_id("dlv");
                 let _ = reply.try_send(Ok(Receipt::Accepted));
+                // `delivery.prepare` is outcome-pending: resolve_outcome
+                // performs the `delivery.prepared` transition itself, and
+                // the event rule for `delivery.prepared` is `from []` (an
+                // outcome only, never a free event) — so the bus emit
+                // follows the resolve directly. The extra emit_event the
+                // actor used to attempt here always violated the table
+                // and was swallowed, which meant the live stream never
+                // carried `delivery.prepared` at all (found by the I5
+                // adapter wiring's live delivery walk, issue #220; the
+                // conformance corpus replays this trace through the table
+                // and so never saw the actor's side).
                 match core.resolve_outcome("delivery.prepared", Some(&corr)) {
                     Ok(_) => {
                         let event = Event::DeliveryPrepared {
                             delivery_id: delivery_id.clone(),
                             compare_token: token.clone(),
                         };
-                        match core.emit_event(event.type_name(), None) {
-                            Ok(_) => {
-                                let _ = self.bus.emit(event, Some(&corr));
-                            }
-                            Err(violation) => core.record_violation(violation),
-                        }
+                        let _ = self.bus.emit(event, Some(&corr));
                         self.deliveries.insert(
                             delivery_id.clone(),
                             DeliveryState {

@@ -35,10 +35,12 @@
 //! [`V2_SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `tombstones`, `meta`. This core implements the
-//! captures/attempts/tombstones/meta surfaces; the context/documents/
-//! deliveries tables exist so later increments (I5) extend the schema
-//! additively instead of rewriting it. `extra_json` per row preserves
-//! unknown/newer fields **verbatim**: it is stored and returned as the raw
+//! captures/attempts/tombstones/meta surfaces plus the
+//! documents/revisions surface (I5, issue #220:
+//! [`StoreV2::upsert_document`] and friends — the documents machine's
+//! persistence); the context/deliveries tables still await their owning
+//! increments (E03's adapters), extending the schema additively.
+//! `extra_json` per row preserves unknown/newer fields **verbatim**: it is stored and returned as the raw
 //! text a writer produced, never re-serialized from parsed form on paths
 //! that do not touch it, and updates that add fields merge into the parsed
 //! object without dropping keys.
@@ -399,6 +401,38 @@ impl AttemptRecord {
                 })
         })
     }
+}
+
+/// One `revisions` row (§4). The documents machine (I5, issue #220) is
+/// the writer; `disposition` distinguishes committed heads from preserved
+/// conflict candidates while `status` carries the revision's own
+/// lifecycle verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionRow {
+    pub rev_id: String,
+    pub doc_id: String,
+    pub base_revision: Option<u64>,
+    /// The revision's provenance (the I3 `Revision`'s
+    /// `sourceAttemptIds` + `instructionTemplateId`) encoded as one JSON
+    /// object — the column the §4 schema gives this side of the record.
+    pub sources_json: Option<String>,
+    pub text: String,
+    pub status: String,
+    pub provenance: Option<String>,
+    /// `"committed"` (head, or a past head) or `"preserved"` (conflict
+    /// candidate retained for explicit user choice).
+    pub disposition: Option<String>,
+}
+
+/// One `documents` row with its revisions in insertion order (the
+/// [`StoreV2::get_document`] shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentRow {
+    pub doc_id: String,
+    pub name: String,
+    pub head_revision: u64,
+    pub turn_seq: u32,
+    pub revisions: Vec<RevisionRow>,
 }
 
 /// Metadata known when a take starts (the columns not derived from the
@@ -1017,6 +1051,175 @@ impl StoreV2 {
             }
         }
         Ok(grouped)
+    }
+
+    // ------------------------------------------------------------------
+    // Documents / revisions (§4 `documents`/`revisions` tables — the I5
+    // documents-machine persistence, issue #220). Rows are plain
+    // metadata: no audio, no per-row files, so these APIs have no
+    // filesystem side and no bounded-read concerns beyond the one query
+    // each.
+    // ------------------------------------------------------------------
+
+    /// Creates or updates one `documents` row. Idempotent on `doc_id`:
+    /// a re-commit of the same head (a caller retrying after a crash
+    /// window) writes the same row rather than colliding. The durable
+    /// head never moves backwards: an older `head_revision` than the
+    /// stored one is a no-op, reported as `Ok(false)`.
+    pub fn upsert_document(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+    ) -> Result<bool, StoreV2Error> {
+        validate_document_id(doc_id)?;
+        let changed = self.conn.execute(
+            "INSERT INTO documents(doc_id, name, head_revision, turn_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(doc_id) DO UPDATE SET
+                name = excluded.name,
+                head_revision = excluded.head_revision,
+                turn_seq = excluded.turn_seq
+             WHERE excluded.head_revision >= documents.head_revision",
+            params![doc_id, name, int64(head_revision)?, int64(u64::from(turn_seq))?],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Inserts (or idempotently re-stores) one `revisions` row. The
+    /// referenced `doc_id` must already exist — `foreign_keys` is ON, so a
+    /// revision for an unknown document fails with the SQLite foreign-key
+    /// error rather than landing orphaned. `disposition` carries the
+    /// documents machine's slot (`"committed"` head / `"preserved"`
+    /// conflict candidate); `status` keeps the revision's own lifecycle
+    /// status verbatim (e.g. `"candidate"`) — two different claims, which
+    /// is why the schema has both columns.
+    pub fn store_document_revision(&self, revision: &RevisionRow) -> Result<(), StoreV2Error> {
+        validate_document_id(&revision.rev_id)?;
+        validate_document_id(&revision.doc_id)?;
+        let changed = self.conn.execute(
+            "INSERT INTO revisions(rev_id, doc_id, base_rev, sources_json, text,
+                                   status, provenance, disposition)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(rev_id) DO UPDATE SET
+                base_rev = excluded.base_rev,
+                sources_json = excluded.sources_json,
+                text = excluded.text,
+                status = excluded.status,
+                provenance = excluded.provenance,
+                disposition = excluded.disposition
+             WHERE revisions.doc_id = excluded.doc_id",
+            params![
+                revision.rev_id,
+                revision.doc_id,
+                revision.base_revision.map(|base| int64(base)).transpose()?,
+                revision.sources_json,
+                revision.text,
+                revision.status,
+                revision.provenance,
+                revision.disposition,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreV2Error::Invalid(format!(
+                "revision {} already belongs to another document",
+                revision.rev_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Advances a document's head and lands the head's revision row in
+    /// one transaction: the durable head never references a revision
+    /// whose row (and text) did not land. Both writes run on `self.conn`
+    /// inside the open transaction; the store's single connection sits
+    /// behind a Mutex in every embedder, so nothing interleaves.
+    pub fn commit_document_head(
+        &self,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &RevisionRow,
+    ) -> Result<(), StoreV2Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        // A refused write returns before `commit`: dropping `tx` rolls
+        // the whole pair back.
+        if !self.upsert_document(&revision.doc_id, name, head_revision, turn_seq)? {
+            return Err(StoreV2Error::Invalid(format!(
+                "document {} head {head_revision} is older than the durable head",
+                revision.doc_id
+            )));
+        }
+        self.store_document_revision(revision)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Advances one document's `turn_seq`, creating the row (head 0,
+    /// name = id) when a turn is appended to a document no updateHead has
+    /// written yet — the documents machine's implicit-document shape. An
+    /// existing row's `head_revision` is never touched here.
+    pub fn bump_document_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), StoreV2Error> {
+        validate_document_id(doc_id)?;
+        self.conn.execute(
+            "INSERT INTO documents(doc_id, name, head_revision, turn_seq)
+             VALUES (?1, ?1, 0, ?2)
+             ON CONFLICT(doc_id) DO UPDATE SET turn_seq = excluded.turn_seq",
+            params![doc_id, int64(u64::from(turn_seq))?],
+        )?;
+        Ok(())
+    }
+
+    /// Loads one document and its revisions (insertion order). `Ok(None)`
+    /// for a document this root has never stored. Revisions of a missing
+    /// document cannot exist (the foreign key), so there is no
+    /// half-present shape to interpret.
+    pub fn get_document(&self, doc_id: &str) -> Result<Option<DocumentRow>, StoreV2Error> {
+        validate_document_id(doc_id)?;
+        // Both reads run on the one connection, which sits behind a Mutex
+        // in every embedder: the document row and its revisions are one
+        // consistent snapshot.
+        let document = self
+            .conn
+            .query_row(
+                "SELECT doc_id, name, head_revision, turn_seq
+                 FROM documents WHERE doc_id = ?1",
+                params![doc_id],
+                |row| {
+                    Ok(DocumentRow {
+                        doc_id: row.get(0)?,
+                        name: row.get(1)?,
+                        head_revision: row.get::<_, i64>(2)?.max(0) as u64,
+                        turn_seq: row.get::<_, i64>(3)?.max(0) as u32,
+                        revisions: Vec::new(),
+                    })
+                },
+            )
+            .optional()?;
+        let Some(mut document) = document else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT rev_id, doc_id, base_rev, sources_json, text, status, provenance, disposition
+             FROM revisions WHERE doc_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![doc_id], |row| {
+            Ok(RevisionRow {
+                rev_id: row.get(0)?,
+                doc_id: row.get(1)?,
+                base_revision: row.get::<_, Option<i64>>(2)?.map(|base| base.max(0) as u64),
+                sources_json: row.get(3)?,
+                text: row.get(4)?,
+                status: row.get(5)?,
+                provenance: row.get(6)?,
+                disposition: row.get(7)?,
+            })
+        })?;
+        for row in rows {
+            document.revisions.push(row?);
+        }
+        Ok(Some(document))
     }
 
     // ------------------------------------------------------------------
@@ -2966,6 +3169,20 @@ fn validate_capture_id(id: &str) -> Result<(), StoreV2Error> {
     if !is_safe_path_component(id) {
         return Err(StoreV2Error::Invalid(format!(
             "capture id {id:?} must be non-empty and contain no path separators"
+        )));
+    }
+    Ok(())
+}
+
+/// Document and revision ids are pure SQLite keys (never path
+/// components, unlike capture ids), so they carry no separator rule —
+/// but they are client-chosen strings, so a non-empty cap keeps a
+/// hostile envelope from making the key the row's only bulk.
+fn validate_document_id(id: &str) -> Result<(), StoreV2Error> {
+    if id.is_empty() || id.len() > 1024 {
+        return Err(StoreV2Error::Invalid(format!(
+            "document/revision id must be non-empty and at most 1024 bytes (got {})",
+            id.len()
         )));
     }
     Ok(())
@@ -6112,5 +6329,161 @@ mod tests {
             !store.audio_journal_exists("c_never").expect("probe unknown"),
             "an unknown id has no audio"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Documents / revisions (§4 tables; the I5 documents-machine
+    // persistence, issue #220).
+    // -----------------------------------------------------------------
+
+    fn sample_revision(rev_id: &str, doc_id: &str, base: u64, text: &str) -> RevisionRow {
+        RevisionRow {
+            rev_id: rev_id.to_string(),
+            doc_id: doc_id.to_string(),
+            base_revision: Some(base),
+            sources_json: Some(
+                serde_json::json!({
+                    "attempts": ["att-1"],
+                    "instructionTemplateId": "tpl-none",
+                })
+                .to_string(),
+            ),
+            text: text.to_string(),
+            status: "candidate".to_string(),
+            provenance: Some("recognition".to_string()),
+            disposition: Some("committed".to_string()),
+        }
+    }
+
+    #[test]
+    fn documents_round_trip_and_survive_reopen() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("v2");
+        {
+            let store = StoreV2::open(&root).expect("open");
+            store
+                .upsert_document("notes", "notes", 1, 1)
+                .expect("upsert document");
+            store
+                .store_document_revision(&sample_revision("rev-1", "notes", 0, "First head."))
+                .expect("store revision");
+            store
+                .store_document_revision(&sample_revision(
+                    "rev-2",
+                    "notes",
+                    0,
+                    "Preserved candidate.",
+                ))
+                .expect("store preserved revision");
+            // The CAS advanced the head: the same upsert is the update.
+            store
+                .upsert_document("notes", "notes", 2, 3)
+                .expect("update document");
+            store.bump_document_turn("notes", 3).expect("bump turn");
+        }
+        // A fresh connection (the documents machine hydrating at boot).
+        let reopened = StoreV2::open(&root).expect("reopen");
+        let doc = reopened
+            .get_document("notes")
+            .expect("get")
+            .expect("the document persisted");
+        assert_eq!(doc.name, "notes");
+        assert_eq!(doc.head_revision, 2);
+        assert_eq!(doc.turn_seq, 3);
+        assert_eq!(doc.revisions.len(), 2);
+        assert_eq!(doc.revisions[0].rev_id, "rev-1");
+        assert_eq!(doc.revisions[1].rev_id, "rev-2");
+        // The provenance JSON survived verbatim.
+        assert_eq!(
+            doc.revisions[0].sources_json.as_deref(),
+            sample_revision("rev-1", "notes", 0, "").sources_json.as_deref()
+        );
+        assert_eq!(doc.revisions[0].text, "First head.");
+        // An unknown document is None, not an error.
+        assert!(reopened.get_document("nope").expect("get unknown").is_none());
+    }
+
+    #[test]
+    fn a_revision_for_an_unknown_document_is_refused_by_the_foreign_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        let err = store
+            .store_document_revision(&sample_revision("rev-x", "ghost", 0, "orphaned"))
+            .expect_err("the foreign key must refuse an orphaned revision");
+        assert!(
+            err.to_string().contains("FOREIGN KEY"),
+            "the refusal is the SQLite foreign-key error: {err}"
+        );
+        // And nothing landed.
+        assert!(store.get_document("ghost").expect("get").is_none());
+    }
+
+    #[test]
+    fn bump_document_turn_creates_and_updates_without_touching_the_head() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        // A turn appended to a document no updateHead ever wrote: the
+        // implicit-document shape creates the row at head 0.
+        store.bump_document_turn("scratch", 1).expect("implicit doc");
+        let doc = store.get_document("scratch").expect("get").expect("row");
+        assert_eq!(doc.head_revision, 0);
+        assert_eq!(doc.turn_seq, 1);
+        assert_eq!(doc.name, "scratch");
+        // An existing document's head survives the bump.
+        store
+            .upsert_document("scratch", "scratch", 4, 1)
+            .expect("advance head");
+        store.bump_document_turn("scratch", 2).expect("bump");
+        let doc = store.get_document("scratch").expect("get").expect("row");
+        assert_eq!(doc.head_revision, 4);
+        assert_eq!(doc.turn_seq, 2);
+    }
+
+    #[test]
+    fn the_durable_head_never_moves_backwards() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        assert!(store.upsert_document("doc", "doc", 2, 0).expect("head 2"));
+        assert!(!store.upsert_document("doc", "doc", 1, 0).expect("stale head is a no-op"));
+        assert_eq!(store.get_document("doc").expect("get").expect("row").head_revision, 2);
+        // A stale commit lands neither the head nor its revision row.
+        store
+            .commit_document_head("doc", 1, 0, &sample_revision("rev-stale", "doc", 0, "stale"))
+            .expect_err("a stale head commit is refused");
+        let doc = store.get_document("doc").expect("get").expect("row");
+        assert_eq!(doc.head_revision, 2);
+        assert!(doc.revisions.is_empty(), "the refused commit rolled back");
+    }
+
+    #[test]
+    fn a_revision_is_never_reparented_to_another_document() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        store.upsert_document("a", "a", 1, 0).expect("doc a");
+        store.upsert_document("b", "b", 0, 0).expect("doc b");
+        store
+            .store_document_revision(&sample_revision("r1", "a", 0, "A's text"))
+            .expect("a's revision");
+        store
+            .commit_document_head("b", 1, 0, &sample_revision("r1", "b", 0, "B's text"))
+            .expect_err("a colliding rev_id under another document is refused");
+        let a = store.get_document("a").expect("get").expect("row");
+        assert_eq!(a.revisions[0].text, "A's text");
+        let b = store.get_document("b").expect("get").expect("row");
+        assert_eq!(b.head_revision, 0, "the refused commit rolled the head back");
+    }
+
+    #[test]
+    fn document_ids_are_validated_before_any_sql_runs() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        for bad in ["", &"x".repeat(1025)] {
+            assert!(store.upsert_document(bad, "n", 0, 0).is_err());
+            assert!(store.bump_document_turn(bad, 1).is_err());
+            assert!(store.get_document(bad).is_err());
+            let mut revision = sample_revision("rev-1", "notes", 0, "t");
+            revision.rev_id = bad.to_string();
+            assert!(store.store_document_revision(&revision).is_err());
+        }
     }
 }
