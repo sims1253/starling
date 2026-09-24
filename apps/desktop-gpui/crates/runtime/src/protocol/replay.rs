@@ -128,13 +128,10 @@ fn is_event_type(type_: &str) -> bool {
 fn stream_key(envelope: &Envelope, kind: Kind) -> String {
     match &envelope.corr {
         Some(corr) => corr.clone(),
-        None => format!(
-            "__{}s__",
-            match kind {
-                Kind::Command => "command",
-                Kind::Event => "event",
-            }
-        ),
+        None => format!("__{}s__", match kind {
+            Kind::Command => "command",
+            Kind::Event => "event",
+        }),
     }
 }
 
@@ -316,11 +313,8 @@ impl MachineReplay {
             });
         }
         if !rule.outcomes.is_empty() {
-            let mut awaited: Vec<String> = rule
-                .outcomes
-                .iter()
-                .map(|(name, _)| name.to_string())
-                .collect();
+            let mut awaited: Vec<String> =
+                rule.outcomes.iter().map(|(name, _)| name.to_string()).collect();
             awaited.sort();
             self.pending = Some(Pending {
                 command_type: static_type(&envelope.type_),
@@ -338,11 +332,7 @@ impl MachineReplay {
                 pending: awaited,
             });
         } else {
-            self.enter(
-                rule.to,
-                TransitionKind::Command,
-                static_type(&envelope.type_),
-            );
+            self.enter(rule.to, TransitionKind::Command, static_type(&envelope.type_));
         }
         Ok(())
     }
@@ -350,7 +340,11 @@ impl MachineReplay {
     fn apply_event(&mut self, envelope: &Envelope) -> Result<(), Violation> {
         let msg_type = static_type(&envelope.type_);
         if let Some(pending) = &self.pending {
-            if let Some((_, target)) = pending.outcomes.iter().find(|(name, _)| *name == msg_type) {
+            if let Some((_, target)) = pending
+                .outcomes
+                .iter()
+                .find(|(name, _)| *name == msg_type)
+            {
                 if envelope.corr != pending.corr {
                     return Err(Violation::CorrMismatch {
                         detail: format!(
@@ -373,12 +367,12 @@ impl MachineReplay {
                 ),
             });
         }
-        let rule =
-            self.spec
-                .event_rule(&envelope.type_)
-                .ok_or_else(|| Violation::IllegalEvent {
-                    detail: format!("{msg_type} is only reachable as a pending outcome"),
-                })?;
+        let rule = self
+            .spec
+            .event_rule(&envelope.type_)
+            .ok_or_else(|| Violation::IllegalEvent {
+                detail: format!("{msg_type} is only reachable as a pending outcome"),
+            })?;
         if !rule.from.contains(&self.state.as_str()) {
             return Err(Violation::IllegalEvent {
                 detail: format!(
@@ -420,7 +414,11 @@ impl MachineReplay {
                 ),
             });
         }
-        if !self.spec.internal_targets(&self.state).contains(&target) {
+        if !self
+            .spec
+            .internal_targets(&self.state)
+            .contains(&target)
+        {
             return Err(Violation::InternalEdgeViolation {
                 detail: format!(
                     "no runtime-internal edge {:?} -> {target:?} in machine {:?}",
@@ -628,9 +626,7 @@ pub fn route_freeze_violations(messages: &[Value]) -> Vec<RouteFreezeViolation> 
                 .and_then(Value::as_str)
                 .map(str::to_string)
             {
-                let ok = frozen
-                    .get(&route)
-                    .is_some_and(|frozen_ts| frozen_ts.as_str() < ts);
+                let ok = frozen.get(&route).is_some_and(|frozen_ts| frozen_ts.as_str() < ts);
                 if !ok {
                     violations.push(RouteFreezeViolation {
                         id: msg.get("id").and_then(Value::as_str).map(str::to_string),
@@ -656,17 +652,13 @@ pub fn load_fixture(text: &str) -> Value {
 /// Splits fixture files into (valid, invalid) by path — the oracle's
 /// `load_fixtures` convention: a trace under a directory named `invalid/`
 /// is invalid.
-pub fn split_fixtures(
-    paths: &[std::path::PathBuf],
-) -> (
-    Vec<(std::path::PathBuf, Value)>,
-    Vec<(std::path::PathBuf, Value)>,
-) {
+pub fn split_fixtures(paths: &[std::path::PathBuf]) -> (Vec<(std::path::PathBuf, Value)>, Vec<(std::path::PathBuf, Value)>) {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|err| panic!("fixture {} unreadable: {err}", path.display()));
+        let text = std::fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("fixture {} unreadable: {err}", path.display())
+        });
         let trace = load_fixture(&text);
         let is_invalid = path
             .parent()
@@ -687,16 +679,8 @@ pub fn valid_corpus_messages(valid: &[(std::path::PathBuf, Value)]) -> Vec<Value
                 if is_directive(record) {
                     continue;
                 }
-                let ts = record
-                    .get("ts")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let id = record
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let ts = record.get("ts").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = record.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                 messages.push((ts, id, record.clone()));
             }
         }

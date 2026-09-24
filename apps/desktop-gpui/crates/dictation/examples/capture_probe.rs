@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use starling_dictation::audio::encode_wav_16k;
-use starling_dictation::recorder::{start_recording, RecorderError, CLIP_THRESHOLD};
+use starling_dictation::recorder::{RecorderError, CLIP_THRESHOLD, start_recording};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

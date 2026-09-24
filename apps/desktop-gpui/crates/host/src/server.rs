@@ -118,7 +118,10 @@ pub enum HostError {
     #[error("preparing the endpoint directory {0:?}: {1}")]
     RuntimeDir(PathBuf, String),
     #[error("reconciling storage v2 at {root:?} after taking the lease failed: {source}")]
-    Reconcile { root: PathBuf, source: StoreV2Error },
+    Reconcile {
+        root: PathBuf,
+        source: StoreV2Error,
+    },
 }
 
 /// The running host. [`HostHandle::shutdown`] stops everything in order
@@ -504,9 +507,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
 /// is the wrong trade. The lease mutex keeps `expect` — its invariants
 /// are ownership-critical, not bookkeeping.
 fn lock_registry<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn spawn(name: &str, run: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
@@ -613,7 +614,8 @@ fn accept_loop(
                         // the error and unregisters — the slot is
                         // returned exactly once, by the reader.
                         state.close();
-                        lock_registry(&shared.conn_threads).push((reader, Arc::clone(&state)));
+                        lock_registry(&shared.conn_threads)
+                            .push((reader, Arc::clone(&state)));
                         continue;
                     }
                 };
@@ -804,7 +806,9 @@ fn connection_reader(
                     terminate(
                         &state,
                         TransportErrorCode::ProtocolViolation,
-                        format!("no frame within {idle_bound:?} of connect; connection closed"),
+                        format!(
+                            "no frame within {idle_bound:?} of connect; connection closed"
+                        ),
                     );
                     break;
                 }

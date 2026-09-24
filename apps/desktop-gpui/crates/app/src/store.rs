@@ -81,10 +81,7 @@ impl Store {
     /// half, seconds for a long take — run without the shared handle, so
     /// listing, playback, deletes, and the transcription job's
     /// exists-checks are never pinned behind one load.
-    pub(crate) fn audio_wav(
-        &self,
-        id: &str,
-    ) -> Result<Option<Arc<Vec<u8>>>, storage::StorageError> {
+    pub(crate) fn audio_wav(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, storage::StorageError> {
         let path = {
             let store = lock_v2(&self.0);
             match store.audio_journal_path(id) {
@@ -187,11 +184,7 @@ impl Store {
 
     /// Marks a transcription attempt as started on the record. `backend`
     /// labels the attempt ("starling:parakeet", "openai:whisper-large-v3").
-    pub(crate) fn mark_attempt(
-        &self,
-        id: &str,
-        backend: &str,
-    ) -> Result<(), storage::StorageError> {
+    pub(crate) fn mark_attempt(&self, id: &str, backend: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
         store
             .begin_recognition(id, backend, None)
@@ -213,11 +206,7 @@ impl Store {
     }
 
     /// Records a failed transcription attempt.
-    pub(crate) fn save_failure(
-        &self,
-        id: &str,
-        message: &str,
-    ) -> Result<(), storage::StorageError> {
+    pub(crate) fn save_failure(&self, id: &str, message: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
         store
             .finish_recognition(id, RecognitionOutcome::Failed { message })
@@ -376,7 +365,9 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
                 ListedCapture::Damaged(_) => None,
             })
             .collect();
-        let attempts = store.attempts_grouped_by_capture(&ids).map_err(v2_err)?;
+        let attempts = store
+            .attempts_grouped_by_capture(&ids)
+            .map_err(v2_err)?;
         for record in page.records {
             records.push(match record {
                 ListedCapture::Capture(listing) => {
@@ -386,10 +377,12 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
                         .unwrap_or_default();
                     ListedRecord::Session(v2_summary(&listing.record, &listing.problems, &attempts))
                 }
-                ListedCapture::Damaged(damaged) => ListedRecord::Damaged(DamagedRecord {
-                    id: damaged.id,
-                    reason: damaged.reason,
-                }),
+                ListedCapture::Damaged(damaged) => {
+                    ListedRecord::Damaged(DamagedRecord {
+                        id: damaged.id,
+                        reason: damaged.reason,
+                    })
+                }
             });
         }
         offset += PAGE;
@@ -566,12 +559,7 @@ mod tests {
             language: None,
             options_json: None,
             text: final_text.unwrap_or_default().to_string(),
-            partial_or_final: if final_text.is_some() {
-                "final"
-            } else {
-                "partial"
-            }
-            .to_string(),
+            partial_or_final: if final_text.is_some() { "final" } else { "partial" }.to_string(),
             status: status.to_string(),
             timing_json: None,
             extra_json: extra.map(str::to_string),
@@ -612,10 +600,7 @@ mod tests {
 
         // Interrupted take, never recognized: interrupted with its note.
         let summary = v2_summary(
-            &record(
-                CaptureStatus::Interrupted,
-                Some(r#"{"recovery":"torn tail"}"#),
-            ),
+            &record(CaptureStatus::Interrupted, Some(r#"{"recovery":"torn tail"}"#)),
             &[],
             &[],
         );
@@ -648,10 +633,7 @@ mod tests {
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[
-                plain_attempt("completed", Some("hello v2"), Some(&extra)),
-                failed,
-            ],
+            &[plain_attempt("completed", Some("hello v2"), Some(&extra)), failed],
         );
         assert_eq!(summary.status, SessionStatus::Failed);
         assert_eq!(summary.transcript.as_ref().unwrap().text, "hello v2");
@@ -756,12 +738,18 @@ mod tests {
 
         // Transcribe lifecycle through the same handles the app uses.
         store.mark_attempt(&id, "starling:parakeet").expect("begin");
-        assert_eq!(session_status(&store, &id), SessionStatus::Transcribing);
+        assert_eq!(
+            session_status(&store, &id),
+            SessionStatus::Transcribing
+        );
         store
             .save_transcript(&id, transcript("round trip"))
             .expect("save transcript");
         assert_eq!(session_status(&store, &id), SessionStatus::Transcribed);
-        assert_eq!(transcript_text(&store, &id).as_deref(), Some("round trip"));
+        assert_eq!(
+            transcript_text(&store, &id).as_deref(),
+            Some("round trip")
+        );
 
         // A failed retry: failed status, transcript kept.
         store.mark_attempt(&id, "starling:parakeet").expect("retry");
@@ -826,7 +814,12 @@ mod tests {
 
         // The journal moved in and became the stored audio.
         assert!(!report.path.exists());
-        assert!(lock_v2(&store.0).load_audio(&id).expect("audio").finalized);
+        assert!(
+            lock_v2(&store.0)
+                .load_audio(&id)
+                .expect("audio")
+                .finalized
+        );
 
         // The listing shows the take as interrupted with its note — not
         // "Captured" with the note invisible.
@@ -858,7 +851,10 @@ mod tests {
     #[test]
     fn a_missing_v2_audio_surfaces_its_error_instead_of_falling_back() {
         let store = v2_store("degrade");
-        let id = store.save_capture(tiny_wav(50), None).expect("save").id;
+        let id = store
+            .save_capture(tiny_wav(50), None)
+            .expect("save")
+            .id;
 
         // The journal vanishes under the store (disk trouble).
         {
@@ -881,11 +877,16 @@ mod tests {
     fn startup_recovery_reports_and_repairs_on_v2() {
         let root = scratch_dir("recovery");
         let owner = reopen_v2(&root);
-        let id = owner.save_capture(tiny_wav(80), None).expect("save").id;
+        let id = owner
+            .save_capture(tiny_wav(80), None)
+            .expect("save")
+            .id;
         // A recognition attempt left "started" by a previous run — #213:
         // that run's attempt markers died with its process, so the owner
         // store is dropped to simulate the crash.
-        owner.mark_attempt(&id, "starling:parakeet").expect("begin");
+        owner
+            .mark_attempt(&id, "starling:parakeet")
+            .expect("begin");
         drop(owner);
 
         let store = reopen_v2(&root);
@@ -904,15 +905,17 @@ mod tests {
         // attempt to Failed — the phantom-failure defect.
         let root = scratch_dir("recovery-live-owner");
         let owner = reopen_v2(&root);
-        let id = owner.save_capture(tiny_wav(80), None).expect("save").id;
-        owner.mark_attempt(&id, "starling:parakeet").expect("begin");
+        let id = owner
+            .save_capture(tiny_wav(80), None)
+            .expect("save")
+            .id;
+        owner
+            .mark_attempt(&id, "starling:parakeet")
+            .expect("begin");
 
         let sweeper = reopen_v2(&root);
         let summary = sweeper.startup_recovery().expect("recovery");
-        assert!(
-            summary.is_empty(),
-            "nothing to report while the owner lives"
-        );
+        assert!(summary.is_empty(), "nothing to report while the owner lives");
         assert_eq!(
             session_status(&sweeper, &id),
             SessionStatus::Transcribing,
@@ -970,10 +973,7 @@ mod tests {
         let decoded = audio::decode_pcm16_wav(&saved.wav).expect("decode");
         assert_eq!(decoded.samples.len(), 120, "the stored journal's samples");
         // And exactly what a retry loads, so the two can never diverge.
-        let reloaded = store
-            .audio_wav(&saved.id)
-            .expect("reload")
-            .expect("present");
+        let reloaded = store.audio_wav(&saved.id).expect("reload").expect("present");
         let reloaded = audio::decode_pcm16_wav(&reloaded).expect("decode");
         assert_eq!(reloaded.samples, decoded.samples);
     }
@@ -1038,7 +1038,10 @@ mod tests {
         // error still surfaces.
         let root = scratch_dir("reconcile-fail");
         let owner = reopen_v2(&root);
-        let stuck = owner.save_capture(tiny_wav(70), None).expect("save").id;
+        let stuck = owner
+            .save_capture(tiny_wav(70), None)
+            .expect("save")
+            .id;
         owner
             .mark_attempt(&stuck, "starling:parakeet")
             .expect("begin");
@@ -1047,7 +1050,10 @@ mod tests {
         // was resurrected under audio/ while its quarantine destination is
         // a directory — the tombstone-completion rename cannot succeed, so
         // reconcile errors while the rest of the store stays healthy.
-        let doomed = owner.save_capture(tiny_wav(30), None).expect("save").id;
+        let doomed = owner
+            .save_capture(tiny_wav(30), None)
+            .expect("save")
+            .id;
         owner.delete(&doomed).expect("delete");
         drop(owner); // the previous run crashed with the attempt in flight
 
@@ -1090,11 +1096,13 @@ mod tests {
 
     fn transcript_text(store: &Store, id: &str) -> Option<String> {
         let listed = store.list().expect("list");
-        listed.iter().find_map(|record| match record {
-            ListedRecord::Session(summary) if &summary.id == id => {
-                summary.transcript.as_ref().map(|t| t.text.clone())
-            }
-            _ => None,
-        })
+        listed
+            .iter()
+            .find_map(|record| match record {
+                ListedRecord::Session(summary) if &summary.id == id => {
+                    summary.transcript.as_ref().map(|t| t.text.clone())
+                }
+                _ => None,
+            })
     }
 }

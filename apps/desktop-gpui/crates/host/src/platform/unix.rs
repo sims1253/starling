@@ -77,15 +77,14 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
             Err(err) => return Err(err),
         }
     }
-    let (listener, temp) = match (listener, temp) {
-        (Some(listener), Some(temp)) => (listener, temp),
-        _ => {
-            return Err(io::Error::new(
+    let (listener, temp) =
+        match (listener, temp) {
+            (Some(listener), Some(temp)) => (listener, temp),
+            _ => return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "could not find a free temp name for the endpoint socket",
-            ))
-        }
-    };
+            )),
+        };
     // Rename publishes the 0600 socket under its final name atomically.
     // A server that bound `path` between the caller's probe and this
     // rename is silently displaced — the same check-then-act window
@@ -329,7 +328,10 @@ mod tests {
             refused.is_err(),
             "a live server's socket file must not be unlinked"
         );
-        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert!(live_path.exists(), "the squatter keeps its socket file");
         drop(squatter);
 

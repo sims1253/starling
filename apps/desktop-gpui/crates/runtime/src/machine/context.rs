@@ -118,9 +118,7 @@ pub enum ContextMsg {
         reply: crate::channel::Sender<Option<String>>,
     },
     /// Take completion: `RouteFrozen → Released` (runtime-internal).
-    TakeCompleted {
-        take: String,
-    },
+    TakeCompleted { take: String },
     Shutdown,
 }
 
@@ -155,9 +153,7 @@ impl RouteFreezer {
     /// Notifies take completion (best effort).
     pub fn take_completed(&self, take: &str) -> bool {
         self.inbox
-            .try_send(ContextMsg::TakeCompleted {
-                take: take.to_string(),
-            })
+            .try_send(ContextMsg::TakeCompleted { take: take.to_string() })
             .is_ok()
     }
 }
@@ -259,34 +255,24 @@ impl ContextActor {
 
     fn handle_command(&mut self, inbound: Inbound) {
         self.auto_expire();
-        let super::Inbound {
-            corr,
-            command,
-            reply,
-            ..
-        } = inbound;
+        let super::Inbound { corr, command, reply, .. } = inbound;
         let corr = corr.unwrap_or_else(|| "ctx-anon".to_string());
         match command {
             Command::ContextSnapshot { source } => {
                 self.cycle_to_observing();
-                match self
-                    .core
-                    .commit_command("context.snapshot", Some(corr.clone()))
-                {
+                match self.core.commit_command("context.snapshot", Some(corr.clone())) {
                     Ok(_) => match self.provider.snapshot(&source) {
                         Ok(data) => {
                             let _ = reply.try_send(Ok(Receipt::Accepted));
                             self.snapshot_expiry = Some(data.expiry.clone());
                             // The snapshot resolves the pending
                             // context.snapshot on this corr.
-                            match self
-                                .core
-                                .resolve_outcome("context.targetSnapshot", Some(&corr))
-                            {
+                            match self.core.resolve_outcome("context.targetSnapshot", Some(&corr)) {
                                 Ok(_) => {
-                                    let _ = self
-                                        .bus
-                                        .emit(Event::ContextTargetSnapshot(data), Some(&corr));
+                                    let _ = self.bus.emit(
+                                        Event::ContextTargetSnapshot(data),
+                                        Some(&corr),
+                                    );
                                 }
                                 Err(violation) => self.core.record_violation(violation),
                             }
@@ -297,9 +283,9 @@ impl ContextActor {
                             // answered by receipt only and nothing is
                             // emitted (never absorbed silently).
                             self.core.record_violation(
-                                crate::protocol::replay::Violation::InvalidEnvelope(format!(
-                                    "context provider failed: {message}"
-                                )),
+                                crate::protocol::replay::Violation::InvalidEnvelope(
+                                    format!("context provider failed: {message}"),
+                                ),
                             );
                             let _ = reply.try_send(Err(Rejection::InvalidPayload(message)));
                         }
@@ -340,8 +326,7 @@ impl ContextActor {
                     }
                     Err(violation) => {
                         self.core.record_violation(violation.clone());
-                        let _ =
-                            reply.try_send(Err(illegal("mode.set", self.core.state(), violation)));
+                        let _ = reply.try_send(Err(illegal("mode.set", self.core.state(), violation)));
                     }
                 }
             }

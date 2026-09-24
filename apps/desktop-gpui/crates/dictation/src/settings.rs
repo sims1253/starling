@@ -234,10 +234,7 @@ mod tests {
         let settings = Settings::load(&path);
         assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
         assert_eq!(settings.model, "whisper-large-v3");
-        assert!(
-            !settings.user_set_model,
-            "no recorded choice: auto-sync stays enabled"
-        );
+        assert!(!settings.user_set_model, "no recorded choice: auto-sync stays enabled");
     }
 
     #[test]

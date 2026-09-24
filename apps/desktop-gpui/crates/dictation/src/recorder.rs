@@ -127,8 +127,7 @@ impl ClipCounters {
         if clipped > 0 {
             self.clipped.fetch_add(clipped, Ordering::Relaxed);
         }
-        self.total
-            .fetch_add(samples.len() as u64, Ordering::Relaxed);
+        self.total.fetch_add(samples.len() as u64, Ordering::Relaxed);
     }
 
     /// Clipped fraction in 0..=1, or 0.0 when nothing was observed (also the
@@ -664,7 +663,10 @@ fn writer_loop<S: JournalSink>(shared: Arc<Shared>, mut journal: Option<JournalW
 /// only by this task, only after a boundary fsync returned, so it stays
 /// monotonic; on a fault it is never stored again (frozen at the last good
 /// boundary).
-fn journal_boundary_step<S: JournalSink>(shared: &Shared, journal: &mut Option<JournalWriter<S>>) {
+fn journal_boundary_step<S: JournalSink>(
+    shared: &Shared,
+    journal: &mut Option<JournalWriter<S>>,
+) {
     if journal.is_none() {
         return;
     }
@@ -714,9 +716,7 @@ fn journal_boundary_step<S: JournalSink>(shared: &Shared, journal: &mut Option<J
     if let Some(acknowledged_samples) = acknowledged {
         // Monotonic: only this task stores, and only with the journal
         // writer's cumulative count after a successful fsync.
-        shared
-            .durable_ack
-            .store(acknowledged_samples, Ordering::Release);
+        shared.durable_ack.store(acknowledged_samples, Ordering::Release);
     }
     if let Some(err) = fault {
         let frozen = shared.durable_ack.load(Ordering::Acquire);
@@ -747,7 +747,10 @@ fn journal_boundary_step<S: JournalSink>(shared: &Shared, journal: &mut Option<J
 /// finalizes is therefore the same tail `stop`'s own final drain observes,
 /// and the producer can add nothing while the finalize fsyncs run — the
 /// journal watermark and the returned take agree by construction.
-fn journal_finalize_step<S: JournalSink>(shared: &Shared, journal: &mut Option<JournalWriter<S>>) {
+fn journal_finalize_step<S: JournalSink>(
+    shared: &Shared,
+    journal: &mut Option<JournalWriter<S>>,
+) {
     let Some(mut writer) = journal.take() else {
         return;
     };
@@ -850,13 +853,12 @@ where
     out.clear();
     match channels {
         0 | 1 => out.extend(data.iter().map(|&sample| sample_to_f32(sample))),
-        _ => out.extend(data.chunks_exact(channels).map(|frame| {
-            frame
-                .iter()
-                .map(|&sample| sample_to_f32(sample))
-                .sum::<f32>()
-                / channels as f32
-        })),
+        _ => out.extend(
+            data.chunks_exact(channels).map(|frame| {
+                frame.iter().map(|&sample| sample_to_f32(sample)).sum::<f32>()
+                    / channels as f32
+            }),
+        ),
     }
 }
 
@@ -1168,11 +1170,15 @@ pub fn start_recording() -> Result<RecorderHandle, RecorderError> {
 /// the capture — it degrades honestly: recording proceeds in memory, the
 /// fault lands in the capture-error slot, and
 /// [`RecorderHandle::acknowledged_samples`] stays 0.
-pub fn start_recording_with_journal(journals_dir: &Path) -> Result<RecorderHandle, RecorderError> {
+pub fn start_recording_with_journal(
+    journals_dir: &Path,
+) -> Result<RecorderHandle, RecorderError> {
     start_recording_inner(Some(journals_dir))
 }
 
-fn start_recording_inner(journals_dir: Option<&Path>) -> Result<RecorderHandle, RecorderError> {
+fn start_recording_inner(
+    journals_dir: Option<&Path>,
+) -> Result<RecorderHandle, RecorderError> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| {
         RecorderError::Device(
@@ -1190,27 +1196,28 @@ fn start_recording_inner(journals_dir: Option<&Path>) -> Result<RecorderHandle, 
     // Open the journal before the stream so a take that starts recording
     // always has its durable sink (or a surfaced fault) from the first
     // sample. create_new means an existing journal can never be stomped.
-    let (journal, journal_identity) =
-        match journals_dir.map(|dir| JournalWriter::<FileSink>::create(dir, sample_rate)) {
-            Some(Ok(writer)) => {
-                let identity = JournalIdentity {
-                    id: writer.id().to_string(),
-                    path: writer.path().to_path_buf(),
-                    rate: writer.sample_rate(),
-                };
-                (Some(writer), Some(identity))
-            }
-            Some(Err(err)) => {
-                // Degraded start (§3 storage-fault honesty): capture without a
-                // journal, with the reason in the capture-error slot.
-                shared.lock_consumer().journal_fault = Some(format!(
-                    "Could not open the capture journal: {err}. Recording continues, but no \
+    let (journal, journal_identity) = match journals_dir
+        .map(|dir| JournalWriter::<FileSink>::create(dir, sample_rate))
+    {
+        Some(Ok(writer)) => {
+            let identity = JournalIdentity {
+                id: writer.id().to_string(),
+                path: writer.path().to_path_buf(),
+                rate: writer.sample_rate(),
+            };
+            (Some(writer), Some(identity))
+        }
+        Some(Err(err)) => {
+            // Degraded start (§3 storage-fault honesty): capture without a
+            // journal, with the reason in the capture-error slot.
+            shared.lock_consumer().journal_fault = Some(format!(
+                "Could not open the capture journal: {err}. Recording continues, but no \
                  samples will be acknowledged as durable."
-                ));
-                (None, None)
-            }
-            None => (None, None),
-        };
+            ));
+            (None, None)
+        }
+        None => (None, None),
+    };
 
     let stream = open_stream(&device, sample_format, &stream_config, &shared)?;
 
@@ -1539,7 +1546,13 @@ mod tests {
     #[test]
     fn clip_counters_count_full_scale_boundary() {
         let counters = ClipCounters::default();
-        counters.observe(&[CLIP_THRESHOLD, CLIP_THRESHOLD - 0.0001, -1.0, f32::NAN, 0.5]);
+        counters.observe(&[
+            CLIP_THRESHOLD,
+            CLIP_THRESHOLD - 0.0001,
+            -1.0,
+            f32::NAN,
+            0.5,
+        ]);
         // Exactly at the threshold counts; just under does not; -1.0 counts;
         // NaN is not evidence of clipping; every observed sample is totaled.
         assert_eq!(counters.ratio(), 0.4);
@@ -1607,7 +1620,13 @@ mod tests {
 
         for block in 0..100 {
             let raw: Vec<f32> = (0..AUTO_GAIN_BLOCK)
-                .map(|index| if (block + index) % 2 == 0 { 1.0 } else { -1.0 })
+                .map(|index| {
+                    if (block + index) % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                })
                 .collect();
             counters.observe(&raw);
 
@@ -2109,11 +2128,7 @@ mod tests {
             callback.process(block, &shared);
         }
         let take = handle.stop().expect("stop with pending samples");
-        assert_eq!(
-            take.audio.samples,
-            data[300..],
-            "stop returns only the pending"
-        );
+        assert_eq!(take.audio.samples, data[300..], "stop returns only the pending");
     }
 
     #[test]
@@ -2194,7 +2209,8 @@ mod tests {
         callback.process(&first, &shared);
         let handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
 
-        let acknowledged = wait_until(|| handle.acknowledged_samples(), |acked| *acked == 20_000);
+        let acknowledged =
+            wait_until(|| handle.acknowledged_samples(), |acked| *acked == 20_000);
         assert_eq!(acknowledged, 20_000, "boundary fsync published the ack");
         assert!(acknowledged <= handle.captured_sample_count());
 
@@ -2211,10 +2227,8 @@ mod tests {
         for block in more.chunks(128) {
             callback.process(block, &shared);
         }
-        let fault =
-            wait_until(|| handle.capture_error(), |fault| fault.is_some()).unwrap_or_else(|| {
-                panic!("the storage fault must surface through the capture-error slot")
-            });
+        let fault = wait_until(|| handle.capture_error(), |fault| fault.is_some())
+            .unwrap_or_else(|| panic!("the storage fault must surface through the capture-error slot"));
         assert!(
             handle.captured_sample_count() == 28_000,
             "capture is still live: {}",
@@ -2226,10 +2240,7 @@ mod tests {
             "acknowledgment frozen at the last fsynced boundary"
         );
         assert!(fault.contains("journal"), "{fault}");
-        assert!(
-            fault.contains("20 000") || fault.contains("20000"),
-            "{fault}"
-        );
+        assert!(fault.contains("20 000") || fault.contains("20000"), "{fault}");
 
         // The take itself is not lost: memory accumulation kept running.
         let take = handle.stop().expect("stop with a faulted journal");
@@ -2237,10 +2248,7 @@ mod tests {
         let report = take.journal.expect("journal report present");
         assert!(!report.finalized, "a faulted journal has no trailer");
         assert_eq!(report.acknowledged_samples, 20_000);
-        assert!(report
-            .fault
-            .as_deref()
-            .is_some_and(|f| f.contains("journal")));
+        assert!(report.fault.as_deref().is_some_and(|f| f.contains("journal")));
 
         // What the journal file can verify on recovery: exactly the frozen
         // boundary's samples.
@@ -2253,7 +2261,8 @@ mod tests {
     #[test]
     fn stop_finalizes_the_journal_with_a_verifiable_trailer() {
         let dir = TempDir::new().expect("tempdir");
-        let writer = JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal");
+        let writer =
+            JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal");
 
         let shared = test_shared(8_192);
         let mut callback = CallbackState::new(1);
@@ -2273,7 +2282,8 @@ mod tests {
         assert_eq!(report.acknowledged_samples, 5_000);
         assert_eq!(report.fault, None);
 
-        let parsed = crate::journal::read_journal(&report.path).expect("parse finalized journal");
+        let parsed =
+            crate::journal::read_journal(&report.path).expect("parse finalized journal");
         assert!(parsed.finalized);
         assert_eq!(parsed.samples, expected, "journal round-trips byte-exact");
         assert_eq!(parsed.torn_tail_bytes, 0);
@@ -2347,7 +2357,10 @@ mod tests {
         // appended), then wait until the writer is parked inside the
         // boundary fsync.
         *gate.0.lock().expect("close the gate") = false;
-        wait_until(|| in_sync.load(Ordering::Acquire), |parked| *parked);
+        wait_until(
+            || in_sync.load(Ordering::Acquire),
+            |parked| *parked,
+        );
 
         // Watchdog: if `latest_window` does block on the consumer lock,
         // release the fsync anyway so the failure below is a latency
@@ -2396,7 +2409,8 @@ mod tests {
         // callback is in flight, and samples delivered during that window
         // must be part of the finalized journal.
         let dir = TempDir::new().expect("tempdir");
-        let writer = JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal");
+        let writer =
+            JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal");
 
         let shared = test_shared(8_192);
         let mut callback = CallbackState::new(1);
@@ -2470,12 +2484,10 @@ mod tests {
         assert_eq!(report.fault, None);
 
         // The durable copy itself, not just the report's claim.
-        let parsed = crate::journal::read_journal(&report.path).expect("parse finalized journal");
+        let parsed =
+            crate::journal::read_journal(&report.path).expect("parse finalized journal");
         assert!(parsed.finalized);
-        assert_eq!(
-            parsed.samples, expected,
-            "the journal round-trips the whole take"
-        );
+        assert_eq!(parsed.samples, expected, "the journal round-trips the whole take");
         assert_eq!(parsed.torn_tail_bytes, 0);
     }
 
@@ -2489,8 +2501,8 @@ mod tests {
         // reconcile then recovers nothing — the committed row prevents a
         // duplicate.
         let journals_dir = TempDir::new().expect("journals tempdir");
-        let writer =
-            JournalWriter::<FileSink>::create(journals_dir.path(), 16_000).expect("create journal");
+        let writer = JournalWriter::<FileSink>::create(journals_dir.path(), 16_000)
+            .expect("create journal");
 
         let shared = test_shared(8_192);
         let mut callback = CallbackState::new(1);
@@ -2542,11 +2554,11 @@ mod tests {
                         None,
                     )
                     .expect("force interrupted");
-                let stored = store
-                    .get_capture(&record.id)
-                    .expect("row")
-                    .expect("committed");
-                assert_eq!(stored.status, crate::store_v2::CaptureStatus::Interrupted);
+                let stored = store.get_capture(&record.id).expect("row").expect("committed");
+                assert_eq!(
+                    stored.status,
+                    crate::store_v2::CaptureStatus::Interrupted
+                );
                 assert!(!report.path.exists(), "adoption moved the journal");
                 let loaded = store.load_audio(&record.id).expect("stored audio");
                 assert_eq!(loaded.samples, expected, "the stored audio is the salvage");
@@ -2555,7 +2567,10 @@ mod tests {
                 // recovers nothing for this take.
                 let rerun = store.reconcile().expect("reconcile rerun");
                 assert!(
-                    !rerun.recovered_torn.iter().any(|take| take.id == record.id),
+                    !rerun
+                        .recovered_torn
+                        .iter()
+                        .any(|take| take.id == record.id),
                     "a committed row is never recovered twice"
                 );
                 assert!(

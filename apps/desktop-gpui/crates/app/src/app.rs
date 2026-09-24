@@ -89,8 +89,13 @@ impl Default for CheckSequencer {
 /// one (the port's `connectionFailureMessage` is already built in).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
-    Ok { model: String, busy: bool },
-    Failed { message: String },
+    Ok {
+        model: String,
+        busy: bool,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// One Test Connection press: in flight against `endpoint`, or settled
@@ -166,7 +171,9 @@ pub(crate) fn settings_callout_view(
                 // the callout must not read "needs attention" the moment
                 // the dialog opens on a fresh launch (#207 review).
                 Connection::Checking => "Checking server…".to_string(),
-                Connection::Busy | Connection::Offline => "Server needs attention".to_string(),
+                Connection::Busy | Connection::Offline => {
+                    "Server needs attention".to_string()
+                }
             },
             detail: live_endpoint.to_string(),
         },
@@ -258,7 +265,8 @@ pub(crate) fn live_check_writes(
             connection: Connection::Offline,
             server_model: None,
             model_sync: None,
-            error_slot: (purpose == HealthCheckPurpose::Live).then(|| Some(message.clone())),
+            error_slot: (purpose == HealthCheckPurpose::Live)
+                .then(|| Some(message.clone())),
         },
     }
 }
@@ -469,7 +477,9 @@ fn rss_bytes() -> u64 {
 
 /// Split a metadata-only listing (G02): readable summaries in listing
 /// order, damaged records flagged alongside them.
-pub(crate) fn split_listing(list: Vec<ListedRecord>) -> (Vec<SessionSummary>, Vec<DamagedRecord>) {
+pub(crate) fn split_listing(
+    list: Vec<ListedRecord>,
+) -> (Vec<SessionSummary>, Vec<DamagedRecord>) {
     let mut sessions = Vec::new();
     let mut damaged = Vec::new();
     for record in list {
@@ -484,7 +494,10 @@ pub(crate) fn split_listing(list: Vec<ListedRecord>) -> (Vec<SessionSummary>, Ve
 /// The selection after applying a listing (G02): kept while the selected
 /// record is still readable, otherwise reset to the newest readable take —
 /// never left pointing at a record the store just flagged as damaged.
-pub(crate) fn next_selection(current: Option<&str>, sessions: &[SessionSummary]) -> Option<String> {
+pub(crate) fn next_selection(
+    current: Option<&str>,
+    sessions: &[SessionSummary],
+) -> Option<String> {
     if current.is_some_and(|id| sessions.iter().any(|session| session.id == id)) {
         return current.map(str::to_string);
     }
@@ -605,7 +618,10 @@ pub(crate) fn effective_delete_arm(armed_for: Option<&str>, selected: Option<&st
 /// (review finding 1): the move must run the same reset as an explicit
 /// click in `select_session` — including stopping playback of a take that
 /// just vanished from the listing.
-pub(crate) fn listing_moves_selection(current: Option<&str>, sessions: &[SessionSummary]) -> bool {
+pub(crate) fn listing_moves_selection(
+    current: Option<&str>,
+    sessions: &[SessionSummary],
+) -> bool {
     next_selection(current, sessions).as_deref() != current
 }
 
@@ -726,9 +742,13 @@ fn write_download_exclusive(
             .open(&path)
         {
             Ok(mut file) => {
-                let written = file
-                    .write_all(bytes)
-                    .and_then(|()| if sync { file.sync_all() } else { Ok(()) });
+                let written = file.write_all(bytes).and_then(|()| {
+                    if sync {
+                        file.sync_all()
+                    } else {
+                        Ok(())
+                    }
+                });
                 if let Err(err) = written {
                     // Never leave a truncated export behind on disk.
                     let _ = std::fs::remove_file(&path);
@@ -830,8 +850,7 @@ impl StarlingApp {
                 // startup.
                 let recovered = {
                     let store = store.clone();
-                    cx.background_spawn(async move { store.startup_recovery() })
-                        .await
+                    cx.background_spawn(async move { store.startup_recovery() }).await
                 };
                 match recovered {
                     Ok(summary) if !summary.is_empty() => {
@@ -844,8 +863,9 @@ impl StarlingApp {
                     Ok(_) => {}
                     Err(err) => {
                         this.update(cx, |app, cx| {
-                            app.error =
-                                Some(format!("Could not recover interrupted recordings: {err}"));
+                            app.error = Some(format!(
+                                "Could not recover interrupted recordings: {err}"
+                            ));
                             cx.notify();
                         })
                         .ok();
@@ -1014,8 +1034,7 @@ impl StarlingApp {
     /// result.
     pub fn test_connection(&mut self, cx: &mut Context<Self>) {
         let draft = self.draft_endpoint.read(cx).value();
-        let Some((token, clean)) =
-            probe_press(&mut self.probe_sequencer, self.probe.as_ref(), &draft)
+        let Some((token, clean)) = probe_press(&mut self.probe_sequencer, self.probe.as_ref(), &draft)
         else {
             // The newest press is still in flight: drop this one, the
             // state-layer twin of the disabled button (#207 review).
@@ -1187,10 +1206,7 @@ impl StarlingApp {
     /// state for the selected take (B05, #208). Derived, so an arm left
     /// behind by any selection change bypassing `select_session` is inert.
     pub fn delete_armed(&self) -> bool {
-        effective_delete_arm(
-            self.confirm_delete_id.as_deref(),
-            self.selected_id.as_deref(),
-        )
+        effective_delete_arm(self.confirm_delete_id.as_deref(), self.selected_id.as_deref())
     }
 
     /// Whether a delete job for `id` is still in flight (#214.3).
@@ -1356,8 +1372,7 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) })
-                    .await
+                cx.background_spawn(async move { store.audio_wav(&id) }).await
             };
             this.update(cx, |app, cx| match loaded {
                 Ok(Some(wav)) => {
@@ -1576,8 +1591,7 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) })
-                    .await
+                cx.background_spawn(async move { store.audio_wav(&id) }).await
             };
             this.update(cx, |app, cx| {
                 match loaded {
@@ -1757,18 +1771,12 @@ mod tests {
 
     #[test]
     fn candidate_names_suffix_before_the_extension() {
-        assert_eq!(
-            download_name_candidate("starling-a.txt", 1),
-            "starling-a.txt"
-        );
+        assert_eq!(download_name_candidate("starling-a.txt", 1), "starling-a.txt");
         assert_eq!(
             download_name_candidate("starling-2026-a.wav", 2),
             "starling-2026-a-2.wav"
         );
-        assert_eq!(
-            download_name_candidate("starling-a.wav", 10),
-            "starling-a-10.wav"
-        );
+        assert_eq!(download_name_candidate("starling-a.wav", 10), "starling-a-10.wav");
         // Extension-less names take the suffix at the end.
         assert_eq!(download_name_candidate("readme", 3), "readme-3");
         // A leading dot is the stem, not an extension.
@@ -1777,7 +1785,10 @@ mod tests {
 
     #[test]
     fn watcher_polls_only_while_the_current_generation_is_audibly_playing() {
-        assert_eq!(playback_watch(7, 7, true, Some(true)), PlaybackWatch::Poll);
+        assert_eq!(
+            playback_watch(7, 7, true, Some(true)),
+            PlaybackWatch::Poll
+        );
     }
 
     #[test]
@@ -1800,7 +1811,10 @@ mod tests {
             playback_watch(6, 7, true, Some(false)),
             PlaybackWatch::Cancelled
         );
-        assert_eq!(playback_watch(6, 7, true, None), PlaybackWatch::Cancelled);
+        assert_eq!(
+            playback_watch(6, 7, true, None),
+            PlaybackWatch::Cancelled
+        );
         assert_eq!(
             playback_watch(6, 7, true, Some(true)),
             PlaybackWatch::Cancelled
@@ -1904,8 +1918,8 @@ mod tests {
     #[test]
     fn exclusive_write_lands_on_a_free_name() {
         let dir = scratch_dir("free");
-        let path =
-            write_download_exclusive(&dir, "starling-t.wav", b"NEW", true).expect("write succeeds");
+        let path = write_download_exclusive(&dir, "starling-t.wav", b"NEW", true)
+            .expect("write succeeds");
         assert_eq!(path, dir.join("starling-t.wav"));
         assert_eq!(std::fs::read(&path).expect("read back"), b"NEW");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1939,17 +1953,10 @@ mod tests {
         std::fs::write(dir.join("starling-t.txt"), b"1").expect("seed");
         std::fs::write(dir.join("starling-t-2.txt"), b"2").expect("seed");
 
-        let path =
-            write_download_exclusive(&dir, "starling-t.txt", b"3", true).expect("third name");
+        let path = write_download_exclusive(&dir, "starling-t.txt", b"3", true).expect("third name");
         assert_eq!(path, dir.join("starling-t-3.txt"));
-        assert_eq!(
-            std::fs::read(dir.join("starling-t.txt")).expect("original"),
-            b"1"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("starling-t-2.txt")).expect("second"),
-            b"2"
-        );
+        assert_eq!(std::fs::read(dir.join("starling-t.txt")).expect("original"), b"1");
+        assert_eq!(std::fs::read(dir.join("starling-t-2.txt")).expect("second"), b"2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1971,8 +1978,8 @@ mod tests {
         std::fs::write(&target, b"PRECIOUS").expect("seed symlink target");
         std::os::unix::fs::symlink(&target, dir.join("starling-t.txt")).expect("plant symlink");
 
-        let path = write_download_exclusive(&dir, "starling-t.txt", b"EXPORT", true)
-            .expect("dodges symlink");
+        let path =
+            write_download_exclusive(&dir, "starling-t.txt", b"EXPORT", true).expect("dodges symlink");
 
         // The symlink and its target are untouched; the export landed beside it.
         assert_eq!(std::fs::read(&target).expect("target content"), b"PRECIOUS");
@@ -2053,10 +2060,7 @@ mod tests {
         // B05, #208: the first click on a take's trash button may never
         // delete; only the second click on that same button does.
         assert_eq!(delete_intent(None, "take-a"), DeleteIntent::Arm);
-        assert_eq!(
-            delete_intent(Some("take-a"), "take-a"),
-            DeleteIntent::Delete
-        );
+        assert_eq!(delete_intent(Some("take-a"), "take-a"), DeleteIntent::Delete);
     }
 
     #[test]
@@ -2112,11 +2116,8 @@ mod tests {
             DiscardIntent::Execute
         );
         // A third stash kills that arm again.
-        let after_third = unsaved_batch_token(&[
-            unsaved("unsaved-1"),
-            unsaved("unsaved-2"),
-            unsaved("unsaved-3"),
-        ]);
+        let after_third =
+            unsaved_batch_token(&[unsaved("unsaved-1"), unsaved("unsaved-2"), unsaved("unsaved-3")]);
         assert_eq!(
             discard_intent(Some(after_stash), after_third),
             DiscardIntent::Arm
@@ -2341,10 +2342,7 @@ mod tests {
         assert!(probe.is_current(probe_token));
         let newer_live = health.begin();
         assert!(!health.is_current(live_token));
-        assert!(
-            probe.is_current(probe_token),
-            "a live check never silences a probe"
-        );
+        assert!(probe.is_current(probe_token), "a live check never silences a probe");
         assert!(health.is_current(newer_live));
     }
 
@@ -2418,12 +2416,14 @@ mod tests {
 
     #[test]
     fn without_a_probe_the_callout_shows_the_live_committed_status() {
-        let ready = settings_callout_view(None, Connection::Ready, "http://committed:8181");
+        let ready =
+            settings_callout_view(None, Connection::Ready, "http://committed:8181");
         assert_eq!(ready.dot, Connection::Ready);
         assert_eq!(ready.title, "Server connected");
         assert_eq!(ready.detail, "http://committed:8181");
 
-        let offline = settings_callout_view(None, Connection::Offline, "http://committed:8181");
+        let offline =
+            settings_callout_view(None, Connection::Offline, "http://committed:8181");
         assert_eq!(offline.dot, Connection::Offline);
         assert_eq!(offline.title, "Server needs attention");
     }
@@ -2464,7 +2464,8 @@ mod tests {
             Some(&ConnectionProbe::Done {
                 endpoint: "http://draft:9000".to_string(),
                 outcome: ProbeOutcome::Failed {
-                    message: "error sending request for url (http://draft:9000/health)".to_string(),
+                    message:
+                        "error sending request for url (http://draft:9000/health)".to_string(),
                 },
             }),
             Connection::Ready,
@@ -2614,7 +2615,8 @@ mod tests {
                 &Ok(health(model, None, None)),
             );
             assert_eq!(
-                writes.model_sync, None,
+                writes.model_sync,
+                None,
                 "no auto-sync for {protocol:?} user_set={user_set} model={model:?}"
             );
         }

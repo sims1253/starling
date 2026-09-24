@@ -69,10 +69,8 @@ use machine::capture::{
     CaptureActor, CaptureConfig, CaptureMsg, CaptureSource, CaptureStore, DeviceCaptureSource,
     InMemoryCaptureStore, TakeRegistry,
 };
-use machine::context::{
-    ContextActor, ContextMsg, ContextProvider, RouteFreezer, StubContextProvider,
-};
-use machine::delivery::{DeliveryActor, DeliveryAdapter, DeliveryMsg, StubDeliveryAdapter};
+use machine::context::{ContextActor, ContextMsg, ContextProvider, RouteFreezer, StubContextProvider};
+use machine::delivery::{DeliveryActor, DeliveryMsg, DeliveryAdapter, StubDeliveryAdapter};
 use machine::docs::{DocsActor, DocsMsg, DocumentStore, MemoryDocumentStore, RevisionRegistry};
 use machine::jobs::{JobsActor, JobsMsg, JobsSnapshot};
 use machine::{MachineView, Receipt, Rejection};
@@ -519,10 +517,7 @@ impl Router {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let payload = value
-            .get("payload")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let payload = value.get("payload").cloned().unwrap_or(serde_json::Value::Null);
         let command = match Command::from_parts(&type_, &payload) {
             Ok(command) => command,
             Err(message) => {
@@ -549,10 +544,15 @@ impl Router {
         // violation is rejected, never absorbed (duplicates and reorders
         // must be surfaced).
         if let Some(seq) = seq {
-            let stream = corr.clone().unwrap_or_else(|| "__commands__".to_string());
+            let stream = corr
+                .clone()
+                .unwrap_or_else(|| "__commands__".to_string());
             let stale = {
                 let frontier = self.command_frontier.lock().expect("frontier lock");
-                frontier.get(&stream).filter(|last| seq <= **last).copied()
+                frontier
+                    .get(&stream)
+                    .filter(|last| seq <= **last)
+                    .copied()
             };
             if let Some(last) = stale {
                 let _ = reply.try_send(Err(Rejection::SeqNotMonotonic {
@@ -597,9 +597,9 @@ impl Router {
             "docs" => forward!(self.docs, DocsMsg::Command),
             "delivery" => forward!(self.delivery, DeliveryMsg::Command),
             other => {
-                let _ = inbound
-                    .reply
-                    .try_send(Err(Rejection::UnknownMessageType(other.to_string())));
+                let _ = inbound.reply.try_send(Err(Rejection::UnknownMessageType(
+                    other.to_string(),
+                )));
             }
         }
     }
@@ -611,7 +611,11 @@ impl RuntimeClient {
     /// The runtime assigns `id`, `ts` and a strictly increasing `seq`.
     /// `Ok` means the owning machine accepted the command; outcome events
     /// follow on the event stream.
-    pub fn send(&self, corr: Option<&str>, command: Command) -> Result<Receipt, Rejection> {
+    pub fn send(
+        &self,
+        corr: Option<&str>,
+        command: Command,
+    ) -> Result<Receipt, Rejection> {
         let corr = corr.map(str::to_string);
         let seq = self.bus.next_seq(corr.as_deref());
         let (tx, rx) = channel::bounded(1);

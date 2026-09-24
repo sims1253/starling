@@ -1329,17 +1329,13 @@ fn startup_reconcile_salvages_a_crashed_predecessors_staging_journal() {
         let confirmed: Vec<f32> = (0..800).map(|i| i as f32 * 0.01).collect();
         take.append_frames(&confirmed).expect("append");
         take.write_boundary().expect("boundary");
-        take.append_frames(&[0.5f32; 120])
-            .expect("unconfirmed tail");
+        take.append_frames(&[0.5f32; 120]).expect("unconfirmed tail");
         let id = take.id().to_string();
         drop(take); // "crash"
         id
     };
     assert!(
-        root.path()
-            .join("staging")
-            .join(format!("{crashed_id}.sj"))
-            .exists(),
+        root.path().join("staging").join(format!("{crashed_id}.sj")).exists(),
         "the residue is in place before the host starts"
     );
 
@@ -1365,10 +1361,7 @@ fn startup_reconcile_salvages_a_crashed_predecessors_staging_journal() {
         starling_dictation::store_v2::CaptureStatus::Interrupted
     );
     assert!(
-        root.path()
-            .join("audio")
-            .join(format!("{crashed_id}.sj"))
-            .exists(),
+        root.path().join("audio").join(format!("{crashed_id}.sj")).exists(),
         "promoted out of staging into audio/"
     );
 
@@ -1440,10 +1433,8 @@ fn shutdown_completes_despite_a_writer_parked_on_a_silent_peer() {
     // writer parks mid-write with the queue (capacity 1024) still far
     // under its cap — no delivery failure, no eviction, just a wedged
     // connection nobody rescues.
-    let request = serde_json::to_vec(&Frame::GetSnapshot {
-        req: "wedged".into(),
-    })
-    .expect("serializes");
+    let request =
+        serde_json::to_vec(&Frame::GetSnapshot { req: "wedged".into() }).expect("serializes");
     for _ in 0..512 {
         write_raw_frame(&mut wedged, &request);
     }
@@ -1595,8 +1586,7 @@ fn an_idle_pre_greeting_connection_is_closed_at_the_deadline() {
     let mut host = serve(config).expect("host serves");
 
     let mut idle = raw_connect(&host);
-    idle.set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
+    idle.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
     // The hello arrives, then nothing from us — the host must answer
     // with the protocol violation and end the connection.
     let (code, detail) = read_transport_error(&mut idle);
@@ -1612,10 +1602,7 @@ fn an_idle_pre_greeting_connection_is_closed_at_the_deadline() {
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                assert!(
-                    Instant::now() < deadline,
-                    "the idle connection never closed"
-                );
+                assert!(Instant::now() < deadline, "the idle connection never closed");
             }
             Err(err) => panic!("reading the idle connection's end: {err}"),
         }
@@ -1690,10 +1677,8 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
             Err(err) => panic!("no hello from the host: {err}"),
         }
     }
-    let request = serde_json::to_vec(&Frame::GetSnapshot {
-        req: "flood".into(),
-    })
-    .expect("serializes");
+    let request =
+        serde_json::to_vec(&Frame::GetSnapshot { req: "flood".into() }).expect("serializes");
     // The flood must decisively exceed every kernel buffer in front of
     // the host's writer: 512 snapshot replies are a few hundred KiB
     // against a ~212 KiB sender buffer plus the shrunk receive window,
@@ -1728,13 +1713,13 @@ fn an_outbound_queue_overflow_closes_with_slow_consumer() {
         );
         let mut chunk = [0u8; 4096];
         match std::io::Read::read(&mut stalled, &mut chunk) {
-            Ok(0) => break,    // clean EOF
-            Ok(_) => continue, // late replies leaving the kernel
+            Ok(0) => break,                                  // clean EOF
+            Ok(_) => continue,                               // late replies leaving the kernel
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                continue; // idle poll slice
+                continue // idle poll slice
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::ConnectionReset

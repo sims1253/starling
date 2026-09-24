@@ -102,19 +102,10 @@ impl HostConfig {
                 runtime_dir.display()
             )
         })?;
-        let store = V2CaptureStore::open(&data_root).map_err(|err| {
-            format!(
-                "capture store at {} will not open: {err}",
-                data_root.display()
-            )
-        })?;
+        let store = V2CaptureStore::open(&data_root)
+            .map_err(|err| format!("capture store at {} will not open: {err}", data_root.display()))?;
         let documents = starling_runtime::machine::docs::V2DocumentStore::open(&data_root)
-            .map_err(|err| {
-                format!(
-                    "documents store at {} will not open: {err}",
-                    data_root.display()
-                )
-            })?;
+            .map_err(|err| format!("documents store at {} will not open: {err}", data_root.display()))?;
         let mut config = HostConfig::new(&data_root, &runtime_dir);
         config.runtime = config
             .runtime

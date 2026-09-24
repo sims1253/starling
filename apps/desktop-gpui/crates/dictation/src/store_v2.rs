@@ -93,7 +93,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::audio::decode_pcm16_wav;
 use crate::journal::{
-    self, read_journal, samples_hash, seal_recovered_journal, sync_dir, JournalWriter,
+    self, JournalWriter, read_journal, samples_hash, seal_recovered_journal, sync_dir,
 };
 use crate::storage::{is_safe_path_component, now_iso};
 
@@ -650,15 +650,19 @@ impl StoreV2 {
             .optional()?;
         match text {
             None => Ok(None),
-            Some(text) => text.parse().map(Some).map_err(|_| {
-                StoreV2Error::Invalid(format!("meta.schema_version {text:?} is not a number"))
-            }),
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| StoreV2Error::Invalid(format!(
+                    "meta.schema_version {text:?} is not a number"
+                ))),
         }
     }
 
     /// The database's schema version (after any upgrade `open` performed).
     pub fn schema_version(&self) -> Result<u32, StoreV2Error> {
-        Ok(Self::read_schema_version(&self.conn)?.expect("open guarantees a schema version row"))
+        Ok(Self::read_schema_version(&self.conn)?
+            .expect("open guarantees a schema version row"))
     }
 
     /// The v2 root directory.
@@ -724,7 +728,8 @@ impl StoreV2 {
     ) -> Result<V2Take, StoreV2Error> {
         validate_capture_id(&id)?;
         std::fs::create_dir_all(self.root.join(STAGING_DIR))?;
-        let writer = JournalWriter::create_named(&self.root.join(STAGING_DIR), id, sample_rate)?;
+        let writer =
+            JournalWriter::create_named(&self.root.join(STAGING_DIR), id, sample_rate)?;
         Ok(V2Take {
             writer,
             created_utc: now_iso(),
@@ -1032,8 +1037,10 @@ impl StoreV2 {
                  FROM recognition_attempts WHERE capture_id IN ({placeholders}) ORDER BY rowid"
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
             let rows = stmt.query_map(params.as_slice(), Self::row_to_attempt)?;
             for row in rows {
                 let attempt = row?;
@@ -1071,13 +1078,9 @@ impl StoreV2 {
              ON CONFLICT(doc_id) DO UPDATE SET
                 name = excluded.name,
                 head_revision = excluded.head_revision,
-                turn_seq = excluded.turn_seq",
-            params![
-                doc_id,
-                name,
-                int64(head_revision)?,
-                int64(u64::from(turn_seq))?
-            ],
+                turn_seq = excluded.turn_seq
+             WHERE excluded.head_revision >= documents.head_revision",
+            params![doc_id, name, int64(head_revision)?, int64(u64::from(turn_seq))?],
         )?;
         Ok(())
     }
@@ -1098,7 +1101,6 @@ impl StoreV2 {
                                    status, provenance, disposition)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(rev_id) DO UPDATE SET
-                doc_id = excluded.doc_id,
                 base_rev = excluded.base_rev,
                 sources_json = excluded.sources_json,
                 text = excluded.text,
@@ -1121,7 +1123,9 @@ impl StoreV2 {
 
     /// Advances a document's head and lands the head's revision row in
     /// one transaction: the durable head never references a revision
-    /// whose row (and text) did not land.
+    /// whose row (and text) did not land. Both writes run on `self.conn`
+    /// inside the open transaction; the store's single connection sits
+    /// behind a Mutex in every embedder, so nothing interleaves.
     pub fn commit_document_head(
         &self,
         name: &str,
@@ -1157,9 +1161,9 @@ impl StoreV2 {
     /// half-present shape to interpret.
     pub fn get_document(&self, doc_id: &str) -> Result<Option<DocumentRow>, StoreV2Error> {
         validate_document_id(doc_id)?;
-        // Both reads run under the caller's `&self` on the one connection
-        // (the store sits behind a Mutex in every embedder), so the
-        // document row and its revisions are one consistent snapshot.
+        // Both reads run on the one connection, which sits behind a Mutex
+        // in every embedder: the document row and its revisions are one
+        // consistent snapshot.
         let document = self
             .conn
             .query_row(
@@ -1216,18 +1220,17 @@ impl StoreV2 {
     /// clamp is the facade's business).
     pub fn list_records(&self, offset: usize, limit: usize) -> Result<CapturePage, StoreV2Error> {
         let limit = limit.min(LIST_PAGE_MAX);
-        let total: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))?;
+        let total: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))?;
         let mut stmt = self.conn.prepare(
             "SELECT id, created_utc, tz, device, actual_rate, policy, frame_count,
                     ack_sample_index, journal_hash, status, retention_class, extra_json
              FROM captures ORDER BY created_utc DESC, id LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = stmt.query_map(
-            params![int64(limit as u64)?, int64(offset as u64)?],
-            |row| Self::row_to_capture(row),
-        )?;
+        let rows = stmt.query_map(params![int64(limit as u64)?, int64(offset as u64)?], |row| {
+            Self::row_to_capture(row)
+        })?;
 
         let mut records = Vec::new();
         for row in rows {
@@ -1266,11 +1269,9 @@ impl StoreV2 {
         let path = self.audio_path(&record.id);
         match std::fs::metadata(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                vec![
-                    "audio journal is missing — the take was committed but its journal \
+                vec!["audio journal is missing — the take was committed but its journal \
                       is gone; the row is kept and marked interrupted"
-                        .to_string(),
-                ]
+                    .to_string()]
             }
             Err(err) => vec![format!("audio journal: {err}")],
             Ok(_) => {
@@ -1566,9 +1567,7 @@ impl StoreV2 {
         // Tombstoned ids outrank everything (R21): the DB row and any file
         // under quarantine/ both mean "deliberately deleted".
         let mut dead: std::collections::HashSet<String> =
-            journal_ids_in(&self.root.join(QUARANTINE_DIR))
-                .into_iter()
-                .collect();
+            journal_ids_in(&self.root.join(QUARANTINE_DIR)).into_iter().collect();
         {
             let mut stmt = self.conn.prepare("SELECT id FROM tombstones")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1580,9 +1579,10 @@ impl StoreV2 {
         // --- staging side ---
         for id in journal_ids_in(&self.root.join(STAGING_DIR)) {
             if !is_safe_path_component(&id) {
-                report
-                    .unreadable
-                    .push((id, "journal id is not a safe path component".to_string()));
+                report.unreadable.push((
+                    id,
+                    "journal id is not a safe path component".to_string(),
+                ));
                 continue;
             }
             if dead.contains(&id) {
@@ -1659,7 +1659,11 @@ impl StoreV2 {
                     // rename, defense for copied trees): keep it, only
                     // ensure the note is present.
                     if existing.status != CaptureStatus::Interrupted {
-                        self.update_capture_status(&id, CaptureStatus::Interrupted, Some(&note))?;
+                        self.update_capture_status(
+                            &id,
+                            CaptureStatus::Interrupted,
+                            Some(&note),
+                        )?;
                     }
                 }
                 None => {
@@ -1679,9 +1683,10 @@ impl StoreV2 {
         // --- audio side ---
         for id in journal_ids_in(&self.root.join(AUDIO_DIR)) {
             if !is_safe_path_component(&id) {
-                report
-                    .unreadable
-                    .push((id, "journal id is not a safe path component".to_string()));
+                report.unreadable.push((
+                    id,
+                    "journal id is not a safe path component".to_string(),
+                ));
                 continue;
             }
             if dead.contains(&id) {
@@ -2360,7 +2365,10 @@ impl StoreV2 {
         }
 
         let mut parsed = read_journal(source).map_err(|err| {
-            StoreV2Error::Invalid(format!("capture journal {}: {err}", source.display()))
+            StoreV2Error::Invalid(format!(
+                "capture journal {}: {err}",
+                source.display()
+            ))
         })?;
         if parsed.samples.is_empty() {
             return Err(StoreV2Error::NoVerifiedSamples { id: id.clone() });
@@ -3092,11 +3100,7 @@ impl ReconciliationReport {
                 "{} ownership lease file{} could not be read; recovery deferred to it \
                  until the file is removed or repaired",
                 self.unreadable_leases.len(),
-                if self.unreadable_leases.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                if self.unreadable_leases.len() == 1 { "" } else { "s" }
             ));
         }
         format!("Startup scan: {}.", parts.join("; "))
@@ -3284,11 +3288,9 @@ fn merge_extra_note(current: Option<&str>, note: &str) -> String {
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    map.insert(
-        "recovery".to_string(),
-        serde_json::Value::String(note.to_string()),
-    );
-    serde_json::to_string(&serde_json::Value::Object(map)).expect("a JSON object serializes")
+    map.insert("recovery".to_string(), serde_json::Value::String(note.to_string()));
+    serde_json::to_string(&serde_json::Value::Object(map))
+        .expect("a JSON object serializes")
 }
 
 /// Read and verify one audio journal from disk (the lock-free half of
@@ -3334,10 +3336,7 @@ fn journal_ids_in(dir: &Path) -> Vec<String> {
 pub enum LeaseAcquisition {
     /// This instance is the owner of the data root. `broke` names the
     /// stale leases broken on the way in.
-    Owner {
-        owner_id: String,
-        broke: Vec<String>,
-    },
+    Owner { owner_id: String, broke: Vec<String> },
     /// A live foreign owner holds the root: this process is a client, not
     /// a competitor. `owner` identifies the live lease.
     Client { owner: LeaseInfo },
@@ -3532,7 +3531,8 @@ impl LeaseSentinel {
             loop {
                 // SAFETY: flock(2) on an fd this guard owns and keeps open
                 // until dropped; no close or hand-off happens here.
-                let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                let taken =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
 
                 if taken == 0 {
                     return Ok(Self { file: Some(file) });
@@ -3776,7 +3776,13 @@ mod tests {
         drop(store);
         let store = store_in(&dir);
         assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
-        assert_eq!(store.list_records(0, 10).expect("list").total, 1);
+        assert_eq!(
+            store
+                .list_records(0, 10)
+                .expect("list")
+                .total,
+            1
+        );
     }
 
     #[test]
@@ -3897,11 +3903,9 @@ mod tests {
         // still sees its own 99.
         let conn = Connection::open(dir.path().join("v2").join(DB_FILE)).expect("reopen");
         let version: String = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |row| {
+                row.get(0)
+            })
             .expect("version");
         assert_eq!(version, "99");
         // …and the row this build wrote is still there, unread but intact.
@@ -3925,10 +3929,7 @@ mod tests {
 
         // Write-side round trip.
         let record = store.get_capture(&id).expect("get").expect("present");
-        assert_eq!(
-            record.extra_json.as_deref(),
-            Some(r#"{"knownField":"kept"}"#)
-        );
+        assert_eq!(record.extra_json.as_deref(), Some(r#"{"knownField":"kept"}"#));
 
         // A newer writer on the same schema version added a field we do
         // not know about, directly in the column.
@@ -4031,8 +4032,7 @@ mod tests {
         take.append_frames(&confirmed).expect("append");
         let acked = take.write_boundary().expect("boundary");
         assert_eq!(acked, 800);
-        take.append_frames(&ramp(120, 800))
-            .expect("unconfirmed tail");
+        take.append_frames(&ramp(120, 800)).expect("unconfirmed tail");
         let id = take.id().to_string();
         drop(take); // "crash"
 
@@ -4220,9 +4220,7 @@ mod tests {
         let mut store = store_in(&dir);
 
         // (1) Torn staging journal.
-        let mut torn = store
-            .begin_take(TakeMeta::for_device("mic"))
-            .expect("begin");
+        let mut torn = store.begin_take(TakeMeta::for_device("mic")).expect("begin");
         torn.append_frames(&ramp(400, 0)).expect("append");
         torn.write_boundary().expect("boundary");
         torn.append_frames(&ramp(50, 400)).expect("tail");
@@ -4230,22 +4228,16 @@ mod tests {
         drop(torn);
 
         // (2) Finalized journal still in staging.
-        let mut staged = store
-            .begin_take(TakeMeta::for_device("mic"))
-            .expect("begin");
+        let mut staged = store.begin_take(TakeMeta::for_device("mic")).expect("begin");
         staged.append_frames(&ramp(200, 0)).expect("append");
         let staged_finalized = staged.finalize().expect("finalize");
         let staged_id = staged_finalized.id;
 
         // (3) Promoted audio with no row.
-        let mut orphan = store
-            .begin_take(TakeMeta::for_device("mic"))
-            .expect("begin");
+        let mut orphan = store.begin_take(TakeMeta::for_device("mic")).expect("begin");
         orphan.append_frames(&ramp(600, 0)).expect("append");
         let orphan_finalized = orphan.finalize().expect("finalize");
-        store
-            .promote_from_staging(&orphan_finalized.id)
-            .expect("promote");
+        store.promote_from_staging(&orphan_finalized.id).expect("promote");
         let orphan_id = orphan_finalized.id;
 
         // (4) A committed take whose audio later vanished.
@@ -4343,9 +4335,7 @@ mod tests {
 
         std::fs::write(store.staging_path("c_garbage"), b"not a journal").expect("garbage");
         // An empty (header-only) journal: crash right after start.
-        store
-            .begin_take(TakeMeta::for_device("mic"))
-            .expect("empty take");
+        store.begin_take(TakeMeta::for_device("mic")).expect("empty take");
 
         let report = store.reconcile().expect("reconcile");
         assert_eq!(report.unreadable.len(), 1);
@@ -4569,7 +4559,13 @@ mod tests {
             other => panic!("expected a typed refusal, got {other:?}"),
         }
         assert!(source.exists(), "the source is kept for the caller");
-        assert!(store.list_records(0, 10).expect("list").records.is_empty());
+        assert!(
+            store
+                .list_records(0, 10)
+                .expect("list")
+                .records
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4595,9 +4591,11 @@ mod tests {
 
         // Empty audio is refused honestly (the decoder rejects a zero-length
         // data chunk before anything is written).
-        assert!(store
-            .save_wav_capture(&wav_bytes(&[]), TakeMeta::for_device("x"))
-            .is_err());
+        assert!(
+            store
+                .save_wav_capture(&wav_bytes(&[]), TakeMeta::for_device("x"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -4658,9 +4656,7 @@ mod tests {
         assert_eq!(committed.record.status, CaptureStatus::Interrupted);
         let record = store.get_capture(&id).expect("get").expect("row");
         assert_eq!(record.status, CaptureStatus::Interrupted);
-        let note = record
-            .recovery_note()
-            .expect("the note landed with the row");
+        let note = record.recovery_note().expect("the note landed with the row");
         assert!(note.contains("salvaged and kept"), "{note}");
         let audio = store.load_audio(&id).expect("audio");
         assert_eq!(audio.samples, samples);
@@ -4732,9 +4728,7 @@ mod tests {
         }
 
         // Failed retry: history keeps the earlier completion above it.
-        store
-            .begin_recognition(&id, "starling:parakeet", None)
-            .expect("begin 2");
+        store.begin_recognition(&id, "starling:parakeet", None).expect("begin 2");
         store
             .finish_recognition(&id, RecognitionOutcome::Failed { message: "offline" })
             .expect("fail");
@@ -4743,7 +4737,8 @@ mod tests {
         assert_eq!(attempts[0].status, "completed", "insertion order kept");
         assert_eq!(attempts[1].status, "failed");
         let extra: serde_json::Value =
-            serde_json::from_str(attempts[1].extra_json.as_deref().expect("extra")).expect("parse");
+            serde_json::from_str(attempts[1].extra_json.as_deref().expect("extra"))
+                .expect("parse");
         assert_eq!(extra["error"], "offline");
 
         // Unknown captures refuse up front.
@@ -4759,9 +4754,7 @@ mod tests {
         let mut store = store_in(&dir);
         let take = committed_take(&mut store, &ramp(30, 0));
         let id = take.record.id.clone();
-        store
-            .begin_recognition(&id, "starling", None)
-            .expect("begin");
+        store.begin_recognition(&id, "starling", None).expect("begin");
 
         // The user's delete wins the race (R21): the cascade removes the
         // in-flight attempt with the row.
@@ -4815,7 +4808,8 @@ mod tests {
         let attempts = store.attempts_for(&live).expect("attempts");
         assert_eq!(attempts[0].status, "failed");
         let extra: serde_json::Value =
-            serde_json::from_str(attempts[0].extra_json.as_deref().expect("extra")).expect("parse");
+            serde_json::from_str(attempts[0].extra_json.as_deref().expect("extra"))
+                .expect("parse");
         assert_eq!(
             extra["error"],
             "Interrupted before the server returned a transcript."
@@ -4849,10 +4843,7 @@ mod tests {
         let swept = sweeper
             .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
             .expect("sweep");
-        assert!(
-            swept.is_empty(),
-            "a live owner's attempt is skipped: {swept:?}"
-        );
+        assert!(swept.is_empty(), "a live owner's attempt is skipped: {swept:?}");
         let attempts = sweeper.attempts_for(&id).expect("attempts");
         assert_eq!(attempts[0].status, "started", "no phantom failure");
 
@@ -4936,10 +4927,7 @@ mod tests {
             .interrupt_stale_attempts("Interrupted before the server returned a transcript.")
             .expect("sweep");
         assert_eq!(swept, vec![id.clone()]);
-        assert_eq!(
-            store.attempts_for(&id).expect("attempts")[0].status,
-            "failed"
-        );
+        assert_eq!(store.attempts_for(&id).expect("attempts")[0].status, "failed");
     }
 
     #[test]
@@ -4956,10 +4944,7 @@ mod tests {
 
         let swept = store.interrupt_stale_attempts("note").expect("sweep");
         assert!(swept.is_empty(), "own live attempt: {swept:?}");
-        assert_eq!(
-            store.attempts_for(&id).expect("attempts")[0].status,
-            "started"
-        );
+        assert_eq!(store.attempts_for(&id).expect("attempts")[0].status, "started");
     }
 
     #[test]
@@ -5034,9 +5019,7 @@ mod tests {
         // process is alive; a child that exited is not (pid reuse inside
         // the test window is not a practical concern).
         assert!(process_is_alive(std::process::id()));
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn true");
+        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
         let pid = child.id();
         child.wait().expect("wait for the child");
         assert!(!process_is_alive(pid), "pid {pid} has exited");
@@ -5097,9 +5080,7 @@ mod tests {
         // unique per attempt) must not leave the marker file on disk.
         let dir = TempDir::new().expect("tempdir");
         let mut holder = store_in(&dir);
-        holder
-            .hold_attempt_lock("a_tamper")
-            .expect("first hold acquires");
+        holder.hold_attempt_lock("a_tamper").expect("first hold acquires");
 
         let mut contender = store_in(&dir);
         let marker = contender.attempt_lock_path("a_tamper");
@@ -5189,10 +5170,7 @@ mod tests {
         assert!(report.has_findings());
         let summary = report.summary();
         assert!(summary.starts_with("Startup scan:"), "{summary}");
-        assert!(
-            summary.contains("recovered 2 interrupted recordings"),
-            "{summary}"
-        );
+        assert!(summary.contains("recovered 2 interrupted recordings"), "{summary}");
 
         let quiet = ReconciliationReport::default();
         assert!(!quiet.has_findings());
@@ -5205,7 +5183,12 @@ mod tests {
         let mut names: Vec<String> = std::fs::read_dir(root.join("leases"))
             .expect("read leases dir")
             .flatten()
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(str::to_string)
+            })
             .collect();
         names.sort();
         names
@@ -6125,7 +6108,9 @@ mod tests {
         );
         // The Ok(bool) contract: this call removed it...
         assert!(
-            store.discard_staging(&other_id).expect("discard other"),
+            store
+                .discard_staging(&other_id)
+                .expect("discard other"),
             "a present journal reports removed-by-this-call"
         );
         // ...and a second discard of the now-missing id reports the
@@ -6325,9 +6310,7 @@ mod tests {
             "no row — exactly the shape the probe exists for"
         );
         assert!(
-            !store
-                .audio_journal_exists("c_never")
-                .expect("probe unknown"),
+            !store.audio_journal_exists("c_never").expect("probe unknown"),
             "an unknown id has no audio"
         );
     }
@@ -6397,16 +6380,11 @@ mod tests {
         // The provenance JSON survived verbatim.
         assert_eq!(
             doc.revisions[0].sources_json.as_deref(),
-            sample_revision("rev-1", "notes", 0, "")
-                .sources_json
-                .as_deref()
+            sample_revision("rev-1", "notes", 0, "").sources_json.as_deref()
         );
         assert_eq!(doc.revisions[0].text, "First head.");
         // An unknown document is None, not an error.
-        assert!(reopened
-            .get_document("nope")
-            .expect("get unknown")
-            .is_none());
+        assert!(reopened.get_document("nope").expect("get unknown").is_none());
     }
 
     #[test]
@@ -6430,9 +6408,7 @@ mod tests {
         let store = StoreV2::open(dir.path().join("v2")).expect("open");
         // A turn appended to a document no updateHead ever wrote: the
         // implicit-document shape creates the row at head 0.
-        store
-            .bump_document_turn("scratch", 1)
-            .expect("implicit doc");
+        store.bump_document_turn("scratch", 1).expect("implicit doc");
         let doc = store.get_document("scratch").expect("get").expect("row");
         assert_eq!(doc.head_revision, 0);
         assert_eq!(doc.turn_seq, 1);

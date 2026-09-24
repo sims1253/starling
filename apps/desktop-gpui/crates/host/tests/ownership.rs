@@ -299,7 +299,8 @@ fn a_live_foreign_server_without_the_lease_is_refused() {
     // (with the squatter gone) now owns.
     drop(squatter);
     let _ = std::fs::remove_file(&socket);
-    let mut successor = serve(plain_config(root.path())).expect("serves once the endpoint is free");
+    let mut successor =
+        serve(plain_config(root.path())).expect("serves once the endpoint is free");
     successor.shutdown();
 }
 

@@ -42,7 +42,10 @@ fn main() {
         match arg.as_str() {
             "--socket" => socket = args.next(),
             "--mode" => mode = args.next(),
-            "--take" => take_corr = args.next().unwrap_or_default(),
+            "--take" => match args.next() {
+                Some(value) if !value.is_empty() => take_corr = value,
+                _ => fail("--take requires a non-empty correlation id"),
+            },
             "--frames" => {
                 frames = args
                     .next()
@@ -54,12 +57,8 @@ fn main() {
             }
         }
     }
-    let Some(socket) = socket else {
-        fail("missing --socket")
-    };
-    let Some(mode) = mode else {
-        fail("missing --mode")
-    };
+    let Some(socket) = socket else { fail("missing --socket") };
+    let Some(mode) = mode else { fail("missing --mode") };
     let socket = std::path::PathBuf::from(socket);
 
     match mode.as_str() {
@@ -183,13 +182,9 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             source: "vscode".into(),
         },
     );
-    wait_for(
-        &client,
-        "context.targetSnapshot",
-        |event: &starling_runtime_host::client::EventWire| {
-            event.type_name() == "context.targetSnapshot"
-        },
-    );
+    wait_for(&client, "context.targetSnapshot", |event: &starling_runtime_host::client::EventWire| {
+        event.type_name() == "context.targetSnapshot"
+    });
     send(
         "ctx-double",
         Command::ModeSet {
@@ -197,11 +192,9 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             source: Manual,
         },
     );
-    wait_for(
-        &client,
-        "mode.decision",
-        |event: &starling_runtime_host::client::EventWire| event.type_name() == "mode.decision",
-    );
+    wait_for(&client, "mode.decision", |event: &starling_runtime_host::client::EventWire| {
+        event.type_name() == "mode.decision"
+    });
 
     send(
         take_corr,
@@ -209,14 +202,10 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             policy: "push-to-talk".into(),
         },
     );
-    wait_for(
-        &client,
-        "acknowledged capture.progress",
-        |event: &starling_runtime_host::client::EventWire| {
-            event.type_name() == "capture.progress"
-                && event.payload()["ackSamples"].as_u64().unwrap_or(0) > 0
-        },
-    );
+    wait_for(&client, "acknowledged capture.progress", |event: &starling_runtime_host::client::EventWire| {
+        event.type_name() == "capture.progress"
+            && event.payload()["ackSamples"].as_u64().unwrap_or(0) > 0
+    });
     ready();
 }
 

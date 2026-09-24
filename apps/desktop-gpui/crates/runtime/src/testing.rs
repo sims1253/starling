@@ -43,10 +43,7 @@ pub struct FakeTakeScript {
 pub enum FakeStop {
     /// A clean take: `samples.len()` samples, journal acknowledged at the
     /// fsynced boundary.
-    Clean {
-        journal_id: String,
-        ack_fraction: f64,
-    },
+    Clean { journal_id: String, ack_fraction: f64 },
     /// The R09 quiesce timeout: salvaged samples ride in the error.
     QuiesceTimeout { journal_id: String },
     /// The device produced nothing.
@@ -227,9 +224,7 @@ impl CaptureSource for FakeCaptureSource {
             .lock()
             .expect("fake capture scripts lock")
             .pop_front()
-            .ok_or_else(|| {
-                "No microphone was found. Connect an input device and try again.".to_string()
-            })?;
+            .ok_or_else(|| "No microphone was found. Connect an input device and try again.".to_string())?;
         self.started_takes
             .lock()
             .expect("fake started takes lock")
@@ -243,8 +238,5 @@ impl CaptureSource for FakeCaptureSource {
 
 /// Convenience: a provider script of clean completions, one per text.
 pub fn clean_provider_script(texts: &[&str]) -> Vec<FakeJob> {
-    texts
-        .iter()
-        .map(|text| FakeJob::completes_with(text))
-        .collect()
+    texts.iter().map(|text| FakeJob::completes_with(text)).collect()
 }

@@ -120,13 +120,7 @@ impl FileSink {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        Ok((
-            Self {
-                file,
-                dir: dir.to_path_buf(),
-            },
-            path,
-        ))
+        Ok((Self { file, dir: dir.to_path_buf() }, path))
     }
 }
 
@@ -325,7 +319,11 @@ impl JournalWriter<FileSink> {
     /// capture id rather than a generated `j_<uuid>`. Crate-visible: the id
     /// becomes a path component, so callers must pass a safe one (the v2
     /// store only ever passes its generated `c_<uuid>` ids).
-    pub(crate) fn create_named(dir: &Path, id: String, sample_rate: u32) -> io::Result<Self> {
+    pub(crate) fn create_named(
+        dir: &Path,
+        id: String,
+        sample_rate: u32,
+    ) -> io::Result<Self> {
         let (sink, path) = FileSink::create(dir, &id)?;
         Self::over_sink(sink, id, path, sample_rate)
     }
@@ -523,10 +521,16 @@ fn parse_journal_from(
                 if read_exact(reader, &mut record)? == Filled::Eof {
                     break 'parse;
                 }
-                let count =
-                    u64::from_le_bytes(record[0..8].try_into().expect("8 bytes parse as u64"));
-                let recorded_hash =
-                    u64::from_le_bytes(record[8..16].try_into().expect("8 bytes parse as u64"));
+                let count = u64::from_le_bytes(
+                    record[0..8]
+                        .try_into()
+                        .expect("8 bytes parse as u64"),
+                );
+                let recorded_hash = u64::from_le_bytes(
+                    record[8..16]
+                        .try_into()
+                        .expect("8 bytes parse as u64"),
+                );
                 if count != samples.len() as u64 || recorded_hash != hash {
                     break 'parse;
                 }
@@ -834,8 +838,8 @@ mod tests {
         let acked = writer.finalize().expect("finalize");
         assert_eq!(acked, expected.len() as u64);
 
-        let parsed =
-            read_journal(&dir.path().join(format!("{id}.sj"))).expect("parse large journal");
+        let parsed = read_journal(&dir.path().join(format!("{id}.sj")))
+            .expect("parse large journal");
         assert!(parsed.finalized);
         assert_eq!(parsed.torn_tail_bytes, 0);
         assert_eq!(parsed.samples.len(), 30_000);
@@ -1013,13 +1017,8 @@ mod tests {
             "one sample is under both thresholds"
         );
         std::thread::sleep(JOURNAL_BOUNDARY_INTERVAL + Duration::from_millis(20));
-        assert!(
-            writer.boundary_due(),
-            "time threshold triggers on pending samples"
-        );
-        writer
-            .write_boundary()
-            .expect("boundary after the interval");
+        assert!(writer.boundary_due(), "time threshold triggers on pending samples");
+        writer.write_boundary().expect("boundary after the interval");
         assert!(!writer.boundary_due(), "boundary acks the pending sample");
         // …and a boundary with nothing new stays a clock-resetting no-op.
         writer.write_boundary().expect("empty boundary");
@@ -1181,8 +1180,9 @@ mod tests {
         let id = "j_syncfault".to_string();
         let (sink, path) = FaultSink::create_sync_faults_only(dir.path(), &id, Arc::clone(&fail))
             .expect("open sync-fault journal");
-        let mut writer = JournalWriter::over_sink(sink, id.clone(), path.clone(), 16_000)
-            .expect("writer with header fsynced");
+        let mut writer =
+            JournalWriter::over_sink(sink, id.clone(), path.clone(), 16_000)
+                .expect("writer with header fsynced");
 
         let first = ramp(1_000, 0);
         writer.append_frames(&first).expect("append 1");
@@ -1221,4 +1221,5 @@ mod tests {
             "the confirmed prefix is always verified"
         );
     }
+
 }

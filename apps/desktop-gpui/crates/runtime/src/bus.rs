@@ -96,8 +96,7 @@ impl EventBus {
     }
 
     fn stream(corr: Option<&str>) -> String {
-        corr.map(str::to_string)
-            .unwrap_or_else(|| "__events__".to_string())
+        corr.map(str::to_string).unwrap_or_else(|| "__events__".to_string())
     }
 
     /// Allocates the next sequence number for `corr`'s stream (the command
@@ -126,10 +125,7 @@ impl EventBus {
     /// failure mode this runtime exists to prevent).
     pub fn subscribe(&self) -> EventSub {
         let (sender, receiver) = bounded(self.capacity);
-        self.subscribers
-            .lock()
-            .expect("subscriber lock")
-            .push(sender);
+        self.subscribers.lock().expect("subscriber lock").push(sender);
         EventSub {
             receiver: Arc::new(receiver),
         }
@@ -226,7 +222,9 @@ mod tests {
         assert!(bus.emit(Event::JobsQueued, None).is_ok());
         // Third emit parks until the subscriber drains (or goes away).
         let parked_bus = Arc::clone(&bus);
-        let parked = std::thread::spawn(move || parked_bus.emit(Event::JobsQueued, None));
+        let parked = std::thread::spawn(move || {
+            parked_bus.emit(Event::JobsQueued, None)
+        });
         std::thread::sleep(Duration::from_millis(30));
         assert!(!parked.is_finished());
         drop(_sub); // dropping the subscriber releases the producer

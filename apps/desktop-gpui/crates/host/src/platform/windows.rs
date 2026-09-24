@@ -48,8 +48,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
-    ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE,
+    ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
     ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE,
 };
@@ -58,21 +58,20 @@ use windows_sys::Win32::Security::Authorization::{
     SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetAce, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
-    DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetAce, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, PSID,
+    PSECURITY_DESCRIPTOR, DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
     PIPE_ACCESS_DUPLEX,
 };
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    WaitNamedPipeW, NMPWAIT_NOWAIT, NMPWAIT_USE_DEFAULT_WAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    NMPWAIT_NOWAIT, NMPWAIT_USE_DEFAULT_WAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows_sys::Win32::System::IO::CancelIoEx;
 
 use super::{Probe, TransportConn, TransportListener};
 use crate::auth::PeerCredentials;
@@ -304,7 +303,10 @@ fn verify_dacl_aces(dacl: *mut ACL) -> io::Result<()> {
             // terminator and the LocalFree below releases it.
             let text = wide_to_string(sid_wstr);
             LocalFree(sid_wstr as _);
-            if matches!(text.as_str(), "S-1-1-0" | "S-1-5-7" | "S-1-5-32-545") {
+            if matches!(
+                text.as_str(),
+                "S-1-1-0" | "S-1-5-7" | "S-1-5-32-545"
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
