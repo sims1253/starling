@@ -140,7 +140,7 @@ added here in the same PR that introduces them.
 | `allowBuilds: esbuild` (`pnpm-workspace.yaml`) | esbuild (transitive of vite-plus) needs its install script to place platform binaries; the Electron entries left with the deleted `apps/desktop` | If pnpm gains binary-only distribution or vite-plus drops the esbuild dependency |
 | `effect` at `4.0.0-rc.115` (catalog) | Pinned exact, module-boundary decision: one async framework, reviewed per the E16 rule (reproducibility/defect isolation over prerelease status) | When Effect 4 stable lands and the migration is exercised through the desktop job |
 | Floating `>=` ranges in the root `pyproject.toml` | Deprecated research backend, kept independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When the research backend is retired or frozen |
-| CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`, `uv --with playwright`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
+| CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
 
 ## socket-security triage
 
