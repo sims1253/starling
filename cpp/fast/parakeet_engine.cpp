@@ -128,6 +128,10 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
     const auto& ml = m.loader;
     cfg = m.config;
     mel.read_from(ml, cfg);
+    if (mel.hop_length == 0 || mel.n_fft < 2 || (mel.n_fft & (mel.n_fft - 1))) {
+        err = "fast parakeet: mel needs a power-of-two n_fft and hop > 0";
+        return false;
+    }
     fmel = std::make_unique<PkMel>(mel);
     D = cfg.d_model; H = cfg.n_heads; dk = D / H; FF = cfg.ff_dim; L = cfg.n_layers;
     CK = cfg.conv_kernel; SC = cfg.subsampling_conv_channels; NM = cfg.n_mels;
@@ -277,7 +281,11 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         if (!t) return false;
         std::vector<float> e;
         if (!tensor_to_f32(t, e, err)) return false;
-        embed.assign((size_t)V1 * PH, 0.0f);
+        if ((uint32_t)t->ne[0] != PH || (uint32_t)t->ne[1] < V1 - 1) {
+            err = "fast parakeet: prediction embedding shape mismatch";
+            return false;
+        }
+        embed.assign((size_t)V1 * PH, 0.0f);   // rows past the table (blank) stay zero
         std::copy_n(e.begin(), std::min(e.size(), embed.size()), embed.begin());
     }
     const uint32_t PL = cfg.pred_rnn_layers ? cfg.pred_rnn_layers : 1;

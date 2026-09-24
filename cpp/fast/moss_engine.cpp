@@ -22,6 +22,8 @@
 
 namespace starling::fast {
 
+constexpr size_t kMaxPromptIds = 256;   // prompt prefix + suffix ids (device buffer)
+
 namespace ms = starling::ggml::moss;
 
 namespace {
@@ -153,7 +155,8 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     NL = lc.n_layers; MAXPOS = lc.max_cache;
     if (EHD != 64 || HDIM != 128 || DS % 8 || cfg.frontend.n_mels != 128 || ec.n_window_infer % 100 ||
         cfg.adapter_input != EOUT || cfg.adapter_output != HD || !lc.tied_embeddings || MAXPOS > 4096 ||
-        NKV == 0 || NH % NKV || cfg.max_new_tokens > MAXPOS) {
+        NKV == 0 || NH % NKV || cfg.max_new_tokens > MAXPOS ||
+        cfg.prompt_prefix.size() + cfg.prompt_suffix.size() > kMaxPromptIds) {
         err = "fast moss: unsupported configuration";
         return false;
     }
@@ -250,6 +253,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     {
         std::vector<float> pe;
         if (!f32("enc.positional_embedding", pe)) return false;
+        if (pe.size() < (size_t)13 * ED) { err = "fast moss: positional embedding shorter than 13 rows"; return false; }
         pe.resize((size_t)13 * ED);                  // rows [0, 13): one chunk of tokens
         pe13 = ar.add_f32(pe);
     }
@@ -303,6 +307,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const ggml_tensor* te = T("llm.embed.weight");
         if (!te) return false;
         const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
+        if (N == 0 || Kc != HD) { err = "fast moss: embedding table shape mismatch"; return false; }
         const size_t rb = ggml_row_size(te->type, Kc);
         emb_blocks.resize((N + emb_block - 1) / emb_block);
         for (size_t b = 0; b < emb_blocks.size(); ++b) {
@@ -367,7 +372,7 @@ bool MossEngine::Impl::alloc_static(std::string& err) {
         return ctx->create_buffer(b, bytes, kind, err);
     };
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
-           mk(state, (16 + (size_t)cfg.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, 256 * 4, vk::Mem::Readback) &&
+           mk(state, (16 + (size_t)cfg.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, kMaxPromptIds * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8);
 }
@@ -807,9 +812,13 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
 
     std::vector<uint32_t> st(16 + (size_t)I.cfg.max_new_tokens);
     int rounds = 0;
+    // The device stops at EOS or the budget; the host bound only guards
+    // against a state buffer that never reports either.
+    const int max_rounds = (int)(I.cfg.max_new_tokens / steps) + 2;
     for (;;) {
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
         if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
+        if (rounds >= max_rounds) { err = "fast moss: decode did not terminate"; return false; }
         if (!I.dec_rec->submit_and_wait(err)) return false;
         if (rounds == 0) I.dec_rec->report_profile("moss decode (K steps)");
         ++rounds;

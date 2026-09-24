@@ -585,7 +585,13 @@ bool Kernels::autotune(std::string& err) {
         std::ifstream in(path);
         TileCfg t;
         uint32_t rows = 0;
-        if (in >> t.BM >> t.BN >> t.TM >> t.TN >> rows && rows >= 8) {
+        const bool fits = [&] {
+            if (!(in >> t.BM >> t.BN >> t.TM >> t.TN >> rows) || rows < 8 || !t.TM || !t.TN) return false;
+            const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
+            return wg >= 32 && wg <= info.max_wg_invocations &&
+                   (size_t)32 * (t.BM + t.BN) * 2 <= info.max_shared_bytes;
+        }();
+        if (fits) {
             R = TuneResult{true, t, rows};
             tile = t;
             gemv_rows_max = rows;

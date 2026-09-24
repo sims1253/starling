@@ -130,7 +130,8 @@ void quantize(const float* x, uint32_t K, QVec& out) {
         const float s = amax / 127.0f;
         const float inv = s > 0.0f ? 1.0f / s : 0.0f;
         out.s[g] = s;
-        for (int i = 0; i < 32; ++i) out.q[g * 32 + i] = (int8_t)std::lrintf(v[i] * inv);
+        for (int i = 0; i < 32; ++i)
+            out.q[g * 32 + i] = (int8_t)std::clamp(std::lrintf(v[i] * inv), -127L, 127L);
     }
 }
 

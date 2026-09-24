@@ -616,9 +616,11 @@ Recording::Recording(Context& ctx) : ctx_(ctx) {
     const Fns& f = ctx_.fn_;
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = ctx_.qfam_;
-    f.vkCreateCommandPool(ctx_.dev_, &cpci, nullptr, &pool_);
+    VkResult r = f.vkCreateCommandPool(ctx_.dev_, &cpci, nullptr, &pool_);
+    if (r != VK_SUCCESS) { pool_ = VK_NULL_HANDLE; fail_ = vk_err("vkCreateCommandPool", r); }
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    f.vkCreateFence(ctx_.dev_, &fci, nullptr, &fence_);
+    r = f.vkCreateFence(ctx_.dev_, &fci, nullptr, &fence_);
+    if (r != VK_SUCCESS) { fence_ = VK_NULL_HANDLE; if (fail_.empty()) fail_ = vk_err("vkCreateFence", r); }
     profile_ = ctx_.profile_;
 }
 
@@ -632,6 +634,7 @@ Recording::~Recording() {
 
 void Recording::begin() {
     const Fns& f = ctx_.fn_;
+    if (!pool_) return;   // fail_ is set; submit_and_wait reports it
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = pool_;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -658,10 +661,13 @@ void Recording::begin() {
     }
 }
 
-void Recording::end() { ctx_.fn_.vkEndCommandBuffer(cb_); }
+void Recording::end() {
+    if (cb_) ctx_.fn_.vkEndCommandBuffer(cb_);
+}
 
 void Recording::split() {
     const Fns& f = ctx_.fn_;
+    if (!cb_) return;
     f.vkEndCommandBuffer(cb_);
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = pool_;
@@ -716,6 +722,7 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
                          const void* push, size_t push_bytes,
                          uint32_t gx, uint32_t gy, uint32_t gz) {
     const Fns& f = ctx_.fn_;
+    if (!cb_) return;
     if (bindings.empty() && p.n_bindings) {
         if (fail_.empty()) fail_ = std::string("dispatch without bindings: ") + p.label;
         return;
@@ -753,6 +760,7 @@ void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
 }
 
 void Recording::barrier() {
+    if (!cb_) return;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
@@ -765,17 +773,20 @@ void Recording::barrier() {
 
 void Recording::copy(const Buffer& src, VkDeviceSize soff, const Buffer& dst,
                      VkDeviceSize doff, VkDeviceSize bytes) {
+    if (!cb_) return;
     VkBufferCopy c{soff, doff, bytes};
     ctx_.fn_.vkCmdCopyBuffer(cb_, src.buf, dst.buf, 1, &c);
 }
 
 void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, uint32_t value) {
+    if (!cb_) return;
     ctx_.fn_.vkCmdFillBuffer(cb_, dst.buf, off, bytes, value);
 }
 
 bool Recording::submit_and_wait(std::string& err) {
     const Fns& f = ctx_.fn_;
     if (!fail_.empty()) { err = "recording failed: " + fail_; return false; }
+    if (segs_.empty()) { err = "recording is empty (begin() not called)"; return false; }
     std::lock_guard<std::mutex> lk(ctx_.queue_mu_);
     VkResult r = VK_SUCCESS;
     for (size_t i = 0; i < segs_.size(); ++i) {
