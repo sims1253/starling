@@ -95,8 +95,13 @@ class OnDeviceEngine(
     fun selectModel(name: String): Boolean {
         val file = installedFile(name) ?: return false
         // The marker write (two fsyncs) stays outside the engine lock, so it
-        // never stalls a transcription.
-        writeActiveName(file.name)
+        // never stalls a transcription. Checked under the marker lock: a
+        // concurrent deleteModel either ran first (the file is gone) or
+        // clears this marker after its unlink.
+        synchronized(markerLock) {
+            if (!file.isFile) return false
+            writeActiveName(file.name)
+        }
         synchronized(lock) { if (loadedFile != file) releaseLocked() }
         return true
     }
@@ -116,7 +121,10 @@ class OnDeviceEngine(
             file
         }
         synchronized(markerLock) {
-            if (readActiveName() == file.name) activeFile.delete()
+            // Also drops a marker naming a model deleted earlier, so a later
+            // install under that name cannot silently become active.
+            val named = readActiveName()
+            if (named != null && installedFiles().none { it.name == named }) activeFile.delete()
         }
         fsyncModelDirectory()
         true
@@ -140,6 +148,16 @@ class OnDeviceEngine(
     private fun activeAmong(installed: List<File>): File? {
         val named = readActiveName()
         return installed.firstOrNull { it.name == named } ?: installed.firstOrNull()
+    }
+
+    /**
+     * The sanitized [name] for an import; catalog file names are reserved
+     * for verified downloads, so an import can never pose as (or be replaced
+     * by) a catalog model.
+     */
+    private fun importName(name: String): String {
+        val sanitized = sanitizeModelName(name)
+        return if (ModelCatalog.ALL.any { it.fileName == sanitized }) "imported-$sanitized" else sanitized
     }
 
     /** [name], or name-2.gguf, name-3.gguf, ... : the first that is not taken. */
@@ -234,7 +252,7 @@ class OnDeviceEngine(
                 // An import never replaces an installed model: a clash gets a
                 // numbered name, so a same-named file cannot silently swap
                 // out a model (or pose as the catalog model).
-                publishStaged(staged, promote) { freeModelFile(sanitizeModelName(name)) }
+                publishStaged(staged, promote) { freeModelFile(importName(name)) }
             }
         }
 

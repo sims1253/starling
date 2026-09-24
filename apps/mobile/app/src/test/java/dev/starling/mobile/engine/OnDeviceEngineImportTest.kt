@@ -635,6 +635,44 @@ class OnDeviceEngineImportTest {
     }
 
     @Test
+    fun anImportCannotTakeACatalogName() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            val catalogName = ModelCatalog.RECOMMENDED_PARAKEET.fileName
+
+            val result = engine.importModel(source.inputStream(), catalogName)
+
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "imported-$catalogName"), result)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deletingDropsAMarkerThatNamesAMissingModel() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "a.gguf")
+            engine.importModel(source.inputStream(), "b.gguf")
+            engine.importModel(source.inputStream(), "c.gguf")
+            // The marker names c; c vanishes behind the engine's back, so a
+            // is active by fallback.
+            File(directory, "c.gguf").delete()
+
+            assertTrue(engine.deleteModel("b.gguf"))
+            sparseModelFile(directory, "c.gguf", parakeetPayload())
+
+            assertEquals("a stale marker must not activate a new file of that name", "a.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun aDownloadReplacesAnEarlierCopyOfItself() {
         val directory = tempDir()
         try {

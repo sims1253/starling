@@ -329,14 +329,9 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * Imports never take an installed name, so only a verified download is
-     * written under the catalog name at the catalog size.
-     */
-    private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean {
-        val recommended = ModelCatalog.RECOMMENDED_PARAKEET
-        return model.name == recommended.fileName && model.sizeBytes == recommended.sizeBytes
-    }
+    /** Catalog file names are reserved for verified downloads (imports never take them). */
+    private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean =
+        model.name == ModelCatalog.RECOMMENDED_PARAKEET.fileName
 
     /** Catalog models by their label; anything else by its file name. */
     private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {

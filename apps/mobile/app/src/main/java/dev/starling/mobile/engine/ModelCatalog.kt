@@ -29,4 +29,7 @@ object ModelCatalog {
         sha256 = "2b5ea37e3193c71b3ad2f859b4238ff4501898ba73d63899568faee1daae9982",
         label = "Parakeet TDT 0.6B v3",
     )
+
+    /** Every catalog model; their file names are reserved for verified downloads. */
+    val ALL = listOf(RECOMMENDED_PARAKEET)
 }
