@@ -52,13 +52,15 @@ class OnDeviceTranscriptionE2ETest {
         val text = (result as? InferenceResult.Success)?.rawTranscript
             ?: throw AssertionError("transcription failed: $result")
         Log.i("StarlingE2E", "transcript: $text")
-        assertEquals(normalize(REFERENCE), normalize(text))
+        assertEquals("transcript mismatch, got: $text", normalize(REFERENCE), normalize(text))
     }
 
     private fun normalize(text: String) =
-        text.lowercase().replace(Regex("[^a-z' ]"), " ").split(' ').filter { it.isNotEmpty() }.joinToString(" ")
+        text.lowercase().replace(NON_LETTERS, " ").split(' ').filter { it.isNotEmpty() }.joinToString(" ")
 
     private companion object {
+        val NON_LETTERS = Regex("[^a-z' ]")
+
         // LibriSpeech 2086-149220-0033 (CC BY 4.0), as in benchmarks/wer.py.
         const val REFERENCE =
             "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. " +
