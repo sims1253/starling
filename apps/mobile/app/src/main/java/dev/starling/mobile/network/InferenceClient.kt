@@ -20,16 +20,7 @@ private val LEGACY_ROUTE_SUFFIXES = listOf("/inference", "/transcribe")
 
 /** Multipart upload to the backend's OpenAI-compatible transcription endpoint. */
 internal fun inferenceUrl(endpoint: String): String {
-    var base = endpoint.trimEnd('/')
-    // Legacy full-route endpoints saved before the API unification (the
-    // old Starling protocol accepted them as complete batch routes) must
-    // migrate cleanly instead of producing .../inference/v1/audio/transcriptions.
-    for (legacy in LEGACY_ROUTE_SUFFIXES) {
-        if (base.endsWith(legacy, ignoreCase = true)) {
-            base = base.removeSuffix(legacy).trimEnd('/')
-            break
-        }
-    }
+    val base = endpoint.trimEnd('/')
     return when {
         base.endsWith("/v1/audio/transcriptions", ignoreCase = true) -> base
         base.endsWith("/v1", ignoreCase = true) -> "$base/audio/transcriptions"
@@ -43,6 +34,7 @@ class InferenceClient {
         if (audioFile.length() > MAX_UPLOAD_BYTES) {
             return InferenceResult.Failure("The recording is larger than the server upload limit", false)
         }
+        warnIfLegacyRoute(config.endpoint)
 
         val validation = EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp)
         if (validation !is EndpointValidation.Valid) {
@@ -154,6 +146,21 @@ class InferenceClient {
             output.write(buffer, 0, count)
         }
         return output.toByteArray()
+    }
+
+    /** Backwards compatibility is out of scope (no released versions), so a
+     *  saved pre-unification full-route endpoint is not migrated — only
+     *  surfaced so the resulting 404 is explainable. */
+    private fun warnIfLegacyRoute(endpoint: String) {
+        val base = endpoint.trimEnd('/')
+        val legacy = LEGACY_ROUTE_SUFFIXES.firstOrNull { base.endsWith(it, ignoreCase = true) }
+        if (legacy != null) {
+            android.util.Log.w(
+                "StarlingInference",
+                "Endpoint '$endpoint' ends in the legacy route '$legacy'; the unified API will " +
+                    "404 on it. Set the server base URL instead.",
+            )
+        }
     }
 
     companion object {
