@@ -53,6 +53,7 @@ cat > "$staging/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+plutil -lint "$staging/Contents/Info.plist"
 
 codesign --force --sign - "$staging"
 
