@@ -177,7 +177,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     }
     if (const char* e = std::getenv("STARLING_FAST_GEMV_ROWS")) {
         unsigned r = (unsigned)std::atoi(e);
-        if (r >= 8 && r % 8 == 0) gemv_rows_max = r;
+        if (r >= 8 && r % 8 == 0) {
+            gemv_rows_max = r;
+            gemv_tgt_wgs = ~0u;   // pinned: no adaptive growth
+        }
     }
     return true;
 }
@@ -283,6 +286,11 @@ bool Kernels::pk_conv(vk::Recording& rec, uint32_t op, const PkConvArgs& a, uint
 
 uint32_t Kernels::gemv_rows(uint32_t N) {
     uint32_t rows = gemv_rows_max;
+    // Grow rows for large N: every workgroup re-reads the x vector once, so
+    // at rows=8 the x traffic rivals the weights (ff_up: 12.6 MB x vs
+    // 15.7 MB weights on MOSS; lm_head reads x 19k times). Keep at least
+    // ~384 workgroups for occupancy and cap at 32 (48+ costs registers).
+    while (rows < 32 && N / (rows * 2) >= gemv_tgt_wgs) rows *= 2;
     while (rows > 8 && N / rows < gemv_min_wgs) rows -= 8;
     return rows;
 }
@@ -585,6 +593,8 @@ bool Kernels::autotune(std::string& err) {
 
     uint32_t best_rows = gemv_rows_max;
     double best_g = 1e30;
+    const uint32_t saved_tgt = gemv_tgt_wgs;
+    gemv_tgt_wgs = ~0u;   // candidates are pinned; growth would blur the sweep
     for (uint32_t rows : {8u, 16u, 32u, 64u}) {
         gemv_rows_max = rows;
         const uint32_t r = gemv_rows(F);
@@ -611,6 +621,7 @@ bool Kernels::autotune(std::string& err) {
             std::fprintf(stderr, "[fast-tune] gemv rows %u: %.3f ms\n", rows, ms);
         if (ms < best_g) { best_g = ms; best_rows = rows; }
     }
+    gemv_tgt_wgs = saved_tgt;
     gemv_rows_max = best_rows;
     R = TuneResult{true, tile, gemv_rows_max};
     if (dir && *dir) {

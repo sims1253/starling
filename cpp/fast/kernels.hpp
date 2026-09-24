@@ -144,6 +144,7 @@ public:
     bool gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y, vk::Ref g,
               vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a, std::string& err);
     uint32_t gemv_rows_max = 32, gemv_min_wgs = 256;
+    uint32_t gemv_tgt_wgs = 384;   // grow rows while N/rows stays above this
     uint32_t gemv_rows(uint32_t N);    // rows per workgroup for an N-row GEMV
 
     const vk::Buffer& dummy() const { return dummy_; }
