@@ -144,6 +144,17 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     f16_math = ctx.info().f16;
     if (const char* e = std::getenv("STARLING_FAST_F16")) f16_math = ctx.info().f16 && e[0] == '1';
     if (!autotune(err)) return false;
+    // Imagination (PowerVR): the synthetic ranking does not transfer to the
+    // real encoders — isolated GEMM pairs rate 64,32,4,4 highest while the
+    // Parakeet/MOSS encoders run ~2x faster on 32,64,4,4, and short GEMV
+    // bursts rate rows 64 highest while real decode wants 8 (measured on a
+    // Pixel 10 Pro / Tensor G5 DXT-48-1536; see RESEARCH_LOG.md). Ship the
+    // measured values for this vendor; STARLING_FAST_TILE / _GEMV_ROWS /
+    // _TUNE=1 still override, and other vendors keep the tuner's pick.
+    if (ctx.info().vendor_id == 0x1010) {
+        tile = TileCfg{32, 64, 4, 4};
+        gemv_rows_max = 8;
+    }
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
         if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) tile = TileCfg{bm, bn, tm, tn};
@@ -309,10 +320,12 @@ bool Kernels::autotune(std::string& err) {
         }
     }
 
-    // Synthetic problem at the encoder's dominant shapes: 256 frames through
-    // a 1024 -> 4096 W4 projection and a 4096 -> 1024 W8 projection, plus a
-    // 4096 x 1024 W4 decode GEMV.
-    const uint32_t M = 256, D = 1024, F = 4096;
+    // Synthetic problem at the encoder's dominant shapes: ~280 frames (odd,
+    // like real subsampled lengths — a multiple of every BM hides tail-wave
+    // costs and mis-ranks tiles on PowerVR) through a 1024 -> 4096 W4
+    // projection and a 4096 -> 1024 W8 projection, plus a 4096 x 1024 W4
+    // decode GEMV.
+    const uint32_t M = 293, D = 1024, F = 4096;
     std::mt19937 rng(1234);
     auto rnd_words = [&](size_t n, bool halves) {
         std::vector<uint32_t> w(n);
@@ -344,7 +357,7 @@ bool Kernels::autotune(std::string& err) {
 
     const TileCfg cands[] = {{64, 128, 4, 8}, {64, 64, 4, 4}, {128, 128, 8, 8}, {128, 64, 8, 4},
                              {64, 64, 8, 8}, {32, 64, 4, 8}, {64, 128, 8, 8}, {128, 128, 8, 4},
-                             {32, 128, 4, 8}, {64, 32, 4, 4}};
+                             {32, 128, 4, 8}, {64, 32, 4, 4}, {32, 64, 4, 4}, {48, 64, 4, 4}};
     TileCfg best_t = tile;
     double best = 1e30;
     const TileCfg saved = tile;
@@ -364,7 +377,21 @@ bool Kernels::autotune(std::string& err) {
             dn.b = BKind::W8; dn.epi = Epi::F32;
             dn.a.M = M; dn.a.N = D; dn.a.K = F; dn.a.lda = F; dn.a.ldb = F; dn.a.ldc = D;
             dn.A = vk::Ref(a); dn.Bq = vk::Ref(wq8); dn.Bs = vk::Ref(ws8); dn.C = vk::Ref(c);
-            if (!gemm(rec, u, err) || !gemm(rec, dn, err)) { tile = saved; return false; }
+            // Match the real layer pattern: a barrier after every kernel (a
+            // tile-based GPU flushes at barriers, so back-to-back dispatches
+            // without one would rank tiles wrongly).
+            if (!gemm(rec, u, err)) { tile = saved; return false; }
+            rec.barrier();
+            // A norm between the GEMMs, as in a real layer: the pipeline
+            // switches and small kernels between large ones are part of what
+            // a tile choice costs on a tile-based GPU.
+            if (!norm(rec, 0, M, F, vk::Ref(c), F, {}, {}, {}, {}, vk::Ref(c), F,
+                      1e-5f, 1e-5f, err)) { tile = saved; return false; }
+            rec.barrier();
+            if (!gemm(rec, dn, err)) { tile = saved; return false; }
+            rec.barrier();
+            if (!norm(rec, 0, M, D, vk::Ref(c), D, {}, {}, {}, {}, vk::Ref(c), D,
+                      1e-5f, 1e-5f, err)) { tile = saved; return false; }
             rec.barrier();
         }
         rec.end();
@@ -392,6 +419,9 @@ bool Kernels::autotune(std::string& err) {
             rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq4), vk::Ref(ws4), vk::Ref(y), vk::Ref(dummy_),
                               vk::Ref(dummy_), vk::Ref(dummy_)},
                          &ga, sizeof(ga), ceil_div(F, r));
+            rec.barrier();
+            if (!norm(rec, 1, 1, D, vk::Ref(y), D, {}, {}, {}, {}, vk::Ref(y), D,
+                      1e-5f, 1e-5f, err)) return false;
             rec.barrier();
         }
         rec.end();
