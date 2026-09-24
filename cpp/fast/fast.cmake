@@ -24,6 +24,10 @@ if(NOT STARLING_GLSLC AND ANDROID_NDK)
   endforeach()
   find_program(STARLING_GLSLC NAMES glslc HINTS ${_glslc_hints} NO_CMAKE_FIND_ROOT_PATH)
 endif()
+find_program(STARLING_SPIRV_AS NAMES spirv-as NO_CMAKE_FIND_ROOT_PATH)
+if(NOT STARLING_SPIRV_AS)
+  message(FATAL_ERROR "STARLING_FAST=ON needs spirv-as (SPIRV-Tools) for the idot probe shader")
+endif()
 if(NOT STARLING_GLSLC)
   message(FATAL_ERROR "STARLING_FAST=ON needs glslc (Vulkan SDK / shaderc, or the Android NDK's shader-tools)")
 endif()
@@ -69,7 +73,7 @@ set(STARLING_FAST_SHADERS
   "norm|norm.comp||6"
   "softmax|softmax.comp||3"
   "pk_conv|pk_conv.comp||5"
-  "idot_probe|idot_probe.spv||2"
+  "idot_probe|idot_probe.asm||2"
 )
 
 set(_spv_dir ${CMAKE_CURRENT_BINARY_DIR}/fast_spv)
@@ -96,14 +100,15 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
     endforeach()
   endif()
   set(_out ${_spv_dir}/${_name}.spv)
-  if(_src MATCHES "\\.spv$")
-    # Prebuilt SPIR-V (e.g. hand-assembled probes glslc cannot express).
+  if(_src MATCHES "\\.asm$")
+    # Hand-assembled SPIR-V kept as text: assembled by spirv-as at build time
+    # (glslc cannot express these instructions).
     add_custom_command(
       OUTPUT ${_out}
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              ${STARLING_FAST_DIR}/shaders/${_src} ${_out}
+      COMMAND ${STARLING_SPIRV_AS} --target-env vulkan1.3
+              ${STARLING_FAST_DIR}/shaders/${_src} -o ${_out}
       DEPENDS ${STARLING_FAST_DIR}/shaders/${_src}
-      COMMENT "spv ${_name}")
+      COMMENT "spirv-as ${_name}")
   else()
   add_custom_command(
     OUTPUT ${_out}
