@@ -7,6 +7,11 @@ worktree: `packages/dictation/src/*.ts` (logic), `apps/desktop/src/App.tsx` +
 `src/useRecorder.ts` + `src/styles.css` (UI), `apps/desktop/electron/*.ts`
 (native shell + native HTTP path).
 
+> The Electron app was removed after this port graduated to be the desktop
+> app. The `apps/desktop` paths below are provenance for where each module
+> came from, not living sources; `packages/dictation/src/*.ts` remains the
+> TypeScript reference for the shared logic.
+
 ## Layout
 
 - `crates/dictation` (`starling-dictation`) — pure logic + IO, no gpui. Ports of

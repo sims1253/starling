@@ -8,27 +8,29 @@ the same native engine boundary. The NVIDIA-only Python/CUDA service is deprecat
 
 ```mermaid
 flowchart LR
-  Desktop["Desktop · Electron / React<br/>Windows · Linux · macOS"] --> API["Starling native server<br/>OpenAI-compatible batch + Starling streaming"]
+  Desktop["Desktop · Rust gpui<br/>Windows · Linux · macOS"] --> API["Starling native server<br/>OpenAI-compatible batch + Starling streaming"]
   Android["Android · Kotlin<br/>Recorder + voice keyboard"] --> API
   iOS["iOS · SwiftUI<br/>Recorder + share / copy"] --> API
-  Shared["Shared wire contract<br/>TypeScript client + fidelity rules"] --> Desktop
+  Shared["Shared wire contract<br/>TypeScript client + fidelity rules"]
+  Shared -. protocol .-> Desktop
   Shared -. protocol .-> Android
   Shared -. protocol .-> iOS
   Quants["GGUF recipes + artifact records"] --> Engine["Starling ggml engines<br/>CPU · Metal · Vulkan · HIP · optional CUDA"]
   API --> Engine
 ```
 
-Each build system owns its natural boundary. pnpm workspaces link the desktop
-interface and TypeScript library. CMake owns the native server and quantizer.
+Each build system owns its natural boundary. Cargo owns the gpui desktop app.
+pnpm workspaces link the TypeScript library and the npm launcher. CMake owns
+the native server and quantizer.
 Gradle owns Android. XcodeGen and Swift Package Manager own iOS. The small Python
 quant catalog is independent of the deprecated Python inference environment.
 
 | Path | Ownership |
 | --- | --- |
-| `apps/desktop` | Desktop UI, microphone capture, local history, native HTTP bridge, global shortcut |
+| `apps/desktop-gpui` | Desktop app (Rust, gpui): UI, microphone capture, journaled local history, HTTP client, global shortcut |
 | `apps/mobile` | Android activity, recorder, private storage, network client, voice keyboard |
 | `apps/ios` | iOS recorder, private history, native HTTP client, share/copy |
-| `packages/dictation` | WAV preparation, TypeScript client, immutable analysis, browser session persistence |
+| `packages/dictation` | WAV preparation, TypeScript client, immutable analysis, browser session persistence (reference library; the Rust desktop re-implements this contract) |
 | `packages/contracts` | Language-independent OpenAPI contract |
 | `backends/native` | Native CMake build definition and real HTTP contract tests |
 | `quants` | Recipe catalog, calibrated recipes, artifact provenance CLI |
@@ -45,14 +47,16 @@ preserve C API consumers and harness paths. The root `pyproject.toml` and
 
 | Target | Implementation | Verification needed on hardware |
 | --- | --- | --- |
-| Windows | Electron desktop + native CPU server | Microphone permissions, shortcut, installer |
-| Linux | Electron desktop + native CPU/Vulkan server | Chromium audio, X11/Wayland shortcut behavior, packaging |
-| macOS | Electron desktop + native CPU/Metal server | Microphone prompt, global shortcut, signing and notarization |
+| Windows | gpui desktop + native CPU server | Microphone permissions, shortcut, installer |
+| Linux | gpui desktop + native CPU/Vulkan server | X11/Wayland audio and shortcut behavior, packaging |
+| macOS | gpui desktop + native CPU/Metal server | Microphone prompt, global shortcut, signing and notarization |
 | Android | Native Kotlin recorder and voice keyboard | Microphone/device lifecycle, IME behavior, LAN connectivity |
 | iOS / iPadOS | Native SwiftUI recorder | Microphone interruptions, local-network prompt, audio routes, signing |
 
-These are development targets, not five published store releases. The CI
-workflow builds the desktop app on three OS runners, builds Android, and builds
+These are development targets, not five published store releases. The gpui
+workflow runs the Rust test suite on Linux, compile-checks the Windows service
+host, and packages unsigned macOS (universal DMG) and Windows (portable
+archive) builds on every push. `apps.yml` builds Android and builds
 iOS for the simulator. Physical-device recording and distribution remain
 separate acceptance checks. A CI configuration is not evidence of a successful
 run until that workflow executes.
@@ -104,12 +108,12 @@ sequenceDiagram
 
 ### Streaming captures
 
-The desktop app can stream audio to the server's `WS /stream` endpoint while
-the microphone is live and show partial transcripts. The streaming path keeps
+The desktop app streams audio to the server's `WS /stream` endpoint while
+the microphone is live and shows partial transcripts. The streaming path keeps
 the same guarantees:
 
-1. The capture requests 16 kHz mono PCM16. Every chunk is appended to a
-   durable IndexedDB journal first; only then is it sent to the server.
+1. The capture is converted to 16 kHz mono PCM16. Only samples the durable
+   journal has acknowledged are sent to the server.
 2. On Stop the journal is assembled into the canonical WAV and the session is
    persisted before the client asks the server to commit. The streamed final
    is accepted only if the socket carried the whole take without errors.
@@ -132,14 +136,12 @@ the same guarantees:
 6. Keep reported audio duration separate from recognized content coverage.
    Segment boundaries often describe chunks, not word-level coverage.
 
-Non-streaming desktop captures (imports, streaming disabled or unavailable)
-buffer active capture in memory until Stop, exactly as before: a crash before
-capture is saved can still lose that active take. Streaming captures journal
-chunks as they arrive, so a crash mid-recording leaves recoverable audio up to
-the last journaled chunk. Browser storage can be cleared or evicted. Native
-mobile recording writes audio into app-private files. None of these paths
-promises recovery from every OS or storage failure. Use saved audio exports
-for recordings that must outlive the app.
+The gpui desktop mirrors every captured take into an append-only journal with
+fsynced boundaries while the microphone is live, so a crash mid-recording
+leaves recoverable audio up to the last acknowledged boundary; recovery runs
+on the next start. Native mobile recording writes audio into app-private
+files. None of these paths promises recovery from every OS or storage
+failure. Use saved audio exports for recordings that must outlive the app.
 
 The text fixtures cover the six failure modes raised in the original request.
 They test preservation and recovery behavior, not real-world recognition

@@ -15,7 +15,7 @@ The package keeps four boundaries explicit:
 - inference returns the server's raw text unchanged;
 - any fidelity warning or edit is advisory data and never mutates raw text;
 - every request is sent with `redirect: "manual"` and 3xx responses fail with
-  the same "Server redirect blocked" wording as the Electron bridge, so audio
+  the same "Server redirect blocked" wording as the native clients, so audio
   and credentials are never re-sent to an origin the user did not configure.
 
 Captured WAVs can be written to `IndexedDbSessionStore` before inference. The
