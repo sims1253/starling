@@ -79,8 +79,9 @@ class OnDeviceEngine(
 
     /** Every installed model, sorted by name, with the active one marked. */
     fun installedModels(): List<InstalledModel> {
-        val active = activeModelFile()
-        return installedFiles().map { InstalledModel(it.name, it.length(), it == active) }
+        val installed = installedFiles()
+        val active = activeAmong(installed)
+        return installed.map { InstalledModel(it.name, it.length(), it == active) }
     }
 
     /**
@@ -111,36 +112,6 @@ class OnDeviceEngine(
         }
     }
 
-    /**
-     * Before 0.2.2 every model, downloaded or imported, was stored as
-     * [DEFAULT_MODEL_NAME]. When that file is byte-for-byte [spec], rename it
-     * to the catalog name so it shows as that model instead of being offered
-     * for download again. Blocking: hashes hundreds of MB, only when the size
-     * already matches. Holds [importLock] throughout, so no import or delete
-     * can change the file between the check, the hash, and the rename; the
-     * engine lock only for the rename, so transcription keeps running.
-     * True when the model was renamed.
-     */
-    fun recognizeLegacyDownload(spec: ModelDownload): Boolean = synchronized(importLock) {
-        val legacy = installedFile(DEFAULT_MODEL_NAME)?.takeIf { it.length() == spec.sizeBytes } ?: return false
-        val target = File(modelDir, sanitizeModelName(spec.fileName))
-        if (target.exists()) return false
-        val digest = runCatching { ModelDownloader.sha256(legacy) }.getOrNull() ?: return false
-        if (!digest.equals(spec.sha256, ignoreCase = true)) return false
-        synchronized(lock) {
-            val wasActive = activeModelFile() == legacy
-            if (!legacy.renameTo(target)) return false
-            // Same bytes: a resident model stays valid under its new name.
-            if (loadedFile == legacy) loadedFile = target
-            if (wasActive) {
-                runCatching { writeActiveName(target.name) }
-                    .onFailure { runCatching { Log.w(TAG, "Could not record the renamed model as active", it) } }
-            }
-            fsyncModelDirectory()
-            true
-        }
-    }
-
     /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
     private fun releaseLocked() {
         if (liveSessions > 0) releasePending = true else unload()
@@ -154,10 +125,19 @@ class OnDeviceEngine(
     private fun installedFile(name: String): File? =
         installedFiles().firstOrNull { it.name == name }
 
-    private fun activeModelFile(): File? {
-        val installed = installedFiles()
+    private fun activeModelFile(): File? = activeAmong(installedFiles())
+
+    private fun activeAmong(installed: List<File>): File? {
         val named = readActiveName()
         return installed.firstOrNull { it.name == named } ?: installed.firstOrNull()
+    }
+
+    /** [name], or name-2.gguf, name-3.gguf, ... : the first that is not taken. */
+    private fun freeModelFile(name: String): File {
+        val stem = name.removeSuffix(MODEL_EXTENSION)
+        return generateSequence(1) { it + 1 }
+            .map { n -> File(modelDir, if (n == 1) name else "$stem-$n$MODEL_EXTENSION") }
+            .first { !it.exists() }
     }
 
     private fun readActiveName(): String? =
@@ -241,7 +221,10 @@ class OnDeviceEngine(
                         ImportStage.COPY,
                     )
                 }
-                publishStaged(staged, File(modelDir, sanitizeModelName(name)), promote)
+                // An import never replaces an installed model: a clash gets a
+                // numbered name, so a same-named file cannot silently swap
+                // out a model (or pose as the catalog model).
+                publishStaged(staged, promote) { freeModelFile(sanitizeModelName(name)) }
             }
         }
 
@@ -272,20 +255,21 @@ class OnDeviceEngine(
                 deleteFile(downloaded, "downloaded model")
                 return ImportResult.Rejected("The downloaded model could not be staged.", ImportStage.COPY)
             }
-            publishStaged(staged, File(modelDir, sanitizeModelName(name)), promote)
+            // A verified download replaces an earlier copy of itself.
+            publishStaged(staged, promote) { File(modelDir, sanitizeModelName(name)) }
         }
 
     private fun stagingFile() = File(modelDir, "$DEFAULT_MODEL_NAME.${UUID.randomUUID()}.importing")
 
     /**
-     * Validates [staged], promotes it over [modelFile] (replacing an installed
-     * model of the same name), and makes it the active model; [staged] is gone
-     * afterwards. Holds [importLock].
+     * Validates [staged], promotes it to the file [target] picks, and makes
+     * that the active model; [staged] is gone afterwards. Holds [importLock],
+     * so the target cannot be taken between choosing and promoting it.
      */
     private fun publishStaged(
         staged: File,
-        modelFile: File,
         promote: (staged: File, target: File) -> Boolean,
+        target: () -> File,
     ): ImportResult {
         val size = staged.length()
         try {
@@ -297,6 +281,7 @@ class OnDeviceEngine(
                 return ImportResult.Rejected(rejection, ImportStage.VALIDATE)
             }
 
+            val modelFile = target()
             synchronized(lock) {
                 // Single atomic step: rename(2) over the target replaces it
                 // or fails — the previous model is never deleted first, so a
@@ -390,9 +375,7 @@ class OnDeviceEngine(
     }
 
     /**
-     * Removes leftover staging files: the unique ones from interrupted
-     * imports and the fixed "parakeet.gguf.importing" name written by app
-     * versions before B08 (both end in ".importing").
+     * Removes staging files left by interrupted imports.
      * Only ever called with [importLock] held, so no staging file can be in
      * use.
      */
@@ -543,7 +526,7 @@ class OnDeviceEngine(
     companion object {
         private const val TAG = "OnDeviceEngine"
 
-        /** Name for a model imported without a usable file name, and of the single model before 0.2.2. */
+        /** Name for a model imported without a usable file name. */
         const val DEFAULT_MODEL_NAME = "parakeet.gguf"
         private const val ACTIVE_FILE_NAME = "active-model"
         private const val MODEL_EXTENSION = ".gguf"
@@ -567,6 +550,9 @@ class OnDeviceEngine(
                 .replace(UNSAFE_NAME_CHARS, "_")
                 .trimStart('.')
                 .take(MAX_NAME_CHARS)
+                // Truncation (or the source) can leave a stray separator
+                // before the extension this appends.
+                .trimEnd('.', '_', '-')
             // Leading dots are gone, so a bare ".gguf" is now "gguf".
             if (base.isEmpty() || base.equals(MODEL_EXTENSION.removePrefix("."), ignoreCase = true)) {
                 return DEFAULT_MODEL_NAME

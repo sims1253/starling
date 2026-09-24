@@ -148,7 +148,7 @@
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
 
-        <!-- Filled by MainActivity.refreshInstalledModels; hidden when none is installed. -->
+        <!-- Filled by MainActivity.renderInstalledModels; hidden when none is installed. -->
         <TextView
             android:id="@+id/installed_models_heading"
             android:layout_width="match_parent"

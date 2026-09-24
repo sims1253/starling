@@ -342,7 +342,7 @@ class OnDeviceEngineImportTest {
     }
 
     @Test
-    fun concurrentImportsSerializeAndPublishExactlyOneModel() {
+    fun concurrentImportsSerializeAndPublishEachModel() {
         val directory = tempDir()
         try {
             val engine = OnDeviceEngine(directory)
@@ -374,14 +374,15 @@ class OnDeviceEngineImportTest {
                 )
             }
 
-            val model = File(directory, "parakeet.gguf")
-            assertTrue("exactly one model must be published", model.isFile)
-            val published = prefix(model, 256)
-            val matchesFirst = published.contentEquals(prefix(first, 256))
-            val matchesSecond = published.contentEquals(prefix(second, 256))
-            assertTrue(
-                "the published model must be exactly one of the two imports",
-                matchesFirst || matchesSecond,
+            // Same name, so the second gets a numbered one; each must hold
+            // exactly its own bytes.
+            val installed = engine.installedModels().map { it.name }
+            assertEquals(listOf("parakeet-2.gguf", "parakeet.gguf"), installed)
+            val prefixes = installed.map { prefix(File(directory, it), 256).toList() }.toSet()
+            assertEquals(
+                "each import is published intact under its own name",
+                setOf(prefix(first, 256).toList(), prefix(second, 256).toList()),
+                prefixes,
             )
             assertEquals(
                 "no staging files may survive concurrent imports",
@@ -601,56 +602,49 @@ class OnDeviceEngineImportTest {
     }
 
     @Test
-    fun legacySingleModelIsStillTheActiveOne() {
+    fun withoutAnActiveMarkerTheFirstInstalledModelIsActive() {
         val directory = tempDir()
         try {
-            sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
+            sparseModelFile(directory, "b.gguf", parakeetPayload())
+            sparseModelFile(directory, "a.gguf", parakeetPayload())
 
             val engine = OnDeviceEngine(directory)
 
-            assertEquals("parakeet.gguf", engine.activeModelName())
-        } finally {
-            directory.deleteRecursively()
-        }
-    }
-
-    private fun catalogSpec(file: File, sha256: String = ModelDownloader.sha256(file)) = ModelDownload(
-        url = "https://example.invalid/models/recommended.gguf",
-        sizeBytes = file.length(),
-        sha256 = sha256,
-        label = "Recommended",
-    )
-
-    @Test
-    fun legacyCopyOfTheCatalogModelGetsItsCatalogName() {
-        val directory = tempDir()
-        try {
-            val legacy = sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
-            val engine = OnDeviceEngine(directory)
-
-            assertTrue(engine.recognizeLegacyDownload(catalogSpec(legacy)))
-
-            assertEquals("recommended.gguf", engine.activeModelName())
-            assertEquals(listOf("recommended.gguf"), engine.installedModels().map { it.name })
+            assertEquals("a.gguf", engine.activeModelName())
         } finally {
             directory.deleteRecursively()
         }
     }
 
     @Test
-    fun legacyModelWithOtherBytesKeepsItsName() {
+    fun anImportNeverReplacesAnInstalledModel() {
         val directory = tempDir()
         try {
-            val legacy = sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
             val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
 
-            assertFalse("a digest mismatch is not the catalog model", engine.recognizeLegacyDownload(catalogSpec(legacy, "0".repeat(64))))
-            assertFalse(
-                "a size mismatch is not even hashed",
-                engine.recognizeLegacyDownload(catalogSpec(legacy).copy(sizeBytes = legacy.length() + 1)),
-            )
+            engine.importModel(source.inputStream(), "model.gguf")
+            val second = engine.importModel(source.inputStream(), "model.gguf")
 
-            assertEquals(listOf("parakeet.gguf"), engine.installedModels().map { it.name })
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "model-2.gguf"), second)
+            assertEquals(listOf("model-2.gguf", "model.gguf"), engine.installedModels().map { it.name })
+            assertEquals("model-2.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aDownloadReplacesAnEarlierCopyOfItself() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            repeat(2) {
+                val download = sparseModelFile(directory, "download-test.part", parakeetPayload())
+                engine.adoptDownloaded(download, "catalog.gguf")
+            }
+
+            assertEquals(listOf("catalog.gguf"), engine.installedModels().map { it.name })
         } finally {
             directory.deleteRecursively()
         }
@@ -679,6 +673,8 @@ class OnDeviceEngineImportTest {
         assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(null))
         assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName("..."))
         assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(".gguf"))
+        assertEquals("draft.gguf", OnDeviceEngine.sanitizeModelName("draft."))
+        assertEquals("a".repeat(120) + ".gguf", OnDeviceEngine.sanitizeModelName("a".repeat(200)))
         assertEquals("a.gguf.importing.gguf", OnDeviceEngine.sanitizeModelName("a.gguf.importing"))
     }
 }

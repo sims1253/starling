@@ -165,20 +165,21 @@ class MainActivity : Activity() {
     private fun renderDownload(state: ModelDownloadController.State) {
         val spec = ModelCatalog.RECOMMENDED_PARAKEET
         val totalMb = mb(spec.sizeBytes)
-        if (state is ModelDownloadController.State.Running) {
-            downloadModelButton.visibility = View.VISIBLE
-            downloadModelButton.setText(R.string.cancel_download)
-            onDeviceStatus.text = if (state.verifying) {
-                getString(R.string.on_device_verifying)
-            } else {
-                val percent = if (state.total > 0) (state.bytes * 100 / state.total).toInt() else 0
-                getString(R.string.on_device_downloading, percent, mb(state.bytes), totalMb)
-            }
-            return
-        }
-        val models = application.onDeviceEngine.installedModels()
+        // Listed only once the download is not running: progress ticks
+        // never touch the model directory.
+        val models by lazy { application.onDeviceEngine.installedModels() }
         when (state) {
-            is ModelDownloadController.State.Running -> Unit
+            is ModelDownloadController.State.Running -> {
+                downloadModelButton.visibility = View.VISIBLE
+                downloadModelButton.setText(R.string.cancel_download)
+                onDeviceStatus.text = if (state.verifying) {
+                    getString(R.string.on_device_verifying)
+                } else {
+                    val percent = if (state.total > 0) (state.bytes * 100 / state.total).toInt() else 0
+                    getString(R.string.on_device_downloading, percent, mb(state.bytes), totalMb)
+                }
+                return
+            }
             is ModelDownloadController.State.Finished -> when (val result = state.result) {
                 // Re-delivered on every onStart, so no one-shot message here.
                 is OnDeviceEngine.ImportResult.Imported -> renderOnDeviceStatus(models)
@@ -191,7 +192,6 @@ class MainActivity : Activity() {
                 onDeviceStatus.text = getString(R.string.on_device_download_failed, state.reason)
             ModelDownloadController.State.Paused ->
                 onDeviceStatus.setText(R.string.on_device_download_paused)
-            // Also re-published when the installed models change in the background.
             ModelDownloadController.State.Idle -> renderOnDeviceStatus(models)
         }
         renderInstalledModels(models)
@@ -319,10 +319,10 @@ class MainActivity : Activity() {
         onDeviceStatus.text = when {
             active == null -> getString(R.string.on_device_status_no_model)
             engineOnDeviceInput.isChecked ->
-                getString(R.string.on_device_model_in_use, modelDisplayName(active.name), mb(active.sizeBytes))
+                getString(R.string.on_device_model_in_use, modelDisplayName(active), mb(active.sizeBytes))
             else -> getString(
                 R.string.on_device_model_not_selected,
-                modelDisplayName(active.name),
+                modelDisplayName(active),
                 mb(active.sizeBytes),
                 getString(R.string.engine_on_device),
             )
@@ -330,12 +330,14 @@ class MainActivity : Activity() {
     }
 
     /** Catalog models by their label; anything else by its file name. */
-    private fun modelDisplayName(name: String): String {
+    private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {
         val recommended = ModelCatalog.RECOMMENDED_PARAKEET
-        return if (name == recommended.fileName) {
+        // Imports never take an installed name, and only a verified
+        // download is written under the catalog name at the catalog size.
+        return if (model.name == recommended.fileName && model.sizeBytes == recommended.sizeBytes) {
             getString(R.string.recommended_model_name, recommended.label)
         } else {
-            name
+            model.name
         }
     }
 
@@ -353,7 +355,7 @@ class MainActivity : Activity() {
         // Each row is its own layout, so no RadioGroup keeps them exclusive.
         val choices = mutableListOf<RadioButton>()
         for (model in models) {
-            val displayName = modelDisplayName(model.name)
+            val displayName = modelDisplayName(model)
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -381,7 +383,7 @@ class MainActivity : Activity() {
             row.addView(delete)
             installedModelsContainer.addView(row)
         }
-        val recommendedInstalled = models.any { it.name == recommended.fileName }
+        val recommendedInstalled = models.any { it.name == recommended.fileName && it.sizeBytes == recommended.sizeBytes }
         val downloads = application.modelDownloads
         downloadModelButton.visibility = if (
             recommendedInstalled && !downloads.isRunning && downloads.resumableBytes(recommended) == 0L

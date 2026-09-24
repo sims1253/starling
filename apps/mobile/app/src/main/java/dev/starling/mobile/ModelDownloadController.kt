@@ -44,18 +44,6 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
         listeners -= listener
     }
 
-    /**
-     * Renames a pre-0.2.2 copy of [spec] to its catalog name (see
-     * [OnDeviceEngine.recognizeLegacyDownload]) and re-renders listeners.
-     * Blocking; any thread. Never throws: a failure only leaves the old name.
-     */
-    fun recognizeLegacyDownload(spec: ModelDownload) {
-        val renamed = runCatching { engine.recognizeLegacyDownload(spec) }
-            .onFailure { Log.w(TAG, "legacy model recognition failed", it) }
-            .getOrDefault(false)
-        if (renamed) main.post { publish(state) }
-    }
-
     /** Starts (or resumes) downloading [spec]; a no-op while one is running. Main thread. */
     fun start(spec: ModelDownload) {
         if (isRunning) return
