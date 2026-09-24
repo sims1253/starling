@@ -100,8 +100,9 @@ use crate::storage::{is_safe_path_component, now_iso};
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
-/// real updated-at source for the summaries).
-pub const V2_SCHEMA_VERSION: u32 = 2;
+/// real updated-at source for the summaries); v3 added `insight_events`
+/// (#294: per-job processing latency, recorded for Insights #308).
+pub const V2_SCHEMA_VERSION: u32 = 3;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -239,6 +240,15 @@ CREATE TABLE IF NOT EXISTS deliveries (
     undo_json     TEXT,
     failure_json  TEXT
 );
+CREATE TABLE IF NOT EXISTS insight_events (
+    event_id     TEXT PRIMARY KEY,
+    capture_id   TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+    type         TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_insight_events_capture
+    ON insight_events(capture_id);
 CREATE TABLE IF NOT EXISTS tombstones (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
@@ -1154,6 +1164,69 @@ impl StoreV2 {
         self.store_document_revision(revision)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Deletes one document and (by cascade) its revisions. `Ok(false)`
+    /// when there was nothing to delete. Documents carry no foreign key
+    /// to a capture, so an embedder that keys a document by capture id
+    /// deletes it alongside the capture.
+    pub fn delete_document(&self, doc_id: &str) -> Result<bool, StoreV2Error> {
+        validate_document_id(doc_id)?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM documents WHERE doc_id = ?1", params![doc_id])?;
+        Ok(changed > 0)
+    }
+
+    /// Records one insight event (`packages/contracts/insight-events`)
+    /// for a capture. Idempotent on `event_id` like the contract says: a
+    /// byte-identical replay is a no-op, a different payload under a
+    /// known id is an error, never an overwrite. The row cascades away
+    /// with its capture, so deleting a take removes its events.
+    pub fn record_insight_event(
+        &self,
+        event_id: &str,
+        capture_id: &str,
+        kind: &str,
+        occurred_at: &str,
+        payload_json: &str,
+    ) -> Result<(), StoreV2Error> {
+        let known: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM insight_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match known {
+            Some(payload) if payload == payload_json => Ok(()),
+            Some(_) => Err(StoreV2Error::Invalid(format!(
+                "insight event {event_id} already recorded with a different payload"
+            ))),
+            None => {
+                self.conn.execute(
+                    "INSERT INTO insight_events(event_id, capture_id, type, occurred_at, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![event_id, capture_id, kind, occurred_at, payload_json],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// One capture's insight events as `(type, payload_json)`, in
+    /// insertion order.
+    pub fn insight_events_for(&self, capture_id: &str) -> Result<Vec<(String, String)>, StoreV2Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT type, payload_json FROM insight_events WHERE capture_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![capture_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
     }
 
     /// Advances one document's `turn_seq`, creating the row (head 0,
@@ -6485,5 +6558,67 @@ mod tests {
             revision.rev_id = bad.to_string();
             assert!(store.store_document_revision(&revision).is_err());
         }
+    }
+
+    #[test]
+    fn a_document_is_deleted_with_its_revisions() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        store
+            .commit_document_head("take", 1, 0, &sample_revision("take#h1", "take", 0, "raw"))
+            .expect("head");
+        assert!(store.delete_document("take").expect("delete"));
+        assert!(store.get_document("take").expect("get").is_none());
+        assert!(!store.delete_document("take").expect("second delete"));
+        // The cascade took the revision row: its id is free again.
+        store
+            .commit_document_head("other", 1, 0, &sample_revision("take#h1", "other", 0, "x"))
+            .expect("the rev id no longer belongs to the deleted document");
+    }
+
+    #[test]
+    fn insight_events_are_idempotent_and_die_with_their_capture() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(1600, 0));
+        let id = take.record.id.clone();
+        let payload = r#"{"type":"processing_recorded","job_id":"req-1"}"#;
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload)
+            .expect("record");
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload)
+            .expect("a byte-identical replay is a no-op");
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", "{}")
+            .expect_err("a different payload under a known id is a conflict");
+        assert_eq!(
+            store.insight_events_for(&id).expect("events"),
+            vec![("processing_recorded".to_string(), payload.to_string())]
+        );
+        store.delete_capture(&id).expect("delete");
+        assert!(store.insight_events_for(&id).expect("events").is_empty());
+    }
+
+    #[test]
+    fn a_version_2_database_gains_the_insight_table() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("v2");
+        {
+            let store = StoreV2::open(&root).expect("open");
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE insight_events;
+                     UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+                )
+                .expect("downgrade to the v2 layout");
+        }
+        let mut store = StoreV2::open(&root).expect("reopen upgrades");
+        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        let take = committed_take(&mut store, &ramp(160, 0));
+        store
+            .record_insight_event("e1", &take.record.id, "processing_recorded", "2026-09-24T10:00:00Z", "{}")
+            .expect("the table exists after the upgrade");
     }
 }

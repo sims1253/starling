@@ -344,3 +344,37 @@ def test_a_dictated_command_line_is_just_text() -> None:
     text = "please run rm -rf / and open https://example.com period"
     got = sc.apply(text, language="en", spoken_commands=True, snippets=[], table=COMMAND_TABLE)
     assert got == "please run rm -rf / and open https://example.com."
+
+
+# --------------------------------------------------------------------------- #
+# The desktop app's built-in modes (#295) are an ordinary profiles document
+# --------------------------------------------------------------------------- #
+DESKTOP_MODES = mr.load_json(mr.REPO / "apps" / "desktop-gpui" / "crates" / "app" / "modes"
+                             / "desktop-profiles.json")
+
+
+def test_desktop_modes_conform_and_pass_every_rule() -> None:
+    assert_valid(DESKTOP_MODES, mr.load_schema("profiles.schema.json"))
+    mr.validate_config(DESKTOP_MODES)
+    mr.validate_processing(DESKTOP_MODES)
+    by_id = {p["id"]: p for p in DESKTOP_MODES["profiles"]}
+    assert DESKTOP_MODES["default_profile"] == "verbatim"
+    assert by_id["verbatim"]["transform_kinds"] == []
+    # The local mode is local-only English (S1-mini's guardrails); the API
+    # mode is the only one allowed off the machine.
+    assert by_id["clean-local"]["local_only"] and by_id["clean-local"]["language"] == "en"
+    assert not by_id["clean-api"]["local_only"]
+    assert all(p["context_fields"] == [] for p in DESKTOP_MODES["profiles"])
+
+
+def test_desktop_modes_route_to_the_desktop_providers() -> None:
+    by_id = {p["id"]: p for p in DESKTOP_MODES["profiles"]}
+    s1 = dict(PROVIDERS_BY_ID["local-s1"], route="local-authoring-s1")
+    api = dict(PROVIDERS_BY_ID["remote-openai"], route="remote-authoring-api")
+    providers = [s1, api]
+    assert mr.processing_route(by_id["clean-local"], providers)["provider"] == "local-s1"
+    assert mr.processing_route(by_id["clean-api"], providers)["provider"] == "remote-openai"
+    assert mr.processing_route(by_id["verbatim"], providers)["status"] == "none"
+    # Without the S1 server configured, the local mode blocks; it never
+    # falls back to the API.
+    assert mr.processing_route(by_id["clean-local"], [api])["reason"] == "provider_unavailable"

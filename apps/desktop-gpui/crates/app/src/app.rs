@@ -2,7 +2,7 @@
 //! `apps/desktop/src/App.tsx`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
@@ -19,12 +19,15 @@ use starling_dictation::{
     fidelity::{self, TranscriptAnalysisOptions},
     player::Player,
     recorder::RecorderHandle,
-    settings::Settings,
+    settings::{ProcessingSettings, Settings},
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
 use crate::{input::TextField, store::Store, theme, upload::refresh_sessions, views};
 use crate::live_stream::LiveStream;
+use crate::processing::{self, Providers, TakeProcessing};
+use starling_processing::staging::Draft;
+use starling_processing::CancelToken;
 
 actions!(starling, [ToggleRecording]);
 
@@ -340,6 +343,23 @@ pub struct StarlingApp {
     pub draft_endpoint: Entity<TextField>,
     pub draft_model: Entity<TextField>,
     pub draft_terms: Entity<TextField>,
+
+    /// Text processing after transcription (#295): the committed
+    /// settings, the providers built from them, each take's processing
+    /// view and staged draft, the running job per take, and when each
+    /// recent take stopped (for stop-to-processed latency).
+    pub processing_settings: ProcessingSettings,
+    pub(crate) providers: Providers,
+    pub(crate) processing: HashMap<String, TakeProcessing>,
+    pub(crate) drafts: HashMap<String, Draft>,
+    pub(crate) processing_jobs: HashMap<String, (String, CancelToken)>,
+    pub(crate) stop_instants: HashMap<String, Instant>,
+    /// The settings dialog's processing drafts (committed on save).
+    pub draft_mode: String,
+    pub draft_s1_endpoint: Entity<TextField>,
+    pub draft_api_endpoint: Entity<TextField>,
+    pub draft_api_model: Entity<TextField>,
+    pub draft_api_key_env: Entity<TextField>,
 
     pub connection: Connection,
     pub server_model: String,
@@ -799,6 +819,18 @@ impl StarlingApp {
         let draft_endpoint = cx.new(|cx| TextField::new("http://127.0.0.1:8181", &endpoint, cx));
         let draft_model = cx.new(|cx| TextField::new("parakeet", &model, cx));
         let draft_terms = cx.new(|cx| TextField::new("auth, Starling, GGUF", &terms_input, cx));
+        let processing_settings = settings.processing.clone();
+        let draft_s1_endpoint = cx.new(|cx| {
+            TextField::new("http://127.0.0.1:8182", &processing_settings.s1_endpoint, cx)
+        });
+        let draft_api_endpoint = cx.new(|cx| {
+            TextField::new("https://api.openai.com/v1", &processing_settings.api_endpoint, cx)
+        });
+        let draft_api_model =
+            cx.new(|cx| TextField::new("gpt-4.1-mini", &processing_settings.api_model, cx));
+        let draft_api_key_env = cx.new(|cx| {
+            TextField::new("OPENAI_API_KEY", &processing_settings.api_key_env, cx)
+        });
 
         Self {
             error: store_error.clone(),
@@ -816,6 +848,17 @@ impl StarlingApp {
             draft_endpoint,
             draft_model,
             draft_terms,
+            providers: processing::build_providers(&processing_settings),
+            draft_mode: processing_settings.mode.clone(),
+            processing_settings,
+            processing: HashMap::new(),
+            drafts: HashMap::new(),
+            processing_jobs: HashMap::new(),
+            stop_instants: HashMap::new(),
+            draft_s1_endpoint,
+            draft_api_endpoint,
+            draft_api_model,
+            draft_api_key_env,
             connection: Connection::Checking,
             server_model: "server".to_string(),
             probe: None,
@@ -1012,6 +1055,37 @@ impl StarlingApp {
         self.draft_terms.update(cx, |field, cx| {
             field.set_value(&terms, cx);
         });
+        let processing = self.processing_settings.clone();
+        self.draft_mode = processing.mode.clone();
+        self.draft_s1_endpoint.update(cx, |field, cx| {
+            field.set_value(&processing.s1_endpoint, cx);
+        });
+        self.draft_api_endpoint.update(cx, |field, cx| {
+            field.set_value(&processing.api_endpoint, cx);
+        });
+        self.draft_api_model.update(cx, |field, cx| {
+            field.set_value(&processing.api_model, cx);
+        });
+        self.draft_api_key_env.update(cx, |field, cx| {
+            field.set_value(&processing.api_key_env, cx);
+        });
+        cx.notify();
+    }
+
+    /// The processing settings the dialog currently shows (for the
+    /// destination disclosure, before anything is saved).
+    pub(crate) fn draft_processing_settings(&self, cx: &gpui::App) -> ProcessingSettings {
+        ProcessingSettings {
+            mode: self.draft_mode.clone(),
+            s1_endpoint: self.draft_s1_endpoint.read(cx).value().trim().to_string(),
+            api_endpoint: self.draft_api_endpoint.read(cx).value().trim().to_string(),
+            api_model: self.draft_api_model.read(cx).value().trim().to_string(),
+            api_key_env: self.draft_api_key_env.read(cx).value().trim().to_string(),
+        }
+    }
+
+    pub(crate) fn pick_draft_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.draft_mode = mode.to_string();
         cx.notify();
     }
 
@@ -1122,12 +1196,17 @@ impl StarlingApp {
             user_set_model_after_save(self.user_set_model, &self.model, &draft_model);
         self.model = draft_model;
         self.expected_terms_input = self.draft_terms.read(cx).value();
+        // A new processing configuration takes effect for the next job;
+        // jobs already running keep the provider they started with.
+        self.processing_settings = self.draft_processing_settings(cx);
+        self.providers = processing::build_providers(&self.processing_settings);
 
         let mut settings = Settings {
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             expected_terms: Vec::new(),
             user_set_model: self.user_set_model,
+            processing: self.processing_settings.clone(),
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
 
@@ -1173,7 +1252,8 @@ impl StarlingApp {
         if self.selected_id.as_deref() != Some(id.as_str()) {
             self.selection_moved();
         }
-        self.selected_id = Some(id);
+        self.selected_id = Some(id.clone());
+        self.load_processing(id, cx);
         cx.notify();
     }
 
@@ -1264,6 +1344,9 @@ impl StarlingApp {
         let Some(store) = self.store.clone() else {
             return false;
         };
+        // Delete during processing: the job is cancelled and its draft
+        // deleted, so a late result lands nowhere.
+        self.drop_processing(&id);
         self.deleting_ids.insert(id.clone());
         cx.spawn(async move |this, cx| {
             let deleted = {
@@ -1315,13 +1398,11 @@ impl StarlingApp {
         let Some(id) = self.selected_id.clone() else {
             return;
         };
-        let Some(transcript) = self
-            .selected()
-            .and_then(|session| session.transcript.clone())
-        else {
+        // The take's head: the used processed text, or the raw transcript.
+        let Some(text) = self.head_text(&id) else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(transcript.text));
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
         // #214.2: the flag names the take it was earned on, so it can never
         // show "Copied" on a different selection.
         self.copied = Some(id.clone());
@@ -1333,18 +1414,18 @@ impl StarlingApp {
         let Some(session) = self.selected() else {
             return;
         };
-        let Some(transcript) = session.transcript.clone() else {
-            return;
-        };
         let name = format!(
             "starling-{}.txt",
             session.created_at.replace([':', '.'], "-")
         );
+        let Some(text) = self.head_text(&session.id) else {
+            return;
+        };
         // Re-exportable from history, so no fsync (see write_download_exclusive);
         // a transcript export flips no Saved flag.
         self.write_download(
             name,
-            Arc::new(transcript.text.into_bytes()),
+            Arc::new(text.into_bytes()),
             None,
             false,
             cx,

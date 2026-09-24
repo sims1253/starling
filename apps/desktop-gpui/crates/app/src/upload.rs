@@ -2,6 +2,7 @@
 //! import flow, split out of `app.rs`.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
@@ -195,6 +196,8 @@ impl StarlingApp {
             if capture_fault.is_some() {
                 stream = None;
             }
+            // Stop-to-processed latency (#295) starts here.
+            let stopped_at = Instant::now();
             match handle.stop() {
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
@@ -255,7 +258,13 @@ impl StarlingApp {
                         match encoded {
                             (Ok(wav), stream) => {
                                 this.update(cx, |app, cx| {
-                                    app.save_and_transcribe(Arc::new(wav), journal_report, stream, cx);
+                                    app.save_and_transcribe(
+                                        Arc::new(wav),
+                                        journal_report,
+                                        stream,
+                                        Some(stopped_at),
+                                        cx,
+                                    );
                                 })
                                 .ok();
                             }
@@ -366,6 +375,7 @@ impl StarlingApp {
         wav: Arc<Vec<u8>>,
         journal: Option<recorder::JournalReport>,
         stream: Option<LiveStream>,
+        stopped_at: Option<Instant>,
         cx: &mut Context<Self>,
     ) {
         // Deliberately no `self.error = None` here: every caller clears the
@@ -400,6 +410,9 @@ impl StarlingApp {
                         // stored evidence itself when the journal was
                         // adopted (the same bytes a retry loads), the
                         // caller's WAV otherwise.
+                        if let Some(stopped_at) = stopped_at {
+                            app.stop_instants.insert(saved.id.clone(), stopped_at);
+                        }
                         app.transcribe_with_stream(saved.id, saved.wav, stream, cx);
                     })
                     .ok();
@@ -734,12 +747,21 @@ impl StarlingApp {
                 .ok();
             }
 
+            let transcribed = job_failure.is_none() && !session_gone;
             this.update(cx, |app, cx| {
                 app.active_ids.remove(&id);
                 cx.notify();
             })
             .ok();
             refresh_sessions(&this, &store_for_job, cx).await;
+            // Raw text is in history now; the active mode's processing
+            // follows as a proposal (#295).
+            if transcribed {
+                this.update(cx, |app, cx| {
+                    app.after_transcription(id, cx);
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -765,7 +787,7 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, cx);
+                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, None, cx);
                             })
                             .ok();
                         }
@@ -831,6 +853,9 @@ pub(crate) async fn refresh_sessions(
         Ok(list) => {
             this.update(cx, |app, cx| {
                 app.apply_sessions(list);
+                if let Some(id) = app.selected_id.clone() {
+                    app.load_processing(id, cx);
+                }
                 cx.notify();
             })
             .ok();
