@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Context
+import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendSettings
@@ -37,6 +38,9 @@ class StarlingApplication : Application() {
         backendSettings = BackendSettings(this)
         onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
         modelDownloads = ModelDownloadController(onDeviceEngine)
+        Thread({ modelDownloads.recognizeLegacyDownload(ModelCatalog.RECOMMENDED_PARAKEET) }, "starling-model-migrate")
+            .apply { isDaemon = true }
+            .start()
         transcription = TranscriptionCoordinator(
             recordings,
             backendSettings,

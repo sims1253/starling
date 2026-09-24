@@ -148,6 +148,35 @@
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
 
+        <!-- Filled by MainActivity.refreshInstalledModels; hidden when none is installed. -->
+        <TextView
+            android:id="@+id/installed_models_heading"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_marginTop="12dp"
+            android:text="@string/installed_models_heading"
+            android:textColor="@color/starling_ink"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/installed_models_help"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="@string/installed_models_help"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/installed_models"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+
         <!-- Label set by MainActivity.renderDownload (size, resume state). -->
         <Button
             android:id="@+id/download_model_button"

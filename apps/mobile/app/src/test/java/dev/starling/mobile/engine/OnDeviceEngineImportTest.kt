@@ -543,4 +543,101 @@ class OnDeviceEngineImportTest {
             elsewhere.deleteRecursively()
         }
     }
+
+    @Test
+    fun importsKeepTheirNamesAndTheLatestIsActive() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+
+            engine.importModel(source.inputStream(), "first.gguf")
+            val result = engine.importModel(source.inputStream(), "second.gguf")
+
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "second.gguf"), result)
+            assertEquals(listOf("first.gguf", "second.gguf"), engine.installedModels().map { it.name })
+            assertEquals("second.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun selectionPersistsAcrossEngineInstances() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "first.gguf")
+            engine.importModel(source.inputStream(), "second.gguf")
+
+            assertTrue(engine.selectModel("first.gguf"))
+            assertFalse("an unknown model cannot be selected", engine.selectModel("missing.gguf"))
+
+            assertEquals("first.gguf", OnDeviceEngine(directory).activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun deletingTheActiveModelFallsBackToARemainingOne() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val source = sparseModelFile(directory, "source.part", parakeetPayload())
+            engine.importModel(source.inputStream(), "first.gguf")
+            engine.importModel(source.inputStream(), "second.gguf")
+
+            assertTrue(engine.deleteModel("second.gguf"))
+            assertEquals("first.gguf", engine.activeModelName())
+            assertTrue(engine.deleteModel("first.gguf"))
+            assertFalse(engine.hasModel())
+            assertFalse("only installed models can be deleted", engine.deleteModel("source.part"))
+            assertTrue(File(directory, "source.part").exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun legacySingleModelIsStillTheActiveOne() {
+        val directory = tempDir()
+        try {
+            sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
+
+            val engine = OnDeviceEngine(directory)
+
+            assertEquals("parakeet.gguf", engine.activeModelName())
+            assertTrue(engine.renameModel("parakeet.gguf", "recommended.gguf"))
+            assertEquals("recommended.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun downloadIsInstalledUnderItsCatalogName() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val download = sparseModelFile(directory, "download-test.part", parakeetPayload())
+
+            engine.adoptDownloaded(download, ModelCatalog.RECOMMENDED_PARAKEET.fileName)
+
+            assertEquals(ModelCatalog.RECOMMENDED_PARAKEET.fileName, engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun importNamesAreSanitized() {
+        assertEquals("model.gguf", OnDeviceEngine.sanitizeModelName("../x/model.gguf"))
+        assertEquals("my_model_v2.gguf", OnDeviceEngine.sanitizeModelName("my model v2"))
+        assertEquals("hidden.gguf", OnDeviceEngine.sanitizeModelName(".hidden.gguf"))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(null))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName("..."))
+        assertEquals("a.gguf.importing.gguf", OnDeviceEngine.sanitizeModelName("a.gguf.importing"))
+    }
 }

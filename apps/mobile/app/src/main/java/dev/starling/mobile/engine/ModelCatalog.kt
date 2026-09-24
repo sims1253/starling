@@ -9,7 +9,12 @@ data class ModelDownload(
     val url: String,
     val sizeBytes: Long,
     val sha256: String,
-)
+    /** Shown in the model list instead of the long file name. */
+    val label: String,
+) {
+    /** Installed under the file name it has upstream, so it is recognizable in the model list. */
+    val fileName: String get() = url.substringAfterLast('/')
+}
 
 object ModelCatalog {
     /**
@@ -22,5 +27,6 @@ object ModelCatalog {
             "96402b32bd374742aa1da3c66af30aa64cea3fdb/parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf",
         sizeBytes = 552_670_624L,
         sha256 = "2b5ea37e3193c71b3ad2f859b4238ff4501898ba73d63899568faee1daae9982",
+        label = "Parakeet TDT 0.6B v3",
     )
 }
