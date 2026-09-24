@@ -31,7 +31,9 @@ devices (SwiftShader, llvmpipe) are ignored.
 | --- | --- |
 | `STARLING_FAST_F16=0` | f32 products in the GEMMs (default: packed-f16 products with f32 accumulation per 32-deep slice where the device has `shaderFloat16`) |
 | `STARLING_FAST_CACHE_DIR` | where the Vulkan pipeline cache and autotuning results persist (the Android app sets it to its model directory) |
-| `STARLING_FAST_TUNE=1` | re-run the tile autotuner now |
+| `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR, which otherwise ships measured defaults) |
+| `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR only) |
+| `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
 | `STARLING_FAST_KSTEP=n` | MOSS decode tokens per submission (default 16) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
@@ -109,6 +111,9 @@ words); the packed-f16 variants additionally need `shaderFloat16`.
   and latency for several engine variants on the same clips.
 * `benchmarks/fast_engine/android_bench.sh`: cross-builds `starling-bench`,
   pushes it to a phone with the models and compares engines there.
+* `benchmarks/fast_engine/pixel_measure.sh`: the tuning campaign's phone
+  metric (Parakeet medium + MOSS short) with a fixture-transcript gate;
+  `phone_ab.sh` interleaves several binaries in one thermal window.
 
 The fast engines are **not** byte-exact with ggml: activations enter the
 matrix products as f16 (ggml's CPU path quantizes them to 8 bits), so
@@ -152,25 +157,33 @@ experiment log and `AUTORESEARCH.md` for the method). Vendor-keyed defaults
 for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128),
 f32 GEMM products, GEMV rows 8 with RSPLIT row slots padding workgroups to a
 whole subgroup; the CPU transducer decoder splits its GEMV rows across a
-second spinning thread. ggml runs with the app's 6 threads. Transcripts match
+second thread (held spinning for one transcription, parked in between);
+W4 decode GEMVs unpack nibbles with `unpackUnorm4x8`. ggml runs with the app's 6 threads. Transcripts match
 ggml on the fixtures; FLEURS en_us 100: Parakeet 5.33 % (ggml 5.47 %), MOSS
 q4e8 7.87 % (ggml 7.92 %).
 
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |
 | --- | --- | --- | --- |
-| Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.28 s** (enc 2.05 s, dec 0.14–0.20 s) |
+| Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.22 s** (enc 1.98 s, dec 0.14–0.20 s) |
 | Parakeet, 74.4 s | — | 9.0 s | **7.6 s** |
-| MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **6.0 s** (mel 0.13 s, decode 88.7 ms/tok) |
+| MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **5.6 s** (mel 0.13 s, enc+prefill 2.95 s, decode 76 ms/tok) |
 
-Energy per transcription (batterystats power model, 40/20-run averages):
+Energy per transcription (batterystats power model, 40/20-run averages,
+measured before the W4 unpack change, i.e. MOSS at 88.7 ms/token):
 Parakeet medium fast ≈ 1.33 mWh vs ggml ≈ 5.0 mWh (3.8×), MOSS short fast
 ≈ 2.05 mWh vs ggml ≈ 5.2 mWh (2.5×).
 
 The desktop-tuned GPU kernels now reach ~180 GFLOPS on the encoder GEMMs
 (peak f32 ≈ 500 GFLOPS); the remaining gap is shared-memory traffic, not
-barriers or tail waves. `VK_KHR_cooperative_matrix` is advertised (f16 and
-int8 shapes) but the driver's shader compiler faults on any coopmat
-instruction — the kernels exist (`gemm_coop.comp`) behind
-`STARLING_FAST_COOPMAT=1` for drivers that fix this. The q4e4 model file
+barriers or tail waves. Decode GEMVs, in contrast, are instruction-issue
+bound on this GPU, not bandwidth bound: W4 and W8 both stream ~33 G
+weights/s, so saving ALU per weight (the `unpackUnorm4x8` path, −13 % MOSS
+decode) pays and saving bytes alone does not. `VK_KHR_cooperative_matrix`
+is advertised (f16 and int8 shapes) but the driver's shader compiler faults
+on any coopmat instruction; an unfinished coopmat GEMM was removed (commit
+b1182f2 has it). Integer dot products (`OpSDot`) do work
+(`STARLING_FAST_MICRO=idot`, needs a glslc with `GL_EXT_integer_dot_product`;
+the NDK's does not have it) — the obvious next lever for decode, at the cost
+of int8 activations. The q4e4 model file
 saves a further ~7 % decode time at +0.14 % WER (8.06 vs 7.92, inside the
 0.2-pt gate) if maximum battery life matters more than the last word error.

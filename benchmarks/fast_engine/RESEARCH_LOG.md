@@ -1,7 +1,8 @@
 # Fast-engine research log (Pixel 10 Pro)
 
 Baseline: branch head `94230cf`. Workload: `starling-bench` on the phone,
-`STARLING_ENGINE=fast`, median of 3 runs after warm-up (see `.auto/measure.sh`).
+`STARLING_ENGINE=fast`, median of 3 runs after warm-up (`pixel_measure.sh`;
+`phone_ab.sh` for alternating A/B).
 Gates: fixture transcripts identical (G1), FLEURS WER within 0.2 pts (G2, at
 milestones), `fast_weights_test` (G3), desktop RADV ≤ 10 % regression (G4).
 
@@ -42,3 +43,13 @@ Notes:
 | 28 | Reviewer round: GEMV immediate partial stores | RPP>=16 variant captured ff_up (+10%)/lm_head (+6%) isolated | **in-context decode 4-7% WORSE** (alternating A/B, same thermal window) — isolated probes do not predict interleaved decode; reverted | G1 ✓ | discard |
 | 29 | Reviewer round: narrow-N GEMM tiles | N≤64 ops (attention PV dk=64, subsampling) use 32,64,4,4 instead of BN=128 | PK encoder **−2.7%** (alternating A/B 3/3 rounds: 2010-2035 → 1957-1980); bit-exact (tile partitions outputs only); desktop unchanged; MOSS unaffected (head_dim 128) | G1 ✓ | **keep** (`c604898`) |
 | 30 | Reviewer round: OpSDot probe (glslang has no GLSL front-end for it) | hand-assembled SPIR-V via spirv-as (`shaders/idot_probe.asm`), prebuilt-.spv embed support in fast.cmake, `STARLING_FAST_MICRO=idot` probe | **OpSDot WORKS on this driver** (exact correctness; coopmat's compiler crash does not extend to integer dot). ILP probe: ~154 G i8-MAC/s vs 77.5 G f32 MAC/s for the scalar GEMM ≈ **2× headroom** for an int8-activation GEMM | — | infrastructure keep |
+| 31 | Review round (PR #287): bounds / CI / idle-worker fixes | coopmat stub removed, GEMV rows>WGS, MOSS hgroup + token buffer, tuner OOB, Android configure without spirv-as; decoder worker parks when idle | alternating A/B vs `283a21e`: PK 2163-2200 vs 2185-2226, MOSS 5975-6008 vs 5932-6019 (noise); NDK glslc = host glslc | G1 ✓, weights test ✓ | keep (`be39f3e`) |
+| 32 | Parked decoder worker wakes cold at decode start | first version parked between jobs: PK decode median 204 vs 173 ms (+17 %, 4×12 runs), the woken thread lands on a little core; fix: the engine holds the worker spinning for one transcription | decode 197.7 vs 196.6 ms (parity), no idle burn between transcriptions | G1 ✓, helper test bit-exact | keep (`be39f3e`) |
+| 33 | Decode GEMVs are issue-bound, not bandwidth-bound: W8 36.6 GB/s ≈ W4 22 GB/s ≈ 33 G weights/s (#24) → cut ALU per weight | `gemv_w4u`: mask one nibble per byte, `unpackUnorm4x8` → 4 floats (~5 ops / 8 weights vs ~16), x permuted to even/odd order, ×255 folded into the scale | isolated +12..60 %; MOSS decode 2950 → 2575 ms (alternating, 3/3), 88.5 → 76.8 ms/tok; **phone_ms 8143 → 7823**; RADV slower (38 → 31 GB/s) → PowerVR default only | G1 ✓ (short/medium/long identical), G2 ✓ MOSS FLEURS 7.87 % both, 0/100 differ | **keep** |
+| 34 | The same A/B exposed an init bug in the first W4U build: PowerVR re-ran the cached tuner result over the vendor tile | control flow fixed before commit | PK encoder 2330 → 1980 ms (the stale cached tile is 17 % slower) | — | fix |
+
+Next levers (not pursued; the PR is ready to merge): the same issue-bound
+argument applies to the W8 lm_head (28 % of decode bytes; `unpackSnorm4x8`
+needs a proof that no -128 codes occur) and, larger, to int8-activation
+GEMVs with `OpSDot` (works on this driver; needs a glslc newer than the
+NDK's and a WER run).

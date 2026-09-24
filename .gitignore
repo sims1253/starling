@@ -22,6 +22,9 @@ golden/
 *.wav
 *.flac
 *.mp3
+# ...except the one public fixture source (LibriSpeech 2086-149220-0033, CC BY 4.0):
+# tests/fixtures/make_fixtures.py builds short/medium/long.wav from it.
+!tests/fixtures/2086-149220-0033.wav
 
 # regenerable benchmark corpora (downloaded + cached on first run)
 tests/fixtures/leaderboard_corpus/
