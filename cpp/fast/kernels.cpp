@@ -358,6 +358,38 @@ bool Kernels::autotune(std::string& err) {
     // prints the achieved GB/s — the honest per-kernel signal on a GPU where
     // per-dispatch timestamps are misattributed.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
+        if (std::strncmp(mi, "norm", 4) == 0) {
+            // Norm-kernel probe: STARLING_FAST_MICRO=norm,rows,D[,reps[,mode]]
+            uint32_t rows = 107, D = 2048, reps = 64, mode = 1;
+            std::sscanf(mi, "norm,%u,%u,%u,%u", &rows, &D, &reps, &mode);
+            vk::Buffer xb, ob;
+            std::vector<float> xf(std::max<size_t>(rows * D, 4096), 0.5f);
+            auto up = [&](vk::Buffer& b) {
+                return ctx_->create_buffer(b, xf.size() * 4, vk::Mem::Device, err) &&
+                       ctx_->upload(b, 0, xf.data(), xf.size() * 4, err);
+            };
+            if (!up(xb) || !up(ob))
+                return false;
+            const vk::Pipeline* p = ctx_->pipeline("norm", {256u, mode}, err);
+            if (!p) return false;
+            struct { uint32_t D, ld_x, ld_o, x_off, o_off; float eps, eps2; } pc{
+                D, D, D, 0, 0, 1e-5f, 1e-5f};
+            vk::Recording rec(*ctx_);
+            rec.begin();
+            for (uint32_t i = 0; i < reps; ++i) {
+                rec.dispatch(*p, {vk::Ref(xb), vk::Ref(dummy_), vk::Ref(dummy_), vk::Ref(dummy_),
+                                  vk::Ref(dummy_), vk::Ref(ob)},
+                             &pc, sizeof(pc), rows);
+                rec.barrier();
+            }
+            rec.end();
+            const double ms = time_ms(rec, err);
+            if (ms < 0) return false;
+            std::fprintf(stderr, "[fast-micro] norm mode=%u rows=%u D=%u: %.3f ms/dispatch = %.1f GB/s\n",
+                         mode, rows, D, ms / reps,
+                         (double)reps * rows * D * 2 * 4 / ms * 1e-3);
+            return true;
+        }
         if (std::strncmp(mi, "alu", 3) == 0) {
             // Pure-FMA issue-rate probe: STARLING_FAST_MICRO=alu[,groups[,iters]].
             uint32_t groups = 48, iters = 4096;
