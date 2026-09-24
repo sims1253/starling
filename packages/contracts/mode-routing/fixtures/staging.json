@@ -1,0 +1,967 @@
+[
+  {
+    "name": "revised_partials",
+    "description": "Streaming partials replace the live tail in place; the final turns it into a raw region.",
+    "ops": [
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hel",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hello wor",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hello world",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hello world",
+        "expect": "unchanged"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Hello world.",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "Hello world.",
+      "revision": 4,
+      "regions": [
+        [
+          "raw",
+          "Hello world."
+        ]
+      ],
+      "raw_text": "Hello world."
+    }
+  },
+  {
+    "name": "typing_during_partial_replacement",
+    "description": "Typing inside the live partial pins its segment: later partials and the final are recorded but never replace the user's text.",
+    "ops": [
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "send the report",
+        "expect": "applied"
+      },
+      {
+        "op": "insert",
+        "at": 5,
+        "text": "final ",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "send the report tomorrow",
+        "expect": "ignored_pinned"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Send the report tomorrow.",
+        "expect": "recorded_pinned"
+      }
+    ],
+    "expect": {
+      "text": "send final the report",
+      "revision": 2,
+      "regions": [
+        [
+          "user",
+          "send final the report"
+        ]
+      ],
+      "pinned_segments": [
+        0
+      ],
+      "raw_text": "Send the report tomorrow."
+    }
+  },
+  {
+    "name": "typing_after_partial_does_not_pin",
+    "description": "Typing at the tail boundary is new user text after the partial; the partial keeps updating in front of it.",
+    "ops": [
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hello",
+        "expect": "applied"
+      },
+      {
+        "op": "insert",
+        "at": 5,
+        "text": " there",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "hello world",
+        "expect": "applied"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Hello world.",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "Hello world. there",
+      "revision": 4,
+      "regions": [
+        [
+          "raw",
+          "Hello world."
+        ],
+        [
+          "user",
+          " there"
+        ]
+      ],
+      "pinned_segments": []
+    }
+  },
+  {
+    "name": "deleting_in_partial_pins",
+    "description": "Deleting inside the live partial pins it just like typing.",
+    "ops": [
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "one two three",
+        "expect": "applied"
+      },
+      {
+        "op": "delete",
+        "start": 4,
+        "end": 8,
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "one two three four",
+        "expect": "ignored_pinned"
+      }
+    ],
+    "expect": {
+      "text": "one three",
+      "revision": 2,
+      "regions": [
+        [
+          "user",
+          "one three"
+        ]
+      ],
+      "pinned_segments": [
+        0
+      ]
+    }
+  },
+  {
+    "name": "partial_after_final_is_ignored",
+    "description": "A late partial for a finalized segment never replaces the final.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Done.",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 0,
+        "text": "don",
+        "expect": "ignored_final"
+      }
+    ],
+    "expect": {
+      "text": "Done.",
+      "revision": 1
+    }
+  },
+  {
+    "name": "current_proposal_accepted",
+    "description": "A result on the current revision is a current proposal; accepting it is a new revision, and raw is one action away.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "um so the meeting is at three",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "So the meeting is at three.",
+        "expect": "current"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "expect": "applied"
+      },
+      {
+        "op": "revert_raw",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "um so the meeting is at three",
+      "revision": 3,
+      "regions": [
+        [
+          "raw",
+          "um so the meeting is at three"
+        ]
+      ],
+      "requests": {
+        "r1": "settled"
+      },
+      "proposals": {
+        "r1": "accepted"
+      }
+    }
+  },
+  {
+    "name": "stale_proposal",
+    "description": "The user edits while the job runs: the result stays a stale proposal and cannot be accepted implicitly.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "um the meeting is at three",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "insert",
+        "at": 26,
+        "text": " pm",
+        "expect": "applied"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "The meeting is at three.",
+        "expect": "stale"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "expect": "stale_rejected"
+      },
+      {
+        "op": "swap_check",
+        "request_id": "r1",
+        "target_digest": "t1",
+        "expect": "keep"
+      }
+    ],
+    "expect": {
+      "text": "um the meeting is at three pm",
+      "revision": 2,
+      "requests": {
+        "r1": "settled"
+      },
+      "proposals": {
+        "r1": "stale"
+      }
+    }
+  },
+  {
+    "name": "explicit_stale_choice",
+    "description": "Only an explicit forced accept (a user action) takes a stale proposal.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "um the meeting is at three",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "insert",
+        "at": 26,
+        "text": " pm",
+        "expect": "applied"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "The meeting is at three.",
+        "expect": "stale"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "force": true,
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "The meeting is at three.",
+      "revision": 3,
+      "regions": [
+        [
+          "processed",
+          "The meeting is at three."
+        ]
+      ],
+      "proposals": {
+        "r1": "accepted"
+      }
+    }
+  },
+  {
+    "name": "concurrent_retry",
+    "description": "A retry supersedes the in-flight request; the late original result lands as superseded, the retry's as current.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "uh hello",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "request",
+        "request_id": "r2",
+        "retry_of": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "Hello (first).",
+        "expect": "superseded"
+      },
+      {
+        "op": "result",
+        "request_id": "r2",
+        "status": "completed",
+        "text": "Hello.",
+        "expect": "current"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "expect": "not_open"
+      },
+      {
+        "op": "accept",
+        "request_id": "r2",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "Hello.",
+      "revision": 2,
+      "requests": {
+        "r1": "superseded",
+        "r2": "settled"
+      },
+      "proposals": {
+        "r1": "superseded",
+        "r2": "accepted"
+      }
+    }
+  },
+  {
+    "name": "delete_during_processing",
+    "description": "Deleting the draft cancels its requests; a result arriving afterwards is discarded.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "draft text",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "delete_draft",
+        "expect": "deleted"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "Draft text.",
+        "expect": "discarded"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "expect": "ignored_deleted"
+      }
+    ],
+    "expect": {
+      "deleted": true,
+      "requests": {
+        "r1": "cancelled"
+      },
+      "proposals": {}
+    }
+  },
+  {
+    "name": "cancel_detaches",
+    "description": "A cancelled request's late result lands nowhere.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "keep me raw",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "cancel",
+        "request_id": "r1",
+        "expect": "cancelled"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "Keep me raw.",
+        "expect": "discarded"
+      },
+      {
+        "op": "cancel",
+        "request_id": "r1",
+        "expect": "not_pending"
+      }
+    ],
+    "expect": {
+      "text": "keep me raw",
+      "revision": 1,
+      "requests": {
+        "r1": "cancelled"
+      },
+      "proposals": {}
+    }
+  },
+  {
+    "name": "failed_result_keeps_raw",
+    "description": "A failed job leaves the raw text exactly as it was.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "raw survives",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "failed",
+        "expect": "failed"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "failed",
+        "expect": "duplicate"
+      }
+    ],
+    "expect": {
+      "text": "raw survives",
+      "revision": 1,
+      "requests": {
+        "r1": "settled"
+      },
+      "proposals": {}
+    }
+  },
+  {
+    "name": "crash_reconnect_result_still_current",
+    "description": "A request in flight at a crash is interrupted; its result is still judged against its base revision.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "before the crash",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "crash",
+        "expect": "restarted"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "Before the crash.",
+        "expect": "current"
+      }
+    ],
+    "expect": {
+      "text": "before the crash",
+      "revision": 1,
+      "requests": {
+        "r1": "settled"
+      },
+      "proposals": {
+        "r1": "current"
+      }
+    }
+  },
+  {
+    "name": "crash_drops_live_partial",
+    "description": "Live partials are not durable: a crash drops them, and the revision moves, so an earlier request comes back stale.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "first.",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "partial",
+        "segment": 1,
+        "text": " and then",
+        "expect": "applied"
+      },
+      {
+        "op": "crash",
+        "expect": "restarted"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "First.",
+        "expect": "stale"
+      },
+      {
+        "op": "result",
+        "request_id": "r9",
+        "status": "completed",
+        "text": "x",
+        "expect": "unknown_request"
+      }
+    ],
+    "expect": {
+      "text": "first.",
+      "revision": 3,
+      "regions": [
+        [
+          "raw",
+          "first."
+        ]
+      ],
+      "requests": {
+        "r1": "settled"
+      },
+      "proposals": {
+        "r1": "stale"
+      }
+    }
+  },
+  {
+    "name": "duplicate_final_delivery",
+    "description": "A duplicated final callback is idempotent, and a revision is inserted into a target at most once.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Hi there.",
+        "expect": "applied"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Hi there.",
+        "expect": "duplicate"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "Hi there!",
+        "expect": "attempt_conflict"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d1",
+        "target_digest": "t1",
+        "expect": "delivered"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d1",
+        "target_digest": "t1",
+        "expect": "duplicate"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d2",
+        "target_digest": "t1",
+        "expect": "duplicate"
+      }
+    ],
+    "expect": {
+      "text": "Hi there.",
+      "revision": 1,
+      "raw_text": "Hi there."
+    }
+  },
+  {
+    "name": "direct_swap_unchanged_target",
+    "description": "Direct mode: raw is delivered first; the processed revision replaces it because the target still holds exactly that delivery.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "so um yes",
+        "expect": "applied"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d1",
+        "target_digest": "t1",
+        "expect": "delivered"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "So, yes.",
+        "expect": "current"
+      },
+      {
+        "op": "swap_check",
+        "request_id": "r1",
+        "target_digest": "t1",
+        "expect": "swap"
+      }
+    ],
+    "expect": {
+      "text": "So, yes.",
+      "revision": 2,
+      "proposals": {
+        "r1": "accepted"
+      }
+    }
+  },
+  {
+    "name": "direct_swap_target_changed",
+    "description": "Direct mode: the target changed after the raw delivery, so the processed text stays a proposal.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "so um yes",
+        "expect": "applied"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d1",
+        "target_digest": "t1",
+        "expect": "delivered"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": "So, yes.",
+        "expect": "current"
+      },
+      {
+        "op": "swap_check",
+        "request_id": "r1",
+        "target_digest": "t2",
+        "expect": "keep"
+      }
+    ],
+    "expect": {
+      "text": "so um yes",
+      "revision": 1,
+      "proposals": {
+        "r1": "current"
+      }
+    }
+  },
+  {
+    "name": "request_refused_with_live_partial",
+    "description": "Processing reads finals only.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "one.",
+        "expect": "applied"
+      },
+      {
+        "op": "partial",
+        "segment": 1,
+        "text": " two",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "refused_partial"
+      },
+      {
+        "op": "deliver",
+        "delivery_id": "d1",
+        "target_digest": "t1",
+        "expect": "refused_partial"
+      }
+    ],
+    "expect": {
+      "text": "one. two",
+      "requests": {}
+    }
+  },
+  {
+    "name": "rerecognition_is_recorded_not_shown",
+    "description": "A second final for a shown segment is kept as an attempt; the visible text changes only on an explicit raw revert.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "hello",
+        "expect": "applied"
+      },
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-2",
+        "text": "Hello.",
+        "expect": "recorded"
+      },
+      {
+        "op": "revert_raw",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "Hello.",
+      "revision": 2,
+      "raw_text": "Hello."
+    }
+  },
+  {
+    "name": "command_regions_stay_out_of_the_input",
+    "description": "A trailing instruction travels as the request's instruction, not as text to clean.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "please send the report make it formal",
+        "expect": "applied"
+      },
+      {
+        "op": "mark_command",
+        "start": 22,
+        "end": 37,
+        "command": "trailing_instruction",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      }
+    ],
+    "expect": {
+      "text": "please send the report make it formal",
+      "revision": 1,
+      "regions": [
+        [
+          "raw",
+          "please send the report"
+        ],
+        [
+          "command",
+          " make it formal"
+        ]
+      ],
+      "request_inputs": {
+        "r1": [
+          "please send the report",
+          " make it formal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "unicode_offsets_are_code_points",
+    "description": "Offsets count code points: combining marks, ZWJ emoji, RTL text, CR/LF and tabs survive edits, and raw round-trips byte for byte.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "naïve 👩‍💻 café שלום\r\n\ttab",
+        "expect": "applied"
+      },
+      {
+        "op": "insert",
+        "at": 9,
+        "text": "!",
+        "expect": "applied",
+        "expect_text": "naïve 👩‍💻! café שלום\r\n\ttab"
+      },
+      {
+        "op": "delete",
+        "start": 11,
+        "end": 17,
+        "expect": "applied",
+        "expect_text": "naïve 👩‍💻! שלום\r\n\ttab"
+      },
+      {
+        "op": "revert_raw",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "naïve 👩‍💻 café שלום\r\n\ttab",
+      "revision": 4,
+      "raw_text": "naïve 👩‍💻 café שלום\r\n\ttab"
+    }
+  },
+  {
+    "name": "revert_after_edits",
+    "description": "Raw recovery rebuilds the recognition exactly, whatever was typed or deleted.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "First part.",
+        "expect": "applied"
+      },
+      {
+        "op": "final",
+        "segment": 1,
+        "attempt_id": "att-2",
+        "text": " Second part.",
+        "expect": "applied"
+      },
+      {
+        "op": "insert",
+        "at": 0,
+        "text": ">> ",
+        "expect": "applied",
+        "expect_text": ">> First part. Second part."
+      },
+      {
+        "op": "delete",
+        "start": 9,
+        "end": 15,
+        "expect": "applied",
+        "expect_text": ">> First Second part."
+      },
+      {
+        "op": "revert_raw",
+        "expect": "applied"
+      }
+    ],
+    "expect": {
+      "text": "First part. Second part.",
+      "revision": 5,
+      "regions": [
+        [
+          "raw",
+          "First part."
+        ],
+        [
+          "raw",
+          " Second part."
+        ]
+      ],
+      "raw_text": "First part. Second part."
+    }
+  }
+]

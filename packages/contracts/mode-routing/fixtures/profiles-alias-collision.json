@@ -31,6 +31,12 @@
       "selection_required": false,
       "clipboard": false,
       "max_context_characters": 0,
+      "transform_kinds": [],
+      "language": null,
+      "style": null,
+      "spoken_commands": true,
+      "context_fields": [],
+      "processing_delivery": "direct",
       "delivery": "insert",
       "automatic_delivery": true
     },
@@ -53,6 +59,12 @@
       "selection_required": false,
       "clipboard": false,
       "max_context_characters": 0,
+      "transform_kinds": [],
+      "language": null,
+      "style": null,
+      "spoken_commands": false,
+      "context_fields": [],
+      "processing_delivery": "direct",
       "delivery": "insert",
       "automatic_delivery": true
     },
@@ -88,6 +100,16 @@
       "selection_required": false,
       "clipboard": false,
       "max_context_characters": 8000,
+      "transform_kinds": [
+        "rewrite"
+      ],
+      "language": null,
+      "style": null,
+      "spoken_commands": false,
+      "context_fields": [
+        "vocabulary"
+      ],
+      "processing_delivery": "staged",
       "delivery": "insert",
       "automatic_delivery": true
     },
@@ -112,6 +134,14 @@
       "selection_required": true,
       "clipboard": false,
       "max_context_characters": 8000,
+      "transform_kinds": [
+        "rewrite"
+      ],
+      "language": null,
+      "style": null,
+      "spoken_commands": false,
+      "context_fields": [],
+      "processing_delivery": "staged",
       "delivery": "replace_selection",
       "automatic_delivery": true
     },
@@ -136,6 +166,14 @@
       "selection_required": true,
       "clipboard": false,
       "max_context_characters": 8000,
+      "transform_kinds": [
+        "rewrite"
+      ],
+      "language": null,
+      "style": null,
+      "spoken_commands": false,
+      "context_fields": [],
+      "processing_delivery": "staged",
       "delivery": "preview",
       "automatic_delivery": false
     },
@@ -160,6 +198,18 @@
       "selection_required": false,
       "clipboard": false,
       "max_context_characters": 0,
+      "transform_kinds": [
+        "clean"
+      ],
+      "language": "en",
+      "style": {
+        "formality": "semi-formal",
+        "structure": "prose",
+        "context": "general"
+      },
+      "spoken_commands": true,
+      "context_fields": [],
+      "processing_delivery": "direct",
       "delivery": "save_note",
       "automatic_delivery": true
     }
