@@ -118,6 +118,10 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
         }
+        engineInput.setOnCheckedChangeListener { _, _ ->
+            // Download progress owns the status line while it runs.
+            if (!application.modelDownloads.isRunning) refreshOnDeviceStatus()
+        }
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshOnDeviceStatus()
         refreshRecordings()
@@ -288,7 +292,11 @@ class MainActivity : Activity() {
         onDeviceStatus.text = when {
             engine.hasModel() -> {
                 val sizeMb = mb(engine.modelSizeBytes())
-                getString(R.string.on_device_model_present, sizeMb)
+                if (engineOnDeviceInput.isChecked) {
+                    getString(R.string.on_device_model_in_use, sizeMb)
+                } else {
+                    getString(R.string.on_device_model_not_selected, sizeMb, getString(R.string.engine_on_device))
+                }
             }
             else -> getString(R.string.on_device_status_no_model)
         }

@@ -8,6 +8,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.starling.mobile.engine.OnDeviceEngine
+import dev.starling.mobile.engine.StarlingNative
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -36,6 +37,13 @@ class DeviceIntegrationTest {
             services.map { it.serviceInfo.name },
         )
         assertTrue(SpeechRecognizer.isRecognitionAvailable(context))
+    }
+
+    @Test
+    fun packagedEngineMatchesTheExpectedAbi() {
+        // Loads the real libstarling_jni: a mismatch here fails every
+        // on-device recording at runtime.
+        assertEquals(StarlingNative.EXPECTED_ABI_VERSION, StarlingNative.abiVersion())
     }
 
     @Test

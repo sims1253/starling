@@ -106,6 +106,11 @@ android {
     }
 
     buildTypes {
+        // Installs beside a release build, so device tests never need to
+        // uninstall (and wipe) the app someone actually uses.
+        debug {
+            applicationIdSuffix = ".debug"
+        }
         release {
             if (releaseSigning != null) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
