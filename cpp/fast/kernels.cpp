@@ -169,6 +169,7 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     coopmat_ = false;
     if (const char* e = std::getenv("STARLING_FAST_COOPMAT"))
         if (e[0] == '1') coopmat_ = ctx.info().coopmat;
+    rsplit_on_ = !(std::getenv("STARLING_FAST_NORSPLIT") && std::getenv("STARLING_FAST_NORSPLIT")[0] == '1');
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
         if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) tile = TileCfg{bm, bn, tm, tn};
@@ -296,8 +297,21 @@ bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x
     }
     // Enough workgroups to fill the GPU: fewer rows per workgroup for small N.
     uint32_t rows = gemv_rows(w.N);
+    // Pad the workgroup to a full subgroup with parallel row slots: GPUs
+    // issue whole subgroups, so lanes < subgroup_size strands issue slots
+    // (W4 K=1024: ~7 GB/s at 32 threads, ~27 at 128 on PowerVR).
+    uint32_t rsplit = 1;
+    if (rsplit_on_) {
+        const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
+        if (const char* e = std::getenv("STARLING_FAST_RSPLIT"))
+            rsplit = std::min(8u, (uint32_t)std::atoi(e));
+        else
+            while (rsplit < 8 && lanes * rsplit < target && rows % (2 * rsplit) == 0u) rsplit *= 2;
+    }
+    const uint32_t wg = lanes * rsplit;
+    if (wg > ctx_->info().max_wg_invocations) rsplit = 1;
     const vk::Pipeline* p = ctx_->pipeline(
-        name, {lanes, rows, g.buf ? 1u : 0u, epi, state.buf ? 1u : 0u}, err);
+        name, {lanes, rows, g.buf ? 1u : 0u, epi, state.buf ? 1u : 0u, rsplit, lanes * rsplit}, err);
     if (!p) return false;
     a.N = w.N;
     a.K = w.K;
@@ -330,6 +344,114 @@ double time_ms(vk::Recording& rec, std::string& err) {
 bool Kernels::autotune(std::string& err) {
     TuneResult& R = tune_result();
     if (R.done) { tile = R.tile; gemv_rows_max = R.gemv_rows; return true; }
+    // Isolated GEMV bandwidth probe: STARLING_FAST_MICRO=bits,N,K,reps
+    // (bits 4 / 8 / 16) times a pure loop of decode GEMVs at a real shape and
+    // prints the achieved GB/s — the honest per-kernel signal on a GPU where
+    // per-dispatch timestamps are misattributed.
+    if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
+        uint32_t bits = 4, n = 4096, k = 1024, reps = 64, rows = 0;
+        const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
+        if (got < 3) {
+            err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
+            return false;
+        }
+        if (!rows) rows = gemv_rows(n);
+        std::mt19937 rng(99);
+        auto rnd = [&](size_t cnt) {
+            std::vector<uint32_t> w(cnt);
+            for (auto& v : w) v = (uint32_t)rng();
+            return w;
+        };
+        const size_t qw = bits == 4 ? (size_t)n * k / 8 + 1 : bits == 8 ? (size_t)n * k / 4 + 1
+                                                                        : (size_t)n * k / 2 + 1;
+        const size_t sw = bits == 16 ? 0 : (size_t)n * k / 32 + 1;
+        vk::Buffer wq, ws, x, y;
+        std::vector<float> xf(k);
+        for (auto& f : xf) f = (float)(rng() % 2001) / 1000.0f - 1.0f;
+        std::vector<float> y0(n, 0.0f);
+        auto up32 = [&](vk::Buffer& b, const void* d, size_t bytes) {
+            return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
+                   ctx_->upload(b, 0, d, bytes, err);
+        };
+        auto wv = rnd(qw);
+        auto sv = sw ? rnd(sw) : std::vector<uint32_t>{};
+        if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
+            !up32(x, xf.data(), k * 4) || !up32(y, y0.data(), n * 4))
+            return false;
+        const char* name = bits == 4 ? "gemv_w4" : bits == 8 ? "gemv_w8" : "gemv_f16";
+        const uint32_t lanes = k / 32;
+        uint32_t rsplit = 1;
+        {
+            const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
+            while (rsplit < 8 && lanes * rsplit < target && rows % (2 * rsplit) == 0u) rsplit *= 2;
+        }
+        const vk::Pipeline* p = ctx_->pipeline(name, {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
+        if (!p) return false;
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        GemvArgs ga;
+        ga.N = n;
+        ga.K = k;
+        for (uint32_t i = 0; i < reps; ++i) {
+            rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+                              vk::Ref(dummy_), vk::Ref(dummy_)},
+                         &ga, sizeof(ga), ceil_div(n, rows));
+            rec.barrier();
+        }
+        rec.end();
+        // Correctness: CPU reference dot products for the first rows.
+        if (bits == 4 || bits == 8) {
+            vk::Recording rc1(*ctx_);
+            rc1.begin();
+            rc1.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+                              vk::Ref(dummy_), vk::Ref(dummy_)},
+                         &ga, sizeof(ga), ceil_div(n, rows));
+            rc1.end();
+            if (!rc1.submit_and_wait(err)) return false;
+            std::vector<float> got(n, 0.0f);
+            if (!ctx_->download(y, 0, got.data(), n * 4, err)) return false;
+            auto h2f = [](uint32_t h) {
+                const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+                uint32_t b;
+                if (e == 0) b = (s << 31) | (m >> 1);            // subnormal ~
+                else b = (s << 31) | ((e + 112) << 23) | (m << 13);
+                float f;
+                std::memcpy(&f, &b, 4);
+                return f;
+            };
+            double maxerr = 0;
+            const uint32_t nchk = std::min(n, 256u);
+            for (uint32_t r = 0; r < nchk; ++r) {
+                double ref = 0;
+                for (uint32_t kk = 0; kk < k; ++kk) {
+                    const uint32_t grp = kk / 32, in = kk % 32;
+                    const uint32_t sraw = sv[(size_t)r * (k / 32) + grp];
+                    if (bits == 4) {
+                        const uint32_t w32 = wv[(size_t)r * (k / 8) + grp * 4 + in / 8];
+                        const float nib = (float)((w32 >> (4 * (in % 8))) & 15u);
+                        // packHalf2x16(scale, offset): scale = low half
+                        ref += (h2f(sraw & 0xffff) * nib + h2f(sraw >> 16)) * xf[kk];
+                    } else {
+                        const uint32_t w32 = wv[(size_t)r * (k / 4) + grp * 8 + in / 4];
+                        const int i8 = (int8_t)((w32 >> (8 * (in % 4))) & 0xffu);
+                        // packHalf2x16(s_lo, s_hi): s_lo covers weights 0..15
+                        const float s = h2f((in / 16) == 0 ? (sraw & 0xffff) : (sraw >> 16));
+                        ref += s * (float)i8 * xf[kk];
+                    }
+                }
+                maxerr = std::max(maxerr, std::abs(ref - got[r]) /
+                                              std::max(1.0, std::abs(ref)));
+            }
+            std::fprintf(stderr, "[fast-micro] check rsplit=%u: max rel err = %.5f (first %u rows)\n",
+                         rsplit, maxerr, nchk);
+        }
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
+        std::fprintf(stderr,
+                     "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
+                     bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-3);
+    }
     const auto& info = ctx_->info();
     const char* dir = std::getenv("STARLING_FAST_CACHE_DIR");
     const char* force = std::getenv("STARLING_FAST_TUNE");
@@ -442,7 +564,7 @@ bool Kernels::autotune(std::string& err) {
     for (uint32_t rows : {8u, 16u, 32u, 64u}) {
         gemv_rows_max = rows;
         const uint32_t r = gemv_rows(F);
-        const vk::Pipeline* p = ctx_->pipeline("gemv_w4", {D / 32, r, 0u, 0u, 0u}, err);
+        const vk::Pipeline* p = ctx_->pipeline("gemv_w4", {D / 32, r, 0u, 0u, 0u, 1u, D / 32}, err);
         if (!p) return false;
         vk::Recording rec(*ctx_);
         rec.begin();

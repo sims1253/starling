@@ -151,6 +151,7 @@ public:
     TileCfg tile;
     bool f16_math = false;
     bool coopmat_ = false;   // dispatch GEMMs to gemm_coop shaders
+    bool rsplit_on_ = true;  // RSPLIT row slots to pad GEMV workgroups
 
 private:
     vk::Context* ctx_ = nullptr;

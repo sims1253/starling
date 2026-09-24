@@ -6,12 +6,16 @@
 //                           workgroup recomputes rstd from its x slices,
 //                           cheaper than a separate dispatch + barrier)
 //
-// Layout: the workgroup has one thread per 32-wide group of K (LANES = K/32)
-// and owns ROWS consecutive rows. Each thread keeps its 32 x values in
-// registers for the whole workgroup, so x is read once per workgroup instead
-// of once per row, and a row's weights are read by the workgroup as one
-// contiguous, coalesced run. Partial sums are reduced through shared memory
-// eight rows at a time.
+// Layout: the workgroup covers LANES 32-wide K groups (one per thread) and
+// RSPLIT row slots in parallel — wg = LANES * RSPLIT threads. GPUs issue
+// whole subgroups (128 on PowerVR), so a K/32-thread workgroup would idle
+// most of its issue slots; RSPLIT pads the workgroup out when K is small
+// (measured: W4 K=1024 ~7 GB/s at 32 threads vs ~27 GB/s at 128). Thread
+// (kg, rs) keeps the 32 x values of K group kg in registers and processes
+// rows rs, rs + RSPLIT, ... so x is read once per workgroup and a row's
+// weights are read as one contiguous, coalesced run. Row partials are
+// reduced through shared memory, one thread per row (plus the pair row for
+// the GLU epilogue).
 //
 // Weights: W_W4 / W_W8 / W_F16 (same layouts as gemm.comp).
 // EPI 0: y[n] = v            EPI 1: y[n] += v (residual)
@@ -23,12 +27,14 @@
 
 #include "common.glsl"
 
-layout(constant_id = 0) const uint LANES = 64;   // == K / 32 == workgroup size
-layout(constant_id = 1) const uint ROWS = 32;    // rows per workgroup (multiple of 8)
+layout(constant_id = 0) const uint LANES = 64;   // == K / 32 (K groups)
+layout(constant_id = 1) const uint ROWS = 32;    // rows per workgroup (multiple of 2*RSPLIT)
 layout(constant_id = 2) const uint NORM = 0;
 layout(constant_id = 3) const uint EPI = 0;
 layout(constant_id = 4) const uint DONE = 0;
-layout(local_size_x_id = 0) in;
+layout(constant_id = 5) const uint RSPLIT = 1;   // row slots per workgroup
+layout(constant_id = 6) const uint WGS = 64;     // workgroup size = LANES * RSPLIT
+layout(local_size_x_id = 6) in;
 
 layout(std430, binding = 0) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 1) readonly buffer WQ { uvec4 wq4[]; };
@@ -48,50 +54,58 @@ layout(push_constant) uniform PC {
     uint has_bias;
 } p;
 
-const uint RC = 8;                      // rows reduced per round
-shared float red[RC * LANES];
-shared float red2[RC * 32];
+const uint RPP = ROWS / RSPLIT;          // rows per (kg, rs) thread
+shared float red[ROWS * LANES];          // row partials: [row][kg]
+shared float red2[ROWS * 32];            // 32 partials per row, then one
 shared float rowv[ROWS];
+
+float row_sum(uint r) {   // staged by the cooperative reduction below
+    float s = 0.0;
+    for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
+    return s;
+}
 
 void main() {
     if (DONE != 0u && state[2] != 0u) return;
-    const uint t = gl_LocalInvocationID.x;          // = this thread's K group
+    const uint t = gl_LocalInvocationID.x;
+    const uint kg = t % LANES, rs = t / LANES;
     const uint G = LANES;
 
     vec4 xv[8];
     float xsum = 0.0, ss = 0.0;
     [[unroll]] for (uint i = 0; i < 8; ++i) {
-        vec4 v = x4[p.x_off / 4 + t * 8 + i];
+        vec4 v = x4[p.x_off / 4 + kg * 8 + i];
         ss += dot(v, v);
-        if (NORM != 0u) v *= g4[t * 8 + i];
+        if (NORM != 0u) v *= g4[kg * 8 + i];
         xv[i] = v;
         xsum += v.x + v.y + v.z + v.w;
     }
-    float rs = 1.0;
+    float rstd = 1.0;
     if (NORM != 0u) {
-        red[t] = ss;
+        if (rs == 0u) red[kg] = ss;      // every rs slot holds the same value
         barrier();
         float tot = 0.0;
-        for (uint i = 0; i < LANES; ++i) tot += red[i];   // broadcast reads
-        rs = inversesqrt(tot / float(p.K) + p.eps);
+        for (uint i = 0; i < LANES; ++i) tot += red[i];
+        rstd = inversesqrt(tot / float(p.K) + p.eps);
         barrier();
     }
 
     const uint row_base = gl_WorkGroupID.x * ROWS;
-    float acc[ROWS];
-    [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+    float acc[RPP];
+    [[unroll]] for (uint q = 0; q < RPP; ++q) {
+        const uint r = rs + q * RSPLIT;
         const uint n = min(row_base + r, p.N - 1u);      // clamp: tail rows are discarded
-        const uint gi = n * G + t;
+        const uint gi = n * G + kg;
 #if defined(W_W4)
-        const uvec4 q = wq4[gi];
+        const uvec4 q4 = wq4[gi];
         const vec2 so = unpackHalf2x16(ws[gi]);
         float a = 0.0;
         [[unroll]] for (uint w = 0; w < 4; ++w) {
-            const uint word = q[w];
+            const uint word = q4[w];
             a += dot(vec4(float(word & 15u), float((word >> 4) & 15u), float((word >> 8) & 15u), float((word >> 12) & 15u)), xv[2 * w]);
             a += dot(vec4(float((word >> 16) & 15u), float((word >> 20) & 15u), float((word >> 24) & 15u), float(word >> 28)), xv[2 * w + 1]);
         }
-        acc[r] = so.x * a + so.y * xsum;
+        acc[q] = so.x * a + so.y * xsum;
 #elif defined(W_W8)
         const uvec4 q0 = wq4[gi * 2], q1 = wq4[gi * 2 + 1];
         const vec2 sc = unpackHalf2x16(ws[gi]);
@@ -101,7 +115,7 @@ void main() {
             a0 += dot(vec4(bitfieldExtract(v0, 0, 8), bitfieldExtract(v0, 8, 8), bitfieldExtract(v0, 16, 8), bitfieldExtract(v0, 24, 8)), xv[w]);
             a1 += dot(vec4(bitfieldExtract(v1, 0, 8), bitfieldExtract(v1, 8, 8), bitfieldExtract(v1, 16, 8), bitfieldExtract(v1, 24, 8)), xv[4 + w]);
         }
-        acc[r] = sc.x * a0 + sc.y * a1;
+        acc[q] = sc.x * a0 + sc.y * a1;
 #else
         float a = 0.0;
         [[unroll]] for (uint w = 0; w < 4; ++w) {
@@ -109,47 +123,43 @@ void main() {
             a += dot(vec4(unpackHalf2x16(h.x), unpackHalf2x16(h.y)), xv[2 * w]) +
                  dot(vec4(unpackHalf2x16(h.z), unpackHalf2x16(h.w)), xv[2 * w + 1]);
         }
-        acc[r] = a;
+        acc[q] = a;
 #endif
     }
 
-    // Reduce RC rows per round: red[r][lane] -> 32 partial sums per row ->
-    // one value per row (thread r of the round finishes row r).
-    for (uint r0 = 0; r0 < ROWS; r0 += RC) {
-        [[unroll]] for (uint rr = 0; rr < RC; ++rr) red[rr * LANES + t] = acc[r0 + rr];
-        barrier();
-        for (uint u = t; u < RC * 32; u += LANES) {
-            const uint rr = u / 32, part = u % 32;
-            float s = 0.0;
-            for (uint i = part; i < LANES; i += 32) s += red[rr * LANES + i];
-            red2[u] = s;
-        }
-        barrier();
-        if (t < RC) {
-            float s = 0.0;
-            for (uint i = 0; i < 32; ++i) s += red2[t * 32 + i];
-            const uint r = r0 + t, n = row_base + r;
-            float v = s * rs;
-            if (n < p.N) {
-                if (p.has_bias != 0u) v += bias[n];
-                if (EPI == 3u) rowv[r] = v;
-                else red2[t] = v;        // stash for the paired epilogue below
-            } else if (EPI == 3u) {
-                rowv[r] = -3.4e38;
-            }
-        }
-        barrier();
-        if (EPI != 3u && t < RC) {
-            const uint n = row_base + r0 + t;
-            if (n < p.N) {
-                const float v = red2[t];
-                if (EPI == 0u) y[p.y_off + n] = v;
-                else if (EPI == 1u) y[p.y_off + n] += v;
-                else if ((t & 1u) == 0u && n + 1 < p.N) y[p.y_off + n / 2] = silu_f(v) * red2[t + 1];
-            }
-        }
-        barrier();
+    // Stage row partials, then a two-stage reduction: LANES -> 32 partials
+    // per row (stride 32) -> one value per row.
+    [[unroll]] for (uint q = 0; q < RPP; ++q) red[(rs + q * RSPLIT) * LANES + kg] = acc[q];
+    barrier();
+    for (uint u = t; u < ROWS * 32; u += LANES * RSPLIT) {
+        const uint rr = u / 32, part = u % 32;
+        float s = 0.0;
+        for (uint i = part; i < LANES; i += 32) s += red[rr * LANES + i];
+        red2[u] = s;
     }
+    barrier();
+    if (EPI != 3u && t < ROWS) {
+        const uint n = row_base + t;
+        if (n < p.N) {
+            float v = row_sum(t) * rstd;
+            if (p.has_bias != 0u) v += bias[n];
+            if (EPI == 0u) {
+                y[p.y_off + n] = v;
+            } else if (EPI == 1u) {
+                y[p.y_off + n] += v;
+            } else if ((t & 1u) == 0u && n + 1 < p.N) {
+                float v2 = row_sum(t + 1) * rstd;
+                if (p.has_bias != 0u) v2 += bias[n + 1];
+                y[p.y_off + n / 2] = silu_f(v) * v2;
+            }
+        }
+    } else if (EPI == 3u && t < ROWS) {
+        const uint n = row_base + t;
+        float v = n < p.N ? row_sum(t) * rstd : -3.4e38;
+        if (n < p.N && p.has_bias != 0u) v += bias[n];
+        rowv[t] = v;
+    }
+    barrier();
     if (EPI == 3u && t == 0u) {
         float best = -3.4e38;
         uint bi = 0xffffffffu;
