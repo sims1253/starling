@@ -144,3 +144,20 @@ FLEURS en_us test, first 100 clips (`wer_engines.py`):
 
 10 (Parakeet) and 16 (MOSS) of 100 transcripts differ from ggml, all in
 near-tie words and punctuation, in both directions.
+
+### Pixel 10 Pro (Tensor G5, PowerVR DXT-48-1536)
+
+First on-device run (autotuned tile 64,64,4,4, GEMV rows 8; ggml with the
+app's 6 threads). Transcripts match ggml on the fixtures.
+
+| Model / audio | ggml CPU | fast |
+| --- | --- | --- |
+| Parakeet, 22.3 s | 7.2 s (encoder 1.30 s, decoder 5.9 s) | 2.79 s (encoder 2.56 s, decoder 0.20 s) |
+| Parakeet, 74.4 s | — | 9.0 s |
+| MOSS, 7.4 s | 7.3 s | 7.0 s (enc+prefill 3.6 s, decode 100 ms/token) |
+
+The CPU decoder is where the fast engine wins on the phone; the GPU kernels
+are still desktop-tuned and reach only ~130 GFLOPS / ~11 GB/s here. Weight
+upload uses mapped memory on CPU-cached unified memory (1.2 s instead of
+10 s staged). `benchmarks/fast_engine/AUTORESEARCH.md` is the plan for
+tuning the kernels on this device.

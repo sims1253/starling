@@ -46,7 +46,7 @@ fi
 
 adb shell mkdir -p "$DEV_DIR"
 adb push "$BUILD/starling-bench" "$DEV_DIR/" >/dev/null
-find "$BUILD" -name 'libggml*.so' -exec adb push {} "$DEV_DIR/" \; >/dev/null
+find "$BUILD/ggml" -name 'libggml*.so' -exec adb push {} "$DEV_DIR/" \; >/dev/null
 for w in "${WAVS[@]}"; do adb push "$w" "$DEV_DIR/" >/dev/null; done
 DEV_WAVS=""
 for w in "${WAVS[@]}"; do DEV_WAVS="$DEV_WAVS $DEV_DIR/$(basename "$w")"; done
@@ -54,7 +54,10 @@ for w in "${WAVS[@]}"; do DEV_WAVS="$DEV_WAVS $DEV_DIR/$(basename "$w")"; done
 run() {  # model-kind gguf engine
   local kind=$1 gguf=$2 engine=$3
   echo "== $kind / $engine =="
+  # STARLING_GGML_THREADS=6: the app's default (prime + performance cores);
+  # letting ggml spread over the efficiency cores makes its decoder ~3x slower.
   adb shell "cd $DEV_DIR && LD_LIBRARY_PATH=$DEV_DIR STARLING_ENGINE=$engine STARLING_FAST_TIMING=1 \
+    STARLING_GGML_THREADS=\${STARLING_GGML_THREADS:-6} STARLING_PARAKEET_TIMING=1 STARLING_MOSS_TIMING=1 \
     STARLING_FAST_CACHE_DIR=$DEV_DIR $EXTRA_ENV ./starling-bench --model $kind --gguf $DEV_DIR/$gguf \
     --warmup --runs $RUNS $DEV_WAVS"
 }

@@ -56,7 +56,12 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     buffers_.clear();
     for (VkDeviceSize sz : sizes) {
         auto buf = std::make_unique<vk::Buffer>();
-        const vk::Mem kind = std::getenv("STARLING_FAST_MAPPED_WEIGHTS") ? vk::Mem::Device : vk::Mem::DeviceOnly;
+        // Mapped uploads (plain memcpy) when device memory is CPU-cached
+        // (phones: 8x faster than staging); staged copies where mapped device
+        // memory is uncached for the CPU (desktop APUs).
+        const char* mw = std::getenv("STARLING_FAST_MAPPED_WEIGHTS");
+        const bool mapped = mw ? mw[0] == '1' : ctx.info().uma_cached;
+        const vk::Mem kind = mapped ? vk::Mem::Device : vk::Mem::DeviceOnly;
         if (!ctx.create_buffer(*buf, sz, kind, err)) return false;
         buffers_.push_back(std::move(buf));
         total_ += sz;

@@ -114,6 +114,7 @@ struct DeviceInfo {
     uint32_t vendor_id = 0, device_id = 0, driver_version = 0, api_version = 0;
     bool discrete = false;
     bool uma = false;                    // a device-local memory type is host-visible
+    bool uma_cached = false;             // ... and CPU-cached (mapped writes are fast)
     uint32_t subgroup_size = 0;
     uint32_t max_shared_bytes = 0;       // maxComputeSharedMemorySize
     uint32_t max_wg_invocations = 0;

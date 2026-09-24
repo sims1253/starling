@@ -249,7 +249,10 @@ bool Context::init(std::string& err) {
         VkMemoryPropertyFlags f = memprops_.memoryTypes[i].propertyFlags;
         if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
             memprops_.memoryHeaps[memprops_.memoryTypes[i].heapIndex].size > (512ull << 20))
+        {
             info_.uma = !info_.discrete;
+            if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) info_.uma_cached = info_.uma;
+        }
     }
 
     // Pipeline cache: persisted next to other caches so the second process
@@ -290,11 +293,11 @@ bool Context::init(std::string& err) {
     if (env_on("STARLING_FAST_VERBOSE"))
         std::fprintf(stderr,
             "[fast] device '%s' vendor=%04x api=%u.%u subgroup=%u shared=%u "
-            "max_storage=%llu uma=%d f16=%d queue_family=%u\n",
+            "max_storage=%llu uma=%d%s f16=%d queue_family=%u\n",
             info_.name.c_str(), info_.vendor_id, VK_VERSION_MAJOR(info_.api_version),
             VK_VERSION_MINOR(info_.api_version), info_.subgroup_size,
             info_.max_shared_bytes, (unsigned long long)info_.max_storage_range,
-            info_.uma ? 1 : 0, info_.f16 ? 1 : 0, qfam_);
+            info_.uma ? 1 : 0, info_.uma_cached ? "(cached)" : "", info_.f16 ? 1 : 0, qfam_);
     return true;
 }
 
@@ -362,7 +365,8 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     case Mem::Device:
         // UMA: device-local memory that is also host-visible lets uploads be
         // plain memcpy (no staging round trip, no second copy of the weights).
-        if (info_.uma) mt = find_memory(req.memoryTypeBits, DL | HV | HC, 0);
+        if (info_.uma_cached) mt = find_memory(req.memoryTypeBits, DL | HV | HC | CA, 0);
+        if (mt < 0 && info_.uma) mt = find_memory(req.memoryTypeBits, DL | HV | HC, 0);
         if (mt < 0) mt = find_memory(req.memoryTypeBits, DL, 0);
         break;
     case Mem::DeviceOnly:
