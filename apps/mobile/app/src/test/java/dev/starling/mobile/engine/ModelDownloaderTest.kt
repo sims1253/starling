@@ -36,7 +36,6 @@ class ModelDownloaderTest {
     }
 
     private fun spec(sha: String = sha256(payload)) = ModelDownload(
-        displayName = "test",
         url = server.url("/model.gguf").toString(),
         sizeBytes = payload.size.toLong(),
         sha256 = sha,
@@ -53,7 +52,7 @@ class ModelDownloaderTest {
         val partial = File(directory, "model.part")
         var last = 0L
 
-        val result = ModelDownloader().download(spec(), partial) { bytes, _ -> last = bytes }
+        val result = ModelDownloader().download(spec(), partial) { bytes, _, _ -> last = bytes }
 
         assertTrue("$result", result is ModelDownloader.Result.Done)
         assertArrayEquals(payload, partial.readBytes())
@@ -72,7 +71,7 @@ class ModelDownloaderTest {
                 .setBody(body(payload.copyOfRange(half, payload.size))),
         )
 
-        val result = ModelDownloader().download(spec(), partial) { _, _ -> }
+        val result = ModelDownloader().download(spec(), partial) { _, _, _ -> }
 
         assertTrue("$result", result is ModelDownloader.Result.Done)
         assertEquals("bytes=$half-", server.takeRequest().getHeader("Range"))
@@ -84,7 +83,7 @@ class ModelDownloaderTest {
         val partial = File(directory, "model.part").apply { writeBytes(ByteArray(1000) { 1 }) }
         server.enqueue(MockResponse().setBody(body(payload)))   // 200: the whole file
 
-        val result = ModelDownloader().download(spec(), partial) { _, _ -> }
+        val result = ModelDownloader().download(spec(), partial) { _, _, _ -> }
 
         assertTrue("$result", result is ModelDownloader.Result.Done)
         assertArrayEquals(payload, partial.readBytes())
@@ -95,7 +94,7 @@ class ModelDownloaderTest {
         server.enqueue(MockResponse().setBody(body(payload)))
         val partial = File(directory, "model.part")
 
-        val result = ModelDownloader().download(spec(sha = "00".repeat(32)), partial) { _, _ -> }
+        val result = ModelDownloader().download(spec(sha = "00".repeat(32)), partial) { _, _, _ -> }
 
         assertTrue("$result", result is ModelDownloader.Result.Failed)
         assertFalse("a corrupt download must not survive", partial.exists())
@@ -110,7 +109,7 @@ class ModelDownloaderTest {
         )
         val partial = File(directory, "model.part")
 
-        val result = ModelDownloader().download(spec(), partial) { _, _ -> }
+        val result = ModelDownloader().download(spec(), partial) { _, _, _ -> }
 
         assertTrue("$result", result is ModelDownloader.Result.Failed)
         assertTrue("received bytes are kept", partial.length() in 1 until payload.size)
@@ -119,10 +118,26 @@ class ModelDownloaderTest {
     }
 
     @Test
+    fun resumeAtTheWrongOffsetStartsOver() {
+        val partial = File(directory, "model.part").apply { writeBytes(payload.copyOfRange(0, 1000)) }
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(206)
+                .setHeader("Content-Range", "bytes 0-${payload.size - 1}/${payload.size}")
+                .setBody(body(payload)),
+        )
+
+        val result = ModelDownloader().download(spec(), partial) { _, _, _ -> }
+
+        assertTrue("$result", result is ModelDownloader.Result.Failed)
+        assertFalse("a misaligned resume must not be appended", partial.exists())
+    }
+
+    @Test
     fun serverErrorIsReported() {
         server.enqueue(MockResponse().setResponseCode(404))
 
-        val result = ModelDownloader().download(spec(), File(directory, "model.part")) { _, _ -> }
+        val result = ModelDownloader().download(spec(), File(directory, "model.part")) { _, _, _ -> }
 
         assertTrue("$result", result is ModelDownloader.Result.Failed)
         assertTrue((result as ModelDownloader.Result.Failed).reason.contains("404"))

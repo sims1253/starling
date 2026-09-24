@@ -537,6 +537,7 @@ class OnDeviceEngineImportTest {
 
             assertTrue(result is OnDeviceEngine.ImportResult.Rejected)
             assertFalse(engine.hasModel())
+            assertTrue("a file the engine does not own is left alone", download.exists())
         } finally {
             directory.deleteRecursively()
             elsewhere.deleteRecursively()

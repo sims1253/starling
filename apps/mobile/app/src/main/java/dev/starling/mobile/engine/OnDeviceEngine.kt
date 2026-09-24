@@ -133,7 +133,8 @@ class OnDeviceEngine(
      * the on-device model. The file is renamed into a staging name in the
      * model directory — no second multi-hundred-MB copy — and then goes
      * through the same validation and atomic promotion as [importModel].
-     * [downloaded] must live in the model directory; it is consumed either way.
+     * [downloaded] must live in the model directory (a file elsewhere is
+     * refused and left alone); once staged it is consumed either way.
      */
     fun adoptDownloaded(downloaded: File): ImportResult = adoptDownloaded(downloaded, ::promoteByMove)
 
@@ -141,9 +142,11 @@ class OnDeviceEngine(
         synchronized(importLock) {
             sweepStaleStaging()
             val staged = File(modelFile.parentFile, "$MODEL_FILE_NAME.${UUID.randomUUID()}.importing")
-            if (downloaded.parentFile?.canonicalFile != modelFile.parentFile?.canonicalFile ||
-                !downloaded.renameTo(staged)
-            ) {
+            // A file outside the model directory is not ours: refuse, keep it.
+            if (downloaded.parentFile?.canonicalFile != modelFile.parentFile?.canonicalFile) {
+                return ImportResult.Rejected("The downloaded model is not in the model directory.", ImportStage.COPY)
+            }
+            if (!downloaded.renameTo(staged)) {
                 deleteFile(downloaded, "downloaded model")
                 return ImportResult.Rejected("The downloaded model could not be staged.", ImportStage.COPY)
             }

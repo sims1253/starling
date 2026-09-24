@@ -43,22 +43,30 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
 
     /**
      * Downloads [spec] into [partial], resuming whatever it already holds.
-     * [progress] receives (bytes on disk, total bytes) roughly every MiB, and
-     * once with (total, total) while the checksum runs.
+     * [progress] receives (bytes on disk, total bytes, verifying) roughly
+     * every MiB while downloading, then once with verifying = true while the
+     * checksum runs.
      */
-    fun download(spec: ModelDownload, partial: File, progress: (Long, Long) -> Unit): Result {
+    fun download(spec: ModelDownload, partial: File, progress: (Long, Long, Boolean) -> Unit): Result {
         cancelled = false
         partial.parentFile?.mkdirs()
         if (partial.length() > spec.sizeBytes) partial.delete()
         if (partial.length() < spec.sizeBytes) {
-            val fetched = fetch(spec, partial, progress)
+            val needed = spec.sizeBytes - partial.length() + FREE_SPACE_MARGIN_BYTES
+            val free = partial.parentFile?.usableSpace ?: Long.MAX_VALUE
+            if (free < needed) {
+                return Result.Failed(
+                    "Not enough free storage: the model needs ${needed / MB} MB, ${free / MB} MB are free.",
+                )
+            }
+            val fetched = fetch(spec, partial) { bytes, total -> progress(bytes, total, false) }
             if (fetched != null) return fetched
         }
         if (partial.length() != spec.sizeBytes) {
             partial.delete()
             return Result.Failed("The server sent a file of the wrong size.")
         }
-        progress(spec.sizeBytes, spec.sizeBytes)
+        progress(spec.sizeBytes, spec.sizeBytes, true)
         val digest = runCatching { sha256(partial) }.getOrElse {
             return Result.Failed("The download could not be read back: ${it.message}")
         }
@@ -83,7 +91,13 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
             current.execute().use { response ->
                 when {
                     response.code == 206 && rangeStart(response.header("Content-Range")) == offset -> Unit
-                    response.isSuccessful -> offset = 0   // range ignored: start over
+                    response.code == 206 -> {
+                        // A resume from another position cannot be appended.
+                        partial.delete()
+                        return Result.Failed("The server resumed at the wrong position; tap Download to start over.")
+                    }
+                    response.code == 200 -> offset = 0   // range ignored: start over
+                    response.isSuccessful -> return Result.Failed("The server answered HTTP ${response.code}.")
                     response.code == 416 -> {
                         // Our partial is not a prefix the server recognizes.
                         partial.delete()
@@ -133,6 +147,10 @@ class ModelDownloader(private val client: OkHttpClient = defaultClient()) {
     companion object {
         private const val BUFFER_BYTES = 256 * 1024
         private const val PROGRESS_STEP_BYTES = 1L shl 20
+        private const val MB = 1_000_000L
+
+        /** Headroom left on the volume so recordings and app data keep working. */
+        private const val FREE_SPACE_MARGIN_BYTES = 200L * MB
 
         /** Hugging Face redirects to its CDN; only the connect and per-read waits are bounded. */
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()

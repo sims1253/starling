@@ -27,12 +27,13 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     private val main = Handler(Looper.getMainLooper())
     private val listeners = mutableListOf<(State) -> Unit>()
     private var state: State = State.Idle
-    private var downloader: ModelDownloader? = null
+    @Volatile private var downloader: ModelDownloader? = null
 
     val isRunning: Boolean get() = state is State.Running
 
     /** Bytes already on disk from an earlier, unfinished attempt. */
-    fun resumableBytes(spec: ModelDownload): Long = engine.downloadFile(spec).length()
+    fun resumableBytes(spec: ModelDownload): Long =
+        engine.downloadFile(spec).length().coerceAtMost(spec.sizeBytes)
 
     fun addListener(listener: (State) -> Unit) {
         listeners += listener
@@ -60,8 +61,8 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     private fun run(job: ModelDownloader, spec: ModelDownload) {
         val partial = engine.downloadFile(spec)
         val result = runCatching {
-            job.download(spec, partial) { bytes, total ->
-                main.post { publish(State.Running(bytes, total, verifying = bytes >= total)) }
+            job.download(spec, partial) { bytes, total, verifying ->
+                main.post { if (downloader === job) publish(State.Running(bytes, total, verifying)) }
             }
         }.getOrElse { error ->
             Log.e(TAG, "model download failed unexpectedly", error)
@@ -81,14 +82,17 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
             ModelDownloader.Result.Cancelled -> State.Paused
         }
         main.post {
+            // Only the current job may end the download (a paused job's
+            // late result must not override a newer run).
+            if (downloader !== job) return@post
             downloader = null
             publish(next)
         }
     }
 
+    // Progress posts are tagged with their job in run(), so a stale post
+    // from a paused run can never overwrite a newer state.
     private fun publish(next: State) {
-        // A progress post queued before the final state must not overwrite it.
-        if (next is State.Running && state !is State.Running && downloader == null) return
         state = next
         for (listener in listeners.toList()) listener(next)
     }

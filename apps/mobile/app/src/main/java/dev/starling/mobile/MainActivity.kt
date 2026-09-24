@@ -152,7 +152,7 @@ class MainActivity : Activity() {
 
     private fun renderDownload(state: ModelDownloadController.State) {
         val spec = ModelCatalog.RECOMMENDED_PARAKEET
-        val totalMb = (spec.sizeBytes / MB).toInt()
+        val totalMb = mb(spec.sizeBytes)
         when (state) {
             is ModelDownloadController.State.Running -> {
                 downloadModelButton.setText(R.string.cancel_download)
@@ -160,7 +160,7 @@ class MainActivity : Activity() {
                     getString(R.string.on_device_verifying)
                 } else {
                     val percent = if (state.total > 0) (state.bytes * 100 / state.total).toInt() else 0
-                    getString(R.string.on_device_downloading, percent, (state.bytes / MB).toInt(), totalMb)
+                    getString(R.string.on_device_downloading, percent, mb(state.bytes), totalMb)
                 }
                 return
             }
@@ -178,7 +178,7 @@ class MainActivity : Activity() {
                 onDeviceStatus.setText(R.string.on_device_download_paused)
             ModelDownloadController.State.Idle -> Unit
         }
-        val partialMb = (application.modelDownloads.resumableBytes(spec) / MB).toInt()
+        val partialMb = mb(application.modelDownloads.resumableBytes(spec))
         downloadModelButton.text = if (partialMb > 0) {
             getString(R.string.resume_download, partialMb, totalMb)
         } else {
@@ -287,7 +287,7 @@ class MainActivity : Activity() {
         val engine = application.onDeviceEngine
         onDeviceStatus.text = when {
             engine.hasModel() -> {
-                val sizeMb = engine.modelSizeBytes() / MB
+                val sizeMb = mb(engine.modelSizeBytes())
                 getString(R.string.on_device_model_present, sizeMb)
             }
             else -> getString(R.string.on_device_status_no_model)
@@ -577,5 +577,8 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 4002
         // Decimal megabytes, as Hugging Face and file managers show sizes.
         private const val MB = 1_000_000L
+
+        /** Bytes to decimal MB, rounded to nearest like Hugging Face's listing. */
+        private fun mb(bytes: Long): Int = ((bytes + MB / 2) / MB).toInt()
     }
 }
