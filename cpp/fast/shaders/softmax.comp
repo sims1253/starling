@@ -1,0 +1,94 @@
+#version 450
+// softmax.comp — attention-score softmax, one workgroup per (query row, head).
+//
+//   s(j) = (S[h][i][j] + (RELPOS ? BD[h][i][T-1-i+j] : 0)) * scale
+//   s(j) = -inf when j >= key_valid or j > i + causal_off
+//   P[h][i][j] = f16(softmax(s)(j))
+//
+// RELPOS folds FastConformer's rel_shift (the bd skew) into the read index,
+// so the skewed matrix is never materialized.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint RELPOS = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer S { float s[]; };
+layout(std430, binding = 1) readonly buffer BD { float bd[]; };
+layout(std430, binding = 2) buffer P { uint pw[]; };
+
+layout(push_constant) uniform PC {
+    uint T;            // keys per row
+    uint ld_s, ld_b, ld_p;
+    uint sh_s, sh_b, sh_p;   // per-head strides (elements)
+    float scale;
+    uint key_valid;
+    uint causal_off;   // 0xffffffff = no causal mask
+    uint T_rel;        // query count used by the skew (= T for self-attention)
+} p;
+
+shared float red[WG];
+
+float block_max(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint k = WG / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] = max(red[tid], red[tid + k]);
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+float block_sum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint k = WG / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i = gl_WorkGroupID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint sb = h * p.sh_s + i * p.ld_s;
+    const uint bb = h * p.sh_b + i * p.ld_b + (p.T_rel - 1u - i);
+    const uint pb = h * p.sh_p + i * p.ld_p;
+    const uint lim = min(p.key_valid, p.causal_off == 0xffffffffu ? p.T : i + p.causal_off + 1u);
+
+    float mx = -3.0e38;
+    for (uint j = tid; j < lim; j += WG) {
+        float v = s[sb + j];
+        if (RELPOS != 0u) v += bd[bb + j];
+        mx = max(mx, v * p.scale);
+    }
+    mx = block_max(mx);
+    float sum = 0.0;
+    for (uint j = tid; j < lim; j += WG) {
+        float v = s[sb + j];
+        if (RELPOS != 0u) v += bd[bb + j];
+        sum += exp(v * p.scale - mx);
+    }
+    const float inv = 1.0 / block_sum(sum);
+    // Pairs of columns per word; columns >= lim get probability 0.
+    for (uint q = tid; q < (p.T + 1u) / 2u; q += WG) {
+        vec2 pr = vec2(0.0);
+        [[unroll]] for (uint c = 0; c < 2; ++c) {
+            const uint j = 2 * q + c;
+            if (j < lim) {
+                float v = s[sb + j];
+                if (RELPOS != 0u) v += bd[bb + j];
+                pr[c] = exp(v * p.scale - mx) * inv;
+            }
+        }
+        pw[(pb >> 1) + q] = packHalf2x16(pr);
+    }
+}

@@ -20,6 +20,11 @@
 
 #include "starling_ggml.h"
 
+#if defined(STARLING_HAVE_FAST)
+#include "engine_select.hpp"
+#include "parakeet_engine.hpp"
+#endif
+
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +48,13 @@ struct ParakeetCtx {
     std::unique_ptr<starling::ggml::parakeet::Encoder> encoder;
     std::unique_ptr<starling::ggml::parakeet::PredictionNet> prediction;
     std::unique_ptr<starling::ggml::parakeet::Joint> joint;
+#if defined(STARLING_HAVE_FAST)
+    // Model-specialized Vulkan engine (cpp/fast). When set, it owns every
+    // weight on the device, `model` is released after load and only `cfg`
+    // (config + tokenizer) is kept.
+    std::unique_ptr<starling::fast::ParakeetEngine> fast;
+#endif
+    starling::ggml::parakeet::Config cfg;
     std::string err;
 };
 
@@ -76,6 +88,29 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
             report_error(err_out, ctx->err.c_str());
             return nullptr;
         }
+        ctx->cfg = ctx->model->config;
+#if defined(STARLING_HAVE_FAST)
+        const auto choice = starling::fast::engine_choice();
+        if (choice != starling::fast::EngineChoice::Ggml) {
+            std::string ferr;
+            ctx->fast = starling::fast::ParakeetEngine::create(*ctx->model, ferr);
+            if (ctx->fast) {
+                if (std::getenv("STARLING_FAST_VERBOSE"))
+                    std::fprintf(stderr, "[fast] parakeet engine: %s\n", ctx->fast->describe().c_str());
+                // The fast engine holds its own (repacked) weights: drop the
+                // GGUF copy instead of realizing it on a ggml backend.
+                ctx->model.reset();
+                if (err_out) *err_out = nullptr;
+                return ctx.release();
+            }
+            if (choice == starling::fast::EngineChoice::Fast) {
+                report_error(err_out, ("fast engine unavailable: " + ferr).c_str());
+                return nullptr;
+            }
+            if (std::getenv("STARLING_FAST_VERBOSE"))
+                std::fprintf(stderr, "[fast] parakeet falls back to ggml: %s\n", ferr.c_str());
+        }
+#endif
         ctx->mel_const.read_from(ctx->model->loader, ctx->model->config);
         // Realize weights to the process-global backend (zero-copy on CPU /
         // upload on GPU). Also forces global_backend() creation so the
@@ -130,6 +165,7 @@ float * starling_ggml_parakeet_mel(void * handle, const float * pcm, int64_t n,
                                    int * out_T, const char ** err_out) {
     auto* c = static_cast<ParakeetCtx*>(handle);
     if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    if (!c->model) { if (err_out) *err_out = "mel entry unavailable on the fast engine"; return nullptr; }
     std::vector<float> feats;
     int T = 0;
     try {
@@ -162,6 +198,21 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
                                       int * out_T, const char ** err_out) {
     auto* c = static_cast<ParakeetCtx*>(handle);
     if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+#if defined(STARLING_HAVE_FAST)
+    if (c->fast) {
+        std::vector<float> enc;
+        int Tp = 0;
+        if (!c->fast->encode(pcm, (size_t)n, enc, Tp, c->err)) {
+            report_error(err_out, c->err.c_str());
+            return nullptr;
+        }
+        if (out_T) *out_T = Tp;
+        float* out = (float*)std::malloc(enc.size() * sizeof(float));
+        if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+        std::memcpy(out, enc.data(), enc.size() * sizeof(float));
+        return out;
+    }
+#endif
     // 1. mel frontend -> feat-major [n_mels, T].
     std::vector<float> feats;
     int T_mel = 0;
@@ -206,6 +257,20 @@ static bool parakeet_full_decode(ParakeetCtx* c,
                                  const float* pcm, int64_t n,
                                  std::vector<int32_t>& ids,
                                  const char** err_out) {
+#if defined(STARLING_HAVE_FAST)
+    if (c->fast) {
+        try {
+            if (!c->fast->decode_ids(pcm, (size_t)n, ids, c->err)) {
+                report_error(err_out, c->err.c_str());
+                return false;
+            }
+        } catch (const std::exception& e) {
+            report_error(err_out, e.what());
+            return false;
+        }
+        return true;
+    }
+#endif
     using Clock = std::chrono::steady_clock;
     const char* timing_env = std::getenv("STARLING_PARAKEET_TIMING");
     const bool timing = timing_env && std::strcmp(timing_env, "1") == 0;
@@ -282,7 +347,7 @@ char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n
     std::vector<int32_t> ids;
     if (!parakeet_full_decode(c, pcm, n, ids, err_out)) return nullptr;
     std::string text = starling::ggml::parakeet::detokenize(
-        c->model->config.tokenizer_pieces, ids);
+        c->cfg.tokenizer_pieces, ids);
     char* out = (char*)std::malloc(text.size() + 1);
     if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
     std::memcpy(out, text.data(), text.size());
@@ -308,7 +373,7 @@ int64_t * starling_ggml_parakeet_decode_ids(void * handle, const float * pcm, in
     if (!parakeet_full_decode(c, pcm, n, ids, err_out)) return nullptr;
     // Prepend the decoder_start_token_id (= blank_id) to match the golden
     // stream format (HF model.generate's sequences[0] includes it).
-    const int64_t blank = (int64_t)c->model->config.blank_id;
+    const int64_t blank = (int64_t)c->cfg.blank_id;
     if (out_n) *out_n = (int64_t)ids.size() + 1;
     int64_t* out = (int64_t*)std::malloc(((size_t)ids.size() + 1) * sizeof(int64_t));
     if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }

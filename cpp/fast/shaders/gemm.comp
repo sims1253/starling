@@ -1,0 +1,308 @@
+#version 450
+// gemm.comp — tiled C = A · Bᵀ with fused epilogues.
+//
+//   A: f16 activations, row-major [M, K] (row stride lda, element offsets).
+//   B: one of (compile-time -D):
+//        B_W4   4-bit weights  [N, K/32 groups]: 4 words of nibbles + one
+//               packHalf2x16(scale, offset) word per group (w = s*q + o).
+//               Repacked at load from Q4_0 / Q4_K.
+//        B_W8   8-bit weights  [N, K/32 groups]: 8 words of int8 + one
+//               packHalf2x16(s_lo, s_hi) word (scale per 16 weights).
+//               Repacked from Q8_0 / Q6_K.
+//        B_F16  f16 [N, K] row-major (weights or activations; ldb).
+//        B_F16T f16 [K, N] row-major (activations such as V; ldb).
+//   Batched over gl_WorkGroupID.z with a two-level (hi, lo) decomposition so
+//   attention heads/windows map onto one dispatch (GQA via `gqa`).
+//
+// Tiles: BM x BN per workgroup, BK = 32 (one quant group), each thread owns a
+// TM x TN register tile. Both operand tiles live in shared memory as f16
+// pairs packed along M / N, which halves shared-memory traffic and size
+// (16 KiB for 128x128 tiles — the Vulkan minimum) and lets the A tile be
+// rearranged with bit operations instead of conversions. Products are
+// accumulated in f32; with F16MATH (-D, needs shaderFloat16) each 32-deep
+// slice is accumulated with packed f16 FMAs and flushed into the f32
+// accumulators, doubling ALU throughput on GPUs with 2x f16 rate.
+//
+// The grid's x dimension walks M so consecutive workgroups reuse one weight
+// tile from cache (weights are read from DRAM ~once per N tile).
+//
+// Epilogues (EPI): 0 store f32, 1 store f16, 2 residual (C_f32 += result),
+// 3 GLU (interleaved (a, gate) pairs -> a*sigmoid(gate), f16),
+// 4 SwiGLU (interleaved (gate, up) pairs -> silu(gate)*up, f16),
+// 5 QUV (two f16 outputs: result + bias[n] and result + bias2[n]).
+// `alpha` scales the product; rows >= row_valid are zeroed before the bias.
+// HAS_BIAS: 0 none, 1 per column (bias[n]), 2 per row (bias[m]).
+
+#include "common.glsl"
+#ifdef F16MATH
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint BM = 128;
+layout(constant_id = 2) const uint BN = 128;
+layout(constant_id = 3) const uint TM = 8;
+layout(constant_id = 4) const uint TN = 8;
+layout(constant_id = 5) const uint EPI = 0;
+layout(constant_id = 6) const uint ACT = 0;
+layout(constant_id = 7) const uint HAS_BIAS = 0;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+const uint BK = 32;
+
+layout(std430, binding = 0) readonly buffer ABuf { uint a_w[]; };
+layout(std430, binding = 0) readonly buffer ABuf4 { uvec4 a_w4[]; };
+layout(std430, binding = 1) readonly buffer BQ { uint bq[]; };
+layout(std430, binding = 1) readonly buffer BQ4 { uvec4 bq4[]; };
+layout(std430, binding = 2) readonly buffer BS { uint bs[]; };
+layout(std430, binding = 3) buffer CBuf { uint c_w[]; };
+layout(std430, binding = 4) readonly buffer Bias { float bias[]; };
+layout(std430, binding = 5) readonly buffer Bias2 { float bias2[]; };
+layout(std430, binding = 6) buffer C2Buf { uint c2_w[]; };
+
+layout(push_constant) uniform PC {
+    uint M, N, K;
+    uint lda, ldb, ldc;
+    uint a_off, b_off, c_off;     // element offsets
+    uint nb_lo;                   // z = hi * nb_lo + lo
+    uint sa_hi, sa_lo, sb_hi, sb_lo, sc_hi, sc_lo;
+    uint gqa;                     // B batch lo index = lo / gqa
+    uint row_valid;
+    float alpha;
+    uint mdiv, ldc_mhi;           // row m -> (m / mdiv) * ldc_mhi + (m % mdiv) * ldc
+    uint ldc_n;                   // column stride (f32 outputs only)
+} p;
+
+// f16 pairs: As[k][r] = (A[2r][k], A[2r+1][k]); Bs[k][c] = (B[2c][k], B[2c+1][k]).
+shared uint As[BK][BM / 2];
+shared uint Bs[BK][BN / 2];
+
+// Pick half `h` (0..7) of an 8-half vector held in a uvec4.
+uint half_bits(uvec4 v, uint h) { return (v[h >> 1] >> (16u * (h & 1u))) & 0xffffu; }
+
+// 8 consecutive f16 values (k..k+7) of A row `m`, as bits.
+uvec4 load8_a(uint m, uint k, uint base) {
+    if (m < p.M && k + 8 <= p.K) return a_w4[(base + m * p.lda + k) >> 3];
+    uvec4 r = uvec4(0);
+    if (m < p.M)
+        for (uint i = 0; i < 8; ++i)
+            if (k + i < p.K) {
+                const uint e = base + m * p.lda + k + i;
+                r[i >> 1] |= ((a_w[e >> 1] >> (16u * (e & 1u))) & 0xffffu) << (16u * (i & 1u));
+            }
+    return r;
+}
+uvec4 load8_b(uint n, uint k, uint base) {
+    if (n < p.N && k + 8 <= p.K && ((base + n * p.ldb + k) & 7u) == 0u) return bq4[(base + n * p.ldb + k) >> 3];
+    uvec4 r = uvec4(0);
+    if (n < p.N)
+        for (uint i = 0; i < 8; ++i)
+            if (k + i < p.K) {
+                const uint e = base + n * p.ldb + k + i;
+                r[i >> 1] |= ((bq[e >> 1] >> (16u * (e & 1u))) & 0xffffu) << (16u * (i & 1u));
+            }
+    return r;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint m0 = gl_WorkGroupID.x * BM;
+    const uint n0 = gl_WorkGroupID.y * BN;
+    const uint z = gl_WorkGroupID.z;
+    const uint zhi = z / p.nb_lo, zlo = z % p.nb_lo;
+    const uint a_base = p.a_off + zhi * p.sa_hi + zlo * p.sa_lo;
+    const uint b_base = p.b_off + zhi * p.sb_hi + (zlo / p.gqa) * p.sb_lo;
+    const uint c_base = p.c_off + zhi * p.sc_hi + zlo * p.sc_lo;
+
+    const uint TPM = BM / TM;             // threads along M
+    const uint tm = tid % TPM, tn = tid / TPM;
+
+    float acc[TM * TN];
+    [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = 0.0;
+
+    const uint n_k = (p.K + BK - 1) / BK;
+    for (uint kt = 0; kt < n_k; ++kt) {
+        const uint k0 = kt * BK;
+        // ---- A tile: (BM/2 row pairs) x (4 chunks of 8 k) ----
+        for (uint u = tid; u < BM * 2; u += WG) {
+            const uint r = u >> 2, kc = (u & 3u) * 8;
+            const uvec4 x0 = load8_a(m0 + 2 * r, k0 + kc, a_base);
+            const uvec4 x1 = load8_a(m0 + 2 * r + 1, k0 + kc, a_base);
+            [[unroll]] for (uint i = 0; i < 8; ++i)
+                As[kc + i][r] = half_bits(x0, i) | (half_bits(x1, i) << 16);
+        }
+        // ---- B tile ----
+#if defined(B_W4)
+        // (BN/2 row pairs) x 4 words; one word = 8 consecutive weights.
+        for (uint u = tid; u < BN * 2; u += WG) {
+            const uint r = u >> 2, wi = u & 3u;
+            const uint n = n0 + 2 * r;
+            vec2 so0 = vec2(0.0), so1 = vec2(0.0);
+            uint q0 = 0, q1 = 0;
+            if (n < p.N) {
+                const uint g = n * (p.K / BK) + kt;
+                so0 = unpackHalf2x16(bs[g]);
+                q0 = bq[g * 4 + wi];
+            }
+            if (n + 1 < p.N) {
+                const uint g = (n + 1) * (p.K / BK) + kt;
+                so1 = unpackHalf2x16(bs[g]);
+                q1 = bq[g * 4 + wi];
+            }
+            [[unroll]] for (uint i = 0; i < 8; ++i)
+                Bs[wi * 8 + i][r] = packHalf2x16(vec2(so0.x * float((q0 >> (4 * i)) & 15u) + so0.y,
+                                                      so1.x * float((q1 >> (4 * i)) & 15u) + so1.y));
+        }
+#elif defined(B_W8)
+        // (BN/2 row pairs) x 8 words; one word = 4 consecutive int8 weights.
+        for (uint u = tid; u < BN * 4; u += WG) {
+            const uint r = u >> 3, wi = u & 7u;
+            const uint n = n0 + 2 * r;
+            float s0 = 0.0, s1 = 0.0;
+            int q0 = 0, q1 = 0;
+            if (n < p.N) {
+                const uint g = n * (p.K / BK) + kt;
+                s0 = unpackHalf2x16(bs[g])[wi >> 2];
+                q0 = int(bq[g * 8 + wi]);
+            }
+            if (n + 1 < p.N) {
+                const uint g = (n + 1) * (p.K / BK) + kt;
+                s1 = unpackHalf2x16(bs[g])[wi >> 2];
+                q1 = int(bq[g * 8 + wi]);
+            }
+            [[unroll]] for (uint i = 0; i < 4; ++i)
+                Bs[wi * 4 + i][r] = packHalf2x16(vec2(s0 * float(bitfieldExtract(q0, int(8 * i), 8)),
+                                                      s1 * float(bitfieldExtract(q1, int(8 * i), 8))));
+        }
+#elif defined(B_F16)
+        for (uint u = tid; u < BN * 2; u += WG) {
+            const uint r = u >> 2, kc = (u & 3u) * 8;
+            const uvec4 x0 = load8_b(n0 + 2 * r, k0 + kc, b_base);
+            const uvec4 x1 = load8_b(n0 + 2 * r + 1, k0 + kc, b_base);
+            [[unroll]] for (uint i = 0; i < 8; ++i)
+                Bs[kc + i][r] = half_bits(x0, i) | (half_bits(x1, i) << 16);
+        }
+#elif defined(B_F16T)
+        // B stored [K, N]: tile rows are contiguous along n, already paired.
+        for (uint u = tid; u < BK * (BN / 8); u += WG) {
+            const uint kr = u / (BN / 8), nc = (u % (BN / 8)) * 8;
+            const uint k = k0 + kr, n = n0 + nc;
+            uvec4 v = uvec4(0);
+            if (k < p.K && n + 8 <= p.N && ((b_base + k * p.ldb + n) & 7u) == 0u) {
+                v = bq4[(b_base + k * p.ldb + n) >> 3];
+            } else if (k < p.K) {
+                for (uint i = 0; i < 8; ++i)
+                    if (n + i < p.N) {
+                        const uint e = b_base + k * p.ldb + n + i;
+                        v[i >> 1] |= ((bq[e >> 1] >> (16u * (e & 1u))) & 0xffffu) << (16u * (i & 1u));
+                    }
+            }
+            [[unroll]] for (uint i = 0; i < 4; ++i) Bs[kr][(nc >> 1) + i] = v[i];
+        }
+#endif
+        barrier();
+        // ---- register-tiled products over the 32-deep slice ----
+#ifdef F16MATH
+        f16vec2 acc16[TM * TN / 2];
+        [[unroll]] for (uint i = 0; i < TM * TN / 2; ++i) acc16[i] = f16vec2(0.0hf);
+        [[unroll]] for (uint k = 0; k < BK; ++k) {
+            f16vec2 b2[TN / 2];
+            [[unroll]] for (uint j = 0; j < TN / 2; ++j) b2[j] = unpackFloat2x16(Bs[k][tn * (TN / 2) + j]);
+            [[unroll]] for (uint i = 0; i < TM / 2; ++i) {
+                const f16vec2 a2 = unpackFloat2x16(As[k][tm * (TM / 2) + i]);
+                [[unroll]] for (uint j = 0; j < TN / 2; ++j) {
+                    acc16[(2 * i) * (TN / 2) + j] = fma(f16vec2(a2.x), b2[j], acc16[(2 * i) * (TN / 2) + j]);
+                    acc16[(2 * i + 1) * (TN / 2) + j] = fma(f16vec2(a2.y), b2[j], acc16[(2 * i + 1) * (TN / 2) + j]);
+                }
+            }
+        }
+        [[unroll]] for (uint i = 0; i < TM; ++i)
+            [[unroll]] for (uint j = 0; j < TN / 2; ++j) {
+                acc[i * TN + 2 * j] += float(acc16[i * (TN / 2) + j].x);
+                acc[i * TN + 2 * j + 1] += float(acc16[i * (TN / 2) + j].y);
+            }
+#else
+        [[unroll]] for (uint k = 0; k < BK; ++k) {
+            vec2 b2[TN / 2];
+            [[unroll]] for (uint j = 0; j < TN / 2; ++j) b2[j] = unpackHalf2x16(Bs[k][tn * (TN / 2) + j]);
+            [[unroll]] for (uint i = 0; i < TM / 2; ++i) {
+                const vec2 a2 = unpackHalf2x16(As[k][tm * (TM / 2) + i]);
+                [[unroll]] for (uint j = 0; j < TN / 2; ++j) {
+                    acc[(2 * i) * TN + 2 * j] = fma(a2.x, b2[j].x, acc[(2 * i) * TN + 2 * j]);
+                    acc[(2 * i) * TN + 2 * j + 1] = fma(a2.x, b2[j].y, acc[(2 * i) * TN + 2 * j + 1]);
+                    acc[(2 * i + 1) * TN + 2 * j] = fma(a2.y, b2[j].x, acc[(2 * i + 1) * TN + 2 * j]);
+                    acc[(2 * i + 1) * TN + 2 * j + 1] = fma(a2.y, b2[j].y, acc[(2 * i + 1) * TN + 2 * j + 1]);
+                }
+            }
+        }
+#endif
+        barrier();
+    }
+
+    // ---- epilogue ----
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        const uint m = m0 + tm * TM + i;
+        if (m >= p.M) continue;
+        const bool live = m < p.row_valid;
+        const uint row = c_base + (m / p.mdiv) * p.ldc_mhi + (m % p.mdiv) * p.ldc;
+        float v[TN];
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            const uint n = n0 + tn * TN + j;
+            float x = live ? acc[i * TN + j] * p.alpha : 0.0;
+            if (HAS_BIAS == 1u && n < p.N) x += bias[n];
+            if (HAS_BIAS == 2u) x += bias[m];
+            v[j] = x;
+        }
+        if (EPI == 0u) {
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                const uint n = n0 + tn * TN + j;
+                if (n < p.N) c_w[row + n * p.ldc_n] = floatBitsToUint(apply_act(ACT, v[j]));
+            }
+        } else if (EPI == 2u) {
+            [[unroll]] for (uint j = 0; j < TN; ++j) {
+                const uint n = n0 + tn * TN + j;
+                if (n < p.N) {
+                    const uint idx = row + n * p.ldc_n;
+                    c_w[idx] = floatBitsToUint(uintBitsToFloat(c_w[idx]) + apply_act(ACT, v[j]));
+                }
+            }
+        } else if (EPI == 1u) {
+            // f16 pairs; N, row and n0 are even (host-checked).
+            [[unroll]] for (uint j = 0; j < TN; j += 2) {
+                const uint n = n0 + tn * TN + j;
+                if (n < p.N)
+                    c_w[(row + n) >> 1] = packHalf2x16(vec2(apply_act(ACT, v[j]), apply_act(ACT, v[j + 1])));
+            }
+        } else if (EPI == 3u || EPI == 4u) {
+            // Interleaved pairs -> one output per pair; 4 columns -> 2 outputs
+            // -> one packed word. Output row stride is ldc (in output elements).
+            [[unroll]] for (uint j = 0; j < TN; j += 4) {
+                const uint n = n0 + tn * TN + j;
+                if (n < p.N) {
+                    float o0 = 0.0, o1 = 0.0;
+                    if (!live) {
+                        // padded rows stay exactly zero (NeMo masks after GLU)
+                    } else if (EPI == 3u) {
+                        o0 = v[j] * sigmoid_f(v[j + 1]);
+                        o1 = v[j + 2] * sigmoid_f(v[j + 3]);
+                    } else {
+                        o0 = silu_f(v[j]) * v[j + 1];
+                        o1 = silu_f(v[j + 2]) * v[j + 3];
+                    }
+                    c_w[(row + (n >> 1)) >> 1] = packHalf2x16(vec2(o0, o1));
+                }
+            }
+        } else if (EPI == 5u) {
+            [[unroll]] for (uint j = 0; j < TN; j += 2) {
+                const uint n = n0 + tn * TN + j;
+                if (n < p.N) {
+                    // QUV uses the raw product plus the two per-column biases.
+                    const float r0 = live ? acc[i * TN + j] * p.alpha : 0.0;
+                    const float r1 = live ? acc[i * TN + j + 1] * p.alpha : 0.0;
+                    c_w[(row + n) >> 1] = packHalf2x16(vec2(r0 + bias[n], r1 + bias[n + 1]));
+                    c2_w[(row + n) >> 1] = packHalf2x16(vec2(r0 + bias2[n], r1 + bias2[n + 1]));
+                }
+            }
+        }
+    }
+}

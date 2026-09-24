@@ -131,6 +131,14 @@ target_include_directories(starling_ggml_core PUBLIC
 target_compile_definitions(starling_ggml_core PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
 target_link_libraries(starling_ggml_core PUBLIC ggml)
 
+# Model-specialized fast engines (cpp/fast): hand-written Vulkan kernels for
+# the Parakeet and MOSS Q4 checkpoints, selected at load time by
+# STARLING_ENGINE (see docs/fast-engine.md). Independent of GGML_VULKAN.
+option(STARLING_FAST "Build the model-specialized Vulkan fast engines (cpp/fast)" OFF)
+if(STARLING_FAST)
+  include(${STARLING_REPO_ROOT}/cpp/fast/fast.cmake)
+endif()
+
 if(STARLING_GGML_SHARED)
   add_library(starling_ggml SHARED $<TARGET_OBJECTS:starling_ggml_core>)
   set_target_properties(starling_ggml PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -140,6 +148,9 @@ endif()
 set_target_properties(starling_ggml PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_include_directories(starling_ggml PUBLIC ${STARLING_REPO_ROOT}/cpp/include)
 target_link_libraries(starling_ggml PUBLIC ggml)
+if(STARLING_FAST)
+  target_link_libraries(starling_ggml PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 if(STARLING_GGML_TESTS)
   set(STARLING_GGML_TEST_SUPPORT_CPP ${STARLING_REPO_ROOT}/cpp/tests/golden_io.cpp)
@@ -151,6 +162,10 @@ if(STARLING_GGML_TESTS)
         ${STARLING_REPO_ROOT}/cpp ${STARLING_REPO_ROOT}/cpp/tests
         ${STARLING_REPO_ROOT}/third_party ${STARLING_REPO_ROOT}/third_party/ggml/include)
     target_link_libraries(${test_name} PRIVATE ggml)
+    if(STARLING_FAST)
+      target_include_directories(${test_name} PRIVATE ${STARLING_REPO_ROOT}/cpp/fast ${STARLING_FAST_VK_INCLUDE})
+      target_link_libraries(${test_name} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 
     # The stream_session_test needs the serve sources (server.cpp,
     # stream_session.cpp, audio.cpp) + cpp-httplib's header path.
@@ -197,6 +212,16 @@ set_target_properties(starling_ggml PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+
+# starling-bench: transcribe WAV files through the C API and report latency
+# (engine comparison: STARLING_ENGINE=ggml|fast).
+option(STARLING_BENCH "Build the starling-bench latency tool" ON)
+if(STARLING_BENCH)
+  add_executable(starling-bench ${STARLING_REPO_ROOT}/cpp/tools/starling_bench.cpp)
+  target_include_directories(starling-bench PRIVATE ${STARLING_REPO_ROOT}/cpp ${STARLING_REPO_ROOT}/cpp/include)
+  target_link_libraries(starling-bench PRIVATE starling_ggml)
+  set_target_properties(starling-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
 
 # --------------------------------------------------------------------------- #
 # starling-quantize: the calibrated-quantization CLI for Starling GGUFs.
