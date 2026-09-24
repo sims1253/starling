@@ -149,10 +149,16 @@
             android:textSize="13sp" />
 
         <Button
+            android:id="@+id/download_model_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" />
+
+        <Button
             android:id="@+id/import_model_button"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="4dp"
             android:text="@string/import_model" />
 
         <View

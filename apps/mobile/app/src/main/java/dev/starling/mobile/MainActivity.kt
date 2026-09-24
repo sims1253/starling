@@ -26,6 +26,7 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
+import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.EndpointPolicy
@@ -44,6 +45,7 @@ class MainActivity : Activity() {
     private lateinit var engineInput: RadioGroup
     private lateinit var engineOnDeviceInput: RadioButton
     private lateinit var onDeviceStatus: TextView
+    private lateinit var downloadModelButton: Button
     private lateinit var endpointMessage: TextView
     private lateinit var recordingMessage: TextView
     private lateinit var liveTranscript: TextView
@@ -105,6 +107,11 @@ class MainActivity : Activity() {
             config.engine == TranscriptionEngine.REMOTE
         findViewById<Button>(R.id.save_endpoint_button).setOnClickListener { saveEndpoint() }
         findViewById<Button>(R.id.import_model_button).setOnClickListener { importModel() }
+        downloadModelButton = findViewById(R.id.download_model_button)
+        downloadModelButton.setOnClickListener {
+            val downloads = application.modelDownloads
+            if (downloads.isRunning) downloads.cancel() else downloads.start(ModelCatalog.RECOMMENDED_PARAKEET)
+        }
         recordButton.setOnClickListener {
             if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
         }
@@ -124,11 +131,59 @@ class MainActivity : Activity() {
         refreshRecordings()
     }
 
+    override fun onStart() {
+        super.onStart()
+        application.modelDownloads.addListener(downloadListener)
+    }
+
     override fun onStop() {
+        application.modelDownloads.removeListener(downloadListener)
         // A backgrounded Activity should never keep the microphone open. The
         // finalized file stays in app-private storage and can be retried later.
         if (activeRecording != null) stopAndQueueRecording()
         super.onStop()
+    }
+
+    // The download is app-scoped (it survives rotation and leaving the
+    // screen); this Activity only renders its state while visible.
+    private val downloadListener: (ModelDownloadController.State) -> Unit = { state ->
+        renderDownload(state)
+    }
+
+    private fun renderDownload(state: ModelDownloadController.State) {
+        val spec = ModelCatalog.RECOMMENDED_PARAKEET
+        val totalMb = (spec.sizeBytes / MB).toInt()
+        when (state) {
+            is ModelDownloadController.State.Running -> {
+                downloadModelButton.setText(R.string.cancel_download)
+                onDeviceStatus.text = if (state.verifying) {
+                    getString(R.string.on_device_verifying)
+                } else {
+                    val percent = if (state.total > 0) (state.bytes * 100 / state.total).toInt() else 0
+                    getString(R.string.on_device_downloading, percent, (state.bytes / MB).toInt(), totalMb)
+                }
+                return
+            }
+            is ModelDownloadController.State.Finished -> when (val result = state.result) {
+                // Re-delivered on every onStart, so no one-shot message here.
+                is OnDeviceEngine.ImportResult.Imported -> refreshOnDeviceStatus()
+                is OnDeviceEngine.ImportResult.Rejected -> {
+                    Log.w(TAG, "downloaded model rejected at ${result.stage}: ${result.reason}")
+                    onDeviceStatus.text = result.reason
+                }
+            }
+            is ModelDownloadController.State.Failed ->
+                onDeviceStatus.text = getString(R.string.on_device_download_failed, state.reason)
+            ModelDownloadController.State.Paused ->
+                onDeviceStatus.setText(R.string.on_device_download_paused)
+            ModelDownloadController.State.Idle -> Unit
+        }
+        val partialMb = (application.modelDownloads.resumableBytes(spec) / MB).toInt()
+        downloadModelButton.text = if (partialMb > 0) {
+            getString(R.string.resume_download, partialMb, totalMb)
+        } else {
+            getString(R.string.download_model, totalMb)
+        }
     }
 
     override fun onDestroy() {
@@ -232,7 +287,7 @@ class MainActivity : Activity() {
         val engine = application.onDeviceEngine
         onDeviceStatus.text = when {
             engine.hasModel() -> {
-                val sizeMb = engine.modelSizeBytes() / (1024 * 1024)
+                val sizeMb = engine.modelSizeBytes() / MB
                 getString(R.string.on_device_model_present, sizeMb)
             }
             else -> getString(R.string.on_device_status_no_model)
@@ -520,5 +575,7 @@ class MainActivity : Activity() {
         private const val TAG = "MainActivity"
         private const val REQUEST_RECORD_AUDIO = 4001
         private const val REQUEST_IMPORT_MODEL = 4002
+        // Decimal megabytes, as Hugging Face and file managers show sizes.
+        private const val MB = 1_000_000L
     }
 }

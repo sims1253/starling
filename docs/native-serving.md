@@ -363,6 +363,16 @@ starling-serve --model parakeet \
   --gguf ./models/parakeet-tdt-0.6b-v3-q8_0.gguf --port 8181
 ```
 
+MOSS-Transcribe weights (Q4_0 + imatrix linears, Q8_0 tied head, 1.55 GB)
+are in [`scholzmx/moss-transcribe-preview-2b-gguf`](https://huggingface.co/scholzmx/moss-transcribe-preview-2b-gguf):
+
+```bash
+hf download scholzmx/moss-transcribe-preview-2b-gguf \
+  moss-transcribe-preview-2b-q4e8-fullimx.gguf --local-dir ./models
+starling-serve --model moss \
+  --gguf ./models/moss-transcribe-preview-2b-q4e8-fullimx.gguf --port 8181
+```
+
 The planned `starling/*-gguf` repositories are not public downloads.
 For other models, use the converters below with the original model weights.
 The [GGUF file guide](hf-gguf-readme.md) describes filenames and metadata.

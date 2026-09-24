@@ -124,45 +124,73 @@ class OnDeviceEngine(
                         ImportStage.COPY,
                     )
                 }
-                val size = staged.length()
-
-                try {
-                    // Validation reads only the staging file, so it runs
-                    // outside the engine lock; a concurrent transcription
-                    // keeps serving the previous model meanwhile.
-                    val rejection = ModelFiles.validateStaged(staged)
-                    if (rejection != null) {
-                        return ImportResult.Rejected(rejection, ImportStage.VALIDATE)
-                    }
-
-                    synchronized(lock) {
-                        // Single atomic step: rename(2) over the target
-                        // replaces it or fails — the previous model is never
-                        // deleted first, so a failed promotion keeps the
-                        // last usable model recoverable.
-                        if (!promote(staged, modelFile)) {
-                            return ImportResult.Rejected(
-                                "The model could not be moved into place; the previous model was kept.",
-                                ImportStage.PROMOTE,
-                            )
-                        }
-                        fsyncModelDirectory()
-                        // The new file is already in place; a native failure
-                        // here must not mask a completed import (the next
-                        // transcription reloads from the new file anyway).
-                        runCatching { unload() }
-                    }
-                    ImportResult.Imported(size)
-                } finally {
-                    // Every path that reaches here without a rename-based
-                    // promotion leaves the staged file behind: rejection,
-                    // failed promotion, a copy-based test seam, or an
-                    // unexpected throw. Delete it so at most one staging
-                    // file ever exists.
-                    deleteFile(staged, "staging file")
-                }
+                publishStaged(staged, promote)
             }
         }
+
+    /**
+     * Imports a finished, checksum-verified download ([ModelDownloader]) as
+     * the on-device model. The file is renamed into a staging name in the
+     * model directory — no second multi-hundred-MB copy — and then goes
+     * through the same validation and atomic promotion as [importModel].
+     * [downloaded] must live in the model directory; it is consumed either way.
+     */
+    fun adoptDownloaded(downloaded: File): ImportResult = adoptDownloaded(downloaded, ::promoteByMove)
+
+    internal fun adoptDownloaded(downloaded: File, promote: (staged: File, target: File) -> Boolean): ImportResult =
+        synchronized(importLock) {
+            sweepStaleStaging()
+            val staged = File(modelFile.parentFile, "$MODEL_FILE_NAME.${UUID.randomUUID()}.importing")
+            if (downloaded.parentFile?.canonicalFile != modelFile.parentFile?.canonicalFile ||
+                !downloaded.renameTo(staged)
+            ) {
+                deleteFile(downloaded, "downloaded model")
+                return ImportResult.Rejected("The downloaded model could not be staged.", ImportStage.COPY)
+            }
+            publishStaged(staged, promote)
+        }
+
+    /** Validates [staged] and promotes it over the model; [staged] is gone afterwards. Holds [importLock]. */
+    private fun publishStaged(staged: File, promote: (staged: File, target: File) -> Boolean): ImportResult {
+        val size = staged.length()
+        try {
+            // Validation reads only the staging file, so it runs outside the
+            // engine lock; a concurrent transcription keeps serving the
+            // previous model meanwhile.
+            val rejection = ModelFiles.validateStaged(staged)
+            if (rejection != null) {
+                return ImportResult.Rejected(rejection, ImportStage.VALIDATE)
+            }
+
+            synchronized(lock) {
+                // Single atomic step: rename(2) over the target replaces it
+                // or fails — the previous model is never deleted first, so a
+                // failed promotion keeps the last usable model recoverable.
+                if (!promote(staged, modelFile)) {
+                    return ImportResult.Rejected(
+                        "The model could not be moved into place; the previous model was kept.",
+                        ImportStage.PROMOTE,
+                    )
+                }
+                fsyncModelDirectory()
+                // The new file is already in place; a native failure here
+                // must not mask a completed import (the next transcription
+                // reloads from the new file anyway).
+                runCatching { unload() }
+            }
+            return ImportResult.Imported(size)
+        } finally {
+            // Every path that reaches here without a rename-based promotion
+            // leaves the staged file behind: rejection, failed promotion, a
+            // copy-based test seam, or an unexpected throw. Delete it so at
+            // most one staging file ever exists.
+            deleteFile(staged, "staging file")
+        }
+    }
+
+    /** Where an in-progress download of [spec] lives (resumable across restarts). */
+    fun downloadFile(spec: ModelDownload): File =
+        File(modelFile.parentFile, "download-${spec.sha256.take(16)}.part")
 
     /**
      * Promotion: a single atomic rename over the target replaces it or
