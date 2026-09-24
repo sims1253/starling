@@ -39,9 +39,13 @@ def main() -> int:
     os.makedirs(a.out, exist_ok=True)
     refs: dict[str, str] = {}
     for f in files:
+        if len(refs) >= a.n:
+            break
         t = pq.read_table(f)
         cols = t.column_names
-        text_col = "transcription" if "transcription" in cols else "raw_transcription"
+        text_col = next((c for c in ("transcription", "raw_transcription") if c in cols), None)
+        if text_col is None:
+            raise SystemExit(f"{f}: no transcription column (have {cols})")
         for row in t.to_pylist():
             if len(refs) >= a.n:
                 break

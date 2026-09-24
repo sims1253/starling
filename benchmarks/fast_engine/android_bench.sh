@@ -23,8 +23,8 @@ WAVS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-build) BUILD_IT=0 ;;
-    --models) MODELS=$2; shift ;;
-    --wav) WAVS+=("$2"); shift ;;
+    --models) [ $# -ge 2 ] || { echo "--models needs a directory" >&2; exit 2; }; MODELS=$2; shift ;;
+    --wav) [ $# -ge 2 ] || { echo "--wav needs a file" >&2; exit 2; }; WAVS+=("$2"); shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
   shift

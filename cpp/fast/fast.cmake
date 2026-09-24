@@ -127,7 +127,7 @@ add_custom_command(
   COMMENT "embed fast-engine SPIR-V"
   VERBATIM)
 
-file(GLOB STARLING_FAST_CPP ${STARLING_FAST_DIR}/*.cpp)
+file(GLOB STARLING_FAST_CPP CONFIGURE_DEPENDS ${STARLING_FAST_DIR}/*.cpp)
 target_sources(starling_ggml_core PRIVATE ${STARLING_FAST_CPP} ${_embed_cpp})
 target_compile_definitions(starling_ggml_core PUBLIC STARLING_HAVE_FAST=1)
 target_include_directories(starling_ggml_core PUBLIC ${STARLING_FAST_DIR})
