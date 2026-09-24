@@ -7,6 +7,8 @@
 #include "weights.hpp"
 
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,6 +44,25 @@ struct GMat {
     bool has_s = false;
 };
 GMat arena_matrix(Arena& a, HostMatrix&& m);
+
+// Run f(i) for i in [0, n) on up to hardware_concurrency threads.
+void parallel_for(size_t n, const std::function<void(size_t)>& f);
+
+// Weight repacking jobs run in parallel at load, then land in the arena in
+// the order they were added (deterministic layout).
+class PackJobs {
+public:
+    using Fn = std::function<bool(HostMatrix&, std::string&)>;
+    // Result becomes a resident matrix written to *dst.
+    void add(GMat* dst, Fn fn) { jobs_.push_back({dst, nullptr, std::move(fn)}); }
+    // Result is left in *sink for the caller (e.g. to split into chunks).
+    void add_host(HostMatrix* sink, Fn fn) { jobs_.push_back({nullptr, sink, std::move(fn)}); }
+    bool run(Arena& ar, std::string& err);
+
+private:
+    struct Job { GMat* dst; HostMatrix* sink; Fn fn; HostMatrix out; std::string err; bool ok = false; };
+    std::deque<Job> jobs_;
+};
 
 // ---------------------------------------------------------------------------
 // GEMM (gemm.comp). Field names follow the shader's push-constant block.

@@ -148,6 +148,8 @@ struct Buffer {
 
 enum class Mem {
     Device,    // device-local; host access via staging (mapped when UMA)
+    DeviceOnly,// device-local, never mapped: bulk weights (staged through
+               // cached memory — mapped UMA memory can be uncached for the CPU)
     Upload,    // host-visible write-combined staging
     Readback,  // host-visible, cached when available
 };

@@ -123,6 +123,7 @@ std::string ParakeetEngine::describe() const {
 }
 
 bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
+    const auto t_load0 = std::chrono::steady_clock::now();
     const auto& ml = m.loader;
     cfg = m.config;
     mel.read_from(ml, cfg);
@@ -157,12 +158,11 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         id = (int)ar.add_f32(v);
         return true;
     };
+    PackJobs jobs;   // matrices repack in parallel before the upload
     auto mat = [&](const std::string& n, GMat& g) {
         const ggml_tensor* t = T(n);
         if (!t) return false;
-        HostMatrix hm;
-        if (!pack_gpu_matrix(t, hm, err)) return false;
-        g = arena_matrix(ar, std::move(hm));
+        jobs.add(&g, [t](HostMatrix& hm, std::string& e) { return pack_gpu_matrix(t, hm, e); });
         return true;
     };
     // Conv weights stored with leading singleton dims: view as [N][K].
@@ -173,9 +173,9 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
             err = "fast parakeet: unexpected shape for " + n;
             return false;
         }
-        HostMatrix hm;
-        if (!pack_gpu_matrix_raw((int)t->type, t->data, N_, K_, hm, err)) return false;
-        g = arena_matrix(ar, std::move(hm));
+        jobs.add(&g, [t, N_, K_](HostMatrix& hm, std::string& e) {
+            return pack_gpu_matrix_raw((int)t->type, t->data, N_, K_, hm, e);
+        });
         return true;
     };
 
@@ -187,12 +187,6 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         !mat_raw("encoder.pre_encode.conv.6.weight", SC, SC, c6_pw) || !vec_id("encoder.pre_encode.conv.6.bias", c6_b) ||
         !mat("encoder.pre_encode.out.weight", out_w) || !vec_id("encoder.pre_encode.out.bias", out_b))
         return false;
-    // The stage-3 pointwise conv is the A operand of a GEMM: it must be f16.
-    if (c6_pw.fmt != GpuFmt::F16) { err = "fast parakeet: pre_encode.conv.6 must be float"; return false; }
-    if (out_w.K != SC * (uint32_t)stage_len(stage_len(stage_len((int)NM))) || out_w.N != D) {
-        err = "fast parakeet: pre_encode.out shape mismatch";
-        return false;
-    }
 
     // ---- conformer layers ----
     layers.resize(L);
@@ -231,12 +225,14 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         {
             const ggml_tensor* t = T(p + "conv.pointwise_conv1.weight");
             if (!t) return false;
-            HostMatrix hm;
-            if (!pack_gpu_matrix_raw((int)t->type, t->data, 2 * D, D, hm, err)) return false;
-            std::vector<uint32_t> order(2 * D);
-            for (uint32_t j = 0; j < D; ++j) { order[2 * j] = j; order[2 * j + 1] = j + D; }
-            permute_rows(hm, order);
-            Y.pw1 = arena_matrix(ar, std::move(hm));
+            const uint32_t Dd = D;
+            jobs.add(&Y.pw1, [t, Dd](HostMatrix& hm, std::string& e) {
+                if (!pack_gpu_matrix_raw((int)t->type, t->data, 2 * Dd, Dd, hm, e)) return false;
+                std::vector<uint32_t> order(2 * Dd);
+                for (uint32_t j = 0; j < Dd; ++j) { order[2 * j] = j; order[2 * j + 1] = j + Dd; }
+                permute_rows(hm, order);
+                return true;
+            });
             if (has(p + "conv.pointwise_conv1.bias")) {
                 std::vector<float> b, bi(2 * D);
                 if (!f32(p + "conv.pointwise_conv1.bias", b)) return false;
@@ -268,7 +264,7 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         }
     }
     if (!mat("joint.enc.weight", jenc) || !vec_id("joint.enc.bias", jenc_b)) return false;
-    JH = jenc.N;
+    JH = (uint32_t)T("joint.enc.weight")->ne[1];
 
     // ---- CPU decoder weights ----
     PH = cfg.pred_hidden;
@@ -302,7 +298,18 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         if (jout.N != V1 + n_dur || jpred.N != JH) { err = "fast parakeet: joint shape mismatch"; return false; }
     }
 
+    if (!jobs.run(ar, err)) return false;
+    // The stage-3 pointwise conv is the A operand of a GEMM: it must be f16.
+    if (c6_pw.fmt != GpuFmt::F16) { err = "fast parakeet: pre_encode.conv.6 must be float"; return false; }
+    if (out_w.K != SC * (uint32_t)stage_len(stage_len(stage_len((int)NM))) || out_w.N != D) {
+        err = "fast parakeet: pre_encode.out shape mismatch";
+        return false;
+    }
+    if (jenc.K != D) { err = "fast parakeet: joint.enc shape mismatch"; return false; }
+    const double t_pack = ms_since(t_load0);
     if (!ar.finalize(*ctx, err)) return false;
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-parakeet] load: repack %.1f ms, upload %.1f ms\n", t_pack, ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
         std::fprintf(stderr, "[fast] parakeet: %u layers, weights %.1f MiB on '%s', decoder %s\n", L,
                      ar.total_bytes() / 1048576.0, ctx->info().name.c_str(), cpu::isa_name());

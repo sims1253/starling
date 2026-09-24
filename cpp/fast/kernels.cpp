@@ -3,6 +3,9 @@
 #include "kernels.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <fstream>
 #include <random>
@@ -53,21 +56,61 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     buffers_.clear();
     for (VkDeviceSize sz : sizes) {
         auto buf = std::make_unique<vk::Buffer>();
-        if (!ctx.create_buffer(*buf, sz, vk::Mem::Device, err)) return false;
+        const vk::Mem kind = std::getenv("STARLING_FAST_MAPPED_WEIGHTS") ? vk::Mem::Device : vk::Mem::DeviceOnly;
+        if (!ctx.create_buffer(*buf, sz, kind, err)) return false;
         buffers_.push_back(std::move(buf));
         total_ += sz;
     }
-    for (Blob& b : blobs_) {
-        if (!ctx.upload(*buffers_[b.buffer], b.off, b.words.data(), b.words.size() * 4, err))
-            return false;
+    // Uploads are independent copies (memcpy into mapped memory on UMA
+    // devices), so they run in parallel; staged uploads serialize internally.
+    std::atomic<bool> ok{true};
+    std::string first_err;
+    std::mutex mu;
+    parallel_for(blobs_.size(), [&](size_t i) {
+        Blob& b = blobs_[i];
+        std::string e;
+        if (ok && !ctx.upload(*buffers_[b.buffer], b.off, b.words.data(), b.words.size() * 4, e)) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (ok.exchange(false)) first_err = e;
+        }
         std::vector<uint32_t>().swap(b.words);   // release the host copy
-    }
+    });
+    if (!ok) { err = first_err; return false; }
     return true;
 }
 
 vk::Ref Arena::ref(Id id) const {
     const Blob& b = blobs_[id];
     return vk::Ref(*buffers_[b.buffer], b.off, b.bytes);
+}
+
+void parallel_for(size_t n, const std::function<void(size_t)>& f) {
+    const size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const size_t nt = std::min(n, std::min<size_t>(hw, 8));
+    if (nt <= 1) {
+        for (size_t i = 0; i < n; ++i) f(i);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < nt; ++t)
+        th.emplace_back([&] {
+            for (size_t i; (i = next.fetch_add(1)) < n;) f(i);
+        });
+    for (auto& t : th) t.join();
+}
+
+bool PackJobs::run(Arena& ar, std::string& err) {
+    std::vector<Job*> v;
+    for (Job& j : jobs_) v.push_back(&j);
+    parallel_for(v.size(), [&](size_t i) { v[i]->ok = v[i]->fn(v[i]->out, v[i]->err); });
+    for (Job& j : jobs_) {
+        if (!j.ok) { err = j.err.empty() ? "fast engine: weight repack failed" : j.err; return false; }
+        if (j.dst) *j.dst = arena_matrix(ar, std::move(j.out));
+        else *j.sink = std::move(j.out);
+    }
+    jobs_.clear();
+    return true;
 }
 
 GMat arena_matrix(Arena& a, HostMatrix&& m) {
@@ -90,8 +133,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // 256-thread tiles need maxComputeWorkGroupInvocations >= 256 (the spec
     // only guarantees 128); fall back to 8x4 register tiles otherwise.
     if (ctx.info().max_wg_invocations < 256) tile = TileCfg{64, 64, 4, 4};
-    // Packed-f16 products (f32 accumulation per 32-deep slice): opt-in until
-    // validated per device (STARLING_FAST_F16=1).
+    // Packed-f16 products (f32 accumulation per 32-deep slice) wherever the
+    // device has shaderFloat16: same FLEURS WER as f32 on both models.
+    // STARLING_FAST_F16=0 forces f32 products.
+    f16_math = ctx.info().f16;
     if (const char* e = std::getenv("STARLING_FAST_F16")) f16_math = ctx.info().f16 && e[0] == '1';
     if (!autotune(err)) return false;
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {

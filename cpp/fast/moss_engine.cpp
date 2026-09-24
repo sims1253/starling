@@ -135,6 +135,7 @@ std::string MossEngine::describe() const {
 }
 
 bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
+    const auto t_load0 = std::chrono::steady_clock::now();
     const auto& ml = m.loader;
     cfg = m.config;
     const auto& ec = cfg.encoder;
@@ -167,23 +168,29 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const ggml_tensor* t = T(n);
         return t && pack_gpu_matrix(t, hm, err);
     };
+    PackJobs jobs;   // matrices repack in parallel before the upload
     auto mat = [&](const std::string& n, GMat& g) {
-        HostMatrix hm;
-        if (!host_mat(n, hm)) return false;
-        g = arena_matrix(ar, std::move(hm));
+        const ggml_tensor* t = T(n);
+        if (!t) return false;
+        jobs.add(&g, [t](HostMatrix& hm, std::string& e) { return pack_gpu_matrix(t, hm, e); });
         return true;
     };
     // Rows of `b` interleaved with rows of `a` (a0 b0 a1 b1 ...): the paired
     // GEMM/GEMV epilogues own both halves of each gated unit.
     auto interleave = [&](const std::string& a, const std::string& b, GMat& g) {
-        HostMatrix ha, hb;
-        if (!host_mat(a, ha) || !host_mat(b, hb)) return false;
-        const uint32_t n = ha.N;
-        if (!concat_rows(ha, hb, err)) return false;
-        std::vector<uint32_t> order(2 * n);
-        for (uint32_t j = 0; j < n; ++j) { order[2 * j] = j; order[2 * j + 1] = n + j; }
-        permute_rows(ha, order);
-        g = arena_matrix(ar, std::move(ha));
+        const ggml_tensor* ta = T(a);
+        const ggml_tensor* tb = T(b);
+        if (!ta || !tb) return false;
+        jobs.add(&g, [ta, tb](HostMatrix& ha, std::string& e) {
+            HostMatrix hb;
+            if (!pack_gpu_matrix(ta, ha, e) || !pack_gpu_matrix(tb, hb, e)) return false;
+            const uint32_t n = ha.N;
+            if (!concat_rows(ha, hb, e)) return false;
+            std::vector<uint32_t> order(2 * n);
+            for (uint32_t j = 0; j < n; ++j) { order[2 * j] = j; order[2 * j + 1] = n + j; }
+            permute_rows(ha, order);
+            return true;
+        });
         return true;
     };
 
@@ -263,11 +270,15 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     for (uint32_t l = 0; l < NL; ++l) {
         LlmLayer& Y = llm[l];
         const std::string p = "llm.blk." + std::to_string(l) + ".";
-        HostMatrix q, k, v;
-        if (!host_mat(p + "attn.q.weight", q) || !host_mat(p + "attn.k.weight", k) ||
-            !host_mat(p + "attn.v.weight", v) || !concat_rows(q, k, err) || !concat_rows(q, v, err))
-            return false;
-        Y.qkv = arena_matrix(ar, std::move(q));
+        const ggml_tensor* tq = T(p + "attn.q.weight");
+        const ggml_tensor* tk = T(p + "attn.k.weight");
+        const ggml_tensor* tv = T(p + "attn.v.weight");
+        if (!tq || !tk || !tv) return false;
+        jobs.add(&Y.qkv, [tq, tk, tv](HostMatrix& q, std::string& e) {
+            HostMatrix k, v;
+            return pack_gpu_matrix(tq, q, e) && pack_gpu_matrix(tk, k, e) && pack_gpu_matrix(tv, v, e) &&
+                   concat_rows(q, k, e) && concat_rows(q, v, e);
+        });
         if (!mat(p + "attn.o.weight", Y.o) ||
             !interleave(p + "ffn.gate.weight", p + "ffn.up.weight", Y.gateup) ||
             !mat(p + "ffn.down.weight", Y.down) || !vec_id(p + "attn_norm.weight", Y.attn_norm) ||
@@ -276,19 +287,43 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
             return false;
     }
     if (!vec_id("llm.final_norm.weight", final_norm)) return false;
+    // Tied embedding / lm_head: repacked in row blocks (parallel), then
+    // regrouped into chunks that each fit one storage-buffer binding.
+    std::vector<HostMatrix> emb_blocks;
+    const uint32_t emb_block = 8192;
     {
-        HostMatrix e;
-        if (!host_mat("llm.embed.weight", e)) return false;
-        embed.N = e.N; embed.K = e.K; embed.fmt = e.fmt;
-        const size_t row_bytes = (e.q.size() + e.s.size()) * 4 / e.N;
-        VkDeviceSize cap = std::min<VkDeviceSize>(256ull << 20, ctx->info().max_storage_range);
-        embed.chunk_rows = (uint32_t)std::max<size_t>(16, (cap / row_bytes) / 16 * 16);
-        if (((size_t)e.N + embed.chunk_rows - 1) / embed.chunk_rows > 4) {
+        const ggml_tensor* te = T("llm.embed.weight");
+        if (!te) return false;
+        const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
+        const size_t rb = ggml_row_size(te->type, Kc);
+        emb_blocks.resize((N + emb_block - 1) / emb_block);
+        for (size_t b = 0; b < emb_blocks.size(); ++b) {
+            const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
+            jobs.add_host(&emb_blocks[b], [te, r0, n, Kc, rb](HostMatrix& hm, std::string& e) {
+                return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e);
+            });
+        }
+    }
+    if (!jobs.run(ar, err)) return false;
+    {
+        embed.K = emb_blocks[0].K; embed.fmt = emb_blocks[0].fmt;
+        embed.N = 0;
+        for (const HostMatrix& b : emb_blocks) embed.N += b.N;
+        const size_t row_bytes = (emb_blocks[0].q.size() + emb_blocks[0].s.size()) * 4 / emb_blocks[0].N;
+        const VkDeviceSize cap = std::min<VkDeviceSize>(256ull << 20, ctx->info().max_storage_range);
+        embed.chunk_rows = (uint32_t)std::max<size_t>(emb_block, (cap / row_bytes) / emb_block * emb_block);
+        if (((size_t)embed.N + embed.chunk_rows - 1) / embed.chunk_rows > 4) {
             err = "fast moss: embedding table needs more than 4 buffer chunks on this device";
             return false;
         }
-        for (HostMatrix& c : split_rows(std::move(e), embed.chunk_rows))
+        const size_t per_chunk = embed.chunk_rows / emb_block;
+        for (size_t b0 = 0; b0 < emb_blocks.size(); b0 += per_chunk) {
+            HostMatrix c = std::move(emb_blocks[b0]);
+            for (size_t b = b0 + 1; b < std::min(emb_blocks.size(), b0 + per_chunk); ++b)
+                if (!concat_rows(c, emb_blocks[b], err)) return false;
             embed.parts.push_back(arena_matrix(ar, std::move(c)));
+        }
+        std::vector<HostMatrix>().swap(emb_blocks);
     }
     // RoPE table as Transformers builds it: inv_freq and pos*inv_freq in f32.
     {
@@ -305,7 +340,10 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         }
         rope_tab = ar.add_f32(tab);
     }
+    const double t_pack = ms_since(t_load0);
     if (!ar.finalize(*ctx, err)) return false;
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-moss] load: repack %.1f ms, upload %.1f ms\n", t_pack, ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
         std::fprintf(stderr, "[fast] moss: weights %.1f MiB on '%s' (embed %s, %zu chunk(s))\n",
                      ar.total_bytes() / 1048576.0, ctx->info().name.c_str(), fmt_name(embed.fmt),

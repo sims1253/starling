@@ -365,6 +365,10 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
         if (info_.uma) mt = find_memory(req.memoryTypeBits, DL | HV | HC, 0);
         if (mt < 0) mt = find_memory(req.memoryTypeBits, DL, 0);
         break;
+    case Mem::DeviceOnly:
+        mt = find_memory(req.memoryTypeBits, DL, HV);
+        if (mt < 0) mt = find_memory(req.memoryTypeBits, DL, 0);
+        break;
     case Mem::Upload:
         mt = find_memory(req.memoryTypeBits, HV | HC, CA);
         if (mt < 0) mt = find_memory(req.memoryTypeBits, HV | HC, 0);
@@ -388,7 +392,7 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     }
     fn_.vkBindBufferMemory(dev_, out.buf, out.mem, 0);
     VkMemoryPropertyFlags f = memprops_.memoryTypes[mt].propertyFlags;
-    if (f & HV) {
+    if ((f & HV) && kind != Mem::DeviceOnly) {
         r = fn_.vkMapMemory(dev_, out.mem, 0, VK_WHOLE_SIZE, 0, &out.host);
         if (r != VK_SUCCESS) out.host = nullptr;
         out.coherent = (f & HC) != 0;
