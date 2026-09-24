@@ -10,17 +10,20 @@ set(STARLING_FAST_DIR ${STARLING_REPO_ROOT}/cpp/fast)
 
 # ---- tools / headers --------------------------------------------------------
 set(_glslc_hints "")
-if(ANDROID_NDK)
+if(DEFINED ENV{VULKAN_SDK})
+  list(APPEND _glslc_hints "$ENV{VULKAN_SDK}/bin")
+endif()
+# Host glslc first (SPIR-V is built on the host regardless of target); the
+# NDK's older shader-tools copy is the fallback for hosts without one.
+find_program(STARLING_GLSLC NAMES glslc HINTS ${_glslc_hints} NO_CMAKE_FIND_ROOT_PATH)
+if(NOT STARLING_GLSLC AND ANDROID_NDK)
   file(GLOB _ndk_glslc "${ANDROID_NDK}/shader-tools/*/glslc")
   foreach(_g IN LISTS _ndk_glslc)
     get_filename_component(_d "${_g}" DIRECTORY)
     list(APPEND _glslc_hints "${_d}")
   endforeach()
+  find_program(STARLING_GLSLC NAMES glslc HINTS ${_glslc_hints} NO_CMAKE_FIND_ROOT_PATH)
 endif()
-if(DEFINED ENV{VULKAN_SDK})
-  list(APPEND _glslc_hints "$ENV{VULKAN_SDK}/bin")
-endif()
-find_program(STARLING_GLSLC NAMES glslc HINTS ${_glslc_hints} NO_CMAKE_FIND_ROOT_PATH)
 if(NOT STARLING_GLSLC)
   message(FATAL_ERROR "STARLING_FAST=ON needs glslc (Vulkan SDK / shaderc, or the Android NDK's shader-tools)")
 endif()
@@ -46,6 +49,11 @@ set(STARLING_FAST_SHADERS
   "gemm_f16t_h|gemm.comp|B_F16T,F16MATH|7"
   "gemm_conv|gemm.comp|B_F16,A_CONV|7"
   "gemm_conv_h|gemm.comp|B_F16,A_CONV,F16MATH|7"
+  "gemm_coop_w4|gemm_coop.comp|B_W4|7|--target-env=vulkan1.3"
+  "gemm_coop_w8|gemm_coop.comp|B_W8|7|--target-env=vulkan1.3"
+  "gemm_coop_f16|gemm_coop.comp|B_F16|7|--target-env=vulkan1.3"
+  "gemm_coop_f16t|gemm_coop.comp|B_F16T|7|--target-env=vulkan1.3"
+  "coop_probe|coop_probe.comp||3|--target-env=vulkan1.3"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w8|gemv.comp|W_W8|7"
   "gemv_f16|gemv.comp|W_F16|7"
@@ -73,6 +81,11 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
   list(GET _parts 1 _src)
   list(GET _parts 2 _defs)
   list(GET _parts 3 _nb)
+  set(_extra "")
+  list(LENGTH _parts _nparts)
+  if(_nparts GREATER 4)
+    list(GET _parts 4 _extra)
+  endif()
   set(_def_args "")
   if(_defs)
     string(REPLACE "," ";" _deflist "${_defs}")
@@ -83,7 +96,7 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
   set(_out ${_spv_dir}/${_name}.spv)
   add_custom_command(
     OUTPUT ${_out}
-    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -O ${_def_args}
+    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -O ${_def_args} ${_extra}
             -I ${STARLING_FAST_DIR}/shaders
             ${STARLING_FAST_DIR}/shaders/${_src} -o ${_out}
     DEPENDS ${STARLING_FAST_DIR}/shaders/${_src} ${_fast_glsl_includes}

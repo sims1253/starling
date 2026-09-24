@@ -39,6 +39,7 @@ namespace starling::fast::vk {
     X(vkGetPhysicalDeviceProperties)           \
     X(vkGetPhysicalDeviceProperties2)          \
     X(vkGetPhysicalDeviceFeatures2)            \
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) \
     X(vkGetPhysicalDeviceQueueFamilyProperties)\
     X(vkGetPhysicalDeviceMemoryProperties)     \
     X(vkEnumerateDeviceExtensionProperties)    \
@@ -123,6 +124,7 @@ struct DeviceInfo {
     uint64_t max_alloc = 0;              // maxMemoryAllocationSize (0 = unknown)
     double timestamp_period_ns = 0.0;    // 0 = timestamps unsupported
     bool f16 = false;                    // shaderFloat16 enabled on the device
+    bool coopmat = false;                // f16 coopmat (64/16x16x16, f32 acc) usable
 };
 
 class Context;

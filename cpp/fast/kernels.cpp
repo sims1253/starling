@@ -160,6 +160,15 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         tile = TileCfg{32, 64, 4, 4};
         gemv_rows_max = 8;
     }
+    // Hardware cooperative matrices: the machinery exists (gemm_coop.comp)
+    // but no verified driver yet — the Pixel 10 Pro's PowerVR driver
+    // advertises VK_KHR_cooperative_matrix and then SEGFAULTS inside
+    // vkCreateComputePipelines on any coopmat instruction (probe: shaders/
+    // coop_probe.comp). Default off; STARLING_FAST_COOPMAT=1 opts in for
+    // bring-up on drivers that actually compile it.
+    coopmat_ = false;
+    if (const char* e = std::getenv("STARLING_FAST_COOPMAT"))
+        if (e[0] == '1') coopmat_ = ctx.info().coopmat;
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
         if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) tile = TileCfg{bm, bn, tm, tn};
@@ -177,6 +186,23 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     if (c.a_conv) {
         if (c.b != BKind::F16 || c.a.cv_cin % 8) { err = "gemm: conv mode needs f16 weights and cin % 8 == 0"; return false; }
         name = "gemm_conv";
+    } else if (coopmat_) {
+        // Hardware cooperative-matrix path: one 128-thread subgroup computes a
+        // 64 x 64 output tile. Falls back to the scalar kernels below when the
+        // shape or the device does not fit (conv mode stays scalar).
+        const bool shape_ok = (c.a.lda % 8) == 0 && (c.a.a_off % 8) == 0 && c.a.sa_hi % 8 == 0 &&
+                              c.a.sa_lo % 8 == 0 && (c.a.K % 16) == 0;
+        if (shape_ok) {
+            std::string cn = c.b == BKind::W4 ? "gemm_coop_w4" : c.b == BKind::W8 ? "gemm_coop_w8"
+                           : c.b == BKind::F16 ? "gemm_coop_f16" : "gemm_coop_f16t";
+            const vk::Pipeline* p = ctx_->pipeline(cn.c_str(),
+                {128u, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
+            if (!p) return false;
+            rec.dispatch(*p, {or_dummy(c.A), or_dummy(c.Bq), or_dummy(c.Bs), or_dummy(c.C),
+                              or_dummy(c.bias), or_dummy(c.bias2), or_dummy(c.C2)},
+                         &c.a, sizeof(c.a), ceil_div(c.a.M, 64u), ceil_div(c.a.N, 64u), c.batch);
+            return true;
+        }
     }
     if (f16_math) name += "_h";
     const TileCfg t = tile;
@@ -330,7 +356,10 @@ bool Kernels::autotune(std::string& err) {
     // costs and mis-ranks tiles on PowerVR) through a 1024 -> 4096 W4
     // projection and a 4096 -> 1024 W8 projection, plus a 4096 x 1024 W4
     // decode GEMV.
-    const uint32_t M = 293, D = 1024, F = 4096;
+    const uint32_t M = std::getenv("STARLING_FAST_TUNE_M")
+                           ? (uint32_t)std::atoi(std::getenv("STARLING_FAST_TUNE_M"))
+                           : 293,
+                 D = 1024, F = 4096;
     std::mt19937 rng(1234);
     auto rnd_words = [&](size_t n, bool halves) {
         std::vector<uint32_t> w(n);

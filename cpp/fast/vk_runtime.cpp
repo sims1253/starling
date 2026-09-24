@@ -220,9 +220,89 @@ bool Context::init(std::string& err) {
             info_.f16 = f16.shaderFloat16 == VK_TRUE && !env_on("STARLING_FAST_NO_F16");
             if (info_.f16 && !core12) exts.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         }
+        if (env_on("STARLING_FAST_VERBOSE")) {
+            std::fprintf(stderr, "[fast-vk] device %04x:%04x driver %08x api %08x\n", info_.vendor_id,
+                         info_.device_id, info_.driver_version, info_.api_version);
+            for (auto& e : ep)
+                std::fprintf(stderr, "[fast-vk] ext %s %u\n", e.extensionName, e.specVersion);
+            VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2.pNext = &sg;
+            fn_.vkGetPhysicalDeviceProperties2(phys_, &p2);
+            std::fprintf(stderr, "[fast-vk] subgroup size %u ops %08x stages %08x\n", sg.subgroupSize,
+                         sg.supportedOperations, sg.supportedStages);
+            if (props.apiVersion >= VK_API_VERSION_1_3) {
+                VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+                VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
+                fn_.vkGetPhysicalDeviceFeatures2(phys_, &f2);
+                std::fprintf(stderr, "[fast-vk] v13 dotProduct %d\n", f13.shaderIntegerDotProduct);
+            }
+            if (has_ext(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+                uint32_t n_cmp = 0;
+                fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, nullptr);
+                std::vector<VkCooperativeMatrixPropertiesKHR> cmp(
+                    n_cmp, VkCooperativeMatrixPropertiesKHR{
+                        VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+                fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, cmp.data());
+                for (auto& m : cmp)
+                    std::fprintf(stderr,
+                                 "[fast-vk] coopmat %ux%ux%u A=%u B=%u C=%u satur=%d scope=%u\n",
+                                 m.MSize, m.NSize, m.KSize, m.AType, m.BType, m.CType,
+                                 m.saturatingAccumulation, m.scope);
+            }
+        }
     }
     VkPhysicalDeviceShaderFloat16Int8Features f16_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
     f16_on.shaderFloat16 = info_.f16 ? VK_TRUE : VK_FALSE;
+
+    // Cooperative matrices (hardware f16xf16->f32 / i8xi8->i32 matmuls) when
+    // the device has them with the shapes the coopmat kernels use.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_on{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceVulkan12Features v12_on{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    {
+        uint32_t n_ext2 = 0;
+        fn_.vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n_ext2, nullptr);
+        std::vector<VkExtensionProperties> ep2(n_ext2);
+        fn_.vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n_ext2, ep2.data());
+        const bool has_cm = std::any_of(
+            ep2.begin(), ep2.end(), [](const VkExtensionProperties& e) {
+                return std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
+            });
+        if (has_cm && info_.subgroup_size >= 128) {
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+            VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
+            v12.pNext = &cm;
+            fn_.vkGetPhysicalDeviceFeatures2(phys_, &f2);
+            uint32_t n_cmp = 0;
+            fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, nullptr);
+            std::vector<VkCooperativeMatrixPropertiesKHR> cmp(
+                n_cmp, VkCooperativeMatrixPropertiesKHR{
+                           VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, cmp.data());
+            bool a64 = false, b16 = false;   // 64x16x16 f16 A/B (+f32 C), 16x16x16 B
+            for (const auto& m : cmp) {
+                const bool f16t = m.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                  m.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                  m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR;
+                a64 = a64 || (f16t && m.MSize == 64 && m.NSize == 16 && m.KSize == 16);
+                b16 = b16 || (f16t && m.MSize == 16 && m.NSize == 16 && m.KSize == 16);
+            }
+            if (cm.cooperativeMatrix == VK_TRUE && a64 && b16 && v12.shaderFloat16 == VK_TRUE) {
+                info_.coopmat = true;
+                coop_on.cooperativeMatrix = VK_TRUE;
+                // The coopmat SPIR-V uses the Vulkan memory model (scope
+                // semantics on loads/stores): enable the feature, the driver
+                // compiler faults on it otherwise.
+                v12_on.vulkanMemoryModel = VK_TRUE;
+                v12_on.vulkanMemoryModelDeviceScope = VK_TRUE;
+                exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            }
+        }
+    }
 
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -234,7 +314,18 @@ bool Context::init(std::string& err) {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = (uint32_t)exts.size();
     dci.ppEnabledExtensionNames = exts.empty() ? nullptr : exts.data();
-    if (info_.f16) dci.pNext = &f16_on;
+    void* feat_chain = nullptr;
+    if (info_.coopmat) {
+        coop_on.pNext = feat_chain;
+        feat_chain = &coop_on;
+        v12_on.pNext = feat_chain;
+        feat_chain = &v12_on;
+    }
+    if (info_.f16) {
+        f16_on.pNext = feat_chain;
+        feat_chain = &f16_on;
+    }
+    dci.pNext = feat_chain;
     r = fn_.vkCreateDevice(phys_, &dci, nullptr, &dev_);
     if (r != VK_SUCCESS) { err = vk_err("vkCreateDevice", r); return false; }
 #define STARLING_VK_LOAD_D(name)                                                   \

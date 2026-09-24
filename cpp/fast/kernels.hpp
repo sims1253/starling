@@ -150,6 +150,7 @@ public:
     vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
     TileCfg tile;
     bool f16_math = false;
+    bool coopmat_ = false;   // dispatch GEMMs to gemm_coop shaders
 
 private:
     vk::Context* ctx_ = nullptr;
