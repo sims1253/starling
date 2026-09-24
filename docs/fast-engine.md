@@ -147,17 +147,30 @@ near-tie words and punctuation, in both directions.
 
 ### Pixel 10 Pro (Tensor G5, PowerVR DXT-48-1536)
 
-First on-device run (autotuned tile 64,64,4,4, GEMV rows 8; ggml with the
-app's 6 threads). Transcripts match ggml on the fixtures.
+Tuned on-device (see `benchmarks/fast_engine/RESEARCH_LOG.md` for the
+experiment log and `AUTORESEARCH.md` for the method). Vendor-keyed defaults
+for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128),
+f32 GEMM products, GEMV rows 8 with RSPLIT row slots padding workgroups to a
+whole subgroup; the CPU transducer decoder splits its GEMV rows across a
+second spinning thread. ggml runs with the app's 6 threads. Transcripts match
+ggml on the fixtures; FLEURS en_us 100: Parakeet 5.33 % (ggml 5.47 %), MOSS
+q4e8 7.87 % (ggml 7.92 %).
 
-| Model / audio | ggml CPU | fast |
-| --- | --- | --- |
-| Parakeet, 22.3 s | 7.2 s (encoder 1.30 s, decoder 5.9 s) | 2.79 s (encoder 2.56 s, decoder 0.20 s) |
-| Parakeet, 74.4 s | — | 9.0 s |
-| MOSS, 7.4 s | 7.3 s | 7.0 s (enc+prefill 3.6 s, decode 100 ms/token) |
+| Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |
+| --- | --- | --- | --- |
+| Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.30 s** (enc 2.06 s, dec 0.20 s) |
+| Parakeet, 74.4 s | — | 9.0 s | **7.6 s** |
+| MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **6.3–6.5 s** (decode 95–104 ms/tok) |
 
-The CPU decoder is where the fast engine wins on the phone; the GPU kernels
-are still desktop-tuned and reach only ~130 GFLOPS / ~11 GB/s here. Weight
-upload uses mapped memory on CPU-cached unified memory (1.2 s instead of
-10 s staged). `benchmarks/fast_engine/AUTORESEARCH.md` is the plan for
-tuning the kernels on this device.
+Energy per transcription (batterystats power model, 40/20-run averages):
+Parakeet medium fast ≈ 1.4 mWh vs ggml ≈ 5.0 mWh (3.6×), MOSS short fast
+≈ 2.2 mWh vs ggml ≈ 5.2 mWh (2.4×).
+
+The desktop-tuned GPU kernels now reach ~180 GFLOPS on the encoder GEMMs
+(peak f32 ≈ 500 GFLOPS); the remaining gap is shared-memory traffic, not
+barriers or tail waves. `VK_KHR_cooperative_matrix` is advertised (f16 and
+int8 shapes) but the driver's shader compiler faults on any coopmat
+instruction — the kernels exist (`gemm_coop.comp`) behind
+`STARLING_FAST_COOPMAT=1` for drivers that fix this. The q4e4 model file
+saves a further ~7 % decode time at +0.14 % WER (8.06 vs 7.92, inside the
+0.2-pt gate) if maximum battery life matters more than the last word error.

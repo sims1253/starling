@@ -47,7 +47,16 @@ Thermals: median of ≥3 runs, brief says alternate order if numbers drift.
   device+driver+f16 flag ONLY → delete it (REFRESH_TUNE=1) after kernel changes.
 
 ## What's Been Tried
-(see RESEARCH_LOG.md for details — keep this synced)
+(see benchmarks/fast_engine/RESEARCH_LOG.md for full details)
+
+- **keep** vendor defaults tile 32,64,4,4→32,128,4,8 + gemv rows 8 (autotuner mis-ranks; measured end-to-end)
+- **keep** f32 GEMM products on PowerVR (f16 unpack overhead > savings)
+- **keep** GEMV RSPLIT (pad wg to full 128-subgroup; MOSS decode -4.5%)
+- **keep** PK decoder 2-thread GEMV split + NEON/AVX2 quantize (decode -20%)
+- **dead end** VK_KHR_cooperative_matrix: driver compiler segfaults (dormant code behind STARLING_FAST_COOPMAT=1)
+- **dead end** BK=64 K-tiles (-19%); shared-tile double-buffering (-54%, occupancy loss)
+- measured: GEMM ~155-180 GFLOPS vs ~500 ALU peak; big-K W8 GEMV hits 24-30 GB/s, small-K was 7 (fixed by RSPLIT)
+- q4e4 model file: -7% MOSS decode, +0.14 WER (option, not default)
 
 ## Loop Rules
 One hypothesis per iteration → smallest change → build+measure → keep (commit
