@@ -23,3 +23,6 @@ Notes:
 | 9 | Shared-tile double buffering hides load latency | two-buffer A/B tiles | PK enc 2029→3118ms — **54% worse**: doubled shared halves occupancy; reverted | — | discard (occupancy > latency hiding on PowerVR) |
 | 10 | PK decoder single-threaded (0.9ms/step, ~30× above ALU floor) | NEON/AVX2 quantize; `cpu::GemvHelper` persistent spin worker, row-split GEMVs (>1M MACs); decode-stage timing env | decode split: joint 106→57-67ms, pred 138→124ms → decode 252→201ms; phone_ms 8812→8615 | G1 ✓ (row split is order-identical); desktop decode 61→36ms | **keep** (`4be985e`) |
 | 11 | Milestone: long fixture + desktop re-gates | — | PK long 9000→7579ms; desktop PK medium 421ms (was 522), MOSS 1759ms (was 1820); fast_weights_test all pass | G1-G4 ✓ | milestone |
+| 12 | Energy per transcription (batterystats power model, 40/20-run averages) | — | PK medium: fast ≈1.4 mWh vs ggml ≈5.0 (3.6×); MOSS short: fast ≈2.2 vs ≈5.2 (2.4×). MOSS/fast: GPU 10.2 mAh + CPU small; ggml: CPU 24.5 mAh | — | measured |
+| 13 | MOSS mel thread count (shared frontend uses all 9 cores) | STARLING_MEL_THREADS sweep | 1: 124ms, 2: 269(!), 3: 124, 9: 216 — scheduling noise dominates, no reliable win; real fix is a faster FFT path | — | skip (noise) |
+| 14 | KSTEP (decode tokens per submission) | env sweep 4-64 | 4-8 ≈ 3098ms vs 16 ≈ 3141 — ~1% at best, within noise | — | skip |
