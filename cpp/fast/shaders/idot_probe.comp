@@ -1,0 +1,22 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+// idot_probe.comp — packed 4x8 signed integer dot product (OpSDot) issue-rate
+// probe: four independent dependency chains per thread, no memory traffic.
+// in = [iters, a, b, seed]; iters = 0 checks correctness (see kernels.cpp).
+// Optional shader: only built when glslc knows GL_EXT_integer_dot_product.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In { uint in_[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint o[]; };
+void main() {
+    const uint iters = in_[0];
+    const int b = int(in_[2]);
+    const uint d0 = in_[3] ^ uint(dotPacked4x8EXT(int(in_[1]), b));
+    int v0 = int(d0), v1 = int(d0 + 1u), v2 = int(d0 + 2u), v3 = int(d0 + 3u);
+    for (uint k = 0; k < iters; ++k) {
+        v0 = dotPacked4x8EXT(v0, b);
+        v1 = dotPacked4x8EXT(v1, b);
+        v2 = dotPacked4x8EXT(v2, b);
+        v3 = dotPacked4x8EXT(v3, b);
+    }
+    o[gl_GlobalInvocationID.x] = uint(v0) + uint(v1) + uint(v2) + uint(v3) - 6u;
+}

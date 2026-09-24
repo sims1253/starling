@@ -106,6 +106,13 @@ struct MossEngine::Impl {
     bool alloc_static(std::string& err);
     bool ensure(int C, int A, int S, std::string& err);
     bool record_prefill(int C, int tail, Rec& r, std::string& err);
+    // Prefill attention heads per score-matrix group: whole GQA groups within
+    // a 64 MiB budget (at least one GQA group, however long the prompt).
+    uint32_t prefill_hgroup(size_t S) const {
+        const uint32_t gqa = NH / NKV;
+        const size_t fit = std::min<size_t>(NH, (64ull << 20) / (S * S * 4));
+        return std::max<uint32_t>(gqa, (uint32_t)(fit / gqa * gqa));
+    }
     bool record_decode(uint32_t steps, std::string& err);
     bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err);
     bool dec_next(vk::Recording& rc, std::string& err);
@@ -145,7 +152,8 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     HD = lc.hidden; NH = lc.n_heads; NKV = lc.n_kv_heads; HDIM = lc.head_dim; FF = lc.intermediate;
     NL = lc.n_layers; MAXPOS = lc.max_cache;
     if (EHD != 64 || HDIM != 128 || DS % 8 || cfg.frontend.n_mels != 128 || ec.n_window_infer % 100 ||
-        cfg.adapter_input != EOUT || cfg.adapter_output != HD || !lc.tied_embeddings || MAXPOS > 4096) {
+        cfg.adapter_input != EOUT || cfg.adapter_output != HD || !lc.tied_embeddings || MAXPOS > 4096 ||
+        NKV == 0 || NH % NKV || cfg.max_new_tokens > MAXPOS) {
         err = "fast moss: unsupported configuration";
         return false;
     }
@@ -359,7 +367,7 @@ bool MossEngine::Impl::alloc_static(std::string& err) {
         return ctx->create_buffer(b, bytes, kind, err);
     };
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
-           mk(state, (16 + 1024) * 4, vk::Mem::Readback) && mk(ids, 256 * 4, vk::Mem::Readback) &&
+           mk(state, (16 + (size_t)cfg.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, 256 * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8);
 }
@@ -373,11 +381,13 @@ bool MossEngine::Impl::ensure(int C, int A, int S, std::string& err) {
     const size_t nwin = (A + W - 1) / W;
     const size_t ldPw = round_up((uint32_t)W, 8);
     const size_t ldPs = round_up((uint32_t)S, 8);
-    // Prefill attention scores are processed in head groups bounded to 64 MiB.
+    // Prefill attention scores are processed in head groups (prefill_hgroup).
+    // record_prefill sizes its groups from the actual buffer capacity, so a
+    // shorter prompt recorded against these buffers can never overrun them.
     auto mk = [&](vk::Buffer& b, size_t bytes, vk::Mem kind = vk::Mem::Device) {
         return ctx->create_buffer(b, std::max<size_t>(bytes, 16), kind, err);
     };
-    const size_t hgroup = std::max<size_t>(1, std::min<size_t>(NH, (64ull << 20) / ((size_t)S * S * 4)));
+    const size_t hgroup = prefill_hgroup((size_t)S);
     if (!mk(mel_in, (size_t)C * 128 * P * 4, ctx->info().uma ? vk::Mem::Device : vk::Mem::Upload) ||
         !mk(cv1, (size_t)C * T1 * F1 * DS * 2) || !mk(cv2, (size_t)C * T2 * F2 * DS * 2) ||
         !mk(cv3, (size_t)C * T3 * F3 * DS * 2) || !mk(ex, (size_t)A * ED * 4) || !mk(eh, (size_t)A * ED * 2) ||
@@ -602,10 +612,11 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
     // ---- LLM prefill ----
     const uint32_t QKVW = (NH + 2 * NKV) * HDIM;
     const uint32_t ldS = S, ldP = round_up(S, 8);
-    // Head groups keep the score matrices within 64 MiB; groups are whole GQA
-    // groups so each group's first head starts a KV head.
+    // Head groups are whole GQA groups (each group's first head starts a KV
+    // head), as many as the score buffers allocated by ensure() hold.
     const uint32_t gqa = NH / NKV;
-    uint32_t hgroup = std::min<uint32_t>(NH, (uint32_t)((64ull << 20) / ((size_t)S * S * 4)));
+    uint32_t hgroup = (uint32_t)std::min<size_t>(
+        {(size_t)NH, lsc.size / ((size_t)S * S * 4), lp.size / ((size_t)S * ldP * 2)});
     hgroup = std::max(gqa, hgroup / gqa * gqa);
     const float leps = cfg.llm.rms_norm_eps;
     const float lscale = 1.0f / std::sqrt((float)HDIM);
@@ -794,18 +805,18 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     it->second.rec->report_profile("moss encoder+prefill");
     const double t_pre = ms_since(t0);
 
-    uint32_t st[16 + 1024];
+    std::vector<uint32_t> st(16 + (size_t)I.cfg.max_new_tokens);
     int rounds = 0;
     for (;;) {
-        if (!I.ctx->download(I.state, 0, st, 16 * 4, err)) return false;
+        if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
         if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
         if (!I.dec_rec->submit_and_wait(err)) return false;
         if (rounds == 0) I.dec_rec->report_profile("moss decode (K steps)");
         ++rounds;
     }
     const uint32_t ngen = std::min<uint32_t>(st[1], I.cfg.max_new_tokens);
-    if (!I.ctx->download(I.state, 16 * 4, st + 16, ngen * 4, err)) return false;
-    out_ids.assign(st + 16, st + 16 + ngen);
+    if (!I.ctx->download(I.state, 16 * 4, st.data() + 16, ngen * 4, err)) return false;
+    out_ids.assign(st.begin() + 16, st.begin() + 16 + ngen);
     eos = !out_ids.empty() && out_ids.back() == I.cfg.eos_token_id;
     if (timing)
         std::fprintf(stderr, "[fast-moss] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%u tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",

@@ -24,10 +24,6 @@ if(NOT STARLING_GLSLC AND ANDROID_NDK)
   endforeach()
   find_program(STARLING_GLSLC NAMES glslc HINTS ${_glslc_hints} NO_CMAKE_FIND_ROOT_PATH)
 endif()
-find_program(STARLING_SPIRV_AS NAMES spirv-as NO_CMAKE_FIND_ROOT_PATH)
-if(NOT STARLING_SPIRV_AS)
-  message(FATAL_ERROR "STARLING_FAST=ON needs spirv-as (SPIRV-Tools) for the idot probe shader")
-endif()
 if(NOT STARLING_GLSLC)
   message(FATAL_ERROR "STARLING_FAST=ON needs glslc (Vulkan SDK / shaderc, or the Android NDK's shader-tools)")
 endif()
@@ -53,11 +49,6 @@ set(STARLING_FAST_SHADERS
   "gemm_f16t_h|gemm.comp|B_F16T,F16MATH|7"
   "gemm_conv|gemm.comp|B_F16,A_CONV|7"
   "gemm_conv_h|gemm.comp|B_F16,A_CONV,F16MATH|7"
-  "gemm_coop_w4|gemm_coop.comp|B_W4|7|--target-env=vulkan1.3"
-  "gemm_coop_w8|gemm_coop.comp|B_W8|7|--target-env=vulkan1.3"
-  "gemm_coop_f16|gemm_coop.comp|B_F16|7|--target-env=vulkan1.3"
-  "gemm_coop_f16t|gemm_coop.comp|B_F16T|7|--target-env=vulkan1.3"
-  "coop_probe|coop_probe.comp||3|--target-env=vulkan1.3"
   "alu_probe|alu_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w8|gemv.comp|W_W8|7"
@@ -73,8 +64,27 @@ set(STARLING_FAST_SHADERS
   "norm|norm.comp||6"
   "softmax|softmax.comp||3"
   "pk_conv|pk_conv.comp||5"
-  "idot_probe|idot_probe.asm||2"
 )
+
+# Diagnostic probes that need newer GLSL extensions than the NDK's glslc
+# knows: built only when this glslc compiles them (else the probe reports
+# "unknown fast-engine shader" at run time).
+set(STARLING_FAST_OPTIONAL_SHADERS
+  "idot_probe|idot_probe.comp||2"
+)
+foreach(_entry IN LISTS STARLING_FAST_OPTIONAL_SHADERS)
+  string(REPLACE "|" ";" _parts "${_entry}")
+  list(GET _parts 1 _src)
+  execute_process(
+    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -c ${STARLING_FAST_DIR}/shaders/${_src}
+            -o ${CMAKE_CURRENT_BINARY_DIR}/fast_probe_check.spv
+    RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+  if(_rc EQUAL 0)
+    list(APPEND STARLING_FAST_SHADERS "${_entry}")
+  else()
+    message(STATUS "fast engine: ${_src} skipped (glslc lacks its extensions)")
+  endif()
+endforeach()
 
 set(_spv_dir ${CMAKE_CURRENT_BINARY_DIR}/fast_spv)
 file(MAKE_DIRECTORY ${_spv_dir})
@@ -87,11 +97,6 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
   list(GET _parts 1 _src)
   list(GET _parts 2 _defs)
   list(GET _parts 3 _nb)
-  set(_extra "")
-  list(LENGTH _parts _nparts)
-  if(_nparts GREATER 4)
-    list(GET _parts 4 _extra)
-  endif()
   set(_def_args "")
   if(_defs)
     string(REPLACE "," ";" _deflist "${_defs}")
@@ -100,24 +105,13 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
     endforeach()
   endif()
   set(_out ${_spv_dir}/${_name}.spv)
-  if(_src MATCHES "\\.asm$")
-    # Hand-assembled SPIR-V kept as text: assembled by spirv-as at build time
-    # (glslc cannot express these instructions).
-    add_custom_command(
-      OUTPUT ${_out}
-      COMMAND ${STARLING_SPIRV_AS} --target-env vulkan1.3
-              ${STARLING_FAST_DIR}/shaders/${_src} -o ${_out}
-      DEPENDS ${STARLING_FAST_DIR}/shaders/${_src}
-      COMMENT "spirv-as ${_name}")
-  else()
   add_custom_command(
     OUTPUT ${_out}
-    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -O ${_def_args} ${_extra}
+    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -O ${_def_args}
             -I ${STARLING_FAST_DIR}/shaders
             ${STARLING_FAST_DIR}/shaders/${_src} -o ${_out}
     DEPENDS ${STARLING_FAST_DIR}/shaders/${_src} ${_fast_glsl_includes}
     COMMENT "glslc ${_name}" VERBATIM)
-  endif()
   list(APPEND _spv_files ${_out})
   list(APPEND _embed_list "${_name}@${_out}@${_nb}")
 endforeach()

@@ -77,6 +77,7 @@ struct ParakeetEngine::Impl {
     // (row V1-1 doubles as the start-of-sequence zero input). Same GEMV, so
     // bit-identical to computing it every step.
     std::vector<std::vector<float>> in0_cache;
+    cpu::GemvHelper gemv2;   // decoder's second GEMV thread (parks when idle)
 
     // ---- runtime state ----
     int cap_T = 0, cap_Tp = 0;             // scratch capacity (mel frames / encoder frames)
@@ -270,6 +271,7 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
     PH = cfg.pred_hidden;
     V1 = cfg.vocab_size + 1;
     n_dur = (uint32_t)cfg.tdt_durations.size();
+    if (n_dur == 0) { err = "fast parakeet: no TDT durations"; return false; }
     {
         const ggml_tensor* t = T("decoder.prediction.embed.weight");
         if (!t) return false;
@@ -632,7 +634,6 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     std::vector<int32_t> hyp;
 
     auto sigm = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
-    static cpu::GemvHelper gemv2;   // one persistent decoder worker thread
     struct Acc { double pred = 0, joint = 0, arg = 0; } acc;
     if (in0_cache.size() != V1 + 1) in0_cache.assign(V1 + 1, {});
     auto pred_step = [&]() {
@@ -741,6 +742,13 @@ bool ParakeetEngine::encode(const float* pcm, size_t n, std::vector<float>& enc,
 
 bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err) {
     Impl& I = *impl_;
+    // Keep the decoder's GEMV worker busy (and on a big core) from here on;
+    // it parks again once this transcription is done.
+    struct Hold {
+        cpu::GemvHelper& g;
+        explicit Hold(cpu::GemvHelper& h) : g(h) { g.hold(true); }
+        ~Hold() { g.hold(false); }
+    } hold(I.gemv2);
     const bool timing = env_on("STARLING_FAST_TIMING");
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<float> feats;

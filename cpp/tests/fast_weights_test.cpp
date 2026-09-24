@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 #if !defined(STARLING_HAVE_FAST)
@@ -132,6 +134,43 @@ int check_gemv() {
     return ok ? 0 : 1;
 }
 
+// GemvHelper splits big products across a worker that spins, parks when idle
+// and is woken by the next job or by hold(true). Every handoff path must give
+// the single-threaded result bit for bit.
+int check_gemv_helper() {
+    CpuQ8 m;
+    m.N = 512;
+    m.K = 4096;   // 2M MACs: above the split threshold
+    std::mt19937 rng(11);
+    m.q.resize((size_t)m.N * m.K);
+    for (int8_t& v : m.q) v = (int8_t)((int)(rng() % 255) - 127);
+    m.s.resize((size_t)m.N * (m.K / 32));
+    for (float& v : m.s) v = (float)(rng() % 1000) * 1e-5f;
+    std::vector<float> x(m.K), b(m.N, 0.25f), ref(m.N), y(m.N);
+    for (float& v : x) v = (float)((int)(rng() % 2001) - 1000) * 1e-3f;
+    cpu::QVec xq;
+    cpu::quantize(x.data(), m.K, xq);
+    cpu::gemv(m, xq, b.data(), ref.data());
+    auto idle = [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); };
+    int bad = 0;
+    cpu::GemvHelper h;
+    const char* steps[] = {"first", "spinning", "after park", "held", "held after idle", "released+parked"};
+    for (int i = 0; i < 6; ++i) {
+        if (i == 2 || i == 5) idle();              // worker parks
+        if (i == 3) h.hold(true);
+        if (i == 4) idle();                        // held: keeps spinning
+        if (i == 5) { h.hold(false); idle(); }
+        std::fill(y.begin(), y.end(), -1.0f);
+        h.run(m, xq, b.data(), y.data());
+        if (std::memcmp(y.data(), ref.data(), y.size() * sizeof(float)) != 0) {
+            std::printf("FAIL gemv helper: %s differs from single-threaded\n", steps[i]);
+            ++bad;
+        }
+    }
+    if (!bad) std::printf("ok   gemv helper: split / park / hold paths bit-exact\n");
+    return bad ? 1 : 0;
+}
+
 } // namespace
 
 int main() {
@@ -146,6 +185,7 @@ int main() {
     fails += check_type(GGML_TYPE_Q6_K, GpuFmt::W8, 2e-3f);
     fails += check_type(GGML_TYPE_Q5_K, GpuFmt::W8, 1e-2f);
     fails += check_gemv();
+    fails += check_gemv_helper();
     std::printf(fails ? "fast_weights_test: %d FAILED\n" : "fast_weights_test: all passed\n", fails);
     return fails ? 1 : 0;
 }

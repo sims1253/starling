@@ -138,26 +138,29 @@ void main() {
         red2[u] = s;
     }
     barrier();
-    if (EPI != 3u && t < ROWS) {
-        const uint n = row_base + t;
-        if (n < p.N) {
-            float v = row_sum(t) * rstd;
-            if (p.has_bias != 0u) v += bias[n];
-            if (EPI == 0u) {
-                y[p.y_off + n] = v;
-            } else if (EPI == 1u) {
-                y[p.y_off + n] += v;
-            } else if ((t & 1u) == 0u && n + 1 < p.N) {
-                float v2 = row_sum(t + 1) * rstd;
-                if (p.has_bias != 0u) v2 += bias[n + 1];
-                y[p.y_off + n / 2] = silu_f(v) * v2;
+    // One thread per row; strided so ROWS > WGS (small K without RSPLIT)
+    // still writes every row. With ROWS <= WGS this is a single pass.
+    for (uint r = t; r < ROWS; r += WGS) {
+        const uint n = row_base + r;
+        if (EPI != 3u) {
+            if (n < p.N) {
+                float v = row_sum(r) * rstd;
+                if (p.has_bias != 0u) v += bias[n];
+                if (EPI == 0u) {
+                    y[p.y_off + n] = v;
+                } else if (EPI == 1u) {
+                    y[p.y_off + n] += v;
+                } else if ((r & 1u) == 0u && n + 1 < p.N) {
+                    float v2 = row_sum(r + 1) * rstd;
+                    if (p.has_bias != 0u) v2 += bias[n + 1];
+                    y[p.y_off + n / 2] = silu_f(v) * v2;
+                }
             }
+        } else {
+            float v = n < p.N ? row_sum(r) * rstd : -3.4e38;
+            if (n < p.N && p.has_bias != 0u) v += bias[n];
+            rowv[r] = v;
         }
-    } else if (EPI == 3u && t < ROWS) {
-        const uint n = row_base + t;
-        float v = n < p.N ? row_sum(t) * rstd : -3.4e38;
-        if (n < p.N && p.has_bias != 0u) v += bias[n];
-        rowv[t] = v;
     }
     barrier();
     if (EPI == 3u && t == 0u) {

@@ -112,6 +112,9 @@ public:
     // search runs when that directory is set or STARLING_FAST_TUNE=1.
     // Explicit STARLING_FAST_TILE / STARLING_FAST_GEMV_ROWS win.
     bool autotune(std::string& err);
+    // Isolated single-kernel probes (STARLING_FAST_MICRO=...; see kernels.cpp):
+    // print a throughput figure to stderr, touch no engine state.
+    bool micro(const char* mi, std::string& err);
     vk::Context& ctx() { return *ctx_; }
 
     bool gemm(vk::Recording& rec, const GemmCall& c, std::string& err);
@@ -151,7 +154,7 @@ public:
     vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
     TileCfg tile;
     bool f16_math = false;
-    bool coopmat_ = false;   // dispatch GEMMs to gemm_coop shaders
+    bool tile_pinned_ = false;  // STARLING_FAST_TILE given: no per-op tile heuristics
     bool rsplit_on_ = true;  // RSPLIT row slots to pad GEMV workgroups
 
 private:

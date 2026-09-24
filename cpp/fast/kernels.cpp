@@ -136,8 +136,8 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     ctx_ = &ctx;
     if (!ctx.create_buffer(dummy_, 256, vk::Mem::Device, err)) return false;
     // 256-thread tiles need maxComputeWorkGroupInvocations >= 256 (the spec
-    // only guarantees 128); fall back to 8x4 register tiles otherwise.
-    if (ctx.info().max_wg_invocations < 256) tile = TileCfg{64, 64, 4, 4};
+    // only guarantees 128); fall back to a 128-thread tile otherwise.
+    if (ctx.info().max_wg_invocations < 256) tile = TileCfg{32, 64, 4, 4};
     // Packed-f16 products (f32 accumulation per 32-deep slice) wherever the
     // device has shaderFloat16: same FLEURS WER as f32 on both models.
     // STARLING_FAST_F16=0 forces f32 products.
@@ -148,32 +148,33 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // numerically larger path, so quality gates are unaffected.
     if (ctx.info().vendor_id == 0x1010) f16_math = false;
     if (const char* e = std::getenv("STARLING_FAST_F16")) f16_math = ctx.info().f16 && e[0] == '1';
-    if (!autotune(err)) return false;
+    const char* tune_env = std::getenv("STARLING_FAST_TUNE");
+    const bool tune_forced = tune_env && tune_env[0] == '1';
     // Imagination (PowerVR): the synthetic ranking does not transfer to the
     // real encoders — isolated GEMM pairs rate 64,32,4,4 highest while the
     // Parakeet/MOSS encoders run fastest on 32,128,4,8 (a full 128-thread
     // subgroup with BN=128 halves weight re-reads), and short GEMV bursts
     // rate rows 64 highest while real decode wants 8 (measured on a Pixel
     // 10 Pro / Tensor G5 DXT-48-1536; see RESEARCH_LOG.md). Ship the measured
-    // values for this vendor; STARLING_FAST_TILE / _GEMV_ROWS / _TUNE=1 still
-    // override, and other vendors keep the tuner's pick.
-    if (ctx.info().vendor_id == 0x1010) {
+    // values for this vendor without running the synthetic tuner;
+    // STARLING_FAST_TUNE=1 runs it anyway, STARLING_FAST_TILE / _GEMV_ROWS
+    // override either. Other vendors keep the tuner's pick.
+    if (ctx.info().vendor_id == 0x1010 && !tune_forced) {
         tile = TileCfg{32, 128, 4, 8};
         gemv_rows_max = 8;
+    } else if (!autotune(err)) {
+        return false;
     }
-    // Hardware cooperative matrices: the machinery exists (gemm_coop.comp)
-    // but no verified driver yet — the Pixel 10 Pro's PowerVR driver
-    // advertises VK_KHR_cooperative_matrix and then SEGFAULTS inside
-    // vkCreateComputePipelines on any coopmat instruction (probe: shaders/
-    // coop_probe.comp). Default off; STARLING_FAST_COOPMAT=1 opts in for
-    // bring-up on drivers that actually compile it.
-    coopmat_ = false;
-    if (const char* e = std::getenv("STARLING_FAST_COOPMAT"))
-        if (e[0] == '1') coopmat_ = ctx.info().coopmat;
+    // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
+    if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
+        if (!micro(mi, err)) return false;
     rsplit_on_ = !(std::getenv("STARLING_FAST_NORSPLIT") && std::getenv("STARLING_FAST_NORSPLIT")[0] == '1');
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
         unsigned bm, bn, tm, tn;
-        if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) tile = TileCfg{bm, bn, tm, tn};
+        if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) {
+            tile = TileCfg{bm, bn, tm, tn};
+            tile_pinned_ = true;
+        }
     }
     if (const char* e = std::getenv("STARLING_FAST_GEMV_ROWS")) {
         unsigned r = (unsigned)std::atoi(e);
@@ -191,23 +192,6 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     if (c.a_conv) {
         if (c.b != BKind::F16 || c.a.cv_cin % 8) { err = "gemm: conv mode needs f16 weights and cin % 8 == 0"; return false; }
         name = "gemm_conv";
-    } else if (coopmat_) {
-        // Hardware cooperative-matrix path: one 128-thread subgroup computes a
-        // 64 x 64 output tile. Falls back to the scalar kernels below when the
-        // shape or the device does not fit (conv mode stays scalar).
-        const bool shape_ok = (c.a.lda % 8) == 0 && (c.a.a_off % 8) == 0 && c.a.sa_hi % 8 == 0 &&
-                              c.a.sa_lo % 8 == 0 && (c.a.K % 16) == 0;
-        if (shape_ok) {
-            std::string cn = c.b == BKind::W4 ? "gemm_coop_w4" : c.b == BKind::W8 ? "gemm_coop_w8"
-                           : c.b == BKind::F16 ? "gemm_coop_f16" : "gemm_coop_f16t";
-            const vk::Pipeline* p = ctx_->pipeline(cn.c_str(),
-                {128u, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
-            if (!p) return false;
-            rec.dispatch(*p, {or_dummy(c.A), or_dummy(c.Bq), or_dummy(c.Bs), or_dummy(c.C),
-                              or_dummy(c.bias), or_dummy(c.bias2), or_dummy(c.C2)},
-                         &c.a, sizeof(c.a), ceil_div(c.a.M, 64u), ceil_div(c.a.N, 64u), c.batch);
-            return true;
-        }
     }
     if (f16_math) name += "_h";
     TileCfg t = tile;
@@ -215,7 +199,7 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     // waste most of a BN=128 tile's columns; a BN=64 tile of the same
     // proven family doubles the useful fraction. Tile shape only partitions
     // outputs — each element's K accumulation order is unchanged.
-    if (c.a.N <= 64 && t.BN > 64) t = TileCfg{32, 64, 4, 4};
+    if (c.a.N <= 64 && t.BN > 64 && !tile_pinned_) t = TileCfg{32, 64, 4, 4};
     const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
     const vk::Pipeline* p = ctx_->pipeline(
         name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
@@ -322,8 +306,8 @@ bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x
         else
             while (rsplit < 8 && lanes * rsplit < target && rows % (2 * rsplit) == 0u) rsplit *= 2;
     }
-    const uint32_t wg = lanes * rsplit;
-    if (wg > ctx_->info().max_wg_invocations) rsplit = 1;
+    // Each row slot owns ROWS / RSPLIT rows (an env pin may not divide).
+    if (rsplit == 0 || rows % rsplit || lanes * rsplit > ctx_->info().max_wg_invocations) rsplit = 1;
     const vk::Pipeline* p = ctx_->pipeline(
         name, {lanes, rows, g.buf ? 1u : 0u, epi, state.buf ? 1u : 0u, rsplit, lanes * rsplit}, err);
     if (!p) return false;
@@ -355,223 +339,232 @@ double time_ms(vk::Recording& rec, std::string& err) {
 
 } // namespace
 
-bool Kernels::autotune(std::string& err) {
-    TuneResult& R = tune_result();
-    if (R.done) { tile = R.tile; gemv_rows_max = R.gemv_rows; return true; }
-    // Isolated GEMV bandwidth probe: STARLING_FAST_MICRO=bits,N,K,reps
+bool Kernels::micro(const char* mi, std::string& err) {
+    // Default: isolated GEMV bandwidth probe, STARLING_FAST_MICRO=bits,N,K,reps
     // (bits 4 / 8 / 16) times a pure loop of decode GEMVs at a real shape and
     // prints the achieved GB/s — the honest per-kernel signal on a GPU where
-    // per-dispatch timestamps are misattributed.
-    if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
-        if (std::strncmp(mi, "idot", 4) == 0) {
-            // Integer-dot probe: OpSDot (packed 4x8) through a hand-assembled
-            // SPIR-V (glslang cannot express it). in = [iters, a, b, seed].
-            // STARLING_FAST_MICRO=idot[,iters[,groups]]
-            uint32_t iters = 65536, groups = 96;
-            std::sscanf(mi, "idot,%u,%u", &iters, &groups);
-            vk::Buffer ib, ob;
-            std::vector<uint32_t> iv{iters, 0x02020202u, 0x03030303u, 0x12345678u};
-            std::vector<uint32_t> ov(64 * groups, 0);
-            auto upl = [&](vk::Buffer& b, const void* d, size_t bytes) {
-                return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
-                       ctx_->upload(b, 0, d, bytes, err);
-            };
-            if (!upl(ib, iv.data(), 16) || !upl(ob, ov.data(), ov.size() * 4)) return false;
-            const vk::Pipeline* p = ctx_->pipeline("idot_probe", {}, err);
-            if (!p) return false;
-            // Correctness: iters = 0 -> out = seed ^ SDot(a,b) = seed ^ 24.
-            {
-                iv[0] = 0;
-                if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
-                vk::Recording r0(*ctx_);
-                r0.begin();
-                r0.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
-                r0.end();
-                if (!r0.submit_and_wait(err)) return false;
-                std::vector<uint32_t> got(8, 0);
-                if (!ctx_->download(ob, 0, got.data(), 32, err)) return false;
-                bool ok = true;
-                for (uint32_t g : got) ok = ok && (g == (0x12345678u ^ 24u));
-                std::fprintf(stderr, "[fast-micro] idot check: %s (want %08x, got %08x)\n",
-                             ok ? "OK" : "FAIL", 0x12345678u ^ 24u, got[0]);
-                if (!ok) return false;
-            }
-            if (iters == 0) return true;
-            iv[0] = iters;
-            if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
-            vk::Recording rec(*ctx_);
-            rec.begin();
-            for (int r = 0; r < 8; ++r) {
-                rec.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
-                rec.barrier();
-            }
-            rec.end();
-            const double ms = time_ms(rec, err);
-            if (ms < 0) return false;
-            // The ILP probe runs four independent dot chains per thread.
-            const double dots = (double)8 * groups * 64 * iters * 4;
-            std::fprintf(stderr, "[fast-micro] idot: %.1f G i8-MAC/s (%.3f ms, 4 ILP chains)\n",
-                         dots / (ms * 1e-3) / 1e9, ms);
-            return true;
-        }
-        if (std::strncmp(mi, "norm", 4) == 0) {
-            // Norm-kernel probe: STARLING_FAST_MICRO=norm,rows,D[,reps[,mode]]
-            uint32_t rows = 107, D = 2048, reps = 64, mode = 1;
-            std::sscanf(mi, "norm,%u,%u,%u,%u", &rows, &D, &reps, &mode);
-            vk::Buffer xb, ob;
-            std::vector<float> xf(std::max<size_t>(rows * D, 4096), 0.5f);
-            auto up = [&](vk::Buffer& b) {
-                return ctx_->create_buffer(b, xf.size() * 4, vk::Mem::Device, err) &&
-                       ctx_->upload(b, 0, xf.data(), xf.size() * 4, err);
-            };
-            if (!up(xb) || !up(ob))
-                return false;
-            const vk::Pipeline* p = ctx_->pipeline("norm", {256u, mode}, err);
-            if (!p) return false;
-            struct { uint32_t D, ld_x, ld_o, x_off, o_off; float eps, eps2; } pc{
-                D, D, D, 0, 0, 1e-5f, 1e-5f};
-            vk::Recording rec(*ctx_);
-            rec.begin();
-            for (uint32_t i = 0; i < reps; ++i) {
-                rec.dispatch(*p, {vk::Ref(xb), vk::Ref(dummy_), vk::Ref(dummy_), vk::Ref(dummy_),
-                                  vk::Ref(dummy_), vk::Ref(ob)},
-                             &pc, sizeof(pc), rows);
-                rec.barrier();
-            }
-            rec.end();
-            const double ms = time_ms(rec, err);
-            if (ms < 0) return false;
-            std::fprintf(stderr, "[fast-micro] norm mode=%u rows=%u D=%u: %.3f ms/dispatch = %.1f GB/s\n",
-                         mode, rows, D, ms / reps,
-                         (double)reps * rows * D * 2 * 4 / ms * 1e-3);
-            return true;
-        }
-        if (std::strncmp(mi, "alu", 3) == 0) {
-            // Pure-FMA issue-rate probe: STARLING_FAST_MICRO=alu[,groups[,iters]].
-            uint32_t groups = 48, iters = 4096;
-            std::sscanf(mi, "alu,%u,%u", &groups, &iters);
-            vk::Buffer ob;
-            std::vector<float> zeros(128 * groups, 0.0f);
-            if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
-                !ctx_->upload(ob, 0, zeros.data(), zeros.size() * 4, err))
-                return false;
-            const vk::Pipeline* p = ctx_->pipeline("alu_probe", {}, err);
-            if (!p) return false;
-            struct { uint32_t iters; } pc{iters};
-            vk::Recording rec(*ctx_);
-            rec.begin();
-            rec.dispatch(*p, {vk::Ref(ob)}, &pc, sizeof(pc), groups);
-            rec.end();
-            const double ms = time_ms(rec, err);
-            if (ms < 0) return false;
-            const double fma = (double)groups * 128 * iters * 32;
-            std::fprintf(stderr, "[fast-micro] alu: %.1f GFLOPS (%.3f ms)\n",
-                         2.0 * fma / (ms * 1e-3) / 1e9, ms);
-            return true;
-        }
-        uint32_t bits = 4, n = 4096, k = 1024, reps = 64, rows = 0;
-        const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
-        if (got < 3) {
-            err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
+    // per-dispatch timestamps are misattributed. Also idot / norm / alu below.
+    if (std::strncmp(mi, "idot", 4) == 0) {
+        // Integer-dot probe: packed 4x8 signed dot products (OpSDot), four
+        // independent chains per thread. in = [iters, a, b, seed].
+        // STARLING_FAST_MICRO=idot[,iters[,groups]]
+        if (!ctx_->info().int_dot) {
+            err = "idot probe: device lacks shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product)";
             return false;
         }
-        if (!rows) rows = gemv_rows(n);
-        std::mt19937 rng(99);
-        auto rnd = [&](size_t cnt) {
-            std::vector<uint32_t> w(cnt);
-            for (auto& v : w) v = (uint32_t)rng();
-            return w;
-        };
-        const size_t qw = bits == 4 ? (size_t)n * k / 8 + 1 : bits == 8 ? (size_t)n * k / 4 + 1
-                                                                        : (size_t)n * k / 2 + 1;
-        const size_t sw = bits == 16 ? 0 : (size_t)n * k / 32 + 1;
-        vk::Buffer wq, ws, x, y;
-        std::vector<float> xf(k);
-        for (auto& f : xf) f = (float)(rng() % 2001) / 1000.0f - 1.0f;
-        std::vector<float> y0(n, 0.0f);
-        auto up32 = [&](vk::Buffer& b, const void* d, size_t bytes) {
+        uint32_t iters = 65536, groups = 96;
+        std::sscanf(mi, "idot,%u,%u", &iters, &groups);
+        vk::Buffer ib, ob;
+        std::vector<uint32_t> iv{iters, 0x02020202u, 0x03030303u, 0x12345678u};
+        std::vector<uint32_t> ov(64 * groups, 0);
+        auto upl = [&](vk::Buffer& b, const void* d, size_t bytes) {
             return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
                    ctx_->upload(b, 0, d, bytes, err);
         };
-        auto wv = rnd(qw);
-        auto sv = sw ? rnd(sw) : std::vector<uint32_t>{};
-        if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
-            !up32(x, xf.data(), k * 4) || !up32(y, y0.data(), n * 4))
-            return false;
-        const char* name = bits == 4 ? "gemv_w4" : bits == 8 ? "gemv_w8" : "gemv_f16";
-        const uint32_t lanes = k / 32;
-        uint32_t rsplit = 1;
-        {
-            const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
-            while (rsplit < 8 && lanes * rsplit < target && rows % (2 * rsplit) == 0u) rsplit *= 2;
-        }
-        const vk::Pipeline* p = ctx_->pipeline(name, {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
+        if (!upl(ib, iv.data(), 16) || !upl(ob, ov.data(), ov.size() * 4)) return false;
+        const vk::Pipeline* p = ctx_->pipeline("idot_probe", {}, err);
         if (!p) return false;
+        // Correctness: iters = 0 -> out = 4 * (seed ^ SDot(a,b)) = 4 * (seed ^ 24).
+        {
+            iv[0] = 0;
+            if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
+            vk::Recording r0(*ctx_);
+            r0.begin();
+            r0.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
+            r0.end();
+            if (!r0.submit_and_wait(err)) return false;
+            std::vector<uint32_t> got(8, 0);
+            if (!ctx_->download(ob, 0, got.data(), 32, err)) return false;
+            bool ok = true;
+            const uint32_t want = 4u * (0x12345678u ^ 24u);
+            for (uint32_t g : got) ok = ok && g == want;
+            std::fprintf(stderr, "[fast-micro] idot check: %s (want %08x, got %08x)\n",
+                         ok ? "OK" : "FAIL", want, got[0]);
+            if (!ok) return false;
+        }
+        if (iters == 0) return true;
+        iv[0] = iters;
+        if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
         vk::Recording rec(*ctx_);
         rec.begin();
-        GemvArgs ga;
-        ga.N = n;
-        ga.K = k;
-        for (uint32_t i = 0; i < reps; ++i) {
-            rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
-                              vk::Ref(dummy_), vk::Ref(dummy_)},
-                         &ga, sizeof(ga), ceil_div(n, rows));
+        for (int r = 0; r < 8; ++r) {
+            rec.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
             rec.barrier();
         }
         rec.end();
-        // Correctness: CPU reference dot products for the first rows.
-        if (bits == 4 || bits == 8) {
-            vk::Recording rc1(*ctx_);
-            rc1.begin();
-            rc1.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
-                              vk::Ref(dummy_), vk::Ref(dummy_)},
-                         &ga, sizeof(ga), ceil_div(n, rows));
-            rc1.end();
-            if (!rc1.submit_and_wait(err)) return false;
-            std::vector<float> got(n, 0.0f);
-            if (!ctx_->download(y, 0, got.data(), n * 4, err)) return false;
-            auto h2f = [](uint32_t h) {
-                const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
-                uint32_t b;
-                if (e == 0) b = (s << 31) | (m >> 1);            // subnormal ~
-                else b = (s << 31) | ((e + 112) << 23) | (m << 13);
-                float f;
-                std::memcpy(&f, &b, 4);
-                return f;
-            };
-            double maxerr = 0;
-            const uint32_t nchk = std::min(n, 256u);
-            for (uint32_t r = 0; r < nchk; ++r) {
-                double ref = 0;
-                for (uint32_t kk = 0; kk < k; ++kk) {
-                    const uint32_t grp = kk / 32, in = kk % 32;
-                    const uint32_t sraw = sv[(size_t)r * (k / 32) + grp];
-                    if (bits == 4) {
-                        const uint32_t w32 = wv[(size_t)r * (k / 8) + grp * 4 + in / 8];
-                        const float nib = (float)((w32 >> (4 * (in % 8))) & 15u);
-                        // packHalf2x16(scale, offset): scale = low half
-                        ref += (h2f(sraw & 0xffff) * nib + h2f(sraw >> 16)) * xf[kk];
-                    } else {
-                        const uint32_t w32 = wv[(size_t)r * (k / 4) + grp * 8 + in / 4];
-                        const int i8 = (int8_t)((w32 >> (8 * (in % 4))) & 0xffu);
-                        // packHalf2x16(s_lo, s_hi): s_lo covers weights 0..15
-                        const float s = h2f((in / 16) == 0 ? (sraw & 0xffff) : (sraw >> 16));
-                        ref += s * (float)i8 * xf[kk];
-                    }
-                }
-                maxerr = std::max(maxerr, std::abs(ref - got[r]) /
-                                              std::max(1.0, std::abs(ref)));
-            }
-            std::fprintf(stderr, "[fast-micro] check rsplit=%u: max rel err = %.5f (first %u rows)\n",
-                         rsplit, maxerr, nchk);
-        }
         const double ms = time_ms(rec, err);
         if (ms < 0) return false;
-        const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
-        std::fprintf(stderr,
-                     "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
-                     bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-3);
+        // Four independent chains per thread, 4 MACs per packed dot.
+        const double dots = (double)8 * groups * 64 * iters * 4 * 4;
+        std::fprintf(stderr, "[fast-micro] idot: %.1f G i8-MAC/s (%.3f ms, 4 ILP chains)\n",
+                     dots / (ms * 1e-3) / 1e9, ms);
+        return true;
     }
+    if (std::strncmp(mi, "norm", 4) == 0) {
+        // Norm-kernel probe: STARLING_FAST_MICRO=norm,rows,D[,reps[,mode]]
+        uint32_t rows = 107, D = 2048, reps = 64, mode = 1;
+        std::sscanf(mi, "norm,%u,%u,%u,%u", &rows, &D, &reps, &mode);
+        vk::Buffer xb, ob, gb;
+        std::vector<float> xf(std::max<size_t>(rows * D, 4096), 0.5f);
+        auto up = [&](vk::Buffer& b) {
+            return ctx_->create_buffer(b, xf.size() * 4, vk::Mem::Device, err) &&
+                   ctx_->upload(b, 0, xf.data(), xf.size() * 4, err);
+        };
+        // xf holds >= D floats, so it doubles as the g/b/g2/b2 vectors.
+        if (!up(xb) || !up(ob) || !up(gb))
+            return false;
+        const vk::Pipeline* p = ctx_->pipeline("norm", {256u, mode}, err);
+        if (!p) return false;
+        struct { uint32_t D, ld_x, ld_o, x_off, o_off; float eps, eps2; } pc{
+            D, D, D, 0, 0, 1e-5f, 1e-5f};
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        for (uint32_t i = 0; i < reps; ++i) {
+            rec.dispatch(*p, {vk::Ref(xb), vk::Ref(gb), vk::Ref(gb), vk::Ref(gb), vk::Ref(gb),
+                              vk::Ref(ob)},
+                         &pc, sizeof(pc), rows);
+            rec.barrier();
+        }
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        std::fprintf(stderr, "[fast-micro] norm mode=%u rows=%u D=%u: %.3f ms/dispatch = %.1f GB/s\n",
+                     mode, rows, D, ms / reps,
+                     (double)reps * rows * D * 2 * 4 / ms * 1e-6);
+        return true;
+    }
+    if (std::strncmp(mi, "alu", 3) == 0) {
+        // Pure-FMA issue-rate probe: STARLING_FAST_MICRO=alu[,groups[,iters]].
+        uint32_t groups = 48, iters = 4096;
+        std::sscanf(mi, "alu,%u,%u", &groups, &iters);
+        vk::Buffer ob;
+        std::vector<float> zeros(128 * groups, 0.0f);
+        if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
+            !ctx_->upload(ob, 0, zeros.data(), zeros.size() * 4, err))
+            return false;
+        const vk::Pipeline* p = ctx_->pipeline("alu_probe", {}, err);
+        if (!p) return false;
+        struct { uint32_t iters; } pc{iters};
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        rec.dispatch(*p, {vk::Ref(ob)}, &pc, sizeof(pc), groups);
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        const double fma = (double)groups * 128 * iters * 32;
+        std::fprintf(stderr, "[fast-micro] alu: %.1f GFLOPS (%.3f ms)\n",
+                     2.0 * fma / (ms * 1e-3) / 1e9, ms);
+        return true;
+    }
+    uint32_t bits = 4, n = 4096, k = 1024, reps = 64, rows = 0;
+    const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
+    if (got < 3) {
+        err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
+        return false;
+    }
+    if (!rows) rows = gemv_rows(n);
+    std::mt19937 rng(99);
+    auto rnd = [&](size_t cnt) {
+        std::vector<uint32_t> w(cnt);
+        for (auto& v : w) v = (uint32_t)rng();
+        return w;
+    };
+    const size_t qw = bits == 4 ? (size_t)n * k / 8 + 1 : bits == 8 ? (size_t)n * k / 4 + 1
+                                                                    : (size_t)n * k / 2 + 1;
+    const size_t sw = bits == 16 ? 0 : (size_t)n * k / 32 + 1;
+    vk::Buffer wq, ws, x, y;
+    std::vector<float> xf(k);
+    for (auto& f : xf) f = (float)(rng() % 2001) / 1000.0f - 1.0f;
+    std::vector<float> y0(n, 0.0f);
+    auto up32 = [&](vk::Buffer& b, const void* d, size_t bytes) {
+        return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
+               ctx_->upload(b, 0, d, bytes, err);
+    };
+    auto wv = rnd(qw);
+    auto sv = sw ? rnd(sw) : std::vector<uint32_t>{};
+    for (auto& v : sv) v &= 0xbfffbfffu;   // f16 scale pairs: exponent < 16, never inf/NaN
+    if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
+        !up32(x, xf.data(), k * 4) || !up32(y, y0.data(), n * 4))
+        return false;
+    const char* name = bits == 4 ? "gemv_w4" : bits == 8 ? "gemv_w8" : "gemv_f16";
+    const uint32_t lanes = k / 32;
+    uint32_t rsplit = 1;
+    {
+        const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
+        while (rsplit < 8 && lanes * rsplit < target && rows % (2 * rsplit) == 0u) rsplit *= 2;
+    }
+    const vk::Pipeline* p = ctx_->pipeline(name, {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
+    if (!p) return false;
+    vk::Recording rec(*ctx_);
+    rec.begin();
+    GemvArgs ga;
+    ga.N = n;
+    ga.K = k;
+    for (uint32_t i = 0; i < reps; ++i) {
+        rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+                          vk::Ref(dummy_), vk::Ref(dummy_)},
+                     &ga, sizeof(ga), ceil_div(n, rows));
+        rec.barrier();
+    }
+    rec.end();
+    // Correctness: CPU reference dot products for the first rows.
+    if (bits == 4 || bits == 8) {
+        vk::Recording rc1(*ctx_);
+        rc1.begin();
+        rc1.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+                          vk::Ref(dummy_), vk::Ref(dummy_)},
+                     &ga, sizeof(ga), ceil_div(n, rows));
+        rc1.end();
+        if (!rc1.submit_and_wait(err)) return false;
+        std::vector<float> got(n, 0.0f);
+        if (!ctx_->download(y, 0, got.data(), n * 4, err)) return false;
+        auto h2f = [](uint32_t h) {
+            const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+            uint32_t b;
+            if (e == 0) b = (s << 31) | (m >> 1);            // subnormal ~
+            else b = (s << 31) | ((e + 112) << 23) | (m << 13);
+            float f;
+            std::memcpy(&f, &b, 4);
+            return f;
+        };
+        double maxerr = 0;
+        const uint32_t nchk = std::min(n, 256u);
+        for (uint32_t r = 0; r < nchk; ++r) {
+            double ref = 0;
+            for (uint32_t kk = 0; kk < k; ++kk) {
+                const uint32_t grp = kk / 32, in = kk % 32;
+                const uint32_t sraw = sv[(size_t)r * (k / 32) + grp];
+                if (bits == 4) {
+                    const uint32_t w32 = wv[(size_t)r * (k / 8) + grp * 4 + in / 8];
+                    const float nib = (float)((w32 >> (4 * (in % 8))) & 15u);
+                    // packHalf2x16(scale, offset): scale = low half
+                    ref += (h2f(sraw & 0xffff) * nib + h2f(sraw >> 16)) * xf[kk];
+                } else {
+                    const uint32_t w32 = wv[(size_t)r * (k / 4) + grp * 8 + in / 4];
+                    const int i8 = (int8_t)((w32 >> (8 * (in % 4))) & 0xffu);
+                    // packHalf2x16(s_lo, s_hi): s_lo covers weights 0..15
+                    const float s = h2f((in / 16) == 0 ? (sraw & 0xffff) : (sraw >> 16));
+                    ref += s * (float)i8 * xf[kk];
+                }
+            }
+            maxerr = std::max(maxerr, std::abs(ref - got[r]) /
+                                          std::max(1.0, std::abs(ref)));
+        }
+        std::fprintf(stderr, "[fast-micro] check rsplit=%u: max rel err = %.5f (first %u rows)\n",
+                     rsplit, maxerr, nchk);
+    }
+    const double ms = time_ms(rec, err);
+    if (ms < 0) return false;
+    const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
+    std::fprintf(stderr,
+                 "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
+                 bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-6);
+    return true;
+}
+
+bool Kernels::autotune(std::string& err) {
+    TuneResult& R = tune_result();
+    if (R.done) { tile = R.tile; gemv_rows_max = R.gemv_rows; return true; }
     const auto& info = ctx_->info();
     const char* dir = std::getenv("STARLING_FAST_CACHE_DIR");
     const char* force = std::getenv("STARLING_FAST_TUNE");
@@ -616,7 +609,7 @@ bool Kernels::autotune(std::string& err) {
         }
         return w;
     };
-    vk::Buffer a, wq4, ws4, wq8, ws8, c, x, y;
+    vk::Buffer a, wq4, ws4, wq8, ws8, c, x, y, ones;
     auto up = [&](vk::Buffer& b, const std::vector<uint32_t>& w) {
         return ctx_->create_buffer(b, w.size() * 4, vk::Mem::Device, err) &&
                ctx_->upload(b, 0, w.data(), w.size() * 4, err);
@@ -627,6 +620,7 @@ bool Kernels::autotune(std::string& err) {
     if (!up(a, rnd_words((size_t)M * F / 2, true)) || !up(wq4, rnd_words((size_t)F * D / 8, false)) ||
         !up(ws4, rnd_words((size_t)F * D / 32, true)) || !up(wq8, rnd_words((size_t)D * F / 4, false)) ||
         !up(ws8, rnd_words((size_t)D * F / 32, true)) || !up(x, xw) ||
+        !up(ones, std::vector<uint32_t>(F, 0x3f800000u)) ||   // norm g/b (1.0f)
         !ctx_->create_buffer(c, (size_t)M * F * 4, vk::Mem::Device, err) ||
         !ctx_->create_buffer(y, (size_t)F * 4, vk::Mem::Device, err))
         return false;
@@ -661,12 +655,12 @@ bool Kernels::autotune(std::string& err) {
             // A norm between the GEMMs, as in a real layer: the pipeline
             // switches and small kernels between large ones are part of what
             // a tile choice costs on a tile-based GPU.
-            if (!norm(rec, 0, M, F, vk::Ref(c), F, {}, {}, {}, {}, vk::Ref(c), F,
+            if (!norm(rec, 0, M, F, vk::Ref(c), F, vk::Ref(ones), vk::Ref(ones), {}, {}, vk::Ref(c), F,
                       1e-5f, 1e-5f, err)) { tile = saved; return false; }
             rec.barrier();
             if (!gemm(rec, dn, err)) { tile = saved; return false; }
             rec.barrier();
-            if (!norm(rec, 0, M, D, vk::Ref(c), D, {}, {}, {}, {}, vk::Ref(c), D,
+            if (!norm(rec, 0, M, D, vk::Ref(c), D, vk::Ref(ones), vk::Ref(ones), {}, {}, vk::Ref(c), D,
                       1e-5f, 1e-5f, err)) { tile = saved; return false; }
             rec.barrier();
         }
@@ -698,7 +692,7 @@ bool Kernels::autotune(std::string& err) {
                               vk::Ref(dummy_), vk::Ref(dummy_)},
                          &ga, sizeof(ga), ceil_div(F, r));
             rec.barrier();
-            if (!norm(rec, 1, 1, D, vk::Ref(y), D, {}, {}, {}, {}, vk::Ref(y), D,
+            if (!norm(rec, 1, 1, D, vk::Ref(y), D, vk::Ref(ones), vk::Ref(ones), vk::Ref(ones), vk::Ref(ones), vk::Ref(y), D,
                       1e-5f, 1e-5f, err)) return false;
             rec.barrier();
         }

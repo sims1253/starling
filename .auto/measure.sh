@@ -30,7 +30,12 @@ if [ "${NO_BUILD:-0}" != 1 ]; then
       -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm \
       -DSTARLING_GGML_TESTS=OFF -DSTARLING_QUANTIZE=OFF >/dev/null
   fi
-  cmake --build "$BUILD" -j --target starling-bench 2>&1 | grep -iE "error|warning: #|FAILED" && exit 1 || true
+  if ! cmake --build "$BUILD" -j --target starling-bench > /tmp/m_build.log 2>&1; then
+    grep -iE "error|FAILED" /tmp/m_build.log | head -20 >&2
+    echo "build failed (full log: /tmp/m_build.log)" >&2
+    exit 1
+  fi
+  adb shell "mkdir -p $DEV"
   adb push "$BUILD/starling-bench" "$DEV/" >/dev/null
   find "$BUILD/ggml" -name 'libggml*.so' -exec adb push {} "$DEV/" \; >/dev/null
 fi

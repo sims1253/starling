@@ -200,17 +200,22 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
     if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
 #if defined(STARLING_HAVE_FAST)
     if (c->fast) {
-        std::vector<float> enc;
-        int Tp = 0;
-        if (!c->fast->encode(pcm, (size_t)n, enc, Tp, c->err)) {
-            report_error(err_out, c->err.c_str());
+        try {
+            std::vector<float> enc;
+            int Tp = 0;
+            if (!c->fast->encode(pcm, (size_t)n, enc, Tp, c->err)) {
+                report_error(err_out, c->err.c_str());
+                return nullptr;
+            }
+            if (out_T) *out_T = Tp;
+            float* out = (float*)std::malloc(enc.size() * sizeof(float));
+            if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+            std::memcpy(out, enc.data(), enc.size() * sizeof(float));
+            return out;
+        } catch (const std::exception& e) {
+            report_error(err_out, e.what());
             return nullptr;
         }
-        if (out_T) *out_T = Tp;
-        float* out = (float*)std::malloc(enc.size() * sizeof(float));
-        if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
-        std::memcpy(out, enc.data(), enc.size() * sizeof(float));
-        return out;
     }
 #endif
     // 1. mel frontend -> feat-major [n_mels, T].

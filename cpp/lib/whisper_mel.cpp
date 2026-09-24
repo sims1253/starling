@@ -7,7 +7,6 @@
 #include "ggml-backend.h"
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cmath>
 #include <complex>
 #include <cstdio>

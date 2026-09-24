@@ -12,7 +12,9 @@
 #include "weights.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -34,8 +36,14 @@ const char* isa_name();
 
 // Second thread for the decoder's large matrix-vector products: one
 // persistent worker spinning on a sequence counter (a futex/condvar wake
-// costs ~10x a spin). The split is by rows, so every output element is
-// computed exactly as in the single-threaded path.
+// costs ~10x a spin). While held (hold(true), for the length of one
+// transcription) it spins even between jobs; otherwise it parks on a
+// condition variable ~2 ms after its last job, so an idle engine costs no
+// CPU. Holding matters on big.LITTLE phones: a thread woken cold at decode
+// start lands on a little core (Pixel 10 Pro: decode +17 %), while one kept
+// busy through the GPU encoder stays on a big core. The split is by rows,
+// so every output element is computed exactly as in the single-threaded path.
+// Not re-entrant: one decode at a time per helper (one helper per engine).
 class GemvHelper {
 public:
     ~GemvHelper();
@@ -43,6 +51,8 @@ public:
     // is large enough to amortize the handoff (~2 us).
     void run(const CpuQ8& W, const QVec& x, const float* bias, float* y, uint32_t r0 = 0,
              uint32_t r1 = UINT32_MAX);
+    // Keep the worker spinning (true) until released (false); starts it.
+    void hold(bool on);
 
 private:
     struct Job {
@@ -58,6 +68,10 @@ private:
     Job job_;
     std::thread th_;
     bool started_ = false;
+    std::atomic<bool> parked_{false};
+    std::atomic<bool> held_{false};
+    std::mutex park_m_;
+    std::condition_variable park_cv_;
 };
 
 } // namespace starling::fast::cpu

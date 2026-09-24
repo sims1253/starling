@@ -39,7 +39,6 @@ namespace starling::fast::vk {
     X(vkGetPhysicalDeviceProperties)           \
     X(vkGetPhysicalDeviceProperties2)          \
     X(vkGetPhysicalDeviceFeatures2)            \
-    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) \
     X(vkGetPhysicalDeviceQueueFamilyProperties)\
     X(vkGetPhysicalDeviceMemoryProperties)     \
     X(vkEnumerateDeviceExtensionProperties)    \
@@ -124,7 +123,7 @@ struct DeviceInfo {
     uint64_t max_alloc = 0;              // maxMemoryAllocationSize (0 = unknown)
     double timestamp_period_ns = 0.0;    // 0 = timestamps unsupported
     bool f16 = false;                    // shaderFloat16 enabled on the device
-    bool coopmat = false;                // f16 coopmat (64/16x16x16, f32 acc) usable
+    bool int_dot = false;                // shaderIntegerDotProduct enabled (packed 4x8 dots)
 };
 
 class Context;
@@ -234,6 +233,7 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> dpools_;
     uint32_t dpool_left_ = 0;
+    std::string fail_;   // first recording error (descriptor allocation); reported by submit_and_wait
     size_t n_dispatch_ = 0;
     bool profile_ = false;
     VkQueryPool qpool_ = VK_NULL_HANDLE;

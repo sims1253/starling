@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -12,7 +13,9 @@
 // and picked at run time, so the library itself needs no -march flags.
 #if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
 #include <arm_neon.h>
-#if defined(__linux__) || defined(__ANDROID__)
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__) || defined(__ANDROID__)
 #include <sys/auxv.h>
 #ifndef HWCAP_ASIMDDP
 #define HWCAP_ASIMDDP (1 << 20)
@@ -32,7 +35,13 @@ namespace {
 bool have_simd() {
 #if defined(STARLING_FAST_NEON_DOT)
 #if defined(__APPLE__)
-    return true;
+    // SDOT is ARMv8.2 (A12 / M1 and later), not every arm64 Apple chip.
+    static const bool ok = [] {
+        int v = 0;
+        size_t n = sizeof v;
+        return sysctlbyname("hw.optional.arm.FEAT_DotProd", &v, &n, nullptr, 0) == 0 && v != 0;
+    }();
+    return ok;
 #elif defined(__linux__) || defined(__ANDROID__)
     static const bool ok = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
     return ok;
@@ -109,10 +118,11 @@ void quantize(const float* x, uint32_t K, QVec& out) {
             vst1_s8(q + i, vqmovn_s16(h));
         }
     }
+    return;
 #elif defined(STARLING_FAST_AVX2)
     if (have_simd()) { quantize_avx2(x, K, out); return; }
 #endif
-#if defined(STARLING_FAST_AVX2)
+    // Portable path (also x86 without AVX2).
     for (uint32_t g = 0; g < G; ++g) {
         const float* v = x + g * 32;
         float amax = 0.0f;
@@ -122,7 +132,6 @@ void quantize(const float* x, uint32_t K, QVec& out) {
         out.s[g] = s;
         for (int i = 0; i < 32; ++i) out.q[g * 32 + i] = (int8_t)std::lrintf(v[i] * inv);
     }
-#endif
 }
 
 namespace {
@@ -252,22 +261,61 @@ void gemv(const CpuQ8& W, const QVec& x, const float* bias, float* y, uint32_t r
     gemv_scalar(W, x, bias, y, r0, r1);
 }
 
+namespace {
+constexpr uint32_t kPoison = 0xffffffffu;   // job_.seq value that stops the worker
+}
+
 GemvHelper::~GemvHelper() {
     if (started_) {
-        job_.seq.store(0xffffffffu, std::memory_order_release);   // poison: exit
+        job_.seq.store(kPoison, std::memory_order_seq_cst);
+        { std::lock_guard<std::mutex> lk(park_m_); }
+        park_cv_.notify_one();
         th_.join();
     }
 }
 
 void GemvHelper::worker() {
+    // Unheld, spin this long after a job before parking: covers the gaps
+    // between a decode step's products (tens of us).
+    constexpr auto kSpin = std::chrono::milliseconds(2);
     uint32_t seen = 0;
     for (;;) {
-        while (job_.seq.load(std::memory_order_acquire) == seen) cpu_relax();
-        const uint32_t s = job_.seq.load(std::memory_order_relaxed);
-        if (s == 0xffffffffu) return;
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; job_.seq.load(std::memory_order_acquire) == seen; ++i) {
+            cpu_relax();
+            if ((i & 255u) == 255u && !held_.load(std::memory_order_relaxed) &&
+                std::chrono::steady_clock::now() - t0 > kSpin) {
+                // Park. seq_cst on parked_ vs seq / held_ pairs with run() and
+                // hold(): either they see parked_ and notify, or this
+                // predicate sees their store.
+                std::unique_lock<std::mutex> lk(park_m_);
+                parked_.store(true, std::memory_order_seq_cst);
+                park_cv_.wait(lk, [&] {
+                    return job_.seq.load(std::memory_order_seq_cst) != seen ||
+                           held_.load(std::memory_order_seq_cst);
+                });
+                parked_.store(false, std::memory_order_relaxed);
+                t0 = std::chrono::steady_clock::now();
+            }
+        }
+        const uint32_t s = job_.seq.load(std::memory_order_acquire);
+        if (s == kPoison) return;
         gemv(*job_.W, *job_.x, job_.bias, job_.y, job_.r0, job_.r1);
         seen = s;
         job_.ack.store(s, std::memory_order_release);
+    }
+}
+
+void GemvHelper::hold(bool on) {
+    held_.store(on, std::memory_order_seq_cst);
+    if (!on) return;
+    if (!started_) {
+        th_ = std::thread([this] { worker(); });
+        started_ = true;
+    }
+    if (parked_.load(std::memory_order_seq_cst)) {
+        { std::lock_guard<std::mutex> lk(park_m_); }
+        park_cv_.notify_one();
     }
 }
 
@@ -290,8 +338,13 @@ void GemvHelper::run(const CpuQ8& W, const QVec& x, const float* bias, float* y,
     job_.y = y;
     job_.r0 = r0;
     job_.r1 = mid;
-    const uint32_t s = job_.seq.load(std::memory_order_relaxed) + 1;
-    job_.seq.store(s, std::memory_order_release);
+    uint32_t s = job_.seq.load(std::memory_order_relaxed) + 1;
+    if (s == kPoison) s = 1;   // skip the poison value on wrap-around
+    job_.seq.store(s, std::memory_order_seq_cst);
+    if (parked_.load(std::memory_order_seq_cst)) {
+        { std::lock_guard<std::mutex> lk(park_m_); }
+        park_cv_.notify_one();
+    }
     gemv(W, x, bias, y, mid, r1);
     while (job_.ack.load(std::memory_order_acquire) != s) cpu_relax();
 }

@@ -220,6 +220,17 @@ bool Context::init(std::string& err) {
             info_.f16 = f16.shaderFloat16 == VK_TRUE && !env_on("STARLING_FAST_NO_F16");
             if (info_.f16 && !core12) exts.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         }
+        // Integer dot products (probe only so far). The instance targets
+        // Vulkan 1.1, so this goes through the KHR extension even on 1.3.
+        if (has_ext(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+            VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idf{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &idf;
+            fn_.vkGetPhysicalDeviceFeatures2(phys_, &f2);
+            info_.int_dot = idf.shaderIntegerDotProduct == VK_TRUE;
+            if (info_.int_dot) exts.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+        }
         if (env_on("STARLING_FAST_VERBOSE")) {
             std::fprintf(stderr, "[fast-vk] device %04x:%04x driver %08x api %08x\n", info_.vendor_id,
                          info_.device_id, info_.driver_version, info_.api_version);
@@ -231,78 +242,15 @@ bool Context::init(std::string& err) {
             fn_.vkGetPhysicalDeviceProperties2(phys_, &p2);
             std::fprintf(stderr, "[fast-vk] subgroup size %u ops %08x stages %08x\n", sg.subgroupSize,
                          sg.supportedOperations, sg.supportedStages);
-            if (props.apiVersion >= VK_API_VERSION_1_3) {
-                VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-                VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f13};
-                fn_.vkGetPhysicalDeviceFeatures2(phys_, &f2);
-                std::fprintf(stderr, "[fast-vk] v13 dotProduct %d\n", f13.shaderIntegerDotProduct);
-            }
-            if (has_ext(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
-                uint32_t n_cmp = 0;
-                fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, nullptr);
-                std::vector<VkCooperativeMatrixPropertiesKHR> cmp(
-                    n_cmp, VkCooperativeMatrixPropertiesKHR{
-                        VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-                fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, cmp.data());
-                for (auto& m : cmp)
-                    std::fprintf(stderr,
-                                 "[fast-vk] coopmat %ux%ux%u A=%u B=%u C=%u satur=%d scope=%u\n",
-                                 m.MSize, m.NSize, m.KSize, m.AType, m.BType, m.CType,
-                                 m.saturatingAccumulation, m.scope);
-            }
+            std::fprintf(stderr, "[fast-vk] f16 %d int_dot %d\n", info_.f16, info_.int_dot);
         }
     }
     VkPhysicalDeviceShaderFloat16Int8Features f16_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
     f16_on.shaderFloat16 = info_.f16 ? VK_TRUE : VK_FALSE;
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idot_on{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
+    idot_on.shaderIntegerDotProduct = VK_TRUE;
 
-    // Cooperative matrices (hardware f16xf16->f32 / i8xi8->i32 matmuls) when
-    // the device has them with the shapes the coopmat kernels use.
-    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_on{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
-    VkPhysicalDeviceVulkan12Features v12_on{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    {
-        uint32_t n_ext2 = 0;
-        fn_.vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n_ext2, nullptr);
-        std::vector<VkExtensionProperties> ep2(n_ext2);
-        fn_.vkEnumerateDeviceExtensionProperties(phys_, nullptr, &n_ext2, ep2.data());
-        const bool has_cm = std::any_of(
-            ep2.begin(), ep2.end(), [](const VkExtensionProperties& e) {
-                return std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0;
-            });
-        if (has_cm && info_.subgroup_size >= 128) {
-            VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
-            VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &v12};
-            v12.pNext = &cm;
-            fn_.vkGetPhysicalDeviceFeatures2(phys_, &f2);
-            uint32_t n_cmp = 0;
-            fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, nullptr);
-            std::vector<VkCooperativeMatrixPropertiesKHR> cmp(
-                n_cmp, VkCooperativeMatrixPropertiesKHR{
-                           VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
-            fn_.vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(phys_, &n_cmp, cmp.data());
-            bool a64 = false, b16 = false;   // 64x16x16 f16 A/B (+f32 C), 16x16x16 B
-            for (const auto& m : cmp) {
-                const bool f16t = m.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                                  m.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                                  m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR;
-                a64 = a64 || (f16t && m.MSize == 64 && m.NSize == 16 && m.KSize == 16);
-                b16 = b16 || (f16t && m.MSize == 16 && m.NSize == 16 && m.KSize == 16);
-            }
-            if (cm.cooperativeMatrix == VK_TRUE && a64 && b16 && v12.shaderFloat16 == VK_TRUE) {
-                info_.coopmat = true;
-                coop_on.cooperativeMatrix = VK_TRUE;
-                // The coopmat SPIR-V uses the Vulkan memory model (scope
-                // semantics on loads/stores): enable the feature, the driver
-                // compiler faults on it otherwise.
-                v12_on.vulkanMemoryModel = VK_TRUE;
-                v12_on.vulkanMemoryModelDeviceScope = VK_TRUE;
-                exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-            }
-        }
-    }
 
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -315,15 +263,13 @@ bool Context::init(std::string& err) {
     dci.enabledExtensionCount = (uint32_t)exts.size();
     dci.ppEnabledExtensionNames = exts.empty() ? nullptr : exts.data();
     void* feat_chain = nullptr;
-    if (info_.coopmat) {
-        coop_on.pNext = feat_chain;
-        feat_chain = &coop_on;
-        v12_on.pNext = feat_chain;
-        feat_chain = &v12_on;
-    }
     if (info_.f16) {
         f16_on.pNext = feat_chain;
         feat_chain = &f16_on;
+    }
+    if (info_.int_dot) {
+        idot_on.pNext = feat_chain;
+        feat_chain = &idot_on;
     }
     dci.pNext = feat_chain;
     r = fn_.vkCreateDevice(phys_, &dci, nullptr, &dev_);
@@ -393,7 +339,10 @@ bool Context::init(std::string& err) {
 }
 
 Context::~Context() {
-    if (!dev_) return;
+    if (!dev_) {   // init failed after creating the instance
+        if (inst_) fn_.vkDestroyInstance(inst_, nullptr);
+        return;
+    }
     fn_.vkDeviceWaitIdle(dev_);
     if (pcache_ && !pcache_path_.empty()) {
         size_t n = 0;
@@ -498,7 +447,9 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
 bool Context::ensure_staging(VkDeviceSize bytes, std::string& err) {
     if (staging_ && staging_.size >= bytes) return true;
     VkDeviceSize want = std::max<VkDeviceSize>(bytes, 64ull << 20);
-    return create_buffer(staging_, want, Mem::Readback, err);
+    if (!create_buffer(staging_, want, Mem::Readback, err)) return false;
+    if (!staging_.host) { staging_.release(); err = "staging buffer is not host-mappable"; return false; }
+    return true;
 }
 
 bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err) {
@@ -694,7 +645,11 @@ void Recording::begin() {
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qci.queryCount = max_queries_;
-        if (!qpool_) f.vkCreateQueryPool(ctx_.dev_, &qci, nullptr, &qpool_);
+        if (!qpool_ && f.vkCreateQueryPool(ctx_.dev_, &qci, nullptr, &qpool_) != VK_SUCCESS) {
+            qpool_ = VK_NULL_HANDLE;
+            profile_ = false;   // profiling is best-effort
+            return;
+        }
         f.vkCmdResetQueryPool(cb_, qpool_, 0, max_queries_);
         n_queries_ = 0;
         q_labels_.clear();
@@ -723,36 +678,50 @@ void Recording::split() {
 VkDescriptorSet Recording::alloc_set(const Pipeline& p) {
     const Fns& f = ctx_.fn_;
     const uint32_t kSets = 256;
-    if (dpools_.empty() || dpool_left_ == 0) {
-        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 8};
-        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpci.maxSets = kSets;
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &ps;
-        VkDescriptorPool dp;
-        f.vkCreateDescriptorPool(ctx_.dev_, &dpci, nullptr, &dp);
-        dpools_.push_back(dp);
-        dpool_left_ = kSets;
+    // Two attempts: the current pool, then a fresh one (a pool can run out of
+    // descriptors before sets when layouts have many bindings).
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (dpools_.empty() || dpool_left_ == 0) {
+            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 16};
+            VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dpci.maxSets = kSets;
+            dpci.poolSizeCount = 1;
+            dpci.pPoolSizes = &ps;
+            VkDescriptorPool dp = VK_NULL_HANDLE;
+            VkResult r = f.vkCreateDescriptorPool(ctx_.dev_, &dpci, nullptr, &dp);
+            if (r != VK_SUCCESS) {
+                if (fail_.empty()) fail_ = vk_err("vkCreateDescriptorPool", r);
+                return VK_NULL_HANDLE;
+            }
+            dpools_.push_back(dp);
+            dpool_left_ = kSets;
+        }
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = dpools_.back();
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &p.dsl;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkResult r = f.vkAllocateDescriptorSets(ctx_.dev_, &ai, &set);
+        if (r == VK_SUCCESS) {
+            --dpool_left_;
+            return set;
+        }
+        dpool_left_ = 0;
+        if (attempt == 1 && fail_.empty()) fail_ = vk_err("vkAllocateDescriptorSets", r);
     }
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = dpools_.back();
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &p.dsl;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    VkResult r = f.vkAllocateDescriptorSets(ctx_.dev_, &ai, &set);
-    if (r != VK_SUCCESS) {
-        dpool_left_ = 0;   // pool exhausted by binding count: start a new one
-        return alloc_set(p);
-    }
-    --dpool_left_;
-    return set;
+    return VK_NULL_HANDLE;
 }
 
 void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
                          const void* push, size_t push_bytes,
                          uint32_t gx, uint32_t gy, uint32_t gz) {
     const Fns& f = ctx_.fn_;
+    if (bindings.empty() && p.n_bindings) {
+        if (fail_.empty()) fail_ = std::string("dispatch without bindings: ") + p.label;
+        return;
+    }
     VkDescriptorSet set = alloc_set(p);
+    if (!set) return;   // fail_ is set; submit_and_wait reports it
     std::vector<VkDescriptorBufferInfo> infos(p.n_bindings);
     std::vector<VkWriteDescriptorSet> writes(p.n_bindings);
     for (uint32_t i = 0; i < p.n_bindings; ++i) {
@@ -806,6 +775,7 @@ void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, ui
 
 bool Recording::submit_and_wait(std::string& err) {
     const Fns& f = ctx_.fn_;
+    if (!fail_.empty()) { err = "recording failed: " + fail_; return false; }
     std::lock_guard<std::mutex> lk(ctx_.queue_mu_);
     VkResult r = VK_SUCCESS;
     for (size_t i = 0; i < segs_.size(); ++i) {
@@ -822,8 +792,15 @@ bool Recording::submit_and_wait(std::string& err) {
     }
     // Bounded wait: a lost device must surface as an error, not a hang.
     r = f.vkWaitForFences(ctx_.dev_, 1, &fence_, VK_TRUE, 120ull * 1000 * 1000 * 1000);
+    if (r != VK_SUCCESS) {
+        // The fence may still be pending (timeout): drain the queue before
+        // it is reset or the recording's buffers are freed.
+        f.vkDeviceWaitIdle(ctx_.dev_);
+        f.vkResetFences(ctx_.dev_, 1, &fence_);
+        err = vk_err("vkWaitForFences", r);
+        return false;
+    }
     f.vkResetFences(ctx_.dev_, 1, &fence_);
-    if (r != VK_SUCCESS) { err = vk_err("vkWaitForFences", r); return false; }
     return true;
 }
 
