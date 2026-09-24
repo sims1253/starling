@@ -210,7 +210,12 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
         }
     }
     if (f16_math) name += "_h";
-    const TileCfg t = tile;
+    TileCfg t = tile;
+    // Narrow outputs (attention PV at head_dim, tiny subsampling mixes)
+    // waste most of a BN=128 tile's columns; a BN=64 tile of the same
+    // proven family doubles the useful fraction. Tile shape only partitions
+    // outputs — each element's K accumulation order is unchanged.
+    if (c.a.N <= 64 && t.BN > 64) t = TileCfg{32, 64, 4, 4};
     const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
     const vk::Pipeline* p = ctx_->pipeline(
         name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
