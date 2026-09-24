@@ -22,6 +22,8 @@ class StarlingApplication : Application() {
         private set
     lateinit var onDeviceEngine: OnDeviceEngine
         private set
+    lateinit var modelDownloads: ModelDownloadController
+        private set
 
     // One worker for releases: repeated trims while a transcription holds the
     // engine queue behind each other instead of stacking waiting threads.
@@ -34,6 +36,7 @@ class StarlingApplication : Application() {
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
         onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
+        modelDownloads = ModelDownloadController(onDeviceEngine)
         transcription = TranscriptionCoordinator(
             recordings,
             backendSettings,

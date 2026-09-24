@@ -486,4 +486,61 @@ class OnDeviceEngineImportTest {
             directory.deleteRecursively()
         }
     }
+
+    @Test
+    fun verifiedDownloadIsAdoptedWithoutACopy() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val download = sparseModelFile(directory, "download-test.part", parakeetPayload())
+            val size = download.length()
+
+            val result = engine.adoptDownloaded(download)
+
+            assertTrue("a valid download must be imported: $result", result is OnDeviceEngine.ImportResult.Imported)
+            assertTrue(engine.hasModel())
+            assertEquals(size, File(directory, "parakeet.gguf").length())
+            assertFalse("the download file is consumed", download.exists())
+            assertTrue("no staging file may remain", directory.listFiles()!!.none { it.name.endsWith(".importing") })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun unrelatedDownloadIsRejectedAndDiscarded() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val download = sparseModelFile(directory, "download-test.part", llamaPayload())
+
+            val result = engine.adoptDownloaded(download)
+
+            assertTrue("an unrelated GGUF must be rejected: $result", result is OnDeviceEngine.ImportResult.Rejected)
+            assertFalse(engine.hasModel())
+            assertFalse("a rejected download is discarded", download.exists())
+            assertTrue("no staging file may remain", directory.listFiles()!!.none { it.name.endsWith(".importing") })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun downloadOutsideTheModelDirectoryIsRefused() {
+        val directory = tempDir()
+        val elsewhere = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            val download = sparseModelFile(elsewhere, "download-test.part", parakeetPayload())
+
+            val result = engine.adoptDownloaded(download)
+
+            assertTrue(result is OnDeviceEngine.ImportResult.Rejected)
+            assertFalse(engine.hasModel())
+            assertTrue("a file the engine does not own is left alone", download.exists())
+        } finally {
+            directory.deleteRecursively()
+            elsewhere.deleteRecursively()
+        }
+    }
 }

@@ -38,11 +38,14 @@ response from being inserted into a field that has changed.
 
 No Python or GPU runtime is bundled. An optional **on-device engine**
 (experimental) embeds the repository's native Parakeet engine
-(`libstarling_ggml`) for offline transcription: download a Parakeet-TDT GGUF
-from [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf)
-(`parakeet-tdt-0.6b-v3-q4_k_m.gguf`, 704 MB, is a good default), import it
-through **Import model (.gguf)**, then select **This device** under
-*Transcribe on*. The model stays in app-private storage and is loaded on first
+(`libstarling_ggml`) for offline transcription. Tap **Download recommended
+model** to fetch `parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf` (553 MB) from
+[`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf).
+The download is pinned to a repository revision, resumes where it stopped
+after a dropped connection or app restart, and is checked against its
+SHA-256 before it replaces the active model (`engine/ModelCatalog.kt`).
+Any other Parakeet-TDT GGUF can be imported through **Import model
+(.gguf)** instead. Then select **This device** under *Transcribe on*. The model stays in app-private storage and is loaded on first
 use; no server or network is needed. Server transcription remains the
 default. When a transcription fails — unreachable server or missing model —
 the failure is surfaced and the local recording remains available for retry.
