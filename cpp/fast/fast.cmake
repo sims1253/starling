@@ -69,6 +69,7 @@ set(STARLING_FAST_SHADERS
   "norm|norm.comp||6"
   "softmax|softmax.comp||3"
   "pk_conv|pk_conv.comp||5"
+  "idot_probe|idot_probe.spv||2"
 )
 
 set(_spv_dir ${CMAKE_CURRENT_BINARY_DIR}/fast_spv)
@@ -95,14 +96,23 @@ foreach(_entry IN LISTS STARLING_FAST_SHADERS)
     endforeach()
   endif()
   set(_out ${_spv_dir}/${_name}.spv)
+  if(_src MATCHES "\\.spv$")
+    # Prebuilt SPIR-V (e.g. hand-assembled probes glslc cannot express).
+    add_custom_command(
+      OUTPUT ${_out}
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              ${STARLING_FAST_DIR}/shaders/${_src} ${_out}
+      DEPENDS ${STARLING_FAST_DIR}/shaders/${_src}
+      COMMENT "spv ${_name}")
+  else()
   add_custom_command(
     OUTPUT ${_out}
     COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -O ${_def_args} ${_extra}
             -I ${STARLING_FAST_DIR}/shaders
             ${STARLING_FAST_DIR}/shaders/${_src} -o ${_out}
     DEPENDS ${STARLING_FAST_DIR}/shaders/${_src} ${_fast_glsl_includes}
-    COMMENT "glslc ${_name}"
-    VERBATIM)
+    COMMENT "glslc ${_name}" VERBATIM)
+  endif()
   list(APPEND _spv_files ${_out})
   list(APPEND _embed_list "${_name}@${_out}@${_nb}")
 endforeach()

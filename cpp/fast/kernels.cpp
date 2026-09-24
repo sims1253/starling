@@ -363,6 +363,57 @@ bool Kernels::autotune(std::string& err) {
     // prints the achieved GB/s — the honest per-kernel signal on a GPU where
     // per-dispatch timestamps are misattributed.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
+        if (std::strncmp(mi, "idot", 4) == 0) {
+            // Integer-dot probe: OpSDot (packed 4x8) through a hand-assembled
+            // SPIR-V (glslang cannot express it). in = [iters, a, b, seed].
+            // STARLING_FAST_MICRO=idot[,iters[,groups]]
+            uint32_t iters = 65536, groups = 96;
+            std::sscanf(mi, "idot,%u,%u", &iters, &groups);
+            vk::Buffer ib, ob;
+            std::vector<uint32_t> iv{iters, 0x02020202u, 0x03030303u, 0x12345678u};
+            std::vector<uint32_t> ov(64 * groups, 0);
+            auto upl = [&](vk::Buffer& b, const void* d, size_t bytes) {
+                return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
+                       ctx_->upload(b, 0, d, bytes, err);
+            };
+            if (!upl(ib, iv.data(), 16) || !upl(ob, ov.data(), ov.size() * 4)) return false;
+            const vk::Pipeline* p = ctx_->pipeline("idot_probe", {}, err);
+            if (!p) return false;
+            // Correctness: iters = 0 -> out = seed ^ SDot(a,b) = seed ^ 24.
+            {
+                iv[0] = 0;
+                if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
+                vk::Recording r0(*ctx_);
+                r0.begin();
+                r0.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
+                r0.end();
+                if (!r0.submit_and_wait(err)) return false;
+                std::vector<uint32_t> got(8, 0);
+                if (!ctx_->download(ob, 0, got.data(), 32, err)) return false;
+                bool ok = true;
+                for (uint32_t g : got) ok = ok && (g == (0x12345678u ^ 24u));
+                std::fprintf(stderr, "[fast-micro] idot check: %s (want %08x, got %08x)\n",
+                             ok ? "OK" : "FAIL", 0x12345678u ^ 24u, got[0]);
+                if (!ok) return false;
+            }
+            if (iters == 0) return true;
+            iv[0] = iters;
+            if (!ctx_->upload(ib, 0, iv.data(), 16, err)) return false;
+            vk::Recording rec(*ctx_);
+            rec.begin();
+            for (int r = 0; r < 8; ++r) {
+                rec.dispatch(*p, {vk::Ref(ib), vk::Ref(ob)}, nullptr, 0, groups);
+                rec.barrier();
+            }
+            rec.end();
+            const double ms = time_ms(rec, err);
+            if (ms < 0) return false;
+            // The ILP probe runs four independent dot chains per thread.
+            const double dots = (double)8 * groups * 64 * iters * 4;
+            std::fprintf(stderr, "[fast-micro] idot: %.1f G i8-MAC/s (%.3f ms, 4 ILP chains)\n",
+                         dots / (ms * 1e-3) / 1e9, ms);
+            return true;
+        }
         if (std::strncmp(mi, "norm", 4) == 0) {
             // Norm-kernel probe: STARLING_FAST_MICRO=norm,rows,D[,reps[,mode]]
             uint32_t rows = 107, D = 2048, reps = 64, mode = 1;
