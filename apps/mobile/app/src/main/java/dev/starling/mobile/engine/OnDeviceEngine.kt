@@ -59,6 +59,9 @@ class OnDeviceEngine(
      */
     private val importLock = Any()
 
+    /** Serializes active-model marker writes (they share one temporary file). */
+    private val markerLock = Any()
+
     private var handle: Long = 0L
 
     /** The model file [handle] was loaded from; a different active model forces a reload. */
@@ -89,11 +92,13 @@ class OnDeviceEngine(
      * installed. The previous model is freed now, or when the live session
      * using it ends (see [releaseWhenIdle]).
      */
-    fun selectModel(name: String): Boolean = synchronized(lock) {
+    fun selectModel(name: String): Boolean {
         val file = installedFile(name) ?: return false
+        // The marker write (two fsyncs) stays outside the engine lock, so it
+        // never stalls a transcription.
         writeActiveName(file.name)
-        if (loadedFile != file) releaseLocked()
-        true
+        synchronized(lock) { if (loadedFile != file) releaseLocked() }
+        return true
     }
 
     /**
@@ -102,14 +107,19 @@ class OnDeviceEngine(
      * live session keeps its already-loaded model until it ends.
      */
     fun deleteModel(name: String): Boolean = synchronized(importLock) {
-        synchronized(lock) {
+        // The unlink under the engine lock, so a load never races it; the
+        // marker and the fsync outside it.
+        val file = synchronized(lock) {
             val file = installedFile(name) ?: return false
             if (!file.delete()) return false
             if (file == loadedFile) releaseLocked()
-            if (readActiveName() == file.name) activeFile.delete()
-            fsyncModelDirectory()
-            true
+            file
         }
+        synchronized(markerLock) {
+            if (readActiveName() == file.name) activeFile.delete()
+        }
+        fsyncModelDirectory()
+        true
     }
 
     /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
@@ -144,7 +154,7 @@ class OnDeviceEngine(
         runCatching { activeFile.readText(Charsets.UTF_8).trim() }.getOrNull()?.takeIf(String::isNotEmpty)
 
     /** Atomically records [name] as the active model. */
-    private fun writeActiveName(name: String) {
+    private fun writeActiveName(name: String) = synchronized(markerLock) {
         modelDir.mkdirs()
         val temporary = File(modelDir, "$ACTIVE_FILE_NAME.tmp")
         FileOutputStream(temporary).use { output ->
@@ -297,10 +307,10 @@ class OnDeviceEngine(
                 // must not mask a completed import (the next transcription
                 // reloads from the new file anyway).
                 runCatching { unload() }
-                // A fresh import is what the user wants to use next. The
-                // model is installed even if this marker write fails.
-                runCatching { writeActiveName(modelFile.name) }
             }
+            // A fresh import is what the user wants to use next. The model is
+            // installed even if this marker write fails.
+            runCatching { writeActiveName(modelFile.name) }
             return ImportResult.Imported(size, modelFile.name)
         } finally {
             // Every path that reaches here without a rename-based promotion

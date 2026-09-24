@@ -329,13 +329,19 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Imports never take an installed name, so only a verified download is
+     * written under the catalog name at the catalog size.
+     */
+    private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean {
+        val recommended = ModelCatalog.RECOMMENDED_PARAKEET
+        return model.name == recommended.fileName && model.sizeBytes == recommended.sizeBytes
+    }
+
     /** Catalog models by their label; anything else by its file name. */
     private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {
-        val recommended = ModelCatalog.RECOMMENDED_PARAKEET
-        // Imports never take an installed name, and only a verified
-        // download is written under the catalog name at the catalog size.
-        return if (model.name == recommended.fileName && model.sizeBytes == recommended.sizeBytes) {
-            getString(R.string.recommended_model_name, recommended.label)
+        return if (isRecommended(model)) {
+            getString(R.string.recommended_model_name, ModelCatalog.RECOMMENDED_PARAKEET.label)
         } else {
             model.name
         }
@@ -383,7 +389,7 @@ class MainActivity : Activity() {
             row.addView(delete)
             installedModelsContainer.addView(row)
         }
-        val recommendedInstalled = models.any { it.name == recommended.fileName && it.sizeBytes == recommended.sizeBytes }
+        val recommendedInstalled = models.any(::isRecommended)
         val downloads = application.modelDownloads
         downloadModelButton.visibility = if (
             recommendedInstalled && !downloads.isRunning && downloads.resumableBytes(recommended) == 0L
