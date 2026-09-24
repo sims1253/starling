@@ -54,8 +54,12 @@ fn main() {
             }
         }
     }
-    let Some(socket) = socket else { fail("missing --socket") };
-    let Some(mode) = mode else { fail("missing --mode") };
+    let Some(socket) = socket else {
+        fail("missing --socket")
+    };
+    let Some(mode) = mode else {
+        fail("missing --mode")
+    };
     let socket = std::path::PathBuf::from(socket);
 
     match mode.as_str() {
@@ -96,16 +100,18 @@ fn connect_transport(socket: &std::path::Path) -> Box<dyn platform::TransportCon
     }
 }
 
-/// Transport-level connect; never read, never written.
+/// Transport-level connect; never read, never written. The connection
+/// is leaked so it stays open until the SIGKILL — the kill, not a
+/// graceful close, is what the host's reader sees.
 fn raw_mode(socket: &std::path::Path) {
-    let _conn = connect_transport(socket);
+    std::mem::forget(connect_transport(socket));
     ready();
 }
 
 /// Full client handshake, then idle.
 fn hold_mode(socket: &std::path::Path) {
     match HostClient::connect(socket) {
-        Ok(_client) => {}
+        Ok(client) => std::mem::forget(client),
         Err(err) => fail(&format!("client connect failed: {err}")),
     }
     ready();
@@ -177,9 +183,13 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             source: "vscode".into(),
         },
     );
-    wait_for(&client, "context.targetSnapshot", |event: &starling_runtime_host::client::EventWire| {
-        event.type_name() == "context.targetSnapshot"
-    });
+    wait_for(
+        &client,
+        "context.targetSnapshot",
+        |event: &starling_runtime_host::client::EventWire| {
+            event.type_name() == "context.targetSnapshot"
+        },
+    );
     send(
         "ctx-double",
         Command::ModeSet {
@@ -187,9 +197,11 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             source: Manual,
         },
     );
-    wait_for(&client, "mode.decision", |event: &starling_runtime_host::client::EventWire| {
-        event.type_name() == "mode.decision"
-    });
+    wait_for(
+        &client,
+        "mode.decision",
+        |event: &starling_runtime_host::client::EventWire| event.type_name() == "mode.decision",
+    );
 
     send(
         take_corr,
@@ -197,10 +209,14 @@ fn take_mode(socket: &std::path::Path, take_corr: &str) {
             policy: "push-to-talk".into(),
         },
     );
-    wait_for(&client, "acknowledged capture.progress", |event: &starling_runtime_host::client::EventWire| {
-        event.type_name() == "capture.progress"
-            && event.payload()["ackSamples"].as_u64().unwrap_or(0) > 0
-    });
+    wait_for(
+        &client,
+        "acknowledged capture.progress",
+        |event: &starling_runtime_host::client::EventWire| {
+            event.type_name() == "capture.progress"
+                && event.payload()["ackSamples"].as_u64().unwrap_or(0) > 0
+        },
+    );
     ready();
 }
 

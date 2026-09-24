@@ -171,6 +171,7 @@ fn documents_survive_a_runtime_restart_through_storage_v2() {
 
         // The durable head is the CAS truth: base 0 — which the first
         // session accepted — must conflict now.
+        let events = client.subscribe();
         client
             .send(
                 Some("doc-2"),
@@ -181,7 +182,6 @@ fn documents_survive_a_runtime_restart_through_storage_v2() {
                 },
             )
             .expect("stale update is answered (the event decides)");
-        let events = client.subscribe();
         let event = until(&events, "docs.headConflict", Duration::from_secs(5));
         match event {
             Event::DocsHeadConflict { actual, .. } => assert_eq!(actual, 2),

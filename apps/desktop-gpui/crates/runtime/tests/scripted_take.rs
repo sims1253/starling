@@ -19,13 +19,13 @@ use std::time::{Duration, Instant};
 use starling_dictation::recorder::{CaptureGap, JournalReport, RecorderFault};
 use starling_runtime::bus::{EventMessage, EventSub};
 use starling_runtime::machine::capture::{
-    CaptureSource, CaptureStore, CaptureConfig, InMemoryCaptureStore, TakeRecord, TakeStatus,
+    CaptureConfig, CaptureSource, CaptureStore, InMemoryCaptureStore, TakeRecord, TakeStatus,
     V2CaptureStore,
 };
-use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::machine::Rejection;
+use starling_runtime::protocol::replay::{route_freeze_violations, MachineReplay};
 use starling_runtime::protocol::{Command, Event, JobLimits, Revision};
-use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript, FakeStop};
+use starling_runtime::testing::{FakeCaptureSource, FakeStop, FakeTakeScript};
 use starling_runtime::{
     provider::{FakeJob, Partial, ProviderOutcome},
     Runtime, RuntimeClient, RuntimeConfig,
@@ -98,16 +98,34 @@ fn test_config(
 fn freeze_route(client: &RuntimeClient, events: &EventSub) -> Vec<EventMessage> {
     let mut log = Vec::new();
     client
-        .send(Some("ctx-1"), Command::ContextSnapshot { source: "vscode".into() })
+        .send(
+            Some("ctx-1"),
+            Command::ContextSnapshot {
+                source: "vscode".into(),
+            },
+        )
         .expect("snapshot accepted");
-    log.extend(until(events, "context.targetSnapshot", |m| m.type_name() == "context.targetSnapshot", Duration::from_secs(5)));
+    log.extend(until(
+        events,
+        "context.targetSnapshot",
+        |m| m.type_name() == "context.targetSnapshot",
+        Duration::from_secs(5),
+    ));
     client
-        .send(Some("ctx-1"), Command::ModeSet {
-            mode: "code-guidance".into(),
-            source: starling_runtime::protocol::Manual,
-        })
+        .send(
+            Some("ctx-1"),
+            Command::ModeSet {
+                mode: "code-guidance".into(),
+                source: starling_runtime::protocol::Manual,
+            },
+        )
         .expect("mode accepted");
-    log.extend(until(events, "mode.decision", |m| m.type_name() == "mode.decision", Duration::from_secs(5)));
+    log.extend(until(
+        events,
+        "mode.decision",
+        |m| m.type_name() == "mode.decision",
+        Duration::from_secs(5),
+    ));
     log
 }
 
@@ -126,9 +144,19 @@ fn run_take(
     let mut log = Vec::new();
     source.push(script);
     client
-        .send(Some(take), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some(take),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    log.extend(until(events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5)));
+    log.extend(until(
+        events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    ));
     log.extend(until(
         events,
         "capture.progress (samples accumulated)",
@@ -138,7 +166,12 @@ fn run_take(
     client
         .send(Some(take), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
-    log.extend(until(events, "capture.stopped", |m| m.type_name() == "capture.stopped", Duration::from_secs(5)));
+    log.extend(until(
+        events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped",
+        Duration::from_secs(5),
+    ));
     log
 }
 
@@ -155,7 +188,11 @@ fn wait_for_state(client: &RuntimeClient, state: &str, deadline: Duration) {
             ("delivery", snapshot.delivery.state.clone()),
             ("jobs", snapshot.jobs.state.clone()),
         ];
-        if current.iter().any(|(name, s)| s == state || name == &state && s == state) && current.iter().any(|(_, s)| s == state) {
+        if current
+            .iter()
+            .any(|(name, s)| s == state || name == &state && s == state)
+            && current.iter().any(|(_, s)| s == state)
+        {
             return;
         }
         if start.elapsed() >= deadline {
@@ -213,9 +250,9 @@ fn poll_until(deadline: Duration, predicate: impl Fn() -> bool) -> bool {
 fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
     let source = FakeCaptureSource::new(vec![]);
     let store = InMemoryCaptureStore::new();
-    let provider = starling_runtime::provider::FakeProvider::new(vec![
-        FakeJob::transforms_to("Hello, world."),
-    ]);
+    let provider = starling_runtime::provider::FakeProvider::new(vec![FakeJob::transforms_to(
+        "Hello, world.",
+    )]);
     let config = test_config(
         std::sync::Arc::clone(&source),
         provider,
@@ -233,34 +270,64 @@ fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
     let mut log = freeze_route(&client, &events);
 
     // -- capture: one scripted take -------------------------------------
-    log.extend(run_take(&source, &client, &events, "take_77", FakeTakeScript::clean()));
+    log.extend(run_take(
+        &source,
+        &client,
+        &events,
+        "take_77",
+        FakeTakeScript::clean(),
+    ));
 
     // -- jobs: submit the take on the frozen route ----------------------
     client
-        .send(Some("job-1"), Command::JobsSubmit {
-            capture_ref: "take_77".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsSubmit {
+                capture_ref: "take_77".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
-    log.extend(until(&events, "jobs.completed", |m| m.type_name() == "jobs.completed", Duration::from_secs(5)));
+    log.extend(until(
+        &events,
+        "jobs.completed",
+        |m| m.type_name() == "jobs.completed",
+        Duration::from_secs(5),
+    ));
 
     // -- docs: head update referencing the attempt, then a turn ---------
     client
-        .send(Some("up-1"), Command::DocsUpdateHead {
-            doc_id: "notes".into(),
-            expected_base: 0,
-            new_revision: revision(0, "Hello, world.", &["att-1"]),
-        })
+        .send(
+            Some("up-1"),
+            Command::DocsUpdateHead {
+                doc_id: "notes".into(),
+                expected_base: 0,
+                new_revision: revision(0, "Hello, world.", &["att-1"]),
+            },
+        )
         .expect("update accepted");
-    log.extend(until(&events, "docs.headUpdated", |m| m.type_name() == "docs.headUpdated", Duration::from_secs(5)));
+    log.extend(until(
+        &events,
+        "docs.headUpdated",
+        |m| m.type_name() == "docs.headUpdated",
+        Duration::from_secs(5),
+    ));
     client
-        .send(Some("turn-1"), Command::DocsAppendTurn {
-            doc_id: "notes".into(),
-            take_ref: "take_77".into(),
-        })
+        .send(
+            Some("turn-1"),
+            Command::DocsAppendTurn {
+                doc_id: "notes".into(),
+                take_ref: "take_77".into(),
+            },
+        )
         .expect("turn accepted");
-    log.extend(until(&events, "docs.turnAppended", |m| m.type_name() == "docs.turnAppended", Duration::from_secs(5)));
+    log.extend(until(
+        &events,
+        "docs.turnAppended",
+        |m| m.type_name() == "docs.turnAppended",
+        Duration::from_secs(5),
+    ));
     let stream = log;
 
     // -- assertions ------------------------------------------------------
@@ -291,7 +358,12 @@ fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
     for message in &stream {
         match message.type_name() {
             "mode.routeFrozen" | "capture.started" | "capture.stopped" => {
-                assert_eq!(message.corr.as_deref(), Some("take_77"), "{}", message.type_name());
+                assert_eq!(
+                    message.corr.as_deref(),
+                    Some("take_77"),
+                    "{}",
+                    message.type_name()
+                );
             }
             "jobs.queued" | "jobs.completed" => {
                 assert_eq!(message.corr.as_deref(), Some("job-1"));
@@ -315,39 +387,51 @@ fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
 
     // 4. The walked command/event sequences replay green through the
     //    oracle port (the deterministic skeleton as a fixture-style trace).
-    replay_walk("context", &[
-        Step::Cmd("context.snapshot", "ctx-1"),
-        Step::Evt("context.targetSnapshot", "ctx-1"),
-        Step::Cmd("mode.set", "ctx-1"),
-        Step::Evt("mode.decision", "ctx-1"),
-        Step::Evt("mode.routeFrozen", "take_77"),
-        Step::Advance("Released"),
-    ]);
-    replay_walk("capture", &[
-        Step::Cmd("capture.start", "take_77"),
-        Step::Evt("capture.started", "take_77"),
-        Step::Cmd("capture.stop", "take_77"),
-        Step::Evt("capture.stopped", "take_77"),
-    ]);
+    replay_walk(
+        "context",
+        &[
+            Step::Cmd("context.snapshot", "ctx-1"),
+            Step::Evt("context.targetSnapshot", "ctx-1"),
+            Step::Cmd("mode.set", "ctx-1"),
+            Step::Evt("mode.decision", "ctx-1"),
+            Step::Evt("mode.routeFrozen", "take_77"),
+            Step::Advance("Released"),
+        ],
+    );
+    replay_walk(
+        "capture",
+        &[
+            Step::Cmd("capture.start", "take_77"),
+            Step::Evt("capture.started", "take_77"),
+            Step::Cmd("capture.stop", "take_77"),
+            Step::Evt("capture.stopped", "take_77"),
+        ],
+    );
     // The dispatch chain is runtime-internal (the fixtures step over it
     // with $advance directives); the scripted provider transformed, so the
     // walk includes the Transforming edge the live scheduler took.
-    replay_walk("jobs", &[
-        Step::Cmd("jobs.submit", "job-1"),
-        Step::Evt("jobs.queued", "job-1"),
-        Step::Advance("Dispatched"),
-        Step::Advance("Loading"),
-        Step::Advance("Recognizing"),
-        Step::Advance("Transforming"),
-        Step::Evt("jobs.completed", "job-1"),
-    ]);
-    replay_walk("docs", &[
-        Step::Cmd("docs.updateHead", "up-1"),
-        Step::Evt("docs.headUpdated", "up-1"),
-        Step::Advance("Steady"),
-        Step::Cmd("docs.appendTurn", "turn-1"),
-        Step::Evt("docs.turnAppended", "turn-1"),
-    ]);
+    replay_walk(
+        "jobs",
+        &[
+            Step::Cmd("jobs.submit", "job-1"),
+            Step::Evt("jobs.queued", "job-1"),
+            Step::Advance("Dispatched"),
+            Step::Advance("Loading"),
+            Step::Advance("Recognizing"),
+            Step::Advance("Transforming"),
+            Step::Evt("jobs.completed", "job-1"),
+        ],
+    );
+    replay_walk(
+        "docs",
+        &[
+            Step::Cmd("docs.updateHead", "up-1"),
+            Step::Evt("docs.headUpdated", "up-1"),
+            Step::Advance("Steady"),
+            Step::Cmd("docs.appendTurn", "turn-1"),
+            Step::Evt("docs.turnAppended", "turn-1"),
+        ],
+    );
 
     // 5. Route-freeze-before-submit over the live stream (the audio-leave
     //    proxy): no violations among the emitted envelopes.
@@ -479,28 +563,40 @@ fn admission_rejection_queue_full_is_rejected_not_absorbed() {
     // queue; job-3 must be answered with jobs.rejected{queue_full} on its
     // corr.
     client
-        .send(Some("job-1"), Command::JobsSubmit {
-            capture_ref: "take_a".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsSubmit {
+                capture_ref: "take_a".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-1 accepted");
     client
-        .send(Some("job-2"), Command::JobsSubmit {
-            capture_ref: "take_b".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-2"),
+            Command::JobsSubmit {
+                capture_ref: "take_b".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-2 accepted");
     let receipt = client
-        .send(Some("job-3"), Command::JobsSubmit {
-            capture_ref: "take_c".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-3"),
+            Command::JobsSubmit {
+                capture_ref: "take_c".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit itself is accepted; the rejection is an event");
 
-    assert!(matches!(receipt, starling_runtime::machine::Receipt::Accepted));
+    assert!(matches!(
+        receipt,
+        starling_runtime::machine::Receipt::Accepted
+    ));
     let rejected = until(
         &events,
         "jobs.rejected(job-3)",
@@ -524,14 +620,18 @@ fn admission_rejection_queue_full_is_rejected_not_absorbed() {
 fn duplicate_submission_of_an_active_capture_is_rejected() {
     let source = FakeCaptureSource::new(vec![]);
     let store = InMemoryCaptureStore::new();
-    let provider = starling_runtime::provider::FakeProvider::new(vec![
-        FakeJob::completes_with("first"),
-    ]);
-    let config = test_config(std::sync::Arc::clone(&source), provider, store, JobLimits {
-        max_queued: 8,
-        max_concurrent: 1,
-        per_route: vec![],
-    });
+    let provider =
+        starling_runtime::provider::FakeProvider::new(vec![FakeJob::completes_with("first")]);
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        store,
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
     let (runtime, client) = Runtime::start(config);
     let events = client.subscribe();
 
@@ -539,18 +639,24 @@ fn duplicate_submission_of_an_active_capture_is_rejected() {
     run_take(&source, &client, &events, "take_a", FakeTakeScript::clean());
 
     client
-        .send(Some("job-1"), Command::JobsSubmit {
-            capture_ref: "take_a".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsSubmit {
+                capture_ref: "take_a".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-1 accepted");
     client
-        .send(Some("job-2"), Command::JobsSubmit {
-            capture_ref: "take_a".into(), // same captureRef while job-1 runs
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-2"),
+            Command::JobsSubmit {
+                capture_ref: "take_a".into(), // same captureRef while job-1 runs
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-2 accepted");
     let collected = until(
         &events,
@@ -590,7 +696,12 @@ fn nack_path_answers_unsupported_version() {
         "got {rejection:?}"
     );
     // The runtime.nack event on the stream, corr = the rejected id.
-    let collected = until(&events, "runtime.nack", |m| m.type_name() == "runtime.nack", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "runtime.nack",
+        |m| m.type_name() == "runtime.nack",
+        Duration::from_secs(5),
+    );
     let nack = collected
         .iter()
         .rev()
@@ -675,9 +786,19 @@ fn submit_against_an_unfrozen_route_is_rejected_before_admission() {
     // No context cycle ran, so no route was frozen: audio must not leave.
     // (Capture can still run — the invariant binds the audio-leave proxy.)
     client
-        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_a"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     // Let the take accumulate samples via an event-based wait rather than
     // a fixed sleep (#217): the first capture.progress proves the fake's
     // acknowledged count went nonzero before the stop.
@@ -690,7 +811,12 @@ fn submit_against_an_unfrozen_route_is_rejected_before_admission() {
     client
         .send(Some("take_a"), Command::CaptureStop { drain: None })
         .expect("stop accepted");
-    until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped",
+        Duration::from_secs(5),
+    );
 
     match client.send(
         Some("job-9"),
@@ -732,9 +858,19 @@ fn quiesce_timeout_salvages_samples_as_interrupted_take() {
 
     freeze_route(&client, &events);
     client
-        .send(Some("take_q"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_q"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     // The salvage below keeps whatever the fake accumulated: prove samples
     // exist via the first capture.progress instead of a fixed sleep a
     // loaded runner may not fit inside (#217).
@@ -747,7 +883,12 @@ fn quiesce_timeout_salvages_samples_as_interrupted_take() {
     client
         .send(Some("take_q"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
-    let collected = until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped",
+        Duration::from_secs(5),
+    );
 
     // The quiesce timeout surfaced as a non-fatal capture.error before the
     // salvaged capture.stopped.
@@ -821,9 +962,19 @@ fn fatal_device_error_mid_take_interrupts() {
 
     freeze_route(&client, &events);
     client
-        .send(Some("take_5"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_5"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
-    let collected = until(&events, "capture.error", |m| m.type_name() == "capture.error", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "capture.error",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
     match &collected.last().unwrap().event {
         Event::CaptureError { code, fatal } => {
             assert_eq!(code, "device_stream_lost");
@@ -840,9 +991,8 @@ fn fatal_device_error_mid_take_interrupts() {
 #[test]
 fn jobs_failure_from_provider_error_is_retryable_and_isolated() {
     let source = FakeCaptureSource::new(vec![]);
-    let provider = starling_runtime::provider::FakeProvider::new(vec![
-        FakeJob::fails("worker_crash", true),
-    ]);
+    let provider =
+        starling_runtime::provider::FakeProvider::new(vec![FakeJob::fails("worker_crash", true)]);
     let config = test_config(
         std::sync::Arc::clone(&source),
         provider,
@@ -859,13 +1009,21 @@ fn jobs_failure_from_provider_error_is_retryable_and_isolated() {
     freeze_route(&client, &events);
     run_take(&source, &client, &events, "take_a", FakeTakeScript::clean());
     client
-        .send(Some("job-5"), Command::JobsSubmit {
-            capture_ref: "take_a".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-5"),
+            Command::JobsSubmit {
+                capture_ref: "take_a".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
-    let collected = until(&events, "jobs.failed", |m| m.type_name() == "jobs.failed", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "jobs.failed",
+        |m| m.type_name() == "jobs.failed",
+        Duration::from_secs(5),
+    );
     match &collected
         .iter()
         .rev()
@@ -973,11 +1131,14 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
     drain(&events);
 
     client
-        .send(Some("job-1"), Command::JobsSubmit {
-            capture_ref: "take_s".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsSubmit {
+                capture_ref: "take_s".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
 
     // Gate the stall on the storm provably being in flight: the projection
@@ -1063,11 +1224,14 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
     // Capacity was truly restored: a second job dispatches onto the freed
     // slot and completes (a leaked slot would park it at Queued forever).
     client
-        .send(Some("job-2"), Command::JobsSubmit {
-            capture_ref: "take_s".into(), // job-1 is terminal, so no duplicate
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-2"),
+            Command::JobsSubmit {
+                capture_ref: "take_s".into(), // job-1 is terminal, so no duplicate
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-2 accepted");
     until(
         &events,
@@ -1129,10 +1293,11 @@ impl CaptureStore for RecordingStore {
         Ok(())
     }
     fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
-        self.records
-            .lock()
-            .unwrap()
-            .push((TakeStatus::Interrupted, take.clone(), note.to_string()));
+        self.records.lock().unwrap().push((
+            TakeStatus::Interrupted,
+            take.clone(),
+            note.to_string(),
+        ));
         Ok(())
     }
     fn describe(&self) -> String {
@@ -1150,12 +1315,7 @@ fn wait_for_context_state(client: &RuntimeClient, state: &str, deadline: Duratio
     wait_for_machine_state(client, "context", state, deadline);
 }
 
-fn wait_for_machine_state(
-    client: &RuntimeClient,
-    machine: &str,
-    state: &str,
-    deadline: Duration,
-) {
+fn wait_for_machine_state(client: &RuntimeClient, machine: &str, state: &str, deadline: Duration) {
     let start = Instant::now();
     loop {
         let current = match machine {
@@ -1199,7 +1359,12 @@ fn failed_device_open_returns_to_idle_and_a_retry_succeeds() {
     freeze_route(&client, &events);
 
     client
-        .send(Some("take_9"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_9"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start itself is accepted; the failure surfaces as an event");
     let collected = until(
         &events,
@@ -1237,13 +1402,28 @@ fn failed_device_open_returns_to_idle_and_a_retry_succeeds() {
     // IllegalInState{Interrupted}.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_10"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_10"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("retry start accepted — the machine left Interrupted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     client
         .send(Some("take_10"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
-    until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped",
+        Duration::from_secs(5),
+    );
     {
         let takes = store.takes.lock().unwrap();
         assert!(
@@ -1265,7 +1445,10 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
     let source = FakeCaptureSource::new(vec![FakeTakeScript {
         gaps: vec![(
             Duration::from_millis(5),
-            CaptureGap { start_sample: 160, end_sample: 320 },
+            CaptureGap {
+                start_sample: 160,
+                end_sample: 320,
+            },
         )],
         stop: FakeStop::DeviceError("DeviceUnavailable".into()),
         ..FakeTakeScript::clean()
@@ -1287,14 +1470,29 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
     freeze_route(&client, &events);
 
     client
-        .send(Some("take_d"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_d"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     std::thread::sleep(Duration::from_millis(40));
     client
         .send(Some("take_d"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
-    let collected = until(&events, "capture.error", |m| m.type_name() == "capture.error", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "capture.error",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
     match &collected.last().unwrap().event {
         Event::CaptureError { code, fatal } => {
             assert_eq!(code, "device_error_on_stop");
@@ -1314,7 +1512,10 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
         );
         std::thread::sleep(Duration::from_millis(25));
     };
-    assert!(record.samples.is_empty(), "no audio rides a device stop error");
+    assert!(
+        record.samples.is_empty(),
+        "no audio rides a device stop error"
+    );
     assert!(
         record.acknowledged_samples > 0,
         "the last acknowledged boundary is kept: {:?}",
@@ -1330,8 +1531,11 @@ fn device_error_on_stop_still_registers_an_interrupted_take() {
     );
     if record.final_sample_index > record.acknowledged_samples {
         assert!(
-            record.gaps.iter().any(|gap| gap.start_sample == record.acknowledged_samples
-                && gap.end_sample == record.final_sample_index),
+            record
+                .gaps
+                .iter()
+                .any(|gap| gap.start_sample == record.acknowledged_samples
+                    && gap.end_sample == record.final_sample_index),
             "the unacknowledged tail is recorded as a gap: {:?}",
             record.gaps
         );
@@ -1358,9 +1562,14 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
         FakeTakeScript {
             gaps: vec![(
                 Duration::from_millis(5),
-                CaptureGap { start_sample: 160, end_sample: 320 },
+                CaptureGap {
+                    start_sample: 160,
+                    end_sample: 320,
+                },
             )],
-            stop: FakeStop::QuiesceTimeout { journal_id: "j_abort_q".into() },
+            stop: FakeStop::QuiesceTimeout {
+                journal_id: "j_abort_q".into(),
+            },
             ..FakeTakeScript::clean()
         },
         FakeTakeScript {
@@ -1388,9 +1597,19 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
     // take_a: abort whose stop times out — the preserved samples ride in
     // the error and must still be salvaged.
     client
-        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_a"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     std::thread::sleep(Duration::from_millis(40));
     client
         .send(Some("take_a"), Command::CaptureAbort)
@@ -1403,7 +1622,11 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
         assert!(Instant::now() < deadline, "take_a never salvaged");
         std::thread::sleep(Duration::from_millis(25));
     };
-    assert!(!salvaged.samples.is_empty(), "quiesce-salvaged samples kept: {:?}", salvaged.samples.len());
+    assert!(
+        !salvaged.samples.is_empty(),
+        "quiesce-salvaged samples kept: {:?}",
+        salvaged.samples.len()
+    );
     assert_eq!(
         salvaged.journal.as_ref().expect("journal linkage").id,
         "j_abort_q"
@@ -1424,9 +1647,19 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
     // take_b: abort whose stop fails device-side — metadata-only, still
     // registered.
     client
-        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_b"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     std::thread::sleep(Duration::from_millis(40));
     client
         .send(Some("take_b"), Command::CaptureAbort)
@@ -1435,7 +1668,10 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
         if let Some(record) = store.interrupted("take_b") {
             break record;
         }
-        assert!(Instant::now() < deadline, "take_b never registered as interrupted");
+        assert!(
+            Instant::now() < deadline,
+            "take_b never registered as interrupted"
+        );
         std::thread::sleep(Duration::from_millis(25));
     };
     assert!(metadata_only.samples.is_empty());
@@ -1447,14 +1683,29 @@ fn aborted_take_with_a_failing_stop_handshake_is_still_salvaged() {
     // take runs end to end.
     freeze_route(&client, &events);
     client
-        .send(Some("take_c"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_c"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start after aborted takes accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     std::thread::sleep(Duration::from_millis(40));
     client
         .send(Some("take_c"), Command::CaptureStop { drain: Some(true) })
         .expect("stop accepted");
-    until(&events, "capture.stopped", |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_c"), Duration::from_secs(5));
+    until(
+        &events,
+        "capture.stopped",
+        |m| m.type_name() == "capture.stopped" && m.corr.as_deref() == Some("take_c"),
+        Duration::from_secs(5),
+    );
     let completed = loop {
         if let Some(record) = store.completed("take_c") {
             break record;
@@ -1474,7 +1725,10 @@ fn fatal_mid_take_salvage_keeps_gap_evidence() {
     let source = FakeCaptureSource::new(vec![FakeTakeScript {
         gaps: vec![(
             Duration::from_millis(5),
-            CaptureGap { start_sample: 160, end_sample: 320 },
+            CaptureGap {
+                start_sample: 160,
+                end_sample: 320,
+            },
         )],
         error_after: Some((
             Duration::from_millis(15),
@@ -1502,9 +1756,19 @@ fn fatal_mid_take_salvage_keeps_gap_evidence() {
 
     freeze_route(&client, &events);
     client
-        .send(Some("take_5"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_5"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
-    let collected = until(&events, "capture.error", |m| m.type_name() == "capture.error", Duration::from_secs(5));
+    let collected = until(
+        &events,
+        "capture.error",
+        |m| m.type_name() == "capture.error",
+        Duration::from_secs(5),
+    );
     match &collected.last().unwrap().event {
         Event::CaptureError { code, fatal } => {
             assert_eq!(code, "device_stream_lost");
@@ -1528,7 +1792,10 @@ fn fatal_mid_take_salvage_keeps_gap_evidence() {
         "the surfaced gap span reaches the persisted record: {:?}",
         record.gaps
     );
-    assert!(!record.samples.is_empty(), "the clean-stop salvage keeps the audio");
+    assert!(
+        !record.samples.is_empty(),
+        "the clean-stop salvage keeps the audio"
+    );
     assert_eq!(
         record.journal.as_ref().expect("journal linkage").id,
         "j_lost2"
@@ -1573,11 +1840,14 @@ fn terminal_jobs_retire_from_the_map_while_the_wire_view_and_duplicate_guard_hol
     // Job one completes and is retired: the map empties, the wire view
     // keeps its terminal state.
     client
-        .send(Some("job-r1"), Command::JobsSubmit {
-            capture_ref: "take_r".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-r1"),
+            Command::JobsSubmit {
+                capture_ref: "take_r".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-r1 accepted");
     until(
         &events,
@@ -1595,18 +1865,26 @@ fn terminal_jobs_retire_from_the_map_while_the_wire_view_and_duplicate_guard_hol
     // A retired job is gone, not merely finished: cancel answers
     // UnknownJob (the documented shape of terminal removal).
     assert!(matches!(
-        client.send(Some("job-r1"), Command::JobsCancel { job_id: "job-r1".into() }),
+        client.send(
+            Some("job-r1"),
+            Command::JobsCancel {
+                job_id: "job-r1".into()
+            }
+        ),
         Err(Rejection::UnknownJob { .. })
     ));
 
     // The terminal job is forgotten for admission too: the same
     // captureRef submits again without a duplicate_submission rejection.
     client
-        .send(Some("job-r2"), Command::JobsSubmit {
-            capture_ref: "take_r".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-r2"),
+            Command::JobsSubmit {
+                capture_ref: "take_r".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-r2 accepted");
     until(
         &events,
@@ -1624,18 +1902,24 @@ fn terminal_jobs_retire_from_the_map_while_the_wire_view_and_duplicate_guard_hol
     // The guard still fires while a job is in flight: an active duplicate
     // is rejected (max_concurrent 1 keeps job-r3 in the machine).
     client
-        .send(Some("job-r3"), Command::JobsSubmit {
-            capture_ref: "take_r".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-r3"),
+            Command::JobsSubmit {
+                capture_ref: "take_r".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-r3 accepted");
     client
-        .send(Some("job-r4"), Command::JobsSubmit {
-            capture_ref: "take_r".into(), // same captureRef while job-r3 runs
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-r4"),
+            Command::JobsSubmit {
+                capture_ref: "take_r".into(), // same captureRef while job-r3 runs
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("job-r4 accepted");
     let collected = until(
         &events,
@@ -1720,11 +2004,14 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
     );
 
     client
-        .send(Some("job-big"), Command::JobsSubmit {
-            capture_ref: "take_big".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-big"),
+            Command::JobsSubmit {
+                capture_ref: "take_big".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
 
     // The cancel races the worker's encode of the ~60 MB WAV. With the
@@ -1733,7 +2020,12 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
     // answered in scheduler time. The bound is set well under half the
     // encode's expected duration.
     let cancel_started = Instant::now();
-    let cancelled = client.send(Some("job-big"), Command::JobsCancel { job_id: "job-big".into() });
+    let cancelled = client.send(
+        Some("job-big"),
+        Command::JobsCancel {
+            job_id: "job-big".into(),
+        },
+    );
     let cancel_latency = cancel_started.elapsed();
     cancelled.expect("cancel is legal while the worker encodes");
     assert!(
@@ -1768,7 +2060,12 @@ fn cancel_is_answered_while_the_wav_encode_is_in_flight() {
     // observe which shape holds, then hold the line either way — the
     // entered branch keeps #216's full-sized-WAV proof for whenever it
     // is reached.
-    let saw_request = || provider_handle.requests().iter().any(|(id, _)| id == "job-big");
+    let saw_request = || {
+        provider_handle
+            .requests()
+            .iter()
+            .any(|(id, _)| id == "job-big")
+    };
     if poll_until(Duration::from_secs(4), saw_request) {
         // The cancel lost the race to the encode: the recognition was
         // entered, so it must unwind at the cancel flag — promptly, not
@@ -1848,17 +2145,32 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
     let events = client.subscribe();
 
     freeze_route(&client, &events);
-    run_take(&source, &client, &events, "take_ca", FakeTakeScript::clean());
-    run_take(&source, &client, &events, "take_cb", FakeTakeScript::clean());
+    run_take(
+        &source,
+        &client,
+        &events,
+        "take_ca",
+        FakeTakeScript::clean(),
+    );
+    run_take(
+        &source,
+        &client,
+        &events,
+        "take_cb",
+        FakeTakeScript::clean(),
+    );
 
     // Job-1 occupies the only worker slot with its 30 s recognition;
     // job-2 queues behind it.
     client
-        .send(Some("job-1"), Command::JobsSubmit {
-            capture_ref: "take_ca".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsSubmit {
+                capture_ref: "take_ca".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
     wait_for_projection(
         &client,
@@ -1873,11 +2185,14 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
         Duration::from_secs(5),
     );
     client
-        .send(Some("job-2"), Command::JobsSubmit {
-            capture_ref: "take_cb".into(),
-            route: "local-default".into(),
-            budget: "standard".into(),
-        })
+        .send(
+            Some("job-2"),
+            Command::JobsSubmit {
+                capture_ref: "take_cb".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
         .expect("submit accepted");
     until(
         &events,
@@ -1888,7 +2203,12 @@ fn cancelled_recognition_stops_the_worker_and_delivers_nothing() {
 
     // Cancel mid-recognition.
     client
-        .send(Some("job-1"), Command::JobsCancel { job_id: "job-1".into() })
+        .send(
+            Some("job-1"),
+            Command::JobsCancel {
+                job_id: "job-1".into(),
+            },
+        )
         .expect("cancel accepted");
 
     // The worker stops early: the provider's `recognize` for job-1
@@ -2004,15 +2324,28 @@ fn capture_commands_stay_answered_while_a_long_v2_persist_writes() {
     // has no real file behind it, so this take exercises the samples
     // path — the store's whole-audio route.
     source.push(FakeTakeScript {
-        stop: FakeStop::Clean { journal_id: "j_v2big".into(), ack_fraction: 1.0 },
+        stop: FakeStop::Clean {
+            journal_id: "j_v2big".into(),
+            ack_fraction: 1.0,
+        },
         samples_per_second: 4_000_000_000,
         sample_cap: 30_000_000,
         ..FakeTakeScript::clean()
     });
     client
-        .send(Some("take_v2"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_v2"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (samples accumulated)",
@@ -2033,7 +2366,12 @@ fn capture_commands_stay_answered_while_a_long_v2_persist_writes() {
     // queued behind the whole write and only then got its table
     // rejection; now the actor answers from a live loop.
     let probe_started = Instant::now();
-    let probed = client.send(Some("take_v2b"), Command::CaptureStart { policy: "dictation".into() });
+    let probed = client.send(
+        Some("take_v2b"),
+        Command::CaptureStart {
+            policy: "dictation".into(),
+        },
+    );
     let probe_latency = probe_started.elapsed();
     assert!(
         matches!(&probed, Err(Rejection::IllegalInState { state, .. }) if state == "Draining"),
@@ -2159,8 +2497,14 @@ fn v2_store_adopts_real_journal_evidence() {
     // the journal rather than trusting the take's in-memory figures).
     assert!(!journal.path.exists(), "adoption moves the source");
     let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
-    let record = inner.get_capture(&journal.id).expect("row").expect("committed");
-    assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Complete);
+    let record = inner
+        .get_capture(&journal.id)
+        .expect("row")
+        .expect("committed");
+    assert_eq!(
+        record.status,
+        starling_dictation::store_v2::CaptureStatus::Complete
+    );
     assert_eq!(record.frame_count, 300);
     let audio = inner.load_audio(&journal.id).expect("audio");
     assert_eq!(audio.samples, samples, "the stored audio is the journal's");
@@ -2186,15 +2530,25 @@ fn v2_store_forces_interrupted_on_a_salvaged_adopted_take() {
 
     let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
     // The row is keyed by the journal's id (adoption names it).
-    let record = inner.get_capture(&journal.id).expect("row").expect("committed");
-    assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Interrupted);
+    let record = inner
+        .get_capture(&journal.id)
+        .expect("row")
+        .expect("committed");
+    assert_eq!(
+        record.status,
+        starling_dictation::store_v2::CaptureStatus::Interrupted
+    );
     let note = record.recovery_note().expect("the salvage note");
     assert!(note.contains("salvaged take was kept"), "{note}");
 }
 
 /// A real journal renamed to a caller-chosen id at `dest` (on the same
 /// filesystem), for tests that need a controlled capture id.
-fn journal_as(id: &str, samples: &[f32], dest: &std::path::Path) -> (JournalReport, tempfile::TempDir) {
+fn journal_as(
+    id: &str,
+    samples: &[f32],
+    dest: &std::path::Path,
+) -> (JournalReport, tempfile::TempDir) {
     let (mut report, scratch) = real_journal(samples);
     let new_path = dest.join(format!("{id}.sj"));
     std::fs::rename(&report.path, &new_path).expect("rename the journal into place");
@@ -2215,11 +2569,18 @@ fn a_destination_conflict_falls_back_once_with_a_recorded_diagnostic() {
     let (journal, _scratch) = journal_as("j_conflict", &samples, dir.path());
     // The conflict: orphaned audio under the journal's id with no row —
     // the crash-window shape adoption's own check refuses.
-    std::fs::write(dir.path().join("audio").join("j_conflict.sj"), b"orphaned audio")
-        .expect("pre-place the destination conflict");
+    std::fs::write(
+        dir.path().join("audio").join("j_conflict.sj"),
+        b"orphaned audio",
+    )
+    .expect("pre-place the destination conflict");
 
     store
-        .commit_take(&take_record("take_conflict", &samples, Some(journal.clone())))
+        .commit_take(&take_record(
+            "take_conflict",
+            &samples,
+            Some(journal.clone()),
+        ))
         .expect("the take is stored from its samples");
 
     let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
@@ -2331,9 +2692,15 @@ fn a_retry_against_a_row_holding_different_audio_stores_the_real_take() {
 
     let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
     let rows = inner.list_records(0, 10).expect("list");
-    assert_eq!(rows.total, 2, "the adopted row and the fallback row: {rows:?}");
+    assert_eq!(
+        rows.total, 2,
+        "the adopted row and the fallback row: {rows:?}"
+    );
 
-    let adopted = inner.get_capture(&id).expect("row").expect("adopted row present");
+    let adopted = inner
+        .get_capture(&id)
+        .expect("row")
+        .expect("adopted row present");
     assert_eq!(
         adopted.frame_count,
         first.len() as u64,
@@ -2550,7 +2917,13 @@ impl SlowStore {
 
     fn waited_for_attempt(&self, id: &str, deadline: Instant) {
         loop {
-            if self.attempts.lock().unwrap().iter().any(|attempted| attempted == id) {
+            if self
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|attempted| attempted == id)
+            {
                 return;
             }
             assert!(
@@ -2621,9 +2994,19 @@ fn abort_during_a_pending_persist_lands_the_take_silently() {
 
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_ab"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_ab"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (samples accumulated)",
@@ -2652,7 +3035,10 @@ fn abort_during_a_pending_persist_lands_the_take_silently() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let landed = store.landed.lock().unwrap().clone();
-        if landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_ab") {
+        if landed
+            .iter()
+            .any(|(status, id)| *status == TakeStatus::Complete && id == "take_ab")
+        {
             break;
         }
         assert!(
@@ -2678,9 +3064,19 @@ fn abort_during_a_pending_persist_lands_the_take_silently() {
     // the next take runs end to end.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_next"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_next"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start after the silent persist accepted");
-    until(&events, "capture.started (take_next)", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started (take_next)",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (take_next)",
@@ -2688,7 +3084,10 @@ fn abort_during_a_pending_persist_lands_the_take_silently() {
         Duration::from_secs(5),
     );
     client
-        .send(Some("take_next"), Command::CaptureStop { drain: Some(true) })
+        .send(
+            Some("take_next"),
+            Command::CaptureStop { drain: Some(true) },
+        )
         .expect("stop accepted");
     until(
         &events,
@@ -2777,9 +3176,19 @@ fn shutdown_returns_while_a_store_write_hangs() {
 
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_hang"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_hang"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (samples accumulated)",
@@ -2787,7 +3196,10 @@ fn shutdown_returns_while_a_store_write_hangs() {
         Duration::from_secs(5),
     );
     client
-        .send(Some("take_hang"), Command::CaptureStop { drain: Some(true) })
+        .send(
+            Some("take_hang"),
+            Command::CaptureStop { drain: Some(true) },
+        )
         .expect("stop accepted");
     wait_for_capture_state(&client, "Draining", Duration::from_secs(5));
 
@@ -2847,9 +3259,19 @@ fn stale_persist_report_lands_nothing_on_the_next_take() {
     // take_a: stopped, then aborted mid-persist, then replaced.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_a"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (take_a)",
@@ -2867,7 +3289,12 @@ fn stale_persist_report_lands_nothing_on_the_next_take() {
     // take_b replaces take_a well before the slow report lands.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_b"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start after the abort accepted");
     until(
         &events,
@@ -2917,8 +3344,12 @@ fn stale_persist_report_lands_nothing_on_the_next_take() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let landed = store.landed.lock().unwrap().clone();
-        let a = landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_a");
-        let b = landed.iter().any(|(status, id)| *status == TakeStatus::Complete && id == "take_b");
+        let a = landed
+            .iter()
+            .any(|(status, id)| *status == TakeStatus::Complete && id == "take_a");
+        let b = landed
+            .iter()
+            .any(|(status, id)| *status == TakeStatus::Complete && id == "take_b");
         if a && b {
             break;
         }
@@ -2963,9 +3394,19 @@ fn a_failed_stale_persist_cannot_poison_the_next_take() {
     // take_a: stopped (commit will fail), aborted mid-persist.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_a"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (take_a)",
@@ -2984,7 +3425,12 @@ fn a_failed_stale_persist_cannot_poison_the_next_take() {
     // failed report arrives.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_b"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_b"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start after the abort accepted");
     until(
         &events,
@@ -3058,9 +3504,19 @@ fn an_aborts_route_release_does_not_wait_for_its_persist() {
 
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_c"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_c"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (take_c)",
@@ -3082,7 +3538,12 @@ fn an_aborts_route_release_does_not_wait_for_its_persist() {
     // And the context cycle really is free mid-persist: a fresh snapshot
     // is answered (from RouteFrozen it would be the wedge's rejection).
     client
-        .send(Some("ctx-2"), Command::ContextSnapshot { source: "vscode".into() })
+        .send(
+            Some("ctx-2"),
+            Command::ContextSnapshot {
+                source: "vscode".into(),
+            },
+        )
         .expect("context.snapshot answered while the abort's persist runs");
     until(
         &events,
@@ -3141,9 +3602,19 @@ fn an_abort_during_a_stops_persist_still_releases_the_route_at_the_decision_poin
     // slow persist encodes.
     source.push(FakeTakeScript::clean());
     client
-        .send(Some("take_s"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .send(
+            Some("take_s"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
         .expect("start accepted");
-    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+    until(
+        &events,
+        "capture.started",
+        |m| m.type_name() == "capture.started",
+        Duration::from_secs(5),
+    );
     until(
         &events,
         "capture.progress (take_s)",
@@ -3181,9 +3652,7 @@ fn a_device_fault_whose_text_mentions_the_journal_is_fatal() {
     let source = FakeCaptureSource::new(vec![FakeTakeScript {
         error_after: Some((
             Duration::from_millis(15),
-            RecorderFault::Device(
-                "device stream error; journal flush pointer invalid".into(),
-            ),
+            RecorderFault::Device("device stream error; journal flush pointer invalid".into()),
         )),
         stop: FakeStop::Clean {
             journal_id: "j_devj".into(),
@@ -3206,7 +3675,12 @@ fn a_device_fault_whose_text_mentions_the_journal_is_fatal() {
 
     freeze_route(&client, &events);
     client
-        .send(Some("take_dj"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_dj"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
     let collected = until(
         &events,
@@ -3217,7 +3691,10 @@ fn a_device_fault_whose_text_mentions_the_journal_is_fatal() {
     match &collected.last().unwrap().event {
         Event::CaptureError { code, fatal } => {
             assert_eq!(code, "device_stream_lost");
-            assert!(*fatal, "a device fault is fatal even when its text says journal");
+            assert!(
+                *fatal,
+                "a device fault is fatal even when its text says journal"
+            );
         }
         other => panic!("expected fatal CaptureError, got {other:?}"),
     }
@@ -3253,7 +3730,12 @@ fn a_journal_fault_is_surfaced_once_non_fatal_and_the_take_completes() {
 
     freeze_route(&client, &events);
     client
-        .send(Some("take_j"), Command::CaptureStart { policy: "dictation".into() })
+        .send(
+            Some("take_j"),
+            Command::CaptureStart {
+                policy: "dictation".into(),
+            },
+        )
         .expect("start accepted");
     let collected = until(
         &events,
@@ -3268,7 +3750,10 @@ fn a_journal_fault_is_surfaced_once_non_fatal_and_the_take_completes() {
     match &fault.event {
         Event::CaptureError { code, fatal } => {
             assert_eq!(code, "journal_fault");
-            assert!(!*fatal, "a journal fault is non-fatal: capture continues in memory");
+            assert!(
+                !*fatal,
+                "a journal fault is non-fatal: capture continues in memory"
+            );
         }
         other => panic!("expected CaptureError, got {other:?}"),
     }

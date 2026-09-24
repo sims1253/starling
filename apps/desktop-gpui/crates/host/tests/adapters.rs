@@ -71,7 +71,10 @@ impl ContextProvider for FileContextProvider {
             descriptor: format!("file:{source}"),
             digest: digest_of(&contents),
             capabilities: vec!["text-insert".to_string()],
-            selection_range: Span { start_offset: 0, end_offset: contents.len() as u64 },
+            selection_range: Span {
+                start_offset: 0,
+                end_offset: contents.len() as u64,
+            },
             offset_encoding: "utf-8".to_string(),
             expiry: FAR_FUTURE_EXPIRY.to_string(),
         })
@@ -352,10 +355,7 @@ fn delivery_applies_through_an_injected_adapter_over_ipc() {
     );
 
     client
-        .send(
-            Some("dlv-adapters"),
-            Command::DeliveryApply { delivery_id },
-        )
+        .send(Some("dlv-adapters"), Command::DeliveryApply { delivery_id })
         .expect("apply accepted");
     // The machine walks SubmittedUnconfirmed then Confirmed on one
     // stream — collect the window and assert both ends of it.
@@ -423,10 +423,7 @@ fn a_changed_target_conflicts_and_the_target_is_never_blindly_written() {
     std::fs::write(&target, b"version B (someone else edited)").expect("the target changes");
 
     client
-        .send(
-            Some("dlv-adapters"),
-            Command::DeliveryApply { delivery_id },
-        )
+        .send(Some("dlv-adapters"), Command::DeliveryApply { delivery_id })
         .expect("apply accepted");
     let conflict = until(
         &client,
@@ -477,7 +474,10 @@ fn prepare_alone_never_inserts_and_unknown_revisions_are_refused() {
         "prepare alone touched the target"
     );
     assert!(
-        delivery.log().iter().all(|entry| !entry.starts_with("insert")),
+        delivery
+            .log()
+            .iter()
+            .all(|entry| !entry.starts_with("insert")),
         "insert ran without apply: {:?}",
         delivery.log()
     );
@@ -490,9 +490,9 @@ fn prepare_alone_never_inserts_and_unknown_revisions_are_refused() {
             target_ref: target.display().to_string(),
         },
     ) {
-        Err(ClientError::Rejected(
-            starling_runtime::machine::Rejection::UnknownRevision { revision_id },
-        )) => assert_eq!(revision_id, "rev-never-committed"),
+        Err(ClientError::Rejected(starling_runtime::machine::Rejection::UnknownRevision {
+            revision_id,
+        })) => assert_eq!(revision_id, "rev-never-committed"),
         other => panic!("expected an UnknownRevision refusal, got {other:?}"),
     }
 

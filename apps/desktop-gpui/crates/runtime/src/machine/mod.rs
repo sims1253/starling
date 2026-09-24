@@ -81,7 +81,12 @@ impl MachineCore {
         self.pending.is_some()
     }
 
-    fn enter(&mut self, target: Option<&'static str>, kind: TransitionKind, msg_type: &'static str) {
+    fn enter(
+        &mut self,
+        target: Option<&'static str>,
+        kind: TransitionKind,
+        msg_type: &'static str,
+    ) {
         match target.filter(|to| *to != self.state) {
             Some(to) => {
                 self.transitions.push(TransitionRecord {
@@ -128,7 +133,10 @@ impl MachineCore {
         }
         let Some(rule) = self.spec.command_rule(command) else {
             return Err(Violation::ForeignMessage {
-                detail: format!("{command:?} does not belong to machine {:?}", self.spec.name),
+                detail: format!(
+                    "{command:?} does not belong to machine {:?}",
+                    self.spec.name
+                ),
             });
         };
         if !rule.from.allows(self.state) {
@@ -149,8 +157,11 @@ impl MachineCore {
                 corr,
                 outcomes: rule.outcomes.to_vec(),
             });
-            let mut awaited: Vec<String> =
-                rule.outcomes.iter().map(|(name, _)| name.to_string()).collect();
+            let mut awaited: Vec<String> = rule
+                .outcomes
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
             awaited.sort();
             let from = self.state.to_string();
             let to = self.state.to_string();
@@ -319,9 +330,7 @@ pub struct PendingView {
 pub type ViewSlot = std::sync::Arc<std::sync::Mutex<MachineView>>;
 
 pub fn view_slot(spec: &'static MachineSpec) -> ViewSlot {
-    std::sync::Arc::new(std::sync::Mutex::new(
-        MachineCore::new(spec).view(),
-    ))
+    std::sync::Arc::new(std::sync::Mutex::new(MachineCore::new(spec).view()))
 }
 
 /// The receipt a client receives for a command: `Ok` once the owning
@@ -367,7 +376,11 @@ pub enum Rejection {
     /// The payload does not match the v1 grammar for this command.
     InvalidPayload(String),
     /// The command is not legal in the machine's current state.
-    IllegalInState { command: String, state: String, detail: String },
+    IllegalInState {
+        command: String,
+        state: String,
+        detail: String,
+    },
     /// An outcome-pending command is unresolved in this machine.
     PendingUnresolved { detail: String },
     /// `seq` did not strictly increase on its stream.
@@ -394,18 +407,28 @@ impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rejection::UnsupportedVersion { id } => {
-                write!(f, "unsupported envelope version (id {id:?}); runtime.nack emitted")
+                write!(
+                    f,
+                    "unsupported envelope version (id {id:?}); runtime.nack emitted"
+                )
             }
             Rejection::InvalidEnvelope(detail) => write!(f, "invalid envelope: {detail}"),
             Rejection::UnknownMessageType(t) => write!(f, "{t:?} is not a v1 command type"),
             Rejection::InvalidPayload(detail) => write!(f, "invalid payload: {detail}"),
-            Rejection::IllegalInState { command, state, detail } => {
+            Rejection::IllegalInState {
+                command,
+                state,
+                detail,
+            } => {
                 write!(f, "{command} illegal in {state}: {detail}")
             }
             Rejection::PendingUnresolved { detail } => write!(f, "{detail}"),
             Rejection::SeqNotMonotonic { detail } => write!(f, "{detail}"),
             Rejection::RouteNotFrozen { route } => {
-                write!(f, "route {route:?} was not frozen by an earlier mode.routeFrozen")
+                write!(
+                    f,
+                    "route {route:?} was not frozen by an earlier mode.routeFrozen"
+                )
             }
             Rejection::UnknownCaptureRef { capture_ref } => {
                 write!(f, "unknown captureRef {capture_ref:?}")
@@ -477,7 +500,9 @@ mod tests {
         // UnsupportedVersion and every unit/newtype variant.
         let rejection_pairs = vec![
             (
-                Rejection::UnsupportedVersion { id: Some("cmd_9".into()) },
+                Rejection::UnsupportedVersion {
+                    id: Some("cmd_9".into()),
+                },
                 serde_json::json!({ "UnsupportedVersion": { "id": "cmd_9" } }),
             ),
             (
@@ -511,31 +536,45 @@ mod tests {
                 }),
             ),
             (
-                Rejection::PendingUnresolved { detail: "waiting".into() },
+                Rejection::PendingUnresolved {
+                    detail: "waiting".into(),
+                },
                 serde_json::json!({ "PendingUnresolved": { "detail": "waiting" } }),
             ),
             (
-                Rejection::SeqNotMonotonic { detail: "seq 4 follows 4".into() },
+                Rejection::SeqNotMonotonic {
+                    detail: "seq 4 follows 4".into(),
+                },
                 serde_json::json!({ "SeqNotMonotonic": { "detail": "seq 4 follows 4" } }),
             ),
             (
-                Rejection::RouteNotFrozen { route: "local-default".into() },
+                Rejection::RouteNotFrozen {
+                    route: "local-default".into(),
+                },
                 serde_json::json!({ "RouteNotFrozen": { "route": "local-default" } }),
             ),
             (
-                Rejection::UnknownCaptureRef { capture_ref: "take_x".into() },
+                Rejection::UnknownCaptureRef {
+                    capture_ref: "take_x".into(),
+                },
                 serde_json::json!({ "UnknownCaptureRef": { "capture_ref": "take_x" } }),
             ),
             (
-                Rejection::UnknownJob { job_id: "job-1".into() },
+                Rejection::UnknownJob {
+                    job_id: "job-1".into(),
+                },
                 serde_json::json!({ "UnknownJob": { "job_id": "job-1" } }),
             ),
             (
-                Rejection::UnknownRevision { revision_id: "rev-1".into() },
+                Rejection::UnknownRevision {
+                    revision_id: "rev-1".into(),
+                },
                 serde_json::json!({ "UnknownRevision": { "revision_id": "rev-1" } }),
             ),
             (
-                Rejection::UnknownDelivery { delivery_id: "d-1".into() },
+                Rejection::UnknownDelivery {
+                    delivery_id: "d-1".into(),
+                },
                 serde_json::json!({ "UnknownDelivery": { "delivery_id": "d-1" } }),
             ),
             (Rejection::InboxFull, serde_json::json!("InboxFull")),
@@ -567,7 +606,9 @@ mod tests {
             core.emit_event("capture.started", None).unwrap(),
             Some("Recording")
         );
-        assert!(core.commit_command("capture.stop", Some("take_77".into())).is_ok());
+        assert!(core
+            .commit_command("capture.stop", Some("take_77".into()))
+            .is_ok());
         assert_eq!(core.state(), "Draining");
         // A fatal error from Draining enters Interrupted.
         assert_eq!(
@@ -608,7 +649,8 @@ mod tests {
             core.emit_event("capture.error", Some(true)).unwrap(),
             Some("Interrupted")
         );
-        core.advance_internal("Idle").expect("Interrupted -> Idle edge");
+        core.advance_internal("Idle")
+            .expect("Interrupted -> Idle edge");
         assert_eq!(core.state(), "Idle");
         // The retry is legal — the machine is not wedged in Interrupted.
         assert!(matches!(

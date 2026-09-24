@@ -410,11 +410,13 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 .gap(px(3.))
                 .flex_1()
                 .child(
-                    div().text_color(theme::ERROR_TITLE).child(if error.is_some() {
-                        "Action failed"
-                    } else {
-                        "Recording not saved"
-                    }),
+                    div()
+                        .text_color(theme::ERROR_TITLE)
+                        .child(if error.is_some() {
+                            "Action failed"
+                        } else {
+                            "Recording not saved"
+                        }),
                 )
                 .children(error.clone().map(|message| div().child(message)))
                 .children(

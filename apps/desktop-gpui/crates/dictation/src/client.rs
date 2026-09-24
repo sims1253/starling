@@ -475,9 +475,7 @@ async fn read_body_capped(
     // actually arrive; an undeclared (chunked) body starts empty.
     const MAX_INITIAL_RESERVATION: usize = 64 * 1024;
     let capacity = response.content_length().map_or(0, |length| {
-        length
-            .min(MAX_INITIAL_RESERVATION as u64)
-            .min(limit as u64) as usize
+        length.min(MAX_INITIAL_RESERVATION as u64).min(limit as u64) as usize
     });
     let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response
@@ -1240,7 +1238,9 @@ mod tests {
             // Exactly one connection is expected; accepting it and
             // dropping the listener lets this thread exit instead of
             // parking on `incoming()` for the rest of the suite.
-            let Ok((mut stream, _)) = listener.accept() else { return };
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = read_request(&mut stream);
             counter.fetch_add(1, Ordering::SeqCst);
             // Hold the connection open (never answer) until the client's

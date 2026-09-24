@@ -62,7 +62,11 @@ impl RevisionSlot {
     fn from_disposition(text: &str) -> RevisionSlot {
         match text {
             "preserved" => RevisionSlot::Preserved,
-            _ => RevisionSlot::Committed,
+            "committed" => RevisionSlot::Committed,
+            other => {
+                eprintln!("documents machine: unknown disposition {other:?}, read as committed");
+                RevisionSlot::Committed
+            }
         }
     }
 }
@@ -100,10 +104,32 @@ pub struct StoredDocument {
 /// restarted machine hydrates from. The default `load_document` answers
 /// "no durable state", so the in-memory store needs no bookkeeping.
 pub trait DocumentStore: Send + Sync {
-    fn upsert_document(&self, doc_id: &str, name: &str, head_revision: u64, turn_seq: u32)
-        -> Result<(), String>;
-    fn store_revision(&self, doc_id: &str, revision: &Revision, slot: RevisionSlot)
-        -> Result<(), String>;
+    fn upsert_document(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+    ) -> Result<(), String>;
+    fn store_revision(
+        &self,
+        doc_id: &str,
+        revision: &Revision,
+        slot: RevisionSlot,
+    ) -> Result<(), String>;
+    /// Advances the head and stores its committed revision. Stores that
+    /// can should do this atomically (see [`V2DocumentStore`]).
+    fn commit_head(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &Revision,
+    ) -> Result<(), String> {
+        self.upsert_document(doc_id, name, head_revision, turn_seq)?;
+        self.store_revision(doc_id, revision, RevisionSlot::Committed)
+    }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String>;
     /// One document's durable rows; `Ok(None)` when this store has never
     /// held the document. Hydration consults this exactly once per
@@ -140,7 +166,9 @@ impl DocumentStore for MemoryDocumentStore {
         self.state
             .lock()
             .expect("document store lock")
-            .push(format!("doc {doc_id} name={name} head={head_revision} turn={turn_seq}"));
+            .push(format!(
+                "doc {doc_id} name={name} head={head_revision} turn={turn_seq}"
+            ));
         Ok(())
     }
     fn store_revision(
@@ -149,10 +177,10 @@ impl DocumentStore for MemoryDocumentStore {
         revision: &Revision,
         slot: RevisionSlot,
     ) -> Result<(), String> {
-        self.state.lock().expect("document store lock").push(format!(
-            "rev {doc_id}/{} slot={:?}",
-            revision.rev_id, slot
-        ));
+        self.state
+            .lock()
+            .expect("document store lock")
+            .push(format!("rev {doc_id}/{} slot={:?}", revision.rev_id, slot));
         Ok(())
     }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
@@ -203,6 +231,7 @@ impl V2DocumentStore {
             return (Vec::new(), String::new());
         };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
+            eprintln!("documents machine: unparsable sources_json, provenance lost: {text:?}");
             return (Vec::new(), String::new());
         };
         let attempts = value
@@ -222,6 +251,19 @@ impl V2DocumentStore {
             .unwrap_or_default()
             .to_string();
         (attempts, template)
+    }
+
+    fn revision_row(doc_id: &str, revision: &Revision, slot: RevisionSlot) -> RevisionRow {
+        RevisionRow {
+            rev_id: revision.rev_id.clone(),
+            doc_id: doc_id.to_string(),
+            base_revision: Some(revision.base_revision),
+            sources_json: Some(Self::sources_json(revision)),
+            text: revision.text.clone(),
+            status: revision.status.clone(),
+            provenance: Some(revision.provenance.clone()),
+            disposition: Some(slot.as_disposition().to_string()),
+        }
     }
 
     fn row_to_stored(row: &RevisionRow) -> (Revision, RevisionSlot) {
@@ -252,7 +294,7 @@ impl DocumentStore for V2DocumentStore {
     ) -> Result<(), String> {
         self.store
             .lock()
-            .expect("v2 document store lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upsert_document(doc_id, name, head_revision, turn_seq)
             .map_err(|err| err.to_string())
     }
@@ -262,26 +304,32 @@ impl DocumentStore for V2DocumentStore {
         revision: &Revision,
         slot: RevisionSlot,
     ) -> Result<(), String> {
-        let row = RevisionRow {
-            rev_id: revision.rev_id.clone(),
-            doc_id: doc_id.to_string(),
-            base_revision: Some(revision.base_revision),
-            sources_json: Some(Self::sources_json(revision)),
-            text: revision.text.clone(),
-            status: revision.status.clone(),
-            provenance: Some(revision.provenance.clone()),
-            disposition: Some(slot.as_disposition().to_string()),
-        };
+        let row = Self::revision_row(doc_id, revision, slot);
         self.store
             .lock()
-            .expect("v2 document store lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .store_document_revision(&row)
+            .map_err(|err| err.to_string())
+    }
+    fn commit_head(
+        &self,
+        doc_id: &str,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &Revision,
+    ) -> Result<(), String> {
+        let row = Self::revision_row(doc_id, revision, RevisionSlot::Committed);
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_document_head(name, head_revision, turn_seq, &row)
             .map_err(|err| err.to_string())
     }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
         self.store
             .lock()
-            .expect("v2 document store lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .bump_document_turn(doc_id, turn_seq)
             .map_err(|err| err.to_string())
     }
@@ -289,7 +337,7 @@ impl DocumentStore for V2DocumentStore {
         let document: Option<DocumentRow> = self
             .store
             .lock()
-            .expect("v2 document store lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_document(doc_id)
             .map_err(|err| err.to_string())?;
         Ok(document.map(|row| StoredDocument {
@@ -385,6 +433,24 @@ impl DocsActor {
         }
         match self.store.load_document(doc_id) {
             Ok(Some(stored)) => {
+                // Re-publish the durable committed revisions so
+                // delivery.prepare resolves them after a restart (the
+                // registry is the delivery actor's only lookup source).
+                self.revisions
+                    .lock()
+                    .expect("revision registry lock")
+                    .extend(
+                        stored
+                            .revisions
+                            .iter()
+                            .filter(|(_, slot)| *slot == RevisionSlot::Committed)
+                            .map(|(revision, _)| {
+                                (
+                                    revision.rev_id.clone(),
+                                    (doc_id.to_string(), revision.clone()),
+                                )
+                            }),
+                    );
                 self.documents.insert(
                     doc_id.to_string(),
                     DocumentRecord {
@@ -405,7 +471,12 @@ impl DocsActor {
     }
 
     fn handle_command(&mut self, inbound: Inbound) {
-        let super::Inbound { corr, command, reply, .. } = inbound;
+        let super::Inbound {
+            corr,
+            command,
+            reply,
+            ..
+        } = inbound;
         let corr = corr.unwrap_or_else(|| "docs-anon".to_string());
         match command {
             Command::DocsGet { doc_id, page } => {
@@ -417,7 +488,8 @@ impl DocsActor {
                     }
                     Err(violation) => {
                         self.core.record_violation(violation.clone());
-                        let _ = reply.try_send(Err(illegal("docs.get", self.core.state(), violation)));
+                        let _ =
+                            reply.try_send(Err(illegal("docs.get", self.core.state(), violation)));
                     }
                 }
             }
@@ -426,7 +498,10 @@ impl DocsActor {
                 expected_base,
                 new_revision,
             } => {
-                match self.core.commit_command("docs.updateHead", Some(corr.clone())) {
+                match self
+                    .core
+                    .commit_command("docs.updateHead", Some(corr.clone()))
+                {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
                         self.apply_cas(corr, doc_id, expected_base, new_revision);
@@ -441,20 +516,25 @@ impl DocsActor {
                     }
                 }
             }
-            Command::DocsAppendTurn { doc_id, take_ref: _ } => {
-                match self.core.commit_command("docs.appendTurn", Some(corr.clone())) {
+            Command::DocsAppendTurn {
+                doc_id,
+                take_ref: _,
+            } => {
+                match self
+                    .core
+                    .commit_command("docs.appendTurn", Some(corr.clone()))
+                {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
                         self.hydrate(&doc_id);
-                        let record = self
-                            .documents
-                            .entry(doc_id.clone())
-                            .or_insert_with(|| DocumentRecord {
+                        let record = self.documents.entry(doc_id.clone()).or_insert_with(|| {
+                            DocumentRecord {
                                 name: doc_id.clone(),
                                 head_revision: 0,
                                 turn_seq: 0,
                                 revisions: Vec::new(),
-                            });
+                            }
+                        });
                         record.turn_seq += 1;
                         let turn_seq = record.turn_seq;
                         if let Err(detail) = self.store.bump_turn(&doc_id, turn_seq) {
@@ -465,10 +545,9 @@ impl DocsActor {
                         // transition recorded by the core), then deliver.
                         match self.core.resolve_outcome("docs.turnAppended", Some(&corr)) {
                             Ok(_) => {
-                                let _ = self.bus.emit(
-                                    Event::DocsTurnAppended { turn_seq },
-                                    Some(&corr),
-                                );
+                                let _ = self
+                                    .bus
+                                    .emit(Event::DocsTurnAppended { turn_seq }, Some(&corr));
                             }
                             Err(violation) => self.core.record_violation(violation),
                         }
@@ -521,17 +600,11 @@ impl DocsActor {
                 revision: committed.clone(),
                 slot: RevisionSlot::Committed,
             });
-            if let Err(detail) = self
-                .store
-                .upsert_document(&doc_id, &record.name, new_head, record.turn_seq)
+            if let Err(detail) =
+                self.store
+                    .commit_head(&doc_id, &record.name, new_head, record.turn_seq, &committed)
             {
-                report_store_failure("upsert_document", &doc_id, detail);
-            }
-            if let Err(detail) = self
-                .store
-                .store_revision(&doc_id, &committed, RevisionSlot::Committed)
-            {
-                report_store_failure("store_revision", &doc_id, detail);
+                report_store_failure("commit_head", &doc_id, detail);
             }
             self.revisions
                 .lock()
@@ -570,9 +643,9 @@ impl DocsActor {
                 revision: candidate,
                 slot: RevisionSlot::Preserved,
             });
-            if let Err(detail) = self
-                .store
-                .store_revision(&doc_id, &revision, RevisionSlot::Preserved)
+            if let Err(detail) =
+                self.store
+                    .store_revision(&doc_id, &revision, RevisionSlot::Preserved)
             {
                 report_store_failure("store_revision(preserved)", &doc_id, detail);
             }

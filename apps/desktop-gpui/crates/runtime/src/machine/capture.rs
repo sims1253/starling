@@ -292,10 +292,11 @@ impl InMemoryCaptureStore {
 
 impl CaptureStore for InMemoryCaptureStore {
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
-        self.takes
-            .lock()
-            .expect("capture store lock")
-            .push((TakeStatus::Complete, take.id.clone(), take.capture_id.clone()));
+        self.takes.lock().expect("capture store lock").push((
+            TakeStatus::Complete,
+            take.id.clone(),
+            take.capture_id.clone(),
+        ));
         Ok(())
     }
     fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
@@ -501,11 +502,10 @@ impl V2CaptureStore {
                     // payload hash before the retry counts as satisfied.
                     match store.get_capture(&report.id) {
                         Ok(Some(existing)) => {
-                            let same_audio = starling_dictation::journal::verified_journal_hash(
-                                &report.path,
-                            )
-                            .map(|hash| hash == existing.journal_hash)
-                            .unwrap_or(false);
+                            let same_audio =
+                                starling_dictation::journal::verified_journal_hash(&report.path)
+                                    .map(|hash| hash == existing.journal_hash)
+                                    .unwrap_or(false);
 
                             if !same_audio {
                                 report_divergence(format!(
@@ -665,11 +665,9 @@ impl V2CaptureStore {
                              the take is durably persisted"
                         ),
                     };
-                    if let Err(note_err) = store.update_capture_status(
-                        &staged_id,
-                        record.status,
-                        Some(&note),
-                    ) {
+                    if let Err(note_err) =
+                        store.update_capture_status(&staged_id, record.status, Some(&note))
+                    {
                         report_divergence(format!(
                             "recording the post-commit divergence on {staged_id} failed \
                              ({note_err}) — the row keeps its committed contents; {note}"
@@ -692,16 +690,16 @@ impl V2CaptureStore {
             }
             let err = chain_adoption_failure(&adoption_error, err.to_string());
             drop(store); // what follows is filesystem work — off the lock
-            // Metadata-only probe (one stat; load_audio would read and
-            // verify the whole journal): which side of the promoting
-            // rename did the failure leave the bytes on? A probe that
-            // itself errors is reported — never silently read as "not
-            // promoted" — and falls through to the discard attempt, the
-            // safer default (removing a not-yet-promoted partial is
-            // correct; the discard no-ops if it was wrong). The probe
-            // takes the lock in its own short scope purely to keep the
-            // filesystem stat off the mutex — audio_journal_exists does
-            // no SQLite work; there is no DB step being protected.
+                         // Metadata-only probe (one stat; load_audio would read and
+                         // verify the whole journal): which side of the promoting
+                         // rename did the failure leave the bytes on? A probe that
+                         // itself errors is reported — never silently read as "not
+                         // promoted" — and falls through to the discard attempt, the
+                         // safer default (removing a not-yet-promoted partial is
+                         // correct; the discard no-ops if it was wrong). The probe
+                         // takes the lock in its own short scope purely to keep the
+                         // filesystem stat off the mutex — audio_journal_exists does
+                         // no SQLite work; there is no DB step being protected.
             let promoted = {
                 let store = self.store.lock().expect("v2 store lock");
                 match store.audio_journal_exists(&staged_id) {
@@ -1292,12 +1290,18 @@ impl CaptureActor {
 
     fn handle_command(&mut self, inbound: Inbound) {
         let super::Inbound {
-            corr, command, reply, ..
+            corr,
+            command,
+            reply,
+            ..
         } = inbound;
         let corr = corr.unwrap_or_else(|| "take-anon".to_string());
         match command {
             Command::CaptureStart { policy } => {
-                match self.core.commit_command("capture.start", Some(corr.clone())) {
+                match self
+                    .core
+                    .commit_command("capture.start", Some(corr.clone()))
+                {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
                         self.start_take(corr, policy);
@@ -1329,7 +1333,10 @@ impl CaptureActor {
                 }
             }
             Command::CaptureAbort => {
-                match self.core.commit_command("capture.abort", Some(corr.clone())) {
+                match self
+                    .core
+                    .commit_command("capture.abort", Some(corr.clone()))
+                {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
                         self.abort_take(&corr);
@@ -1564,7 +1571,12 @@ impl CaptureActor {
                 // must not stall the actor loop. `capture.stopped` (the
                 // §4 durable ack) and the storage-fault degradation are
                 // gated on the report in `handle_persist`.
-                self.hand_off_persist(record, corr, PersistIntent::Commit, PersistFollow::CleanStop);
+                self.hand_off_persist(
+                    record,
+                    corr,
+                    PersistIntent::Commit,
+                    PersistFollow::CleanStop,
+                );
             }
             Err(err @ RecorderError::QuiesceTimeout { .. }) => {
                 // R09/I1 phase 2 semantics: never a silent empty result —
@@ -1976,10 +1988,7 @@ impl CaptureActor {
                 "Take aborted by user; captured samples kept as an interrupted recording."
                     .to_string()
             } else {
-                device_stop_note(
-                    "Take aborted by user",
-                    salvaged.record.acknowledged_samples,
-                )
+                device_stop_note("Take aborted by user", salvaged.record.acknowledged_samples)
             };
             // The interrupted persist runs on a worker (issue #249); the
             // report's [`PersistFollow::Abort`] close-out registers the
@@ -2194,7 +2203,11 @@ fn deliver_persist_report(
     sent
 }
 
-fn rejection_for(command: &str, state: &str, violation: crate::protocol::replay::Violation) -> Rejection {
+fn rejection_for(
+    command: &str,
+    state: &str,
+    violation: crate::protocol::replay::Violation,
+) -> Rejection {
     Rejection::IllegalInState {
         command: command.to_string(),
         state: state.to_string(),

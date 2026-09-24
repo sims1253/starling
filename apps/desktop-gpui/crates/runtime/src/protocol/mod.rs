@@ -51,7 +51,10 @@ impl Envelope {
             v: object.get("v")?.as_u64()?,
             id: object.get("id")?.as_str()?.to_string(),
             ts: object.get("ts")?.as_str()?.to_string(),
-            corr: object.get("corr").and_then(Value::as_str).map(str::to_string),
+            corr: object
+                .get("corr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             seq: object.get("seq").and_then(Value::as_u64),
             type_: object.get("type")?.as_str()?.to_string(),
             payload: object.get("payload").cloned().unwrap_or(Value::Null),
@@ -193,7 +196,10 @@ pub fn envelope_errors(msg: &Value) -> Vec<String> {
         }
     }
     for key in object.keys() {
-        if !matches!(key.as_str(), "v" | "id" | "ts" | "type" | "payload" | "corr" | "seq") {
+        if !matches!(
+            key.as_str(),
+            "v" | "id" | "ts" | "type" | "payload" | "corr" | "seq"
+        ) {
             errors.push(format!("unexpected property '{key}'"));
         }
     }
@@ -443,7 +449,6 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Manual;
 
-
 // Payload shapes for wire parsing: `deny_unknown_fields` is the schemas'
 // `additionalProperties: false` (an unknown field is a validation failure,
 // never a silently ignored extra) and missing required fields fail too.
@@ -567,12 +572,12 @@ impl Command {
     /// `machine.message`).
     pub fn machine(&self) -> &'static str {
         match self {
-            Command::CaptureStart { .. }
-            | Command::CaptureStop { .. }
-            | Command::CaptureAbort => "capture",
-            Command::JobsSubmit { .. }
-            | Command::JobsCancel { .. }
-            | Command::JobsSetLimits(_) => "jobs",
+            Command::CaptureStart { .. } | Command::CaptureStop { .. } | Command::CaptureAbort => {
+                "capture"
+            }
+            Command::JobsSubmit { .. } | Command::JobsCancel { .. } | Command::JobsSetLimits(_) => {
+                "jobs"
+            }
             Command::ContextSnapshot { .. } | Command::ContextExpire => "context",
             Command::ModeSet { .. } => "context", // mode.* events belong to the context machine
             Command::DocsUpdateHead { .. }
@@ -605,8 +610,9 @@ impl Command {
                 "budget": budget,
             }),
             Command::JobsCancel { job_id } => json!({ "jobId": job_id }),
-            Command::JobsSetLimits(limits) => serde_json::to_value(limits)
-                .unwrap_or_else(|_| json!({})),
+            Command::JobsSetLimits(limits) => {
+                serde_json::to_value(limits).unwrap_or_else(|_| json!({}))
+            }
             Command::ContextSnapshot { source } => json!({ "source": source }),
             Command::ModeSet { mode, source: _ } => json!({ "mode": mode, "source": "manual" }),
             Command::ContextExpire => json!({}),
@@ -643,7 +649,10 @@ impl Command {
     /// `additionalProperties: false` surfaces through
     /// `deny_unknown_fields` on every payload struct.
     pub fn from_parts(type_: &str, payload: &Value) -> Result<Command, String> {
-        fn parse<T: serde::de::DeserializeOwned>(payload: &Value, type_: &str) -> Result<T, String> {
+        fn parse<T: serde::de::DeserializeOwned>(
+            payload: &Value,
+            type_: &str,
+        ) -> Result<T, String> {
             serde_json::from_value(payload.clone())
                 .map_err(|err| format!("{type_} payload is invalid: {err}"))
         }
@@ -664,7 +673,9 @@ impl Command {
                 })
             }
             "jobs.cancel" => Ok(Command::JobsCancel {
-                job_id: parse::<JobsCancelP>(payload, type_)?.job_id.unwrap_or_default(),
+                job_id: parse::<JobsCancelP>(payload, type_)?
+                    .job_id
+                    .unwrap_or_default(),
             }),
             "jobs.setLimits" => {
                 let limits: JobLimits = parse(payload, type_)?;
@@ -953,8 +964,9 @@ impl Event {
             Event::JobsFailed { reason, retryable } => {
                 json!({ "reason": reason, "retryable": retryable })
             }
-            Event::ContextTargetSnapshot(data) => serde_json::to_value(data)
-                .unwrap_or_else(|_| json!({})),
+            Event::ContextTargetSnapshot(data) => {
+                serde_json::to_value(data).unwrap_or_else(|_| json!({}))
+            }
             Event::ModeDecision(data) => json!({
                 "modeId": data.mode_id,
                 "source": data.source.as_str(),
@@ -1104,11 +1116,19 @@ mod tests {
         assert!(envelope_errors(&missing).iter().any(|e| e.contains("ts")));
 
         let mut extra = base.clone();
-        extra.as_object_mut().unwrap().insert("trace_id".into(), 1.into());
-        assert!(envelope_errors(&extra).iter().any(|e| e.contains("trace_id")));
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("trace_id".into(), 1.into());
+        assert!(envelope_errors(&extra)
+            .iter()
+            .any(|e| e.contains("trace_id")));
 
         let mut bad_seq = base.clone();
-        bad_seq.as_object_mut().unwrap().insert("seq".into(), (-1).into());
+        bad_seq
+            .as_object_mut()
+            .unwrap()
+            .insert("seq".into(), (-1).into());
         assert!(envelope_errors(&bad_seq).iter().any(|e| e.contains("seq")));
 
         assert!(envelope_errors(&serde_json::json!([]))
@@ -1126,7 +1146,10 @@ mod tests {
         assert_eq!(nack["type"], "runtime.nack");
         assert_eq!(nack["payload"]["reason"], "unsupported_version");
         assert_eq!(nack["corr"], "cmd_900");
-        assert!(envelope_errors(&nack).is_empty(), "nack must be schema-valid");
+        assert!(
+            envelope_errors(&nack).is_empty(),
+            "nack must be schema-valid"
+        );
 
         let ok = serde_json::json!({
             "v": 1, "id": "x", "ts": "2026-09-20T10:00:00Z",
@@ -1166,6 +1189,9 @@ mod tests {
             .unwrap()
             .insert("extra".into(), "no".into());
         let error = Command::from_parts("capture.start", &payload).unwrap_err();
-        assert!(error.contains("unknown field") || error.contains("extra"), "{error}");
+        assert!(
+            error.contains("unknown field") || error.contains("extra"),
+            "{error}"
+        );
     }
 }

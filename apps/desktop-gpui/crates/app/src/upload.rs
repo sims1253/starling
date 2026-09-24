@@ -7,9 +7,7 @@ use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
     client::{ClientError, Protocol, StarlingClient},
-    journal,
-    recorder,
-    storage,
+    journal, recorder, storage,
 };
 
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
@@ -242,9 +240,7 @@ impl StarlingApp {
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
-                            .background_spawn(async move {
-                                audio::encode_wav_16k(&audio)
-                            })
+                            .background_spawn(async move { audio::encode_wav_16k(&audio) })
                             .await;
                         match encoded {
                             Ok(wav) => {
@@ -442,7 +438,10 @@ impl StarlingApp {
         cx.spawn(async move |this, cx| {
             enum Outcome {
                 Success,
-                Failure { message: String, class: FailureClass },
+                Failure {
+                    message: String,
+                    class: FailureClass,
+                },
                 /// The session was deleted while this job was in flight
                 /// (R05): not a failure — nothing to probe, nothing to
                 /// record in history, just keep the audio and surface.
@@ -501,10 +500,7 @@ impl StarlingApp {
                             };
                             match saved {
                                 Ok((session_found, write_error)) => {
-                                    match save_race_decision(
-                                        session_found,
-                                        write_error.as_ref(),
-                                    ) {
+                                    match save_race_decision(session_found, write_error.as_ref()) {
                                         SaveRaceDecision::Written => {}
                                         SaveRaceDecision::SessionDeleted => {
                                             outcome = Outcome::SessionGone;
@@ -586,7 +582,9 @@ impl StarlingApp {
             };
 
             match finished_job(
-                job_failure.as_ref().map(|(message, class)| (message.as_str(), *class)),
+                job_failure
+                    .as_ref()
+                    .map(|(message, class)| (message.as_str(), *class)),
                 history_failure.as_deref(),
             ) {
                 FinishedJob::Failed { message, class } => {
@@ -702,7 +700,8 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) }).await
+                cx.background_spawn(async move { store.audio_wav(&id) })
+                    .await
             };
             this.update(cx, |app, cx| match loaded {
                 Ok(Some(wav)) => {
@@ -832,7 +831,10 @@ mod tests {
             failure_class(&ClientError::Input("Invalid server endpoint.".to_string())),
             FailureClass::Local
         );
-        assert_eq!(failure_class(&ClientError::Redirect(302)), FailureClass::Local);
+        assert_eq!(
+            failure_class(&ClientError::Redirect(302)),
+            FailureClass::Local
+        );
         assert_eq!(
             failure_class(&ClientError::Http {
                 status: 500,
@@ -904,7 +906,10 @@ mod tests {
         // R05: the pre-write re-check came back empty — the delete won, so
         // no write is attempted. The decision is SessionDeleted (keep the
         // audio, surface), never a job failure with a raw NotFound.
-        assert_eq!(save_race_decision(false, None), SaveRaceDecision::SessionDeleted);
+        assert_eq!(
+            save_race_decision(false, None),
+            SaveRaceDecision::SessionDeleted
+        );
     }
 
     #[test]
@@ -947,8 +952,14 @@ mod tests {
         // session was deleted mid-transcription, that the audio is kept,
         // and offer the discard path for a deliberate delete.
         let message = session_deleted_message();
-        assert!(message.contains("deleted while it was being transcribed"), "{message}");
-        assert!(message.contains("transcript could not be saved"), "{message}");
+        assert!(
+            message.contains("deleted while it was being transcribed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("transcript could not be saved"),
+            "{message}"
+        );
         assert!(message.contains("audio is kept"), "{message}");
         assert!(message.contains("discard"), "{message}");
     }

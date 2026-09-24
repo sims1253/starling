@@ -195,6 +195,9 @@ mod tests {
             starling,
             protocol_option_id(dictation_settings::Protocol::Starling)
         );
-        assert_eq!(openai, protocol_option_id(dictation_settings::Protocol::OpenAi));
+        assert_eq!(
+            openai,
+            protocol_option_id(dictation_settings::Protocol::OpenAi)
+        );
     }
 }

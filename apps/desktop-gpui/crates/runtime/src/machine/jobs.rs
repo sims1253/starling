@@ -38,7 +38,10 @@ use crate::provider::{CancelToken, Partial, ProviderOutcome, TranscriptionProvid
 pub enum JobsMsg {
     Command(Inbound),
     /// A worker's report about its job.
-    Worker { job: String, report: WorkerReport },
+    Worker {
+        job: String,
+        report: WorkerReport,
+    },
     Shutdown,
 }
 
@@ -204,7 +207,12 @@ impl JobsActor {
     }
 
     fn handle_command(&mut self, inbound: Inbound) {
-        let super::Inbound { corr, command, reply, .. } = inbound;
+        let super::Inbound {
+            corr,
+            command,
+            reply,
+            ..
+        } = inbound;
         match command {
             Command::JobsSubmit {
                 capture_ref,
@@ -390,12 +398,13 @@ impl JobsActor {
             if self.active.len() >= self.limits.max_concurrent as usize {
                 return;
             }
-            let per_route_active = |jobs: &HashMap<String, Job>, active: &HashSet<String>, route: &str| {
-                active
-                    .iter()
-                    .filter(|id| jobs.get(*id).map(|job| job.route == route).unwrap_or(false))
-                    .count() as u32
-            };
+            let per_route_active =
+                |jobs: &HashMap<String, Job>, active: &HashSet<String>, route: &str| {
+                    active
+                        .iter()
+                        .filter(|id| jobs.get(*id).map(|job| job.route == route).unwrap_or(false))
+                        .count() as u32
+                };
             let route_cap = |limits: &JobLimits, route: &str| -> u32 {
                 limits
                     .per_route
@@ -689,10 +698,7 @@ impl JobsActor {
             // forever; the debug_assert fires in testing on the invariant
             // break itself.
             debug_assert!(
-                matches!(
-                    state,
-                    "Completed" | "Failed" | "Cancelled" | "Rejected"
-                ),
+                matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected"),
                 "retiring job {job_id} in non-terminal state {state}"
             );
             if matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected")
@@ -954,7 +960,10 @@ mod tests {
             )
         });
         std::thread::sleep(Duration::from_millis(30));
-        assert!(!worker.is_finished(), "delivery should be parked on the full inbox");
+        assert!(
+            !worker.is_finished(),
+            "delivery should be parked on the full inbox"
+        );
         drop(rx); // shutdown while the worker waits for room
         assert_eq!(
             worker.join().expect("worker thread"),

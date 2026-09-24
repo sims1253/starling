@@ -136,7 +136,12 @@ impl<T> Sender<T> {
 
     /// Whether a receiver is still connected.
     pub fn is_closed(&self) -> bool {
-        self.chan.queue.lock().expect("channel mutex poisoned").receivers == 0
+        self.chan
+            .queue
+            .lock()
+            .expect("channel mutex poisoned")
+            .receivers
+            == 0
     }
 }
 

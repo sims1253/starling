@@ -65,8 +65,12 @@ pub trait DeliveryAdapter: Send + Sync {
     /// Immediate-before-apply revalidation of identity/range/version.
     fn revalidate(&self, target_ref: &str, compare_token: &str) -> Revalidation;
     /// The insertion itself. Err means the text did not land.
-    fn insert(&self, delivery_id: &str, target_ref: &str, text: &str)
-        -> Result<InsertEvidence, InsertionFailure>;
+    fn insert(
+        &self,
+        delivery_id: &str,
+        target_ref: &str,
+        text: &str,
+    ) -> Result<InsertEvidence, InsertionFailure>;
     /// An honest description for snapshots.
     fn describe(&self) -> String;
 }
@@ -107,7 +111,9 @@ impl Default for StubDeliveryAdapter {
 impl DeliveryAdapter for StubDeliveryAdapter {
     fn prepare(&self, target_ref: &str) -> Result<String, String> {
         let token = format!("stub:{target_ref}:{}", crate::bus::new_id("tok"));
-        self.record(format!("prepared target={target_ref} token={token} (stub: no real target)"));
+        self.record(format!(
+            "prepared target={target_ref} token={token} (stub: no real target)"
+        ));
         Ok(token)
     }
 
@@ -141,8 +147,8 @@ impl DeliveryAdapter for StubDeliveryAdapter {
 struct DeliveryState {
     core: MachineCore,
     #[allow(dead_code)] // identifies the prepared revision; no v1 wire
-                        // field carries it (the E21 documents product
-                        // surface decides how it surfaces)
+    // field carries it (the E21 documents product
+    // surface decides how it surfaces)
     revision_id: String,
     target_ref: String,
     compare_token: String,
@@ -218,7 +224,6 @@ impl DeliveryActor {
         }
     }
 
-
     /// Emits through the delivery's own machine core: an illegal event is
     /// never sent (the stream stays oracle-legal) and the violation lands
     /// in the core's history instead of being absorbed.
@@ -235,7 +240,12 @@ impl DeliveryActor {
     }
 
     fn handle_command(&mut self, inbound: Inbound) {
-        let super::Inbound { corr, command, reply, .. } = inbound;
+        let super::Inbound {
+            corr,
+            command,
+            reply,
+            ..
+        } = inbound;
         let corr = corr.unwrap_or_else(|| "dlv-anon".to_string());
         match command {
             Command::DeliveryPrepare {
@@ -256,7 +266,10 @@ impl DeliveryActor {
                     let _ = reply.try_send(Err(Rejection::UnknownDelivery { delivery_id }));
                     return;
                 };
-                match state.core.commit_command("delivery.copyFallback", Some(corr)) {
+                match state
+                    .core
+                    .commit_command("delivery.copyFallback", Some(corr))
+                {
                     Ok(_) => {
                         state.fallback_requested = true;
                         let _ = reply.try_send(Ok(Receipt::Accepted));
@@ -304,9 +317,9 @@ impl DeliveryActor {
         let token = match self.adapter.prepare(&target_ref) {
             Ok(token) => token,
             Err(message) => {
-                let _ = reply.try_send(Err(Rejection::InvalidPayload(
-                    format!("delivery adapter could not prepare: {message}"),
-                )));
+                let _ = reply.try_send(Err(Rejection::InvalidPayload(format!(
+                    "delivery adapter could not prepare: {message}"
+                ))));
                 return;
             }
         };
@@ -364,7 +377,10 @@ impl DeliveryActor {
         let text = state.text.clone();
         let target_ref = state.target_ref.clone();
         let compare_token = state.compare_token.clone();
-        match state.core.commit_command("delivery.apply", Some(corr.clone())) {
+        match state
+            .core
+            .commit_command("delivery.apply", Some(corr.clone()))
+        {
             Ok(_) => {
                 let _ = reply.try_send(Ok(Receipt::Accepted));
                 // Revalidate immediately before apply.
@@ -384,11 +400,7 @@ impl DeliveryActor {
                             Ok(evidence) => {
                                 // submittedUnconfirmed then confirmed —
                                 // stating the evidence level honestly.
-                                self.emit(
-                                    &delivery_id,
-                                    Event::DeliverySubmittedUnconfirmed,
-                                    &corr,
-                                );
+                                self.emit(&delivery_id, Event::DeliverySubmittedUnconfirmed, &corr);
                                 self.emit(
                                     &delivery_id,
                                     Event::DeliveryConfirmed {

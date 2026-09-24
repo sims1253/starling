@@ -214,7 +214,11 @@ fn sinc_sample(mono: &[f32], center: i64, fraction: f64, half_taps: i64, cutoff:
         let cosine = (std::f64::consts::PI * offset / half_taps as f64).cos();
         let window = 0.42 + 0.5 * cosine + 0.08 * (2.0 * cosine * cosine - 1.0);
         let angle = 2.0 * std::f64::consts::PI * cutoff * offset;
-        let sinc = if angle == 0.0 { 1.0 } else { angle.sin() / angle };
+        let sinc = if angle == 0.0 {
+            1.0
+        } else {
+            angle.sin() / angle
+        };
         let coefficient = window * sinc;
 
         let sample_index = center + tap;
@@ -579,8 +583,7 @@ mod tests {
         );
         let raw = std::fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("read shared fixture {path}: {err}"));
-        let fixture: serde_json::Value =
-            serde_json::from_str(&raw).expect("fixture is valid JSON");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
         let cases = fixture["cases"].as_array().expect("fixture cases array");
         assert!(cases.len() >= 15, "fixture must keep its coverage");
 
@@ -723,7 +726,10 @@ mod tests {
 
         // Outside the input, the fallback clamps to the nearest edge.
         assert_eq!(sinc_sample(&input, -50, 0.5, 4, 1.001), input[0]);
-        assert_eq!(sinc_sample(&input, 500, 0.5, 4, 1.001), input[input.len() - 1]);
+        assert_eq!(
+            sinc_sample(&input, 500, 0.5, 4, 1.001),
+            input[input.len() - 1]
+        );
     }
 
     #[test]
@@ -762,8 +768,8 @@ mod tests {
         let mut imaginary = 0.0f64;
 
         for (index, &sample) in samples.iter().take(window).enumerate() {
-            let phase = 2.0 * std::f64::consts::PI * frequency_hz * index as f64
-                / f64::from(sample_rate);
+            let phase =
+                2.0 * std::f64::consts::PI * frequency_hz * index as f64 / f64::from(sample_rate);
             real += f64::from(sample) * phase.cos();
             imaginary -= f64::from(sample) * phase.sin();
         }
@@ -791,9 +797,9 @@ mod tests {
             let right = (left + 1).min(last);
             let fraction = position - left as f64;
             let left_sample = f64::from(mono_samples[left]);
-            output
-                .push((left_sample + (f64::from(mono_samples[right]) - left_sample) * fraction)
-                    as f32);
+            output.push(
+                (left_sample + (f64::from(mono_samples[right]) - left_sample) * fraction) as f32,
+            );
         }
 
         output
@@ -806,9 +812,7 @@ mod tests {
         // of sin(pi/2 * n) → 0, -0.8, 0, 0.8 …).
         let amplitude = 0.8f64;
         let samples: Vec<f32> = (0..48_000)
-            .map(|index| {
-                (amplitude * (std::f64::consts::PI * index as f64 / 2.0).sin()) as f32
-            })
+            .map(|index| (amplitude * (std::f64::consts::PI * index as f64 / 2.0).sin()) as f32)
             .collect();
         let audio = mono(&samples, 48_000);
 
@@ -838,9 +842,8 @@ mod tests {
             let samples: Vec<f32> = (0..rate)
                 .map(|index| {
                     (amplitude
-                        * (2.0 * std::f64::consts::PI * 1_000.0 * index as f64
-                            / f64::from(rate))
-                        .sin()) as f32
+                        * (2.0 * std::f64::consts::PI * 1_000.0 * index as f64 / f64::from(rate))
+                            .sin()) as f32
                 })
                 .collect();
             let audio = mono(&samples, rate);
@@ -879,7 +882,9 @@ mod tests {
         assert_eq!(output.len(), 1_600);
         assert!(output.iter().all(|sample| sample.is_finite()));
 
-        let peak = output.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        let peak = output
+            .iter()
+            .fold(0.0f32, |max, sample| max.max(sample.abs()));
         assert!(peak <= 1.3, "windowed-sinc overshoot stays bounded: {peak}");
 
         let energy: f64 = output.iter().map(|sample| f64::from(*sample).powi(2)).sum();

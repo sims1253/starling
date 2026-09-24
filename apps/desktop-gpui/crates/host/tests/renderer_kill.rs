@@ -47,7 +47,11 @@ const HOST_BIN: &str = env!("CARGO_BIN_EXE_starling-runtime-host");
 /// The config shape the sibling suites use: transport defaults, real v2
 /// persistence at the root, scripted capture/provider so a take is
 /// drivable without hardware.
-fn kill_config(root: &Path, source: Arc<FakeCaptureSource>, provider: Arc<FakeProvider>) -> HostConfig {
+fn kill_config(
+    root: &Path,
+    source: Arc<FakeCaptureSource>,
+    provider: Arc<FakeProvider>,
+) -> HostConfig {
     let mut config = HostConfig::new(root, root.join("endpoints"));
     config.runtime = config
         .runtime
@@ -153,7 +157,8 @@ impl DoubleRenderer {
             let mut line = String::new();
             // One line only (the double prints exactly one); EOF and
             // empty reads surface as an empty line.
-            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stdout), &mut line);
+            let _ =
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stdout), &mut line);
             let _ = tx.send(line);
         });
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -216,7 +221,11 @@ fn assert_endpoint_removed(socket: &Path) {
     while socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(!socket.exists(), "the endpoint {} was not removed", socket.display());
+    assert!(
+        !socket.exists(),
+        "the endpoint {} was not removed",
+        socket.display()
+    );
 }
 
 // --------------------------------------------------------------------- //
@@ -305,7 +314,9 @@ fn a_crashlooping_renderer_never_leaks_connection_slots() {
 
     // Still serving, still within the cap, after the whole loop.
     let final_client = connect_with_retry(&socket);
-    let snapshot = final_client.snapshot().expect("snapshot after the crashloop");
+    let snapshot = final_client
+        .snapshot()
+        .expect("snapshot after the crashloop");
     assert_eq!(snapshot["jobs"]["limits"]["maxQueued"], 2 + 7);
     drop(final_client);
     host.shutdown();
@@ -333,8 +344,18 @@ fn a_renderer_killed_with_a_command_in_flight_costs_only_the_receipt() {
 
     let mut renderer = spawn_double(&socket, "command");
     renderer.wait_ready(&socket);
-    // Let the host read and route the command before the kill lands.
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait until the host has observably routed the command, then kill —
+    // no fixed sleep guessing at the reader.
+    let probe = connect_with_retry(&socket);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe.snapshot().expect("probe snapshot")["jobs"]["limits"]["maxQueued"] != 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the renderer's command was never routed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(probe);
     renderer.kill();
 
     let successor = connect_with_retry(&socket);
@@ -393,12 +414,13 @@ fn a_renderer_process_killed_mid_take_leaves_a_durable_take_and_a_serving_host()
     until(
         &successor,
         "capture.stopped",
-        |event| {
-            event.type_name() == "capture.stopped" && event.corr() == Some("take_kill")
-        },
+        |event| event.type_name() == "capture.stopped" && event.corr() == Some("take_kill"),
         Duration::from_secs(10),
     );
-    assert_eq!(successor.snapshot().unwrap()["capture"]["state"], "Persisted");
+    assert_eq!(
+        successor.snapshot().unwrap()["capture"]["state"],
+        "Persisted"
+    );
 
     // The durable witness: the row is in storage v2, not in any process.
     let store = starling_dictation::store_v2::StoreV2::open(root.path()).expect("store opens");
@@ -576,7 +598,10 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
         Receipt::Served(view) => {
             assert_eq!(view["found"], true, "{view}");
             assert_eq!(view["headRevision"], 1, "{view}");
-            assert_eq!(view["revisions"][0]["text"], "Written before the host died.");
+            assert_eq!(
+                view["revisions"][0]["text"],
+                "Written before the host died."
+            );
         }
         other => panic!("expected a served view, got {other:?}"),
     }

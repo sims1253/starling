@@ -435,8 +435,11 @@ mod tests {
         // pins the resume contract, then proves the stream stays
         // framed afterwards.
         let first = encode(&command_frame("push-to-talk"), DEFAULT_MAX_FRAME_BYTES).unwrap();
-        let second =
-            encode(&Frame::GetSnapshot { req: "s-2".into() }, DEFAULT_MAX_FRAME_BYTES).unwrap();
+        let second = encode(
+            &Frame::GetSnapshot { req: "s-2".into() },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
         let mut wire = first;
         wire.extend_from_slice(&second);
 

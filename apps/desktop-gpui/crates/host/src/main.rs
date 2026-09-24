@@ -75,8 +75,7 @@ fn main() {
         // exact abrupt-SIGTERM-with-lease-held death the early
         // registration exists to prevent — so it is checked, not
         // ignored.
-        if libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t)
-            == libc::SIG_ERR
+        if libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t) == libc::SIG_ERR
             || libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t)
                 == libc::SIG_ERR
         {

@@ -174,26 +174,41 @@ pub static CAPTURE: MachineSpec = MachineSpec {
     name: "capture",
     initial: "Idle",
     states: &[
-        "Idle", "Acquiring", "Recording", "Draining", "Persisted", "Interrupted", "Recovering",
+        "Idle",
+        "Acquiring",
+        "Recording",
+        "Draining",
+        "Persisted",
+        "Interrupted",
+        "Recovering",
     ],
     commands: &[
         (
             "capture.start",
             command!(from only!("Idle", "Persisted"), to Some("Acquiring")),
         ),
-        ("capture.stop", command!(from only!("Recording"), to Some("Draining"))),
+        (
+            "capture.stop",
+            command!(from only!("Recording"), to Some("Draining")),
+        ),
         (
             "capture.abort",
             command!(from only!("Acquiring", "Recording", "Draining"), to Some("Idle")),
         ),
     ],
     events: &[
-        ("capture.started", event!(from ["Acquiring"], to Some("Recording"))),
+        (
+            "capture.started",
+            event!(from ["Acquiring"], to Some("Recording")),
+        ),
         (
             "capture.progress",
             event!(from ["Recording", "Draining", "Recovering"]),
         ),
-        ("capture.gap", event!(from ["Recording", "Draining", "Recovering"])),
+        (
+            "capture.gap",
+            event!(from ["Recording", "Draining", "Recovering"]),
+        ),
         (
             "capture.error",
             event!(
@@ -223,8 +238,16 @@ pub static JOBS: MachineSpec = MachineSpec {
     name: "jobs",
     initial: "Idle",
     states: &[
-        "Idle", "Queued", "Dispatched", "Loading", "Recognizing", "Transforming", "Completed",
-        "Failed", "Cancelled", "Rejected",
+        "Idle",
+        "Queued",
+        "Dispatched",
+        "Loading",
+        "Recognizing",
+        "Transforming",
+        "Completed",
+        "Failed",
+        "Cancelled",
+        "Rejected",
     ],
     commands: &[
         (
@@ -246,7 +269,10 @@ pub static JOBS: MachineSpec = MachineSpec {
     events: &[
         ("jobs.queued", event!(from [], to Some("Queued"))),
         ("jobs.rejected", event!(from [], to Some("Rejected"))),
-        ("jobs.progress", event!(from ["Loading", "Recognizing", "Transforming"])),
+        (
+            "jobs.progress",
+            event!(from ["Loading", "Recognizing", "Transforming"]),
+        ),
         (
             "jobs.completed",
             event!(from ["Recognizing", "Transforming"], to Some("Completed")),
@@ -272,7 +298,12 @@ pub static CONTEXT: MachineSpec = MachineSpec {
     name: "context",
     initial: "Observing",
     states: &[
-        "Observing", "SnapshotTaken", "ModeDecided", "RouteFrozen", "Expired", "Released",
+        "Observing",
+        "SnapshotTaken",
+        "ModeDecided",
+        "RouteFrozen",
+        "Expired",
+        "Released",
     ],
     commands: &[
         (
@@ -298,7 +329,10 @@ pub static CONTEXT: MachineSpec = MachineSpec {
         ),
     ],
     events: &[
-        ("context.targetSnapshot", event!(from [], to Some("SnapshotTaken"))),
+        (
+            "context.targetSnapshot",
+            event!(from [], to Some("SnapshotTaken")),
+        ),
         ("mode.decision", event!(from [], to Some("ModeDecided"))),
         // Emitted when the audio route freezes at capture start; only legal
         // once a mode has been decided, never after (a later spoken phrase
@@ -337,11 +371,20 @@ pub static DOCS: MachineSpec = MachineSpec {
                 outcomes &[("docs.turnAppended", None)],
             ),
         ),
-        ("docs.get", command!(from only!("Steady", "Committed", "Conflicted"))),
+        (
+            "docs.get",
+            command!(from only!("Steady", "Committed", "Conflicted")),
+        ),
     ],
     events: &[
-        ("docs.headUpdated", event!(from ["Validating"], to Some("Committed"))),
-        ("docs.headConflict", event!(from ["Validating"], to Some("Conflicted"))),
+        (
+            "docs.headUpdated",
+            event!(from ["Validating"], to Some("Committed")),
+        ),
+        (
+            "docs.headConflict",
+            event!(from ["Validating"], to Some("Conflicted")),
+        ),
         ("docs.turnAppended", event!(from [])),
     ],
     internal: &[("Committed", "Steady")],
@@ -352,8 +395,14 @@ pub static DELIVERY: MachineSpec = MachineSpec {
     name: "delivery",
     initial: "Idle",
     states: &[
-        "Idle", "Prepared", "Revalidating", "SubmittedUnconfirmed", "Confirmed", "Failed",
-        "Conflict", "Cancelled",
+        "Idle",
+        "Prepared",
+        "Revalidating",
+        "SubmittedUnconfirmed",
+        "Confirmed",
+        "Failed",
+        "Conflict",
+        "Cancelled",
     ],
     commands: &[
         (
@@ -363,7 +412,10 @@ pub static DELIVERY: MachineSpec = MachineSpec {
                 outcomes &[("delivery.prepared", Some("Prepared"))],
             ),
         ),
-        ("delivery.apply", command!(from only!("Prepared"), to Some("Revalidating"))),
+        (
+            "delivery.apply",
+            command!(from only!("Prepared"), to Some("Revalidating")),
+        ),
         (
             "delivery.cancel",
             command!(
@@ -371,7 +423,10 @@ pub static DELIVERY: MachineSpec = MachineSpec {
                 to Some("Cancelled"),
             ),
         ),
-        ("delivery.copyFallback", command!(from only!("Failed", "Conflict"))),
+        (
+            "delivery.copyFallback",
+            command!(from only!("Failed", "Conflict")),
+        ),
     ],
     events: &[
         ("delivery.prepared", event!(from [], to Some("Prepared"))),
@@ -476,9 +531,7 @@ mod tests {
         let mut typed_commands = std::collections::HashSet::new();
         // Every enum variant reports its wire type; enumerate via samples.
         let samples = [
-            Command::CaptureStart {
-                policy: "p".into(),
-            },
+            Command::CaptureStart { policy: "p".into() },
             Command::CaptureStop { drain: None },
             Command::CaptureAbort,
             Command::JobsSubmit {
@@ -492,9 +545,7 @@ mod tests {
                 max_concurrent: 1,
                 per_route: vec![],
             }),
-            Command::ContextSnapshot {
-                source: "s".into(),
-            },
+            Command::ContextSnapshot { source: "s".into() },
             Command::ModeSet {
                 mode: "m".into(),
                 source: crate::protocol::Manual,

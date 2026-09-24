@@ -38,7 +38,10 @@ pub enum ProviderOutcome {
         /// `Transforming` edge when set).
         transformed: bool,
     },
-    Failed { reason: String, retryable: bool },
+    Failed {
+        reason: String,
+        retryable: bool,
+    },
 }
 
 /// Why a provider call failed, mapped to v1 `jobs.failed{reason,
@@ -49,9 +52,7 @@ pub fn failure_from_client_error(error: &ClientError) -> (String, bool) {
         ClientError::Transport(_) => ("transport_error".to_string(), true),
         ClientError::Timeout(_) => ("timeout".to_string(), true),
         ClientError::Redirect(_) => ("redirect_blocked".to_string(), false),
-        ClientError::Http { status, .. } => {
-            (format!("http_{status}"), *status >= 500)
-        }
+        ClientError::Http { status, .. } => (format!("http_{status}"), *status >= 500),
         ClientError::Protocol(_) => ("protocol_error".to_string(), false),
         // An oversized body is deterministic server behavior: the same
         // request would produce the same wall of bytes, so retrying
@@ -322,12 +323,8 @@ mod tests {
             })
         };
         let started = Instant::now();
-        let outcome = provider.recognize(
-            vec![0u8; 64],
-            "job-x",
-            &mut |_partial: Partial| {},
-            &token,
-        );
+        let outcome =
+            provider.recognize(vec![0u8; 64], "job-x", &mut |_partial: Partial| {}, &token);
         let elapsed = started.elapsed();
         canceller.join().expect("canceller thread");
         assert!(
@@ -356,12 +353,8 @@ mod tests {
         let token = CancelToken::new();
         token.cancel();
         let started = Instant::now();
-        let outcome = provider.recognize(
-            vec![0u8; 64],
-            "job-y",
-            &mut |_partial: Partial| {},
-            &token,
-        );
+        let outcome =
+            provider.recognize(vec![0u8; 64], "job-y", &mut |_partial: Partial| {}, &token);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a precancelled recognition must not run its 30 s work"
