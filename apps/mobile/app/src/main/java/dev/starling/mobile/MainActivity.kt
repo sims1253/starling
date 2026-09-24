@@ -292,10 +292,11 @@ class MainActivity : Activity() {
         onDeviceStatus.text = when {
             engine.hasModel() -> {
                 val sizeMb = mb(engine.modelSizeBytes())
-                val usage = getString(
-                    if (engineOnDeviceInput.isChecked) R.string.on_device_in_use else R.string.on_device_not_selected,
-                )
-                getString(R.string.on_device_model_present, sizeMb) + " " + usage
+                if (engineOnDeviceInput.isChecked) {
+                    getString(R.string.on_device_model_in_use, sizeMb)
+                } else {
+                    getString(R.string.on_device_model_not_selected, sizeMb, getString(R.string.engine_on_device))
+                }
             }
             else -> getString(R.string.on_device_status_no_model)
         }

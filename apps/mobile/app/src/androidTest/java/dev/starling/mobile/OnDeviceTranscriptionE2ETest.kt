@@ -1,5 +1,6 @@
 package dev.starling.mobile
 
+import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.starling.mobile.engine.ModelCatalog
@@ -19,7 +20,7 @@ import java.io.File
  * Opt-in because it fetches 553 MB and needs a capable arm64 phone:
  *   ./gradlew connectedDebugAndroidTest \
  *     -Pandroid.testInstrumentationRunnerArguments.e2e=true
- * The model stays in the app's files dir, so reruns only re-verify it.
+ * Gradle uninstalls the test app afterwards, so every run downloads again.
  */
 @RunWith(AndroidJUnit4::class)
 class OnDeviceTranscriptionE2ETest {
@@ -50,6 +51,7 @@ class OnDeviceTranscriptionE2ETest {
         val result = engine.transcribe(wav)
         val text = (result as? InferenceResult.Success)?.rawTranscript
             ?: throw AssertionError("transcription failed: $result")
+        Log.i("StarlingE2E", "transcript: $text")
         assertEquals(normalize(REFERENCE), normalize(text))
     }
 
