@@ -77,7 +77,8 @@ foreach(_entry IN LISTS STARLING_FAST_OPTIONAL_SHADERS)
   string(REPLACE "|" ";" _parts "${_entry}")
   list(GET _parts 1 _src)
   execute_process(
-    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -c ${STARLING_FAST_DIR}/shaders/${_src}
+    COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -I ${STARLING_FAST_DIR}/shaders
+            -c ${STARLING_FAST_DIR}/shaders/${_src}
             -o ${CMAKE_CURRENT_BINARY_DIR}/fast_probe_check.spv
     RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
   if(_rc EQUAL 0)

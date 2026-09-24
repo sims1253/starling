@@ -495,7 +495,6 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
 
     // ---- encoder layers ----
     const uint32_t n_full = A / W, tail_w = A % W;
-    const uint32_t ldPw = round_up(W, 8);
     const float escale = 1.0f / std::sqrt((float)EHD);
     auto attention = [&](uint32_t tok0, uint32_t nwin, uint32_t Wn) {
         if (nwin == 0 || Wn == 0) return true;
@@ -530,7 +529,6 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
         rc.label("enc_attn_pv");
         return K.gemm(rc, v, err);
     };
-    (void)ldPw;
     const float eps = ec.layer_norm_eps;
     for (uint32_t l = 0; l < EL; ++l) {
         const EncLayer& Y = enc[l];

@@ -227,7 +227,7 @@ bool pack_gpu_matrix_raw(int type, const void* data, uint32_t N, uint32_t K,
                 m.q[i / 2] |= (i & 1) ? h << 16 : h;
             }
         }
-        m.lossless = (type == GGML_TYPE_BF16) ? false : false;
+        m.lossless = false;   // f32 -> f16 rounds
         return true;
     }
     default:

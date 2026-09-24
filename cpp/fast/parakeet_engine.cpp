@@ -80,7 +80,7 @@ struct ParakeetEngine::Impl {
     cpu::GemvHelper gemv2;   // decoder's second GEMV thread (parks when idle)
 
     // ---- runtime state ----
-    int cap_T = 0, cap_Tp = 0;             // scratch capacity (mel frames / encoder frames)
+    int cap_T = 0;                         // scratch capacity (mel frames)
     int pos_cap = 0;                       // positional-table capacity (encoder frames)
     vk::Buffer mel_in, sub1, sub2a, sub2b, sub3a, sub3b, x, h, ffh, qu, qv, kk, vv;
     vk::Buffer S, BD, P, att, glu, dw, enc, pe, pos_tab;
@@ -285,7 +285,7 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
             err = "fast parakeet: prediction embedding shape mismatch";
             return false;
         }
-        embed.assign((size_t)V1 * PH, 0.0f);   // rows past the table (blank) stay zero
+        embed.assign((size_t)V1 * PH, 0.0f);   // a table without the blank row leaves it zero
         std::copy_n(e.begin(), std::min(e.size(), embed.size()), embed.begin());
     }
     const uint32_t PL = cfg.pred_rnn_layers ? cfg.pred_rnn_layers : 1;
@@ -352,7 +352,6 @@ bool ParakeetEngine::Impl::ensure_capacity(int T, std::string& err) {
         !mk(dw, Tp * D * 2) || !mk(enc, Tp * JH * 4, vk::Mem::Readback))
         return false;
     cap_T = cT;
-    cap_Tp = (int)Tp;
     return true;
 }
 

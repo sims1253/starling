@@ -39,7 +39,8 @@ class Engine:
         self.lib = lib
         self.ctx = lib.starling_ggml_load(KIND_PARAKEET, gguf.encode())
         if not self.ctx:
-            raise SystemExit(f"load ({engine}) failed: {lib.starling_ggml_last_error(None).decode()}")
+            msg = lib.starling_ggml_last_error(None)
+            raise SystemExit(f"load ({engine}) failed: {msg.decode() if msg else 'unknown error'}")
         self.name = engine
 
     def encode(self, pcm: np.ndarray) -> np.ndarray:

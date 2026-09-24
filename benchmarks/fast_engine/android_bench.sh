@@ -34,7 +34,9 @@ if [ ${#WAVS[@]} -eq 0 ]; then
 fi
 
 if [ "$BUILD_IT" = 1 ]; then
-  NDK=${ANDROID_NDK:-$(ls -d "${ANDROID_HOME:-/opt/android-sdk}"/ndk/* | sort -V | tail -1)}
+  NDK=${ANDROID_NDK:-$(ls -d "${ANDROID_HOME:-/opt/android-sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)}
+  [ -n "$NDK" ] && [ -f "$NDK/build/cmake/android.toolchain.cmake" ] || {
+    echo "Android NDK not found (set ANDROID_NDK or ANDROID_HOME)" >&2; exit 1; }
   cmake -S "$ROOT" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DCMAKE_BUILD_TYPE=Release \

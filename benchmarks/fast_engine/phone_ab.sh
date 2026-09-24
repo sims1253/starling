@@ -33,7 +33,7 @@ for spec in "$@"; do
   names+=("$name")
 done
 
-median() { sort -n | awk '{a[NR]=$1} END {print (NR % 2) ? a[(NR+1)/2] : (a[NR/2] + a[NR/2+1]) / 2}'; }
+median() { sort -n | awk '{a[NR]=$1} END {if (!NR) {print "FAILED"; exit} print (NR % 2) ? a[(NR+1)/2] : (a[NR/2] + a[NR/2+1]) / 2}'; }
 
 run() { # name kind gguf wav -> median total ms
   adb shell "cd $DEV && LD_LIBRARY_PATH=. STARLING_ENGINE=fast STARLING_GGML_THREADS=6 \

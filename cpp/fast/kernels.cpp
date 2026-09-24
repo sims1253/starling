@@ -508,7 +508,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     ga.N = n;
     ga.K = k;
     for (uint32_t i = 0; i < reps; ++i) {
-        rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+        rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
                           vk::Ref(dummy_), vk::Ref(dummy_)},
                      &ga, sizeof(ga), ceil_div(n, rows));
         rec.barrier();
@@ -518,7 +518,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (bits == 4 || bits == 8) {
         vk::Recording rc1(*ctx_);
         rc1.begin();
-        rc1.dispatch(*p, {vk::Ref(x), vk::Ref(wq), vk::Ref(ws), vk::Ref(y), vk::Ref(dummy_),
+        rc1.dispatch(*p, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
                           vk::Ref(dummy_), vk::Ref(dummy_)},
                      &ga, sizeof(ga), ceil_div(n, rows));
         rc1.end();

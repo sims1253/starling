@@ -100,11 +100,13 @@ def main() -> int:
         p = lib.starling_ggml_transcribe_pcm(ctx, w.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(w), 16000)
         lib.starling_ggml_free_string(p)
         texts = []
+        failed = 0
         t0 = time.perf_counter()
         for _, pcm in clips:
             p = lib.starling_ggml_transcribe_pcm(
                 ctx, pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(pcm), 16000)
             if not p:
+                failed += 1
                 texts.append("")
                 continue
             texts.append(ctypes.cast(p, ctypes.c_char_p).value.decode("utf-8", "replace"))
@@ -120,14 +122,15 @@ def main() -> int:
         base_name = next(iter(outputs))   # first variant that loaded
         ndiff = sum(x != y for x, y in zip(outputs[base_name], texts))
         print(f"{v:9s} WER {100.0 * errs / max(words, 1):6.2f}%  time {dt:7.2f}s  "
-              f"RTF {dt / audio_s:.4f}  clips {len(clips)}  differ-from-{base_name} {ndiff}",
+              f"RTF {dt / audio_s:.4f}  clips {len(clips)}  differ-from-{base_name} {ndiff}"
+              + (f"  FAILED {failed}" if failed else ""),
               flush=True)
     if a.show_diffs and len(outputs) > 1:
-        base = next(iter(outputs.values()))
+        base_name, base = next(iter(outputs.items()))
         for v, texts in outputs.items():
             for (n, _), x, y in zip(clips, base, texts):
                 if x != y:
-                    print(f"[{v}] {n}\n   {a.variants[0]}: {x}\n   {v}: {y}")
+                    print(f"[{v}] {n}\n   {base_name}: {x}\n   {v}: {y}")
     return 0
 
 

@@ -42,8 +42,8 @@ struct HostMatrix {
     size_t bytes() const { return (q.size() + s.size()) * 4; }
 };
 
-// Repack a 2-D ggml tensor (ne0 = K, ne1 = N) into `out`. `prefer` is only a
-// hint for float tensors (F16 unless W8 is requested for memory reasons).
+// Repack a 2-D ggml tensor (ne0 = K, ne1 = N) into `out` (float tensors
+// become F16).
 bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err);
 
 // Same for raw data of a given ggml type (row-major, N rows of K).
@@ -59,7 +59,7 @@ bool concat_rows(HostMatrix& a, const HostMatrix& b, std::string& err);
 // Dequantize any 2-D/1-D tensor to f32 (row-major, ne0 fastest).
 bool tensor_to_f32(const ggml_tensor* t, std::vector<float>& out, std::string& err);
 
-// f32 -> packed f16 words (n even; pads the last word with 0 when odd).
+// f32 -> packed f16 words, (n + 1) / 2 of them (odd n: the last high half is 0).
 std::vector<uint32_t> pack_f16(const float* x, size_t n);
 
 // CPU decoder weights: int8 [N][K] + f32 scale per 32.

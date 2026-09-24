@@ -211,6 +211,7 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
             float* out = (float*)std::malloc(enc.size() * sizeof(float));
             if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
             std::memcpy(out, enc.data(), enc.size() * sizeof(float));
+            if (err_out) *err_out = nullptr;
             return out;
         } catch (const std::exception& e) {
             report_error(err_out, e.what());

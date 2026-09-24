@@ -11,6 +11,7 @@
 #include "starling_ggml.h"
 #include "runtime/audio_io.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +87,7 @@ int main(int argc, char** argv) {
             starling::ggml::resample_pcm(pcm.data(), pcm.size(), sr, 16000, rs);
             pcm.swap(rs);
         }
+        if (pcm.empty()) { std::fprintf(stderr, "%s: no samples\n", path.c_str()); return 1; }
         const double dur = pcm.size() / 16000.0;
         if (warmup) {
             char* w = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
