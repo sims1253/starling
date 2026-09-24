@@ -58,5 +58,10 @@ class EndpointPolicyTest {
             "https://server.example/v1/audio/transcriptions",
             inferenceUrl("https://server.example/v1/audio/transcriptions"),
         )
+        // Pre-unification full routes are not migrated (no backwards compatibility).
+        assertEquals(
+            "https://server.example/transcribe/v1/audio/transcriptions",
+            inferenceUrl("https://server.example/transcribe"),
+        )
     }
 }

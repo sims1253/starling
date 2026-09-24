@@ -15,9 +15,6 @@ sealed interface InferenceResult {
     data class Failure(val message: String, val retryable: Boolean) : InferenceResult
 }
 
-/** Full batch routes the pre-unification Starling protocol accepted. */
-private val LEGACY_ROUTE_SUFFIXES = listOf("/inference", "/transcribe")
-
 /** Multipart upload to the backend's OpenAI-compatible transcription endpoint. */
 internal fun inferenceUrl(endpoint: String): String {
     val base = endpoint.trimEnd('/')
@@ -34,7 +31,6 @@ class InferenceClient {
         if (audioFile.length() > MAX_UPLOAD_BYTES) {
             return InferenceResult.Failure("The recording is larger than the server upload limit", false)
         }
-        warnIfLegacyRoute(config.endpoint)
 
         val validation = EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp)
         if (validation !is EndpointValidation.Valid) {
@@ -146,21 +142,6 @@ class InferenceClient {
             output.write(buffer, 0, count)
         }
         return output.toByteArray()
-    }
-
-    /** Backwards compatibility is out of scope (no released versions), so a
-     *  saved pre-unification full-route endpoint is not migrated — only
-     *  surfaced so the resulting 404 is explainable. */
-    private fun warnIfLegacyRoute(endpoint: String) {
-        val base = endpoint.trimEnd('/')
-        val legacy = LEGACY_ROUTE_SUFFIXES.firstOrNull { base.endsWith(it, ignoreCase = true) }
-        if (legacy != null) {
-            android.util.Log.w(
-                "StarlingInference",
-                "Endpoint '$endpoint' ends in the legacy route '$legacy'; the unified API will " +
-                    "404 on it. Set the server base URL instead.",
-            )
-        }
     }
 
     companion object {
