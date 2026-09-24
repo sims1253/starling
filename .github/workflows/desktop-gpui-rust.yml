@@ -57,3 +57,64 @@ jobs:
         if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         working-directory: apps/desktop-gpui
         run: cargo check -p starling-runtime-host
+
+  # Packaged desktop lanes: the universal macOS bundle (DMG) and the portable
+  # Windows archive. Unsigned — artifacts are development builds for testing,
+  # not notarized releases.
+  build-macos:
+    name: package starling-gpui (macos, universal)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Ensure the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build the universal binary and assemble Starling.app + DMG
+        working-directory: apps/desktop-gpui
+        run: scripts/package-macos.sh
+      - name: Upload the macOS disk image
+        # Installable build of every push and same-repository PR, mirroring the
+        # Android APK gate; fork PRs (unreviewed code) get no installable
+        # artifact.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-gpui-macos-universal-dmg
+          path: apps/desktop-gpui/target/package/Starling-macOS-universal.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: package starling-gpui (windows, x64)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Ensure the stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build the release binary
+        working-directory: apps/desktop-gpui
+        run: cargo build --release -p starling-gpui
+      - name: Package the portable archive
+        working-directory: apps/desktop-gpui
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/package | Out-Null
+          Compress-Archive -Path target/release/starling-gpui.exe -DestinationPath target/package/starling-gpui-windows-x64.zip
+      - name: Upload the Windows archive
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-gpui-windows-x64-zip
+          path: apps/desktop-gpui/target/package/starling-gpui-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
