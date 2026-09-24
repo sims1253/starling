@@ -221,12 +221,9 @@ def descriptor_endpoints() -> list[tuple[str, str]]:
 # wired in cpp/serve/main.cpp; the OpenAI subset comes from openapi.json.
 DOCUMENTED_NATIVE_ROUTES = {
     ("GET", "/health"),
-    ("GET", "/"),
     ("POST", "/warmup"),
-    ("POST", "/transcribe"),
-    ("POST", "/inference"),
     ("POST", "/normalize"),
-    ("DELETE", "/inference/<id>"),
+    ("DELETE", "/v1/audio/transcriptions/<id>"),
     ("GET", "/stream"),
 }
 
@@ -310,7 +307,7 @@ def test_descriptor_maps_onto_the_live_capabilities_route():
         "language_selection": features["language_selection"],
         "word_timestamps": features["word_timestamps"],
         "streaming_transcriptions": features["server_sent_transcription_events"],
-        "legacy_websocket_path": DESCRIPTOR["streaming"]["path"],
+        "websocket_path": DESCRIPTOR["streaming"]["path"],
     }
     live = json.loads(
         (CONTRACT / "fixtures" / "starling_capabilities_route.json").read_text()
@@ -394,13 +391,11 @@ def test_no_client_consumes_the_capability_route_yet():
     assert not offenders, f"clients now consume the capability route: {offenders}"
 
 
-def test_clients_still_probe_health_and_models_the_hardcoded_way():
-    """The documented today-state: health probing goes through /health or
-    /v1/models, never the capability descriptor."""
+def test_clients_probe_models_the_hardcoded_way():
+    """Health probing uses /v1/models, not the capability descriptor."""
     dictation_client = (REPO / "packages" / "dictation" / "src" / "client.ts").read_text()
-    assert '"/v1/models"' in dictation_client
-    assert '"/health"' in dictation_client
-    # Endpoint selection is a hardcoded ternary, not a descriptor lookup.
+    assert "/v1/models" in dictation_client
+    assert '"/health"' not in dictation_client
     assert '"/v1/audio/transcriptions"' in dictation_client
 
 
@@ -418,7 +413,8 @@ def test_readme_documents_the_adoption_map():
         "apps/desktop/electron/main.ts",
         "backends/python",
         "Electron (TS) today",
-        "Rust today",
-        "Python backend today",
+        "Android",
+        "iOS",
+        "Python backend",
     ):
         assert anchor in README, f"adoption map is missing {anchor!r}"

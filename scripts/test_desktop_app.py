@@ -120,7 +120,7 @@ def main():
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
 
                 # An upload failure must leave the recording in durable history.
-                upload = re.compile(r"/api/(inference|transcribe|v1/audio/transcriptions)$")
+                upload = re.compile(r"/api/v1/audio/transcriptions$")
                 page.route(upload, lambda route: route.abort())
                 page.locator('input[type="file"]').set_input_files(audio_file())
                 expect(page.locator(".history-row")).to_have_count(2)
@@ -145,7 +145,7 @@ def main():
                 expect(page.locator(".history-row")).to_have_count(4)
                 expect(page.locator(".take-state.transcribing")).to_have_count(2)
                 page.get_by_role("button", name="Open server settings").click()
-                page.get_by_label(re.compile(r"^API format")).select_option("openai")
+                page.get_by_label(re.compile(r"^Words to watch")).fill("auth")
                 page.get_by_role("button", name="Save settings", exact=True).click()
                 expect(page.locator(".connection")).to_contain_text("ready")
                 expect(page.locator(".take-state.transcribing")).to_have_count(2)
@@ -161,14 +161,8 @@ def main():
                 expect(page.locator(".transcript-body")).to_contain_text(RAW)
                 page.unroute(upload)
 
-                # The overlap block saved settings with the OpenAI API format;
-                # live streaming is Starling-API-only, so restore it first.
-                page.get_by_role("button", name="Open server settings").click()
-                page.get_by_label(re.compile(r"^API format")).select_option("starling")
-                page.get_by_role("button", name="Save settings", exact=True).click()
-
                 # Fake microphone supplies real PCM through the browser capture
-                # path. Live streaming is on by default for the Starling API:
+                # path. Live streaming is on by default:
                 # partials appear while recording and Stop commits the stream.
                 page.get_by_role("button", name="Start recording").click()
                 expect(page.get_by_role("button", name="Stop recording")).to_be_visible()

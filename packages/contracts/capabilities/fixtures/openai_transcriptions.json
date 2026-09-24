@@ -434,7 +434,7 @@
           }
         }
       },
-      "note": "The legacy handler's flat error string is re-wrapped in the OpenAI envelope; the native server has no resampler."
+      "note": "the native server has no resampler."
     }
   ]
 }

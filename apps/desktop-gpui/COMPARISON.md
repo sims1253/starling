@@ -49,11 +49,14 @@ electron:             {"mainProcess":{"rssBytes":193945600,...},"processes":[Bro
 ## Functional parity
 
 Same: recording flow (mono capture → PCM16 16 kHz WAV → local history →
-upload), starling + OpenAI protocols, retry/failure states with retained audio,
+upload), `/v1/audio/transcriptions` batch requests, retry/failure states with retained audio,
 transcript fidelity warnings, settings persistence, in-app + global
 Cmd/Ctrl+Shift+Space, import of `.wav` files, clipboard copy, exports.
 
 Different by design:
+
+- GPUI sends WAV chunks through `WS /stream` while recording and shows live
+  partials. The complete local WAV remains the fallback if streaming fails.
 
 - IndexedDB → on-disk store (`~/.local/share/starling-gpui/sessions`), same
   manifest schema.

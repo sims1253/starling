@@ -10,7 +10,8 @@ import { streamWebSocketUrl } from "@starling/dictation";
  *   path-only endpoint (the browser preview's `/api`) resolves against the
  *   page origin. The desktop default endpoint is `http://127.0.0.1:8181`
  *   (App.tsx), so the default live URL is `ws://127.0.0.1:8181/stream`.
- * - Batch transcription and health checks fetch `${endpoint}/inference` etc.
+ * - Batch transcription and health checks fetch `/v1/audio/transcriptions`
+ *   and `/v1/models` on the configured endpoint.
  *   directly from the renderer only in the browser preview (the packaged app
  *   routes them through the desktop bridge), and refinement always fetches an
  *   arbitrary user-configured OpenAI-compatible `http(s)` endpoint.

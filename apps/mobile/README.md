@@ -112,12 +112,11 @@ From this directory:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open **Starling Mobile**, grant microphone access, enter the server URL, choose
-the API protocol, and tap **Save connection**. `starling-serve` binds to
+Open **Starling Mobile**, grant microphone access, enter the server URL and
+its model slug, then tap **Save connection**. `starling-serve` binds to
 `127.0.0.1` by default; start it with `--host 0.0.0.0` (or the machine's LAN
-or Tailscale address) so the phone can reach it. The default protocol is the
-legacy Starling route. OpenAI-compatible mode requires the model slug served by
-the process (the native `/v1/models` response shows it). The default transport
+or Tailscale address) so the phone can reach it. The model slug is shown by
+the server's `/v1/models` response. The default transport
 is HTTPS. For a local development server using the documented default HTTP
 port, explicitly check **Allow HTTP for a trusted private LAN** and use an
 address such as:
@@ -163,14 +162,16 @@ recording, retry, and failure story is indistinguishable from the
 non-streaming flow. In the voice keyboard a failed stream removes its
 composing text and falls back to the explicit **Insert transcript** flow.
 
-### Voice input inside other keyboards
+### Voice input and Android settings
 
 Starling also registers as a system speech recognizer
 (`StarlingRecognitionService`). Keyboards that use Android's `SpeechRecognizer`
 API — for example the open-source HeliBoard, OpenBoard, or AnySoftKeyboard —
 then show their own microphone button and transcribe through Starling, without
-switching keyboards. Tap **Set Starling as voice input** and choose Starling
-Voice Recognition as the voice input service. Closed keyboards such as Gboard
+switching keyboards. Android may offer a speech recognition service picker in
+some contexts, but the Pixel **Default digital assistant app** screen is a
+different setting and does not list Starling. Enable **Starling Voice Input**
+as a keyboard for dictation in text fields. Closed keyboards such as Gboard
 or SwiftKey keep their bundled engines and cannot delegate to a custom
 recognizer. When the configuration supports streaming, growing partials are
 delivered through the platform's `partialResults` callback while you speak;
@@ -188,20 +189,16 @@ it.
 
 ## API compatibility
 
-Starling legacy mode sends a multipart field named `file` to `/inference`,
-matching the legacy contracts in `../../docs/python-serving.md` and
-`../../docs/native-serving.md`. OpenAI-compatible mode sends the standard
-multipart fields `file`, `model`, and `response_format=json` to
-`/v1/audio/transcriptions`; the model field is required and is never guessed at
-request time. Successful JSON responses must contain a `text` string. No
-normalization endpoint is called, so the returned transcript remains the
-source of truth.
+Batch transcription sends the multipart fields `file`, `model`, and
+`response_format=json` to `/v1/audio/transcriptions`. The model field is
+required. Successful JSON responses must contain a `text` string. Live
+dictation uses Starling's `WS /stream` and falls back to batch transcription
+if the stream fails. No normalization endpoint is called, so the returned
+transcript remains the source of truth.
 
-Set the endpoint to a server root, or enter the exact route. For OpenAI mode a
-server root gets `/v1/audio/transcriptions` appended; a root ending in `/v1`
-gets `/audio/transcriptions` appended. Legacy mode appends `/inference` to a
-server root. This supports the native server and the shared app protocol
-adapter without sending OpenAI fields to the legacy route.
+Set the endpoint to a server root, or enter the exact route. A server root
+gets `/v1/audio/transcriptions` appended; a root ending in `/v1` gets
+`/audio/transcriptions` appended.
 
 ## Scope and limitations
 

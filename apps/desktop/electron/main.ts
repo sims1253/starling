@@ -10,6 +10,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import { Data, Effect, Option, Schema } from "effect";
+import { DEFAULT_TRANSCRIPTION_MODEL } from "@starling/dictation";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -149,15 +150,6 @@ const WireTranscriptionSchema = Schema.Struct({
   request_id: Schema.optionalKey(Schema.String),
 });
 
-const WireHealthSchema = Schema.Struct({
-  status: Schema.String,
-  phase: Schema.optionalKey(Schema.String),
-  model: Schema.optionalKey(Schema.String),
-  loaded: Schema.optionalKey(Schema.Boolean),
-  busy: Schema.optionalKey(Schema.Boolean),
-  queue_depth: Schema.optionalKey(Schema.Finite),
-});
-
 const OpenAiModelsSchema = Schema.Struct({
   object: Schema.optionalKey(Schema.Literal("list")),
   data: Schema.Array(Schema.Struct({ id: Schema.String })),
@@ -172,8 +164,6 @@ const ErrorObjectJsonSchema = Schema.fromJsonString(ErrorObjectSchema);
 const ErrorMessageJsonSchema = Schema.fromJsonString(ErrorMessageSchema);
 
 const WireTranscriptionJsonSchema = Schema.fromJsonString(WireTranscriptionSchema);
-
-const WireHealthJsonSchema = Schema.fromJsonString(WireHealthSchema);
 
 const OpenAiModelsJsonSchema = Schema.fromJsonString(OpenAiModelsSchema);
 
@@ -325,32 +315,15 @@ function healthProgram(input: HealthInput) {
   return Effect.gen(function* () {
     const base = yield* cleanEndpoint(input.endpoint);
     const timeoutMs = yield* requestTimeout(input.timeoutMs);
-    const route = input.protocol === "openai" ? "/v1/models" : "/health";
-    const response = yield* requestBody(`${base}${route}`, { method: "GET" }, timeoutMs);
+    const response = yield* requestBody(`${base}/v1/models`, { method: "GET" }, timeoutMs);
+    const models = yield* Schema.decodeUnknownEffect(OpenAiModelsJsonSchema)(response.body);
 
-    if (input.protocol === "openai") {
-      const models = yield* Schema.decodeUnknownEffect(OpenAiModelsJsonSchema)(response.body);
+    // busy/queueDepth stay absent rather than fabricated: the OpenAI
+    // models route cannot observe them, and the optional fields encode
+    // "unknown" honestly for the consumers that check them.
+    const result: Mutable<ServerHealth> = { status: "ok", phase: "ready" };
 
-      const result: Mutable<ServerHealth> = { status: "ok", phase: "ready", busy: false };
-
-      if (models.data[0]) result.model = models.data[0].id;
-
-      return result satisfies ServerHealth;
-    }
-
-    const health = yield* Schema.decodeUnknownEffect(WireHealthJsonSchema)(response.body);
-
-    const result: Mutable<ServerHealth> = { status: health.status };
-
-    if (health.phase !== undefined) result.phase = health.phase;
-
-    if (health.model !== undefined) result.model = health.model;
-
-    if (health.loaded !== undefined) result.loaded = health.loaded;
-
-    if (health.busy !== undefined) result.busy = health.busy;
-
-    if (health.queue_depth !== undefined) result.queueDepth = health.queue_depth;
+    if (models.data[0]) result.model = models.data[0].id;
 
     return result satisfies ServerHealth;
   });
@@ -368,25 +341,14 @@ function transcribeProgram(input: TranscribeInput) {
       );
     }
 
-    let route = "/transcribe";
-    let body: BodyInit;
-    let headers: HeadersInit = { "x-request-id": id };
-
-    if (input.protocol === "openai") {
-      route = "/v1/audio/transcriptions";
-      const form = new FormData();
-      form.append("file", new Blob([input.audio], { type: "audio/wav" }), "recording.wav");
-      form.append("model", input.model || "parakeet");
-      form.append("response_format", "json");
-      body = form;
-    } else {
-      body = Buffer.from(input.audio);
-      headers = { ...headers, "content-type": "audio/wav" };
-    }
+    const form = new FormData();
+    form.append("file", new Blob([input.audio], { type: "audio/wav" }), "recording.wav");
+    form.append("model", input.model || DEFAULT_TRANSCRIPTION_MODEL);
+    form.append("response_format", "json");
 
     const response = yield* requestBody(
-      `${base}${route}`,
-      { method: "POST", headers, body },
+      `${base}/v1/audio/transcriptions`,
+      { method: "POST", headers: { "x-request-id": id }, body: form },
       timeoutMs,
     );
 

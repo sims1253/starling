@@ -22,14 +22,19 @@
           "schema_version": 1,
           "model": "parakeet",
           "audio_transcription": true,
-          "audio_formats": ["wav"],
+          "audio_formats": [
+            "wav"
+          ],
           "sample_rate_hz": 16000,
-          "response_formats": ["json", "text"],
+          "response_formats": [
+            "json",
+            "text"
+          ],
           "prompt": false,
           "language_selection": false,
           "word_timestamps": false,
           "streaming_transcriptions": false,
-          "legacy_websocket_path": "/stream"
+          "websocket_path": "/stream"
         }
       },
       "note": "Subset of capability.json; the field-by-field mapping is pinned in README.md and enforced by tests/test_capabilities_conformance.py. audio_transcription is false when the resident model is a text model (s1)."

@@ -28,7 +28,6 @@ import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
-import dev.starling.mobile.network.BackendProtocol
 import dev.starling.mobile.network.EndpointPolicy
 import dev.starling.mobile.network.EndpointValidation
 import dev.starling.mobile.network.StreamEvent
@@ -41,8 +40,6 @@ import kotlin.concurrent.thread
 class MainActivity : Activity() {
     private lateinit var endpointInput: EditText
     private lateinit var allowHttpInput: CheckBox
-    private lateinit var protocolInput: RadioGroup
-    private lateinit var openAiProtocolInput: RadioButton
     private lateinit var modelInput: EditText
     private lateinit var engineInput: RadioGroup
     private lateinit var engineOnDeviceInput: RadioButton
@@ -89,8 +86,6 @@ class MainActivity : Activity() {
 
         endpointInput = findViewById(R.id.endpoint_input)
         allowHttpInput = findViewById(R.id.allow_http_input)
-        protocolInput = findViewById(R.id.protocol_input)
-        openAiProtocolInput = findViewById(R.id.protocol_openai)
         modelInput = findViewById(R.id.model_input)
         engineInput = findViewById(R.id.engine_input)
         engineOnDeviceInput = findViewById(R.id.engine_on_device)
@@ -104,15 +99,10 @@ class MainActivity : Activity() {
         val config = application.backendSettings.load()
         endpointInput.setText(config.endpoint)
         allowHttpInput.isChecked = config.allowTrustedLanHttp
-        openAiProtocolInput.isChecked = config.protocol == BackendProtocol.OPENAI
-        findViewById<RadioButton>(R.id.protocol_starling).isChecked =
-            config.protocol == BackendProtocol.STARLING
         modelInput.setText(config.model)
         engineOnDeviceInput.isChecked = config.engine == TranscriptionEngine.ON_DEVICE
         findViewById<RadioButton>(R.id.engine_server).isChecked =
             config.engine == TranscriptionEngine.REMOTE
-        protocolInput.setOnCheckedChangeListener { _, _ -> updateProtocolFields() }
-        updateProtocolFields()
         findViewById<Button>(R.id.save_endpoint_button).setOnClickListener { saveEndpoint() }
         findViewById<Button>(R.id.import_model_button).setOnClickListener { importModel() }
         recordButton.setOnClickListener {
@@ -121,10 +111,6 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.open_keyboard_button).setOnClickListener {
             startActivity(Intent("android.settings.INPUT_METHOD_SETTINGS"))
         }
-        findViewById<Button>(R.id.open_voice_input_button).setOnClickListener {
-            startActivity(Intent(android.provider.Settings.ACTION_VOICE_INPUT_SETTINGS))
-        }
-
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshOnDeviceStatus()
         refreshRecordings()
@@ -158,15 +144,9 @@ class MainActivity : Activity() {
     }
 
     private fun currentConfig(): BackendConfig? {
-        val protocol = if (openAiProtocolInput.isChecked) {
-            BackendProtocol.OPENAI
-        } else {
-            BackendProtocol.STARLING
-        }
         val config = BackendConfig(
             endpoint = endpointInput.text.toString(),
             allowTrustedLanHttp = allowHttpInput.isChecked,
-            protocol = protocol,
             model = modelInput.text.toString().trim(),
             engine = if (engineOnDeviceInput.isChecked) {
                 TranscriptionEngine.ON_DEVICE
@@ -174,7 +154,7 @@ class MainActivity : Activity() {
                 TranscriptionEngine.REMOTE
             },
         )
-        if (config.protocol == BackendProtocol.OPENAI && config.model.isEmpty()) {
+        if (config.engine == TranscriptionEngine.REMOTE && config.model.isEmpty()) {
             endpointMessage.setText(R.string.model_required)
             return null
         }
@@ -185,11 +165,6 @@ class MainActivity : Activity() {
             }
             is EndpointValidation.Valid -> config.copy(endpoint = validation.endpoint)
         }
-    }
-
-    private fun updateProtocolFields() {
-        if (!::modelInput.isInitialized) return
-        modelInput.visibility = if (openAiProtocolInput.isChecked) View.VISIBLE else View.GONE
     }
 
     private fun importModel() {
@@ -206,31 +181,49 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_IMPORT_MODEL || resultCode != RESULT_OK) return
-        val uri: Uri = data?.data ?: return
+        val uri: Uri = data?.data ?: run {
+            onDeviceStatus.setText(R.string.on_device_file_missing)
+            return
+        }
         onDeviceStatus.setText(R.string.on_device_importing)
         val resolver = contentResolver
         thread {
-            val input = runCatching { resolver.openInputStream(uri) }.getOrNull()
+            val opened = runCatching { resolver.openInputStream(uri) }
+            val input = opened.getOrNull()
             val result = if (input == null) {
+                val detail = opened.exceptionOrNull()?.localizedMessage?.takeIf(String::isNotBlank)
                 OnDeviceEngine.ImportResult.Rejected(
-                    "The selected file could not be opened.",
+                    "The selected file could not be opened" +
+                        (detail?.let { ": $it" } ?: "."),
                     OnDeviceEngine.ImportStage.OPEN,
                 )
             } else {
-                application.onDeviceEngine.importModel(input)
+                runCatching { application.onDeviceEngine.importModel(input) }.getOrElse { error ->
+                    Log.e(TAG, "model import failed unexpectedly", error)
+                    OnDeviceEngine.ImportResult.Rejected(
+                        "The model could not be imported: ${error.message ?: error::class.java.simpleName}",
+                        OnDeviceEngine.ImportStage.COPY,
+                    )
+                }
             }
             runOnUiThread {
+                // The copy can outlive a user who navigated away
+                // mid-import; posting into a destroyed activity leaks it
+                // and risks a crash, so a dead activity drops the update.
+                if (isDestroyed || isFinishing) return@runOnUiThread
                 when (result) {
                     is OnDeviceEngine.ImportResult.Imported -> {
+                        refreshOnDeviceStatus()
                         recordingMessage.setText(R.string.on_device_imported)
                     }
                     is OnDeviceEngine.ImportResult.Rejected -> {
-                        // The stage is diagnostics (logcat); the user copy stays the reason alone.
                         Log.w(TAG, "model import rejected at ${result.stage}: ${result.reason}")
+                        // Keep the failure beside the Import button. A message
+                        // in the recording section is off screen during import.
+                        onDeviceStatus.text = result.reason
                         recordingMessage.text = result.reason
                     }
                 }
-                refreshOnDeviceStatus()
             }
         }
     }

@@ -197,12 +197,13 @@ class ArmServer:
         # separate unhashed "gguf" field that could silently differ from
         # the model the record claims.
         model = arm.get("model")
+        self.model_slug = arm.get("model_slug") or "parakeet"
         if arm.get("stub_args"):
             cmd = [sys.executable, *arm["stub_args"], str(port)]
         else:
             cmd = [
                 os.path.expandvars(arm["binary"]),
-                "--model", arm.get("model_slug") or "parakeet",
+                "--model", self.model_slug,
                 "--gguf", os.path.expandvars(model) if model else "/dev/null",
                 "--port", str(port),
             ]
@@ -245,6 +246,9 @@ class ArmServer:
                 data = f.read()
             body = b"".join([
                 f"--{boundary}\r\n".encode("ascii"),
+                b'Content-Disposition: form-data; name="model"\r\n\r\n',
+                self.model_slug.encode("utf-8"),
+                f"\r\n--{boundary}\r\n".encode("ascii"),
                 (f'Content-Disposition: form-data; name="file"; '
                  f'filename="{audio.name}"\r\n').encode("utf-8"),
                 b"Content-Type: audio/wav\r\n\r\n",
@@ -252,7 +256,7 @@ class ArmServer:
                 f"\r\n--{boundary}--\r\n".encode("ascii"),
             ])
             req = urllib.request.Request(
-                f"{self.base}/inference",
+                f"{self.base}/v1/audio/transcriptions",
                 data=body,
                 method="POST",
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},

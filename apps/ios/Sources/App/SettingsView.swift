@@ -5,14 +5,12 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var endpoint: String
     @Binding var serverModel: String
-    @Binding var protocolValue: String
     @Binding var allowLocalHTTP: Bool
 
     private var validationMessage: String? {
         let configuration = ServerConfiguration(
             endpoint: endpoint,
             model: serverModel,
-            apiProtocol: ServerProtocol(rawValue: protocolValue) ?? .openAI,
             allowsInsecureLocalHTTP: allowLocalHTTP
         )
         do {
@@ -34,11 +32,6 @@ struct SettingsView: View {
                     TextField("Model", text: $serverModel)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Picker("API", selection: $protocolValue) {
-                        ForEach(ServerProtocol.allCases, id: \.rawValue) { item in
-                            Text(item.title).tag(item.rawValue)
-                        }
-                    }
                 }
 
                 Section {

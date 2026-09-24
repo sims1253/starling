@@ -20,7 +20,6 @@ use gpui::{
     Animation, AnimationExt, Context, ElementId, Rgba, SharedString, Svg, Transformation, Window,
     div, point, prelude::*, pulsating_between, px, radians, svg,
 };
-use starling_dictation::settings as dictation_settings;
 
 use crate::app::{Connection, StarlingApp};
 use crate::theme;
@@ -134,22 +133,6 @@ pub(crate) fn status_dot(
     }
 }
 
-/// The settings modal's protocol-toggle option ids (R04): keyed by the
-/// option, never by selection state. The old `"protocol-selected"` /
-/// `"protocol-option"` pair flipped an option's element identity the moment
-/// it was clicked, re-seating element state; a stable per-option id keeps
-/// each half of the toggle itself across re-renders.
-pub(crate) fn protocol_option_id(protocol: dictation_settings::Protocol) -> SharedString {
-    SharedString::from(format!("protocol-option-{}", protocol_slug(protocol)))
-}
-
-fn protocol_slug(protocol: dictation_settings::Protocol) -> &'static str {
-    match protocol {
-        dictation_settings::Protocol::Starling => "starling",
-        dictation_settings::Protocol::OpenAi => "openai",
-    }
-}
-
 pub(crate) fn connection_label(app: &StarlingApp) -> String {
     match app.connection {
         Connection::Ready => format!("{} ready", app.server_model),
@@ -183,18 +166,4 @@ mod tests {
         assert_ne!(TOPBAR_STATUS_DOT_ID, SETTINGS_CALLOUT_DOT_ID);
     }
 
-    #[test]
-    fn protocol_option_ids_are_keyed_by_option_not_selection_state() {
-        // R04: clicking an option must not re-seat either half of the
-        // toggle — the ids depend only on which option they name, so they
-        // are equal before and after the selection flips.
-        let starling = protocol_option_id(dictation_settings::Protocol::Starling);
-        let openai = protocol_option_id(dictation_settings::Protocol::OpenAi);
-        assert_ne!(starling, openai);
-        assert_eq!(
-            starling,
-            protocol_option_id(dictation_settings::Protocol::Starling)
-        );
-        assert_eq!(openai, protocol_option_id(dictation_settings::Protocol::OpenAi));
-    }
 }

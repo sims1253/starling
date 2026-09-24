@@ -12,11 +12,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var isStartingCapture = false
     @Published var selectedSession: SessionRecord?
     @Published var errorMessage: String?
+    @Published private(set) var livePartial = ""
 
     let recorder: AudioRecorder
     let playback: AudioPlayback
     private let repository: SessionRepository
     private(set) var audioURLs: [UUID: URL] = [:]
+    private var liveStream: LiveTranscription?
+    private var streamPump: Task<Void, Never>?
 
     init(repository: SessionRepository) {
         self.repository = repository
@@ -26,6 +29,11 @@ final class AppModel: ObservableObject {
         // Capture can end without the stop button (a call, Siri, a lost
         // microphone route). Keep the audio captured so far in history.
         recorder.onForcedStop = { [weak self] capture, message in
+            self?.streamPump?.cancel()
+            self?.liveStream?.close()
+            self?.streamPump = nil
+            self?.liveStream = nil
+            self?.livePartial = ""
             Task { await self?.preserveInterruptedRecording(capture, message: message) }
         }
         Task { await recoverAndReload() }
@@ -43,6 +51,40 @@ final class AppModel: ObservableObject {
                 playback.stop()
                 let stagingURL = try await repository.stagingRecordingURL()
                 try await recorder.start(at: stagingURL)
+                guard recorder.isRecording else { return }
+                livePartial = ""
+                do {
+                    liveStream = try LiveTranscription(configuration: configuration) { [weak self] text in
+                        self?.livePartial = text
+                    }
+                } catch {
+                    // Stream setup failure is deterministic (an endpoint
+                    // or scheme the WS URL builder rejects): the recording
+                    // itself is fine and falls back to the full upload,
+                    // but the missing partials must be explained instead
+                    // of silently dropped.
+                    liveStream = nil
+                    errorMessage = "Live transcription is unavailable: \(error.localizedDescription)"
+                }
+                streamPump = Task { [weak self] in
+                    while let self, self.recorder.isRecording, !Task.isCancelled {
+                        let chunks = self.recorder.drainStreamChunks()
+                        if let stream = self.liveStream {
+                            do {
+                                try await stream.send(chunks)
+                            } catch {
+                                stream.close()
+                                self.liveStream = nil
+                                // Stop showing a partial the stream can no
+                                // longer update. Draining continues so the
+                                // sink's frame buffer stays bounded for the
+                                // rest of the take.
+                                self.livePartial = ""
+                            }
+                        }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -119,8 +161,21 @@ final class AppModel: ObservableObject {
     }
 
     private func finishRecording(configuration: ServerConfiguration) async {
+        var streamToClose: LiveTranscription?
         do {
             let capture = try recorder.stop()
+            await streamPump?.value
+            streamPump = nil
+            let stream = liveStream
+            streamToClose = stream
+            liveStream = nil
+            if let stream {
+                do {
+                    try await stream.send(recorder.drainStreamChunks())
+                } catch {
+                    stream.close()
+                }
+            }
             // The source is already app-private. Promotion deletes it only
             // after the durable audio copy and manifest have both succeeded.
             let record = try await repository.commitStagedRecording(
@@ -128,8 +183,12 @@ final class AppModel: ObservableObject {
                 durationMilliseconds: capture.durationMilliseconds
             )
             await reload()
-            await transcribe(record, configuration: configuration)
+            await transcribe(record, configuration: configuration, stream: stream)
+            streamToClose = nil
+            livePartial = ""
         } catch {
+            streamToClose?.close()
+            livePartial = ""
             errorMessage = error.localizedDescription
         }
     }
@@ -150,16 +209,45 @@ final class AppModel: ObservableObject {
         await reload()
     }
 
-    private func transcribe(_ record: SessionRecord, configuration: ServerConfiguration) async {
-        guard !isWorking else { return }
+    private func transcribe(
+        _ record: SessionRecord,
+        configuration: ServerConfiguration,
+        stream: LiveTranscription? = nil
+    ) async {
+        guard !isWorking else {
+            // A Retry on a history row won the race for the working slot:
+            // close the stream we were handed rather than dropping the
+            // reference and leaving the socket for the server's heartbeat
+            // reaper to collect.
+            stream?.close()
+            return
+        }
         isWorking = true
         defer { isWorking = false }
+        // Why a stream-produced transcript was discarded, kept for the
+        // failure path so the fallback stays diagnosable.
+        var streamFailureNote: String?
         do {
             let attempting = try await repository.markAttempt(record.id)
             await reload()
             let recordingURL = await repository.recordingURL(for: attempting)
-            let transcript = try await StarlingClient(configuration: configuration)
-                .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+            let transcript: Transcript
+            if let stream {
+                do {
+                    transcript = try await stream.finish()
+                } catch {
+                    // The stream already carried every frame and the
+                    // commit; the full upload is the only way to a
+                    // transcript now. Keep the reason — if the upload
+                    // also fails, the user sees both.
+                    streamFailureNote = "Live transcription failed (\(error.localizedDescription)); the recording was re-uploaded in full."
+                    transcript = try await StarlingClient(configuration: configuration)
+                        .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+                }
+            } else {
+                transcript = try await StarlingClient(configuration: configuration)
+                    .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
+            }
             _ = try await repository.saveTranscript(transcript, for: attempting.id)
             await reload()
         } catch {
@@ -169,7 +257,8 @@ final class AppModel: ObservableObject {
                 errorMessage = error.localizedDescription
             }
             await reload()
-            errorMessage = error.localizedDescription
+            errorMessage = streamFailureNote.map { "\($0) \(error.localizedDescription)" }
+                ?? error.localizedDescription
         }
     }
 }

@@ -28,25 +28,57 @@
     "features"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "product": { "const": "starling-serve" },
-    "endpoints": { "$ref": "#/$defs/endpoints" },
-    "audio": { "$ref": "#/$defs/audio" },
-    "models": { "$ref": "#/$defs/models" },
-    "responses": { "$ref": "#/$defs/responses" },
-    "streaming": { "$ref": "#/$defs/streaming" },
-    "limits": { "$ref": "#/$defs/limits" },
-    "request_ids": { "$ref": "#/$defs/requestIds" },
-    "error_contract": { "$ref": "#/$defs/errorContract" },
-    "features": { "$ref": "#/$defs/features" }
+    "schema_version": {
+      "const": 1
+    },
+    "product": {
+      "const": "starling-serve"
+    },
+    "endpoints": {
+      "$ref": "#/$defs/endpoints"
+    },
+    "audio": {
+      "$ref": "#/$defs/audio"
+    },
+    "models": {
+      "$ref": "#/$defs/models"
+    },
+    "responses": {
+      "$ref": "#/$defs/responses"
+    },
+    "streaming": {
+      "$ref": "#/$defs/streaming"
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    },
+    "request_ids": {
+      "$ref": "#/$defs/requestIds"
+    },
+    "error_contract": {
+      "$ref": "#/$defs/errorContract"
+    },
+    "features": {
+      "$ref": "#/$defs/features"
+    }
   },
   "$defs": {
     "endpoint": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["method", "path", "protocol"],
+      "required": [
+        "method",
+        "path",
+        "protocol"
+      ],
       "properties": {
-        "method": { "enum": ["GET", "POST", "DELETE"] },
+        "method": {
+          "enum": [
+            "GET",
+            "POST",
+            "DELETE"
+          ]
+        },
         "path": {
           "type": "string",
           "pattern": "^/",
@@ -54,32 +86,44 @@
         },
         "protocol": {
           "enum": [
-            "starling-legacy",
             "starling-extension",
             "starling-streaming",
             "openai-subset"
           ]
         },
-        "upgrade": { "enum": ["websocket"] },
-        "alias_of": { "type": "string", "pattern": "^/" },
+        "upgrade": {
+          "enum": [
+            "websocket"
+          ]
+        },
         "requires": {
           "type": "string",
           "description": "Condition under which the route serves this purpose."
         },
-        "purpose": { "type": "string" }
+        "purpose": {
+          "type": "string"
+        }
       }
     },
     "numberSetting": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["value", "cli_flag"],
+      "required": [
+        "value",
+        "cli_flag"
+      ],
       "properties": {
-        "value": { "type": "number", "minimum": 0 },
+        "value": {
+          "type": "number",
+          "minimum": 0
+        },
         "cli_flag": {
           "type": "string",
           "description": "CLI flag that overrides this default. Compile-time values are not modelled as numberSettings at all; they are plain typed fields with compile-time noted in their own descriptions."
         },
-        "zero_means": { "type": "string" }
+        "zero_means": {
+          "type": "string"
+        }
       }
     },
     "endpoints": {
@@ -96,27 +140,37 @@
         "batch_transcription": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/endpoint" }
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
         },
         "text_normalization": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/endpoint" }
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
         },
         "live_transcription": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/endpoint" }
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
         },
         "control": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/endpoint" }
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
         },
         "discovery": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/endpoint" }
+          "items": {
+            "$ref": "#/$defs/endpoint"
+          }
         }
       }
     },
@@ -135,7 +189,10 @@
         "sample_rates_hz": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "integer", "minimum": 1 }
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
         },
         "resampling": {
           "type": "boolean",
@@ -144,11 +201,22 @@
         "channel_handling": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["wav_max_channels", "wav_mixdown", "pcm16_channels"],
+          "required": [
+            "wav_max_channels",
+            "wav_mixdown",
+            "pcm16_channels"
+          ],
           "properties": {
-            "wav_max_channels": { "type": "integer", "minimum": 1 },
-            "wav_mixdown": { "const": "average_to_mono" },
-            "pcm16_channels": { "const": 1 }
+            "wav_max_channels": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "wav_mixdown": {
+              "const": "average_to_mono"
+            },
+            "pcm16_channels": {
+              "const": 1
+            }
           }
         },
         "max_upload_mb": {
@@ -159,25 +227,10 @@
         "batch": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["starling_legacy", "openai_subset"],
+          "required": [
+            "openai_subset"
+          ],
           "properties": {
-            "starling_legacy": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["containers", "wav_magic"],
-              "properties": {
-                "containers": {
-                  "type": "array",
-                  "minItems": 1,
-                  "items": { "enum": ["wav", "pcm16le"] }
-                },
-                "wav_magic": {
-                  "type": "array",
-                  "minItems": 1,
-                  "items": { "enum": ["RIFF", "RF64", "RIFX"] }
-                }
-              }
-            },
             "openai_subset": {
               "type": "object",
               "additionalProperties": false,
@@ -191,15 +244,26 @@
                 "containers": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "const": "wav" }
+                  "items": {
+                    "const": "wav"
+                  }
                 },
                 "wav_magic": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "enum": ["RIFF", "RF64"] }
+                  "items": {
+                    "enum": [
+                      "RIFF",
+                      "RF64"
+                    ]
+                  }
                 },
-                "multipart_file_part_name": { "const": "file" },
-                "multipart_model_field_required": { "const": true }
+                "multipart_file_part_name": {
+                  "const": "file"
+                },
+                "multipart_model_field_required": {
+                  "const": true
+                }
               }
             }
           }
@@ -207,12 +271,20 @@
         "live": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["containers", "whole_sample_frames_required"],
+          "required": [
+            "containers",
+            "whole_sample_frames_required"
+          ],
           "properties": {
             "containers": {
               "type": "array",
               "minItems": 1,
-              "items": { "enum": ["wav", "pcm16le"] }
+              "items": {
+                "enum": [
+                  "wav",
+                  "pcm16le"
+                ]
+              }
             },
             "whole_sample_frames_required": {
               "const": true,
@@ -233,7 +305,9 @@
         "created_semantics"
       ],
       "properties": {
-        "listing_endpoint": { "const": "/v1/models" },
+        "listing_endpoint": {
+          "const": "/v1/models"
+        },
         "resident_limit": {
           "const": 1,
           "description": "One model is resident per process; selecting another slug is not supported."
@@ -244,12 +318,26 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "object", "created", "owned_by"],
+            "required": [
+              "id",
+              "object",
+              "created",
+              "owned_by"
+            ],
             "properties": {
-              "id": { "type": "string", "minLength": 1 },
-              "object": { "const": "model" },
-              "created": { "const": 0 },
-              "owned_by": { "const": "starling" }
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "object": {
+                "const": "model"
+              },
+              "created": {
+                "const": 0
+              },
+              "owned_by": {
+                "const": "starling"
+              }
             }
           }
         },
@@ -269,20 +357,21 @@
       "required": [
         "openai_subset_formats",
         "openai_subset_plain_text_content_type",
-        "starling_legacy_shape",
         "streaming_final_shape"
       ],
       "properties": {
         "openai_subset_formats": {
           "type": "array",
           "minItems": 1,
-          "items": { "enum": ["json", "text"] }
+          "items": {
+            "enum": [
+              "json",
+              "text"
+            ]
+          }
         },
         "openai_subset_plain_text_content_type": {
           "const": "text/plain; charset=utf-8"
-        },
-        "starling_legacy_shape": {
-          "const": "{text, segments: [{text, start_s, end_s}], duration_s, request_id}"
         },
         "streaming_final_shape": {
           "const": "{type: final, text, segments: [{text, start_s, end_s}], duration_s}"
@@ -307,9 +396,15 @@
         "heartbeat"
       ],
       "properties": {
-        "transport": { "const": "websocket" },
-        "path": { "const": "/stream" },
-        "protocol": { "const": "starling-streaming" },
+        "transport": {
+          "const": "websocket"
+        },
+        "path": {
+          "const": "/stream"
+        },
+        "protocol": {
+          "const": "starling-streaming"
+        },
         "openai_realtime_compatible": {
           "const": false,
           "description": "WS /stream is Starling's own protocol, not OpenAI Realtime."
@@ -321,13 +416,25 @@
           "type": "array",
           "minItems": 1,
           "items": {
-            "enum": ["partial", "final", "error", "pong", "reset_ack"]
+            "enum": [
+              "partial",
+              "final",
+              "error",
+              "pong",
+              "reset_ack"
+            ]
           }
         },
         "client_controls": {
           "type": "array",
           "minItems": 1,
-          "items": { "enum": ["commit", "reset", "ping"] }
+          "items": {
+            "enum": [
+              "commit",
+              "reset",
+              "ping"
+            ]
+          }
         },
         "chunking": {
           "type": "object",
@@ -340,10 +447,18 @@
             "overlap_dedup"
           ],
           "properties": {
-            "window_seconds": { "$ref": "#/$defs/numberSetting" },
-            "overlap_seconds": { "$ref": "#/$defs/numberSetting" },
-            "min_seconds_before_first_partial": { "$ref": "#/$defs/numberSetting" },
-            "min_seconds_between_partials": { "$ref": "#/$defs/numberSetting" },
+            "window_seconds": {
+              "$ref": "#/$defs/numberSetting"
+            },
+            "overlap_seconds": {
+              "$ref": "#/$defs/numberSetting"
+            },
+            "min_seconds_before_first_partial": {
+              "$ref": "#/$defs/numberSetting"
+            },
+            "min_seconds_between_partials": {
+              "$ref": "#/$defs/numberSetting"
+            },
             "overlap_dedup": {
               "const": "word-match-at-boundary",
               "description": "Word matching reduces overlap duplication but cannot guarantee agreement across windows."
@@ -353,7 +468,12 @@
         "finalization": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["commit", "busy", "invalidated_take", "reset"],
+          "required": [
+            "commit",
+            "busy",
+            "invalidated_take",
+            "reset"
+          ],
           "properties": {
             "commit": {
               "const": "commit finalizes all buffered audio and answers one final message"
@@ -372,9 +492,14 @@
         "live_buffer_cap": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["default_seconds", "behavior"],
+          "required": [
+            "default_seconds",
+            "behavior"
+          ],
           "properties": {
-            "default_seconds": { "$ref": "#/$defs/numberSetting" },
+            "default_seconds": {
+              "$ref": "#/$defs/numberSetting"
+            },
             "behavior": {
               "const": "one error frame per rejection, further audio ignored until reset; bounds the live (un-finalized) buffer only"
             }
@@ -383,13 +508,20 @@
         "take_invalidation": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["reasons", "recovery"],
+          "required": [
+            "reasons",
+            "recovery"
+          ],
           "properties": {
             "reasons": {
               "type": "array",
               "minItems": 1,
               "items": {
-                "enum": ["malformed_wav", "sample_rate_mismatch", "odd_pcm_length"]
+                "enum": [
+                  "malformed_wav",
+                  "sample_rate_mismatch",
+                  "odd_pcm_length"
+                ]
               }
             },
             "recovery": {
@@ -400,10 +532,17 @@
         "heartbeat": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ping_interval_seconds", "max_missed_pongs"],
+          "required": [
+            "ping_interval_seconds",
+            "max_missed_pongs"
+          ],
           "properties": {
-            "ping_interval_seconds": { "const": 30 },
-            "max_missed_pongs": { "const": 3 }
+            "ping_interval_seconds": {
+              "const": 30
+            },
+            "max_missed_pongs": {
+              "const": 3
+            }
           }
         }
       }
@@ -423,8 +562,12 @@
           "minimum": 1,
           "description": "Beyond this many concurrent waiters the server answers 503 busy (compile-time)."
         },
-        "request_timeout_seconds": { "$ref": "#/$defs/numberSetting" },
-        "idle_shutdown_seconds": { "$ref": "#/$defs/numberSetting" },
+        "request_timeout_seconds": {
+          "$ref": "#/$defs/numberSetting"
+        },
+        "idle_shutdown_seconds": {
+          "$ref": "#/$defs/numberSetting"
+        },
         "serial_inference": {
           "const": true,
           "description": "Requests queue in arrival order; one inference is in flight at a time."
@@ -439,26 +582,28 @@
         "fallback_header",
         "generated_when_absent",
         "reserved_prefix",
-        "echo_legacy",
         "echo_openai_subset",
         "cancellation"
       ],
       "properties": {
-        "header": { "const": "X-Request-Id" },
-        "fallback_header": { "const": "X-Correlation-Id" },
-        "generated_when_absent": { "const": true },
+        "header": {
+          "const": "X-Request-Id"
+        },
+        "fallback_header": {
+          "const": "X-Correlation-Id"
+        },
+        "generated_when_absent": {
+          "const": true
+        },
         "reserved_prefix": {
           "const": "#",
           "description": "Client-supplied ids starting with # are rejected with 400."
-        },
-        "echo_legacy": {
-          "const": "request_id field in the JSON body"
         },
         "echo_openai_subset": {
           "const": "X-Request-Id response header"
         },
         "cancellation": {
-          "const": "DELETE /inference/{request_id}"
+          "const": "DELETE /v1/audio/transcriptions/{request_id}"
         }
       }
     },
@@ -475,13 +620,16 @@
         "bodies": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["openai_subset", "starling_legacy"],
+          "required": [
+            "openai_subset"
+          ],
           "properties": {
             "openai_subset": {
               "const": "{error: {message, type, param, code}}"
             },
-            "starling_legacy": {
-              "const": "{error: string, text: \"\", request_id?}"
+            "starling_extension_plain": {
+              "const": "{error: string, text, request_id}",
+              "description": "Engine-stage failures (busy, cancelled, timeout, decode) on the native server keep the Starling plain-string error body alongside the OpenAI-subset envelope used for request validation."
             }
           }
         },
@@ -489,19 +637,36 @@
           "const": true,
           "description": "Malformed/oversized requests rejected by the HTTP parser can get the parser's own non-JSON error."
         },
-        "clients_must_check_status_first": { "const": true },
+        "clients_must_check_status_first": {
+          "const": true
+        },
         "status_codes": {
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["code", "when"],
+            "required": [
+              "code",
+              "when"
+            ],
             "properties": {
               "code": {
-                "enum": [400, 404, 409, 413, 499, 500, 503, 504]
+                "enum": [
+                  400,
+                  404,
+                  409,
+                  413,
+                  499,
+                  500,
+                  503,
+                  504
+                ]
               },
-              "when": { "type": "string", "minLength": 1 }
+              "when": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           }
         }
@@ -535,19 +700,29 @@
           "type": "boolean",
           "description": "True only when the resident model is a text model (s1)."
         },
-        "prompt": { "const": false },
-        "language_selection": { "const": false },
-        "word_timestamps": { "const": false },
+        "prompt": {
+          "const": false
+        },
+        "language_selection": {
+          "const": false
+        },
+        "word_timestamps": {
+          "const": false
+        },
         "segment_timestamps": {
           "const": true,
           "description": "Legacy and streaming-final responses carry one segment with start_s/end_s."
         },
-        "verbose_json": { "const": false },
+        "verbose_json": {
+          "const": false
+        },
         "subtitle_formats": {
           "const": false,
           "description": "SRT/VTT are not implemented."
         },
-        "diarization": { "const": false },
+        "diarization": {
+          "const": false
+        },
         "sampling_controls": {
           "const": false,
           "description": "temperature must be 0 or 0.0; no configurable sampling is exposed."
@@ -556,7 +731,9 @@
           "const": false,
           "description": "The OpenAI-compatible route has no streaming; stream=false only."
         },
-        "openai_realtime": { "const": false },
+        "openai_realtime": {
+          "const": false
+        },
         "resampling": {
           "const": false,
           "description": "Non-16kHz WAV is rejected with 400 (the deprecated Python server resamples instead)."

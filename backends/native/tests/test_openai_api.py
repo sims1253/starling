@@ -92,13 +92,9 @@ class OpenAIContract(unittest.TestCase):
         self.assertEqual((status, body), (200, RAW))
         self.assertIn("text/plain", headers["Content-Type"])
 
-    def test_legacy_route_remains_compatible(self):
-        status, _, body = self.request([], path="/inference")
-        result = json.loads(body)
-        self.assertEqual(status, 200)
-        self.assertEqual(result["text"], RAW)
-        self.assertIn("duration_s", result)
-        self.assertIn("segments", result)
+    def test_old_batch_route_is_unavailable(self):
+        status, _, _ = self.request([], path="/inference")
+        self.assertEqual(status, 404)
 
     def test_models(self):
         with urllib.request.urlopen(self.base + "/v1/models") as response:

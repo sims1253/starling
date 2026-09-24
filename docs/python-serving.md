@@ -98,16 +98,16 @@ Endpoints:
 
 | Method + path             | Purpose |
 | ------------------------- | ------- |
-| `GET  /` `/health`        | liveness + `phase` (`loading_weights`/`warming_up`/`ready`) and `queue_depth` |
-| `POST /inference`         | multipart or raw WAV -> `{text, segments, duration_s, request_id}` |
-| `POST /transcribe`        | multipart or raw WAV -> same shape as `/inference` |
+| `GET /health`            | liveness + `phase` (`loading_weights`/`warming_up`/`ready`) and `queue_depth` |
+| `GET /v1/models`         | configured model slug |
+| `POST /v1/audio/transcriptions` | multipart WAV `file` + `model` -> `{text}` or plain text |
 | `POST /warmup`            | pre-capture CUDA graphs on a silent clip (idempotent; 202, or 409 when the model is not loaded) |
-| `DELETE /inference/<id>`  | cancel a queued or running request by its `X-Request-Id` |
+| `DELETE /v1/audio/transcriptions/<id>` | cancel a queued or running request by its `X-Request-Id` |
 | `WS   /stream`            | real-time streaming dictation |
 
 A single GPU worker serves one request at a time; concurrent requests queue
 (up to `MAX_WAITERS`) and only get HTTP 503 when full. `X-Request-Id` on a POST
-enables `DELETE /inference/<id>` cancellation, which is best-effort once on the GPU
+enables `DELETE /v1/audio/transcriptions/<id>` cancellation, which is best-effort once on the GPU
 (CUDA-graph replays aren't preemptible; an in-flight request finishes its
 current step then returns HTTP 499).
 
@@ -168,10 +168,5 @@ exposes the Granite and Qwen3 batched pipelines.
 
 ### Timestamps
 
-`/inference` returns chunk-level segments
-(`[{text, start_s, end_s}]`). LLM-decoder models (granite, moss, qwen3, ark,
-higgs, audex) have no
-per-token audio alignment, so segments are at `--max-chunk-seconds` granularity;
-shrink it for finer segments at the cost of more decode passes. Parakeet
-and cohere chunk internally and return a single whole-utterance segment.
-
+The batch API returns raw text without timestamps. The `WS /stream` protocol
+reports partial and final text while recording.

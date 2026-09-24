@@ -15,7 +15,6 @@ import {
 function draft(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
   return {
     endpoint: "http://127.0.0.1:8181",
-    protocol: "starling",
     model: "parakeet",
     streamLive: true,
     expectedTerms: "auth, Starling",
@@ -76,9 +75,8 @@ describe("normalizeSettings", () => {
     });
   });
 
-  it("keeps protocol, model, streaming, terms, key, and instruction exactly as drafted", () => {
+  it("keeps model, streaming, terms, key, and instruction exactly as drafted", () => {
     const changed = draft({
-      protocol: "openai",
       model: " whisper-large ",
       streamLive: false,
       expectedTerms: "x, y",
@@ -373,7 +371,6 @@ describe("persistSettings", () => {
   it("rolls every key back to its prior value when a write fails mid-transaction", () => {
     const storage = new MemoryStorage({
       "starling:endpoint": "http://old:8181",
-      "starling:protocol": "starling",
       "starling:model": "old-model",
       "starling:refine:apiKey": "old-plaintext-key",
     });
@@ -426,7 +423,6 @@ describe("readCommittedSettings", () => {
 
     expect(committed).toEqual({
       endpoint: "/api",
-      protocol: "starling",
       model: "parakeet",
       streamLive: true,
       expectedTerms: "",
@@ -438,11 +434,10 @@ describe("readCommittedSettings", () => {
     });
   });
 
-  it("decodes stored values, defaulting an unknown protocol to starling", () => {
+  it("decodes stored values", () => {
     const committed = readCommittedSettings(
       new MemoryStorage({
         "starling:endpoint": "http://127.0.0.1:8181",
-        "starling:protocol": "openai",
         "starling:model": "whisper-1",
         "starling:streaming": "0",
         "starling:terms": "auth",
@@ -455,7 +450,6 @@ describe("readCommittedSettings", () => {
       "/api",
     );
 
-    expect(committed.protocol).toBe("openai");
     expect(committed.model).toBe("whisper-1");
     expect(committed.streamLive).toBe(false);
     expect(committed.expectedTerms).toBe("auth");
@@ -464,9 +458,5 @@ describe("readCommittedSettings", () => {
     expect(committed.refineApiKey).toBe("sk-test");
     expect(committed.refineInstruction).toBe("tighten");
     expect(committed.refineKeyPlaintextOptIn).toBe(true);
-
-    expect(
-      readCommittedSettings(new MemoryStorage({ "starling:protocol": "bogus" }), "/api").protocol,
-    ).toBe("starling");
   });
 });

@@ -5,7 +5,6 @@ struct ContentView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("server.endpoint") private var endpoint = "https://starling.local:8181"
     @AppStorage("server.model") private var serverModel = "parakeet"
-    @AppStorage("server.protocol") private var protocolValue = ServerProtocol.openAI.rawValue
     @AppStorage("server.allowLocalHTTP") private var allowLocalHTTP = false
     @State private var showsSettings = false
 
@@ -13,7 +12,6 @@ struct ContentView: View {
         ServerConfiguration(
             endpoint: endpoint,
             model: serverModel,
-            apiProtocol: ServerProtocol(rawValue: protocolValue) ?? .openAI,
             allowsInsecureLocalHTTP: allowLocalHTTP
         )
     }
@@ -50,7 +48,6 @@ struct ContentView: View {
                 SettingsView(
                     endpoint: $endpoint,
                     serverModel: $serverModel,
-                    protocolValue: $protocolValue,
                     allowLocalHTTP: $allowLocalHTTP
                 )
             }
@@ -115,6 +112,12 @@ private struct RecorderCard: View {
                         .font(.system(.body, design: .monospaced).weight(.medium))
                         .foregroundStyle(.secondary)
                 }
+            }
+            if recorder.isRecording && !model.livePartial.isEmpty {
+                Text(model.livePartial)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Live transcription")
             }
         }
         .frame(maxWidth: .infinity)

@@ -214,123 +214,6 @@ static void test_pcm16_conversion() {
     CHECK(pcm16_to_float32("").empty());
 }
 
-// ---- multipart tests -------------------------------------------------------
-
-// Build a one-part multipart body with full control over the part headers.
-static std::string multipart(const std::string& boundary,
-                             const std::string& part_headers,
-                             const std::string& payload) {
-    std::string body = "--" + boundary + "\r\n";
-    body += part_headers;
-    body += "\r\n\r\n";
-    body += payload;
-    body += "\r\n--" + boundary + "--\r\n";
-    return body;
-}
-
-static void test_multipart_basic_extraction() {
-    std::string payload = "RIFFxxxxWAVEfake-audio-bytes";
-    std::string body = multipart("XX",
-        "Content-Disposition: form-data; name=\"audio\"; filename=\"a.wav\"",
-        payload);
-    std::string ct = "multipart/form-data; boundary=XX";
-    std::string got = extract_multipart_payload(body, ct);
-    // Regression (issue #12): the payload must be byte-identical — the old
-    // separator skip left a stray "\r\n" prefix that broke WAV RIFF sniffing.
-    CHECK(got == payload);
-}
-
-static void test_multipart_quoted_boundary() {
-    std::string payload = "AUDIO";
-    std::string body = multipart("abc123", "Content-Disposition: form-data; name=\"file\"", payload);
-    std::string ct = "multipart/form-data; boundary=\"abc123\"";
-    CHECK(extract_multipart_payload(body, ct) == payload);
-}
-
-static void test_multipart_selection_priority() {
-    // "audio"/"file" named part wins over a filename'd part.
-    std::string b = "--B\r\n"
-        "Content-Disposition: form-data; name=\"metadata\"\r\n\r\n"
-        "meta\r\n"
-        "--B\r\n"
-        "Content-Disposition: form-data; name=\"audio\"; filename=\"x.wav\"\r\n\r\n"
-        "AUDIOPART\r\n"
-        "--B\r\n"
-        "Content-Disposition: form-data; filename=\"other.bin\"\r\n\r\n"
-        "FILEPART\r\n"
-        "--B--\r\n";
-    std::string ct = "multipart/form-data; boundary=B";
-    CHECK(extract_multipart_payload(b, ct) == "AUDIOPART");
-}
-
-static void test_multipart_fallback_last_part() {
-    // No scoring part matches → the last non-empty payload is returned.
-    std::string b = "--B\r\n"
-        "Content-Disposition: form-data; name=\"foo\"\r\n\r\n"
-        "first\r\n"
-        "--B\r\n"
-        "Content-Disposition: form-data; name=\"bar\"\r\n\r\n"
-        "second\r\n"
-        "--B--\r\n";
-    std::string ct = "multipart/form-data; boundary=B";
-    CHECK(extract_multipart_payload(b, ct) == "second");
-}
-
-static void test_multipart_empty_part_underflow() {
-    // Regression for the relative part_end guard (issue #12): a zero-width
-    // part ("--B\r\n" immediately followed by the next delimiter) made the
-    // OLD absolute check (part_end >= 2) strip a CRLF *before* part_start,
-    // underflowing part_end - part_start and letting substr() swallow the
-    // rest of the body. The real payload must still win.
-    std::string payload = "AUDIO";
-    std::string b = "--B\r\n"
-        "--B\r\n"
-        "Content-Disposition: form-data; name=\"audio\"\r\n\r\n"
-        + payload + "\r\n"
-        "--B--\r\n";
-    std::string ct = "multipart/form-data; boundary=B";
-    std::string got = extract_multipart_payload(b, ct);
-    CHECK(got == payload);
-}
-
-static void test_multipart_blank_part() {
-    // A part with an EMPTY payload next to the real one, plus a headerless
-    // blank part at the end. Must not crash or return a body-sized blob.
-    std::string payload = "AUDIO";
-    std::string b = "--B\r\n"
-        "Content-Disposition: form-data; name=\"audio\"\r\n\r\n"
-        "\r\n"
-        "--B\r\n"
-        "Content-Disposition: form-data; name=\"file\"\r\n\r\n"
-        + payload + "\r\n"
-        "--B\r\n"
-        "\r\n"
-        "--B--\r\n";
-    std::string ct = "multipart/form-data; boundary=B";
-    CHECK(extract_multipart_payload(b, ct) == payload);
-}
-
-static void test_multipart_binary_safe() {
-    // Payloads with embedded NULs and header-like bytes must pass through
-    // verbatim (audio bytes are not text).
-    std::string payload;
-    payload += static_cast<char>(0x00);
-    payload += static_cast<char>(0xff);
-    payload += "\r\n--almost-a-boundary--";
-    payload += "RIFF";
-    std::string body = multipart("B",
-        "Content-Disposition: form-data; name=\"audio\"", payload);
-    std::string ct = "multipart/form-data; boundary=B";
-    CHECK(extract_multipart_payload(body, ct) == payload);
-}
-
-static void test_multipart_not_multipart() {
-    // No boundary parameter → body returned unchanged (raw WAV path).
-    std::string body = "RIFF....WAVE....";
-    CHECK(extract_multipart_payload(body, "application/octet-stream") == body);
-    CHECK(extract_multipart_payload(body, "multipart/form-data") == body);
-}
-
 // ---- main -----------------------------------------------------------------
 int main() {
     test_wav_mono_decode();
@@ -341,14 +224,6 @@ int main() {
     test_wav_truncated_decodes_available();
     test_wav_rejects_garbage();
     test_pcm16_conversion();
-    test_multipart_basic_extraction();
-    test_multipart_quoted_boundary();
-    test_multipart_selection_priority();
-    test_multipart_fallback_last_part();
-    test_multipart_empty_part_underflow();
-    test_multipart_blank_part();
-    test_multipart_binary_safe();
-    test_multipart_not_multipart();
 
     std::printf("audio_parser_test: %d/%d passed\n", g_passed, g_tests);
     return g_passed == g_tests ? 0 : 1;

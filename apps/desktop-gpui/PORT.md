@@ -40,26 +40,21 @@ package.json). Never touch files outside `apps/desktop-gpui`.
 
 ## Behavior contract
 
-### Transcription client (mirror the Electron native path, not the browser one)
+### Transcription client
 
-`StarlingClient { base_url, protocol, model, timeout }`, errors via `thiserror`
+`StarlingClient { base_url, model, timeout }`, errors via `thiserror`
 (`Input`, `Transport`, `Timeout { timeout_ms }`, `Http { status, message }`,
 `Protocol`). Endpoint must be http(s) URL without credentials; trailing `/`
 trimmed. Timeouts: default 180s, allowed 1ms..=600s. Redirects are blocked
 (`redirect: manual` in TS): any 3xx is an error "Server redirect blocked (…)".
 
-- starling protocol:
-  - `health`: `GET {base}/health` → `{status, phase?, model?, loaded?, busy?, queue_depth?}`
-  - `transcribe`: `POST {base}/transcribe` with raw WAV body, headers
-    `x-request-id: {id}` + `content-type: audio/wav`
-- openai protocol:
-  - `health`: `GET {base}/v1/models` → `{data: [{id}, …]}`; map to health
-    `{status: "ok", phase: "ready", busy: false, model: first id}`
-  - `transcribe`: `POST {base}/v1/audio/transcriptions` multipart:
-    `file` = `recording.wav` (audio/wav), `model` (default `parakeet`),
-    `response_format=json`
-- transcribe response (both): `{text, segments?: [{text, start_s?|start?, end_s?|end?}], duration_s?|duration?, request_id?}`;
-  normalize to `TranscriptionResult { text, segments: Vec<TranscriptionSegment{text, start_seconds, end_seconds}>, duration_seconds: Option<f64>, request_id: Option<String> }`
+- `health`: `GET {base}/v1/models` → `{data: [{id}, …]}`; map to health
+  `{status: "ok", phase: "ready", busy: false, model: first id}`
+- `transcribe`: `POST {base}/v1/audio/transcriptions` multipart:
+  `file` = `recording.wav` (audio/wav), `model` (default `parakeet`),
+  `response_format=json`
+- Response: `{text}` with `X-Request-Id` header; the saved result has no
+  server timestamps.
   (fallback request id: body → `x-request-id` header → the sent id). Invalid
   timestamps (missing, negative start, end < start) and negative duration are
   `Protocol` errors.
@@ -122,8 +117,8 @@ UTC strings with millisecond precision (JS `toISOString()` equivalent).
 ### Settings (localStorage equivalent)
 
 `dirs::config_dir()/starling-gpui/settings.json`:
-`{ endpoint, protocol, model, expected_terms }`. Defaults mirroring App.tsx:
-endpoint `http://127.0.0.1:8181`, protocol `starling`, model `parakeet`,
+`{ endpoint, model, expected_terms }`. Defaults mirroring App.tsx:
+endpoint `http://127.0.0.1:8181`, model `parakeet`,
 expected terms `["auth"]` (input UI is the comma-joined string). Invalid file →
 defaults (do not crash).
 
@@ -138,8 +133,9 @@ missing (case/NFKC-insensitive contains). Only the subset the UI consumes.
 ### Recorder (replaces useRecorder.ts)
 
 Mono capture via cpal (request f32, 16 kHz if the device allows; else native
-rate + resample on stop). While recording, produce two streams for the UI:
-cumulative samples (for the final WAV) and recent-window frequency levels for
+rate + resample on stop). While recording, send chunks to `WS /stream`,
+retain the complete local take, and show partial text. The saved WAV is used
+for a batch retry if the stream fails. Recent-window frequency levels drive
 52 waveform bars. Waveform mapping mirrors the TS analyser loop: magnitude
 bins normalized to 0..1, `stride = max(1, bins/52)`, value =
 `max(0.045, v.powf(1.45))`, bars 2px wide, idle floor `0.06`.
@@ -177,8 +173,7 @@ Match `apps/desktop/src/styles.css` + `App.tsx` closely:
   fidelity warnings strip below (amber `#705a2b` on paper).
 - Error banner: bottom of capture pane, `#39241f` bg / `#ffac99` text, with
   unsaved-recording recovery buttons when storage failed.
-- Settings modal: endpoint input, protocol select (Starling native / OpenAI
-  compatible), model input, "Words to watch" input, connection callout, Test
+- Settings modal: endpoint input, model input, "Words to watch" input, connection callout, Test
   connection + Save.
 - Keys: in-app `cmd/ctrl-shift-space` toggles recording; system-wide hotkey via
   `global-hotkey` (best effort on Wayland — warn and continue like Electron's

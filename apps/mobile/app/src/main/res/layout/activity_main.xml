@@ -91,34 +91,6 @@
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
 
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="18dp"
-            android:text="@string/protocol_heading"
-            android:textColor="@color/starling_ink"
-            android:textSize="15sp"
-            android:textStyle="bold" />
-
-        <RadioGroup
-            android:id="@+id/protocol_input"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-            <RadioButton
-                android:id="@+id/protocol_starling"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/protocol_starling" />
-
-            <RadioButton
-                android:id="@+id/protocol_openai"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/protocol_openai" />
-        </RadioGroup>
-
         <EditText
             android:id="@+id/model_input"
             android:layout_width="match_parent"
@@ -129,7 +101,7 @@
             android:singleLine="true"
             android:textColor="@color/starling_ink"
             android:textColorHint="@color/starling_muted"
-            android:visibility="gone" />
+            android:visibility="visible" />
 
         <TextView
             android:layout_width="match_parent"
@@ -269,12 +241,5 @@
             android:textColor="@color/starling_muted"
             android:textSize="14sp" />
 
-        <Button
-            android:id="@+id/open_voice_input_button"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:layout_marginBottom="8dp"
-            android:text="@string/open_voice_input_settings" />
     </LinearLayout>
 </ScrollView>

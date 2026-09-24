@@ -6,14 +6,14 @@
 //
 //   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 //
-// Endpoints (mirroring the Python server):
+// Endpoints:
 //   GET    /health          → { model, loaded, phase, queue_depth, busy }
-//   POST   /transcribe      → multipart/raw WAV → { text, segments, duration_s, request_id }
-//   POST   /inference       → alias for /transcribe
+//   GET    /v1/models       → the configured model
+//   POST   /v1/audio/transcriptions → multipart WAV + model → { text }
 //   POST   /normalize       → text models only (s1): { transcript, styling?,
 //                             structure?, context? } → { text, request_id }
 //   POST   /warmup          → idempotent warmup (silent clip / probe text)
-//   DELETE /inference/<id>  → cancel a queued/in-flight request by X-Request-Id
+//   DELETE /v1/audio/transcriptions/<id> → cancel by X-Request-Id
 //   WS     /stream          → real-time streaming dictation
 //
 // One model is resident at a time (the supervisor enforces this). Inference is
@@ -88,11 +88,6 @@ enum class Phase { Unloaded, Loading, Ready, Busy };
 // ---- transcribe result ----------------------------------------------------
 struct TranscribeResult {
     std::string text;
-    // one segment: { text, start_s, end_s }
-    struct Segment { std::string text; double start_s; double end_s; };
-    std::vector<Segment> segments;
-    double duration_s = 0.0;
-    std::string to_json() const;
 };
 
 // ---- request context (for cancellation) ----------------------------------

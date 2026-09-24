@@ -131,10 +131,10 @@ describe("the browser preview under the same static policy", () => {
   });
 
   it("still permits the batch, health, and refinement http(s) fetches", () => {
-    expect(allows("http://127.0.0.1:8181/inference")).toBe(true);
+    expect(allows("http://127.0.0.1:8181/v1/audio/transcriptions")).toBe(true);
     expect(allows("http://127.0.0.1:8181/health")).toBe(true);
     expect(allows("https://api.openai.com/v1/chat/completions")).toBe(true);
-    expect(allows("http://192.168.1.10:8181/inference")).toBe(true);
+    expect(allows("http://192.168.1.10:8181/v1/audio/transcriptions")).toBe(true);
   });
 });
 
@@ -203,9 +203,9 @@ describe("loopbackStreamTokens", () => {
     }
 
     expect(connectSrcAllows(derived, "ws://127.0.0.1:8182/stream", PREVIEW_ORIGIN)).toBe(true);
-    expect(connectSrcAllows(derived, "http://127.0.0.1:8181/inference", PREVIEW_ORIGIN)).toBe(
-      false,
-    );
+    expect(
+      connectSrcAllows(derived, "http://127.0.0.1:8181/v1/audio/transcriptions", PREVIEW_ORIGIN),
+    ).toBe(false);
   });
 
   it("reports null for URLs a static token cannot cover", () => {

@@ -23,9 +23,9 @@ class StreamClientTest {
     @Test fun streamUrlsFollowTheBatchEndpointAndPolicy() {
         assertEquals("ws://127.0.0.1:8181/stream", streamUrl("http://127.0.0.1:8181", true))
         assertEquals("wss://server.example:8181/stream", streamUrl("https://server.example:8181", false))
-        assertEquals("ws://192.168.1.20:8181/stream", streamUrl("http://192.168.1.20:8181/inference", true))
+        assertEquals("ws://192.168.1.20:8181/stream", streamUrl("http://192.168.1.20:8181/v1/audio/transcriptions", true))
         assertEquals("wss://server.example/stream", streamUrl("https://server.example/v1/audio/transcriptions", false))
-        assertEquals("wss://server.example/starling/stream", streamUrl("https://server.example/starling/inference", false))
+        assertEquals("wss://server.example/starling/stream", streamUrl("https://server.example/starling/v1/audio/transcriptions", false))
         assertEquals("wss://server.example/stream", streamUrl("https://server.example/", false))
     }
 

@@ -532,13 +532,6 @@ int main(int argc, char** argv) {
             send_json(res, server->health_json());
         });
 
-    // ---- GET / (health alias) ----
-    svr.Get("/",
-        [&server](const httplib::Request&, httplib::Response& res) {
-            g_last_activity.store(std::time(nullptr));
-            send_json(res, server->health_json());
-        });
-
     // ---- POST /warmup ----
     svr.Post("/warmup",
         [&server](const httplib::Request&, httplib::Response& res) {
@@ -583,88 +576,38 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // Extract the audio payload FIRST: cpp-httplib parses
-        // multipart/form-data bodies itself into req.form (req.body stays
-        // empty for them), so the body-empty check below must not run before
-        // the form has been consulted. Selection order mirrors
-        // audio::extract_multipart_payload (the manual parser in audio.cpp —
-        // kept as the Python-parity reference; this is its production twin):
-        // a part named "audio", then one named "file", then any file part,
-        // then a filename-less field named
-        // "audio"/"file" (httplib routes parts without a filename to
-        // form.fields; the Python server accepts those too). Raw bodies
-        // carry the bytes directly.
-        std::string payload;
-        bool is_multipart = req.is_multipart_form_data();
-        if (is_multipart) {
-            // Every branch requires non-empty content: an empty "audio" part
-            // must not shadow a populated "file" part (same rule as the
-            // parity parser, which skips empty parts when scoring).
-            if (req.form.has_file("audio")
-                && !req.form.get_file("audio").content.empty()) {
-                payload = req.form.get_file("audio").content;
-            } else if (req.form.has_file("file")
-                       && !req.form.get_file("file").content.empty()) {
-                payload = req.form.get_file("file").content;
-            } else {
-                for (const auto& [name, file] : req.form.files) {
-                    (void)name;
-                    if (!file.content.empty()) {
-                        payload = file.content;
-                        break;
-                    }
-                }
-            }
-            // Filename-less parts ("audio"/"file" sent as plain form fields,
-            // e.g. curl -F 'audio=<clip.wav' or files={"audio": (None,
-            // data)}) live in form.fields, not form.files.
-            if (payload.empty()) {
-                if (!req.form.get_field("audio").empty()) {
-                    payload = req.form.get_field("audio");
-                } else if (!req.form.get_field("file").empty()) {
-                    payload = req.form.get_field("file");
-                }
-            }
-        } else {
-            payload = req.body;
-        }
+        // Copied explicitly: get_file returns its FormData by value, and
+        // binding a reference to a member of that temporary leans on
+        // lifetime extension that any later refactor could silently break.
+        const std::string payload = req.form.get_file("file").content;
 
         // Check payload size.
         size_t max_bytes = static_cast<size_t>(server->config().max_upload_mb) * 1024 * 1024;
         if (payload.size() > max_bytes) {
-            send_json(res, "{\"error\":\"request body too large\"}", 413);
+            send_json(res,
+                R"({"error":"request body too large","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                413);
             return;
         }
         if (payload.empty()) {
-            send_json(res, "{\"error\":\"empty request body\"}", 400);
+            send_json(res,
+                R"({"error":"empty request body","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                400);
             return;
         }
 
         // Decode audio.
         std::vector<float> samples;
         int sr = 0;
-        bool looks_like_wav = payload.size() >= 12
-            && (payload.compare(0, 4, "RIFF") == 0
-                || payload.compare(0, 4, "RF64") == 0
-                || payload.compare(0, 4, "RIFX") == 0)
-            && payload.compare(8, 4, "WAVE") == 0;
         bool decoded = serve::audio::wav_bytes_to_float32(payload, samples, sr);
         if (!decoded) {
-            // A payload with a RIFF/WAVE magic that fails WAV decoding (e.g. a
-            // header claiming more frames than the payload holds, or a
-            // truncated data chunk) is malformed: fail fast with 400 rather
-            // than reinterpreting header bytes as raw PCM16.
-            if (looks_like_wav) {
-                send_json(res, "{\"error\":\"malformed audio payload\",\"text\":\"\"}", 400);
-                return;
-            }
-            // Try raw PCM16.
-            samples = serve::audio::pcm16_to_float32(payload);
-            sr = 16000;
-            if (samples.empty()) {
-                send_json(res, "{\"error\":\"malformed audio payload\",\"text\":\"\"}", 400);
-                return;
-            }
+            send_json(res,
+                R"({"error":"malformed audio payload","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                400);
+            return;
         }
         if (sr != 0 && sr != serve::kSampleRate) {
             // The engine expects 16 kHz; there is no C++ resampler (the
@@ -727,18 +670,12 @@ int main(int argc, char** argv) {
         }
 
         // Success.
-        std::string json = result.to_json();
-        // Insert request_id before closing brace.
-        json = json.substr(0, json.size() - 1) +
-               ",\"request_id\":\"" + json_escape(rid) + "\"}";
-        send_json(res, json, 200);
+        send_json(res, "{\"text\":\"" + json_escape(result.text)
+            + "\",\"request_id\":\"" + json_escape(rid) + "\"}", 200);
     };
 
-    svr.Post("/transcribe", handle_transcribe);
-    svr.Post("/inference", handle_transcribe);
-
-    // OpenAI-compatible batch transcription subset. Keep validation separate
-    // from legacy routes: unsupported options must never look as if they worked.
+    // OpenAI-compatible batch transcription subset. Unsupported options
+    // return an explicit error instead of being silently ignored.
     svr.Get("/v1/models", [&server](const httplib::Request&, httplib::Response& res) {
         g_last_activity.store(std::time(nullptr));
         send_json(res, "{\"object\":\"list\",\"data\":[{\"id\":\""
@@ -752,7 +689,7 @@ int main(int argc, char** argv) {
             + ",\"audio_formats\":[\"wav\"],\"sample_rate_hz\":16000,"
               "\"response_formats\":[\"json\",\"text\"],\"prompt\":false,"
               "\"language_selection\":false,\"word_timestamps\":false,"
-              "\"streaming_transcriptions\":false,\"legacy_websocket_path\":\"/stream\"}");
+              "\"streaming_transcriptions\":false,\"websocket_path\":\"/stream\"}");
     });
     svr.Post("/v1/audio/transcriptions", [&server, &handle_transcribe](
             const httplib::Request& req, httplib::Response& res) {
@@ -832,7 +769,7 @@ int main(int argc, char** argv) {
         g_last_activity.store(std::time(nullptr));
         if (!server->is_text_model()) {
             send_json(res,
-                "{\"error\":\"model has no text path (audio models use /transcribe)\"}",
+                "{\"error\":\"model has no text path (audio models use /v1/audio/transcriptions)\"}",
                 400);
             return;
         }
@@ -922,8 +859,8 @@ int main(int argc, char** argv) {
     });
 
 
-    // ---- DELETE /inference/<id> ----
-    svr.Delete(R"(/inference/(.*))",
+    // ---- DELETE /v1/audio/transcriptions/<id> ----
+    svr.Delete(R"(/v1/audio/transcriptions/(.*))",
         [&server](const httplib::Request& req, httplib::Response& res) {
             g_last_activity.store(std::time(nullptr));
             std::string rid = req.matches.size() > 1

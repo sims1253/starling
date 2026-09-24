@@ -18,8 +18,8 @@ const prepared = await prepareWav16k({
   sampleRate: 16_000,
 });
 
-describe("StarlingClient protocol compatibility", () => {
-  it("uploads multipart WAV to the legacy endpoint with proxy auth", async () => {
+describe("StarlingClient transcription API", () => {
+  it("uploads multipart WAV to the transcription endpoint with proxy auth", async () => {
     let capturedUrl = "";
     let capturedHeaders: Headers | undefined;
     let capturedBody: FormData | undefined;
@@ -31,15 +31,10 @@ describe("StarlingClient protocol compatibility", () => {
       assert.ok(body instanceof FormData);
       capturedBody = body;
 
-      return new Response(
-        JSON.stringify({
-          text: "  never remove like  ",
-          segments: [{ text: "never", start_s: 0, end_s: 0.1 }],
-          duration_s: 0.1,
-          request_id: "server-id",
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+      return new Response(JSON.stringify({ text: "  never remove like  " }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "X-Request-Id": "server-id" },
+      });
     };
 
     const client = new StarlingClient({
@@ -49,24 +44,23 @@ describe("StarlingClient protocol compatibility", () => {
     });
 
     const result = await client.transcribe(prepared, { requestId: "client-id" });
-    assert.equal(capturedUrl, "http://localhost:8181/inference");
+    assert.equal(capturedUrl, "http://localhost:8181/v1/audio/transcriptions");
     assert.equal(capturedHeaders?.get("authorization"), "Bearer secret");
     assert.equal(capturedHeaders?.get("x-request-id"), "client-id");
     const uploadedFile = capturedBody?.get("file");
     assert.ok(uploadedFile instanceof Blob);
     assert.equal(uploadedFile.type, "audio/wav");
-    assert.equal(capturedBody?.has("model"), false);
+    assert.equal(capturedBody?.get("model"), "parakeet");
     assert.equal(result.text, "  never remove like  ");
-    assert.equal(result.durationSeconds, 0.1);
+    assert.equal(result.durationSeconds, undefined);
     assert.equal(result.requestId, "server-id");
-    assert.deepEqual(result.segments, [{ text: "never", startSeconds: 0, endSeconds: 0.1 }]);
+    assert.deepEqual(result.segments, []);
   });
 
-  it("requires an explicit model before uploading through OpenAI", async () => {
-    for (const options of [{}, { model: "" }, { model: "   " }]) {
+  it("requires a nonempty model before uploading", async () => {
+    for (const options of [{ model: "" }, { model: "   " }]) {
       const client = new StarlingClient({
         baseUrl: "http://localhost:8181",
-        protocol: "openai",
         ...options,
         fetch: async () => assert.fail("Missing models must fail before sending audio"),
       });
@@ -93,7 +87,6 @@ describe("StarlingClient protocol compatibility", () => {
 
     const result = await new StarlingClient({
       baseUrl: "http://localhost:8181",
-      protocol: "openai",
       model: "parakeet",
       fetch: fetcher,
     }).transcribe(prepared);
@@ -124,16 +117,15 @@ describe("StarlingClient protocol compatibility", () => {
 
     const health = await new StarlingClient({
       baseUrl: "http://localhost:8181",
-      protocol: "openai",
       fetch: fetcher,
     }).health();
 
     assert.equal(capturedUrl, "http://localhost:8181/v1/models");
-    assert.deepEqual(health, { status: "ok", phase: "ready", busy: false, model: "parakeet" });
+    // busy stays absent: the OpenAI models route cannot observe it.
+    assert.deepEqual(health, { status: "ok", phase: "ready", model: "parakeet" });
 
     const malformed = new StarlingClient({
       baseUrl: "http://localhost:8181",
-      protocol: "openai",
       fetch: async () =>
         new Response(JSON.stringify({ object: "list", data: [{ name: "missing-id" }] }), {
           status: 200,
@@ -172,7 +164,7 @@ describe("StarlingClient protocol compatibility", () => {
       return new Response("", {
         status: 302,
         statusText: "Found",
-        headers: { Location: "https://elsewhere.example/inference" },
+        headers: { Location: "https://elsewhere.example/v1/audio/transcriptions" },
       });
     };
 
@@ -216,7 +208,7 @@ describe("StarlingClient protocol compatibility", () => {
     const fetcher: typeof fetch = async (_input, init) => {
       capturedRedirects.push(init?.redirect);
 
-      return new Response(JSON.stringify({ status: "ready" }), { status: 200 });
+      return new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 });
     };
 
     const client = new StarlingClient({
@@ -224,7 +216,7 @@ describe("StarlingClient protocol compatibility", () => {
       fetch: fetcher,
     });
 
-    assert.equal((await client.health()).status, "ready");
+    assert.equal((await client.health()).status, "ok");
     await client.cancel("request-id");
     assert.deepEqual(capturedRedirects, ["manual", "manual"]);
   });
@@ -232,7 +224,6 @@ describe("StarlingClient protocol compatibility", () => {
   it("surfaces nested OpenAI error messages", async () => {
     const client = new StarlingClient({
       baseUrl: "http://localhost:8181",
-      protocol: "openai",
       model: "missing-model",
       fetch: async () =>
         new Response(JSON.stringify({ error: { message: "unknown model" } }), {
@@ -483,7 +474,7 @@ describe("StarlingClient protocol compatibility", () => {
   });
 
   it("reassembles chunked bodies under the cap across multibyte boundaries", async () => {
-    const encoded = new TextEncoder().encode('{"status":"réady"}');
+    const encoded = new TextEncoder().encode('{"data":[{"id":"réady"}]}');
     // Split inside the two-byte é (0xc3 0xa9): a naive per-chunk decode
     // would corrupt it, the streaming decoder must not.
     const split = encoded.indexOf(0xc3) + 1;
@@ -505,7 +496,7 @@ describe("StarlingClient protocol compatibility", () => {
       fetch: async () => new Response(body, { status: 200 }),
     }).health();
 
-    assert.equal(health.status, "réady");
+    assert.equal(health.model, "réady");
   });
 
   it("refuses a response whose declared content-length already exceeds the cap", async () => {
@@ -561,7 +552,7 @@ describe("StarlingClient protocol compatibility", () => {
         fetch: fetcher,
       });
 
-    const atCap = JSON.stringify({ status: "ok" }).padEnd(64);
+    const atCap = JSON.stringify({ data: [] }).padEnd(64);
 
     assert.equal(atCap.length, 64);
 

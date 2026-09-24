@@ -24,13 +24,17 @@ from test_desktop_app import ROOT, RAW, audio_file, free_port, stop, wait_ready
 def check_transport_failures(page, stack):
     """Check HTTP status preservation and interruption after response headers."""
     disconnected = threading.Event()
+    # Health always probes /v1/models: the first probe gets an HTTP error,
+    # later ones a body that stalls after the headers.
+    unavailable_sent = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
         def do_GET(self):
-            if self.path == "/v1/models":
+            if not unavailable_sent.is_set():
+                unavailable_sent.set()
                 payload = b"Test proxy is unavailable"
                 self.send_response(503)
                 self.send_header("Content-Type", "text/plain")
@@ -61,7 +65,7 @@ def check_transport_failures(page, stack):
     endpoint = f"http://127.0.0.1:{server.server_port}"
     error = page.evaluate("""async (endpoint) => {
         try {
-            await window.starlingDesktop.health({endpoint, protocol: 'openai'});
+            await window.starlingDesktop.health({endpoint});
             return 'unexpected success';
         } catch (cause) { return String(cause); }
     }""", endpoint)
@@ -69,7 +73,7 @@ def check_transport_failures(page, stack):
     started = time.perf_counter()
     error = page.evaluate("""async (endpoint) => {
         try {
-            await window.starlingDesktop.health({endpoint, protocol: 'starling', timeoutMs: 80});
+            await window.starlingDesktop.health({endpoint, timeoutMs: 80});
             return 'unexpected success';
         } catch (cause) { return String(cause); }
     }""", endpoint)
@@ -124,7 +128,6 @@ def main():
                 assert page.evaluate("typeof require") == "undefined", "Renderer must not expose Node"
                 page.get_by_role("button", name="Open server settings").click()
                 page.get_by_label("Server endpoint", exact=True).fill(endpoint)
-                page.get_by_label(re.compile(r"^API format")).select_option("openai")
                 page.get_by_label("Model", exact=True).fill("parakeet")
                 page.get_by_role("button", name="Save settings", exact=True).click()
                 expect(page.locator(".connection")).to_contain_text("ready")

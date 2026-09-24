@@ -51,7 +51,7 @@ class StreamingFallbackTest {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse = when {
                 request.path == "/stream" -> MockResponse().withWebSocketUpgrade(serverStream)
-                request.path == "/inference" && request.method == "POST" ->
+                request.path == "/v1/audio/transcriptions" && request.method == "POST" ->
                     MockResponse().setResponseCode(200)
                         .setBody("""{"text":"batch transcript of the saved wav"}""")
                 else -> MockResponse().setResponseCode(404)
@@ -85,11 +85,12 @@ class StreamingFallbackTest {
 
             // The upload carried the saved WAV itself, like any retry.
             val upload = pollForUpload(server)
-            assertEquals("/inference", upload.path)
+            assertEquals("/v1/audio/transcriptions", upload.path)
             assertEquals("POST", upload.method)
             val body = upload.body.readByteArray().toString(Charsets.UTF_8)
             assertTrue(body.contains("""name="file"; filename="recording.wav""""))
             assertTrue(body.contains("audio/wav"))
+            assertTrue(body.contains("name=\"model\""))
         } finally {
             runCatching { server.shutdown() }
             wav.delete()
