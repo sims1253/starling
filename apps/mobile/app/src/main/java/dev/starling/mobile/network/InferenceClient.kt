@@ -15,9 +15,21 @@ sealed interface InferenceResult {
     data class Failure(val message: String, val retryable: Boolean) : InferenceResult
 }
 
-/** Minimal platform transport for the Starling multipart HTTP contract. */
+/** Full batch routes the pre-unification Starling protocol accepted. */
+private val LEGACY_ROUTE_SUFFIXES = listOf("/inference", "/transcribe")
+
+/** Multipart upload to the backend's OpenAI-compatible transcription endpoint. */
 internal fun inferenceUrl(endpoint: String): String {
-    val base = endpoint.trimEnd('/')
+    var base = endpoint.trimEnd('/')
+    // Legacy full-route endpoints saved before the API unification (the
+    // old Starling protocol accepted them as complete batch routes) must
+    // migrate cleanly instead of producing .../inference/v1/audio/transcriptions.
+    for (legacy in LEGACY_ROUTE_SUFFIXES) {
+        if (base.endsWith(legacy, ignoreCase = true)) {
+            base = base.removeSuffix(legacy).trimEnd('/')
+            break
+        }
+    }
     return when {
         base.endsWith("/v1/audio/transcriptions", ignoreCase = true) -> base
         base.endsWith("/v1", ignoreCase = true) -> "$base/audio/transcriptions"
@@ -40,6 +52,11 @@ class InferenceClient {
             )
         }
         if (config.model.trim().isEmpty()) {
+            // Batch transcription always runs against the remote engine's
+            // OpenAI-compatible route, which requires the model field —
+            // the same invariant BackendSettings.save enforces at save
+            // time for the REMOTE engine. On-device captures never reach
+            // this client.
             return InferenceResult.Failure("Enter the model name served by the backend", false)
         }
 

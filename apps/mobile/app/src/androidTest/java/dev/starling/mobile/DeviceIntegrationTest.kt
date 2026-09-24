@@ -9,6 +9,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.starling.mobile.engine.OnDeviceEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -42,8 +43,9 @@ class DeviceIntegrationTest {
         val dir = File(context.cacheDir, "import-test").apply { deleteRecursively(); mkdirs() }
         try {
             val result = OnDeviceEngine(dir).importModel(ByteArrayInputStream(ByteArray(64)))
-            assertTrue("expected rejection, got $result", result is OnDeviceEngine.ImportResult.Rejected)
-            assertTrue((result as OnDeviceEngine.ImportResult.Rejected).reason.isNotBlank())
+            val rejected = result as? OnDeviceEngine.ImportResult.Rejected
+            assertTrue("expected rejection, got $result", rejected != null)
+            assertTrue(rejected?.reason?.isNotBlank() == true)
         } finally {
             dir.deleteRecursively()
         }
@@ -52,7 +54,7 @@ class DeviceIntegrationTest {
     @Test
     fun mainActivityLaunches() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.onActivity { activity -> assertTrue(!activity.isFinishing) }
+            scenario.onActivity { activity -> assertFalse(activity.isFinishing) }
         }
     }
 }

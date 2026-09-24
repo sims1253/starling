@@ -746,6 +746,99 @@ def test_http_transcriptions_accept_wav_uploads(monkeypatch):
     assert result.headers["x-request-id"] == "upload-id"
 
 
+def _transcriptions_response(body, content_type, extra_headers=None):
+    """POST a raw body at the transcriptions route, bypassing TestClient.
+
+    Reuses the manual Request construction of the WAV-upload test so the
+    strict multipart parser's error paths run without a live socket.
+    """
+    import asyncio
+    import json
+    from starling import server as module
+
+    server = StarlingServer()
+    server._ensure_loaded = lambda: None
+    server._run_queued_sync = lambda samples, request_id: TranscribeResult(text="edge-ok")
+    headers = {"content-length": str(len(body)), "content-type": content_type,
+               "x-request-id": "edge-id"}
+    headers.update(extra_headers or {})
+    fastapi = pytest.importorskip("fastapi")
+    app = module.create_app(server=server, load_on_startup=False)
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    path = "/v1/audio/transcriptions"
+    request = fastapi.Request({"type": "http", "method": "POST", "path": path,
+                               "headers": [(k.encode(), v.encode()) for k, v in headers.items()]},
+                              receive)
+    route = next(r for r in app.routes if getattr(r, "path", None) == path)
+    result = asyncio.run(route.endpoint(request))
+    try:
+        payload = json.loads(result.body)
+    except (ValueError, UnicodeDecodeError):
+        payload = result.body
+    return result.status_code, payload, result.headers
+
+
+def _multipart_body(model="granite", file_bytes=None):
+    wav = file_bytes if file_bytes is not None else _wav_bytes(np.zeros(160, dtype=np.float32))
+    fields = b""
+    if model is not None:
+        fields += (b'--audio-boundary\r\n'
+                   b'Content-Disposition: form-data; name="model"\r\n\r\n' + model.encode() + b'\r\n')
+    return (fields
+            + b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n'
+            b'Content-Type: audio/wav\r\n\r\n' + wav + b'\r\n--audio-boundary--\r\n')
+
+
+def test_http_transcriptions_rejects_non_multipart_content_type():
+    status, response, headers = _transcriptions_response(
+        b"RIFF....WAVE", "application/octet-stream"
+    )
+    assert status == 400
+    assert "multipart" in response["error"]["message"]
+    # Error responses correlate the request the same way successes do.
+    assert headers["x-request-id"] == "edge-id"
+
+
+def test_http_transcriptions_accepts_lenient_multipart_media_type():
+    # Casing and stray whitespace around the parameter separator must not
+    # reject an otherwise parseable multipart body.
+    body = _multipart_body()
+    status, response, _ = _transcriptions_response(
+        body, "MULTIPART/FORM-DATA ; boundary=audio-boundary"
+    )
+    assert status == 200
+    assert response["text"] == "edge-ok"
+
+
+def test_http_transcriptions_requires_exactly_one_model():
+    status, response, _ = _transcriptions_response(
+        _multipart_body(model=None), "multipart/form-data; boundary=audio-boundary"
+    )
+    assert status == 400
+    assert "model" in response["error"]["message"]
+
+
+def test_http_transcriptions_rejects_model_mismatch_with_404():
+    status, response, _ = _transcriptions_response(
+        _multipart_body(model="some-other-model"), "multipart/form-data; boundary=audio-boundary"
+    )
+    assert status == 404
+    assert response["error"]["param"] == "model"
+
+
+def test_http_transcriptions_rejects_non_wav_payload():
+    status, response, _ = _transcriptions_response(
+        _multipart_body(file_bytes=b"not a riff file at all"),
+        "multipart/form-data; boundary=audio-boundary",
+    )
+    assert status == 400
+    assert "WAV" in response["error"]["message"]
+
+
 @pytest.mark.parametrize("stage", ["_ensure_loaded", "_run_queued_sync"])
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
 def test_http_engine_errors_are_json(stage, error_type, monkeypatch, caplog):

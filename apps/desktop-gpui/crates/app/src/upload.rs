@@ -197,25 +197,17 @@ impl StarlingApp {
             }
             match handle.stop() {
                 Ok(mut take) => {
+                    // `sent_samples` indexes device-rate samples of the
+                    // spliced layout (drained stream prefix + journal
+                    // tail) — the same units the render loop advanced it
+                    // in, so the remainder slice below lines up exactly.
                     take.audio.samples.splice(0..0, streamed_samples);
                     if !matches!(take.journal.as_ref(), Some(report) if report.finalized && report.fault.is_none()) {
                         stream = None;
                     }
-                    if let Some(ref live) = stream {
-                        if sent_samples < take.audio.samples.len() {
-                            if let Ok(wav) = audio::encode_wav_16k_parts(
-                                &take.audio.samples[sent_samples..], take.audio.sample_rate, 1
-                            ) {
-                                if !live.send_audio(wav) {
-                                    stream = None;
-                                }
-                            } else {
-                                stream = None;
-                            }
-                        }
-                    }
                     self.levels = vec![0.06; 52];
-                    self.capture_warning = recorder::clipping_warning(source_clip_ratio);
+                    self.capture_warning = recorder::clipping_warning(source_clip_ratio)
+                        .or_else(|| self.stream_degradation.take());
                     if let Some(fault) = capture_fault {
                         self.error = Some(fault);
                     }
@@ -225,16 +217,43 @@ impl StarlingApp {
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
-                            .background_spawn(async move { audio::encode_wav_16k(&take.audio) })
+                            .background_spawn(async move {
+                                // The un-streamed remainder — everything
+                                // past the send watermark — is encoded and
+                                // sent here, beside the save-path encode,
+                                // never on the UI thread: after a mid-take
+                                // stall it can be as long as the rest of
+                                // the take. A failed encode or send drops
+                                // the stream, so the job's final result
+                                // stays gated on the remainder actually
+                                // reaching the server (otherwise the full
+                                // upload below covers it).
+                                let remainder_sent = match stream.as_ref() {
+                                    Some(live) if sent_samples < take.audio.samples.len() => {
+                                        audio::encode_wav_16k_parts(
+                                            &take.audio.samples[sent_samples..],
+                                            take.audio.sample_rate,
+                                            1,
+                                        )
+                                        .map(|wav| live.send_audio(wav))
+                                        .unwrap_or(false)
+                                    }
+                                    _ => true,
+                                };
+                                if !remainder_sent {
+                                    stream = None;
+                                }
+                                (audio::encode_wav_16k(&take.audio), stream)
+                            })
                             .await;
                         match encoded {
-                            Ok(wav) => {
+                            (Ok(wav), stream) => {
                                 this.update(cx, |app, cx| {
                                     app.save_and_transcribe(Arc::new(wav), journal_report, stream, cx);
                                 })
                                 .ok();
                             }
-                            Err(err) => {
+                            (Err(err), _) => {
                                 this.update(cx, |app, cx| {
                                     app.error = Some(err.to_string());
                                     cx.notify();
@@ -310,6 +329,7 @@ impl StarlingApp {
                     self.live_partial.clear();
                     self.streamed_samples.clear();
                     self.stream_sent_samples = 0;
+                    self.stream_degradation = None;
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
@@ -497,17 +517,33 @@ impl StarlingApp {
                         let id = id.clone();
                         cx.background_spawn(async move {
                             let client = StarlingClient::new(&endpoint, &model)?;
+                            // The stream failure reason is kept (and logged
+                            // when the batch fallback also fails): silently
+                            // re-uploading after a dead stream made
+                            // stream-mode regressions undiagnosable.
+                            let mut stream_failure = None;
                             if let Some(stream) = stream {
                                 if stream.commit() {
-                                    if let Ok(result) = stream.final_result() {
-                                        return Ok(result);
+                                    match stream.final_result() {
+                                        Ok(result) => return Ok(result),
+                                        Err(err) => stream_failure = Some(err),
                                     }
+                                } else {
+                                    stream_failure =
+                                        Some("stream closed before commit".to_string());
                                 }
                             }
                             // Shares the upload buffer with the client by
                             // reference count (issue #235): the WAV bytes
                             // are never duplicated for this request.
-                            client.transcribe(wav, &id)
+                            let outcome = client.transcribe(wav, &id);
+                            if let (Err(err), Some(stream_err)) = (&outcome, stream_failure) {
+                                eprintln!(
+                                    "STARLING stream failed ({stream_err}); \
+                                     batch upload fallback also failed: {err}"
+                                );
+                            }
+                            outcome
                         })
                         .await
                     };

@@ -576,16 +576,25 @@ int main(int argc, char** argv) {
             return;
         }
 
-        const std::string& payload = req.form.get_file("file").content;
+        // Copied explicitly: get_file returns its FormData by value, and
+        // binding a reference to a member of that temporary leans on
+        // lifetime extension that any later refactor could silently break.
+        const std::string payload = req.form.get_file("file").content;
 
         // Check payload size.
         size_t max_bytes = static_cast<size_t>(server->config().max_upload_mb) * 1024 * 1024;
         if (payload.size() > max_bytes) {
-            send_json(res, "{\"error\":\"request body too large\"}", 413);
+            send_json(res,
+                R"({"error":"request body too large","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                413);
             return;
         }
         if (payload.empty()) {
-            send_json(res, "{\"error\":\"empty request body\"}", 400);
+            send_json(res,
+                R"({"error":"empty request body","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                400);
             return;
         }
 
@@ -594,7 +603,10 @@ int main(int argc, char** argv) {
         int sr = 0;
         bool decoded = serve::audio::wav_bytes_to_float32(payload, samples, sr);
         if (!decoded) {
-            send_json(res, "{\"error\":\"malformed audio payload\"}", 400);
+            send_json(res,
+                R"({"error":"malformed audio payload","text":"","request_id":")"
+                + json_escape(rid) + "\"}",
+                400);
             return;
         }
         if (sr != 0 && sr != serve::kSampleRate) {

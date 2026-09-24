@@ -92,8 +92,11 @@ impl LiveStream {
                             }
                             message = socket.next() => {
                                 let event = match message {
-                                    Some(Ok(Message::Text(text))) => parse_message(text.as_ref())
-                                        .or_else(|| Some(Event::Error("Invalid stream response".into()))),
+                                    // A skipped frame (parse_message ->
+                                    // None) stays skipped: the permissive
+                                    // parse above is what decides what is
+                                    // fatal, not this loop.
+                                    Some(Ok(Message::Text(text))) => parse_message(text.as_ref()),
                                     Some(Ok(Message::Close(_))) | None => Some(Event::Error("Stream closed before final transcript".into())),
                                     Some(Err(err)) => Some(Event::Error(err.to_string())),
                                     _ => None,
@@ -117,6 +120,14 @@ impl LiveStream {
         self.commands.try_send(Command::Audio(wav)).is_ok()
     }
 
+    /// True once the runtime thread has exited and the command channel is
+    /// closed — the terminal condition. A failed `send_audio` with this
+    /// false is only backpressure (the bounded channel is momentarily
+    /// full); the unsent span is kept and the caller can retry.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     pub(crate) fn commit(&self) -> bool {
         self.commands.try_send(Command::Commit).is_ok()
     }
@@ -134,8 +145,13 @@ impl LiveStream {
     }
 
     pub(crate) fn final_result(self) -> Result<TranscriptionResult, String> {
+        // One total budget for the whole wait, not one per event: a server
+        // that keeps dribbling partials (or pongs) would otherwise reset a
+        // per-recv timeout forever and wedge the wait indefinitely.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
-            match self.events.recv_timeout(Duration::from_secs(120)) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.events.recv_timeout(remaining) {
                 Ok(Event::Final(result)) => return Ok(result),
                 Ok(Event::Partial(_)) => {}
                 Ok(Event::Error(err)) => return Err(err),
@@ -147,19 +163,41 @@ impl LiveStream {
 
 fn parse_message(text: &str) -> Option<Event> {
     let payload: Value = serde_json::from_str(text).ok()?;
-    match payload.get("type")?.as_str()? {
-        "partial" => Some(Event::Partial(payload.get("text")?.as_str()?.to_string())),
-        "error" => Some(Event::Error(payload.get("message")?.as_str()?.to_string())),
-        "final" => {
+    match payload.get("type").and_then(Value::as_str) {
+        // A partial without text, an unparseable frame, or a message type
+        // this build does not know is skipped, not fatal: killing the
+        // stream over a forward-compat frame would silently downgrade the
+        // whole session to full-file upload.
+        Some("partial") => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| Event::Partial(text.to_string())),
+        Some("error") => Some(Event::Error(
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown stream error")
+                .to_string(),
+        )),
+        Some("final") => {
             let text = payload.get("text")?.as_str()?.to_string();
+            // Segments are permissive: one malformed segment entry must not
+            // discard an otherwise complete transcript — the top-level text
+            // is the source of truth and bad segment rows are skipped.
             let mut segments = Vec::new();
             if let Some(items) = payload.get("segments").and_then(Value::as_array) {
                 for item in items {
-                    segments.push(TranscriptionSegment {
-                        text: item.get("text")?.as_str()?.to_string(),
-                        start_seconds: item.get("start_s")?.as_f64()?,
-                        end_seconds: item.get("end_s")?.as_f64()?,
-                    });
+                    if let (Some(text), Some(start), Some(end)) = (
+                        item.get("text").and_then(Value::as_str),
+                        item.get("start_s").and_then(Value::as_f64),
+                        item.get("end_s").and_then(Value::as_f64),
+                    ) {
+                        segments.push(TranscriptionSegment {
+                            text: text.to_string(),
+                            start_seconds: start,
+                            end_seconds: end,
+                        });
+                    }
                 }
             }
             Some(Event::Final(TranscriptionResult {
@@ -169,8 +207,8 @@ fn parse_message(text: &str) -> Option<Event> {
                 request_id: None,
             }))
         }
-        "pong" | "reset_ack" => None,
-        _ => Some(Event::Error("Unknown stream response".into())),
+        // "pong", "reset_ack", and any future message type are ignored.
+        _ => None,
     }
 }
 

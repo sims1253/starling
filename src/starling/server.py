@@ -1401,7 +1401,7 @@ def create_app(
         WebSocket,
         WebSocketDisconnect,
     )
-    from fastapi.responses import JSONResponse  # type: ignore
+    from fastapi.responses import JSONResponse, PlainTextResponse  # type: ignore
 
     if server is not None and config is not None and server.config is not config:
         raise ValueError("pass either config or server, not both")
@@ -1482,16 +1482,24 @@ def create_app(
         })
 
     async def _transcriptions(request):  # noqa: ANN001
+        # Computed once, up front: every response — success or any
+        # validation failure — can then correlate the request the same way.
+        rid = _request_id(request)
+
         def fail(message: str, param: Optional[str], status: int = 400) -> JSONResponse:
             return JSONResponse(
                 {"error": {"message": message,
                            "type": "server_error" if status >= 500 else "invalid_request_error",
                            "param": param, "code": None}},
                 status_code=status,
+                headers={"X-Request-Id": rid},
             )
 
         content_type = request.headers.get("content-type", "")
-        if not content_type.lower().startswith("multipart/form-data;"):
+        # Lenient media-type match: casing and whitespace around the ';'
+        # must not reject an otherwise parseable multipart body. A missing
+        # boundary still fails below, at the actual parse.
+        if content_type.lower().split(";")[0].strip() != "multipart/form-data":
             return fail("Expected multipart/form-data with file and model", "file")
         body = await _read_bounded_body(request)
         message = BytesParser(policy=email.policy.HTTP).parsebytes(
@@ -1534,7 +1542,6 @@ def create_app(
         payload = files[0][1]
         if len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WAVE":
             return fail("This backend accepts WAV files", "file")
-        rid = _request_id(request)
         status, response = await asyncio.to_thread(
             _transcribe_payload_sync, server, payload, rid
         )
@@ -1542,7 +1549,6 @@ def create_app(
             return fail(str(response.get("error", "Transcription failed")), None, status)
         headers = {"X-Request-Id": rid}
         if response_format == "text":
-            from fastapi.responses import PlainTextResponse
             return PlainTextResponse(response["text"], headers=headers)
         return JSONResponse({"text": response["text"]}, headers=headers)
 

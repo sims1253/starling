@@ -53,8 +53,18 @@ final class AppModel: ObservableObject {
                 try await recorder.start(at: stagingURL)
                 guard recorder.isRecording else { return }
                 livePartial = ""
-                liveStream = try? LiveTranscription(configuration: configuration) { [weak self] text in
-                    self?.livePartial = text
+                do {
+                    liveStream = try LiveTranscription(configuration: configuration) { [weak self] text in
+                        self?.livePartial = text
+                    }
+                } catch {
+                    // Stream setup failure is deterministic (an endpoint
+                    // or scheme the WS URL builder rejects): the recording
+                    // itself is fine and falls back to the full upload,
+                    // but the missing partials must be explained instead
+                    // of silently dropped.
+                    liveStream = nil
+                    errorMessage = "Live transcription is unavailable: \(error.localizedDescription)"
                 }
                 streamPump = Task { [weak self] in
                     while let self, self.recorder.isRecording, !Task.isCancelled {
@@ -65,6 +75,11 @@ final class AppModel: ObservableObject {
                             } catch {
                                 stream.close()
                                 self.liveStream = nil
+                                // Stop showing a partial the stream can no
+                                // longer update. Draining continues so the
+                                // sink's frame buffer stays bounded for the
+                                // rest of the take.
+                                self.livePartial = ""
                             }
                         }
                         try? await Task.sleep(for: .milliseconds(100))
@@ -199,18 +214,33 @@ final class AppModel: ObservableObject {
         configuration: ServerConfiguration,
         stream: LiveTranscription? = nil
     ) async {
-        guard !isWorking else { return }
+        guard !isWorking else {
+            // A Retry on a history row won the race for the working slot:
+            // close the stream we were handed rather than dropping the
+            // reference and leaving the socket for the server's heartbeat
+            // reaper to collect.
+            stream?.close()
+            return
+        }
         isWorking = true
         defer { isWorking = false }
+        // Why a stream-produced transcript was discarded, kept for the
+        // failure path so the fallback stays diagnosable.
+        var streamFailureNote: String?
         do {
             let attempting = try await repository.markAttempt(record.id)
             await reload()
             let recordingURL = await repository.recordingURL(for: attempting)
             let transcript: Transcript
             if let stream {
-                if let streamed = try? await stream.finish() {
-                    transcript = streamed
-                } else {
+                do {
+                    transcript = try await stream.finish()
+                } catch {
+                    // The stream already carried every frame and the
+                    // commit; the full upload is the only way to a
+                    // transcript now. Keep the reason — if the upload
+                    // also fails, the user sees both.
+                    streamFailureNote = "Live transcription failed (\(error.localizedDescription)); the recording was re-uploaded in full."
                     transcript = try await StarlingClient(configuration: configuration)
                         .transcribe(recordingURL: recordingURL, requestID: UUID().uuidString)
                 }
@@ -227,7 +257,8 @@ final class AppModel: ObservableObject {
                 errorMessage = error.localizedDescription
             }
             await reload()
-            errorMessage = error.localizedDescription
+            errorMessage = streamFailureNote.map { "\($0) \(error.localizedDescription)" }
+                ?? error.localizedDescription
         }
     }
 }

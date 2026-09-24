@@ -121,7 +121,8 @@ describe("StarlingClient transcription API", () => {
     }).health();
 
     assert.equal(capturedUrl, "http://localhost:8181/v1/models");
-    assert.deepEqual(health, { status: "ok", phase: "ready", busy: false, model: "parakeet" });
+    // busy stays absent: the OpenAI models route cannot observe it.
+    assert.deepEqual(health, { status: "ok", phase: "ready", model: "parakeet" });
 
     const malformed = new StarlingClient({
       baseUrl: "http://localhost:8181",

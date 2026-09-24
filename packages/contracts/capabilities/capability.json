@@ -205,7 +205,8 @@
   },
   "error_contract": {
     "bodies": {
-      "openai_subset": "{error: {message, type, param, code}}"
+      "openai_subset": "{error: {message, type, param, code}}",
+      "starling_extension_plain": "{error: string, text, request_id}"
     },
     "non_json_bodies_possible": true,
     "clients_must_check_status_first": true,

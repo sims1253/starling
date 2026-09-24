@@ -36,26 +36,42 @@ final class LiveTranscription {
         socket.resume()
         let socket = self.socket
         reader = Task {
-            while true {
-                let message = try await socket.receive()
-                guard case let .string(json) = message,
-                      let data = json.data(using: .utf8),
-                      let payload = try? JSONDecoder().decode(StreamMessage.self, from: data)
-                else { throw StreamFailure.invalidResponse }
-                switch payload.type {
-                case "partial":
-                    onPartial(payload.text ?? "")
-                case "final":
-                    guard let text = payload.text else { throw StreamFailure.invalidResponse }
-                    let segments = (payload.segments ?? []).map {
-                        TranscriptSegment(text: $0.text, startSeconds: $0.start, endSeconds: $0.end)
+            do {
+                while true {
+                    let message = try await socket.receive()
+                    // A non-text frame, invalid JSON, or a message this
+                    // build does not understand is skipped, not fatal:
+                    // killing the reader over one malformed frame would
+                    // silently end partials while the pump keeps feeding
+                    // the socket. Only a "final" without text (the one
+                    // payload we are waiting to complete on) stays an
+                    // error.
+                    guard case let .string(json) = message,
+                          let data = json.data(using: .utf8),
+                          let payload = try? JSONDecoder().decode(StreamMessage.self, from: data)
+                    else { continue }
+                    switch payload.type {
+                    case "partial":
+                        onPartial(payload.text ?? "")
+                    case "final":
+                        guard let text = payload.text else { throw StreamFailure.invalidResponse }
+                        let segments = (payload.segments ?? []).map {
+                            TranscriptSegment(text: $0.text, startSeconds: $0.start, endSeconds: $0.end)
+                        }
+                        return Transcript(text: text, segments: segments, durationSeconds: payload.duration)
+                    case "error":
+                        throw StreamFailure.server(payload.message ?? "Unknown stream error")
+                    default:
+                        break
                     }
-                    return Transcript(text: text, segments: segments, durationSeconds: payload.duration)
-                case "error":
-                    throw StreamFailure.server(payload.message ?? "Unknown stream error")
-                default:
-                    break
                 }
+            } catch {
+                // The reader is the only side that hears a dead stream.
+                // Cancel the socket so the send path (and finish()) see
+                // the failure on their next call instead of feeding a
+                // connection nobody is reading.
+                socket.cancel(with: .normalClosure, reason: nil)
+                throw error
             }
         }
     }

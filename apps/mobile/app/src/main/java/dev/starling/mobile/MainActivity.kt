@@ -207,6 +207,10 @@ class MainActivity : Activity() {
                 }
             }
             runOnUiThread {
+                // The copy can outlive a user who navigated away
+                // mid-import; posting into a destroyed activity leaks it
+                // and risks a crash, so a dead activity drops the update.
+                if (isDestroyed || isFinishing) return@runOnUiThread
                 when (result) {
                     is OnDeviceEngine.ImportResult.Imported -> {
                         refreshOnDeviceStatus()

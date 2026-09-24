@@ -23,14 +23,22 @@ class BackendSettings(context: Context) {
         Context.MODE_PRIVATE,
     )
 
-    fun load(): BackendConfig = BackendConfig(
-        endpoint = preferences.getString(KEY_ENDPOINT, DEFAULT_ENDPOINT) ?: DEFAULT_ENDPOINT,
-        allowTrustedLanHttp = preferences.getBoolean(KEY_ALLOW_HTTP, false),
-        model = preferences.getString(KEY_MODEL, DEFAULT_MODEL) ?: DEFAULT_MODEL,
-        engine = preferences.getString(KEY_ENGINE, TranscriptionEngine.REMOTE.name)
-            ?.let { value -> runCatching { TranscriptionEngine.valueOf(value) }.getOrDefault(TranscriptionEngine.REMOTE) }
-            ?: TranscriptionEngine.REMOTE,
-    )
+    fun load(): BackendConfig {
+        // One-time migration: the protocol selector was removed by the API
+        // unification, so installs upgraded from those versions drop the
+        // orphaned key instead of carrying it forever.
+        if (preferences.contains(KEY_PROTOCOL_LEGACY)) {
+            preferences.edit().remove(KEY_PROTOCOL_LEGACY).apply()
+        }
+        return BackendConfig(
+            endpoint = preferences.getString(KEY_ENDPOINT, DEFAULT_ENDPOINT) ?: DEFAULT_ENDPOINT,
+            allowTrustedLanHttp = preferences.getBoolean(KEY_ALLOW_HTTP, false),
+            model = preferences.getString(KEY_MODEL, DEFAULT_MODEL) ?: DEFAULT_MODEL,
+            engine = preferences.getString(KEY_ENGINE, TranscriptionEngine.REMOTE.name)
+                ?.let { value -> runCatching { TranscriptionEngine.valueOf(value) }.getOrDefault(TranscriptionEngine.REMOTE) }
+                ?: TranscriptionEngine.REMOTE,
+        )
+    }
 
     fun save(config: BackendConfig) {
         val validated = EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp)
@@ -53,6 +61,9 @@ class BackendSettings(context: Context) {
         private const val KEY_ALLOW_HTTP = "allow_trusted_lan_http"
         private const val KEY_MODEL = "model"
         private const val KEY_ENGINE = "engine"
+
+        /** Persisted by pre-unification versions alongside the removed selector. */
+        private const val KEY_PROTOCOL_LEGACY = "protocol"
         const val DEFAULT_MODEL = "parakeet"
 
         // HTTPS is the safe default. Local development can explicitly opt into

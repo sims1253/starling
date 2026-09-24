@@ -96,10 +96,6 @@
             "websocket"
           ]
         },
-        "alias_of": {
-          "type": "string",
-          "pattern": "^/"
-        },
         "requires": {
           "type": "string",
           "description": "Condition under which the route serves this purpose."
@@ -630,6 +626,10 @@
           "properties": {
             "openai_subset": {
               "const": "{error: {message, type, param, code}}"
+            },
+            "starling_extension_plain": {
+              "const": "{error: string, text, request_id}",
+              "description": "Engine-stage failures (busy, cancelled, timeout, decode) on the native server keep the Starling plain-string error body alongside the OpenAI-subset envelope used for request validation."
             }
           }
         },

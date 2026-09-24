@@ -7,9 +7,7 @@
 #include "audio.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
-#include <sstream>
 
 #include "dr_wav.h"
 

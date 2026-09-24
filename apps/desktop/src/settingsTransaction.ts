@@ -1,3 +1,5 @@
+import { DEFAULT_TRANSCRIPTION_MODEL } from "@starling/dictation";
+
 /**
  * Every settings field the dialog edits, as one immutable configuration
  * (B06): a draft while the dialog is open, the committed values once a save
@@ -44,7 +46,8 @@ const KEYS = {
   refineKeyPlaintextOptIn: "starling:refine:keyPlaintextOptIn",
 } as const;
 
-const DEFAULT_MODEL = "parakeet";
+/** One source of truth with the dictation client's own default. */
+const DEFAULT_MODEL = DEFAULT_TRANSCRIPTION_MODEL;
 
 /** Why a draft cannot be saved at all: there is no endpoint to connect to. */
 export const EMPTY_ENDPOINT_REASON = "Enter a server endpoint before saving.";
@@ -222,6 +225,9 @@ export function persistSettings(
   // encrypted key or strand a half-applied key form (B10).
   const writes: ReadonlyArray<readonly [string, string | null]> = [
     [KEYS.endpoint, settings.endpoint],
+    // Migration: the protocol selector was removed by the API unification,
+    // so every save also clears the key older installs still carry.
+    ["starling:protocol", null],
     [KEYS.model, settings.model],
     [KEYS.streaming, settings.streamLive ? "1" : "0"],
     [KEYS.terms, settings.expectedTerms],

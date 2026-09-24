@@ -99,6 +99,11 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var engine: AVAudioEngine?
     private var sink: CaptureSink?
     private var recordingURL: URL?
+    /// The input port and rate the tap was installed with, so a later
+    /// engine configuration change can tell "the tapped input is gone"
+    /// (stop and salvage) from "only the outputs changed" (restart).
+    private var activeInputUID: String?
+    private var activeSampleRate: Double?
     private var interruptionObserver: (any NSObjectProtocol)?
     private var routeChangeObserver: (any NSObjectProtocol)?
     private var mediaServicesResetObserver: (any NSObjectProtocol)?
@@ -126,6 +131,8 @@ final class AudioRecorder: NSObject, ObservableObject {
                   format.sampleRate.isFinite, format.sampleRate > 0
             else { throw AudioRecorderError.couldNotStart }
             let sink = try CaptureSink(url: url, sampleRate: format.sampleRate)
+            activeInputUID = AVAudioSession.sharedInstance().currentRoute.inputs.first?.uid
+            activeSampleRate = format.sampleRate
             input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
                 sink.append(buffer)
             }
@@ -226,7 +233,23 @@ final class AudioRecorder: NSObject, ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.forcedStop(
+                guard let self, self.isRecording, let engine = self.engine else { return }
+                // This notification also fires for output-only route
+                // changes (plugging in headphones, a Bluetooth output
+                // connecting), which must not end capture — the
+                // route-change handler below already ends it when the
+                // input itself is lost. When the tapped input is still on
+                // the route at the same format, the engine only needs a
+                // restart; only its loss or a failed restart salvages the
+                // take as a forced stop.
+                let inputAlive = AVAudioSession.sharedInstance().currentRoute.inputs
+                    .contains { $0.uid == self.activeInputUID }
+                if inputAlive,
+                   engine.inputNode.outputFormat(forBus: 0).sampleRate == self.activeSampleRate,
+                   (try? engine.start()) != nil {
+                    return
+                }
+                self.forcedStop(
                     message: "The microphone configuration changed. The audio captured so far was saved to history."
                 )
             }
@@ -282,10 +305,15 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 }
 
-/// The tap owns one sink. The lock orders file writes and stream frames, and
-/// stop removes the tap before finalizing the WAV header.
+/// The tap owns one sink. The tap callback only copies the buffer's channel
+/// memory (valid solely inside the callback); every lock, allocation,
+/// resample, and file write happens on the sink's serial queue, off the
+/// real-time audio thread. `stop` removes the tap before finalizing the WAV
+/// header.
 private final class CaptureSink: @unchecked Sendable {
     private let lock = NSLock()
+    /// Serializes encode+write work moved off the render thread.
+    private let queue = DispatchQueue(label: "dev.starling.capture.sink", qos: .userInitiated)
     private let file: FileHandle
     private let inputRate: Double
     private var inputIndex = 0
@@ -294,6 +322,9 @@ private final class CaptureSink: @unchecked Sendable {
     private var frames: [Data] = []
     private var byteCount = 0
     private var finished = false
+    /// Set by the first failed write; later appends are skipped so the file
+    /// stays a valid (truncated) WAV instead of growing a hole.
+    private var failed = false
 
     init(url: URL, sampleRate: Double) throws {
         inputRate = sampleRate
@@ -306,13 +337,38 @@ private final class CaptureSink: @unchecked Sendable {
         try file.seekToEnd()
     }
 
+    deinit {
+        // The start-failure path drops the sink without finish(); the file
+        // descriptor must not leak. Pending queue work holds no strong
+        // reference, so draining it first only orders the close.
+        queue.sync {}
+        if !finished {
+            try? file.synchronize()
+            try? file.close()
+        }
+    }
+
+    /// Copies the tap buffer on the calling (render) thread and moves all
+    /// heavy work to the sink queue.
     func append(_ buffer: AVAudioPCMBuffer) {
         guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
         let count = Int(buffer.frameLength)
         let channelCount = Int(buffer.format.channelCount)
+        var copies = [[Float]]()
+        copies.reserveCapacity(channelCount)
+        for channel in 0..<channelCount {
+            copies.append(Array(UnsafeBufferPointer(start: channels[channel], count: count)))
+        }
+        queue.async { [weak self] in
+            self?.encodeAndWrite(channels: copies, count: count)
+        }
+    }
+
+    private func encodeAndWrite(channels: [[Float]], count: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished, !failed else { return }
+        let channelCount = channels.count
         var mono = [Float](repeating: 0, count: count)
         for channel in 0..<channelCount {
             for i in 0..<count { mono[i] += channels[channel][i] / Float(channelCount) }
@@ -335,11 +391,25 @@ private final class CaptureSink: @unchecked Sendable {
         }
         lastSample = mono[count - 1]
         inputIndex = end
-        if !bytes.isEmpty {
-            file.write(bytes)
+        guard !bytes.isEmpty else { return }
+        do {
+            // The throwing API: the legacy `write(_:)` raises an ObjC
+            // exception (crashing the app) on a full disk or vanished
+            // file instead of returning an error.
+            try file.write(contentsOf: bytes)
             byteCount += bytes.count
             frames.append(bytes)
+        } catch {
+            failed = true
         }
+    }
+
+    /// True once a write failed; capture produced a valid but truncated
+    /// WAV and the caller may want to end it early.
+    var writeFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
     }
 
     func drain() -> [Data] {
@@ -351,6 +421,9 @@ private final class CaptureSink: @unchecked Sendable {
     }
 
     func finish() -> Int {
+        // Wait out any queued copies first so the finalized header covers
+        // every frame the tap produced.
+        queue.sync {}
         lock.lock()
         defer { lock.unlock() }
         finished = true
@@ -367,7 +440,7 @@ private final class CaptureSink: @unchecked Sendable {
         var length = UInt32(byteCount).littleEndian
         withUnsafeBytes(of: &length) { header.append(contentsOf: $0) }
         file.seek(toFileOffset: 0)
-        file.write(header)
+        try? file.write(contentsOf: header)
         try? file.synchronize()
         try? file.close()
         return byteCount * 1_000 / 32_000

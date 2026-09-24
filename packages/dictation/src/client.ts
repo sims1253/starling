@@ -420,12 +420,22 @@ const decodeTranscriptionResponse = Schema.decodeEffect(
 
 const decodeModelsResponse = Schema.decodeEffect(Schema.fromJsonString(OpenAiModelsResponseSchema));
 
+/**
+ * The model sent when a caller configures none. One named, exported
+ * constant so the browser client, the Electron bridge, and the settings
+ * defaults cannot drift apart.
+ */
+export const DEFAULT_TRANSCRIPTION_MODEL = "parakeet";
+
 function normalizeTranscription(
   wire: Schema.Schema.Type<typeof TranscriptionResponseSchema>,
   headerRequestId: string | null,
 ): Effect.Effect<TranscriptionResult, DictationProtocolError> {
   const requestId = headerRequestId ?? undefined;
 
+  // Batch transcription returns text only — the OpenAI-shaped wire schema
+  // above decodes no timing data — so segments stay empty here; timed
+  // segments are populated exclusively by the streaming path.
   const normalized: MutableTranscriptionResult = {
     text: wire.text,
     segments: Object.freeze([]),
@@ -439,10 +449,12 @@ function normalizeTranscription(
 function normalizeModels(
   wire: Schema.Schema.Type<typeof OpenAiModelsResponseSchema>,
 ): ServerHealth {
+  // busy/queueDepth stay absent rather than fabricated: the OpenAI models
+  // route cannot observe them, and an absent optional is the honest
+  // encoding of "unknown" for the consumers that check them.
   const health: MutableServerHealth = {
     status: "ok",
     phase: "ready",
-    busy: false,
   };
 
   const model = wire.data[0]?.id;
@@ -498,7 +510,7 @@ export class StarlingClient {
     this.baseUrl = cleanBaseUrl(options.baseUrl);
     this.backend = options.backend ?? "auto";
     this.endpoint = options.endpoint ?? "/v1/audio/transcriptions";
-    this.model = (options.model ?? "parakeet").trim();
+    this.model = (options.model ?? DEFAULT_TRANSCRIPTION_MODEL).trim();
     this.auth = options.auth;
     this.headers = options.headers ?? {};
     this.timeoutMs = options.timeoutMs ?? 120_000;
@@ -606,8 +618,11 @@ export class StarlingClient {
 
     return Effect.fnUntraced(function* (client: StarlingClient) {
       const headers = yield* client.requestHeadersEffect();
+      // Derived from the same configurable endpoint transcribeEffect uses,
+      // so a client mounted under a sub-path cancels against the right
+      // route instead of silently missing the queued request.
       yield* client.requestEffect(
-        `${client.baseUrl}/v1/audio/transcriptions/${encodeURIComponent(requestId)}`,
+        `${client.baseUrl}${client.endpoint}/${encodeURIComponent(requestId)}`,
         {
           method: "DELETE",
           headers,

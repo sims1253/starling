@@ -236,28 +236,26 @@ impl StarlingClient {
             ));
         }
 
-        let response = {
-                let url = format!("{}/v1/audio/transcriptions", self.base_url);
-                let model = if self.model.is_empty() {
-                    "parakeet"
-                } else {
-                    self.model.as_str()
-                };
-                let file = multipart::Part::stream_with_length(wav_bytes(&wav), wav.len() as u64)
-                    .file_name("recording.wav")
-                    .mime_str("audio/wav")
-                    .map_err(|error| ClientError::Transport(error.to_string()))?;
-                let form = multipart::Form::new()
-                    .part("file", file)
-                    .text("model", model.to_string())
-                    .text("response_format", "json");
-                let request = self
-                    .http
-                    .post(&url)
-                    .header("x-request-id", sent_request_id.as_str())
-                    .multipart(form);
-                self.execute(request, cancel)?
+        let url = format!("{}/v1/audio/transcriptions", self.base_url);
+        let model = if self.model.is_empty() {
+            "parakeet"
+        } else {
+            self.model.as_str()
         };
+        let file = multipart::Part::stream_with_length(wav_bytes(&wav), wav.len() as u64)
+            .file_name("recording.wav")
+            .mime_str("audio/wav")
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let form = multipart::Form::new()
+            .part("file", file)
+            .text("model", model.to_string())
+            .text("response_format", "json");
+        let request = self
+            .http
+            .post(&url)
+            .header("x-request-id", sent_request_id.as_str())
+            .multipart(form);
+        let response = self.execute(request, cancel)?;
 
         parse_transcription(
             &response.body,
@@ -443,9 +441,7 @@ async fn read_body_capped(
     // actually arrive; an undeclared (chunked) body starts empty.
     const MAX_INITIAL_RESERVATION: usize = 64 * 1024;
     let capacity = response.content_length().map_or(0, |length| {
-        length
-            .min(MAX_INITIAL_RESERVATION as u64)
-            .min(limit as u64) as usize
+        length.min(MAX_INITIAL_RESERVATION as u64).min(limit as u64) as usize
     });
     let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = response
@@ -921,8 +917,7 @@ mod tests {
 
     #[test]
     fn transcribe_validates_request_id_and_payload() {
-        let client = StarlingClient::new("http://127.0.0.1:9", "")
-            .expect("valid client");
+        let client = StarlingClient::new("http://127.0.0.1:9", "").expect("valid client");
         expect_input(
             client.transcribe(Arc::new(fake_wav()), "").unwrap_err(),
             "Invalid transcription request id.",
@@ -1015,8 +1010,7 @@ mod tests {
 
     #[test]
     fn response_limit_must_be_positive() {
-        let client = StarlingClient::new("http://127.0.0.1:9", "")
-            .expect("valid client");
+        let client = StarlingClient::new("http://127.0.0.1:9", "").expect("valid client");
         expect_client_input_error(
             client.with_max_response_bytes(0),
             "Response size limit must be at least 1 byte.",
@@ -1037,7 +1031,9 @@ mod tests {
             // Exactly one connection is expected; accepting it and
             // dropping the listener lets this thread exit instead of
             // parking on `incoming()` for the rest of the suite.
-            let Ok((mut stream, _)) = listener.accept() else { return };
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = read_request(&mut stream);
             counter.fetch_add(1, Ordering::SeqCst);
             // Hold the connection open (never answer) until the client's

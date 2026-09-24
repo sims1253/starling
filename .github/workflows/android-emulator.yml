@@ -37,6 +37,7 @@ jobs:
           java-version: 17
           cache: gradle
       - name: Enable KVM
+        shell: bash
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -44,6 +45,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Build the app and test APKs
         working-directory: apps/mobile
+        shell: bash
         run: ./gradlew --no-daemon assembleDebug assembleDebugAndroidTest
       - name: Run instrumented tests
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0

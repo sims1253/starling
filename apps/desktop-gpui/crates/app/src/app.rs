@@ -411,6 +411,10 @@ pub struct StarlingApp {
     pub(crate) live_partial: String,
     pub(crate) streamed_samples: Vec<f32>,
     pub(crate) stream_sent_samples: usize,
+    /// Set when live streaming died mid-recording: the partial view going
+    /// quiet must be explainable, so the stop path folds this into the
+    /// capture warning shown beside the saved take.
+    pub(crate) stream_degradation: Option<String>,
     pub levels: Vec<f32>,
     pub elapsed_ms: f64,
 
@@ -835,6 +839,7 @@ impl StarlingApp {
             live_partial: String::new(),
             streamed_samples: Vec::new(),
             stream_sent_samples: 0,
+            stream_degradation: None,
             levels: vec![0.06; 52],
             elapsed_ms: 0.0,
             diagnostics: diagnostics.then_some((started, false)),
@@ -1721,23 +1726,41 @@ impl Render for StarlingApp {
                 let quantum = crate::live_stream::exact_input_quantum(handle.sample_rate());
                 let acknowledged = (handle.acknowledged_samples() as usize)
                     .min(self.streamed_samples.len()) / quantum * quantum;
-                if acknowledged > self.stream_sent_samples {
+                // Bound each frame's encode to ~2 s of audio. In steady
+                // state the delta is a few frames' worth, but a stall (an
+                // occluded window pausing renders, a slow journal flush)
+                // can accumulate a large acknowledged span; catching up in
+                // a single frame would encode that span on the UI thread.
+                // The residue goes out on later frames, and the stop path
+                // sends whatever is still unsent.
+                let per_frame_cap = (handle.sample_rate() as usize).max(1) * 2 / quantum * quantum;
+                let target = acknowledged.min(self.stream_sent_samples + per_frame_cap);
+                if target > self.stream_sent_samples {
                     if let Ok(wav) = starling_dictation::audio::encode_wav_16k_parts(
-                        &self.streamed_samples[self.stream_sent_samples..acknowledged],
+                        &self.streamed_samples[self.stream_sent_samples..target],
                         handle.sample_rate(), 1
                     ) {
                         if stream.send_audio(wav) {
-                            self.stream_sent_samples = acknowledged;
-                        } else {
+                            self.stream_sent_samples = target;
+                        } else if stream.is_closed() {
                             stream_failed = true;
                         }
+                        // else: the bounded command channel is momentarily
+                        // full — backpressure, not death. The unsent span
+                        // stays and the next frame retries it.
                     } else {
                         stream_failed = true;
                     }
                 }
                 match stream.poll_partial() {
                     Ok(Some(text)) => self.live_partial = text,
-                    Err(_) => stream_failed = true,
+                    Err(reason) => {
+                        self.stream_degradation = Some(format!(
+                            "Live transcription stopped mid-recording ({reason}). The full \
+                             recording will still be transcribed after you stop."
+                        ));
+                        stream_failed = true;
+                    }
                     Ok(None) => {}
                 }
                 if stream_failed {

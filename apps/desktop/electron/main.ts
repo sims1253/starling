@@ -10,6 +10,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import { Data, Effect, Option, Schema } from "effect";
+import { DEFAULT_TRANSCRIPTION_MODEL } from "@starling/dictation";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -317,7 +318,10 @@ function healthProgram(input: HealthInput) {
     const response = yield* requestBody(`${base}/v1/models`, { method: "GET" }, timeoutMs);
     const models = yield* Schema.decodeUnknownEffect(OpenAiModelsJsonSchema)(response.body);
 
-    const result: Mutable<ServerHealth> = { status: "ok", phase: "ready", busy: false };
+    // busy/queueDepth stay absent rather than fabricated: the OpenAI
+    // models route cannot observe them, and the optional fields encode
+    // "unknown" honestly for the consumers that check them.
+    const result: Mutable<ServerHealth> = { status: "ok", phase: "ready" };
 
     if (models.data[0]) result.model = models.data[0].id;
 
@@ -339,7 +343,7 @@ function transcribeProgram(input: TranscribeInput) {
 
     const form = new FormData();
     form.append("file", new Blob([input.audio], { type: "audio/wav" }), "recording.wav");
-    form.append("model", input.model || "parakeet");
+    form.append("model", input.model || DEFAULT_TRANSCRIPTION_MODEL);
     form.append("response_format", "json");
 
     const response = yield* requestBody(
