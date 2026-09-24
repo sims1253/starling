@@ -58,6 +58,33 @@ const char* isa_name() {
 #endif
 }
 
+#if defined(STARLING_FAST_AVX2)
+STARLING_TARGET_AVX2 void quantize_avx2(const float* x, uint32_t K, QVec& out) {
+    const uint32_t G = K / 32;
+    out.q.resize(K);
+    out.s.resize(G);
+    for (uint32_t g = 0; g < G; ++g) {
+        const float* v = x + g * 32;
+        __m128 am = _mm_setzero_ps();
+        for (uint i = 0; i < 32; i += 4)
+            am = _mm_max_ps(am, _mm_andnot_ps(_mm_set1_ps(-0.0f), _mm_loadu_ps(v + i)));
+        am = _mm_max_ps(am, _mm_movehl_ps(am, am));
+        am = _mm_max_ss(am, _mm_movehdup_ps(am));
+        const float amax = _mm_cvtss_f32(am);
+        const float s = amax / 127.0f;
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        out.s[g] = s;
+        int8_t* q = out.q.data() + g * 32;
+        for (uint i = 0; i < 32; i += 8) {
+            const __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(v + i), _mm256_set1_ps(inv)));
+            const __m128i h = _mm_packs_epi32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
+            _mm_storel_epi64((__m128i*)(q + i), _mm_packs_epi16(h, h));
+        }
+    }
+}
+#endif
+
+
 void quantize(const float* x, uint32_t K, QVec& out) {
     const uint32_t G = K / 32;
     out.q.resize(K);
@@ -83,24 +110,9 @@ void quantize(const float* x, uint32_t K, QVec& out) {
         }
     }
 #elif defined(STARLING_FAST_AVX2)
-    for (uint32_t g = 0; g < G; ++g) {
-        const float* v = x + g * 32;
-        __m128 am = _mm_setzero_ps();
-        for (uint i = 0; i < 32; i += 4) am = _mm_max_ps(am, _mm_andnot_ps(_mm_set1_ps(-0.0f), _mm_loadu_ps(v + i)));
-        am = _mm_max_ps(am, _mm_movehl_ps(am, am));
-        am = _mm_max_ss(am, _mm_movehdup_ps(am));
-        const float amax = _mm_cvtss_f32(am);
-        const float s = amax / 127.0f;
-        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-        out.s[g] = s;
-        int8_t* q = out.q.data() + g * 32;
-        for (uint i = 0; i < 32; i += 8) {
-            const __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(v + i), _mm256_set1_ps(inv)));
-            const __m128i h = _mm_packs_epi32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
-            _mm_storel_epi64((__m128i*)(q + i), _mm_packs_epi16(h, h));
-        }
-    }
-#else
+    if (have_simd()) { quantize_avx2(x, K, out); return; }
+#endif
+#if defined(STARLING_FAST_AVX2)
     for (uint32_t g = 0; g < G; ++g) {
         const float* v = x + g * 32;
         float amax = 0.0f;
@@ -118,10 +130,12 @@ namespace {
 void cpu_relax() {
 #if defined(__aarch64__)
     asm volatile("yield" ::: "memory");
-#else
+#elif defined(STARLING_FAST_AVX2)
     _mm_pause();
+#else
 #endif
 }
+
 
 #if defined(STARLING_FAST_NEON_DOT)
 
