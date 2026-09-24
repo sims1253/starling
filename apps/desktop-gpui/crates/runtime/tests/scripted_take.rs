@@ -214,7 +214,7 @@ fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
     let source = FakeCaptureSource::new(vec![]);
     let store = InMemoryCaptureStore::new();
     let provider = starling_runtime::provider::FakeProvider::new(vec![
-        FakeJob::transforms_to("Hello, world."),
+        FakeJob::completes_with("Hello, world."),
     ]);
     let config = test_config(
         std::sync::Arc::clone(&source),
@@ -330,15 +330,14 @@ fn scripted_take_through_capture_jobs_docs_matches_an_i0_trace() {
         Step::Evt("capture.stopped", "take_77"),
     ]);
     // The dispatch chain is runtime-internal (the fixtures step over it
-    // with $advance directives); the scripted provider transformed, so the
-    // walk includes the Transforming edge the live scheduler took.
+    // with $advance directives). Recognition never passes through
+    // Transforming: processing is its own jobs.transform job (#294).
     replay_walk("jobs", &[
         Step::Cmd("jobs.submit", "job-1"),
         Step::Evt("jobs.queued", "job-1"),
         Step::Advance("Dispatched"),
         Step::Advance("Loading"),
         Step::Advance("Recognizing"),
-        Step::Advance("Transforming"),
         Step::Evt("jobs.completed", "job-1"),
     ]);
     replay_walk("docs", &[
@@ -928,7 +927,6 @@ fn worker_done_report_survives_a_full_inbox_and_releases_the_slot() {
             backend: "fake-provider".to_string(),
             timing_ms: 12.0,
             completion_evidence: "final_decode".to_string(),
-            transformed: false,
         },
         partials,
         work_ms: 5,

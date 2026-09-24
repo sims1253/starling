@@ -1,0 +1,270 @@
+{
+  "machine": "jobs",
+  "description": "Transform jobs (#294): job-t1 processes a take's text Queued -> Dispatched -> Loading -> Transforming (streaming its output as progress) -> Completed via jobs.transformed with the result; job-t2 retries it and fails with the provider's typed reason; job-t3 is cancelled while transforming. No transform job touches the raw recognition: jobs.transformed carries a proposal for the draft.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "ok",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_300",
+      "ts": "2026-09-24T10:00:00Z",
+      "corr": "job-t1",
+      "seq": 1,
+      "type": "jobs.transform",
+      "payload": {
+        "request": {
+          "schema_version": 1,
+          "request_id": "req-1",
+          "retry_of": null,
+          "draft_id": "draft-1",
+          "capture_id": "cap-1",
+          "base_revision": 1,
+          "source_attempt_ids": [
+            "att-1"
+          ],
+          "mode_id": "capture",
+          "mode_version": 1,
+          "prompt_version": null,
+          "kinds": [
+            "clean"
+          ],
+          "language": "en",
+          "input": "um so the meeting is at three",
+          "instruction": null,
+          "style": {
+            "formality": "semi-formal",
+            "structure": "prose",
+            "context": "general"
+          },
+          "context": {},
+          "provider": {
+            "id": "local-s1",
+            "kind": "s1",
+            "locality": "local",
+            "route": "local-authoring-default",
+            "model": "s1-mini",
+            "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "local_only": true,
+          "deadline_ms": 20000,
+          "max_output_chars": 4000
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_300",
+      "ts": "2026-09-24T10:00:00Z",
+      "corr": "job-t1",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
+    {
+      "$advance": "Transforming"
+    },
+    {
+      "v": 1,
+      "id": "evt_301",
+      "ts": "2026-09-24T10:00:00.3Z",
+      "corr": "job-t1",
+      "seq": 3,
+      "type": "jobs.progress",
+      "payload": {
+        "partial": "So the meeting",
+        "stabilityHint": "growing"
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_302",
+      "ts": "2026-09-24T10:00:00.6Z",
+      "corr": "job-t1",
+      "seq": 4,
+      "type": "jobs.transformed",
+      "payload": {
+        "result": {
+          "schema_version": 1,
+          "request_id": "req-1",
+          "base_revision": 1,
+          "status": "completed",
+          "text": "So the meeting is at three.",
+          "failure": null,
+          "provider": {
+            "id": "local-s1",
+            "kind": "s1",
+            "locality": "local",
+            "route": "local-authoring-default",
+            "model": "s1-mini",
+            "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "timing": {
+            "queued_ms": 1.5,
+            "processing_ms": 412.0,
+            "stop_to_result_ms": 655.25
+          }
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_301",
+      "ts": "2026-09-24T10:00:05Z",
+      "corr": "job-t2",
+      "seq": 1,
+      "type": "jobs.transform",
+      "payload": {
+        "request": {
+          "schema_version": 1,
+          "request_id": "req-2",
+          "retry_of": "req-1",
+          "draft_id": "draft-1",
+          "capture_id": "cap-1",
+          "base_revision": 1,
+          "source_attempt_ids": [
+            "att-1"
+          ],
+          "mode_id": "capture",
+          "mode_version": 1,
+          "prompt_version": null,
+          "kinds": [
+            "clean"
+          ],
+          "language": "en",
+          "input": "um so the meeting is at three",
+          "instruction": null,
+          "style": {
+            "formality": "semi-formal",
+            "structure": "prose",
+            "context": "general"
+          },
+          "context": {},
+          "provider": {
+            "id": "local-s1",
+            "kind": "s1",
+            "locality": "local",
+            "route": "local-authoring-default",
+            "model": "s1-mini",
+            "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "local_only": true,
+          "deadline_ms": 20000,
+          "max_output_chars": 4000
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_303",
+      "ts": "2026-09-24T10:00:05Z",
+      "corr": "job-t2",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
+    {
+      "$advance": "Transforming"
+    },
+    {
+      "v": 1,
+      "id": "evt_304",
+      "ts": "2026-09-24T10:00:06Z",
+      "corr": "job-t2",
+      "seq": 3,
+      "type": "jobs.failed",
+      "payload": {
+        "reason": "rate_limited",
+        "retryable": true
+      }
+    },
+    {
+      "v": 1,
+      "id": "cmd_302",
+      "ts": "2026-09-24T10:00:09Z",
+      "corr": "job-t3",
+      "seq": 1,
+      "type": "jobs.transform",
+      "payload": {
+        "request": {
+          "schema_version": 1,
+          "request_id": "req-3",
+          "retry_of": null,
+          "draft_id": "draft-1",
+          "capture_id": "cap-1",
+          "base_revision": 1,
+          "source_attempt_ids": [
+            "att-1"
+          ],
+          "mode_id": "capture",
+          "mode_version": 1,
+          "prompt_version": null,
+          "kinds": [
+            "clean"
+          ],
+          "language": "en",
+          "input": "um so the meeting is at three",
+          "instruction": null,
+          "style": {
+            "formality": "semi-formal",
+            "structure": "prose",
+            "context": "general"
+          },
+          "context": {},
+          "provider": {
+            "id": "local-s1",
+            "kind": "s1",
+            "locality": "local",
+            "route": "local-authoring-default",
+            "model": "s1-mini",
+            "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "local_only": true,
+          "deadline_ms": 20000,
+          "max_output_chars": 4000
+        }
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_305",
+      "ts": "2026-09-24T10:00:09Z",
+      "corr": "job-t3",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
+    {
+      "$advance": "Transforming"
+    },
+    {
+      "v": 1,
+      "id": "cmd_303",
+      "ts": "2026-09-24T10:00:10Z",
+      "corr": "job-t3",
+      "seq": 3,
+      "type": "jobs.cancel",
+      "payload": {
+        "jobId": "job-t3"
+      }
+    }
+  ]
+}

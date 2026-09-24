@@ -378,6 +378,9 @@ pub enum Rejection {
     RouteNotFrozen { route: String },
     /// The submit's `captureRef` names no take this runtime captured.
     UnknownCaptureRef { capture_ref: String },
+    /// A `jobs.transform` request is `local_only` but names a remote
+    /// provider (#294): refused before admission, nothing is sent.
+    RemoteForbidden { request_id: String },
     /// The named job is not active (already terminal or unknown).
     UnknownJob { job_id: String },
     /// The named revision does not exist (delivery.prepare).
@@ -404,6 +407,9 @@ impl std::fmt::Display for Rejection {
             }
             Rejection::PendingUnresolved { detail } => write!(f, "{detail}"),
             Rejection::SeqNotMonotonic { detail } => write!(f, "{detail}"),
+            Rejection::RemoteForbidden { request_id } => {
+                write!(f, "transform {request_id:?} is local-only but names a remote provider")
+            }
             Rejection::RouteNotFrozen { route } => {
                 write!(f, "route {route:?} was not frozen by an earlier mode.routeFrozen")
             }

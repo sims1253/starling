@@ -223,6 +223,15 @@ MACHINES: dict[str, dict[str, Any]] = {
                     "jobs.rejected": "Rejected",
                 },
             },
+            # A transform job (#294): same admission, runs
+            # Loading -> Transforming, ends with jobs.transformed.
+            "jobs.transform": {
+                "from": ["Idle", "Completed", "Failed", "Cancelled", "Rejected"],
+                "outcomes": {
+                    "jobs.queued": "Queued",
+                    "jobs.rejected": "Rejected",
+                },
+            },
             "jobs.cancel": {
                 "from": [
                     "Queued",
@@ -242,8 +251,14 @@ MACHINES: dict[str, dict[str, Any]] = {
                 "from": ["Loading", "Recognizing", "Transforming"],
                 "to": None,
             },
+            # Recognition completes with raw text only; processing is its
+            # own job and never rewrites a recognition result.
             "jobs.completed": {
-                "from": ["Recognizing", "Transforming"],
+                "from": ["Recognizing"],
+                "to": "Completed",
+            },
+            "jobs.transformed": {
+                "from": ["Transforming"],
                 "to": "Completed",
             },
             "jobs.failed": {
@@ -261,7 +276,7 @@ MACHINES: dict[str, dict[str, Any]] = {
             ["Queued", "Dispatched"],
             ["Dispatched", "Loading"],
             ["Loading", "Recognizing"],
-            ["Recognizing", "Transforming"],
+            ["Loading", "Transforming"],
         ],
     },
     "context": {

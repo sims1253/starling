@@ -224,6 +224,8 @@ impl ProfilesDocument {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    /// The deterministic step alone: no model call.
+    Builtin,
     S1,
     OpenaiCompatible,
     Anthropic,
@@ -233,6 +235,7 @@ pub enum ProviderKind {
 impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            ProviderKind::Builtin => "builtin",
             ProviderKind::S1 => "s1",
             ProviderKind::OpenaiCompatible => "openai_compatible",
             ProviderKind::Anthropic => "anthropic",
@@ -400,6 +403,16 @@ pub struct Failure {
     pub detail: String,
 }
 
+impl Failure {
+    pub fn new(reason: FailureReason, retryable: bool, detail: impl Into<String>) -> Failure {
+        Failure {
+            reason,
+            retryable,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Per-job latency; no text ever goes in here.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -489,6 +502,15 @@ pub fn validate_provider(provider: &ProviderDecl) -> Result<(), String> {
             "{}: rewrite/translate need instructions",
             provider.id
         ));
+    }
+    if (provider.kind == ProviderKind::Builtin) != provider.transform_kinds.is_empty() {
+        return Err(format!(
+            "{}: only the builtin provider runs no model kinds",
+            provider.id
+        ));
+    }
+    if provider.kind == ProviderKind::Builtin && provider.locality != Locality::Local {
+        return Err(format!("{}: the builtin step is local", provider.id));
     }
     if provider.locality == Locality::Remote && provider.artifact.is_some() {
         return Err(format!(

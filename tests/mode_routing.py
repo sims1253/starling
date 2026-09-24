@@ -401,6 +401,10 @@ def validate_provider(provider: dict[str, Any]) -> None:
         raise ValueError(f'{provider["id"]}: locality must match the route')
     if set(INSTRUCTION_KINDS) & set(provider['transform_kinds']) and not provider['instructions']:
         raise ValueError(f'{provider["id"]}: rewrite/translate need instructions')
+    if (provider['kind'] == 'builtin') != (not provider['transform_kinds']):
+        raise ValueError(f'{provider["id"]}: only the builtin provider runs no model kinds')
+    if provider['kind'] == 'builtin' and provider['locality'] != 'local':
+        raise ValueError(f'{provider["id"]}: the builtin step is local')
     if provider['locality'] == 'remote' and provider['artifact'] is not None:
         raise ValueError(f'{provider["id"]}: a remote provider has no local artifact')
 
@@ -469,12 +473,17 @@ def check_request(request: dict[str, Any], profile: dict[str, Any],
     expected_sha = provider['artifact']['sha256'] if provider['artifact'] else None
     if ref['artifact_sha256'] != expected_sha:
         found.append('provider artifact differs from the declaration')
-    route = processing_route(profile, [provider])
-    if route['status'] != 'ready':
-        found.append(f'mode cannot use this provider: {route["reason"]}')
-    for field in request['context']:
-        if field not in route['context_fields']:
-            found.append(f'context field {field} was not allowed to be sent')
+    if provider['kind'] == 'builtin':
+        # The deterministic step alone: no model kinds, nothing sent.
+        if request['kinds'] or request['context']:
+            found.append('the builtin provider runs no model and sends no context')
+    else:
+        route = processing_route(profile, [provider])
+        if route['status'] != 'ready':
+            found.append(f'mode cannot use this provider: {route["reason"]}')
+        for field in request['context']:
+            if field not in route['context_fields']:
+                found.append(f'context field {field} was not allowed to be sent')
     if request['instruction'] is not None and not set(INSTRUCTION_KINDS) & set(request['kinds']):
         found.append('only rewrite/translate may carry an instruction')
     if request['style'] != profile['style']:

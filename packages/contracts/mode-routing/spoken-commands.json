@@ -1,0 +1,226 @@
+{
+  "$comment": [
+    "Spoken punctuation and layout commands (#294), per language (BCP 47",
+    "primary subtag). A mode with spoken_commands true uses the table of its",
+    "language; an undeclared language (null) uses 'en'; a language without a",
+    "table gets no commands. Matching is whole-token and case-insensitive,",
+    "ignoring punctuation the recognizer attached to the command word",
+    "(,.;:!?); a quoted mention never matches. The literal word before a",
+    "command keeps the command as plain text ('literal new line').",
+    "Actions: punctuation attaches value to the previous word (replacing",
+    "punctuation the recognizer already put there); line_break and",
+    "paragraph insert a newline / blank line and drop the spaces around it;",
+    "bullet starts a '- ' list item on its own line.",
+    "Semantics: tests/spoken_commands.py; fixtures/spoken-commands.json."
+  ],
+  "schema_version": 1,
+  "languages": {
+    "en": {
+      "literal": "literal",
+      "commands": [
+        {
+          "phrase": "comma",
+          "action": "punctuation",
+          "value": ","
+        },
+        {
+          "phrase": "period",
+          "action": "punctuation",
+          "value": "."
+        },
+        {
+          "phrase": "full stop",
+          "action": "punctuation",
+          "value": "."
+        },
+        {
+          "phrase": "question mark",
+          "action": "punctuation",
+          "value": "?"
+        },
+        {
+          "phrase": "exclamation mark",
+          "action": "punctuation",
+          "value": "!"
+        },
+        {
+          "phrase": "exclamation point",
+          "action": "punctuation",
+          "value": "!"
+        },
+        {
+          "phrase": "colon",
+          "action": "punctuation",
+          "value": ":"
+        },
+        {
+          "phrase": "semicolon",
+          "action": "punctuation",
+          "value": ";"
+        },
+        {
+          "phrase": "new line",
+          "action": "line_break"
+        },
+        {
+          "phrase": "new paragraph",
+          "action": "paragraph"
+        },
+        {
+          "phrase": "bullet point",
+          "action": "bullet"
+        },
+        {
+          "phrase": "bullet",
+          "action": "bullet"
+        }
+      ]
+    },
+    "de": {
+      "literal": "wörtlich",
+      "commands": [
+        {
+          "phrase": "komma",
+          "action": "punctuation",
+          "value": ","
+        },
+        {
+          "phrase": "punkt",
+          "action": "punctuation",
+          "value": "."
+        },
+        {
+          "phrase": "fragezeichen",
+          "action": "punctuation",
+          "value": "?"
+        },
+        {
+          "phrase": "ausrufezeichen",
+          "action": "punctuation",
+          "value": "!"
+        },
+        {
+          "phrase": "doppelpunkt",
+          "action": "punctuation",
+          "value": ":"
+        },
+        {
+          "phrase": "semikolon",
+          "action": "punctuation",
+          "value": ";"
+        },
+        {
+          "phrase": "neue zeile",
+          "action": "line_break"
+        },
+        {
+          "phrase": "neuer absatz",
+          "action": "paragraph"
+        },
+        {
+          "phrase": "aufzählungspunkt",
+          "action": "bullet"
+        }
+      ]
+    },
+    "es": {
+      "literal": "literal",
+      "commands": [
+        {
+          "phrase": "coma",
+          "action": "punctuation",
+          "value": ","
+        },
+        {
+          "phrase": "punto",
+          "action": "punctuation",
+          "value": "."
+        },
+        {
+          "phrase": "signo de interrogación",
+          "action": "punctuation",
+          "value": "?"
+        },
+        {
+          "phrase": "signo de exclamación",
+          "action": "punctuation",
+          "value": "!"
+        },
+        {
+          "phrase": "dos puntos",
+          "action": "punctuation",
+          "value": ":"
+        },
+        {
+          "phrase": "punto y coma",
+          "action": "punctuation",
+          "value": ";"
+        },
+        {
+          "phrase": "nueva línea",
+          "action": "line_break"
+        },
+        {
+          "phrase": "nuevo párrafo",
+          "action": "paragraph"
+        },
+        {
+          "phrase": "viñeta",
+          "action": "bullet"
+        }
+      ]
+    },
+    "fr": {
+      "literal": "littéralement",
+      "commands": [
+        {
+          "phrase": "virgule",
+          "action": "punctuation",
+          "value": ","
+        },
+        {
+          "phrase": "point",
+          "action": "punctuation",
+          "value": "."
+        },
+        {
+          "phrase": "point d'interrogation",
+          "action": "punctuation",
+          "value": "?"
+        },
+        {
+          "phrase": "point d'exclamation",
+          "action": "punctuation",
+          "value": "!"
+        },
+        {
+          "phrase": "deux-points",
+          "action": "punctuation",
+          "value": ":"
+        },
+        {
+          "phrase": "deux points",
+          "action": "punctuation",
+          "value": ":"
+        },
+        {
+          "phrase": "point-virgule",
+          "action": "punctuation",
+          "value": ";"
+        },
+        {
+          "phrase": "nouvelle ligne",
+          "action": "line_break"
+        },
+        {
+          "phrase": "nouveau paragraphe",
+          "action": "paragraph"
+        },
+        {
+          "phrase": "puce",
+          "action": "bullet"
+        }
+      ]
+    }
+  }
+}

@@ -18,7 +18,9 @@
     "request with a remote provider is invalid.",
     "deadline_ms bounds the whole call; max_output_chars caps the output",
     "(an output over the cap is a truncated_output failure, never a",
-    "silently shortened text)."
+    "silently shortened text).",
+    "kinds is empty only for the builtin provider: the deterministic step",
+    "(spoken commands, snippets) with no model call."
   ],
   "type": "object",
   "additionalProperties": false,
@@ -99,7 +101,6 @@
     },
     "kinds": {
       "type": "array",
-      "minItems": 1,
       "items": {
         "enum": [
           "clean",
@@ -212,6 +213,7 @@
     },
     "providerKind": {
       "enum": [
+        "builtin",
         "s1",
         "openai_compatible",
         "anthropic",

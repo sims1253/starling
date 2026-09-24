@@ -18,8 +18,8 @@ through it.
 | File | Role |
 |---|---|
 | `envelope.schema.json` | The wire envelope every message shares (structure, version, NACK + seq rules in `$comment`). |
-| `commands.schema.json` | All 16 v1 commands, payload discriminated by `type`, `additionalProperties: false` everywhere. |
-| `events.schema.json` | All 22 v1 events (21 machine events + `runtime.nack`), same discipline. |
+| `commands.schema.json` | All 17 v1 commands, payload discriminated by `type`, `additionalProperties: false` everywhere. |
+| `events.schema.json` | All 23 v1 events (22 machine events + `runtime.nack`), same discipline. |
 | `fixtures/*.json` | Valid command→event traces, one set per machine, covering every state and transition named in §2. |
 | `fixtures/invalid/*.json` | Invalid cases: unknown version, non-monotonic `seq`, command/event illegal in the current state, unfrozen route. |
 
@@ -87,21 +87,31 @@ Draining never waits on inference (test-enforced).**
 
 ### jobs (scheduler; supervised workers)
 
-Per job: `Queued → Dispatched → Loading → Recognizing → [Transforming] →
-Completed | Failed | Cancelled`, plus `Rejected` at admission (queue full,
-resource limits, duplicate submission) and the scheduler's pre-job `Idle`.
+Per job: `Queued → Dispatched → Loading → Recognizing → Completed | Failed |
+Cancelled` for a recognition job, `Queued → Dispatched → Loading →
+Transforming → Completed | Failed | Cancelled` for a transform job (#294),
+plus `Rejected` at admission (queue full, resource limits, duplicate
+submission) and the scheduler's pre-job `Idle`.
 
-`jobs.submit{captureRef, route, budget}` is answered by exactly one of
-`jobs.queued` (→ `Queued`) or `jobs.rejected{reason}` (→ `Rejected`) on the
-same `corr`. `Dispatched/Loading/Recognizing/Transforming` are internal;
+`jobs.submit{captureRef, route, budget}` and `jobs.transform{request}` are
+each answered by exactly one of `jobs.queued` (→ `Queued`) or
+`jobs.rejected{reason}` (→ `Rejected`) on the same `corr`.
+`Dispatched/Loading/Recognizing/Transforming` are internal;
 `jobs.progress{partial, stabilityHint}` is legal from
 `Loading|Recognizing|Transforming` (stability reported independently of
-recording completeness); `jobs.completed` from `Recognizing|Transforming`;
-`jobs.failed{reason, retryable}` demotes from any active state (a crashed
-worker never touches capture or history); `jobs.cancel{jobId}` from any active
-state → `Cancelled` (no v1 event). `jobs.setLimits` (bounded queue, max
-concurrent, per-route caps) is legal in every state. Job identity in v1
-travels on the submit/queued `corr`.
+recording completeness; for a transform job the partial is streamed output);
+`jobs.completed` from `Recognizing` only and always carries raw recognition
+text; `jobs.transformed{result}` from `Transforming` only, carrying a
+completed transform result (a proposal for the take's draft, never a rewrite
+of the recognition); `jobs.failed{reason, retryable}` demotes from any active
+state (a crashed worker never touches capture or history; a failed provider
+call reports the result's typed failure reason); `jobs.cancel{jobId}` from
+any active state → `Cancelled` (no v1 event). `jobs.setLimits` (bounded
+queue, max concurrent, per-route caps) is legal in every state. Job identity
+in v1 travels on the submit/queued `corr`. The transform request is the
+mode-routing `transform-request.schema.json` record, embedded verbatim in
+`commands.schema.json` (and the result in `events.schema.json`); the tests
+assert the copies cannot drift.
 
 ### context / mode (context service)
 
@@ -192,7 +202,7 @@ short, v1 freezes the following choices (each is test-visible, none expands
    `deliveryId` (§2 lists it bare).
 2. Bookkeeping states not named in §2: jobs `Idle` (pre-admission), docs
    `Steady` (between head updates), delivery `Idle` (before prepare).
-3. Outcome-pending commands (`jobs.submit`, `context.snapshot`, `mode.set`,
+3. Outcome-pending commands (`jobs.submit`, `jobs.transform`, `context.snapshot`, `mode.set`,
    `docs.appendTurn`, `delivery.prepare`) resolve via exactly one correlated
    event; the event must carry the command's `corr`.
 4. `jobs.queued`/`jobs.rejected` payloads are `{}` per §2; job identity

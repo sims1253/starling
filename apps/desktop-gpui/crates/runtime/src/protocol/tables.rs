@@ -241,16 +241,23 @@ pub static JOBS: MachineSpec = MachineSpec {
                 to Some("Cancelled"),
             ),
         ),
+        (
+            "jobs.transform",
+            command!(
+                from only!("Idle", "Completed", "Failed", "Cancelled", "Rejected"),
+                outcomes &[("jobs.queued", Some("Queued")), ("jobs.rejected", Some("Rejected"))],
+            ),
+        ),
         ("jobs.setLimits", command!(from FromStates::Any)),
     ],
     events: &[
         ("jobs.queued", event!(from [], to Some("Queued"))),
         ("jobs.rejected", event!(from [], to Some("Rejected"))),
         ("jobs.progress", event!(from ["Loading", "Recognizing", "Transforming"])),
-        (
-            "jobs.completed",
-            event!(from ["Recognizing", "Transforming"], to Some("Completed")),
-        ),
+        // Recognition completes with raw text only; processing is its own
+        // job (#294) and never rewrites a recognition result.
+        ("jobs.completed", event!(from ["Recognizing"], to Some("Completed"))),
+        ("jobs.transformed", event!(from ["Transforming"], to Some("Completed"))),
         (
             "jobs.failed",
             event!(
@@ -263,7 +270,7 @@ pub static JOBS: MachineSpec = MachineSpec {
         ("Queued", "Dispatched"),
         ("Dispatched", "Loading"),
         ("Loading", "Recognizing"),
-        ("Recognizing", "Transforming"),
+        ("Loading", "Transforming"),
     ],
 };
 
@@ -486,6 +493,9 @@ mod tests {
                 route: "r".into(),
                 budget: "b".into(),
             },
+            Command::JobsTransform {
+                request: Box::new(transform_sample("jobs.transform", "request")),
+            },
             Command::JobsCancel { job_id: "j".into() },
             Command::JobsSetLimits(JobLimits {
                 max_queued: 1,
@@ -533,7 +543,7 @@ mod tests {
                 delivery_id: "d".into(),
             },
         ];
-        assert_eq!(samples.len(), 16, "all 16 v1 commands enumerated");
+        assert_eq!(samples.len(), 17, "all 17 v1 commands enumerated");
         for command in &samples {
             assert!(
                 typed_commands.insert(command.type_name()),
@@ -545,7 +555,7 @@ mod tests {
 
         let schema_events: std::collections::HashSet<&str> =
             all_event_types().into_iter().collect();
-        assert_eq!(schema_events.len(), 21, "21 machine event types");
+        assert_eq!(schema_events.len(), 22, "22 machine event types");
         // Every Event variant's type name must appear in the tables (the
         // reverse direction plus the count is checked in conformance.rs via
         // the fixtures).
@@ -591,6 +601,7 @@ mod tests {
                 timing: 0.0,
                 completion_evidence: "final_decode".into(),
             }),
+            Event::JobsTransformed(Box::new(transform_sample("jobs.transformed", "result"))),
             Event::JobsFailed {
                 reason: "r".into(),
                 retryable: false,
@@ -647,7 +658,7 @@ mod tests {
                 reason: crate::protocol::NackReason,
             },
         ];
-        assert_eq!(event_samples.len(), 22, "all 22 v1 events enumerated");
+        assert_eq!(event_samples.len(), 23, "all 23 v1 events enumerated");
         for event in &event_samples {
             let name = event.type_name();
             if name == "runtime.nack" {
@@ -656,6 +667,19 @@ mod tests {
                 assert!(schema_events.contains(name), "{name} missing from tables");
             }
         }
+    }
+
+    /// A transform request/result from the vendored transform fixture.
+    fn transform_sample<T: serde::de::DeserializeOwned>(message: &str, field: &str) -> T {
+        let trace: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/jobs-transform.json")).unwrap();
+        let envelope = trace["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["type"] == message)
+            .unwrap();
+        serde_json::from_value(envelope["payload"][field].clone()).unwrap()
     }
 
     /// The oracle's `test_capture_never_blocks_draining_on_jobs`.

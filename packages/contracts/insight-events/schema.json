@@ -10,23 +10,50 @@
     "resend a byte-identical payload under the same event_id; a differing",
     "payload under a known event_id is a conflict, not a harmless replay.",
     "Deletion: capture_deleted is a tombstone that dominates stale replays;",
-    "replayed pre-deletion events can never resurrect the capture's totals."
+    "replayed pre-deletion events can never resurrect the capture's totals.",
+    "processing_recorded (#294): one processing job's latency and outcome,",
+    "for #308/#226: provider kind and locality, status and typed failure",
+    "reason, how the result arrived against the draft (current, stale,",
+    "superseded, discarded), queue and processing time, stop-to-result time",
+    "(null when the stop time is unknown) and character counts. Never text."
   ],
   "oneOf": [
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version": { "const": 1 },
-        "event_id": { "$ref": "#/$defs/eventId" },
-        "capture_id": { "$ref": "#/$defs/eventId" },
-        "occurred_at": { "$ref": "#/$defs/timestamp" },
-        "type": { "const": "capture_finalized" },
-        "sample_count": { "type": "integer", "minimum": 0 },
-        "sample_rate": { "type": "integer", "minimum": 1 },
-        "complete_audio": { "type": "boolean" },
-        "mode_id": { "$ref": "#/$defs/safeToken" },
-        "reporting_timezone": { "$ref": "#/$defs/tzName" }
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "capture_finalized"
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sample_rate": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "complete_audio": {
+          "type": "boolean"
+        },
+        "mode_id": {
+          "$ref": "#/$defs/safeToken"
+        },
+        "reporting_timezone": {
+          "$ref": "#/$defs/tzName"
+        }
       },
       "required": [
         "schema_version",
@@ -45,17 +72,46 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version": { "const": 1 },
-        "event_id": { "$ref": "#/$defs/eventId" },
-        "capture_id": { "$ref": "#/$defs/eventId" },
-        "occurred_at": { "$ref": "#/$defs/timestamp" },
-        "type": { "const": "recognition_selected" },
-        "attempt_id": { "$ref": "#/$defs/eventId" },
-        "selection_seq": { "type": "integer", "minimum": 0 },
-        "lexical_words": { "type": "integer", "minimum": 0 },
-        "raw_words": { "type": "integer", "minimum": 0 },
-        "tokenizer": { "$ref": "#/$defs/safeToken" },
-        "post_stop_ready_ms": { "type": ["number", "null"], "minimum": 0 }
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "recognition_selected"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "selection_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lexical_words": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_words": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokenizer": {
+          "$ref": "#/$defs/safeToken"
+        },
+        "post_stop_ready_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
       },
       "required": [
         "schema_version",
@@ -75,13 +131,28 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version": { "const": 1 },
-        "event_id": { "$ref": "#/$defs/eventId" },
-        "capture_id": { "$ref": "#/$defs/eventId" },
-        "occurred_at": { "$ref": "#/$defs/timestamp" },
-        "type": { "const": "transformation_completed" },
-        "revision_id": { "$ref": "#/$defs/eventId" },
-        "revision_seq": { "type": "integer", "minimum": 0 },
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "transformation_completed"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "revision_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
         "transformation_kind": {
           "enum": [
             "model_authoring",
@@ -90,16 +161,33 @@
             "dictionary_substitution"
           ]
         },
-        "formula_version": { "const": 1 },
+        "formula_version": {
+          "const": 1
+        },
         "change_counts": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "structural": { "type": "integer", "minimum": 0 },
-            "user": { "type": "integer", "minimum": 0 },
-            "dictionary": { "type": "integer", "minimum": 0 },
-            "snippet": { "type": "integer", "minimum": 0 },
-            "style": { "type": "integer", "minimum": 0 }
+            "structural": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "user": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "dictionary": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "snippet": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "style": {
+              "type": "integer",
+              "minimum": 0
+            }
           },
           "required": [
             "structural",
@@ -127,13 +215,28 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version": { "const": 1 },
-        "event_id": { "$ref": "#/$defs/eventId" },
-        "capture_id": { "$ref": "#/$defs/eventId" },
-        "occurred_at": { "$ref": "#/$defs/timestamp" },
-        "type": { "const": "delivery_recorded" },
-        "delivery_id": { "$ref": "#/$defs/eventId" },
-        "delivery_seq": { "type": "integer", "minimum": 0 },
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "delivery_recorded"
+        },
+        "delivery_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "delivery_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
         "status": {
           "enum": [
             "confirmed",
@@ -143,8 +246,14 @@
             "cancelled"
           ]
         },
-        "output_words": { "type": "integer", "minimum": 0 },
-        "generated_words": { "type": "integer", "minimum": 0 }
+        "output_words": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generated_words": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "required": [
         "schema_version",
@@ -163,11 +272,161 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "schema_version": { "const": 1 },
-        "event_id": { "$ref": "#/$defs/eventId" },
-        "capture_id": { "$ref": "#/$defs/eventId" },
-        "occurred_at": { "$ref": "#/$defs/timestamp" },
-        "type": { "const": "capture_deleted" }
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "processing_recorded"
+        },
+        "job_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "mode_id": {
+          "$ref": "#/$defs/safeToken"
+        },
+        "mode_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "provider_kind": {
+          "enum": [
+            "builtin",
+            "s1",
+            "openai_compatible",
+            "anthropic",
+            "gemini"
+          ]
+        },
+        "locality": {
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "transform_kinds": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "clean",
+              "format",
+              "rewrite",
+              "translate"
+            ]
+          }
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "failure_reason": {
+          "enum": [
+            null,
+            "timeout",
+            "cancelled",
+            "transport_error",
+            "redirect_blocked",
+            "rate_limited",
+            "http_error",
+            "unknown_model",
+            "malformed_response",
+            "empty_output",
+            "truncated_output",
+            "unsupported_language",
+            "unsupported_kind",
+            "remote_forbidden",
+            "provider_unavailable",
+            "invalid_input"
+          ]
+        },
+        "arrival": {
+          "enum": [
+            "current",
+            "stale",
+            "superseded",
+            "discarded",
+            "not_applicable"
+          ]
+        },
+        "queued_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "processing_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "stop_to_result_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "input_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_chars": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "schema_version",
+        "event_id",
+        "capture_id",
+        "occurred_at",
+        "type",
+        "job_id",
+        "mode_id",
+        "mode_version",
+        "provider_kind",
+        "locality",
+        "transform_kinds",
+        "status",
+        "failure_reason",
+        "arrival",
+        "queued_ms",
+        "processing_ms",
+        "stop_to_result_ms",
+        "input_chars",
+        "output_chars"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "event_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "capture_id": {
+          "$ref": "#/$defs/eventId"
+        },
+        "occurred_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "type": {
+          "const": "capture_deleted"
+        }
       },
       "required": [
         "schema_version",

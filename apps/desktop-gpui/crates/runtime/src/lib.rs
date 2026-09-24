@@ -75,7 +75,7 @@ use machine::docs::{DocsActor, DocsMsg, DocumentStore, MemoryDocumentStore, Revi
 use machine::jobs::{JobsActor, JobsMsg, JobsSnapshot};
 use machine::{MachineView, Receipt, Rejection};
 use protocol::{Command, Event, JobLimits};
-use provider::TranscriptionProvider;
+use provider::{TranscriptionProvider, TransformProcessor};
 
 /// What the router thread accepts from clients.
 enum RouterMsg {
@@ -105,6 +105,11 @@ pub struct RuntimeConfig {
     /// The inference provider (production: [`provider::StarlingProvider`];
     /// tests: [`provider::FakeProvider`]).
     pub provider: Arc<dyn TranscriptionProvider>,
+    /// The processing seam for `jobs.transform` (#294) (production:
+    /// [`provider::PipelineProcessor`] over the configured providers;
+    /// tests: [`provider::FakeProcessor`]). The default fails every
+    /// transform honestly.
+    pub processor: Arc<dyn TransformProcessor>,
     /// The capture device source (production:
     /// [`machine::capture::DeviceCaptureSource`]).
     pub capture_source: Arc<dyn CaptureSource>,
@@ -139,6 +144,7 @@ impl Default for RuntimeConfig {
                 per_route: Vec::new(),
             },
             provider: Arc::new(provider::UnconfiguredProvider),
+            processor: Arc::new(provider::UnconfiguredProcessor),
             capture_source: Arc::new(DeviceCaptureSource),
             capture_store: InMemoryCaptureStore::new(),
             document_store: MemoryDocumentStore::new(),
@@ -152,6 +158,12 @@ impl RuntimeConfig {
     /// Overrides the inference provider.
     pub fn with_provider(mut self, provider: Arc<dyn TranscriptionProvider>) -> Self {
         self.provider = provider;
+        self
+    }
+
+    /// Overrides the processing seam for `jobs.transform` (#294).
+    pub fn with_processor(mut self, processor: Arc<dyn TransformProcessor>) -> Self {
+        self.processor = processor;
         self
     }
 
@@ -342,6 +354,7 @@ impl Runtime {
             Arc::clone(&bus),
             Arc::clone(&views.jobs),
             Arc::clone(&config.provider),
+            Arc::clone(&config.processor),
             Arc::clone(&registry),
             Arc::clone(&frozen_routes),
             config.jobs_limits.clone(),

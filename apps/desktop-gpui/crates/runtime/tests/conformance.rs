@@ -74,8 +74,8 @@ fn fixture_corpus_covers_all_machines() {
         machines,
         HashSet::from(["capture", "jobs", "context", "docs", "delivery"])
     );
-    assert_eq!(valid.len(), 10, "ten valid fixtures");
-    assert_eq!(invalid.len(), 9, "nine invalid fixtures");
+    assert_eq!(valid.len(), 11, "eleven valid fixtures");
+    assert_eq!(invalid.len(), 11, "eleven invalid fixtures");
 }
 
 // ------------------------------------------------------------------------- //

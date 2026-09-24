@@ -1,6 +1,6 @@
 {
   "machine": "jobs",
-  "description": "Failure and transform paths: job-4 runs the optional Transforming stage before Completed; job-5 is demoted to Failed{retryable} by a worker crash from Loading without touching capture or history.",
+  "description": "Failure paths: job-4 completes from Recognizing after a stable partial (recognition results carry raw text; processing is a separate jobs.transform job, see jobs-transform.json); job-5 is demoted to Failed{retryable} by a worker crash from Loading without touching capture or history.",
   "initial": "Idle",
   "schema_valid": true,
   "replay": "ok",
@@ -12,7 +12,11 @@
       "corr": "job-4",
       "seq": 1,
       "type": "jobs.submit",
-      "payload": { "captureRef": "take_77", "route": "local-default", "budget": "thorough" }
+      "payload": {
+        "captureRef": "take_77",
+        "route": "local-default",
+        "budget": "thorough"
+      }
     },
     {
       "v": 1,
@@ -23,10 +27,15 @@
       "type": "jobs.queued",
       "payload": {}
     },
-    { "$advance": "Dispatched" },
-    { "$advance": "Loading" },
-    { "$advance": "Recognizing" },
-    { "$advance": "Transforming" },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
+    {
+      "$advance": "Recognizing"
+    },
     {
       "v": 1,
       "id": "evt_111",
@@ -34,7 +43,10 @@
       "corr": "job-4",
       "seq": 3,
       "type": "jobs.progress",
-      "payload": { "partial": "Hello world.", "stabilityHint": "stable" }
+      "payload": {
+        "partial": "Hello world.",
+        "stabilityHint": "stable"
+      }
     },
     {
       "v": 1,
@@ -45,7 +57,7 @@
       "type": "jobs.completed",
       "payload": {
         "attemptId": "att-2",
-        "text": "Hello, world.",
+        "text": "Hello world.",
         "backend": "local-parakeet-tdt",
         "timing": 1030.0,
         "completionEvidence": "final_decode"
@@ -58,7 +70,11 @@
       "corr": "job-5",
       "seq": 1,
       "type": "jobs.submit",
-      "payload": { "captureRef": "take_78", "route": "local-default", "budget": "standard" }
+      "payload": {
+        "captureRef": "take_78",
+        "route": "local-default",
+        "budget": "standard"
+      }
     },
     {
       "v": 1,
@@ -69,8 +85,12 @@
       "type": "jobs.queued",
       "payload": {}
     },
-    { "$advance": "Dispatched" },
-    { "$advance": "Loading" },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
     {
       "v": 1,
       "id": "evt_114",
@@ -78,7 +98,10 @@
       "corr": "job-5",
       "seq": 3,
       "type": "jobs.failed",
-      "payload": { "reason": "worker_crash", "retryable": true }
+      "payload": {
+        "reason": "worker_crash",
+        "retryable": true
+      }
     }
   ]
 }

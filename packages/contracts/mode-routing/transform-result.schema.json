@@ -143,6 +143,7 @@
     },
     "providerKind": {
       "enum": [
+        "builtin",
         "s1",
         "openai_compatible",
         "anthropic",

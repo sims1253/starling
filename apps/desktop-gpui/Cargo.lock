@@ -5622,8 +5622,12 @@ dependencies = [
 name = "starling-processing"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
  "serde",
  "serde_json",
+ "starling-dictation",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -5633,6 +5637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "starling-dictation",
+ "starling-processing",
  "starling-runtime",
  "tempfile",
  "thiserror 2.0.20",
