@@ -33,7 +33,11 @@ VARIANTS = {
     "ggml": {"STARLING_ENGINE": "ggml"},
     "fast": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0"},
     "fast-f16": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "1"},
+    # W4 decode GEMVs through unpackUnorm4x8 (the PowerVR default).
+    "fast-w4u": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0", "STARLING_FAST_W4U": "1"},
+    "fast-w4": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0", "STARLING_FAST_W4U": "0"},
 }
+VARIANT_KEYS = sorted({k for env in VARIANTS.values() for k in env})
 
 
 def edit_distance(a: list[str], b: list[str]) -> int:
@@ -58,7 +62,7 @@ def main() -> int:
     ap.add_argument("--model", default="parakeet", choices=sorted(KINDS))
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--clips", required=True)
-    ap.add_argument("--variants", nargs="+", default=["ggml", "fast", "fast-f16"])
+    ap.add_argument("--variants", nargs="+", default=["ggml", "fast", "fast-f16"], choices=sorted(VARIANTS))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--show-diffs", action="store_true")
     a = ap.parse_args()
@@ -81,6 +85,10 @@ def main() -> int:
 
     outputs: dict[str, list[str]] = {}
     for v in a.variants:
+        # Each variant starts from a clean slate: keys set by an earlier
+        # variant must not leak into this one.
+        for k in VARIANT_KEYS:
+            os.environ.pop(k, None)
         for k, val in VARIANTS[v].items():
             os.environ[k] = val
         ctx = lib.starling_ggml_load(KINDS[a.model], a.gguf.encode())
@@ -109,13 +117,13 @@ def main() -> int:
             errs += edit_distance(r, h)
             words += len(r)
         outputs[v] = texts
-        base = outputs[a.variants[0]]
-        ndiff = sum(x != y for x, y in zip(base, texts))
+        base_name = next(iter(outputs))   # first variant that loaded
+        ndiff = sum(x != y for x, y in zip(outputs[base_name], texts))
         print(f"{v:9s} WER {100.0 * errs / max(words, 1):6.2f}%  time {dt:7.2f}s  "
-              f"RTF {dt / audio_s:.4f}  clips {len(clips)}  differ-from-{a.variants[0]} {ndiff}",
+              f"RTF {dt / audio_s:.4f}  clips {len(clips)}  differ-from-{base_name} {ndiff}",
               flush=True)
     if a.show_diffs and len(outputs) > 1:
-        base = outputs[a.variants[0]]
+        base = next(iter(outputs.values()))
         for v, texts in outputs.items():
             for (n, _), x, y in zip(clips, base, texts):
                 if x != y:

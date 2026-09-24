@@ -165,6 +165,13 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     } else if (!autotune(err)) {
         return false;
     }
+    // W4 GEMV nibble unpack through unpackUnorm4x8 (~5 ALU ops per 8
+    // weights instead of ~16). Decode GEMVs on PowerVR are issue-bound, not
+    // bandwidth-bound (W4 and W8 both run at ~33 G weights/s): MOSS decode
+    // -12.7 % on the Pixel 10 Pro. Slower on RADV (38 -> 31 GB/s isolated),
+    // so PowerVR only; STARLING_FAST_W4U=0/1 overrides.
+    w4_unpack_ = ctx.info().vendor_id == 0x1010;
+    if (const char* e = std::getenv("STARLING_FAST_W4U")) w4_unpack_ = e[0] == '1';
     // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
         if (!micro(mi, err)) return false;
@@ -287,7 +294,7 @@ uint32_t Kernels::gemv_rows(uint32_t N) {
 bool Kernels::gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y,
                    vk::Ref g, vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a,
                    std::string& err) {
-    const char* name = w.fmt == GpuFmt::W4 ? "gemv_w4" : w.fmt == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+    const char* name = w.fmt == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : w.fmt == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
     const uint32_t lanes = w.K / 32;      // one thread per 32-wide K group
     if (w.K % 32 || a.x_off % 4 || lanes > ctx_->info().max_wg_invocations || lanes > 1024) {
         err = "gemv: unsupported K / x offset";
@@ -486,7 +493,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
         !up32(x, xf.data(), k * 4) || !up32(y, y0.data(), n * 4))
         return false;
-    const char* name = bits == 4 ? "gemv_w4" : bits == 8 ? "gemv_w8" : "gemv_f16";
+    const char* name = bits == 4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : bits == 8 ? "gemv_w8" : "gemv_f16";
     const uint32_t lanes = k / 32;
     uint32_t rsplit = 1;
     {

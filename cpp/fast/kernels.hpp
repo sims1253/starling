@@ -154,6 +154,7 @@ public:
     vk::Ref or_dummy(const vk::Ref& r) const { return r.buf ? r : vk::Ref(dummy_); }
     TileCfg tile;
     bool f16_math = false;
+    bool w4_unpack_ = false;    // W4 GEMV via unpackUnorm4x8 (gemv_w4u)
     bool tile_pinned_ = false;  // STARLING_FAST_TILE given: no per-op tile heuristics
     bool rsplit_on_ = true;  // RSPLIT row slots to pad GEMV workgroups
 
