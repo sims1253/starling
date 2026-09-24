@@ -1726,14 +1726,16 @@ impl Render for StarlingApp {
                 let quantum = crate::live_stream::exact_input_quantum(handle.sample_rate());
                 let acknowledged = (handle.acknowledged_samples() as usize)
                     .min(self.streamed_samples.len()) / quantum * quantum;
-                // Bound each frame's encode to ~2 s of audio. In steady
-                // state the delta is a few frames' worth, but a stall (an
-                // occluded window pausing renders, a slow journal flush)
-                // can accumulate a large acknowledged span; catching up in
-                // a single frame would encode that span on the UI thread.
-                // The residue goes out on later frames, and the stop path
-                // sends whatever is still unsent.
-                let per_frame_cap = (handle.sample_rate() as usize).max(1) * 2 / quantum * quantum;
+                // Bound each frame's encode to ~250 ms of audio (~sub-
+                // millisecond of encode work). In steady state the delta
+                // is a few frames' worth, but a stall (an occluded window
+                // pausing renders, a slow journal flush) can accumulate a
+                // large acknowledged span; catching up in a single frame
+                // would encode that span on the UI thread. The residue
+                // goes out on later frames, and the stop path sends
+                // whatever is still unsent.
+                let per_frame_cap =
+                    (handle.sample_rate() as usize).max(1) / 4 / quantum * quantum;
                 let target = acknowledged.min(self.stream_sent_samples + per_frame_cap);
                 if target > self.stream_sent_samples {
                     if let Ok(wav) = starling_dictation::audio::encode_wav_16k_parts(
@@ -1743,12 +1745,23 @@ impl Render for StarlingApp {
                         if stream.send_audio(wav) {
                             self.stream_sent_samples = target;
                         } else if stream.is_closed() {
+                            self.stream_degradation = Some(
+                                "Live transcription stopped mid-recording (stream closed). \
+                                 The full recording will still be transcribed after you stop."
+                                    .to_string(),
+                            );
                             stream_failed = true;
                         }
                         // else: the bounded command channel is momentarily
                         // full — backpressure, not death. The unsent span
                         // stays and the next frame retries it.
                     } else {
+                        self.stream_degradation = Some(
+                            "Live transcription stopped mid-recording (audio could not be \
+                             encoded for streaming). The full recording will still be \
+                             transcribed after you stop."
+                                .to_string(),
+                        );
                         stream_failed = true;
                     }
                 }

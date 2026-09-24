@@ -202,6 +202,12 @@ impl StarlingApp {
                     // tail) — the same units the render loop advanced it
                     // in, so the remainder slice below lines up exactly.
                     take.audio.samples.splice(0..0, streamed_samples);
+                    // Streaming requires a finalized, fault-free journal:
+                    // production captures always journal (see the start
+                    // branch), so a missing or faulted report means the
+                    // durable copy cannot be trusted to match what the
+                    // stream already sent — the take must not commit a
+                    // stream result over it.
                     if !matches!(take.journal.as_ref(), Some(report) if report.finalized && report.fault.is_none()) {
                         stream = None;
                     }
@@ -325,11 +331,22 @@ impl StarlingApp {
             // acknowledged (see recorder::start_recording_with_journal).
             match recorder::start_recording_with_journal(&journal::default_journals_root()) {
                 Ok(handle) => {
-                    self.live_stream = LiveStream::start(&self.endpoint).ok();
                     self.live_partial.clear();
                     self.streamed_samples.clear();
                     self.stream_sent_samples = 0;
                     self.stream_degradation = None;
+                    // A URL-shape failure is deterministic, so it gets the
+                    // same visible degradation note as a mid-recording
+                    // death instead of a silent `.ok()` downgrade.
+                    match LiveStream::start(&self.endpoint) {
+                        Ok(stream) => self.live_stream = Some(stream),
+                        Err(reason) => {
+                            self.stream_degradation = Some(format!(
+                                "Live transcription is unavailable ({reason}); the recording \
+                                 will be uploaded in full after you stop."
+                            ));
+                        }
+                    }
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
@@ -523,7 +540,11 @@ impl StarlingApp {
                             // stream-mode regressions undiagnosable.
                             let mut stream_failure = None;
                             if let Some(stream) = stream {
-                                if stream.commit() {
+                                // Guarding on is_closed first collapses the
+                                // dead-stream case to an immediate failure
+                                // instead of a commit that can only time
+                                // out into the fallback.
+                                if !stream.is_closed() && stream.commit() {
                                     match stream.final_result() {
                                         Ok(result) => return Ok(result),
                                         Err(err) => stream_failure = Some(err),

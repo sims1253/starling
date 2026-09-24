@@ -35,6 +35,9 @@ pub(crate) fn stream_url(endpoint: &str) -> Result<String, String> {
     let rest = rest
         .strip_suffix("/v1/audio/transcriptions")
         .or_else(|| rest.strip_suffix("/v1"))
+        // An endpoint pasted with the stream route itself still lands on
+        // /stream once, not /stream/stream.
+        .or_else(|| rest.strip_suffix("/stream"))
         .unwrap_or(rest);
     Ok(format!("{scheme}{rest}/stream"))
 }
@@ -180,7 +183,14 @@ fn parse_message(text: &str) -> Option<Event> {
                 .to_string(),
         )),
         Some("final") => {
-            let text = payload.get("text")?.as_str()?.to_string();
+            // A final whose text is missing or not a string is a broken
+            // terminal frame: error immediately so the caller falls back
+            // to the batch upload instead of waiting out the whole
+            // deadline for a final that already came and went.
+            let Some(text) = payload.get("text").and_then(Value::as_str) else {
+                return Some(Event::Error("final frame missing text".into()));
+            };
+            let text = text.to_string();
             // Segments are permissive: one malformed segment entry must not
             // discard an otherwise complete transcript — the top-level text
             // is the source of truth and bad segment rows are skipped.
