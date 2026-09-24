@@ -142,6 +142,11 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // device has shaderFloat16: same FLEURS WER as f32 on both models.
     // STARLING_FAST_F16=0 forces f32 products.
     f16_math = ctx.info().f16;
+    // PowerVR (DXT): f32 products measured faster than the packed-f16 path
+    // (the unpack/pack around every product costs more than full-rate f32
+    // FMAs save) — Pixel 10 Pro encoder 2246 vs 2315 ms. f32 is also the
+    // numerically larger path, so quality gates are unaffected.
+    if (ctx.info().vendor_id == 0x1010) f16_math = false;
     if (const char* e = std::getenv("STARLING_FAST_F16")) f16_math = ctx.info().f16 && e[0] == '1';
     if (!autotune(err)) return false;
     // Imagination (PowerVR): the synthetic ranking does not transfer to the
