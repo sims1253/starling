@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -83,6 +84,25 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
     std::vector<float> bank_t(M * B);
     for (size_t m = 0; m < M; ++m)
         for (size_t b = 0; b < B; ++b) bank_t[m * B + b] = bank[b * M + m];
+    // Triangular mel filters are mostly zeros: each row touches a contiguous
+    // bin range. Skipping the zero terms is bit-exact (all products are >= +0
+    // and x + 0.0 == x) and cuts the filterbank loop ~3x.
+    std::vector<uint32_t> fb_lo(M, 0), fb_hi(M, 0);
+    for (size_t m = 0; m < M; ++m) {
+        const float* row = &bank_t[m * B];
+        uint32_t lo = (uint32_t)B, hi = 0;
+        for (uint32_t b = 0; b < B; ++b)
+            if (row[b] != 0.0f) { lo = std::min(lo, b); hi = b + 1; }
+        fb_lo[m] = lo < hi ? lo : 0;
+        fb_hi[m] = hi;
+    }
+    const bool mel_timing = std::getenv("STARLING_MEL_TIMING") != nullptr;
+    auto mtnow = [] { return std::chrono::steady_clock::now(); };
+    auto mtms = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+    auto t_l1 = mtnow();
     // Loop 1: per frame reflect-pad + window + r2c FFT + power.
     parallel_for(nthr, fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
         std::vector<double> frame(N);
@@ -105,17 +125,21 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
             }
         }
     });
-    // Loop 2: mel filterbank.
+    const double ms1 = mtms(t_l1);
+    auto t_l2 = mtnow();
+    // Loop 2: mel filterbank (nonzero bin range only — see fb_lo/fb_hi).
     parallel_for(nthr, M * fullT, [&](size_t /*tid*/, size_t lo, size_t hi) {
         for (size_t idx = lo; idx < hi; ++idx) {
             const size_t m = idx / fullT, t = idx % fullT;
             double a = 0;
             const float* fb = &bank_t[m * B];
             const double* pw = &powers[t * B];
-            for (size_t b = 0; b < B; ++b) a += (double) fb[b] * pw[b];
+            for (size_t b = fb_lo[m]; b < fb_hi[m]; ++b) a += (double) fb[b] * pw[b];
             mel64[m * fullT + t] = a;
         }
     });
+    const double ms2 = mtms(t_l2);
+    auto t_l3 = mtnow();
     // Loop 3a: log10 + per-chunk max for a deterministic global-max reduction.
     // MAX_ALL_FRAMES: flat split over all M*fullT entries (moss/ark).
     // MAX_KEPT_FRAMES: per-m split over the KEPT frames [0, T) only, matching
@@ -192,6 +216,9 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
             }
         }
     }
+    if (mel_timing)
+        std::fprintf(stderr, "[mel] fft=%.1f ms, filterbank=%.1f ms, log+norm=%.1f ms (nthr=%zu fullT=%zu)\n",
+                     ms1, ms2, mtms(t_l3), nthr, fullT);
     return true;
 }
 

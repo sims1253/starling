@@ -1,5 +1,8 @@
 # Native ggml engines
 
+> Parakeet and MOSS also have model-specialized Vulkan engines; see
+> [fast engines](fast-engine.md).
+
 The native engines load GGUF models through the shared `libstarling_ggml` C API.
 They support Parakeet, MOSS, ARK, Higgs, Hojo, Granite, Qwen3, S1, and Audex.
 Backend availability depends on the build; see the [benchmarks](benchmarks.md) for measured

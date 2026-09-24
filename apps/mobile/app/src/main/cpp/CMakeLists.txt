@@ -40,6 +40,14 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_CPU_ARM_ARCH "${STARLING_ANDROID_ARM_ARCH}" CACHE STRING "" FORCE)
 endif()
 
+# Model-specialized Vulkan fast engine (cpp/fast): selected automatically at
+# load time when the phone has a Vulkan GPU and the model file is supported
+# (STARLING_ENGINE=auto); otherwise the ggml CPU engine runs as before.
+# libvulkan is loaded at run time, and shaders compile with the NDK's glslc.
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(STARLING_FAST ON CACHE BOOL "" FORCE)
+endif()
+
 add_subdirectory(${STARLING_NATIVE_DIR} starling_native)
 
 add_library(starling_jni SHARED starling_jni.cpp)

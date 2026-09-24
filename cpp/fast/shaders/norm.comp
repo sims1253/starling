@@ -1,0 +1,122 @@
+#version 450
+// norm.comp — row normalization, one workgroup per row.
+//
+// MODE 0: out_f16 = LN(x)·g + b
+// MODE 1: x = LN1(x)·g + b (f32, in place);  out_f16 = LN2(x)·g2 + b2
+//         (a layer's closing norm_out fused with the next layer's first norm)
+// MODE 2: out_f16 = RMS(x)·g
+// MODE 3: x = LN(x)·g + b (f32, in place only)
+// MODE 4: out_f32 = RMS(x)·g  (written to the f32 view of `out`)
+//
+// LayerNorm statistics are two-pass (mean, then centered variance) in f32,
+// matching torch/ggml. Each thread owns element pairs so f16 stores are whole
+// words.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint MODE = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer G { float g[]; };
+layout(std430, binding = 2) readonly buffer B { float b[]; };
+layout(std430, binding = 3) readonly buffer G2 { float g2[]; };
+layout(std430, binding = 4) readonly buffer B2 { float b2[]; };
+layout(std430, binding = 5) buffer O { uint o[]; };
+
+layout(push_constant) uniform PC {
+    uint D;          // row length (even, <= 16 * WG)
+    uint ld_x;       // f32 row stride of x
+    uint ld_o;       // row stride of out (elements)
+    uint x_off, o_off;
+    float eps, eps2;
+} p;
+
+shared float red[WG];
+
+float block_sum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = WG / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+const uint MAXP = 8;   // pairs per thread
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x;
+    const uint xb = p.x_off + row * p.ld_x;
+    const uint ob = p.o_off + row * p.ld_o;
+    const uint npairs = p.D / 2;
+
+    vec2 v[MAXP];
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        v[j] = q < npairs ? vec2(x[xb + 2 * q], x[xb + 2 * q + 1]) : vec2(0.0);
+    }
+
+    if (MODE == 2u || MODE == 4u) {
+        float ss = 0.0;
+        [[unroll]] for (uint j = 0; j < MAXP; ++j) ss += dot(v[j], v[j]);
+        const float rs = inversesqrt(block_sum(ss) / float(p.D) + p.eps);
+        [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+            const uint q = tid + j * WG;
+            if (q < npairs) {
+                const vec2 y = v[j] * rs * vec2(g[2 * q], g[2 * q + 1]);
+                if (MODE == 2u) o[(ob >> 1) + q] = packHalf2x16(y);
+                else { o[ob + 2 * q] = floatBitsToUint(y.x); o[ob + 2 * q + 1] = floatBitsToUint(y.y); }
+            }
+        }
+        return;
+    }
+
+    float s = 0.0;
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) s += v[j].x + v[j].y;
+    float mean = block_sum(s) / float(p.D);
+    float ss = 0.0;
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        if (q < npairs) { const vec2 d = v[j] - mean; ss += dot(d, d); }
+    }
+    float rs = inversesqrt(block_sum(ss) / float(p.D) + p.eps);
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        if (q < npairs) v[j] = (v[j] - mean) * rs * vec2(g[2 * q], g[2 * q + 1]) + vec2(b[2 * q], b[2 * q + 1]);
+    }
+    if (MODE == 0u) {
+        [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+            const uint q = tid + j * WG;
+            if (q < npairs) o[(ob >> 1) + q] = packHalf2x16(v[j]);
+        }
+        return;
+    }
+    // MODE 1 / 3: write the normalized f32 row back.
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        if (q < npairs) { x[xb + 2 * q] = v[j].x; x[xb + 2 * q + 1] = v[j].y; }
+    }
+    if (MODE == 3u) return;
+    s = 0.0;
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) s += v[j].x + v[j].y;
+    mean = block_sum(s) / float(p.D);
+    ss = 0.0;
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        if (q < npairs) { const vec2 d = v[j] - mean; ss += dot(d, d); }
+    }
+    rs = inversesqrt(block_sum(ss) / float(p.D) + p.eps2);
+    [[unroll]] for (uint j = 0; j < MAXP; ++j) {
+        const uint q = tid + j * WG;
+        if (q < npairs)
+            o[(ob >> 1) + q] = packHalf2x16((v[j] - mean) * rs * vec2(g2[2 * q], g2[2 * q + 1]) +
+                                            vec2(b2[2 * q], b2[2 * q + 1]));
+    }
+}

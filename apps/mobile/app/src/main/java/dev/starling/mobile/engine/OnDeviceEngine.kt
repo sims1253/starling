@@ -263,6 +263,7 @@ class OnDeviceEngine(
             return "The on-device model was not loaded: $reason"
         }
         NativeSupport.applyThreadDefault()
+        NativeSupport.applyFastEngineDefaults(modelFile.parentFile)
         val abi = StarlingNative.abiVersion()
         if (abi != StarlingNative.EXPECTED_ABI_VERSION) {
             loadError = "engine ABI $abi, expected ${StarlingNative.EXPECTED_ABI_VERSION}"

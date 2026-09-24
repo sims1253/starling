@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// alu_probe.comp — pure f32 FMA issue-rate probe (no memory traffic).
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer Out { float o[]; };
+layout(push_constant) uniform PC { uint iters; } p;
+void main() {
+    float a0 = float(gl_LocalInvocationID.x) * 1e-6 + 1.0;
+    float b0 = 1.0000001;
+    float acc[32];
+    [[unroll]] for (uint i = 0; i < 32; ++i) acc[i] = a0 + float(i);
+    for (uint it = 0; it < p.iters; ++it) {
+        [[unroll]] for (uint i = 0; i < 32; ++i) acc[i] = fma(acc[i], b0, a0);
+    }
+    float s = 0.0;
+    [[unroll]] for (uint i = 0; i < 32; ++i) s += acc[i];
+    o[gl_GlobalInvocationID.x] = s;
+}

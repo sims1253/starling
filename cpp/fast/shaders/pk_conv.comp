@@ -1,0 +1,104 @@
+#version 450
+// pk_conv.comp — Parakeet (FastConformer) convolution kernels. Each thread
+// produces two adjacent channels (one packed f16 word).
+//
+// OP 0  subsampling stage 1: Conv2d(1 -> C, 3x3, stride 2, pad 1) + bias +
+//       ReLU. in: mel f32 [T][F] (time-major); w f32 [C][kh][kw];
+//       out f16 [T1][F1][C].
+// OP 1  subsampling depthwise Conv2d(C, 3x3, stride 2, pad 1, groups=C) +
+//       bias. in f16 [Ti][Fi][C]; w f32 [C][kh][kw]; out f16 [To][Fo][C].
+// OP 2  conformer depthwise Conv1d over time (kernel K, pad (K-1)/2) with
+//       the batch-norm fold and SiLU: out = silu(conv·scale + shift).
+//       in f16 [T][C]; w f32 [K][C]; scale/shift f32 [C]; out f16 [T][C].
+//
+// OP 3  MOSS encoder stage 1: Conv2d(1 -> C, 3x3, stride 2, pad 1) + bias +
+//       exact GELU per 100-frame chunk. in: f32 [chunk][F][Ti] (mel chunks,
+//       time fastest); w f32 [C][kf][kt]; out f16 [chunk][To][Fo][C].
+//
+// Kernel axes follow ggml's conv_2d: for Parakeet (time-major input) kw runs
+// along frequency and kh along time; MOSS feeds [time, freq] so there kw is
+// time and kh frequency.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WG = 64;
+layout(constant_id = 1) const uint OP = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer I { uint in_w[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) readonly buffer SH { float shift[]; };
+layout(std430, binding = 4) buffer O { uint o[]; };
+
+layout(push_constant) uniform PC {
+    uint C;            // channels (even)
+    uint Ti, Fi;       // input time / freq extents
+    uint To, Fo;       // output extents
+    uint K;            // OP 2 kernel size
+} p;
+
+float in_f16(uint idx) { return unpackHalf2x16(in_w[idx >> 1])[idx & 1u]; }
+
+void main() {
+    const uint cp = gl_GlobalInvocationID.x;   // channel pair
+    if (2u * cp >= p.C) return;
+    const uint c = 2u * cp;
+    if (OP == 0u) {
+        const uint f = gl_WorkGroupID.y, t = gl_WorkGroupID.z;
+        vec2 acc = vec2(bias[c], bias[c + 1]);
+        [[unroll]] for (uint kh = 0; kh < 3; ++kh) {
+            const int ti = int(2 * t + kh) - 1;
+            if (ti < 0 || ti >= int(p.Ti)) continue;
+            [[unroll]] for (uint kw = 0; kw < 3; ++kw) {
+                const int fi = int(2 * f + kw) - 1;
+                if (fi < 0 || fi >= int(p.Fi)) continue;
+                const float xv = uintBitsToFloat(in_w[uint(ti) * p.Fi + uint(fi)]);
+                acc += xv * vec2(w[c * 9 + kh * 3 + kw], w[(c + 1) * 9 + kh * 3 + kw]);
+            }
+        }
+        o[((t * p.Fo + f) * p.C + c) >> 1] = packHalf2x16(max(acc, vec2(0.0)));
+    } else if (OP == 1u) {
+        const uint f = gl_WorkGroupID.y, t = gl_WorkGroupID.z;
+        vec2 acc = vec2(bias[c], bias[c + 1]);
+        [[unroll]] for (uint kh = 0; kh < 3; ++kh) {
+            const int ti = int(2 * t + kh) - 1;
+            if (ti < 0 || ti >= int(p.Ti)) continue;
+            [[unroll]] for (uint kw = 0; kw < 3; ++kw) {
+                const int fi = int(2 * f + kw) - 1;
+                if (fi < 0 || fi >= int(p.Fi)) continue;
+                const vec2 xv = unpackHalf2x16(in_w[((uint(ti) * p.Fi + uint(fi)) * p.C + c) >> 1]);
+                acc += xv * vec2(w[c * 9 + kh * 3 + kw], w[(c + 1) * 9 + kh * 3 + kw]);
+            }
+        }
+        o[((t * p.Fo + f) * p.C + c) >> 1] = packHalf2x16(acc);
+    } else if (OP == 3u) {
+        const uint f = gl_WorkGroupID.y;
+        const uint chunk = gl_WorkGroupID.z / p.To, t = gl_WorkGroupID.z % p.To;
+        vec2 acc = vec2(bias[c], bias[c + 1]);
+        [[unroll]] for (uint kf = 0; kf < 3; ++kf) {
+            const int fi = int(2 * f + kf) - 1;
+            if (fi < 0 || fi >= int(p.Fi)) continue;
+            [[unroll]] for (uint kt = 0; kt < 3; ++kt) {
+                const int ti = int(2 * t + kt) - 1;
+                if (ti < 0 || ti >= int(p.Ti)) continue;
+                const float xv = uintBitsToFloat(in_w[(chunk * p.Fi + uint(fi)) * p.Ti + uint(ti)]);
+                acc += xv * vec2(w[c * 9 + kf * 3 + kt], w[(c + 1) * 9 + kf * 3 + kt]);
+            }
+        }
+        o[(((chunk * p.To + t) * p.Fo + f) * p.C + c) >> 1] =
+            packHalf2x16(vec2(gelu_erf_f(acc.x), gelu_erf_f(acc.y)));
+    } else {
+        const uint t = gl_WorkGroupID.y;
+        const int pad = int(p.K - 1u) / 2;
+        vec2 acc = vec2(0.0);
+        for (uint k = 0; k < p.K; ++k) {
+            const int ti = int(t + k) - pad;
+            if (ti < 0 || ti >= int(p.Ti)) continue;
+            const vec2 xv = unpackHalf2x16(in_w[(uint(ti) * p.C + c) >> 1]);
+            acc += xv * vec2(w[k * p.C + c], w[k * p.C + c + 1]);
+        }
+        const vec2 y = acc * vec2(bias[c], bias[c + 1]) + vec2(shift[c], shift[c + 1]);
+        o[(t * p.C + c) >> 1] = packHalf2x16(vec2(silu_f(y.x), silu_f(y.y)));
+    }
+}

@@ -1,0 +1,55 @@
+# Fast-engine research log (Pixel 10 Pro)
+
+Baseline: branch head `94230cf`. Workload: `starling-bench` on the phone,
+`STARLING_ENGINE=fast`, median of 3 runs after warm-up (`pixel_measure.sh`;
+`phone_ab.sh` for alternating A/B).
+Gates: fixture transcripts identical (G1), FLEURS WER within 0.2 pts (G2, at
+milestones), `fast_weights_test` (G3), desktop RADV ≤ 10 % regression (G4).
+
+| # | Hypothesis | Change | Before → after (median) | Gates | Verdict |
+|---|---|---|---|---|---|
+| 0 | Baseline | — | PK medium 2886 ms (mel 26, enc 2612, dec 248); MOSS short 7183 ms (enc+prefill 3675, decode 3280 @102.5 ms/tok); phone_ms 10069 | G1 captured | — |
+| 1 | Autotuner mis-ranks tiles on PowerVR (synthetic shapes unrepresentative) | env sweep first: TILE 32,64,4,4 → PK 2907→2526 (−13 %); GEMV rows 8 already best (4/16/32/64/128 worse) | — | — | measured, see #2 |
+| 2 | Same, structural | Added candidates {32,64,4,4},{48,64,4,4}; tune recording now barriers after every kernel + norm interleave; M 256→293; **vendor 0x1010 default tile 32,64,4,4 + gemv rows 8** (tuner kept for other vendors) | phone_ms 10069 → **9363** (PK 2886→2529, enc 2612→2288; MOSS 7183→6834, decode 99.2 ms/tok) | G1 ✓ | **keep** (`91dd41f`) |
+
+Notes:
+- Tuner on-device picks by isolated synthetic recordings: 3 attempts to make
+  it representative (barriers, norms, odd M) all still rated 64,32,4,4 ≥
+  32,64,4,4 while reality differs ~2×. Per-dispatch tuning on PowerVR is
+  dominated by fixed overheads; end-to-end wall time is the only trustworthy
+  signal → vendor-keyed measured defaults.
+| 6 | GEMV workgroups with lanes=K/32<128 threads waste PowerVR issue slots (subgroup=128) | RSPLIT row slots pad the workgroup to a full subgroup (wg=lanes×RSPLIT); two-stage tree reduction kept | W4 K=1024 GEMV 7.0→13.6 GB/s isolated (CPU-ref checked, rel err 0); MOSS decode 3203→3060ms (95.6ms/tok); phone_ms 9285→9151 | G1 ✓ | **keep** (`4388153`) |
+| 7 | Milestone gates | desktop RADV: PK medium 429ms (was 522), MOSS short 1759ms (was 1820) — no regression, faster; fast_weights_test all pass; STARLING_FAST=OFF builds; FLEURS en_us 100: PK fast 5.33% vs ggml 5.47%, MOSS q4e8 fast 7.87% vs 7.92%, MOSS q4e4 fast 8.06% (+0.14, inside gate, −7% decode) | — | G1-G4 ✓ | milestone |
+| 8 | GEMM tile landscape after ALU probe (peak ~500 GFLOPS vs 155 achieved) | swept wg=128-compatible configs | 32,128,4,8 best: 1992-2033ms enc (vs 2242) — full subgroup + BN=128 halves weight re-reads; vendor default updated | G1 ✓ | **keep** (`4fd9045`) |
+| 9 | Shared-tile double buffering hides load latency | two-buffer A/B tiles | PK enc 2029→3118ms — **54% worse**: doubled shared halves occupancy; reverted | — | discard (occupancy > latency hiding on PowerVR) |
+| 10 | PK decoder single-threaded (0.9ms/step, ~30× above ALU floor) | NEON/AVX2 quantize; `cpu::GemvHelper` persistent spin worker, row-split GEMVs (>1M MACs); decode-stage timing env | decode split: joint 106→57-67ms, pred 138→124ms → decode 252→201ms; phone_ms 8812→8615 | G1 ✓ (row split is order-identical); desktop decode 61→36ms | **keep** (`4be985e`) |
+| 11 | Milestone: long fixture + desktop re-gates | — | PK long 9000→7579ms; desktop PK medium 421ms (was 522), MOSS 1759ms (was 1820); fast_weights_test all pass | G1-G4 ✓ | milestone |
+| 12 | Energy per transcription (batterystats power model, 40/20-run averages) | — | PK medium: fast ≈1.4 mWh vs ggml ≈5.0 (3.6×); MOSS short: fast ≈2.2 vs ≈5.2 (2.4×). MOSS/fast: GPU 10.2 mAh + CPU small; ggml: CPU 24.5 mAh | — | measured |
+| 13 | MOSS mel thread count (shared frontend uses all 9 cores) | STARLING_MEL_THREADS sweep | 1: 124ms, 2: 269(!), 3: 124, 9: 216 — scheduling noise dominates, no reliable win; real fix is a faster FFT path | — | skip (noise) |
+| 14 | KSTEP (decode tokens per submission) | env sweep 4-64 | 4-8 ≈ 3098ms vs 16 ≈ 3141 — ~1% at best, within noise | — | skip |
+| 15 | x re-reads dominate GEMV for large N (ff_up: 12.6MB x vs 15.7MB weights at rows=8; lm_head reads x 19k×) | adaptive gemv_rows: grow while N/rows≥384, cap 32 (48/64 regress on registers); env pins rows exactly | MOSS decode 3050→2821ms (88.2ms/tok); phone_ms 8615→8358.8; desktop unchanged. NOTE: old global rows sweep predated RSPLIT — landscape flipped | G1 ✓ (reduction order row-independent) | **keep** (`d9eb75b`) |
+| 16 | MOSS mel: thread spawn per parallel_for call + hypot | persistent parked pool; hypot→double sqrt | pool: no win (big.LITTLE join-gating); sqrt: **flipped fixture transcript** (gate 1, reverted) — mel is numerics-pinned | G1 ✗ | discard ×2 |
+| 17 | GEMM inner loop shared-transaction bound → uvec2 wide loads (6→3 transactions/k) | f32 product loop rewrite | PK enc 2082-2095 vs 2058-2066 — neutral; glslc already coalesces | — | discard |
+| 18 | Norm kernels ~10× off memory speed (0.29ms/dispatch for 1.75MB r/w; new norm micro probe) | subgroup-shuffle reduction (1 barrier instead of 8-per-statistic tree) | **4× SLOWER** on PowerVR (1.23 vs 0.29ms) — subgroup shuffles are not cheap here; reverted. Norm cost totals only ~1-2% per model anyway | — | discard |
+| 19 | Mel filterbank multiplies all 201 bins per (mel,frame); filters are ~2/3 zeros | per-mel nonzero [lo,hi) ranges (PkMel-style); bit-exact zero skipping; STARLING_MEL_TIMING phase probe | filterbank 82-100→12-14ms (7×); MOSS mel 200→131ms; phone_ms 8358.8→8319.1; desktop mel 6.5→3.2ms | G1 ✓ (bit-exact: products ≥ +0.0, x+0.0==x) | **keep** (`1e15bee`) |
+| 20 | qkv rows check (N=3072 keeps rows=8 under the ≥384-WG rule) | micro rows 8/16/24 | 16.2 / 14.9 / 15.2 GB/s — rows=8 already optimal; heuristic stands | — | no change |
+| 21 | Milestone: certify bit-exact keeps at corpus scale + refresh energy | FLEURS en_us 100 (fast) | PK 5.33 %, MOSS 7.87 % — identical to pre-change values; energy PK 1.33 mWh (3.8× vs ggml), MOSS 2.05 mWh (2.5×) | G2 ✓ | milestone |
+| 22 | dec_attn: 3.9-4.2 ms/token (new attn micro probe: `STARLING_FAST_MICRO=attn[,pos[,reps[,maxpos]]]`); only ~16µs/token is FLOPs, 16 head-WGs = latency-dominated | (a) vec2 q+k stats + max-scan (barriers 30→16); (b) depth-4 rolling V-load prefetch (add order preserved) | (a) 0.151→0.158 ms, worse at pos=1000 (scan adds O(pos) reads; barriers already overlap across WGs); (b) 0.157 ms neutral — loads already pipelined. Both falsified, reverted | — | discard ×2 |
+| 23 | Verification of kept state after reverts (cool phone) | — | **phone_ms 8143** (session best): PK 2184 (enc 1974), MOSS 5959 (mel 83, decode 88.5 ms/tok) | G1 ✓ | verification |
+| 24 | lm_head W4 requant (brief: "28% of decode bytes") | convert_w8_w4 + STARLING_FAST_LM4=1; embed table W8→W4 at load (paths already exist for q4e4) | isolated lm_head: W8 already 36.6 GB/s (9.57ms), W4 22.1 GB/s (8.78ms) — W4's ALU-per-byte caps it; net 0.79ms/token = 0.9% decode = sub-noise at composite. Transcripts identical, −149MB, load −0.3s. Machinery works; not worth the FLEURS gate cost | G1 ✓ (kept code discarded) | discard, documented |
+| 25 | Verification after reverts | — | phone_ms 8140.9 (session best 8143 within 0.03%) | G1 ✓ | verification |
+| 26 | Brief's load-time idea: cache repacked blobs on disk (mmap) to skip repack | full PackCache built+verified (content fingerprint, parallel mmap carve, offset-reserved parallel pwrite, atomic rename; transcripts identical) | **net loss on this phone**: PK cold+write 3320ms (vs 455 repack), warm 320-345ms; MOSS cold 6197ms (vs 1324), warm 2134ms — 1.6GB doesn't fit page cache. Phone flash: ~200MB/s write, ~0.8-1.5GB/s read; the parallel repack (~1.2GB/s) is already storage-speed. Reverted; design documented (attractive on NVMe/desktop) | — | discard, data-closed |
+| 27 | Verification after revert | — | phone_ms 8331 (thermal band vs best 8143, identical code); baseline loads restored (repack 1347ms) | G1 ✓ | verification |
+| 28 | Reviewer round: GEMV immediate partial stores | RPP>=16 variant captured ff_up (+10%)/lm_head (+6%) isolated | **in-context decode 4-7% WORSE** (alternating A/B, same thermal window) — isolated probes do not predict interleaved decode; reverted | G1 ✓ | discard |
+| 29 | Reviewer round: narrow-N GEMM tiles | N≤64 ops (attention PV dk=64, subsampling) use 32,64,4,4 instead of BN=128 | PK encoder **−2.7%** (alternating A/B 3/3 rounds: 2010-2035 → 1957-1980); bit-exact (tile partitions outputs only); desktop unchanged; MOSS unaffected (head_dim 128) | G1 ✓ | **keep** (`c604898`) |
+| 30 | Reviewer round: OpSDot probe (glslang has no GLSL front-end for it) | hand-assembled SPIR-V via spirv-as (`shaders/idot_probe.asm`), prebuilt-.spv embed support in fast.cmake, `STARLING_FAST_MICRO=idot` probe | **OpSDot WORKS on this driver** (exact correctness; coopmat's compiler crash does not extend to integer dot). ILP probe: ~154 G i8-MAC/s vs 77.5 G f32 MAC/s for the scalar GEMM ≈ **2× headroom** for an int8-activation GEMM | — | infrastructure keep |
+| 31 | Review round (PR #287): bounds / CI / idle-worker fixes | coopmat stub removed, GEMV rows>WGS, MOSS hgroup + token buffer, tuner OOB, Android configure without spirv-as; decoder worker parks when idle | alternating A/B vs `283a21e`: PK 2163-2200 vs 2185-2226, MOSS 5975-6008 vs 5932-6019 (noise); NDK glslc = host glslc | G1 ✓, weights test ✓ | keep (`be39f3e`) |
+| 32 | Parked decoder worker wakes cold at decode start | first version parked between jobs: PK decode median 204 vs 173 ms (+17 %, 4×12 runs), the woken thread lands on a little core; fix: the engine holds the worker spinning for one transcription | decode 197.7 vs 196.6 ms (parity), no idle burn between transcriptions | G1 ✓, helper test bit-exact | keep (`be39f3e`) |
+| 33 | Decode GEMVs are issue-bound, not bandwidth-bound: W8 36.6 GB/s ≈ W4 22 GB/s ≈ 33 G weights/s (#24) → cut ALU per weight | `gemv_w4u`: mask one nibble per byte, `unpackUnorm4x8` → 4 floats (~5 ops / 8 weights vs ~16), x permuted to even/odd order, ×255 folded into the scale | isolated +12..60 %; MOSS decode 2950 → 2575 ms (alternating, 3/3), 88.5 → 76.8 ms/tok; **phone_ms 8143 → 7823**; RADV slower (38 → 31 GB/s) → PowerVR default only | G1 ✓ (short/medium/long identical), G2 ✓ MOSS FLEURS 7.87 % both, 0/100 differ | **keep** |
+| 34 | The same A/B exposed an init bug in the first W4U build: PowerVR re-ran the cached tuner result over the vendor tile | control flow fixed before commit | PK encoder 2330 → 1980 ms (the stale cached tile is 17 % slower) | — | fix |
+
+Next levers (not pursued; the PR is ready to merge): the same issue-bound
+argument applies to the W8 lm_head (28 % of decode bytes; `unpackSnorm4x8`
+needs a proof that no -128 codes occur) and, larger, to int8-activation
+GEMVs with `OpSDot` (works on this driver; needs a glslc newer than the
+NDK's and a WER run).

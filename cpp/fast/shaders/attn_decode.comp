@@ -1,0 +1,132 @@
+#version 450
+// attn_decode.comp — one decode step of Qwen3 attention for one query head,
+// fused end to end: q/k RMSNorm, NEOX RoPE (host-built cos/sin table), the
+// KV-cache append at the current position, scores over all cached keys,
+// softmax and the value mix. Workgroup = one query head (HEAD_DIM threads).
+// The new key/value are kept in shared memory: the kernel never reads the
+// cache slot it (or the sibling GQA head) writes in the same dispatch.
+//
+// Positions come from the device state buffer (state[0]), so a recorded
+// multi-token decode replays without host involvement.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
+layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 2) buffer VC { uint vc[]; };
+layout(std430, binding = 3) buffer O { float o[]; };
+layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
+layout(std430, binding = 5) readonly buffer KN { float kn_w[]; };
+layout(std430, binding = 6) readonly buffer RT { float rope[]; };   // cos [MAXPOS][D/2] then sin
+layout(std430, binding = 7) readonly buffer ST { uint state[]; };
+
+layout(push_constant) uniform PC {
+    uint H, KVH;
+    uint cache_off;   // element offset of this layer's cache (f16 elements)
+    float eps;
+    float scale;
+} p;
+
+shared float qs[D];
+shared float ks[D];
+shared float vs[D];
+shared float red[D];
+shared float sc[MAXPOS];
+
+float block_sum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = D / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+float block_max(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = D / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+// RMSNorm(x)·w then NEOX rotation; x is this thread's element, result for d.
+float norm_rope(float x, const uint d, const bool is_q, uint pos) {
+    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    red[d] = xn;
+    barrier();
+    const uint half_d = D / 2;
+    const uint i = d % half_d;
+    const float c = rope[pos * half_d + i], s = rope[MAXPOS * half_d + pos * half_d + i];
+    const float partner = red[d < half_d ? d + half_d : d - half_d];
+    barrier();
+    return d < half_d ? xn * c - partner * s : partner * s + xn * c;
+}
+
+void main() {
+    if (state[2] != 0u) return;
+    const uint d = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x;
+    const uint g = h / (p.H / p.KVH);
+    const uint pos = state[0];
+    const uint HD = p.H * D;
+
+    qs[d] = norm_rope(qkv[h * D + d], d, true, pos);
+    ks[d] = norm_rope(qkv[HD + g * D + d], d, false, pos);
+    vs[d] = qkv[HD + p.KVH * D + g * D + d];
+    barrier();
+
+    const uint base = p.cache_off + g * MAXPOS * D;   // f16 elements
+    // Append the new key/value (the first head of each GQA group writes).
+    if (h % (p.H / p.KVH) == 0u && d < D / 2) {
+        kc[(base + pos * D) / 2 + d] = packHalf2x16(vec2(ks[2 * d], ks[2 * d + 1]));
+        vc[(base + pos * D) / 2 + d] = packHalf2x16(vec2(vs[2 * d], vs[2 * d + 1]));
+    }
+
+    // Scores over cached keys [0, pos) plus the new key at pos.
+    float mx = -3.0e38;
+    for (uint j = d; j <= pos; j += D) {
+        float s = 0.0;
+        if (j < pos) {
+            const uint kb = (base + j * D) / 2;
+            for (uint w = 0; w < D / 2; ++w) {
+                const vec2 kv = unpackHalf2x16(kc[kb + w]);
+                s += qs[2 * w] * kv.x + qs[2 * w + 1] * kv.y;
+            }
+        } else {
+            for (uint w = 0; w < D; ++w) s += qs[w] * ks[w];
+        }
+        s *= p.scale;
+        sc[j] = s;
+        mx = max(mx, s);
+    }
+    mx = block_max(mx);
+    float sum = 0.0;
+    for (uint j = d; j <= pos; j += D) {
+        const float e = exp(sc[j] - mx);
+        sc[j] = e;
+        sum += e;
+    }
+    const float inv = 1.0 / block_sum(sum);   // block_sum's barriers publish sc[]
+
+    // Value mix: thread d owns output dim d (coalesced V reads).
+    float acc = 0.0;
+    const uint vb = base / 2 + d / 2;
+    const uint hi = d & 1u;
+    for (uint j = 0; j < pos; ++j) acc += sc[j] * unpackHalf2x16(vc[vb + j * (D / 2)])[hi];
+    acc += sc[pos] * vs[d];
+    o[h * D + d] = acc * inv;
+}

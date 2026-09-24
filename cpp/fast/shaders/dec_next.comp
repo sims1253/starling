@@ -1,0 +1,63 @@
+#version 450
+// dec_next.comp — close one greedy decode step on the GPU: reduce the
+// lm_head argmax partials to the next token (lowest index on ties), append it
+// to the token history, stop on EOS / budget, advance the position and write
+// the next input embedding. With this the whole token loop stays on the
+// device: the host only reads the history after a multi-token submission.
+//
+// state: [0] position of the next input token, [1] tokens generated,
+//        [2] done flag, [3] reserved, [16...] generated token ids.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint CHUNK_ROWS = 0x7fffffff;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer PART { uint part[]; };
+layout(std430, binding = 9) buffer X { float x[]; };
+layout(std430, binding = 10) buffer ST { uint state[]; };
+
+layout(push_constant) uniform PC {
+    uint n_part;
+    uint K;
+    uint eos;
+    uint max_steps;
+} p;
+
+#include "dequant_row.glsl"
+
+shared float bv[WG];
+shared uint bi[WG];
+
+void main() {
+    if (state[2] != 0u) return;
+    const uint tid = gl_LocalInvocationID.x;
+    float best = -3.4e38;
+    uint idx = 0xffffffffu;
+    for (uint i = tid; i < p.n_part; i += WG) {
+        const float v = uintBitsToFloat(part[2 * i]);
+        const uint j = part[2 * i + 1];
+        if (v > best || (v == best && j < idx)) { best = v; idx = j; }
+    }
+    bv[tid] = best;
+    bi[tid] = idx;
+    barrier();
+    for (uint s = WG / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float v = bv[tid + s];
+            const uint j = bi[tid + s];
+            if (v > bv[tid] || (v == bv[tid] && j < bi[tid])) { bv[tid] = v; bi[tid] = j; }
+        }
+        barrier();
+    }
+    const uint tok = bi[0];
+    for (uint k = tid; k < p.K; k += WG) x[k] = dequant(tok, k, p.K);
+    if (tid == 0u) {
+        const uint step = state[1];
+        state[16 + step] = tok;
+        state[1] = step + 1u;
+        state[0] = state[0] + 1u;
+        if (tok == p.eos || step + 1u >= p.max_steps) state[2] = 1u;
+    }
+}
