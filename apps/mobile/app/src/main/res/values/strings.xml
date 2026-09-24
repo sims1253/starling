@@ -21,6 +21,8 @@
     <string name="engine_on_device">This device (experimental)</string>
     <string name="on_device_status_no_model">No on-device model yet. Download the recommended Parakeet model (553 MB; Wi-Fi recommended), or import a Parakeet TDT GGUF you already have.</string>
     <string name="on_device_model_present">Model imported: parakeet.gguf (%1$d MB). Transcribes offline on this device, live while you speak.</string>
+    <string name="on_device_in_use">Selected: recordings use this model.</string>
+    <string name="on_device_not_selected">Not in use: choose \"This device\" above to transcribe with it.</string>
     <string name="on_device_importing">Importing model…</string>
     <string name="on_device_file_missing">Android Files did not return a model file. Select the GGUF again.</string>
     <string name="on_device_imported">Model imported. On-device transcription is ready.</string>
