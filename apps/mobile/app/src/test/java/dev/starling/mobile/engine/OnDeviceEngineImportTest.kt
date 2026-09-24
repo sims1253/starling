@@ -609,8 +609,48 @@ class OnDeviceEngineImportTest {
             val engine = OnDeviceEngine(directory)
 
             assertEquals("parakeet.gguf", engine.activeModelName())
-            assertTrue(engine.renameModel("parakeet.gguf", "recommended.gguf"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    private fun catalogSpec(file: File, sha256: String = ModelDownloader.sha256(file)) = ModelDownload(
+        url = "https://example.invalid/models/recommended.gguf",
+        sizeBytes = file.length(),
+        sha256 = sha256,
+        label = "Recommended",
+    )
+
+    @Test
+    fun legacyCopyOfTheCatalogModelGetsItsCatalogName() {
+        val directory = tempDir()
+        try {
+            val legacy = sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
+            val engine = OnDeviceEngine(directory)
+
+            assertTrue(engine.recognizeLegacyDownload(catalogSpec(legacy)))
+
             assertEquals("recommended.gguf", engine.activeModelName())
+            assertEquals(listOf("recommended.gguf"), engine.installedModels().map { it.name })
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun legacyModelWithOtherBytesKeepsItsName() {
+        val directory = tempDir()
+        try {
+            val legacy = sparseModelFile(directory, "parakeet.gguf", parakeetPayload())
+            val engine = OnDeviceEngine(directory)
+
+            assertFalse("a digest mismatch is not the catalog model", engine.recognizeLegacyDownload(catalogSpec(legacy, "0".repeat(64))))
+            assertFalse(
+                "a size mismatch is not even hashed",
+                engine.recognizeLegacyDownload(catalogSpec(legacy).copy(sizeBytes = legacy.length() + 1)),
+            )
+
+            assertEquals(listOf("parakeet.gguf"), engine.installedModels().map { it.name })
         } finally {
             directory.deleteRecursively()
         }
@@ -638,6 +678,7 @@ class OnDeviceEngineImportTest {
         assertEquals("hidden.gguf", OnDeviceEngine.sanitizeModelName(".hidden.gguf"))
         assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(null))
         assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName("..."))
+        assertEquals("parakeet.gguf", OnDeviceEngine.sanitizeModelName(".gguf"))
         assertEquals("a.gguf.importing.gguf", OnDeviceEngine.sanitizeModelName("a.gguf.importing"))
     }
 }

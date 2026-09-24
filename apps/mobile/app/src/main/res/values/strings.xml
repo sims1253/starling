@@ -20,13 +20,12 @@
     <string name="engine_server">Starling server</string>
     <string name="engine_on_device">This device (experimental)</string>
     <string name="on_device_status_no_model">No on-device model yet. Download the recommended Parakeet model (553 MB; Wi-Fi recommended), or import a Parakeet TDT GGUF you already have.</string>
-    <string name="on_device_model_in_use">Using %1$s (%2$d MB). Recordings transcribe offline on this device, live while you speak.</string>
-    <string name="on_device_model_not_selected">Installed: %1$s (%2$d MB), not in use. Choose \"%3$s\" above to transcribe with it.</string>
-    <string name="recommended_model_label">the recommended model</string>
+    <string name="on_device_model_in_use">Using %1$s, %2$d MB. Recordings transcribe offline on this device, live while you speak.</string>
+    <string name="on_device_model_not_selected">Installed: %1$s, %2$d MB, not in use. Choose \"%3$s\" above to transcribe with it.</string>
+    <string name="recommended_model_name">%1$s (recommended)</string>
     <string name="installed_models_heading">Installed models</string>
     <string name="installed_models_help">Kept in Starling\'s private storage (not in Downloads or Files). Tap one to use it.</string>
-    <string name="installed_model_row">%1$s (%2$d MB)</string>
-    <string name="installed_model_row_recommended">Recommended: %1$s (%2$d MB)</string>
+    <string name="installed_model_row">%1$s, %2$d MB</string>
     <string name="delete_model">Delete</string>
     <string name="delete_model_title">Delete this model?</string>
     <string name="delete_model_message">%1$s is removed from this device. Download or import it again to use it later.</string>

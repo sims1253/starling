@@ -83,54 +83,73 @@ class OnDeviceEngine(
         return installedFiles().map { InstalledModel(it.name, it.length(), it == active) }
     }
 
-    /** Makes the installed model [name] the active one; false when it is not installed. */
+    /**
+     * Makes the installed model [name] the active one; false when it is not
+     * installed. The previous model is freed now, or when the live session
+     * using it ends (see [releaseWhenIdle]).
+     */
     fun selectModel(name: String): Boolean = synchronized(lock) {
         val file = installedFile(name) ?: return false
         writeActiveName(file.name)
-        // Free the previous model now; the next transcription loads this one.
-        if (loadedFile != file) unload()
+        if (loadedFile != file) releaseLocked()
         true
     }
 
     /**
      * Deletes the installed model [name]. Deleting the active model makes the
-     * first remaining one active. Waits for an in-flight transcription.
+     * first remaining one active. Waits for an in-flight transcription; a
+     * live session keeps its already-loaded model until it ends.
      */
     fun deleteModel(name: String): Boolean = synchronized(importLock) {
         synchronized(lock) {
             val file = installedFile(name) ?: return false
-            if (file == loadedFile) unload()
             if (!file.delete()) return false
+            if (file == loadedFile) releaseLocked()
             if (readActiveName() == file.name) activeFile.delete()
+            fsyncModelDirectory()
             true
         }
     }
 
     /**
-     * Renames the installed model [from] to [to] (a sanitized file name),
-     * keeping it active if it was. Refuses to overwrite another model.
+     * Before 0.2.2 every model, downloaded or imported, was stored as
+     * [DEFAULT_MODEL_NAME]. When that file is byte-for-byte [spec], rename it
+     * to the catalog name so it shows as that model instead of being offered
+     * for download again. Blocking: hashes hundreds of MB, only when the size
+     * already matches. Holds [importLock] throughout, so no import or delete
+     * can change the file between the check, the hash, and the rename; the
+     * engine lock only for the rename, so transcription keeps running.
+     * True when the model was renamed.
      */
-    fun renameModel(from: String, to: String): Boolean = synchronized(importLock) {
+    fun recognizeLegacyDownload(spec: ModelDownload): Boolean = synchronized(importLock) {
+        val legacy = installedFile(DEFAULT_MODEL_NAME)?.takeIf { it.length() == spec.sizeBytes } ?: return false
+        val target = File(modelDir, sanitizeModelName(spec.fileName))
+        if (target.exists()) return false
+        val digest = runCatching { ModelDownloader.sha256(legacy) }.getOrNull() ?: return false
+        if (!digest.equals(spec.sha256, ignoreCase = true)) return false
         synchronized(lock) {
-            val file = installedFile(from) ?: return false
-            val target = File(modelDir, sanitizeModelName(to))
-            if (target.exists()) return false
-            val wasActive = activeModelFile() == file
-            if (file == loadedFile) unload()
-            if (!file.renameTo(target)) return false
-            if (wasActive) writeActiveName(target.name)
+            val wasActive = activeModelFile() == legacy
+            if (!legacy.renameTo(target)) return false
+            // Same bytes: a resident model stays valid under its new name.
+            if (loadedFile == legacy) loadedFile = target
+            if (wasActive) {
+                runCatching { writeActiveName(target.name) }
+                    .onFailure { runCatching { Log.w(TAG, "Could not record the renamed model as active", it) } }
+            }
             fsyncModelDirectory()
             true
         }
+    }
+
+    /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
+    private fun releaseLocked() {
+        if (liveSessions > 0) releasePending = true else unload()
     }
 
     private fun installedFiles(): List<File> =
         modelDir.listFiles { file ->
             file.isFile && isModelName(file.name) && file.length() >= ModelFiles.MIN_MODEL_BYTES
         }.orEmpty().sortedBy { it.name }
-
-    /** The installed model file [name], for read-only checks such as hashing. */
-    fun modelFile(name: String): File? = installedFile(name)
 
     private fun installedFile(name: String): File? =
         installedFiles().firstOrNull { it.name == name }
@@ -400,8 +419,10 @@ class OnDeviceEngine(
     private fun ensureLoadedLocked(): String? {
         val modelFile = activeModelFile()
             ?: return "Download or import a Parakeet model first to transcribe on this device."
-        // The user picked another model since this one was loaded.
-        if (handle != 0L && loadedFile != modelFile) unload()
+        // The user picked another model since this one was loaded. A live
+        // session keeps the loaded one: a mid-recording reload of hundreds
+        // of MB would stall the stream (the switch follows the session).
+        if (handle != 0L && loadedFile != modelFile && liveSessions == 0) unload()
         if (handle != 0L) return null
         nativeSupport()?.let { reason ->
             loadError = reason
@@ -457,9 +478,7 @@ class OnDeviceEngine(
      * past its live-buffer cap. A recording is minutes at most, and the
      * release follows it immediately.
      */
-    fun releaseWhenIdle() = synchronized(lock) {
-        if (liveSessions > 0) releasePending = true else unload()
-    }
+    fun releaseWhenIdle() = synchronized(lock) { releaseLocked() }
 
     override fun liveSessionStarted() {
         synchronized(lock) { liveSessions++ }
@@ -529,6 +548,7 @@ class OnDeviceEngine(
         private const val ACTIVE_FILE_NAME = "active-model"
         private const val MODEL_EXTENSION = ".gguf"
         private const val MAX_NAME_CHARS = 120
+        private val UNSAFE_NAME_CHARS = Regex("[^A-Za-z0-9._-]")
 
         /** Holds the previous model during a [moveAsideFirst] promotion. */
         private const val ASIDE_SUFFIX = ".previous"
@@ -544,10 +564,13 @@ class OnDeviceEngine(
          */
         fun sanitizeModelName(name: String?): String {
             val base = name.orEmpty().substringAfterLast('/')
-                .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                .replace(UNSAFE_NAME_CHARS, "_")
                 .trimStart('.')
                 .take(MAX_NAME_CHARS)
-            if (base.isEmpty() || base.equals(MODEL_EXTENSION, ignoreCase = true)) return DEFAULT_MODEL_NAME
+            // Leading dots are gone, so a bare ".gguf" is now "gguf".
+            if (base.isEmpty() || base.equals(MODEL_EXTENSION.removePrefix("."), ignoreCase = true)) {
+                return DEFAULT_MODEL_NAME
+            }
             return if (isModelName(base)) base else base + MODEL_EXTENSION
         }
 

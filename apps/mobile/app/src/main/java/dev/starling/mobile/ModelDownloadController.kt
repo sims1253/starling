@@ -45,23 +45,15 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     }
 
     /**
-     * Before 0.2.2 every model, downloaded or imported, was stored as
-     * [OnDeviceEngine.DEFAULT_MODEL_NAME]. When that file is byte-for-byte
-     * [spec], give it the catalog name so the app shows it as the recommended
-     * model instead of offering to download it again. Blocking (hashes
-     * hundreds of MB, only when the size already matches); any thread.
+     * Renames a pre-0.2.2 copy of [spec] to its catalog name (see
+     * [OnDeviceEngine.recognizeLegacyDownload]) and re-renders listeners.
+     * Blocking; any thread. Never throws: a failure only leaves the old name.
      */
     fun recognizeLegacyDownload(spec: ModelDownload) {
-        val legacy = engine.installedModels()
-            .firstOrNull { it.name == OnDeviceEngine.DEFAULT_MODEL_NAME && it.sizeBytes == spec.sizeBytes }
-            ?: return
-        if (engine.installedModels().any { it.name == spec.fileName }) return
-        val file = engine.modelFile(legacy.name) ?: return
-        val digest = runCatching { ModelDownloader.sha256(file) }.getOrNull() ?: return
-        if (digest.equals(spec.sha256, ignoreCase = true)) {
-            engine.renameModel(legacy.name, spec.fileName)
-            main.post { publish(state) }
-        }
+        val renamed = runCatching { engine.recognizeLegacyDownload(spec) }
+            .onFailure { Log.w(TAG, "legacy model recognition failed", it) }
+            .getOrDefault(false)
+        if (renamed) main.post { publish(state) }
     }
 
     /** Starts (or resumes) downloading [spec]; a no-op while one is running. Main thread. */

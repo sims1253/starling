@@ -40,7 +40,7 @@ class OnDeviceTranscriptionE2ETest {
             val result = ModelDownloader().download(spec, engine.downloadFile(spec)) { _, _, _ -> }
             val done = result as? ModelDownloader.Result.Done
                 ?: throw AssertionError("download failed: $result")
-            val adopted = engine.adoptDownloaded(done.file)
+            val adopted = engine.adoptDownloaded(done.file, spec.fileName)
             if (adopted !is OnDeviceEngine.ImportResult.Imported) throw AssertionError("model rejected: $adopted")
         }
 
