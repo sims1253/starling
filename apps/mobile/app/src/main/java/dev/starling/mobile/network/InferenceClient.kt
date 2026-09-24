@@ -15,21 +15,9 @@ sealed interface InferenceResult {
     data class Failure(val message: String, val retryable: Boolean) : InferenceResult
 }
 
-/** Full batch routes the pre-unification Starling protocol accepted. */
-private val LEGACY_ROUTE_SUFFIXES = listOf("/inference", "/transcribe")
-
 /** Multipart upload to the backend's OpenAI-compatible transcription endpoint. */
 internal fun inferenceUrl(endpoint: String): String {
-    var base = endpoint.trimEnd('/')
-    // Legacy full-route endpoints saved before the API unification (the
-    // old Starling protocol accepted them as complete batch routes) must
-    // migrate cleanly instead of producing .../inference/v1/audio/transcriptions.
-    for (legacy in LEGACY_ROUTE_SUFFIXES) {
-        if (base.endsWith(legacy, ignoreCase = true)) {
-            base = base.removeSuffix(legacy).trimEnd('/')
-            break
-        }
-    }
+    val base = endpoint.trimEnd('/')
     return when {
         base.endsWith("/v1/audio/transcriptions", ignoreCase = true) -> base
         base.endsWith("/v1", ignoreCase = true) -> "$base/audio/transcriptions"
