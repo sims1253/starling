@@ -16,6 +16,7 @@ concurrency:
 jobs:
   typescript:
     name: TypeScript workspace (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

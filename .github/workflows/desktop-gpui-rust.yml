@@ -23,18 +23,15 @@ jobs:
         with:
           persist-credentials: false
       - name: Install system libs for cpal and gpui's X11/Wayland link
-        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
       - name: Install stable toolchain
-        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Check and test the desktop-gpui workspace
-        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         working-directory: apps/desktop-gpui
         run: |
           cargo check --workspace
@@ -54,7 +51,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Check the host crate
-        if: ${{ hashFiles('apps/desktop-gpui/Cargo.toml') != '' }}
         working-directory: apps/desktop-gpui
         run: cargo check -p starling-runtime-host
 

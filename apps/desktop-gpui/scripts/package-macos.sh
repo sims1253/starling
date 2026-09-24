@@ -7,6 +7,12 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/app/Cargo.toml)"
+if [[ -z "$version" ]]; then
+  echo "error: no version found in crates/app/Cargo.toml" >&2
+  exit 1
+fi
+# Distinguishes CI builds of the same version; local builds report 0.
+build_number="${GITHUB_RUN_NUMBER:-0}"
 
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo build --release -p starling-gpui \
@@ -39,7 +45,7 @@ cat > "$staging/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>Starling</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleVersion</key><string>${build_number}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key>

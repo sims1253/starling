@@ -7,11 +7,7 @@ export default defineConfig({
     useTabs: false,
     semi: true,
     singleQuote: false,
-    ignorePatterns: [
-      "**/dist/**",
-      "tools/oxlint/anti-slop/**",
-      "pnpm-lock.yaml",
-    ],
+    ignorePatterns: ["**/dist/**", "tools/oxlint/anti-slop/**", "pnpm-lock.yaml"],
   },
   lint: {
     ignorePatterns: [
