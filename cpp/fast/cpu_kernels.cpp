@@ -3,8 +3,10 @@
 #include "cpu_kernels.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 // ISA-specific kernels are compiled with function-level target attributes
 // and picked at run time, so the library itself needs no -march flags.
@@ -60,6 +62,45 @@ void quantize(const float* x, uint32_t K, QVec& out) {
     const uint32_t G = K / 32;
     out.q.resize(K);
     out.s.resize(G);
+#if defined(STARLING_FAST_NEON_DOT)
+    for (uint32_t g = 0; g < G; ++g) {
+        const float* v = x + g * 32;
+        float32x4_t am = vdupq_n_f32(0.0f);
+        for (uint i = 0; i < 32; i += 4) am = vmaxq_f32(am, vabsq_f32(vld1q_f32(v + i)));
+        const float amax = vmaxvq_f32(am);
+        const float s = amax / 127.0f;
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        out.s[g] = s;
+        int8_t* q = out.q.data() + g * 32;
+        // lrintf rounds to nearest-even; so does vcvtnq_s32_f32 (but the
+        // saturating variant clamps at ±127, which is what we want anyway).
+        for (uint i = 0; i < 32; i += 8) {
+            const float32x4_t a = vmulq_n_f32(vld1q_f32(v + i), inv);
+            const float32x4_t b = vmulq_n_f32(vld1q_f32(v + i + 4), inv);
+            const int16x8_t h = vcombine_s16(vqmovn_s32(vcvtnq_s32_f32(a)),
+                                             vqmovn_s32(vcvtnq_s32_f32(b)));
+            vst1_s8(q + i, vqmovn_s16(h));
+        }
+    }
+#elif defined(STARLING_FAST_AVX2)
+    for (uint32_t g = 0; g < G; ++g) {
+        const float* v = x + g * 32;
+        __m128 am = _mm_setzero_ps();
+        for (uint i = 0; i < 32; i += 4) am = _mm_max_ps(am, _mm_andnot_ps(_mm_set1_ps(-0.0f), _mm_loadu_ps(v + i)));
+        am = _mm_max_ps(am, _mm_movehl_ps(am, am));
+        am = _mm_max_ss(am, _mm_movehdup_ps(am));
+        const float amax = _mm_cvtss_f32(am);
+        const float s = amax / 127.0f;
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        out.s[g] = s;
+        int8_t* q = out.q.data() + g * 32;
+        for (uint i = 0; i < 32; i += 8) {
+            const __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(v + i), _mm256_set1_ps(inv)));
+            const __m128i h = _mm_packs_epi32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
+            _mm_storel_epi64((__m128i*)(q + i), _mm_packs_epi16(h, h));
+        }
+    }
+#else
     for (uint32_t g = 0; g < G; ++g) {
         const float* v = x + g * 32;
         float amax = 0.0f;
@@ -69,9 +110,18 @@ void quantize(const float* x, uint32_t K, QVec& out) {
         out.s[g] = s;
         for (int i = 0; i < 32; ++i) out.q[g * 32 + i] = (int8_t)std::lrintf(v[i] * inv);
     }
+#endif
 }
 
 namespace {
+
+void cpu_relax() {
+#if defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    _mm_pause();
+#endif
+}
 
 #if defined(STARLING_FAST_NEON_DOT)
 
@@ -186,6 +236,50 @@ void gemv(const CpuQ8& W, const QVec& x, const float* bias, float* y, uint32_t r
     if (have_simd()) { gemv_simd(W, x, bias, y, r0, r1); return; }
 #endif
     gemv_scalar(W, x, bias, y, r0, r1);
+}
+
+GemvHelper::~GemvHelper() {
+    if (started_) {
+        job_.seq.store(0xffffffffu, std::memory_order_release);   // poison: exit
+        th_.join();
+    }
+}
+
+void GemvHelper::worker() {
+    uint32_t seen = 0;
+    for (;;) {
+        while (job_.seq.load(std::memory_order_acquire) == seen) cpu_relax();
+        const uint32_t s = job_.seq.load(std::memory_order_relaxed);
+        if (s == 0xffffffffu) return;
+        gemv(*job_.W, *job_.x, job_.bias, job_.y, job_.r0, job_.r1);
+        seen = s;
+        job_.ack.store(s, std::memory_order_release);
+    }
+}
+
+void GemvHelper::run(const CpuQ8& W, const QVec& x, const float* bias, float* y,
+                     uint32_t r0, uint32_t r1) {
+    r1 = std::min(r1, W.N);
+    if (r0 >= r1) return;
+    // Only the big products: the handoff costs a few us.
+    const uint64_t macs = (uint64_t)(r1 - r0) * W.K;
+    const bool split = macs > (1u << 20) && r1 - r0 >= 256;
+    if (!split) { gemv(W, x, bias, y, r0, r1); return; }
+    if (!started_) {
+        th_ = std::thread([this] { worker(); });
+        started_ = true;
+    }
+    const uint32_t mid = r0 + ((r1 - r0) / 8) * 4;   // bias toward this thread
+    job_.W = &W;
+    job_.x = &x;
+    job_.bias = bias;
+    job_.y = y;
+    job_.r0 = r0;
+    job_.r1 = mid;
+    const uint32_t s = job_.seq.load(std::memory_order_relaxed) + 1;
+    job_.seq.store(s, std::memory_order_release);
+    gemv(W, x, bias, y, mid, r1);
+    while (job_.ack.load(std::memory_order_acquire) != s) cpu_relax();
 }
 
 } // namespace starling::fast::cpu

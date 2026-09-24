@@ -632,6 +632,8 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     std::vector<int32_t> hyp;
 
     auto sigm = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+    static cpu::GemvHelper gemv2;   // one persistent decoder worker thread
+    struct Acc { double pred = 0, joint = 0, arg = 0; } acc;
     if (in0_cache.size() != V1 + 1) in0_cache.assign(V1 + 1, {});
     auto pred_step = [&]() {
         const float* layer_in = nullptr;
@@ -644,15 +646,15 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
                     else std::fill(xin.begin(), xin.end(), 0.0f);
                     cpu::quantize(xin.data(), PH, qx);
                     z0.resize(4 * PH);
-                    cpu::gemv(w_ih[0], qx, b_ih[0].data(), z0.data());
+                    gemv2.run(w_ih[0], qx, b_ih[0].data(), z0.data());
                 }
                 std::memcpy(z1.data(), z0.data(), 4 * PH * 4);
             } else {
                 cpu::quantize(layer_in, PH, qx);
-                cpu::gemv(w_ih[l], qx, b_ih[l].data(), z1.data());
+                gemv2.run(w_ih[l], qx, b_ih[l].data(), z1.data());
             }
             cpu::quantize(hc[l].data(), PH, qx);
-            cpu::gemv(w_hh[l], qx, b_hh[l].data(), z2.data());
+            gemv2.run(w_hh[l], qx, b_hh[l].data(), z2.data());
             for (uint32_t i = 0; i < PH; ++i) {
                 const float ig = sigm(z1[i] + z2[i]);
                 const float fg = sigm(z1[PH + i] + z2[PH + i]);
@@ -664,25 +666,34 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
             layer_in = hn[l].data();
         }
         cpu::quantize(hn[PL - 1].data(), PH, qx);
-        cpu::gemv(jpred, qx, jpred_b.data(), pp.data());
+        gemv2.run(jpred, qx, jpred_b.data(), pp.data());
     };
 
     int t = 0;
+    auto tpt = std::chrono::steady_clock::now();
     while (t < T) {
         int symbols_added = 0, skip = 0;
         bool need_loop = true;
         while (need_loop && symbols_added < max_symbols) {
-            if (!g_valid) { pred_step(); g_valid = true; }
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!g_valid) { pred_step(); g_valid = true; }
+                acc.pred += ms_since(t0);
+            }
+            const auto tj0 = std::chrono::steady_clock::now();
             const float* e = enc_proj.data() + (size_t)t * JH;
             for (uint32_t i = 0; i < JH; ++i) f[i] = std::max(e[i] + pp[i], 0.0f);
             cpu::quantize(f.data(), JH, qx);
-            cpu::gemv(jout, qx, jout_b.data(), logits.data());
+            gemv2.run(jout, qx, jout_b.data(), logits.data());
+            acc.joint += ms_since(tj0);
+            const auto ta0 = std::chrono::steady_clock::now();
             int k = 0;
             for (int i = 1; i < token_count; ++i) if (logits[i] > logits[k]) k = i;
             int dk_ = 0;
             for (int i = 1; i < (int)n_dur; ++i)
                 if (logits[token_count + i] > logits[token_count + dk_]) dk_ = i;
             skip = cfg.tdt_durations[(size_t)dk_];
+            acc.arg += ms_since(ta0);
             hyp.push_back(k);
             if (k != blank) {
                 last_token = k;
@@ -698,6 +709,9 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
         if (skip == 0) skip = 1;
         if (symbols_added == max_symbols) t += 1;
     }
+    if (std::getenv("STARLING_PARAKEET_TIMING"))
+        std::fprintf(stderr, "[fast-parakeet] decode split: pred %.1f ms, joint %.1f ms, argmax %.1f ms (total %.1f)\n",
+                     acc.pred, acc.joint, acc.arg, ms_since(tpt));
     return hyp;
 }
 

@@ -11,7 +11,9 @@
 
 #include "weights.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace starling::fast::cpu {
@@ -29,5 +31,33 @@ void gemv(const CpuQ8& W, const QVec& x, const float* bias, float* y,
 
 // Name of the compiled kernel family ("neon-dotprod", "avx2", "scalar").
 const char* isa_name();
+
+// Second thread for the decoder's large matrix-vector products: one
+// persistent worker spinning on a sequence counter (a futex/condvar wake
+// costs ~10x a spin). The split is by rows, so every output element is
+// computed exactly as in the single-threaded path.
+class GemvHelper {
+public:
+    ~GemvHelper();
+    // Splits [r0, r1) across this thread and the worker when the product
+    // is large enough to amortize the handoff (~2 us).
+    void run(const CpuQ8& W, const QVec& x, const float* bias, float* y, uint32_t r0 = 0,
+             uint32_t r1 = UINT32_MAX);
+
+private:
+    struct Job {
+        std::atomic<uint32_t> seq{0};
+        std::atomic<uint32_t> ack{0};
+        const CpuQ8* W = nullptr;
+        const QVec* x = nullptr;
+        const float* bias = nullptr;
+        float* y = nullptr;
+        uint32_t r0 = 0, r1 = 0;
+    };
+    void worker();
+    Job job_;
+    std::thread th_;
+    bool started_ = false;
+};
 
 } // namespace starling::fast::cpu
