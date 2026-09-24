@@ -6,4 +6,4 @@ Everything above the composite noise floor (~1%) has been tried; remaining items
 - **Coopmat**: driver 0x00696bd0 crashes the compiler on any coopmat op (probe: `coop_probe.comp`). The 3-5× encoder path if a driver update fixes it; kernel exists (`gemm_coop.comp`).
 - **Speculative decoding for MOSS decode** (88.7ms/tok, sequential-dependency bound): needs a real draft model (self-n-gram acceptance < the ~50% breakeven) and M>1 batching machinery.
 - **Flash-style fused attention for the encoders**: removes S/BD materialization (~1.4GB traffic at T=743); numerics change (softmax order) requires joint fixture+WER re-baseline.
-- **Load-time repack cache (mmap)**: PK 1.7s/MOSS 4.6s loads → skip repack on warm loads. Not in phone_ms; measure via the load= line if pursued.
+- **Load-time repack cache**: measured net loss on this phone (flash ~200MB/s write / ~0.8-1.5GB/s read vs parallel repack ~1.2GB/s) — see RESEARCH_LOG #26. Revive only on NVMe-class storage. Open micro-question: mapped upload runs 570-800MB/s despite being parallel; check for per-blob vkFlushMappedMemoryRanges cost if the mapped heap is non-coherent.
