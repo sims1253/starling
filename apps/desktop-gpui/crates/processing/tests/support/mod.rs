@@ -75,8 +75,13 @@ impl FakeServer {
                     match step {
                         Some(step) => step(&request, &mut stream),
                         None => {
-                            let _ =
-                                stream.write_all(&response("500 Internal Server Error", &[], "{}"));
+                            // A miscounted script shows up by name in the
+                            // failure detail, not as an ordinary 500.
+                            let _ = stream.write_all(&response(
+                                "500 Internal Server Error",
+                                &[],
+                                r#"{"error":"fake server: script exhausted"}"#,
+                            ));
                         }
                     }
                 });
@@ -95,6 +100,8 @@ impl FakeServer {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
+    // A client that stops mid-request must not wedge the handler thread.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {

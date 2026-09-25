@@ -926,6 +926,41 @@
         "deadline_ms",
         "max_output_chars"
       ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "provider": {
+                "properties": {
+                  "kind": {
+                    "const": "builtin"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              }
+            },
+            "required": [
+              "provider"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kinds": {
+                "maxItems": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "kinds": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "schema_version": {
           "const": 1
@@ -988,7 +1023,8 @@
               "rewrite",
               "translate"
             ]
-          }
+          },
+          "uniqueItems": true
         },
         "language": {
           "oneOf": [

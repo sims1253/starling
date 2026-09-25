@@ -20,6 +20,8 @@ Rules:
   just a word.
 - punctuation: trailing whitespace is dropped, one recognizer-placed
   punctuation mark at the end is replaced, then the value is appended.
+  Line breaks in the dropped whitespace (a layout command just before)
+  are put back after the mark, and whitespace after is then dropped.
 - line_break / paragraph: spaces and tabs before are dropped, ``\\n`` /
   ``\\n\\n`` appended, whitespace after is dropped.
 - bullet: like a line break, but a newline is added only when not already
@@ -117,11 +119,13 @@ def apply(text: str, *, language: str | None, spoken_commands: bool,
         n, command = found
         action = command["action"]
         if action == "punctuation":
-            out = out.rstrip(WHITESPACE)
+            stripped = out.rstrip(WHITESPACE)
+            layout = "\n" * out[len(stripped):].count("\n")
+            out = stripped
             if out and out[-1] in ATTACHED:
                 out = out[:-1]
-            out += command["value"]
-            skip_ws = False
+            out += command["value"] + layout
+            skip_ws = bool(layout)
         elif action in ("line_break", "paragraph"):
             out = out.rstrip(" \t") + ("\n" if action == "line_break" else "\n\n")
             skip_ws = True

@@ -279,5 +279,21 @@
     "snippets": [],
     "input": "done period  ",
     "output": "done.  "
+  },
+  {
+    "name": "punctuation_after_layout_keeps_the_break",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma new paragraph period next",
+    "output": "hello.\n\nnext"
+  },
+  {
+    "name": "punctuation_after_a_line_break",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "line one new line period line two",
+    "output": "line one.\nline two"
   }
 ]
