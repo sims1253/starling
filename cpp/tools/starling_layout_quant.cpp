@@ -433,7 +433,7 @@ void usage(const char* argv0) {
 
 struct Args {
     std::string source, out, layout = "w4g32asym", rules, imatrix, include, pack, gguf_in,
-                gguf_out, dtype = "bf16", tensor, ggml_type = "q4_0";
+                gguf_out, dtype = "auto", tensor, ggml_type = "q4_0";
     uint32_t threads = std::max(1u, std::thread::hardware_concurrency());
     uint32_t verify_rows = 8;
 };
@@ -685,6 +685,20 @@ int cmd_pack(const Args& a) {
 // eval: .pack + reference GGUF -> GGUF with those tensors dequantized to F16
 // ---------------------------------------------------------------------------
 
+// The ggml block type that holds this layout's values exactly (same f16
+// scales, same codes), when one exists — an eval GGUF built from it measures
+// the packed numerics with zero store rounding.
+ggml_type layout_ggml_type(const starling::fast::LayoutDesc& d) {
+    using namespace starling::fast;
+    if (d.scale_dtype != ScaleDtype::F16 || d.order != 0) return GGML_TYPE_COUNT;
+    if (d.bits == 4 && d.group == 32) {
+        if (d.symmetric) return GGML_TYPE_Q4_0;   // w = d*(q-8)
+        return GGML_TYPE_Q4_1;                    // w = d*q + m
+    }
+    if (d.bits == 8 && d.group == 32 && d.symmetric) return GGML_TYPE_Q8_0;
+    return GGML_TYPE_COUNT;
+}
+
 int cmd_eval(const Args& a) {
     if (a.pack.empty() || a.gguf_in.empty() || a.gguf_out.empty()) {
         usage("starling-layout-quant");
@@ -720,7 +734,6 @@ int cmd_eval(const Args& a) {
         const size_t n_el = (size_t)ggml_nelements(t);
         ggml_tensor* dst = nullptr;
         if (packed->has(name)) {
-            // Dequantize to F16 through the reference path.
             const starling::fast::PackedTensor* pt = packed->find(name);
             if (!pt) { std::fprintf(stderr, "error: %s vanished\n", name.c_str()); return 1; }
             if (pt->K != (uint32_t)t->ne[0] ||
@@ -728,12 +741,65 @@ int cmd_eval(const Args& a) {
                 std::fprintf(stderr, "error: %s: packed shape %ux%u != GGUF\n", name.c_str(), pt->N, pt->K);
                 return 1;
             }
-            dst = ggml_new_tensor(ctx_out, eval_type, nd, t->ne);
-            const size_t dst_bytes = ggml_nbytes(dst);
-            owned.emplace_back(new char[dst_bytes]);
-            uint16_t* h16 = (uint16_t*)owned.back().get();
             const uint64_t cb = starling::fast::layout_code_bytes(pt->desc, pt->K);
             const uint64_t sb = starling::fast::layout_scale_bytes(pt->desc, pt->K);
+            const ggml_type native = a.dtype == "auto" ? layout_ggml_type(pt->desc) : GGML_TYPE_COUNT;
+            size_t dst_bytes = 0;
+            if (native != GGML_TYPE_COUNT) {
+                // Exact ggml blocks (same f16 scales, same codes): zero store
+                // rounding and a natively-readable eval GGUF.
+                dst = ggml_new_tensor(ctx_out, native, nd, t->ne);
+                dst_bytes = ggml_nbytes(dst);
+                owned.emplace_back(new char[dst_bytes]);
+                uint8_t* out = (uint8_t*)owned.back().get();
+                const size_t row_bytes = ggml_row_size(native, pt->K);
+                parallel_for(pt->N, a.threads, [&](size_t r) {
+                    const uint8_t* codes = pt->codes.data() + r * cb;
+                    const uint8_t* scales = pt->scales.data() + r * sb;
+                    const uint16_t* sup = pt->super.empty() ? nullptr : &pt->super[r];
+                    const uint8_t* u8s = pt->desc.scale_dtype == starling::fast::ScaleDtype::U8Super
+                                           ? scales : nullptr;
+                    uint8_t* row = out + r * row_bytes;
+                    const uint32_t groups = pt->K / 32;
+                    for (uint32_t g = 0; g < groups; ++g) {
+                        const float s = starling::fast::layout_scale_at(pt->desc, scales, sup, u8s, g);
+                        const uint16_t s16 = ggml_fp32_to_fp16(s);
+                        if (native == GGML_TYPE_Q8_0) {
+                            row[g * 34] = (uint8_t)(s16 & 0xff);
+                            row[g * 34 + 1] = (uint8_t)(s16 >> 8);
+                            for (int j = 0; j < 32; ++j)
+                                row[g * 34 + 2 + j] = (uint8_t)starling::fast::layout_decode_code(
+                                    pt->desc, codes, g * 32 + j);
+                        } else {
+                            // Q4_0: d, qs[16] (byte j: low nibble = code j, high = j+16)
+                            // Q4_1: d, m, qs[16]
+                            const bool asym = native == GGML_TYPE_Q4_1;
+                            const size_t bo = asym ? (size_t)g * 20 : (size_t)g * 18;
+                            row[bo] = (uint8_t)(s16 & 0xff);
+                            row[bo + 1] = (uint8_t)(s16 >> 8);
+                            if (asym) {
+                                const float o = starling::fast::layout_offset_at(pt->desc, scales, g);
+                                const uint16_t o16 = ggml_fp32_to_fp16(o);
+                                row[bo + 2] = (uint8_t)(o16 & 0xff);
+                                row[bo + 3] = (uint8_t)(o16 >> 8);
+                            }
+                            const size_t qo = bo + (asym ? 4 : 2);
+                            for (int j = 0; j < 16; ++j) {
+                                const uint8_t lo = (uint8_t)(starling::fast::layout_decode_code(
+                                    pt->desc, codes, g * 32 + j) & 15);
+                                const uint8_t hi = (uint8_t)(starling::fast::layout_decode_code(
+                                    pt->desc, codes, g * 32 + 16 + j) & 15);
+                                row[qo + j] = (uint8_t)(lo | (hi << 4));
+                            }
+                        }
+                    }
+                });
+            } else {
+            dst = ggml_new_tensor(ctx_out, eval_type, nd, t->ne);
+            const size_t dst_bytes_f = ggml_nbytes(dst);
+            dst_bytes = dst_bytes_f;
+            owned.emplace_back(new char[dst_bytes]);
+            uint16_t* h16 = (uint16_t*)owned.back().get();
             parallel_for(pt->N, a.threads, [&](size_t r) {
                 const uint8_t* codes = pt->codes.data() + r * cb;
                 const uint8_t* scales = pt->scales.data() + r * sb;
@@ -749,6 +815,7 @@ int cmd_eval(const Args& a) {
                                                        : ggml_fp32_to_bf16(v).bits;
                 }
             });
+            }
             ++replaced;
             bytes_out += dst_bytes;
         } else {
