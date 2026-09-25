@@ -20,7 +20,8 @@
     "(an output over the cap is a truncated_output failure, never a",
     "silently shortened text).",
     "kinds is empty only for the builtin provider: the deterministic step",
-    "(spoken commands, snippets) with no model call."
+    "(spoken commands, snippets) with no model call.",
+    "A builtin request carries no kinds; a model request at least one (allOf)."
   ],
   "type": "object",
   "additionalProperties": false,
@@ -45,6 +46,41 @@
     "local_only",
     "deadline_ms",
     "max_output_chars"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "properties": {
+              "kind": {
+                "const": "builtin"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "properties": {
+          "kinds": {
+            "maxItems": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "kinds": {
+            "minItems": 1
+          }
+        }
+      }
+    }
   ],
   "properties": {
     "schema_version": {
@@ -108,7 +144,8 @@
           "rewrite",
           "translate"
         ]
-      }
+      },
+      "uniqueItems": true
     },
     "language": {
       "oneOf": [

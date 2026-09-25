@@ -41,7 +41,10 @@ pub enum ProviderOutcome {
         timing_ms: f64,
         completion_evidence: String,
     },
-    Failed { reason: String, retryable: bool },
+    Failed {
+        reason: String,
+        retryable: bool,
+    },
 }
 
 /// Why a provider call failed, mapped to v1 `jobs.failed{reason,
@@ -52,9 +55,7 @@ pub fn failure_from_client_error(error: &ClientError) -> (String, bool) {
         ClientError::Transport(_) => ("transport_error".to_string(), true),
         ClientError::Timeout(_) => ("timeout".to_string(), true),
         ClientError::Redirect(_) => ("redirect_blocked".to_string(), false),
-        ClientError::Http { status, .. } => {
-            (format!("http_{status}"), *status >= 500)
-        }
+        ClientError::Http { status, .. } => (format!("http_{status}"), *status >= 500),
         ClientError::Protocol(_) => ("protocol_error".to_string(), false),
         // An oversized body is deterministic server behavior: the same
         // request would produce the same wall of bytes, so retrying
@@ -222,6 +223,9 @@ impl TransformProcessor for PipelineProcessor {
                 }
             }
         };
+        // `jobs.progress` carries the whole text so far. The copy per delta
+        // is bounded by the request's output cap, which the pipeline
+        // enforces.
         let mut so_far = String::new();
         let mut on_delta = |delta: &str| {
             so_far.push_str(delta);
@@ -248,7 +252,11 @@ impl TransformProcessor for UnconfiguredProcessor {
     ) -> TransformResult {
         failure_result(
             request,
-            Failure::new(FailureReason::ProviderUnavailable, false, "no processing configured"),
+            Failure::new(
+                FailureReason::ProviderUnavailable,
+                false,
+                "no processing configured",
+            ),
             Timing {
                 queued_ms,
                 processing_ms: 0.0,
@@ -366,6 +374,15 @@ impl TransformProcessor for FakeProcessor {
                 });
             }
             std::thread::sleep(Duration::from_millis(5));
+        }
+        // Deltas the pacing had no tick left for still stream before the
+        // outcome, so the script is honored whatever `work_ms` is.
+        for delta in deltas {
+            so_far.push_str(&delta);
+            on_partial(Partial {
+                text: so_far.clone(),
+                stability_hint: "growing".to_string(),
+            });
         }
         self.returned
             .lock()
@@ -536,12 +553,8 @@ mod tests {
             })
         };
         let started = Instant::now();
-        let outcome = provider.recognize(
-            vec![0u8; 64],
-            "job-x",
-            &mut |_partial: Partial| {},
-            &token,
-        );
+        let outcome =
+            provider.recognize(vec![0u8; 64], "job-x", &mut |_partial: Partial| {}, &token);
         let elapsed = started.elapsed();
         canceller.join().expect("canceller thread");
         assert!(
@@ -570,12 +583,8 @@ mod tests {
         let token = CancelToken::new();
         token.cancel();
         let started = Instant::now();
-        let outcome = provider.recognize(
-            vec![0u8; 64],
-            "job-y",
-            &mut |_partial: Partial| {},
-            &token,
-        );
+        let outcome =
+            provider.recognize(vec![0u8; 64], "job-y", &mut |_partial: Partial| {}, &token);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a precancelled recognition must not run its 30 s work"

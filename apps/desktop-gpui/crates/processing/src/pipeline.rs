@@ -187,6 +187,8 @@ pub fn build_request(
         mode_version: mode.version,
         prompt_version: (model_step && provider.kind != ProviderKind::S1)
             .then(|| crate::prompt::PROMPT_VERSION.to_string()),
+        // Kinds name the model step only (validate_provider): a builtin
+        // request carries none, and the insight event records the same.
         kinds: if model_step {
             mode.transform_kinds.clone()
         } else {
@@ -306,6 +308,8 @@ fn execute(
             "the request names a different provider",
         ));
     }
+    // S1 splits its input into prompts of at most `max_input_chars` (see
+    // `providers::s1`), so for it the cap is per prompt, not per request.
     if request.input.chars().count() as u64 > u64::from(decl.max_input_chars)
         && decl.kind != ProviderKind::S1
     {

@@ -13,7 +13,8 @@ serde_json = "1"
 # The cancellation signal the runtime's jobs already use (issue #251).
 starling-dictation = { path = "../dictation" }
 # Same HTTP stack and posture as the dictation client: async reqwest on a
-# private current-thread runtime behind a blocking facade, rustls only.
+# private runtime behind a blocking facade, rustls only.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `macros` is for tokio::select! in http.rs, not only the tests.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
 url = "2"

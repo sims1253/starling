@@ -94,7 +94,7 @@ impl ProcessingRecorded {
             occurred_at: occurred_at.into(),
             type_: "processing_recorded".to_string(),
             job_id: event_id(&request.request_id),
-            mode_id: request.mode_id.clone(),
+            mode_id: event_id(&request.mode_id),
             mode_version: request.mode_version,
             provider_kind: request.provider.kind,
             locality: request.provider.locality,

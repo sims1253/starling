@@ -423,12 +423,21 @@ impl Draft {
         &self.attempts
     }
 
-    /// The ids of the final attempts the visible raw text came from.
+    /// The ids of the final attempts the visible raw text came from: the
+    /// latest attempt per segment, in segment order, like [`Self::raw_text`].
     pub fn source_attempt_ids(&self) -> Vec<String> {
-        self.attempts
-            .iter()
-            .map(|attempt| attempt.attempt_id.clone())
-            .collect()
+        let mut latest: Vec<(u32, &str)> = Vec::new();
+        for attempt in &self.attempts {
+            match latest
+                .iter_mut()
+                .find(|(segment, _)| *segment == attempt.segment)
+            {
+                Some(entry) => entry.1 = &attempt.attempt_id,
+                None => latest.push((attempt.segment, &attempt.attempt_id)),
+            }
+        }
+        latest.sort_by_key(|(segment, _)| *segment);
+        latest.into_iter().map(|(_, id)| id.to_string()).collect()
     }
 
     pub fn request(&self, request_id: &str) -> Option<&RequestRecord> {
@@ -542,15 +551,12 @@ impl Draft {
                 return index;
             }
             if pos < at && at < end {
-                let region = self.regions[index].clone();
-                let (left, right) = split_chars(&region.text, at - pos);
-                let (left, right) = (left.to_string(), right.to_string());
-                let mut left_region = region.clone();
-                left_region.text = left;
-                let mut right_region = region;
+                let left = &mut self.regions[index];
+                let cut = left.text.len() - split_chars(&left.text, at - pos).1.len();
+                let right = left.text.split_off(cut);
+                let mut right_region = left.clone();
                 right_region.text = right;
-                self.regions
-                    .splice(index..=index, [left_region, right_region]);
+                self.regions.insert(index + 1, right_region);
                 return index + 1;
             }
             pos = end;
@@ -1234,5 +1240,14 @@ mod tests {
         assert_eq!(draft.accept("r1", false), Outcome::StaleRejected);
         assert_eq!(draft.text(), "raw words typed later");
         assert_eq!(draft.raw_text(), "raw words");
+    }
+
+    #[test]
+    fn source_attempts_are_the_latest_per_segment() {
+        let mut draft = Draft::new("d", "c");
+        draft.final_attempt(1, "att-b", "second ");
+        draft.final_attempt(0, "att-a", "first ");
+        draft.final_attempt(1, "att-b2", "second again");
+        assert_eq!(draft.source_attempt_ids(), ["att-a", "att-b2"]);
     }
 }

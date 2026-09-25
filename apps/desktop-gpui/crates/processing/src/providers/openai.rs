@@ -11,9 +11,7 @@
 use serde_json::{json, Value};
 use starling_dictation::client::CancelToken;
 
-use super::{
-    deadline, malformed, max_tokens, non_empty, sse_data, ChatConfig, Collected, Provider,
-};
+use super::{deadline, malformed, max_tokens, non_empty, ChatConfig, Collected, Provider};
 use crate::contract::{Failure, FailureReason, ProviderDecl, TransformRequest};
 use crate::http::{failure, join, validate_endpoint, Http, LineControl};
 use crate::prompt;
@@ -45,12 +43,18 @@ impl OpenAiProvider {
                 {"role": "system", "content": prompt.system},
                 {"role": "user", "content": prompt.user},
             ],
-            "temperature": 0,
-            "max_tokens": max_tokens(request),
             "stream": self.config.stream,
         });
-        if let Some(effort) = &self.config.reasoning_effort {
-            body["reasoning_effort"] = json!(effort);
+        match &self.config.reasoning_effort {
+            // Reasoning models reject `max_tokens` and a set temperature.
+            Some(effort) => {
+                body["reasoning_effort"] = json!(effort);
+                body["max_completion_tokens"] = json!(max_tokens(request));
+            }
+            None => {
+                body["temperature"] = json!(0);
+                body["max_tokens"] = json!(max_tokens(request));
+            }
         }
         if self.config.disable_thinking {
             body["chat_template_kwargs"] = json!({"enable_thinking": false});
@@ -72,15 +76,12 @@ pub(crate) struct StreamState {
     pub finished: bool,
 }
 
-/// Handles one SSE line of a chat-completions stream.
-pub(crate) fn stream_line(
-    line: &str,
+/// Handles one event of a chat-completions stream.
+pub(crate) fn stream_event(
+    data: &str,
     state: &mut StreamState,
     out: &mut Collected,
 ) -> Result<LineControl, Failure> {
-    let Some(data) = sse_data(line) else {
-        return Ok(LineControl::Continue);
-    };
     let data = data.trim();
     if data == "[DONE]" {
         state.finished = true;
@@ -130,8 +131,9 @@ fn finish(reason: Option<&Value>, state: &mut StreamState) -> Result<LineControl
             "the provider's content filter stopped the answer",
         )),
         Some(_) => {
+            // Done: nothing after the finish reason becomes part of the answer.
             state.finished = true;
-            Ok(LineControl::Continue)
+            Ok(LineControl::Done)
         }
     }
 }
@@ -151,6 +153,14 @@ pub(crate) fn parse_body(body: &str, out: &mut Collected) -> Result<(), Failure>
     }
     let mut state = StreamState::default();
     finish(choice.get("finish_reason"), &mut state)?;
+    if !state.finished {
+        // Same rule as a stream: no finish reason, no complete answer.
+        return Err(failure(
+            FailureReason::TruncatedOutput,
+            true,
+            "the response has no finish reason",
+        ));
+    }
     Ok(())
 }
 
@@ -170,14 +180,14 @@ impl Provider for OpenAiProvider {
         let mut out = Collected::new(request.max_output_chars, on_delta);
         if self.config.stream {
             let mut state = StreamState::default();
-            let mut on_line = |line: &str| stream_line(line, &mut state, &mut out);
+            let mut on_event = |data: &str| stream_event(data, &mut state, &mut out);
             self.http.post_json(
                 &self.url,
                 &headers,
                 &body,
                 deadline(request),
                 cancel,
-                Some(&mut on_line),
+                Some(&mut on_event),
             )?;
             if !state.finished {
                 return Err(failure(

@@ -46,7 +46,8 @@ def load_table() -> dict[str, Any]:
 
 
 def table_for(table: dict[str, Any], language: str | None) -> dict[str, Any] | None:
-    primary = (language or "en").split("-", 1)[0]
+    # BCP 47 tags are case-insensitive; the table keys are lowercase.
+    primary = (language or "en").split("-", 1)[0].lower()
     return table["languages"].get(primary)
 
 
@@ -75,7 +76,8 @@ def apply(text: str, *, language: str | None, spoken_commands: bool,
     phrases: list[tuple[list[str], int, dict[str, Any]]] = []
     if spoken_commands and lang:
         for command in lang["commands"]:
-            phrases.append((command["phrase"].lower().split(), 0, command))
+            phrase = command["phrase"].lower()
+            phrases.append(([phrase[s:e] for s, e in _tokens(phrase)], 0, command))
     for snippet in snippets:
         words = [snippet["spoken"].lower()[s:e] for s, e in _tokens(snippet["spoken"].lower())]
         phrases.append((words, 1,

@@ -43,17 +43,24 @@ use crate::bus::EventBus;
 use crate::machine::capture::{TakeRecord, TakeRegistry};
 use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
 use crate::protocol::tables::JOBS;
-use crate::protocol::{Command, CompletionData, Event, JobLimits, RejectReason, TransformRequest, TransformResult};
+use crate::protocol::{
+    Command, CompletionData, Event, JobLimits, RejectReason, TransformRequest, TransformResult,
+};
 
 use super::context::FrozenRoutes;
-use crate::provider::{CancelToken, Partial, ProviderOutcome, TranscriptionProvider, TransformProcessor};
+use crate::provider::{
+    CancelToken, Partial, ProviderOutcome, TranscriptionProvider, TransformProcessor,
+};
 use starling_processing::contract::{Locality, ResultStatus};
 
 /// Messages the scheduler receives.
 pub enum JobsMsg {
     Command(Inbound),
     /// A worker's report about its job.
-    Worker { job: String, report: WorkerReport },
+    Worker {
+        job: String,
+        report: WorkerReport,
+    },
     Shutdown,
 }
 
@@ -235,7 +242,12 @@ impl JobsActor {
     }
 
     fn handle_command(&mut self, inbound: Inbound) {
-        let super::Inbound { corr, command, reply, .. } = inbound;
+        let super::Inbound {
+            corr,
+            command,
+            reply,
+            ..
+        } = inbound;
         match command {
             Command::JobsSubmit {
                 capture_ref,
@@ -292,6 +304,11 @@ impl JobsActor {
             return;
         }
 
+        if let Some(rejection) = self.id_in_use("jobs.submit", &job_id, &[]) {
+            let _ = reply.try_send(Err(rejection));
+            return;
+        }
+
         // Commit the command on a fresh per-job core (from Idle — always
         // legal), which parks it awaiting exactly one of
         // jobs.queued | jobs.rejected on this corr.
@@ -307,19 +324,12 @@ impl JobsActor {
         }
 
         // Admission control (I0): the enumerated rejection reasons.
-        let rejection = if self.limits.max_concurrent == 0 {
-            Some(RejectReason::ResourceLimits)
-        } else if self.jobs.values().any(|job| {
+        let duplicate = self.jobs.values().any(|job| {
             matches!(job.kind, JobKind::Recognition)
                 && job.capture_ref == capture_ref
                 && is_active(job.core.state())
-        }) {
-            Some(RejectReason::DuplicateSubmission)
-        } else if self.waiting.len() >= self.limits.max_queued as usize {
-            Some(RejectReason::QueueFull)
-        } else {
-            None
-        };
+        });
+        let rejection = self.admission(duplicate, self.waiting.len());
 
         let job = Job {
             kind: JobKind::Recognition,
@@ -348,6 +358,25 @@ impl JobsActor {
             return;
         }
         let job_id = corr.unwrap_or_else(|| request.request_id.clone());
+        // Retry identity: the retried job is superseded. It is stopped only
+        // once the retry is admitted, so a rejected retry leaves it running.
+        let superseded: Vec<String> = match request.retry_of.as_deref() {
+            Some(retry_of) => self
+                .jobs
+                .iter()
+                .filter(|(id, job)| {
+                    is_active(job.core.state())
+                        && matches!(&job.kind, JobKind::Transform(active)
+                            if active.request_id == retry_of || id.as_str() == retry_of)
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Some(rejection) = self.id_in_use("jobs.transform", &job_id, &superseded) {
+            let _ = reply.try_send(Err(rejection));
+            return;
+        }
         let mut core = MachineCore::new(&JOBS);
         if let Err(violation) = core.commit_command("jobs.transform", Some(job_id.clone())) {
             core.record_violation(violation.clone());
@@ -358,38 +387,30 @@ impl JobsActor {
             }));
             return;
         }
-        // Retry identity: the retried job is superseded; stop it before
-        // admission so it does not hold a worker slot for a result that
-        // could only land as superseded.
-        if let Some(retry_of) = request.retry_of.as_deref() {
-            let superseded: Vec<String> = self
-                .jobs
-                .iter()
-                .filter(|(id, job)| {
-                    is_active(job.core.state())
-                        && matches!(&job.kind, JobKind::Transform(active)
-                            if active.request_id == retry_of || id.as_str() == retry_of)
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in superseded {
-                self.cancel_job(&id);
-            }
-        }
-        let duplicate = self.jobs.values().any(|job| {
-            is_active(job.core.state())
+        let duplicate = self.jobs.iter().any(|(id, job)| {
+            !superseded.contains(id)
+                && is_active(job.core.state())
                 && matches!(&job.kind, JobKind::Transform(active) if active.request_id == request.request_id)
         });
-        let rejection = if self.limits.max_concurrent == 0 {
-            Some(RejectReason::ResourceLimits)
-        } else if duplicate {
-            Some(RejectReason::DuplicateSubmission)
-        } else if self.waiting.len() >= self.limits.max_queued as usize {
-            Some(RejectReason::QueueFull)
-        } else {
-            None
-        };
+        // A superseded job still waiting gives its queue place to the retry.
+        let waiting = self
+            .waiting
+            .iter()
+            .filter(|id| !superseded.contains(id))
+            .count();
+        let rejection = self.admission(duplicate, waiting);
+        if rejection.is_none() {
+            // Stopped before the retry queues, so it holds no worker slot
+            // for a result that could only land as superseded.
+            for id in &superseded {
+                self.cancel_job(id);
+            }
+        }
         let job = Job {
+            // The take id as the request names it. Unlike a submit's
+            // captureRef it is not checked against this runtime's take
+            // registry: a transform may run on a take captured before a
+            // restart, and it reads no audio.
             capture_ref: request.capture_id.clone(),
             route: request.provider.route.clone(),
             budget: String::new(),
@@ -399,6 +420,36 @@ impl JobsActor {
             cancel: CancelToken::new(),
         };
         self.admit(reply, job_id, job, rejection);
+    }
+
+    /// Admission control (I0), shared by submits and transforms:
+    /// `waiting` is the queue length the new job would join.
+    fn admission(&self, duplicate: bool, waiting: usize) -> Option<RejectReason> {
+        if self.limits.max_concurrent == 0 {
+            Some(RejectReason::ResourceLimits)
+        } else if duplicate {
+            Some(RejectReason::DuplicateSubmission)
+        } else if waiting >= self.limits.max_queued as usize {
+            Some(RejectReason::QueueFull)
+        } else {
+            None
+        }
+    }
+
+    /// A job id names one per-job machine. While the job on it is active
+    /// (of either kind), a new submit or transform on the same id is
+    /// illegal in that state; it must never replace the live entry.
+    /// `except` are ids about to be superseded.
+    fn id_in_use(&self, command: &str, job_id: &str, except: &[String]) -> Option<Rejection> {
+        let job = self.jobs.get(job_id)?;
+        let state = job.core.state();
+        (is_active(state) && !except.iter().any(|id| id == job_id)).then(|| {
+            Rejection::IllegalInState {
+                command: command.to_string(),
+                state: state.to_string(),
+                detail: format!("job {job_id} is still active"),
+            }
+        })
     }
 
     /// Records an admitted-or-rejected job and resolves its outcome.
@@ -484,13 +535,21 @@ impl JobsActor {
 
     /// Cancels an active job on the runtime's own initiative (a retry
     /// superseded it): the same commit and teardown as `jobs.cancel`.
+    ///
+    /// Callers pass active jobs only, and `jobs.cancel` is legal from every
+    /// active state; worker reports arrive through this same actor, so a
+    /// job cannot turn terminal between the choice and the commit. Should
+    /// the commit still fail, the violation is recorded, not dropped.
     fn cancel_job(&mut self, job_id: &str) {
-        let committed = self
-            .jobs
-            .get_mut(job_id)
-            .is_some_and(|job| job.core.commit_command("jobs.cancel", Some(job_id.to_string())).is_ok());
-        if committed {
-            self.stop_cancelled(job_id);
+        let Some(job) = self.jobs.get_mut(job_id) else {
+            return;
+        };
+        match job
+            .core
+            .commit_command("jobs.cancel", Some(job_id.to_string()))
+        {
+            Ok(_) => self.stop_cancelled(job_id),
+            Err(violation) => job.core.record_violation(violation),
         }
     }
 
@@ -519,12 +578,13 @@ impl JobsActor {
             if self.active.len() >= self.limits.max_concurrent as usize {
                 return;
             }
-            let per_route_active = |jobs: &HashMap<String, Job>, active: &HashSet<String>, route: &str| {
-                active
-                    .iter()
-                    .filter(|id| jobs.get(*id).map(|job| job.route == route).unwrap_or(false))
-                    .count() as u32
-            };
+            let per_route_active =
+                |jobs: &HashMap<String, Job>, active: &HashSet<String>, route: &str| {
+                    active
+                        .iter()
+                        .filter(|id| jobs.get(*id).map(|job| job.route == route).unwrap_or(false))
+                        .count() as u32
+                };
             let route_cap = |limits: &JobLimits, route: &str| -> u32 {
                 limits
                     .per_route
@@ -734,14 +794,29 @@ impl JobsActor {
         }
     }
 
-    fn spawn_transform_worker(&mut self, job_id: String, request: Box<TransformRequest>, queued_ms: f64) {
+    fn spawn_transform_worker(
+        &mut self,
+        job_id: String,
+        request: Box<TransformRequest>,
+        queued_ms: f64,
+    ) {
         let processor = Arc::clone(&self.processor);
         let inbox = self.worker_inbox.clone();
-        let cancel = self
-            .jobs
-            .get(&job_id)
-            .map(|job| job.cancel.clone())
-            .unwrap_or_default();
+        // The job was advanced to Transforming on this same call path, so
+        // its entry exists; a miss is an internal fault and fails the job
+        // rather than running it with a cancel token nobody can trip.
+        let Some(cancel) = self.jobs.get(&job_id).map(|job| job.cancel.clone()) else {
+            self.emit(
+                &job_id,
+                Event::JobsFailed {
+                    reason: "internal_dispatch_error".to_string(),
+                    retryable: false,
+                },
+            );
+            self.active.remove(&job_id);
+            self.retire(&job_id);
+            return;
+        };
         let worker_job = job_id.clone();
         // Supervised like a recognition worker: a panic is demoted to
         // Failed{worker_crash, retryable}.
@@ -852,7 +927,12 @@ impl JobsActor {
                 // A completed result ends the job with the proposal; a
                 // provider failure ends it with the typed reason.
                 let event = match (&result.status, &result.failure) {
-                    (ResultStatus::Completed, _) => Event::JobsTransformed(Box::new(result)),
+                    (ResultStatus::Completed, None) => Event::JobsTransformed(Box::new(result)),
+                    // Completed and failed at once is no result at all.
+                    (ResultStatus::Completed, Some(_)) => Event::JobsFailed {
+                        reason: "malformed_response".to_string(),
+                        retryable: false,
+                    },
                     (_, Some(failure)) => Event::JobsFailed {
                         reason: failure.reason.as_str().to_string(),
                         retryable: failure.retryable,
@@ -911,10 +991,7 @@ impl JobsActor {
             // forever; the debug_assert fires in testing on the invariant
             // break itself.
             debug_assert!(
-                matches!(
-                    state,
-                    "Completed" | "Failed" | "Cancelled" | "Rejected"
-                ),
+                matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected"),
                 "retiring job {job_id} in non-terminal state {state}"
             );
             if matches!(state, "Completed" | "Failed" | "Cancelled" | "Rejected")
@@ -1177,7 +1254,10 @@ mod tests {
             )
         });
         std::thread::sleep(Duration::from_millis(30));
-        assert!(!worker.is_finished(), "delivery should be parked on the full inbox");
+        assert!(
+            !worker.is_finished(),
+            "delivery should be parked on the full inbox"
+        );
         drop(rx); // shutdown while the worker waits for room
         assert_eq!(
             worker.join().expect("worker thread"),

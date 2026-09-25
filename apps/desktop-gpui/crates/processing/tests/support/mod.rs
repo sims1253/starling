@@ -28,7 +28,14 @@ impl Recorded {
     }
 
     pub fn json(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.body).expect("request body is JSON")
+        serde_json::from_slice(&self.body).unwrap_or_else(|error| {
+            // read_request only reads content-length bodies (no chunked
+            // uploads, no 100-continue).
+            panic!(
+                "request body is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&self.body)
+            )
+        })
     }
 }
 
@@ -37,8 +44,6 @@ pub type Step = Box<dyn FnOnce(&Recorded, &mut TcpStream) + Send>;
 pub struct FakeServer {
     pub addr: SocketAddr,
     pub requests: Arc<Mutex<Vec<Recorded>>>,
-    /// Set by a step when it saw the client close the connection.
-    pub client_closed: Arc<Mutex<bool>>,
 }
 
 impl FakeServer {
@@ -60,8 +65,11 @@ impl FakeServer {
                     let Some(request) = read_request(&mut stream) else {
                         return;
                     };
+                    // Logging and taking the step under one lock keeps
+                    // request N paired with step N.
                     let step = {
-                        log.lock().unwrap().push(request.clone());
+                        let mut log = log.lock().unwrap();
+                        log.push(request.clone());
                         steps.lock().unwrap().pop_front()
                     };
                     match step {
@@ -74,11 +82,7 @@ impl FakeServer {
                 });
             }
         });
-        FakeServer {
-            addr,
-            requests,
-            client_closed: Arc::new(Mutex::new(false)),
-        }
+        FakeServer { addr, requests }
     }
 
     pub fn url(&self) -> String {
@@ -195,7 +199,9 @@ pub fn stall(hold: Duration) -> Step {
 }
 
 /// Streams one event every `gap` until the client hangs up (or `max`
-/// events), recording whether the hang-up was observed.
+/// events), recording whether the hang-up was observed. The hang-up is
+/// seen by reading the socket (EOF or reset), not by waiting for a write
+/// to fail, which the kernel's buffers can delay for many events.
 pub fn slow_sse_until_closed(
     event: String,
     gap: Duration,
@@ -203,12 +209,27 @@ pub fn slow_sse_until_closed(
     closed: Arc<Mutex<bool>>,
 ) -> Step {
     Box::new(move |_, stream| {
+        if let Ok(mut reader) = stream.try_clone() {
+            let closed = Arc::clone(&closed);
+            std::thread::spawn(move || {
+                let mut byte = [0u8; 1];
+                while let Ok(read) = reader.read(&mut byte) {
+                    if read == 0 {
+                        break;
+                    }
+                }
+                *closed.lock().unwrap() = true;
+            });
+        }
         let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
         if stream.write_all(head.as_bytes()).is_err() {
             *closed.lock().unwrap() = true;
             return;
         }
         for _ in 0..max {
+            if *closed.lock().unwrap() {
+                return;
+            }
             let payload = format!("{event}\n\n");
             let chunk = format!("{:x}\r\n{payload}\r\n", payload.len());
             if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {

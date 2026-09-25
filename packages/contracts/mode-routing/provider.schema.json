@@ -20,7 +20,8 @@
     "valid result (docs/ggml-engine.md 's1 engine notes').",
     "builtin is the deterministic step alone (spoken commands, snippets):",
     "local, no model call, used when a mode asks for no model kinds but",
-    "still has spoken commands or snippets."
+    "still has spoken commands or snippets.",
+    "The builtin kind runs no model kinds; every other kind runs at least one (allOf)."
   ],
   "type": "object",
   "additionalProperties": false,
@@ -37,6 +38,34 @@
     "model",
     "artifact",
     "max_input_chars"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "builtin"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "transform_kinds": {
+            "maxItems": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "transform_kinds": {
+            "minItems": 1
+          }
+        }
+      }
+    }
   ],
   "properties": {
     "schema_version": {
@@ -66,7 +95,8 @@
           "rewrite",
           "translate"
         ]
-      }
+      },
+      "uniqueItems": true
     },
     "languages": {
       "type": "array",
