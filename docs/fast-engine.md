@@ -155,12 +155,26 @@ near-tie words and punctuation, in both directions.
 Tuned on-device (see `benchmarks/fast_engine/RESEARCH_LOG.md` for the
 experiment log and `AUTORESEARCH.md` for the method). Vendor-keyed defaults
 for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128),
-f32 GEMM products, GEMV rows 8 with RSPLIT row slots padding workgroups to a
-whole subgroup; the CPU transducer decoder splits its GEMV rows across a
-second thread (held spinning for one transcription, parked in between);
-W4 decode GEMVs unpack nibbles with `unpackUnorm4x8`. ggml runs with the app's 6 threads. Transcripts match
-ggml on the fixtures; FLEURS en_us 100: Parakeet 5.33 % (ggml 5.47 %), MOSS
-q4e8 7.87 % (ggml 7.92 %).
+f32 GEMM products, GEMV rows 16 pinned (measured best-or-tied at every MOSS
+decode shape — rows=8 cost 15–31 % on the small-N GEMVs whose per-workgroup
+x re-read rivals the weights; RESEARCH_LOG P1-8) with RSPLIT row slots
+padding workgroups to a whole subgroup; the CPU transducer decoder splits its
+GEMV rows across a second thread (held spinning for one transcription,
+parked in between); W4 decode GEMVs unpack nibbles with `unpackUnorm4x8`.
+ggml runs with the app's 6 threads. Transcripts match ggml on the fixtures;
+FLEURS en_us 100: Parakeet 5.33 % (ggml 5.47 %), MOSS q4e8 7.87 %
+(ggml 7.92 %).
+
+Two further PowerVR notes from the layout research (#317, same log):
+`gemv_w4um` processes two tokens' GEMVs in one weight pass (1.76–2.11× the
+per-token rate; the verify primitive for #311's speculative decoding — not
+dispatched by the engine yet), and the GPU driver on the Pixel 10 Pro can
+enter a degraded state under sustained load where fences time out (#325):
+the engine marks itself wedged, leaves a 15-minute marker file
+(`starling-fast-gpu-wedged`, in `STARLING_FAST_CACHE_DIR`) so fresh
+processes refuse with a restart hint instead of joining a retry storm, and
+checks `VK_EXT_memory_budget` before the big allocations where the driver
+exposes it.
 
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |
 | --- | --- | --- | --- |
