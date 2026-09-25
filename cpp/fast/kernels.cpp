@@ -125,6 +125,8 @@ GMat arena_matrix(Arena& a, HostMatrix&& m) {
     g.K = m.K;
     g.q = a.add(std::move(m.q));
     if (!m.s.empty()) { g.s = a.add(std::move(m.s)); g.has_s = true; }
+    if (!m.x.empty()) { g.x = a.add(std::move(m.x)); g.has_x = true; }
+    g.layout = m.layout;
     return g;
 }
 

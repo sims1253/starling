@@ -257,21 +257,26 @@ bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err) {
 }
 
 void permute_rows(HostMatrix& m, const std::vector<uint32_t>& src) {
-    const size_t qw = m.q.size() / m.N, sw = m.N ? m.s.size() / m.N : 0;
-    std::vector<uint32_t> q(m.q.size()), s(m.s.size());
+    const size_t qw = m.q.size() / m.N, sw = m.N ? m.s.size() / m.N : 0,
+                 xw = m.N ? m.x.size() / m.N : 0;
+    std::vector<uint32_t> q(m.q.size()), s(m.s.size()), x(m.x.size());
     for (size_t r = 0; r < src.size(); ++r) {
         std::copy_n(m.q.begin() + src[r] * qw, qw, q.begin() + r * qw);
         if (sw) std::copy_n(m.s.begin() + src[r] * sw, sw, s.begin() + r * sw);
+        if (xw) std::copy_n(m.x.begin() + src[r] * xw, xw, x.begin() + r * xw);
     }
     m.q.swap(q);
     m.s.swap(s);
+    m.x.swap(x);
 }
 
 bool concat_rows(HostMatrix& a, const HostMatrix& b, std::string& err) {
     if (a.fmt != b.fmt || a.K != b.K) { err = "concat_rows: format/K mismatch"; return false; }
     if (a.fmt == GpuFmt::F16 && ((size_t)a.N * a.K) % 2) { err = "concat_rows: odd f16 size"; return false; }
+    if (a.x.empty() != b.x.empty()) { err = "concat_rows: super-scale mismatch"; return false; }
     a.q.insert(a.q.end(), b.q.begin(), b.q.end());
     a.s.insert(a.s.end(), b.s.begin(), b.s.end());
+    a.x.insert(a.x.end(), b.x.begin(), b.x.end());
     a.N += b.N;
     a.lossless = a.lossless && b.lossless;
     return true;
