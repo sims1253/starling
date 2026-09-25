@@ -57,9 +57,10 @@ fn table() -> &'static Table {
 }
 
 fn language_table(language: Option<&str>) -> Option<&'static Language> {
+    // BCP 47 tags are case-insensitive; the table keys are lowercase.
     let language = language.unwrap_or("en");
     let primary = language.split('-').next().unwrap_or(language);
-    table().languages.get(primary)
+    table().languages.get(&primary.to_ascii_lowercase())
 }
 
 /// Whether spoken commands exist for this (declared) language.
@@ -98,6 +99,9 @@ pub fn apply(
     spoken_commands: bool,
     snippets: &[Snippet],
 ) -> String {
+    if !spoken_commands && snippets.is_empty() {
+        return text.to_owned();
+    }
     let lang = language_table(language);
     let literal = lang.map_or("literal", |lang| lang.literal.as_str());
     let mut phrases: Vec<Phrase> = Vec::new();
@@ -107,7 +111,8 @@ pub fn apply(
                 let words: Vec<String> = command
                     .phrase
                     .to_lowercase()
-                    .split(' ')
+                    .split(is_ws)
+                    .filter(|word| !word.is_empty())
                     .map(str::to_string)
                     .collect();
                 phrases.push(Phrase {

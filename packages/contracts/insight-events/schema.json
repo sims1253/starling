@@ -314,6 +314,7 @@
         },
         "transform_kinds": {
           "type": "array",
+          "uniqueItems": true,
           "items": {
             "enum": [
               "clean",

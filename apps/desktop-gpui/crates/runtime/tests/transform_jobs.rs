@@ -12,15 +12,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use starling_processing::contract::{
-    FailureReason, Locality, ProviderKind, ProviderRef, RequestContext, ResultStatus, TransformKind,
-    TransformRequest,
+    FailureReason, Locality, ProviderKind, ProviderRef, RequestContext, ResultStatus,
+    TransformKind, TransformRequest,
 };
 use starling_processing::pipeline::Registry;
 use starling_runtime::bus::{EventMessage, EventSub};
 use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::replay::MachineReplay;
 use starling_runtime::protocol::{Command, Event, JobLimits, RejectReason};
-use starling_runtime::provider::{FakeProcessor, FakeTransform, PipelineProcessor, TransformProcessor};
+use starling_runtime::provider::{
+    FakeProcessor, FakeTransform, PipelineProcessor, TransformProcessor,
+};
 use starling_runtime::{Runtime, RuntimeClient, RuntimeConfig};
 
 fn request(id: &str, locality: Locality) -> TransformRequest {
@@ -59,7 +61,10 @@ fn request(id: &str, locality: Locality) -> TransformRequest {
     }
 }
 
-fn start(processor: Arc<dyn TransformProcessor>, limits: JobLimits) -> (Runtime, RuntimeClient, EventSub) {
+fn start(
+    processor: Arc<dyn TransformProcessor>,
+    limits: JobLimits,
+) -> (Runtime, RuntimeClient, EventSub) {
     let config = RuntimeConfig::default()
         .with_processor(processor)
         .with_jobs_limits(limits);
@@ -101,7 +106,10 @@ fn until_terminal(events: &EventSub, corr: &str, terminal: &[&str]) -> Vec<Event
 fn wait_for(what: &str, predicate: impl Fn() -> bool) {
     let start = Instant::now();
     while !predicate() {
-        assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timed out waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -121,20 +129,29 @@ fn a_transform_job_runs_through_transforming_and_replays_green() {
         "v": 1, "id": "cmd_t1", "ts": "2026-09-24T10:00:00Z", "corr": "job-t1",
         "type": command.type_name(), "payload": command.payload_value(),
     });
-    client.send(Some("job-t1"), command).expect("transform accepted");
+    client
+        .send(Some("job-t1"), command)
+        .expect("transform accepted");
     let seen = until_terminal(&events, "job-t1", &["jobs.transformed", "jobs.failed"]);
 
     let types: Vec<&str> = seen.iter().map(|m| m.event.type_name()).collect();
     assert_eq!(types.first(), Some(&"jobs.queued"));
     assert_eq!(types.last(), Some(&"jobs.transformed"));
-    assert!(types.contains(&"jobs.progress"), "streamed output: {types:?}");
+    assert!(
+        types.contains(&"jobs.progress"),
+        "streamed output: {types:?}"
+    );
     let Event::JobsTransformed(result) = &seen.last().unwrap().event else {
         unreachable!()
     };
     assert_eq!(result.status, ResultStatus::Completed);
     assert_eq!(result.text.as_deref(), Some("So the meeting is at three."));
     assert_eq!(result.request_id, "req-1");
-    assert!(result.timing.queued_ms >= 0.0);
+    assert!(
+        (0.0..5_000.0).contains(&result.timing.queued_ms),
+        "queued wait measured: {}",
+        result.timing.queued_ms
+    );
     assert!(result.timing.processing_ms > 0.0);
 
     // The live stream, with the internal dispatch chain stepped over,
@@ -145,7 +162,9 @@ fn a_transform_job_runs_through_transforming_and_replays_green() {
     for message in &seen {
         if message.event.type_name() != "jobs.queued" && !advanced {
             for state in ["Dispatched", "Loading", "Transforming"] {
-                replay.feed(&serde_json::json!({ "$advance": state })).unwrap();
+                replay
+                    .feed(&serde_json::json!({ "$advance": state }))
+                    .unwrap();
             }
             advanced = true;
         }
@@ -161,12 +180,16 @@ fn a_transform_job_runs_through_transforming_and_replays_green() {
 
 #[test]
 fn a_provider_failure_ends_the_job_with_its_typed_reason() {
-    let processor = FakeProcessor::new(vec![FakeTransform::fails(FailureReason::RateLimited, true)]);
+    let processor =
+        FakeProcessor::new(vec![FakeTransform::fails(FailureReason::RateLimited, true)]);
     let (runtime, client, events) = start(processor, limits(4, 1));
     client
-        .send(Some("job-f"), Command::JobsTransform {
-            request: Box::new(request("req-f", Locality::Local)),
-        })
+        .send(
+            Some("job-f"),
+            Command::JobsTransform {
+                request: Box::new(request("req-f", Locality::Local)),
+            },
+        )
         .unwrap();
     let seen = until_terminal(&events, "job-f", &["jobs.transformed", "jobs.failed"]);
     match &seen.last().unwrap().event {
@@ -188,18 +211,29 @@ fn cancel_stops_the_processor_and_nothing_is_reported() {
     }]);
     let (runtime, client, events) = start(processor.clone(), limits(4, 1));
     client
-        .send(Some("job-c"), Command::JobsTransform {
-            request: Box::new(request("req-c", Locality::Local)),
-        })
+        .send(
+            Some("job-c"),
+            Command::JobsTransform {
+                request: Box::new(request("req-c", Locality::Local)),
+            },
+        )
         .unwrap();
-    wait_for("the processor to start", || !processor.requests().is_empty());
+    wait_for("the processor to start", || {
+        !processor.requests().is_empty()
+    });
     client
-        .send(None, Command::JobsCancel {
-            job_id: "job-c".into(),
-        })
+        .send(
+            None,
+            Command::JobsCancel {
+                job_id: "job-c".into(),
+            },
+        )
         .expect("cancel accepted");
     wait_for("the processor to return", || processor.returned("req-c"));
     // Nothing but the admission outcome ever lands on the job's stream.
+    // The processor has returned; its worker reports (or not) right after,
+    // so this grace covers that report reaching the stream. A report that
+    // came later could only make this pass wrongly, never fail spuriously.
     std::thread::sleep(Duration::from_millis(100));
     let mut types = Vec::new();
     while let Ok(message) = events.recv_timeout(Duration::from_millis(20)) {
@@ -218,12 +252,21 @@ fn a_local_only_request_naming_a_remote_provider_is_refused_before_admission() {
     let (runtime, client, _events) = start(processor.clone(), limits(4, 1));
     let mut sneaky = request("req-r", Locality::Remote);
     sneaky.local_only = true;
-    let refused = client.send(Some("job-r"), Command::JobsTransform {
-        request: Box::new(sneaky),
-    });
-    assert!(matches!(refused, Err(Rejection::RemoteForbidden { .. })), "{refused:?}");
+    let refused = client.send(
+        Some("job-r"),
+        Command::JobsTransform {
+            request: Box::new(sneaky),
+        },
+    );
+    assert!(
+        matches!(refused, Err(Rejection::RemoteForbidden { .. })),
+        "{refused:?}"
+    );
     std::thread::sleep(Duration::from_millis(50));
-    assert!(processor.requests().is_empty(), "nothing reached the processor");
+    assert!(
+        processor.requests().is_empty(),
+        "nothing reached the processor"
+    );
     runtime.shutdown();
 }
 
@@ -239,17 +282,25 @@ fn a_retry_supersedes_the_job_it_retries() {
     ]);
     let (runtime, client, events) = start(processor.clone(), limits(4, 1));
     client
-        .send(Some("job-1"), Command::JobsTransform {
-            request: Box::new(request("req-1", Locality::Local)),
-        })
+        .send(
+            Some("job-1"),
+            Command::JobsTransform {
+                request: Box::new(request("req-1", Locality::Local)),
+            },
+        )
         .unwrap();
-    wait_for("the first job to start", || !processor.requests().is_empty());
+    wait_for("the first job to start", || {
+        !processor.requests().is_empty()
+    });
     let mut retry = request("req-2", Locality::Local);
     retry.retry_of = Some("req-1".to_string());
     client
-        .send(Some("job-2"), Command::JobsTransform {
-            request: Box::new(retry),
-        })
+        .send(
+            Some("job-2"),
+            Command::JobsTransform {
+                request: Box::new(retry),
+            },
+        )
         .unwrap();
     wait_for("the superseded job to stop", || processor.returned("req-1"));
     let seen = until_terminal(&events, "job-2", &["jobs.transformed", "jobs.failed"]);
@@ -257,6 +308,97 @@ fn a_retry_supersedes_the_job_it_retries() {
         panic!("the retry completes: {:?}", seen.last().unwrap().event)
     };
     assert_eq!(result.text.as_deref(), Some("second"));
+    runtime.shutdown();
+}
+
+#[test]
+fn a_rejected_retry_leaves_the_job_it_retries_running() {
+    let processor = FakeProcessor::new(vec![
+        FakeTransform {
+            deltas: vec![],
+            outcome: Ok("first".into()),
+            work_ms: 300,
+        },
+        FakeTransform::returns("queued"),
+    ]);
+    let (runtime, client, events) = start(processor.clone(), limits(1, 1));
+    client
+        .send(
+            Some("job-1"),
+            Command::JobsTransform {
+                request: Box::new(request("req-1", Locality::Local)),
+            },
+        )
+        .unwrap();
+    wait_for("the first job to start", || {
+        !processor.requests().is_empty()
+    });
+    client
+        .send(
+            Some("job-q"),
+            Command::JobsTransform {
+                request: Box::new(request("req-q", Locality::Local)),
+            },
+        )
+        .unwrap();
+    // The queue is full, so the retry is rejected ...
+    let mut retry = request("req-2", Locality::Local);
+    retry.retry_of = Some("req-1".to_string());
+    client
+        .send(
+            Some("job-2"),
+            Command::JobsTransform {
+                request: Box::new(retry),
+            },
+        )
+        .unwrap();
+    let seen = until_terminal(&events, "job-2", &["jobs.rejected", "jobs.queued"]);
+    assert!(matches!(
+        seen.last().unwrap().event,
+        Event::JobsRejected {
+            reason: RejectReason::QueueFull
+        }
+    ));
+    // ... and the job it named was not superseded: it completes.
+    let seen = until_terminal(&events, "job-1", &["jobs.transformed", "jobs.failed"]);
+    let Event::JobsTransformed(result) = &seen.last().unwrap().event else {
+        panic!("the original completes: {:?}", seen.last().unwrap().event)
+    };
+    assert_eq!(result.text.as_deref(), Some("first"));
+    runtime.shutdown();
+}
+
+#[test]
+fn a_new_job_never_replaces_an_active_job_on_the_same_id() {
+    let processor = FakeProcessor::new(vec![FakeTransform {
+        deltas: vec![],
+        outcome: Ok("kept".into()),
+        work_ms: 300,
+    }]);
+    let (runtime, client, events) = start(processor.clone(), limits(4, 1));
+    client
+        .send(
+            Some("job-x"),
+            Command::JobsTransform {
+                request: Box::new(request("req-x1", Locality::Local)),
+            },
+        )
+        .unwrap();
+    let refused = client.send(
+        Some("job-x"),
+        Command::JobsTransform {
+            request: Box::new(request("req-x2", Locality::Local)),
+        },
+    );
+    assert!(
+        matches!(refused, Err(Rejection::IllegalInState { .. })),
+        "{refused:?}"
+    );
+    let seen = until_terminal(&events, "job-x", &["jobs.transformed", "jobs.failed"]);
+    let Event::JobsTransformed(result) = &seen.last().unwrap().event else {
+        panic!("the live job completes: {:?}", seen.last().unwrap().event)
+    };
+    assert_eq!(result.request_id, "req-x1");
     runtime.shutdown();
 }
 
@@ -269,14 +411,20 @@ fn the_same_request_twice_is_a_duplicate_submission() {
     }]);
     let (runtime, client, events) = start(processor.clone(), limits(4, 1));
     client
-        .send(Some("job-a"), Command::JobsTransform {
-            request: Box::new(request("req-same", Locality::Local)),
-        })
+        .send(
+            Some("job-a"),
+            Command::JobsTransform {
+                request: Box::new(request("req-same", Locality::Local)),
+            },
+        )
         .unwrap();
     client
-        .send(Some("job-b"), Command::JobsTransform {
-            request: Box::new(request("req-same", Locality::Local)),
-        })
+        .send(
+            Some("job-b"),
+            Command::JobsTransform {
+                request: Box::new(request("req-same", Locality::Local)),
+            },
+        )
         .unwrap();
     let seen = until_terminal(&events, "job-b", &["jobs.rejected", "jobs.queued"]);
     assert!(matches!(
@@ -300,20 +448,29 @@ fn transform_jobs_share_the_bounded_queue() {
     ]);
     let (runtime, client, events) = start(processor.clone(), limits(1, 1));
     client
-        .send(Some("q-1"), Command::JobsTransform {
-            request: Box::new(request("req-q1", Locality::Local)),
-        })
+        .send(
+            Some("q-1"),
+            Command::JobsTransform {
+                request: Box::new(request("req-q1", Locality::Local)),
+            },
+        )
         .unwrap();
     wait_for("the first job to run", || !processor.requests().is_empty());
     client
-        .send(Some("q-2"), Command::JobsTransform {
-            request: Box::new(request("req-q2", Locality::Local)),
-        })
+        .send(
+            Some("q-2"),
+            Command::JobsTransform {
+                request: Box::new(request("req-q2", Locality::Local)),
+            },
+        )
         .unwrap();
     client
-        .send(Some("q-3"), Command::JobsTransform {
-            request: Box::new(request("req-q3", Locality::Local)),
-        })
+        .send(
+            Some("q-3"),
+            Command::JobsTransform {
+                request: Box::new(request("req-q3", Locality::Local)),
+            },
+        )
         .unwrap();
     let seen = until_terminal(&events, "q-3", &["jobs.rejected", "jobs.queued"]);
     assert!(matches!(
@@ -341,22 +498,28 @@ fn the_pipeline_processor_runs_builtin_and_refuses_unknown_providers() {
         artifact_sha256: None,
     };
     client
-        .send(Some("job-b"), Command::JobsTransform {
-            request: Box::new(builtin),
-        })
+        .send(
+            Some("job-b"),
+            Command::JobsTransform {
+                request: Box::new(builtin),
+            },
+        )
         .unwrap();
     let seen = until_terminal(&events, "job-b", &["jobs.transformed", "jobs.failed"]);
     let Event::JobsTransformed(result) = &seen.last().unwrap().event else {
         panic!("{:?}", seen.last().unwrap().event)
     };
-    // The request's input already went through the deterministic step
-    // when it was built; the builtin run passes it through.
+    // The input is already normalized text; the builtin run passes it
+    // through unchanged.
     assert_eq!(result.text.as_deref(), Some("first new line second"));
 
     client
-        .send(Some("job-u"), Command::JobsTransform {
-            request: Box::new(request("req-u", Locality::Local)),
-        })
+        .send(
+            Some("job-u"),
+            Command::JobsTransform {
+                request: Box::new(request("req-u", Locality::Local)),
+            },
+        )
         .unwrap();
     let seen = until_terminal(&events, "job-u", &["jobs.transformed", "jobs.failed"]);
     match &seen.last().unwrap().event {

@@ -403,12 +403,17 @@ pub struct Failure {
     pub detail: String,
 }
 
+/// Failure details are cut to this many characters.
+pub const MAX_DETAIL_CHARS: usize = 300;
+
 impl Failure {
+    /// The detail is cut to [`MAX_DETAIL_CHARS`], whoever builds the failure.
     pub fn new(reason: FailureReason, retryable: bool, detail: impl Into<String>) -> Failure {
+        let detail: String = detail.into();
         Failure {
             reason,
             retryable,
-            detail: detail.into(),
+            detail: detail.chars().take(MAX_DETAIL_CHARS).collect(),
         }
     }
 }

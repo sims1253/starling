@@ -145,6 +145,28 @@ fn reason(result: &starling_processing::contract::TransformResult) -> FailureRea
 // OpenAI-compatible
 // ---------------------------------------------------------------------------
 
+/// A provider call blocks until its request is on the wire, so anything
+/// it sent was sent before `run` returned; this grace only covers the fake
+/// server reading and logging it.
+fn settle() {
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Cancels `cancel` once the server has logged a request and `after` has
+/// passed, so the cancel lands mid-answer however slow the runner is.
+fn cancel_after_request(server: &FakeServer, cancel: &CancelToken, after: Duration) {
+    let requests = Arc::clone(&server.requests);
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(after);
+        cancel.cancel();
+    });
+}
+
 #[test]
 fn streaming_answer_arrives_in_order_and_completes() {
     let server = FakeServer::start(vec![sse(
@@ -231,6 +253,45 @@ fn reasoning_looking_text_in_the_answer_is_never_stripped() {
 }
 
 #[test]
+fn an_event_split_over_data_lines_is_one_event() {
+    let server = FakeServer::start(vec![sse(
+        vec![
+            "data: {\"choices\": [{\"delta\":\ndata: {\"content\": \"Joined.\"}, \"finish_reason\": \"stop\"}]}"
+                .to_string(),
+        ],
+        Duration::from_millis(1),
+        true,
+    )]);
+    let (provider, decl) = openai(&server, true);
+    let (result, _) = run(&provider, &request(&decl, "hello"), &CancelToken::new());
+    assert_eq!(result.text.as_deref(), Some("Joined."), "{result:?}");
+}
+
+#[test]
+fn text_after_the_finish_reason_is_not_the_answer() {
+    let server = FakeServer::start(vec![sse(
+        vec![chunk("Done."), finish("stop"), chunk(" garbage")],
+        Duration::from_millis(1),
+        true,
+    )]);
+    let (provider, decl) = openai(&server, true);
+    let (result, deltas) = run(&provider, &request(&decl, "hello"), &CancelToken::new());
+    assert_eq!(result.text.as_deref(), Some("Done."), "{result:?}");
+    assert_eq!(deltas, vec!["Done."]);
+}
+
+#[test]
+fn a_whole_answer_without_a_finish_reason_is_truncated() {
+    let server = FakeServer::start(vec![ok_json(
+        json!({"choices": [{"message": {"content": "Cut"}}]}),
+    )]);
+    let (provider, decl) = openai(&server, false);
+    let (result, _) = run(&provider, &request(&decl, "hello"), &CancelToken::new());
+    assert_eq!(reason(&result), FailureReason::TruncatedOutput);
+    assert!(result.text.is_none());
+}
+
+#[test]
 fn a_slow_server_times_out_at_the_deadline() {
     let server = FakeServer::start(vec![stall(Duration::from_secs(10))]);
     let (provider, decl) = openai(&server, true);
@@ -278,16 +339,9 @@ fn cancel_aborts_the_stream_and_closes_the_connection() {
     )]);
     let (provider, decl) = openai(&server, true);
     let cancel = CancelToken::new();
-    let canceller = {
-        let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            cancel.cancel();
-        })
-    };
+    cancel_after_request(&server, &cancel, Duration::from_millis(100));
     let started = Instant::now();
     let (result, deltas) = run(&provider, &request(&decl, "hello"), &cancel);
-    canceller.join().unwrap();
     assert_eq!(result.status, ResultStatus::Cancelled);
     assert!(result.text.is_none());
     assert!(!deltas.is_empty());
@@ -310,7 +364,7 @@ fn a_precancelled_job_sends_nothing() {
     cancel.cancel();
     let (result, _) = run(&provider, &request(&decl, "hello"), &cancel);
     assert_eq!(result.status, ResultStatus::Cancelled);
-    std::thread::sleep(Duration::from_millis(50));
+    settle();
     assert!(server.requests().is_empty());
 }
 
@@ -324,7 +378,7 @@ fn redirects_are_refused_not_followed() {
     let (provider, decl) = openai(&server, true);
     let (result, _) = run(&provider, &request(&decl, "hello"), &CancelToken::new());
     assert_eq!(reason(&result), FailureReason::RedirectBlocked);
-    std::thread::sleep(Duration::from_millis(50));
+    settle();
     assert_eq!(
         server.requests().len(),
         1,
@@ -482,7 +536,7 @@ fn a_local_only_request_never_reaches_a_remote_provider() {
     req.local_only = true;
     let (result, _) = run(&provider, &req, &CancelToken::new());
     assert_eq!(reason(&result), FailureReason::RemoteForbidden);
-    std::thread::sleep(Duration::from_millis(50));
+    settle();
     assert!(server.requests().is_empty(), "nothing was sent");
 }
 
@@ -523,10 +577,18 @@ fn thinking_controls_are_sent_only_when_configured() {
         &request(&decl, "x"),
         &CancelToken::new(),
     );
+    // The runs are sequential: sent[0] is the `plain` request, sent[1] the
+    // `tuned` one.
     let sent = server.requests();
     assert!(sent[0].json().get("reasoning_effort").is_none());
     assert!(sent[0].json().get("chat_template_kwargs").is_none());
+    assert_eq!(sent[0].json()["temperature"], 0);
+    assert!(sent[0].json()["max_tokens"].is_u64());
     assert_eq!(sent[1].json()["reasoning_effort"], "minimal");
+    // Shaped for a reasoning model: no max_tokens, no temperature.
+    assert!(sent[1].json().get("max_tokens").is_none());
+    assert!(sent[1].json().get("temperature").is_none());
+    assert!(sent[1].json()["max_completion_tokens"].is_u64());
     assert_eq!(
         sent[1].json()["chat_template_kwargs"]["enable_thinking"],
         false
@@ -633,7 +695,7 @@ fn s1_refuses_other_languages_and_instructions_without_sending() {
         reason(&run(&provider, &rewrite, &CancelToken::new()).0),
         FailureReason::UnsupportedKind
     );
-    std::thread::sleep(Duration::from_millis(50));
+    settle();
     assert!(server.requests().is_empty());
 }
 
@@ -711,13 +773,7 @@ fn s1_cancel_also_cancels_on_the_server() {
     ]);
     let (provider, decl) = s1(&server);
     let cancel = CancelToken::new();
-    {
-        let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            cancel.cancel();
-        });
-    }
+    cancel_after_request(&server, &cancel, Duration::from_millis(50));
     let started = Instant::now();
     let (result, _) = run(&provider, &s1_request(&decl, "hello"), &cancel);
     assert_eq!(result.status, ResultStatus::Cancelled);
@@ -781,6 +837,8 @@ fn anthropic_streams_text_deltas() {
     assert_eq!(sent.header("x-api-key"), Some("ak-test"));
     assert_eq!(sent.header("anthropic-version"), Some("2023-06-01"));
     assert!(sent.json().get("thinking").is_none());
+    // Current Claude models reject any temperature but the default.
+    assert!(sent.json().get("temperature").is_none());
 }
 
 #[test]
@@ -870,4 +928,11 @@ fn gemini_max_tokens_and_cut_streams_are_truncation() {
         reason(&run(&streaming, &remote_request(&decl, "x"), &CancelToken::new()).0),
         FailureReason::TruncatedOutput
     );
+}
+
+#[test]
+fn a_gemini_model_id_must_be_a_plain_path_segment() {
+    let mut decl = decl(ProviderKind::Gemini, Locality::Remote);
+    decl.model = "gemini/../../other?x=1".to_string();
+    assert!(GeminiProvider::new(decl, ChatConfig::new("https://g.example")).is_err());
 }

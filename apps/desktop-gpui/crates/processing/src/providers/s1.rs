@@ -10,8 +10,10 @@
 //!
 //! S1-mini was trained on prompts of at most 1000 tokens. Longer
 //! transcripts are split at sentence ends into chunks of at most
-//! [`CHUNK_CHARS`] and normalized one after another; the outputs are
-//! joined with a space.
+//! [`CHUNK_CHARS`] (or the declaration's `max_input_chars`, if smaller)
+//! and normalized one after another; the outputs are joined with a space.
+//! So `max_input_chars` bounds each prompt, not the whole transcript; the
+//! request's deadline bounds the total work.
 //!
 //! Cancellation: the job returns at once (the connection is dropped) and
 //! no further chunk is sent. The provider also sends `DELETE
@@ -31,7 +33,7 @@ use crate::contract::{
     self, Failure, FailureReason, Formality, ProviderDecl, Structure, Style, StyleContext,
     TransformKind, TransformRequest,
 };
-use crate::http::{failure, join, validate_endpoint, Http};
+use crate::http::{error_message, failure, join, status_failure, validate_endpoint, Http};
 
 /// Chunk size for long transcripts, in characters. At ~4 characters per
 /// token this keeps each prompt near half of S1-mini's 1000-token limit,
@@ -92,7 +94,7 @@ impl S1Provider {
         chunk: &str,
         id: &str,
         style: &Style,
-        deadline: Duration,
+        remaining: Duration,
         cancel: &CancelToken,
     ) -> Result<String, Failure> {
         let (styling, structure, context) = style.s1_controls();
@@ -104,19 +106,28 @@ impl S1Provider {
         });
         let url = join(&self.endpoint, "normalize");
         let headers = [("x-request-id", id.to_string())];
-        let answer = match self
-            .http
-            .post_json(&url, &headers, &body, deadline, cancel, None)
-        {
+        let answer = match self.http.post_json_with(
+            &url,
+            &headers,
+            &body,
+            remaining,
+            cancel,
+            None,
+            s1_status_failure,
+        ) {
             Ok(answer) => answer,
             Err(error) => {
                 if error.reason == FailureReason::Cancelled {
-                    self.http.delete_best_effort(
-                        &join(&self.endpoint, &format!("v1/audio/transcriptions/{id}")),
-                        Duration::from_millis(500),
-                    );
+                    let mut cancel_url = self.endpoint.clone();
+                    if let Ok(mut path) = cancel_url.path_segments_mut() {
+                        // `push` percent-encodes the id as one segment.
+                        path.pop_if_empty()
+                            .extend(["v1", "audio", "transcriptions", id]);
+                    }
+                    self.http
+                        .delete_best_effort(cancel_url.as_str(), Duration::from_millis(500));
                 }
-                return Err(s1_failure(error));
+                return Err(error);
             }
         };
         let value: Value =
@@ -129,32 +140,28 @@ impl S1Provider {
     }
 }
 
-/// Refines the generic status mapping with what starling-serve's
-/// `/normalize` says (see its handler).
-fn s1_failure(error: Failure) -> Failure {
-    let detail = error.detail.clone();
-    if detail.contains("model has no text path") {
-        return failure(
-            FailureReason::ProviderUnavailable,
-            false,
-            "the server at this endpoint runs an audio model; start a second starling-serve with the S1-mini GGUF",
-        );
-    }
-    if detail.contains("server busy") || detail.contains("model not loaded") {
-        return failure(FailureReason::ProviderUnavailable, true, detail);
-    }
-    if detail.contains("HTTP 499") {
-        return failure(FailureReason::Cancelled, false, detail);
-    }
-    if detail.contains("HTTP 504") {
-        return failure(FailureReason::Timeout, true, detail);
-    }
-    if detail.contains("HTTP 400") {
+/// Maps starling-serve's `/normalize` statuses (see its handler in
+/// `cpp/serve/main.cpp`) to typed failures.
+fn s1_status_failure(status: u16, retry_after: Option<&str>, body: &str) -> Failure {
+    let generic = status_failure(status, retry_after, body);
+    let detail = generic.detail.clone();
+    match status {
+        // Busy, or the model is not loaded yet.
+        503 => failure(FailureReason::ProviderUnavailable, true, detail),
+        499 => failure(FailureReason::Cancelled, false, detail),
+        504 => failure(FailureReason::Timeout, true, detail),
+        400 if error_message(body).is_some_and(|message| message.contains("no text path")) => {
+            failure(
+                FailureReason::ProviderUnavailable,
+                false,
+                "the server at this endpoint runs an audio model; start a second starling-serve with the S1-mini GGUF",
+            )
+        }
         // Prompt too long, unknown control value, malformed body: the
         // same request would fail the same way.
-        return failure(FailureReason::InvalidInput, false, detail);
+        400 | 413 => failure(FailureReason::InvalidInput, false, detail),
+        _ => generic,
     }
-    error
 }
 
 /// Splits `text` into chunks of at most `limit` characters, preferring
@@ -164,7 +171,8 @@ pub fn chunks(text: &str, limit: usize) -> Vec<&str> {
     let limit = limit.max(1);
     let mut out = Vec::new();
     let mut rest = text;
-    while rest.chars().count() > limit {
+    let mut left = rest.chars().count();
+    while left > limit {
         let window_end = rest
             .char_indices()
             .nth(limit)
@@ -177,10 +185,11 @@ pub fn chunks(text: &str, limit: usize) -> Vec<&str> {
                     && window[index + c.len_utf8()..].starts_with(char::is_whitespace)
             })
             .map(|(index, c)| index + c.len_utf8())
-            .last();
+            .next_back();
         let space = window.rfind(char::is_whitespace).filter(|&index| index > 0);
         let cut = sentence.or(space).unwrap_or(window_end);
         out.push(&rest[..cut]);
+        left -= rest[..cut].chars().count();
         rest = &rest[cut..];
     }
     if !rest.is_empty() {
@@ -205,7 +214,9 @@ impl Provider for S1Provider {
         let started = Instant::now();
         let budget = deadline(request);
         let mut output = String::new();
-        for (index, chunk) in chunks(&request.input, CHUNK_CHARS).into_iter().enumerate() {
+        let mut output_chars = 0u64;
+        let limit = CHUNK_CHARS.min(self.decl.max_input_chars as usize);
+        for (index, chunk) in chunks(&request.input, limit).into_iter().enumerate() {
             if chunk.trim().is_empty() {
                 continue;
             }
@@ -229,7 +240,8 @@ impl Provider for S1Provider {
             } else {
                 format!(" {text}")
             };
-            if (output.chars().count() + piece.chars().count()) as u64 > request.max_output_chars {
+            output_chars += piece.chars().count() as u64;
+            if output_chars > request.max_output_chars {
                 return Err(over_cap(request.max_output_chars));
             }
             on_delta(&piece);

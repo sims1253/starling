@@ -9,9 +9,7 @@
 use serde_json::{json, Value};
 use starling_dictation::client::CancelToken;
 
-use super::{
-    deadline, malformed, max_tokens, non_empty, sse_data, ChatConfig, Collected, Provider,
-};
+use super::{deadline, malformed, max_tokens, non_empty, ChatConfig, Collected, Provider};
 use crate::contract::{Failure, FailureReason, ProviderDecl, TransformRequest};
 use crate::http::{failure, join, validate_endpoint, Http, LineControl};
 use crate::prompt;
@@ -26,6 +24,18 @@ pub struct GeminiProvider {
 impl GeminiProvider {
     pub fn new(decl: ProviderDecl, config: ChatConfig) -> Result<GeminiProvider, String> {
         let endpoint = validate_endpoint(&config.endpoint, decl.locality)?;
+        // The model id goes into the URL path as is.
+        if decl.model.is_empty()
+            || !decl
+                .model
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(format!(
+                "\"{}\" is not a Gemini model id (letters, digits, '-', '_', '.')",
+                decl.model
+            ));
+        }
         let method = if config.stream {
             "streamGenerateContent?alt=sse"
         } else {
@@ -124,17 +134,17 @@ impl Provider for GeminiProvider {
         let mut out = Collected::new(request.max_output_chars, on_delta);
         if self.config.stream {
             let mut finished = false;
-            let mut on_line = |line: &str| -> Result<LineControl, Failure> {
-                let Some(data) = sse_data(line) else {
-                    return Ok(LineControl::Continue);
-                };
+            let mut on_event = |data: &str| -> Result<LineControl, Failure> {
                 if data.trim().is_empty() {
                     return Ok(LineControl::Continue);
                 }
                 let value: Value = serde_json::from_str(data)
                     .map_err(|_| malformed("a stream chunk is not JSON"))?;
                 if fold(&value, &mut out)? {
+                    // Done: nothing after the finish reason becomes part
+                    // of the answer.
                     finished = true;
+                    return Ok(LineControl::Done);
                 }
                 Ok(LineControl::Continue)
             };
@@ -144,7 +154,7 @@ impl Provider for GeminiProvider {
                 &body,
                 deadline(request),
                 cancel,
-                Some(&mut on_line),
+                Some(&mut on_event),
             )?;
             if !finished {
                 return Err(failure(

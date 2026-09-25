@@ -31,6 +31,11 @@ pub trait Provider: Send + Sync {
 
     /// Runs the model on `request.input`. Streams text deltas through
     /// `on_delta` when the provider can; returns the complete output.
+    ///
+    /// A failure can come after some deltas were streamed (a length stop,
+    /// a content filter, a dropped connection). Deltas are progress only:
+    /// on a failure the caller discards them, and only the returned text
+    /// is ever the answer.
     fn run(
         &self,
         request: &TransformRequest,
@@ -39,8 +44,8 @@ pub trait Provider: Send + Sync {
     ) -> Result<String, Failure>;
 }
 
-/// Connection settings every chat provider shares.
-#[derive(Clone, Debug)]
+/// Connection settings every chat provider shares. `Debug` redacts the key.
+#[derive(Clone)]
 pub struct ChatConfig {
     /// Base URL (`https://api.openai.com/v1`, `http://127.0.0.1:8080/v1`).
     pub endpoint: String,
@@ -51,13 +56,31 @@ pub struct ChatConfig {
     pub stream: bool,
     /// OpenAI `reasoning_effort` for reasoning models ("minimal", "low").
     /// Left unset, nothing is sent: plain chat models reject the field.
+    /// Set, the request is shaped for a reasoning model: the output budget
+    /// goes in `max_completion_tokens` and no `temperature` is sent, since
+    /// those models reject `max_tokens` and any non-default temperature.
     pub reasoning_effort: Option<String>,
     /// Ask for a non-thinking answer where the API has a switch
     /// (llama-server/vLLM `chat_template_kwargs.enable_thinking=false`,
-    /// Gemini `thinkingBudget: 0`).
+    /// Gemini `thinkingBudget: 0`). Off by default: the llama-server/vLLM
+    /// field is an extension that strict OpenAI-compatible endpoints
+    /// (OpenAI itself included) reject.
     pub disable_thinking: bool,
     /// Response size cap in bytes.
     pub max_response_bytes: usize,
+}
+
+impl std::fmt::Debug for ChatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatConfig")
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("stream", &self.stream)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("disable_thinking", &self.disable_thinking)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
 }
 
 impl ChatConfig {
@@ -73,11 +96,12 @@ impl ChatConfig {
     }
 }
 
-/// The output token budget for a request: generous against its character
-/// cap (one token is at least ~2 characters in every script these models
-/// write), so a length stop means the answer really was too long.
+/// The output token budget for a request: one token per character of its
+/// cap. A token is at least about one character even in dense scripts
+/// (CJK), so a length stop means the answer really was too long; the
+/// character cap itself is enforced on the text.
 pub(crate) fn max_tokens(request: &TransformRequest) -> u64 {
-    (request.max_output_chars / 2).clamp(64, 32_768)
+    request.max_output_chars.clamp(64, 32_768)
 }
 
 pub(crate) fn deadline(request: &TransformRequest) -> Duration {
@@ -145,11 +169,4 @@ pub(crate) fn non_empty(text: String) -> Result<String, Failure> {
 
 pub(crate) fn build_http(max_response_bytes: usize) -> Result<Http, String> {
     Http::new(max_response_bytes)
-}
-
-/// Parses one server-sent-events `data:` line; `None` for comments, event
-/// names, blank separators and other fields.
-pub(crate) fn sse_data(line: &str) -> Option<&str> {
-    let data = line.strip_prefix("data:")?;
-    Some(data.strip_prefix(' ').unwrap_or(data))
 }

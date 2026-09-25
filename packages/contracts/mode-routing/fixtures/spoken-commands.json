@@ -8,6 +8,14 @@
     "output": "hello, how are you?"
   },
   {
+    "name": "language_tags_are_case_insensitive",
+    "language": "EN-us",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello, world"
+  },
+  {
     "name": "asr_punctuation_is_replaced",
     "language": "en",
     "spoken_commands": true,

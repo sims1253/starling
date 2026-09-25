@@ -8,9 +8,7 @@
 use serde_json::{json, Value};
 use starling_dictation::client::CancelToken;
 
-use super::{
-    deadline, malformed, max_tokens, non_empty, sse_data, ChatConfig, Collected, Provider,
-};
+use super::{deadline, malformed, max_tokens, non_empty, ChatConfig, Collected, Provider};
 use crate::contract::{Failure, FailureReason, ProviderDecl, TransformRequest};
 use crate::http::{failure, join, validate_endpoint, Http, LineControl};
 use crate::prompt;
@@ -42,7 +40,8 @@ impl AnthropicProvider {
             "system": prompt.system,
             "messages": [{"role": "user", "content": prompt.user}],
             "max_tokens": max_tokens(request),
-            "temperature": 0,
+            // No `temperature`: models after Claude Opus 4.6 reject any
+            // value but the default.
             "stream": self.config.stream,
         })
     }
@@ -72,14 +71,11 @@ fn stop(reason: Option<&str>) -> Result<(), Failure> {
     }
 }
 
-pub(crate) fn stream_line(
-    line: &str,
+pub(crate) fn stream_event(
+    data: &str,
     finished: &mut bool,
     out: &mut Collected,
 ) -> Result<LineControl, Failure> {
-    let Some(data) = sse_data(line) else {
-        return Ok(LineControl::Continue);
-    };
     if data.trim().is_empty() {
         return Ok(LineControl::Continue);
     }
@@ -156,14 +152,14 @@ impl Provider for AnthropicProvider {
         let mut out = Collected::new(request.max_output_chars, on_delta);
         if self.config.stream {
             let mut finished = false;
-            let mut on_line = |line: &str| stream_line(line, &mut finished, &mut out);
+            let mut on_event = |data: &str| stream_event(data, &mut finished, &mut out);
             self.http.post_json(
                 &self.url,
                 &headers,
                 &body,
                 deadline(request),
                 cancel,
-                Some(&mut on_line),
+                Some(&mut on_event),
             )?;
             if !finished {
                 return Err(failure(

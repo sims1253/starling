@@ -1,7 +1,7 @@
 //! The HTTP core every processing provider shares (#294).
 //!
 //! Same posture as `starling-dictation`'s transcription client: a
-//! blocking facade over async reqwest on a private current-thread runtime,
+//! blocking facade over async reqwest on a private single-worker runtime,
 //! redirects refused (a 3xx is `redirect_blocked`, never followed), bodies
 //! read under a hard size cap, and every request raced against the job's
 //! [`CancelToken`] and its deadline, so a cancel or an expired deadline
@@ -9,7 +9,7 @@
 //!
 //! Failures come back as the contract's typed [`Failure`]. Details carry
 //! status codes and provider error messages, never request text, and are
-//! cut to [`MAX_DETAIL_CHARS`].
+//! cut to [`crate::contract::MAX_DETAIL_CHARS`].
 
 use std::time::Duration;
 
@@ -25,19 +25,12 @@ use crate::contract::{Failure, FailureReason, Locality};
 /// bounding what a broken endpoint can make the client buffer.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-const MAX_DETAIL_CHARS: usize = 300;
-
 pub(crate) fn failure(
     reason: FailureReason,
     retryable: bool,
     detail: impl Into<String>,
 ) -> Failure {
-    let detail: String = detail.into();
-    Failure {
-        reason,
-        retryable,
-        detail: detail.chars().take(MAX_DETAIL_CHARS).collect(),
-    }
+    Failure::new(reason, retryable, detail)
 }
 
 /// Whether `url`'s host is this machine.
@@ -83,12 +76,15 @@ pub(crate) fn join(base: &Url, path: &str) -> String {
     format!("{base}/{}", path.trim_start_matches('/'))
 }
 
-/// What a streaming reader does after one line.
+/// What a streaming reader does after one server-sent event.
 pub(crate) enum LineControl {
     Continue,
     /// The stream said it is done; stop reading.
     Done,
 }
+
+/// The reader a streaming request hands each event's data to.
+pub(crate) type OnEvent<'a> = &'a mut dyn FnMut(&str) -> Result<LineControl, Failure>;
 
 pub(crate) struct Http {
     client: Client,
@@ -119,8 +115,9 @@ impl Http {
     }
 
     /// POSTs `body` as JSON and returns the response body. With
-    /// `on_line`, the body is handed over line by line as it arrives
-    /// (server-sent events) and the returned string is empty; the reader
+    /// `on_event`, the body is read as server-sent events: each event's
+    /// data (its `data:` lines joined with `\n`) is handed over as soon as
+    /// the event is complete, and the returned string is empty; the reader
     /// may stop early with [`LineControl::Done`] or abort with a failure.
     pub(crate) fn post_json(
         &self,
@@ -129,7 +126,31 @@ impl Http {
         body: &Value,
         deadline: Duration,
         cancel: &CancelToken,
-        mut on_line: Option<&mut dyn FnMut(&str) -> Result<LineControl, Failure>>,
+        on_event: Option<OnEvent<'_>>,
+    ) -> Result<String, Failure> {
+        self.post_json_with(
+            url,
+            headers,
+            body,
+            deadline,
+            cancel,
+            on_event,
+            status_failure,
+        )
+    }
+
+    /// [`Self::post_json`] with the provider's own mapping of a non-2xx
+    /// answer (`status`, `Retry-After`, body) to a typed failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn post_json_with(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &Value,
+        deadline: Duration,
+        cancel: &CancelToken,
+        mut on_event: Option<OnEvent<'_>>,
+        map_status: fn(u16, Option<&str>, &str) -> Failure,
     ) -> Result<String, Failure> {
         if cancel.is_cancelled() {
             return Err(failure(FailureReason::Cancelled, false, ""));
@@ -156,12 +177,13 @@ impl Http {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
                 let body = read_capped(&mut response, limit).await.unwrap_or_default();
-                return Err(status_failure(status, retry_after.as_deref(), &body));
+                return Err(map_status(status, retry_after.as_deref(), &body));
             }
-            match on_line.as_mut() {
+            match on_event.as_mut() {
                 None => read_capped(&mut response, limit).await,
-                Some(on_line) => {
+                Some(on_event) => {
                     let mut pending: Vec<u8> = Vec::new();
+                    let mut data: Option<String> = None;
                     let mut total = 0usize;
                     while let Some(chunk) = response.chunk().await.map_err(body_failure)? {
                         total += chunk.len();
@@ -172,15 +194,21 @@ impl Http {
                         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                             let line: Vec<u8> = pending.drain(..=newline).collect();
                             let line = String::from_utf8_lossy(&line);
-                            if let LineControl::Done = on_line(line.trim_end_matches(['\n', '\r']))?
-                            {
-                                return Ok(String::new());
+                            let line = line.trim_end_matches(['\n', '\r']);
+                            if let Some(event) = sse_line(line, &mut data) {
+                                if let LineControl::Done = on_event(&event)? {
+                                    return Ok(String::new());
+                                }
                             }
                         }
                     }
                     if !pending.is_empty() {
                         let line = String::from_utf8_lossy(&pending).into_owned();
-                        on_line(line.trim_end_matches('\r'))?;
+                        sse_line(line.trim_end_matches('\r'), &mut data);
+                    }
+                    // A last event the stream did not close with a blank line.
+                    if let Some(event) = data.take() {
+                        on_event(&event)?;
                     }
                     Ok(String::new())
                 }
@@ -201,12 +229,35 @@ impl Http {
         })
     }
 
-    /// Fire-and-forget DELETE with a short timeout (server-side cancel);
-    /// its outcome does not matter to the caller.
+    /// Fire-and-forget DELETE with a short timeout (server-side cancel).
+    /// It runs on the runtime's worker, so the caller returns at once; its
+    /// outcome does not matter.
     pub(crate) fn delete_best_effort(&self, url: &str, timeout: Duration) {
         let request = self.client.delete(url).timeout(timeout);
-        let _ = self.runtime.block_on(async { request.send().await });
+        self.runtime.spawn(async move {
+            let _ = request.send().await;
+        });
     }
+}
+
+/// Folds one server-sent-events line into the event being read. A blank
+/// line ends the event and returns its data; `data:` lines accumulate,
+/// joined with `\n`; comments and other fields are ignored.
+fn sse_line(line: &str, data: &mut Option<String>) -> Option<String> {
+    if line.is_empty() {
+        return data.take();
+    }
+    if let Some(value) = line.strip_prefix("data:") {
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match data {
+            Some(joined) => {
+                joined.push('\n');
+                joined.push_str(value);
+            }
+            None => *data = Some(value.to_string()),
+        }
+    }
+    None
 }
 
 fn too_large(limit: usize) -> Failure {
@@ -278,9 +329,12 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 /// The provider's own error message, when its body carries one
 /// (`{error: {message}}`, `{error: "..."}`, `{message}`, `{detail}`).
 pub(crate) fn error_message(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let value = match &value {
-        Value::Array(items) => items.first()?.clone(),
+    error_message_value(&serde_json::from_str(body).ok()?)
+}
+
+fn error_message_value(value: &Value) -> Option<String> {
+    let value = match value {
+        Value::Array(items) => items.first()?,
         _ => value,
     };
     match value.get("error") {
@@ -297,8 +351,7 @@ pub(crate) fn error_message(body: &str) -> Option<String> {
         .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_string))
 }
 
-fn error_code(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
+fn error_code(value: &Value) -> Option<String> {
     let error = value.get("error")?;
     ["code", "type", "status"]
         .iter()
@@ -307,13 +360,17 @@ fn error_code(body: &str) -> Option<String> {
 
 /// Maps a non-2xx status to the typed failure vocabulary.
 pub(crate) fn status_failure(status: u16, retry_after: Option<&str>, body: &str) -> Failure {
-    let message = error_message(body).unwrap_or_default();
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(error_message_value)
+        .unwrap_or_default();
     let detail = if message.is_empty() {
         format!("HTTP {status}")
     } else {
         format!("HTTP {status}: {message}")
     };
-    let code = error_code(body).unwrap_or_default();
+    let code = parsed.as_ref().and_then(error_code).unwrap_or_default();
     if code == "model_not_found" || (status == 404 && message.to_lowercase().contains("model")) {
         return failure(FailureReason::UnknownModel, false, detail);
     }
@@ -367,6 +424,22 @@ mod tests {
         );
         assert!(!status_failure(401, None, "").retryable);
         assert!(status_failure(502, None, "").retryable);
+    }
+
+    #[test]
+    fn sse_events_join_their_data_lines() {
+        let mut data = None;
+        let lines = [": keep-alive", "event: x", "data: {\"a\":", "data: 1}", ""];
+        let events: Vec<String> = lines
+            .iter()
+            .filter_map(|line| sse_line(line, &mut data))
+            .collect();
+        assert_eq!(events, ["{\"a\":\n1}"]);
+        assert_eq!(
+            sse_line("", &mut data),
+            None,
+            "a blank line alone is no event"
+        );
     }
 
     #[test]

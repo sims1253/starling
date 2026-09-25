@@ -24,15 +24,18 @@ use starling_processing::staging::{CommandKind, Draft, Outcome, ProposalStatus, 
 use starling_processing::{transforms, CancelToken};
 use support::*;
 
+/// The contract lives in the repository, read in place so the port and the
+/// Python oracle test the same files.
 fn contract_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../packages/contracts/mode-routing")
 }
 
 fn fixture(name: &str) -> Value {
-    serde_json::from_str(
-        &std::fs::read_to_string(contract_dir().join("fixtures").join(name)).unwrap(),
-    )
-    .unwrap()
+    let path = contract_dir().join("fixtures").join(name);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("contract fixture {}: {error}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("contract fixture {}: {error}", path.display()))
 }
 
 #[test]
@@ -271,7 +274,7 @@ fn raw_survives_every_failure() {
             json!({"error": {"message": "model m not found", "code": "model_not_found"}})
                 .to_string(),
         ),
-        stall(Duration::from_secs(5)),
+        stall(Duration::from_secs(2)),
     ];
     let expected = [
         FailureReason::RateLimited,
