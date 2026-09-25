@@ -468,15 +468,16 @@ impl Store {
         let Some(document) = store.get_document(id).map_err(v2_err)? else {
             return Err(storage::StorageError::NotFound(id.to_string()));
         };
-        // A settled row (accepted or rejected) is never demoted: a job's
-        // late write of its proposal after the user already used or
-        // dismissed it lands nowhere.
+        // A settled row (accepted or rejected) is final: a job's late
+        // write of its proposal, or a Dismiss racing an accept, lands
+        // nowhere. (An accept settles its row through
+        // commit_processing_head, not here.)
         let row = proposal.to_row(id);
         let settled = document.revisions.iter().any(|stored| {
             stored.rev_id == row.rev_id
                 && matches!(RowStatus::parse(&stored.status), Some(RowStatus::Accepted | RowStatus::Rejected))
         });
-        if settled && !matches!(proposal.status, RowStatus::Accepted | RowStatus::Rejected) {
+        if settled {
             return Ok(());
         }
         store.store_document_revision(&row).map_err(v2_err)

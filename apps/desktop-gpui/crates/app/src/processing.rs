@@ -792,6 +792,12 @@ impl StarlingApp {
                                 ProcessingState::Failed { message },
                             );
                         }
+                        // The job ended with nothing to show (discarded,
+                        // cancelled, superseded): the drawer must not keep
+                        // spinning for a job that no longer exists.
+                        _ if owned => {
+                            app.set_processing(&id, label.clone(), ProcessingState::Idle);
+                        }
                         _ => {}
                     }
                     cx.notify();
