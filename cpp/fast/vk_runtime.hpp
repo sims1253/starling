@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -315,8 +316,9 @@ private:
     VkFence xfer_fence_ = VK_NULL_HANDLE;
     std::string pcache_path_;
     std::string wedge_path_;
-    bool wedged_ = false;
+    std::atomic<bool> wedged_{false};   // written under queue_mu_, read anywhere
     bool wrote_marker_ = false;
+    mutable std::mutex wedge_mu_;       // marker write vs destructor remove
     std::string wedged_why_;
     bool mem_budget_ = false;
 

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 
 namespace starling::fast {
 
@@ -886,9 +887,14 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     // STARLING_FAST_DUMP_TOKENS=path writes the generated ids (comma
     // separated); a path used repeatedly gets .1, .2 ... suffixes.
     if (const char* dp = std::getenv("STARLING_FAST_DUMP_TOKENS")) {
-        static std::map<std::string, int> seq;
-        std::string path = dp;
-        if (!seq.emplace(path, 0).second) path += "." + std::to_string(++seq[dp]);
+        static std::mutex mu;              // engine use is single-threaded
+        static std::map<std::string, int> seq;   // today; guarded regardless
+        std::string path;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            path = dp;
+            if (!seq.emplace(path, 0).second) path += "." + std::to_string(++seq[dp]);
+        }
         if (FILE* f = std::fopen(path.c_str(), "w")) {
             for (size_t i = 0; i < out_ids.size(); ++i)
                 std::fprintf(f, i ? ",%d" : "%d", (int)out_ids[i]);
