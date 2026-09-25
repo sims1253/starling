@@ -572,6 +572,14 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (m2) mi += 3;
     const bool sweep = std::strncmp(mi, "s", 1) == 0;
     if (sweep) mi += 2;
+    // alt: alternate two pipelines per rep — prices the in-context
+    // per-dispatch overhead attribution (pipeline/spec switch cost vs the
+    // same pipeline back-to-back). "alt,<bits>,<n>,<k>,<reps>" switches spec
+    // constants (rows 16/24); "altx,..." switches shader variants
+    // (gemv_w4u/gemv_w4).
+    int alt_mode = 0;   // 0 off, 1 spec switch, 2 shader switch
+    if (std::strncmp(mi, "altx,", 5) == 0) { alt_mode = 2; mi += 5; }
+    else if (std::strncmp(mi, "alt,", 4) == 0) { alt_mode = 1; mi += 4; }
     const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
     if (got < 3) {
         err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
@@ -610,8 +618,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (m2) { ga.x_off2 = k; ga.y_off2 = n; }
     const uint32_t rows_list[] = {8, 16, 24, 32, 48, 64};
     const uint32_t rows_n = sweep ? 6u : 1u;
-    vk::Recording* rec_out = nullptr;
     uint32_t rsplit_out = 1;
+    double plain_mspt = -1.0;
     // (sweep mode: one model load, one rows value per timing recording)
     std::vector<double> sweep_ms;
     for (uint32_t ri = 0; ri < rows_n; ++ri) {
@@ -623,14 +631,26 @@ bool Kernels::micro(const char* mi, std::string& err) {
     }
     const vk::Pipeline* p = ctx_->pipeline(name, {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
     if (!p) return false;
+    const vk::Pipeline* p2 = p;
+    uint32_t rows2 = rows;
+    if (alt_mode == 1) {   // same shader, different spec (rows 16 <-> 24)
+        rows2 = rows == 16u ? 24u : 16u;
+        p2 = ctx_->pipeline(name, {lanes, rows2, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
+        if (!p2) return false;
+    } else if (alt_mode == 2) {   // different shader file (w4u <-> w4)
+        p2 = ctx_->pipeline(w4_unpack_ && std::string(name) == "gemv_w4u" ? "gemv_w4" : "gemv_w4u",
+                            {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
+        if (!p2) return false;
+    }
     vk::Recording rec(*ctx_);
     rec.begin();
-    rec_out = &rec;
     rsplit_out = rsplit;
     for (uint32_t i = 0; i < reps; ++i) {
-        rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
+        const vk::Pipeline* cur = (alt_mode && (i & 1u)) ? p2 : p;
+        const uint32_t r = (alt_mode == 1 && (i & 1u)) ? rows2 : rows;
+        rec.dispatch(*cur, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
                           vk::Ref(dummy_), vk::Ref(dummy_)},
-                     &ga, sizeof(ga), ceil_div(n, rows));
+                     &ga, sizeof(ga), ceil_div(n, r));
         rec.barrier();
     }
     rec.end();
@@ -639,6 +659,13 @@ bool Kernels::micro(const char* mi, std::string& err) {
         if (ms < 0) return false;
         sweep_ms.push_back(ms / reps);
         continue;
+    }
+    {
+        // Time while `rec` is in scope (the loop body) — the rows loop below
+        // closes its scope before the reporting code runs.
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        plain_mspt = ms / reps;
     }
     // Correctness: CPU reference dot products for the first rows.
     if (bits == 4 || bits == 8) {
@@ -700,8 +727,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         std::fprintf(stderr, "[fast-micro] sweep best: rows=%u\n", best_rows);
         return true;
     }
-    const double ms = time_ms(*rec_out, err);
-    if (ms < 0) return false;
+    const double ms = plain_mspt * reps;
     const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
     if (m2) {
         // One iteration covers both tokens: per-token weight rate doubles.
@@ -712,7 +738,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
                      2.0 * n * k / (ms / reps * 1e-3) / 1e9);
     } else {
         std::fprintf(stderr,
-                     "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
+                     "[fast-micro] gemv%s bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
+                     alt_mode == 1 ? "-ALT(spec)" : alt_mode == 2 ? "-ALT(shader)" : "",
                      bits, n, k, rows, lanes, rsplit_out, ms / reps, bytes / ms * 1e-6);
     }
     return true;
