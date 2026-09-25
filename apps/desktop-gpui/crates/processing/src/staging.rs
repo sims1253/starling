@@ -329,6 +329,12 @@ impl Draft {
             }
         }
         if !head.is_empty() {
+            // A live partial never survives a restart: a persisted partial
+            // head resumes as raw text.
+            let head_kind = match head_kind {
+                RegionKind::Partial => RegionKind::Raw,
+                kind => kind,
+            };
             let mut region = Region::new(head_kind, head);
             if head_kind == RegionKind::Raw {
                 if let Some(latest) = attempts.iter().max_by_key(|attempt| attempt.segment) {

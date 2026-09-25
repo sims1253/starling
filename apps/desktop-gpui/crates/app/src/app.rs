@@ -838,7 +838,10 @@ impl StarlingApp {
         });
 
         Self {
-            error: store_error.clone().or(mode_note),
+            error: match (store_error.clone(), mode_note) {
+                (Some(store), Some(mode)) => Some(format!("{store}\n{mode}")),
+                (store, mode) => store.or(mode),
+            },
             capture_warning: None,
             export_notice: None,
             store,

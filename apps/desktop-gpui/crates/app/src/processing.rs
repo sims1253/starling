@@ -271,10 +271,14 @@ fn declared(settings: &ProcessingSettings) -> (Vec<ProviderDecl>, HashMap<&'stat
     if settings.api_model.trim().is_empty() {
         problems.insert(API_ROUTE, "Set the API model in settings.".to_string());
     } else {
-        match validate_endpoint(&settings.api_endpoint, Locality::Remote) {
+        // The same checks build_providers makes, so the preview agrees.
+        match validate_endpoint(&settings.api_endpoint, Locality::Remote)
+            .map_err(|err| format!("API endpoint: {err}"))
+            .and_then(|_| api_key(settings.api_key_env.trim()))
+        {
             Ok(_) => declarations.push(api_declaration(&settings.api_model)),
-            Err(err) => {
-                problems.insert(API_ROUTE, format!("API endpoint: {err}"));
+            Err(problem) => {
+                problems.insert(API_ROUTE, problem);
             }
         }
     }
@@ -435,7 +439,12 @@ pub(crate) fn failure_message(
             settings.s1_endpoint.trim(),
             failure.detail
         ),
-        FailureReason::UnsupportedLanguage => "S1-mini only processes English.".to_string(),
+        FailureReason::UnsupportedLanguage if result.provider.kind == ProviderKind::S1 => {
+            "S1-mini only processes English.".to_string()
+        }
+        FailureReason::UnsupportedLanguage => {
+            format!("{label} does not process this language.")
+        }
         FailureReason::RateLimited => format!(
             "{label} is rate-limiting requests; try again later. ({})",
             failure.detail

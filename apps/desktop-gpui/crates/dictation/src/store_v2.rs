@@ -1152,9 +1152,23 @@ impl StoreV2 {
         turn_seq: u32,
         revision: &RevisionRow,
     ) -> Result<(), StoreV2Error> {
+        self.commit_document_head_with(name, head_revision, turn_seq, revision, &[])
+    }
+
+    /// [`Self::commit_document_head`] plus further revision rows of the
+    /// same document (e.g. the proposal the new head accepted), all in one
+    /// transaction: either every row lands or none does.
+    pub fn commit_document_head_with(
+        &self,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &RevisionRow,
+        also: &[RevisionRow],
+    ) -> Result<(), StoreV2Error> {
         let tx = self.conn.unchecked_transaction()?;
         // A refused write returns before `commit`: dropping `tx` rolls
-        // the whole pair back.
+        // the whole set back.
         if !self.upsert_document(&revision.doc_id, name, head_revision, turn_seq)? {
             return Err(StoreV2Error::Invalid(format!(
                 "document {} head {head_revision} is older than the durable head",
@@ -1162,6 +1176,15 @@ impl StoreV2 {
             )));
         }
         self.store_document_revision(revision)?;
+        for row in also {
+            if row.doc_id != revision.doc_id {
+                return Err(StoreV2Error::Invalid(format!(
+                    "revision {} belongs to another document",
+                    row.rev_id
+                )));
+            }
+            self.store_document_revision(row)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1170,8 +1193,9 @@ impl StoreV2 {
     /// delivery rows (`revisions` and `deliveries` both declare ON DELETE
     /// CASCADE), so the document's delivery history goes too. `Ok(false)`
     /// when there was nothing to delete. Documents carry no foreign key
-    /// to a capture, so an embedder that keys a document by capture id
-    /// deletes it alongside the capture.
+    /// to a capture, and deleting a capture does not delete them: an
+    /// embedder that keys a document by capture id must call this
+    /// alongside `delete_capture` itself.
     pub fn delete_document(&self, doc_id: &str) -> Result<bool, StoreV2Error> {
         validate_document_id(doc_id)?;
         let changed = self
@@ -1182,12 +1206,12 @@ impl StoreV2 {
 
     /// Records one insight event (`packages/contracts/insight-events`)
     /// for a capture. Idempotent on `event_id` like the contract says: a
-    /// byte-identical replay is a no-op, a different payload under a
+    /// replay identical in every column is a no-op, anything else under a
     /// known id is an error, never an overwrite. The row cascades away
     /// with its capture, so deleting a take removes its events; an event
     /// for a capture that does not exist (deleted meanwhile) is
-    /// `NotFound`. The check and the insert are one statement, so the
-    /// contract holds without any lock around the store.
+    /// `NotFound`. The check, the insert and the comparison run in one
+    /// transaction, so the contract holds without a lock around the store.
     pub fn record_insight_event(
         &self,
         event_id: &str,
@@ -1196,6 +1220,7 @@ impl StoreV2 {
         occurred_at: &str,
         payload_json: &str,
     ) -> Result<(), StoreV2Error> {
+        let tx = self.conn.unchecked_transaction()?;
         if self.get_capture(capture_id)?.is_none() {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         }
@@ -1205,21 +1230,27 @@ impl StoreV2 {
              ON CONFLICT(event_id) DO NOTHING",
             params![event_id, capture_id, kind, occurred_at, payload_json],
         )?;
-        if inserted == 1 {
-            return Ok(());
+        if inserted == 0 {
+            let known: (String, String, String, String) = self.conn.query_row(
+                "SELECT capture_id, type, occurred_at, payload_json
+                 FROM insight_events WHERE event_id = ?1",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let replay = (
+                capture_id.to_string(),
+                kind.to_string(),
+                occurred_at.to_string(),
+                payload_json.to_string(),
+            );
+            if known != replay {
+                return Err(StoreV2Error::Invalid(format!(
+                    "insight event {event_id} already recorded differently"
+                )));
+            }
         }
-        let known: String = self.conn.query_row(
-            "SELECT payload_json FROM insight_events WHERE event_id = ?1",
-            params![event_id],
-            |row| row.get(0),
-        )?;
-        if known == payload_json {
-            Ok(())
-        } else {
-            Err(StoreV2Error::Invalid(format!(
-                "insight event {event_id} already recorded with a different payload"
-            )))
-        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// One capture's insight events as `(type, payload_json)`, in

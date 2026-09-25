@@ -482,15 +482,13 @@ impl Store {
             return Err(storage::StorageError::NotFound(id.to_string()));
         }
         let request_id = accepted.map(|proposal| proposal.request_id.as_str());
+        // The head and the proposal it accepted land together or not at
+        // all, so a crash cannot leave an accepted head next to a live
+        // proposal.
+        let also: Vec<RevisionRow> = accepted.map(|proposal| proposal.to_row(id)).into_iter().collect();
         store
-            .commit_document_head(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, request_id))
-            .map_err(v2_err)?;
-        if let Some(proposal) = accepted {
-            store
-                .store_document_revision(&proposal.to_row(id))
-                .map_err(v2_err)?;
-        }
-        Ok(())
+            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, request_id), &also)
+            .map_err(v2_err)
     }
 
     /// Records one insight event for the take (idempotent on its id). A
