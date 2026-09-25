@@ -322,8 +322,8 @@ double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const f
         double best_err = 1e300;
         float best_s = 0, best_o = 0;
 
-        int16_t best_q[128];
-        int16_t qc[128];
+        int16_t best_q[1024];   // LayoutDesc::valid() permits group <= 1024
+        int16_t qc[1024];
         auto try_cand = [&](float s_raw, float o_raw) {
             // The deployed scale is the f16-rounded one; optimize that.
             const float s = d.scale_dtype == ScaleDtype::F16 ? h2f_(f2h(s_raw)) : s_raw;

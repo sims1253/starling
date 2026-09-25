@@ -179,6 +179,29 @@ int check_gemv_helper() {
 // Quantize + dequant round trip through a descriptor: the reference dequant
 // of the packed bytes must (a) be reproducible from the stored scale halves
 // through the documented f32 expression and (b) stay a sane approximation.
+// Regression (#323 review): f16 subnormal -> f32 conversion (the quantizer
+// and h2f_ share the formula). ggml is the reference.
+int check_f16_subnormals() {
+    for (uint32_t m = 1; m < 1024; m += 97) {
+        for (uint16_t h16 : {(uint16_t)m, (uint16_t)(0x8000u | m)}) {
+            const float ref = ggml_fp16_to_fp32(h16);
+            const uint32_t sign = (uint32_t)(h16 & 0x8000) << 16;
+            int e = -1;
+            uint32_t mm = h16 & 0x3ff;
+            while (!(mm & 0x400)) { mm <<= 1; --e; }
+            const uint32_t bits = sign | ((uint32_t)(e + 114) << 23) | ((mm & 0x3ff) << 13);
+            float got;
+            std::memcpy(&got, &bits, 4);
+            if (got != ref) {
+                std::printf("FAIL f16 subnormal %04x: %g vs ggml %g\n", h16, got, ref);
+                return 1;
+            }
+        }
+    }
+    std::printf("ok   f16 subnormal conversion == ggml (e+114 fix regression)\n");
+    return 0;
+}
+
 int check_layout_roundtrip(const starling::fast::LayoutDesc& d) {
     using namespace starling::fast;
     const uint32_t K = 256, N = 4;
@@ -399,6 +422,7 @@ int main() {
     // reference dequant bit for bit, and the two legacy specs are byte- and
     // bit-identical to the GPU layouts the engines already run.
     fails += check_layout_legacy_bytes();
+    fails += check_f16_subnormals();
     {
         using namespace starling::fast;
         const char* specs[] = {"w4g32asym", "w4g32sym",  "w4g64sym",  "w4g128sym",

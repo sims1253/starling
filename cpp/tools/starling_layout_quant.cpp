@@ -215,10 +215,13 @@ private:
                 if (exp == 0) {
                     if (mant == 0) bits = sign;
                     else {
+                        // f16 subnormal -> normalized f32: value = m*2^-24;
+                        // after the shift loop e = (leading pos) - 11, so the
+                        // f32 exponent field is 127 + (e + 11) - 24 = e + 114.
                         int e = -1;
                         uint32_t m = mant;
                         while (!(m & 0x400)) { m <<= 1; --e; }
-                        bits = sign | ((uint32_t)(e - 1 + 127 - 10 + 1) << 23) | ((m & 0x3ff) << 13);
+                        bits = sign | ((uint32_t)(e + 114) << 23) | ((m & 0x3ff) << 13);
                     }
                 } else if (exp == 31) {
                     bits = sign | 0x7f800000 | (mant << 13);

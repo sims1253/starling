@@ -98,7 +98,9 @@ def run_wer(lib: str, gguf: str, clips_dir: str) -> tuple[float, int]:
         clips.append((name, pcm.astype(np.float32) / 32768.0))
     ctx = libc.starling_ggml_load(2, gguf.encode())
     if not ctx:
-        raise SystemExit(f"load failed: {ctypes.cast(libc.starling_ggml_last_error(None), ctypes.c_char_p).value}")
+        libc.starling_ggml_last_error.restype = ctypes.c_char_p
+        libc.starling_ggml_last_error.argtypes = [ctypes.c_void_p]
+        raise SystemExit(f"load failed: {libc.starling_ggml_last_error(None).decode()}")
     # warm-up (pipeline compilation) outside the WER pass
     p = libc.starling_ggml_transcribe_pcm(
         ctx, clips[0][1].ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(clips[0][1]), 16000)
