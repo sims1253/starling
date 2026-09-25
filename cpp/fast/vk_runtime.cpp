@@ -430,13 +430,15 @@ bool Context::check_memory_budget(uint64_t need, std::string& err) {
     VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     props2.pNext = &budget;
     fn_.vkGetPhysicalDeviceMemoryProperties2(phys_, &props2);
-    uint64_t avail = 0;
+    uint64_t avail = 0, budget_total = 0;
     for (uint32_t h = 0; h < props2.memoryProperties.memoryHeapCount; ++h) {
         if (!(props2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
-        const uint64_t free = budget.heapBudget[h] > budget.heapUsage[h]
+        budget_total += budget.heapBudget[h];
+        const uint64_t heap_free = budget.heapBudget[h] > budget.heapUsage[h]
                                   ? budget.heapBudget[h] - budget.heapUsage[h] : 0;
-        avail += free;
+        avail += heap_free;
     }
+    if (!budget_total) return true;   // driver reports no budgets: cannot check
     if (need + (64ull << 20) > avail) {
         err = "fast engine: GPU memory preflight failed: need " + std::to_string(need >> 20) +
               " MiB, " + std::to_string(avail >> 20) + " MiB available - the GPU driver may be " +

@@ -167,7 +167,7 @@ no speed. The decode-speed lever is not the layout: it is token batching
 (M-token GEMV, #311).
 
 | P1-5 | W4U GEMV plateau comes from the second (scale) load stream | speed-only `W4_NOSCALE` probe: saturated lm_head shape unchanged (25.7 vs 26.5 GB/s) — the scale stream is free at saturation; small N=6144 +28% (unsaturated = load-latency dominated). Scale-interleave layout (#5) not supported. discard |
-| P1-6 | **M-token GEMV**: share the weight unpacks across M tokens — per 32 weights at M=2, ~12 ops/token vs 20 at M=1 | **confirmed, kept (`bb7db62`)**: `gemv_w4um` (GEMV_M) processes two x-vectors per weight pass. Phone per-token rate **1.76–2.11× M=1** (N=151936: 69.7 vs 34.0 G w/s; N=6144: 34.2 vs 16.2; N=12288: 48.7 vs 27.7), second token nearly free; both tokens check rel err ~1e-3; end-to-end unchanged (+0.25 %, noise) with identical transcripts — the GemvArgs push-constant extension breaks nothing. Desktop: second token literally free (bandwidth-bound). This is the enabling kernel for #311 batch verification; at acceptance ≥ 0.5 the GEMV time per output token halves. **keep** |
+| P1-6 | **M-token GEMV**: share the weight unpacks across M tokens — per 32 weights at M=2, ~12 ops/token vs 20 at M=1 | **confirmed, kept (`bb7db62`)**: `gemv_w4um` (GEMV_M) processes two x-vectors per weight pass. Phone per-token rate **1.76–2.11× M=1** (N=151936: 69.7 vs 34.0 G w/s; N=6144: 34.2 vs 16.2; N=12288: 48.7 vs 27.7), second token nearly free. **Correction (review round)**: the original probe validated token-0 only; the token-1 reference check added in the review round exposed a missing token-1 store in the shader (the P1-6 edit that added it had silently no-op'd) — fixed and **both tokens now check rel err ≤ 3e-3**, timing unchanged. End-to-end unchanged (+0.25 %, noise) with identical transcripts. Desktop: second token literally free (bandwidth-bound). This is the enabling kernel for #311 batch verification; at acceptance ≥ 0.5 the GEMV time per output token halves. **keep** |
 
 | P1-7 | A deployable drafter makes the M-token GEMV exploitable for standalone MOSS decode (online n-gram, or copy-draft from Parakeet) | **both dead** (12 FLEURS clips, greedy id streams — the stream encodes every argmax, so acceptance is simulable offline): online n-gram (n=2..4) **1.000 tokens/pass** (no exploitable repeats in ~30-token ASR streams); Parakeet copy-draft **1.03 (K=2) / 1.05 (K=3)** — Parakeet and standalone-MOSS transcripts diverge constantly at the BPE level without prompt conditioning; casing normalization changes nothing. Also proven by construction: single-draft self-lookahead gains zero (the pass re-derives the pending token — identical context, identical logits — and advances exactly one token; K≥2 real drafts are required). Speculative decoding for the standalone metric needs a **learned drafter** (#292's gated EAGLE-3-class follow-up) or the product cleanup flow (Parakeet text in the MOSS prompt), which is a different measurement. `gemv_w4um` stays as the verify primitive; `STARLING_FAST_DUMP_TOKENS` lands as the study hook. discard |
 
@@ -196,8 +196,10 @@ Session outcome (this branch, on top of #323):
 - **Micro→context transfer rules** (both directions measured): op-side
   changes land at ~35 % of the isolated delta; byte-doubling changes don't
   transfer at all (model in-context GEMV traffic at ~43 GB/s).
-- Decode budget fully accounted: linears op-bound ~41 ms + lm_head ~8 ms +
-  dispatch ~5 ms + attention ~4 ms ≈ 69–70 ms/token. The next decode win is
+- Decode budget structurally accounted: linears op-bound ~41 ms + lm_head
+  ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus
+  ~11 ms attributed by P1-10 (pipeline switches, DRAM-cold vs L2-warm
+  micros) ≈ 69–70 ms/token. The next decode win is
   #311's learned drafter on top of `gemv_w4um`, not another layout.
 
 ## #317 addendum: the 10 ms micro-vs-context gap attributed (2026-09-26)
@@ -264,7 +266,7 @@ identical (the decode-time gate on this run is thermal-band only — the phone
 ended the day hot at 45 % battery; 113 ms/token in this state vs the
 cool-window verified 69.2–69.7 ms/token, consistent with the documented
 thermal sensitivity). Certified deliverables: decode −1.9 % (rows=16,
-verified twice in cool windows), quality 7.31 % en / 7.83 % packed vs
-7.87 % baseline, energy 2.42 mWh/transcription, all five gates green,
+verified twice in cool windows), quality 7.31 % en (GGUF and packed paths
+alike) vs 7.87 % baseline, energy 2.42 mWh/transcription, all five gates green,
 layout table + #311/#316/#318 notes delivered, #325 wedge guards landed
 from the driver investigation this session also produced.

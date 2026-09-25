@@ -891,8 +891,10 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
         if (!seq.emplace(path, 0).second) path += "." + std::to_string(++seq[dp]);
         if (FILE* f = std::fopen(path.c_str(), "w")) {
             for (size_t i = 0; i < out_ids.size(); ++i)
-                std::fprintf(f, i ? ",%u" : "%u", out_ids[i]);
+                std::fprintf(f, i ? ",%d" : "%d", (int)out_ids[i]);
             std::fclose(f);
+        } else {
+            std::fprintf(stderr, "[fast-moss] STARLING_FAST_DUMP_TOKENS: cannot write %s\n", path.c_str());
         }
     }
     if (timing)

@@ -473,7 +473,6 @@ bool Kernels::micro(const char* mi, std::string& err) {
             u.a.M = M; u.a.N = Nd; u.a.K = Kd; u.a.lda = Kd; u.a.ldb = Kd; u.a.ldc = Nd;
             u.A = vk::Ref(A); u.Bq = vk::Ref(wq); u.Bs = vk::Ref(ws); u.C = vk::Ref(C);
             const TileCfg saved_tile = tile;
-            if (M <= 16 && tile.BM > 16) tile = TileCfg{32, 128, 4, 8};   // skinny M: vendor tile already
             vk::Recording rec(*ctx_);
             rec.begin();
             for (uint32_t i = 0; i < reps; ++i) {
@@ -584,6 +583,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
     // and the per-token weight rate, against the M=1 gemv_w4u numbers.
     const bool m2 = std::strncmp(mi, "m2,", 3) == 0;   // args required
     if (m2) mi += 3;
+    if (m2 && bits != 4) {   // GEMV_M exists only for the W4 shader
+        err = "STARLING_FAST_MICRO: m2 (two-token) needs bits=4";
+        return false;
+    }
     const bool sweep = std::strncmp(mi, "s,", 2) == 0;   // args required
     if (sweep) mi += 2;
     // alt: alternate two pipelines per rep — prices the in-context
@@ -629,7 +632,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
     GemvArgs ga;
     ga.N = n;
     ga.K = k;
-    if (m2) { ga.x_off2 = k; ga.y_off2 = n; }
+    if (m2) {
+        if (k % 4) { err = "STARLING_FAST_MICRO: m2 needs K % 4 == 0 (x_off2 contract)"; return false; }
+        ga.x_off2 = k; ga.y_off2 = n;
+    }
     const uint32_t rows_list[] = {8, 16, 24, 32, 48, 64};
     const uint32_t rows_n = sweep ? 6u : 1u;
     uint32_t rsplit_out = 1;
@@ -652,6 +658,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
         p2 = ctx_->pipeline(name, {lanes, rows2, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
         if (!p2) return false;
     } else if (alt_mode == 2) {   // different shader file (w4u <-> w4)
+        if (bits != 4 || m2) {
+            err = "STARLING_FAST_MICRO: altx (shader switch) needs bits=4 without m2";
+            return false;
+        }
         p2 = ctx_->pipeline(w4_unpack_ && std::string(name) == "gemv_w4u" ? "gemv_w4" : "gemv_w4u",
                             {lanes, rows, 0u, 0u, 0u, rsplit, lanes * rsplit}, err);
         if (!p2) return false;
@@ -724,6 +734,22 @@ bool Kernels::micro(const char* mi, std::string& err) {
             }
             maxerr = std::max(maxerr, std::abs(ref - got[r]) /
                                           std::max(1.0, std::abs(ref)));
+            if (m2) {
+                // Token-1 rows: same weights against the second x vector.
+                // (Added in the review round — the original probe validated
+                // token 0 only; the kernel is not dispatched by the engine
+                // yet, so no shipped behavior depended on it.)
+                double ref2 = 0;
+                for (uint32_t kk = 0; kk < k; ++kk) {
+                    const uint32_t grp = kk / 32, in = kk % 32;
+                    const uint32_t sraw = sv[(size_t)r * (k / 32) + grp];
+                    const uint32_t w32 = wv[(size_t)r * (k / 8) + grp * 4 + in / 8];
+                    const float nib = (float)((w32 >> (4 * (in % 8))) & 15u);
+                    ref2 += (h2f(sraw & 0xffff) * nib + h2f(sraw >> 16)) * xf[k + kk];
+                }
+                maxerr = std::max(maxerr, std::abs(ref2 - got[tok_base + r]) /
+                                              std::max(1.0, std::abs(ref2)));
+            }
         }
         std::fprintf(stderr, "[fast-micro] check rsplit=%u: max rel err = %.5f (first %u rows)\n",
                      rsplit, maxerr, nchk);
@@ -735,7 +761,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
         for (uint32_t ri = 0; ri < sweep_ms.size(); ++ri) {
             const double gw = (double)n * k / (sweep_ms[ri] * 1e-3) / 1e9;
             std::fprintf(stderr, "[fast-micro] sweep bits=%u N=%u K=%u rows=%u wg=%ux%u: %.4f ms = %.1f G w/s\n",
-                         bits, n, k, rows_list[ri], lanes, 1u, sweep_ms[ri], gw);
+                         bits, n, k, rows_list[ri], lanes, rsplit_out, sweep_ms[ri], gw);
             if (sweep_ms[ri] < best) { best = sweep_ms[ri]; best_rows = rows_list[ri]; }
         }
         std::fprintf(stderr, "[fast-micro] sweep best: rows=%u\n", best_rows);

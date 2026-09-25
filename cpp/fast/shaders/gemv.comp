@@ -219,6 +219,15 @@ void main() {
             if (n < p.N) {
                 float v = row_sum(r) * rstd;
                 if (p.has_bias != 0u) v += bias[n];
+#if defined(GEMV_M)
+                // Token-1 result: identical per-row math, second y row.
+                // (Plain and residual epilogues; the argmax/epi-2 variants
+                // are not used with two tokens.)
+                float v2 = row_sum2(r) * rstd;
+                if (p.has_bias != 0u) v2 += bias[n];
+                if (EPI == 0u) y[p.y_off2 + n] = v2;
+                else if (EPI == 1u) y[p.y_off2 + n] += v2;
+#endif
                 if (EPI == 0u) {
                     y[p.y_off + n] = v;
                 } else if (EPI == 1u) {
