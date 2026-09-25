@@ -95,8 +95,20 @@ M=4-8) — that is the remaining big lever. Layout conclusion + acceptance
 table at the end of the log; notes posted to #311/#316/#318.
 
 Session protocol notes: phone screen OFF (compositor steals the GPU, ±100%
-swings), order-balanced A/B, ±2.5% noise floor, ~8 model loads per boot
-(vkOOM after), absolute numbers drift per boot — same-window deltas only.
+swings), order-balanced A/B, ±2.5% noise floor, absolute numbers drift per
+boot — same-window deltas only.
+
+P1-5..P1-9 + aftermath (see RESEARCH_LOG): scale-interleave dead (free at
+saturation); **gemv_w4um KEPT** (1.76-2.11x/token at M=2 — #311's verify
+primitive); rows=16 KEPT (-1.9% verified twice); drafter study closed the
+speculative path (n-gram 1.000, copy-draft 1.03-1.05 tokens/pass);
+micro-vs-context gap attributed (pipeline switches + DRAM-cold);
+F16-lm_head REJECTED (+9.4%, in-context bandwidth ~43 GB/s); energy
+delivered (2.42 mWh/transcription); #325 driver investigation: VK_TIMEOUT
+hang (not OOM), wedge guards landed (marker + preflight + enriched errors);
+final certification: tree audited, all gates green on the PR head
+(`48a04e0`+), G4 final −1.3%/+0.9%. LOOP COMPLETE — resume only with a new
+hypothesis from #311 (learned drafter) or new hardware/driver.
 
 ## Ideas backlog
 
