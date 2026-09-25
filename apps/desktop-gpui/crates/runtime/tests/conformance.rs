@@ -37,7 +37,10 @@ fn fixture_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn load_fixtures() -> (Vec<(PathBuf, serde_json::Value)>, Vec<(PathBuf, serde_json::Value)>) {
+fn load_fixtures() -> (
+    Vec<(PathBuf, serde_json::Value)>,
+    Vec<(PathBuf, serde_json::Value)>,
+) {
     replay::split_fixtures(&fixture_paths())
 }
 
@@ -74,8 +77,42 @@ fn fixture_corpus_covers_all_machines() {
         machines,
         HashSet::from(["capture", "jobs", "context", "docs", "delivery"])
     );
-    assert_eq!(valid.len(), 10, "ten valid fixtures");
-    assert_eq!(invalid.len(), 9, "nine invalid fixtures");
+    // By name, so a new fixture shows up as exactly the file it is.
+    let names = |set: &[(PathBuf, serde_json::Value)]| -> Vec<String> {
+        set.iter().map(|(path, _)| name_of(path)).collect()
+    };
+    assert_eq!(
+        names(&valid),
+        [
+            "capture-abort.json",
+            "capture-happy.json",
+            "capture-interrupted.json",
+            "capture-recovery.json",
+            "context-freeze.json",
+            "delivery-failure-conflict.json",
+            "delivery-lifecycle.json",
+            "docs-cas.json",
+            "jobs-failure.json",
+            "jobs-lifecycle.json",
+            "jobs-transform.json",
+        ]
+    );
+    assert_eq!(
+        names(&invalid),
+        [
+            "invalid-capture-seq.json",
+            "invalid-capture-stop-idle.json",
+            "invalid-capture-stopped-not-draining.json",
+            "invalid-context-mode-set-observing.json",
+            "invalid-delivery-apply-unprepared.json",
+            "invalid-docs-append-turn-validating.json",
+            "invalid-jobs-cancel-after-completed.json",
+            "invalid-jobs-completed-from-transforming.json",
+            "invalid-jobs-transformed-from-recognizing.json",
+            "invalid-jobs-unfrozen-route.json",
+            "invalid-runtime-unknown-version.json",
+        ]
+    );
 }
 
 // ------------------------------------------------------------------------- //
@@ -206,9 +243,7 @@ fn invalid_fixtures_fail_with_expected_violation() {
             let violations = route_freeze_violations(&corpus);
             assert!(!violations.is_empty(), "{}", name_of(path));
             assert!(
-                violations
-                    .iter()
-                    .all(|v| v.route == "route-never-frozen"),
+                violations.iter().all(|v| v.route == "route-never-frozen"),
                 "{:?}",
                 violations
             );
@@ -330,9 +365,7 @@ fn docs_head_update_is_cas_with_candidate_retained() {
         .expect("docs-cas fixture");
     let conflict = iter_envelopes(trace)
         .into_iter()
-        .find(|message| {
-            message.get("type").and_then(|t| t.as_str()) == Some("docs.headConflict")
-        })
+        .find(|message| message.get("type").and_then(|t| t.as_str()) == Some("docs.headConflict"))
         .expect("conflict event");
     let payload = &conflict["payload"];
     assert_ne!(payload["expected"], payload["actual"]);
@@ -347,9 +380,10 @@ fn docs_head_update_is_cas_with_candidate_retained() {
     assert_eq!(conflict_edges.len(), 1);
     assert_eq!(conflict_edges[0].from, "Validating");
     assert_eq!(conflict_edges[0].to, "Conflicted");
-    assert!(replayed.transitions.iter().any(|t| {
-        t.type_ == Some("docs.headUpdated") && t.to == "Committed"
-    }));
+    assert!(replayed
+        .transitions
+        .iter()
+        .any(|t| { t.type_ == Some("docs.headUpdated") && t.to == "Committed" }));
 }
 
 #[test]
@@ -403,9 +437,7 @@ fn route_freeze_precedes_any_audio_leave() {
         .expect("context fixture");
     let frozen_at: std::collections::HashMap<String, String> = iter_envelopes(context_trace)
         .into_iter()
-        .filter(|message| {
-            message.get("type").and_then(|t| t.as_str()) == Some("mode.routeFrozen")
-        })
+        .filter(|message| message.get("type").and_then(|t| t.as_str()) == Some("mode.routeFrozen"))
         .map(|message| {
             (
                 message["payload"]["route"].as_str().unwrap().to_string(),
@@ -421,9 +453,7 @@ fn route_freeze_precedes_any_audio_leave() {
         .iter()
         .filter(|(_, trace)| trace.get("machine").and_then(|m| m.as_str()) == Some("jobs"))
         .flat_map(|(_, trace)| iter_envelopes(trace))
-        .find(|message| {
-            message.get("type").and_then(|t| t.as_str()) == Some("jobs.submit")
-        })
+        .find(|message| message.get("type").and_then(|t| t.as_str()) == Some("jobs.submit"))
         .expect("first submit");
     let submit_ts = first_submit["ts"].as_str().unwrap();
     let route = first_submit["payload"]["route"].as_str().unwrap();

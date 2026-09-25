@@ -1,0 +1,71 @@
+{
+  "machine": "jobs",
+  "description": "Event illegal in the current state: a recognition job never emits jobs.transformed; processing is a separate jobs.transform job.",
+  "initial": "Idle",
+  "schema_valid": true,
+  "replay": "illegal_event",
+  "messages": [
+    {
+      "v": 1,
+      "id": "cmd_930",
+      "ts": "2026-09-24T10:09:30Z",
+      "corr": "job-10",
+      "seq": 1,
+      "type": "jobs.submit",
+      "payload": {
+        "captureRef": "take_77",
+        "route": "local-default",
+        "budget": "standard"
+      }
+    },
+    {
+      "v": 1,
+      "id": "evt_930",
+      "ts": "2026-09-24T10:09:30Z",
+      "corr": "job-10",
+      "seq": 2,
+      "type": "jobs.queued",
+      "payload": {}
+    },
+    {
+      "$advance": "Dispatched"
+    },
+    {
+      "$advance": "Loading"
+    },
+    {
+      "$advance": "Recognizing"
+    },
+    {
+      "v": 1,
+      "id": "evt_931",
+      "ts": "2026-09-24T10:09:31Z",
+      "corr": "job-10",
+      "seq": 3,
+      "type": "jobs.transformed",
+      "payload": {
+        "result": {
+          "schema_version": 1,
+          "request_id": "req-1",
+          "base_revision": 1,
+          "status": "completed",
+          "text": "So the meeting is at three.",
+          "failure": null,
+          "provider": {
+            "id": "local-s1",
+            "kind": "s1",
+            "locality": "local",
+            "route": "local-authoring-default",
+            "model": "s1-mini",
+            "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "timing": {
+            "queued_ms": 1.5,
+            "processing_ms": 412.0,
+            "stop_to_result_ms": 655.25
+          }
+        }
+      }
+    }
+  ]
+}

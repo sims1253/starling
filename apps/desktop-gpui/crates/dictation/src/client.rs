@@ -120,6 +120,14 @@ impl CancelToken {
         self.state.flag.load(Ordering::Acquire)
     }
 
+    /// Resolves once the token is cancelled: the public form of the
+    /// broadcast wait, so other request clients (the processing
+    /// providers, #294) can race their own futures against the same
+    /// signal.
+    pub async fn cancelled(&self) {
+        self.notified().await
+    }
+
     /// Resolves once the token is cancelled — for *every* concurrent
     /// caller: each waiter watches its own receiver, and `wait_for`
     /// consults the current value first, so a cancel that landed before

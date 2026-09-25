@@ -10,387 +10,944 @@
     "validation failure, never a silently ignored extra.",
     "runtime.nack is the reply to a message whose envelope version cannot be",
     "parsed (v1 knows reason \"unsupported_version\" only). It carries",
-    "corr = the id of the rejected message; the payload is never applied."
+    "corr = the id of the rejected message; the payload is never applied.",
+    "jobs.transformed (#294) ends a transform job (Transforming ->",
+    "Completed) with a completed transform result, embedded verbatim from",
+    "mode-routing under $defs/transformResult. A failed provider call ends",
+    "the job with jobs.failed{reason: the result's failure reason}. The",
+    "result is a proposal for the take's draft; jobs.completed keeps",
+    "carrying raw recognition text only."
   ],
   "oneOf": [
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "capture.started" },
-        "payload": { "$ref": "#/$defs/payloads/capture.started" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "capture.started"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/capture.started"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "capture.progress" },
-        "payload": { "$ref": "#/$defs/payloads/capture.progress" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "capture.progress"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/capture.progress"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "capture.gap" },
-        "payload": { "$ref": "#/$defs/payloads/capture.gap" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "capture.gap"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/capture.gap"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "capture.error" },
-        "payload": { "$ref": "#/$defs/payloads/capture.error" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "capture.error"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/capture.error"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "capture.stopped" },
-        "payload": { "$ref": "#/$defs/payloads/capture.stopped" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "capture.stopped"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/capture.stopped"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "jobs.queued" },
-        "payload": { "$ref": "#/$defs/payloads/jobs.queued" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.queued"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.queued"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "jobs.rejected" },
-        "payload": { "$ref": "#/$defs/payloads/jobs.rejected" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.rejected"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.rejected"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "jobs.progress" },
-        "payload": { "$ref": "#/$defs/payloads/jobs.progress" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.progress"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.progress"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "jobs.completed" },
-        "payload": { "$ref": "#/$defs/payloads/jobs.completed" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.completed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.completed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "jobs.failed" },
-        "payload": { "$ref": "#/$defs/payloads/jobs.failed" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.transformed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.transformed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "context.targetSnapshot" },
-        "payload": { "$ref": "#/$defs/payloads/context.targetSnapshot" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "jobs.failed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/jobs.failed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "mode.decision" },
-        "payload": { "$ref": "#/$defs/payloads/mode.decision" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "context.targetSnapshot"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/context.targetSnapshot"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "mode.routeFrozen" },
-        "payload": { "$ref": "#/$defs/payloads/mode.routeFrozen" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "mode.decision"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/mode.decision"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "docs.headUpdated" },
-        "payload": { "$ref": "#/$defs/payloads/docs.headUpdated" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "mode.routeFrozen"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/mode.routeFrozen"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "docs.headConflict" },
-        "payload": { "$ref": "#/$defs/payloads/docs.headConflict" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "docs.headUpdated"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/docs.headUpdated"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "docs.turnAppended" },
-        "payload": { "$ref": "#/$defs/payloads/docs.turnAppended" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "docs.headConflict"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/docs.headConflict"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "delivery.prepared" },
-        "payload": { "$ref": "#/$defs/payloads/delivery.prepared" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "docs.turnAppended"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/docs.turnAppended"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "delivery.submittedUnconfirmed" },
-        "payload": { "$ref": "#/$defs/payloads/delivery.submittedUnconfirmed" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "delivery.prepared"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/delivery.prepared"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "delivery.confirmed" },
-        "payload": { "$ref": "#/$defs/payloads/delivery.confirmed" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "delivery.submittedUnconfirmed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/delivery.submittedUnconfirmed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "delivery.failed" },
-        "payload": { "$ref": "#/$defs/payloads/delivery.failed" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "delivery.confirmed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/delivery.confirmed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "delivery.conflict" },
-        "payload": { "$ref": "#/$defs/payloads/delivery.conflict" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "delivery.failed"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/delivery.failed"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "v": { "$ref": "#/$defs/version" },
-        "id": { "$ref": "#/$defs/msgId" },
-        "ts": { "$ref": "#/$defs/timestamp" },
-        "corr": { "$ref": "#/$defs/msgId" },
-        "seq": { "$ref": "#/$defs/seq" },
-        "type": { "const": "runtime.nack" },
-        "payload": { "$ref": "#/$defs/payloads/runtime.nack" }
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "delivery.conflict"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/delivery.conflict"
+        }
       },
-      "required": ["v", "id", "ts", "type", "payload"]
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "v": {
+          "$ref": "#/$defs/version"
+        },
+        "id": {
+          "$ref": "#/$defs/msgId"
+        },
+        "ts": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "corr": {
+          "$ref": "#/$defs/msgId"
+        },
+        "seq": {
+          "$ref": "#/$defs/seq"
+        },
+        "type": {
+          "const": "runtime.nack"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloads/runtime.nack"
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "ts",
+        "type",
+        "payload"
+      ]
     }
   ],
   "$defs": {
-    "version": { "type": "integer", "const": 1 },
-    "msgId": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$" },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "msgId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
     "timestamp": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
     },
-    "seq": { "type": "integer", "minimum": 0 },
-    "safeToken": { "type": "string", "pattern": "^[A-Za-z0-9_.:+-]{1,128}$" },
+    "seq": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "safeToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:+-]{1,128}$"
+    },
     "payloads": {
       "capture.started": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "device": { "type": "string", "minLength": 1 },
-          "actualRate": { "type": "integer", "minimum": 1 },
-          "channels": { "type": "integer", "minimum": 1 }
+          "device": {
+            "type": "string",
+            "minLength": 1
+          },
+          "actualRate": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "channels": {
+            "type": "integer",
+            "minimum": 1
+          }
         },
-        "required": ["device", "actualRate", "channels"]
+        "required": [
+          "device",
+          "actualRate",
+          "channels"
+        ]
       },
       "capture.progress": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "ackSamples": { "type": "integer", "minimum": 0 },
-          "clipRatio": { "type": "number", "minimum": 0 },
-          "level": { "type": "number", "minimum": 0 }
+          "ackSamples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "clipRatio": {
+            "type": "number",
+            "minimum": 0
+          },
+          "level": {
+            "type": "number",
+            "minimum": 0
+          }
         },
-        "required": ["ackSamples", "clipRatio", "level"]
+        "required": [
+          "ackSamples",
+          "clipRatio",
+          "level"
+        ]
       },
       "capture.gap": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "startSample": { "type": "integer", "minimum": 0 },
-          "endSample": { "type": "integer", "minimum": 0 }
+          "startSample": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endSample": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
-        "required": ["startSample", "endSample"]
+        "required": [
+          "startSample",
+          "endSample"
+        ]
       },
       "capture.error": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "code": { "$ref": "#/$defs/safeToken" },
-          "fatal": { "type": "boolean" }
+          "code": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "fatal": {
+            "type": "boolean"
+          }
         },
-        "required": ["code", "fatal"]
+        "required": [
+          "code",
+          "fatal"
+        ]
       },
       "capture.stopped": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "finalSampleIndex": { "type": "integer", "minimum": 0 },
-          "acknowledgedSamples": { "type": "integer", "minimum": 0 },
+          "finalSampleIndex": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acknowledgedSamples": {
+            "type": "integer",
+            "minimum": 0
+          },
           "gaps": {
             "type": "array",
             "items": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "startSample": { "type": "integer", "minimum": 0 },
-                "endSample": { "type": "integer", "minimum": 0 }
+                "startSample": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "endSample": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               },
-              "required": ["startSample", "endSample"]
+              "required": [
+                "startSample",
+                "endSample"
+              ]
             }
           },
-          "journalId": { "$ref": "#/$defs/safeToken" },
-          "sampleDurationMs": { "type": "number", "minimum": 0 },
-          "wallClockMs": { "type": "number", "minimum": 0 }
+          "journalId": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "sampleDurationMs": {
+            "type": "number",
+            "minimum": 0
+          },
+          "wallClockMs": {
+            "type": "number",
+            "minimum": 0
+          }
         },
         "required": [
           "finalSampleIndex",
@@ -410,54 +967,103 @@
         "additionalProperties": false,
         "properties": {
           "reason": {
-            "enum": ["queue_full", "resource_limits", "duplicate_submission"]
+            "enum": [
+              "queue_full",
+              "resource_limits",
+              "duplicate_submission"
+            ]
           }
         },
-        "required": ["reason"]
+        "required": [
+          "reason"
+        ]
       },
       "jobs.progress": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "partial": { "type": "string" },
-          "stabilityHint": { "$ref": "#/$defs/safeToken" }
+          "partial": {
+            "type": "string"
+          },
+          "stabilityHint": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["partial", "stabilityHint"]
+        "required": [
+          "partial",
+          "stabilityHint"
+        ]
       },
       "jobs.completed": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "attemptId": { "$ref": "#/$defs/msgId" },
-          "text": { "type": "string" },
-          "backend": { "$ref": "#/$defs/safeToken" },
-          "timing": { "type": "number", "minimum": 0 },
-          "completionEvidence": { "$ref": "#/$defs/safeToken" }
+          "attemptId": {
+            "$ref": "#/$defs/msgId"
+          },
+          "text": {
+            "type": "string"
+          },
+          "backend": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "timing": {
+            "type": "number",
+            "minimum": 0
+          },
+          "completionEvidence": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["attemptId", "text", "backend", "timing", "completionEvidence"]
+        "required": [
+          "attemptId",
+          "text",
+          "backend",
+          "timing",
+          "completionEvidence"
+        ]
       },
       "jobs.failed": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "reason": { "$ref": "#/$defs/safeToken" },
-          "retryable": { "type": "boolean" }
+          "reason": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
         },
-        "required": ["reason", "retryable"]
+        "required": [
+          "reason",
+          "retryable"
+        ]
       },
       "context.targetSnapshot": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "descriptor": { "$ref": "#/$defs/safeToken" },
-          "digest": { "$ref": "#/$defs/safeToken" },
+          "descriptor": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "digest": {
+            "$ref": "#/$defs/safeToken"
+          },
           "capabilities": {
             "type": "array",
-            "items": { "$ref": "#/$defs/safeToken" }
+            "items": {
+              "$ref": "#/$defs/safeToken"
+            }
           },
-          "selectionRange": { "$ref": "#/$defs/payloads/span" },
-          "offsetEncoding": { "$ref": "#/$defs/safeToken" },
-          "expiry": { "$ref": "#/$defs/timestamp" }
+          "selectionRange": {
+            "$ref": "#/$defs/payloads/span"
+          },
+          "offsetEncoding": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "expiry": {
+            "$ref": "#/$defs/timestamp"
+          }
         },
         "required": [
           "descriptor",
@@ -472,63 +1078,124 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "modeId": { "$ref": "#/$defs/safeToken" },
-          "source": { "enum": ["manual", "phrase", "rule"] },
-          "matchedPrefixSpan": {
-            "anyOf": [
-              { "$ref": "#/$defs/payloads/span" },
-              { "type": "null" }
+          "modeId": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "source": {
+            "enum": [
+              "manual",
+              "phrase",
+              "rule"
             ]
           },
-          "explanation": { "type": "string" },
-          "payloadView": { "$ref": "#/$defs/safeToken" }
+          "matchedPrefixSpan": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/payloads/span"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "payloadView": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["modeId", "source", "matchedPrefixSpan", "explanation", "payloadView"]
+        "required": [
+          "modeId",
+          "source",
+          "matchedPrefixSpan",
+          "explanation",
+          "payloadView"
+        ]
       },
       "mode.routeFrozen": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "route": { "$ref": "#/$defs/safeToken" },
-          "decidedAt": { "$ref": "#/$defs/timestamp" }
+          "route": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "decidedAt": {
+            "$ref": "#/$defs/timestamp"
+          }
         },
-        "required": ["route", "decidedAt"]
+        "required": [
+          "route",
+          "decidedAt"
+        ]
       },
       "docs.headUpdated": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "docId": { "$ref": "#/$defs/safeToken" },
-          "headRevision": { "type": "integer", "minimum": 0 }
+          "docId": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "headRevision": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
-        "required": ["docId", "headRevision"]
+        "required": [
+          "docId",
+          "headRevision"
+        ]
       },
       "docs.headConflict": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "expected": { "type": "integer", "minimum": 0 },
-          "actual": { "type": "integer", "minimum": 0 },
-          "candidatePreserved": { "type": "boolean" }
+          "expected": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "actual": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "candidatePreserved": {
+            "type": "boolean"
+          }
         },
-        "required": ["expected", "actual", "candidatePreserved"]
+        "required": [
+          "expected",
+          "actual",
+          "candidatePreserved"
+        ]
       },
       "docs.turnAppended": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "turnSeq": { "type": "integer", "minimum": 0 }
+          "turnSeq": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
-        "required": ["turnSeq"]
+        "required": [
+          "turnSeq"
+        ]
       },
       "delivery.prepared": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "deliveryId": { "$ref": "#/$defs/msgId" },
-          "compareToken": { "$ref": "#/$defs/safeToken" }
+          "deliveryId": {
+            "$ref": "#/$defs/msgId"
+          },
+          "compareToken": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["deliveryId", "compareToken"]
+        "required": [
+          "deliveryId",
+          "compareToken"
+        ]
       },
       "delivery.submittedUnconfirmed": {
         "type": "object",
@@ -538,44 +1205,258 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "evidenceLevel": { "$ref": "#/$defs/safeToken" }
+          "evidenceLevel": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["evidenceLevel"]
+        "required": [
+          "evidenceLevel"
+        ]
       },
       "delivery.failed": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "reason": { "$ref": "#/$defs/safeToken" },
-          "fallbackSuggested": { "type": "boolean" }
+          "reason": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "fallbackSuggested": {
+            "type": "boolean"
+          }
         },
-        "required": ["reason", "fallbackSuggested"]
+        "required": [
+          "reason",
+          "fallbackSuggested"
+        ]
       },
       "delivery.conflict": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "expectedTarget": { "$ref": "#/$defs/safeToken" },
-          "actualTarget": { "$ref": "#/$defs/safeToken" }
+          "expectedTarget": {
+            "$ref": "#/$defs/safeToken"
+          },
+          "actualTarget": {
+            "$ref": "#/$defs/safeToken"
+          }
         },
-        "required": ["expectedTarget", "actualTarget"]
+        "required": [
+          "expectedTarget",
+          "actualTarget"
+        ]
       },
       "runtime.nack": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "reason": { "enum": ["unsupported_version"] }
+          "reason": {
+            "enum": [
+              "unsupported_version"
+            ]
+          }
         },
-        "required": ["reason"]
+        "required": [
+          "reason"
+        ]
       },
       "span": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "startOffset": { "type": "integer", "minimum": 0 },
-          "endOffset": { "type": "integer", "minimum": 0 }
+          "startOffset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endOffset": {
+            "type": "integer",
+            "minimum": 0
+          }
         },
-        "required": ["startOffset", "endOffset"]
+        "required": [
+          "startOffset",
+          "endOffset"
+        ]
+      },
+      "jobs.transformed": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "result"
+        ],
+        "properties": {
+          "result": {
+            "$ref": "#/$defs/transformResult"
+          }
+        }
+      }
+    },
+    "transformResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "request_id",
+        "base_revision",
+        "status",
+        "text",
+        "failure",
+        "provider",
+        "timing"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "request_id": {
+          "$ref": "#/$defs/token"
+        },
+        "base_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failure": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "reason",
+                "retryable",
+                "detail"
+              ],
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "timeout",
+                    "cancelled",
+                    "transport_error",
+                    "redirect_blocked",
+                    "rate_limited",
+                    "http_error",
+                    "unknown_model",
+                    "malformed_response",
+                    "empty_output",
+                    "truncated_output",
+                    "unsupported_language",
+                    "unsupported_kind",
+                    "remote_forbidden",
+                    "provider_unavailable",
+                    "invalid_input"
+                  ]
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "detail": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/providerRef"
+        },
+        "timing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "queued_ms",
+            "processing_ms",
+            "stop_to_result_ms"
+          ],
+          "properties": {
+            "queued_ms": {
+              "type": "number",
+              "minimum": 0
+            },
+            "processing_ms": {
+              "type": "number",
+              "minimum": 0
+            },
+            "stop_to_result_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "providerKind": {
+      "enum": [
+        "builtin",
+        "s1",
+        "openai_compatible",
+        "anthropic",
+        "gemini"
+      ]
+    },
+    "providerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "locality",
+        "route",
+        "model",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "$ref": "#/$defs/providerKind"
+        },
+        "locality": {
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/route"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
       }
     }
   }

@@ -69,5 +69,21 @@
     "model": "qwen3-1.7b",
     "artifact": null,
     "max_input_chars": 16000
+  },
+  {
+    "schema_version": 1,
+    "id": "builtin",
+    "route": "local-builtin",
+    "kind": "builtin",
+    "locality": "local",
+    "transform_kinds": [],
+    "languages": [
+      "*"
+    ],
+    "instructions": false,
+    "context_fields": [],
+    "model": "spoken-commands.v1",
+    "artifact": null,
+    "max_input_chars": 1000000
   }
 ]

@@ -24,6 +24,7 @@ pub mod tables;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use starling_processing::contract::{TransformRequest, TransformResult};
 
 /// Envelope versions this runtime understands (envelope.schema.json
 /// `$defs.version` currently pins `const: 1`).
@@ -388,7 +389,7 @@ pub struct JobLimits {
     pub per_route: Vec<RouteLimit>,
 }
 
-/// All 16 v1 commands, variant per `commands.schema.json` branch. The enum
+/// All 17 v1 commands, variant per `commands.schema.json` branch. The enum
 /// is the typed command set; [`Command::type_name`] is the wire `type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -404,6 +405,9 @@ pub enum Command {
         route: String,
         budget: String,
     },
+    /// `jobs.transform{request}` (#294): one processing job over a take's
+    /// text; the request is the mode-routing transform request.
+    JobsTransform { request: Box<TransformRequest> },
     /// `jobs.cancel{jobId}` — no v1 reply event.
     JobsCancel { job_id: String },
     /// `jobs.setLimits{maxQueued, maxConcurrent, perRoute?}` — legal in
@@ -447,6 +451,12 @@ pub struct Manual;
 // Payload shapes for wire parsing: `deny_unknown_fields` is the schemas'
 // `additionalProperties: false` (an unknown field is a validation failure,
 // never a silently ignored extra) and missing required fields fail too.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobsTransformP {
+    request: TransformRequest,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaptureStartP {
@@ -548,6 +558,7 @@ impl Command {
             Command::CaptureStop { .. } => "capture.stop",
             Command::CaptureAbort => "capture.abort",
             Command::JobsSubmit { .. } => "jobs.submit",
+            Command::JobsTransform { .. } => "jobs.transform",
             Command::JobsCancel { .. } => "jobs.cancel",
             Command::JobsSetLimits(_) => "jobs.setLimits",
             Command::ContextSnapshot { .. } => "context.snapshot",
@@ -571,6 +582,7 @@ impl Command {
             | Command::CaptureStop { .. }
             | Command::CaptureAbort => "capture",
             Command::JobsSubmit { .. }
+            | Command::JobsTransform { .. }
             | Command::JobsCancel { .. }
             | Command::JobsSetLimits(_) => "jobs",
             Command::ContextSnapshot { .. } | Command::ContextExpire => "context",
@@ -604,6 +616,7 @@ impl Command {
                 "route": route,
                 "budget": budget,
             }),
+            Command::JobsTransform { request } => json!({ "request": request }),
             Command::JobsCancel { job_id } => json!({ "jobId": job_id }),
             Command::JobsSetLimits(limits) => serde_json::to_value(limits)
                 .unwrap_or_else(|_| json!({})),
@@ -663,6 +676,9 @@ impl Command {
                     budget: parsed.budget,
                 })
             }
+            "jobs.transform" => Ok(Command::JobsTransform {
+                request: Box::new(parse::<JobsTransformP>(payload, type_)?.request),
+            }),
             "jobs.cancel" => Ok(Command::JobsCancel {
                 job_id: parse::<JobsCancelP>(payload, type_)?.job_id.unwrap_or_default(),
             }),
@@ -759,7 +775,7 @@ pub struct CompletionData {
     pub completion_evidence: String,
 }
 
-/// All 22 v1 events (21 machine events + `runtime.nack`), variant per
+/// All 23 v1 events (22 machine events + `runtime.nack`), variant per
 /// events.schema.json branch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -802,6 +818,10 @@ pub enum Event {
     /// `jobs.completed{attemptId, text, backend, timing,
     /// completionEvidence}`.
     JobsCompleted(CompletionData),
+    /// `jobs.transformed{result}` (#294): a transform job's completed
+    /// result — a proposal for the take's draft, never a rewrite of the
+    /// recognition.
+    JobsTransformed(Box<TransformResult>),
     /// `jobs.failed{reason, retryable}`.
     JobsFailed { reason: String, retryable: bool },
     /// `context.targetSnapshot{…}`.
@@ -868,6 +888,7 @@ impl Event {
             Event::JobsRejected { .. } => "jobs.rejected",
             Event::JobsProgress { .. } => "jobs.progress",
             Event::JobsCompleted(_) => "jobs.completed",
+            Event::JobsTransformed(_) => "jobs.transformed",
             Event::JobsFailed { .. } => "jobs.failed",
             Event::ContextTargetSnapshot(_) => "context.targetSnapshot",
             Event::ModeDecision(_) => "mode.decision",
@@ -950,6 +971,7 @@ impl Event {
                 "timing": data.timing,
                 "completionEvidence": data.completion_evidence,
             }),
+            Event::JobsTransformed(result) => json!({ "result": result }),
             Event::JobsFailed { reason, retryable } => {
                 json!({ "reason": reason, "retryable": retryable })
             }

@@ -1,0 +1,83 @@
+[
+  {
+    "schema_version": 1,
+    "occurred_at": "2026-09-24T10:00:00Z",
+    "event_id": "pc1",
+    "capture_id": "take-p1",
+    "type": "capture_finalized",
+    "sample_count": 160000,
+    "sample_rate": 16000,
+    "complete_audio": true,
+    "mode_id": "clean-local",
+    "reporting_timezone": "Europe/Berlin"
+  },
+  {
+    "schema_version": 1,
+    "occurred_at": "2026-09-24T10:00:02Z",
+    "event_id": "pp1",
+    "capture_id": "take-p1",
+    "type": "processing_recorded",
+    "job_id": "req-p1",
+    "mode_id": "clean-local",
+    "mode_version": 1,
+    "provider_kind": "s1",
+    "locality": "local",
+    "transform_kinds": [
+      "clean"
+    ],
+    "status": "completed",
+    "failure_reason": null,
+    "arrival": "current",
+    "queued_ms": 0.4,
+    "processing_ms": 612.5,
+    "stop_to_result_ms": 1840.0,
+    "input_chars": 182,
+    "output_chars": 160
+  },
+  {
+    "schema_version": 1,
+    "occurred_at": "2026-09-24T10:00:02Z",
+    "event_id": "pp2",
+    "capture_id": "take-p1",
+    "type": "processing_recorded",
+    "job_id": "req-p2",
+    "mode_id": "clean-api",
+    "mode_version": 1,
+    "provider_kind": "openai_compatible",
+    "locality": "remote",
+    "transform_kinds": [
+      "clean"
+    ],
+    "status": "failed",
+    "failure_reason": "rate_limited",
+    "arrival": "not_applicable",
+    "queued_ms": 0.2,
+    "processing_ms": 91.0,
+    "stop_to_result_ms": null,
+    "input_chars": 182,
+    "output_chars": null
+  },
+  {
+    "schema_version": 1,
+    "occurred_at": "2026-09-24T10:00:02Z",
+    "event_id": "pp3",
+    "capture_id": "take-p1",
+    "type": "processing_recorded",
+    "job_id": "req-p3",
+    "mode_id": "clean-api",
+    "mode_version": 1,
+    "provider_kind": "openai_compatible",
+    "locality": "remote",
+    "transform_kinds": [
+      "clean"
+    ],
+    "status": "completed",
+    "failure_reason": null,
+    "arrival": "stale",
+    "queued_ms": 0.2,
+    "processing_ms": 950.0,
+    "stop_to_result_ms": 4210.0,
+    "input_chars": 182,
+    "output_chars": 171
+  }
+]

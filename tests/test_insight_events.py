@@ -372,3 +372,32 @@ def test_reset_yields_zero_state_and_export_round_trips() -> None:
     for payload in (empty, aggregate(BASIC, 50), aggregate(load("generated-output.json"))):
         round_tripped = json.loads(json.dumps(payload))
         assert round_tripped == payload
+
+
+# --------------------------------------------------------------------------- #
+# processing_recorded (#294): recorded for #308/#226, consumed by no metric
+# --------------------------------------------------------------------------- #
+PROCESSING = json.loads((CONTRACT / "fixtures" / "processing-latency.json").read_text())
+
+
+def test_processing_events_conform_and_carry_no_text() -> None:
+    kinds = {event["type"] for event in PROCESSING}
+    assert "processing_recorded" in kinds
+    for event in PROCESSING:
+        assert_valid(event)
+        if event["type"] == "processing_recorded":
+            for field in ("text", "input", "output", "prompt", "endpoint"):
+                poisoned = copy.deepcopy(event)
+                poisoned[field] = "so the meeting is at three"
+                assert_invalid(poisoned)
+
+
+def test_processing_failure_reason_is_typed() -> None:
+    event = copy.deepcopy(next(e for e in PROCESSING if e.get("status") == "failed"))
+    event["failure_reason"] = "the server said no"
+    assert_invalid(event)
+
+
+def test_processing_events_do_not_move_existing_metrics() -> None:
+    capture_only = [e for e in PROCESSING if e["type"] != "processing_recorded"]
+    assert aggregate(PROCESSING) == aggregate(capture_only)

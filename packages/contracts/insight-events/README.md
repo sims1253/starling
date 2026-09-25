@@ -15,6 +15,7 @@ reproduce the semantics frozen here and in `tests/test_insight_events.py`.
 | `recognition_selected` | `capture_id`, `attempt_id`, `selection_seq`, `lexical_words`, `raw_words`, `tokenizer`, `post_stop_ready_ms` | A recognition attempt was selected as final for the capture. Retries carry a new `attempt_id` and higher `selection_seq`. |
 | `transformation_completed` | `capture_id`, `revision_id`, `revision_seq`, `transformation_kind`, `change_counts` | An authored revision of the output (model authoring, snippet expansion, user edit, dictionary substitution). |
 | `delivery_recorded` | `capture_id`, `delivery_id`, `delivery_seq`, `status`, `output_words`, `generated_words` | An output was delivered to a target. `submitted_unconfirmed` and `confirmed` are distinct; submission is never counted as confirmed insertion. |
+| `processing_recorded` | `capture_id`, `job_id`, `mode_id`, `mode_version`, `provider_kind`, `locality`, `transform_kinds`, `status`, `failure_reason`, `arrival`, `queued_ms`, `processing_ms`, `stop_to_result_ms`, `input_chars`, `output_chars` | One processing job (#294): latency from stop to processed text, how the result arrived against the draft (`current`/`stale`/`superseded`/`discarded`), and the typed failure if any. Recorded now for #308/#226; no metric consumes it yet. |
 | `capture_deleted` | `capture_id` | Tombstone. Removes all attributable events/rollups of the capture. |
 
 Identity rules (frozen):
@@ -105,4 +106,5 @@ this schema.
 | `deletion-propagation.json` | A third take tombstoned mid-stream with a stale post-deletion replay — totals equal the basic session. |
 | `timezone-shift.json` | Takes around the Oct 25 2026 Berlin DST fallback and a UTC/Berlin day boundary. |
 | `negative-proxy.json` | 1000 s post-stop wait → proxy −920 s; also an incomplete capture (`complete_audio: false`). |
+| `processing-latency.json` | One take processed locally (current), a remote rate-limit failure and a stale remote result; aggregates are unchanged by these events. |
 | `generated-output.json` | 110 speech words vs 145 generated/240 output words; transformation retry replacing change counts; unknown wait suppresses the proxy. |

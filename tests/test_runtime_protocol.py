@@ -315,3 +315,42 @@ def test_directives_only_advance_internal_edges() -> None:
         "Recognizing",
         "Dispatched",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Transform jobs (#294): the embedded mode-routing records cannot drift
+# --------------------------------------------------------------------------- #
+MODE_ROUTING = rp.REPO / "packages" / "contracts" / "mode-routing"
+
+
+def _embedded_core(schema: dict) -> dict:
+    return {k: v for k, v in schema.items() if k not in ("$schema", "$id", "$comment", "$defs")}
+
+
+def test_transform_records_are_embedded_verbatim() -> None:
+    for protocol_schema, name, key in (
+        (rp.COMMAND_SCHEMA, "transform-request.schema.json", "transformRequest"),
+        (rp.EVENT_SCHEMA, "transform-result.schema.json", "transformResult"),
+    ):
+        source = json.loads((MODE_ROUTING / name).read_text())
+        assert protocol_schema["$defs"][key] == _embedded_core(source)
+        for def_name, definition in source["$defs"].items():
+            assert protocol_schema["$defs"][def_name] == definition, def_name
+
+
+def test_transform_job_payloads_validate() -> None:
+    trace = VALID_BY_NAME["jobs-transform.json"]
+    kinds = {msg["type"] for msg in rp.iter_envelopes(trace)}
+    assert {"jobs.transform", "jobs.transformed", "jobs.failed", "jobs.cancel"} <= kinds
+    for msg in rp.iter_envelopes(trace):
+        assert not schema_errors(msg), msg["type"]
+    poisoned = copy.deepcopy(next(m for m in rp.iter_envelopes(trace) if m["type"] == "jobs.transform"))
+    poisoned["payload"]["request"]["execute"] = True
+    assert_invalid(poisoned)
+
+
+def test_recognition_never_passes_through_transforming() -> None:
+    jobs = rp.MACHINES["jobs"]
+    assert ["Recognizing", "Transforming"] not in jobs["internal"]
+    assert jobs["events"]["jobs.completed"]["from"] == ["Recognizing"]
+    assert jobs["events"]["jobs.transformed"]["from"] == ["Transforming"]

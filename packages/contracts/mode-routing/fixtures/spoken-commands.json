@@ -1,0 +1,299 @@
+[
+  {
+    "name": "punctuation_attaches",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma how are you question mark",
+    "output": "hello, how are you?"
+  },
+  {
+    "name": "language_tags_are_case_insensitive",
+    "language": "EN-us",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello, world"
+  },
+  {
+    "name": "asr_punctuation_is_replaced",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "Hello. Comma, how are you. Question mark.",
+    "output": "Hello, how are you?"
+  },
+  {
+    "name": "new_line_drops_spaces",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "first line new line second line",
+    "output": "first line\nsecond line"
+  },
+  {
+    "name": "new_paragraph",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "one new paragraph two",
+    "output": "one\n\ntwo"
+  },
+  {
+    "name": "bullets",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "shopping list colon bullet milk bullet point eggs",
+    "output": "shopping list:\n- milk\n- eggs"
+  },
+  {
+    "name": "bullet_at_start",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "bullet milk",
+    "output": "- milk"
+  },
+  {
+    "name": "literal_escape",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "type literal new line to break",
+    "output": "type new line to break"
+  },
+  {
+    "name": "literal_escape_keeps_case",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "say Literal Comma please",
+    "output": "say Comma please"
+  },
+  {
+    "name": "literal_before_ordinary_word_stays",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "the literal meaning",
+    "output": "the literal meaning"
+  },
+  {
+    "name": "quoted_mention_stays",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "the word \"comma\" is a noun",
+    "output": "the word \"comma\" is a noun"
+  },
+  {
+    "name": "mid_word_does_not_match",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "commas and periodic tables",
+    "output": "commas and periodic tables"
+  },
+  {
+    "name": "whitespace_is_kept_elsewhere",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "a  b\tc comma d",
+    "output": "a  b\tc, d"
+  },
+  {
+    "name": "commands_off",
+    "language": "en",
+    "spoken_commands": false,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello comma world"
+  },
+  {
+    "name": "undeclared_language_uses_english",
+    "language": null,
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello, world"
+  },
+  {
+    "name": "english_region_subtag",
+    "language": "en-GB",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello, world"
+  },
+  {
+    "name": "german",
+    "language": "de",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "Hallo Komma wie geht es dir Fragezeichen neue Zeile Gruß",
+    "output": "Hallo, wie geht es dir?\nGruß"
+  },
+  {
+    "name": "german_literal",
+    "language": "de",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "schreib wörtlich neue Zeile hin",
+    "output": "schreib neue Zeile hin"
+  },
+  {
+    "name": "german_does_not_use_english_words",
+    "language": "de",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello comma world"
+  },
+  {
+    "name": "spanish_longest_match",
+    "language": "es",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "uno punto y coma dos punto",
+    "output": "uno; dos."
+  },
+  {
+    "name": "french",
+    "language": "fr",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "bonjour virgule ça va point d'interrogation",
+    "output": "bonjour, ça va?"
+  },
+  {
+    "name": "french_literal",
+    "language": "fr",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "écris littéralement nouvelle ligne ici",
+    "output": "écris nouvelle ligne ici"
+  },
+  {
+    "name": "no_table_no_commands",
+    "language": "ja",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma world",
+    "output": "hello comma world"
+  },
+  {
+    "name": "snippet_expands",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [
+      {
+        "spoken": "snake case",
+        "expansion": "snake_case"
+      }
+    ],
+    "input": "use snake case here",
+    "output": "use snake_case here"
+  },
+  {
+    "name": "snippet_literal_escape",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [
+      {
+        "spoken": "snake case",
+        "expansion": "snake_case"
+      }
+    ],
+    "input": "say literal snake case",
+    "output": "say snake case"
+  },
+  {
+    "name": "command_beats_snippet_on_tie",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [
+      {
+        "spoken": "new paragraph",
+        "expansion": "¶"
+      }
+    ],
+    "input": "a new paragraph b",
+    "output": "a\n\nb"
+  },
+  {
+    "name": "longer_snippet_beats_command",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [
+      {
+        "spoken": "sign off comma thanks",
+        "expansion": "Best regards"
+      }
+    ],
+    "input": "sign off comma thanks",
+    "output": "Best regards"
+  },
+  {
+    "name": "snippets_without_commands",
+    "language": "en",
+    "spoken_commands": false,
+    "snippets": [
+      {
+        "spoken": "my addr",
+        "expansion": "42 Main St"
+      }
+    ],
+    "input": "my addr please",
+    "output": "42 Main St please"
+  },
+  {
+    "name": "unicode_untouched",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "naïve 👩‍💻 café comma ok",
+    "output": "naïve 👩‍💻 café, ok"
+  },
+  {
+    "name": "empty",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "",
+    "output": ""
+  },
+  {
+    "name": "only_command",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "new line",
+    "output": "\n"
+  },
+  {
+    "name": "trailing_whitespace_kept",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "done period  ",
+    "output": "done.  "
+  },
+  {
+    "name": "punctuation_after_layout_keeps_the_break",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "hello comma new paragraph period next",
+    "output": "hello.\n\nnext"
+  },
+  {
+    "name": "punctuation_after_a_line_break",
+    "language": "en",
+    "spoken_commands": true,
+    "snippets": [],
+    "input": "line one new line period line two",
+    "output": "line one.\nline two"
+  }
+]

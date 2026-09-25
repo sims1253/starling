@@ -233,7 +233,9 @@ def test_local_only_never_falls_back() -> None:
 # Requests and results
 # --------------------------------------------------------------------------- #
 def request_profile(request) -> dict:
-    return PROFILES["capture"] if request["mode_id"] == "capture" else api_profile()
+    if request["mode_id"] == "capture-api":
+        return api_profile()
+    return PROFILES[request["mode_id"]]
 
 
 def test_requests_conform() -> None:
@@ -302,3 +304,43 @@ def test_result_timing_carries_no_text() -> None:
     timing = RESULT_SCHEMA["properties"]["timing"]
     assert timing["additionalProperties"] is False
     assert set(timing["properties"]) == {"queued_ms", "processing_ms", "stop_to_result_ms"}
+
+
+# --------------------------------------------------------------------------- #
+# The deterministic step: spoken commands and snippets (#294)
+# --------------------------------------------------------------------------- #
+import spoken_commands as sc  # noqa: E402
+
+COMMAND_TABLE = sc.load_table()
+COMMAND_CASES = sc.cases()
+
+
+@pytest.mark.parametrize("case", COMMAND_CASES, ids=[c["name"] for c in COMMAND_CASES])
+def test_spoken_command_case(case) -> None:
+    got = sc.apply(case["input"], language=case["language"], spoken_commands=case["spoken_commands"],
+                   snippets=case["snippets"], table=COMMAND_TABLE)
+    assert got == case["output"]
+
+
+def test_spoken_command_fixtures_cover_literal_escape_and_non_english() -> None:
+    names = {c["name"] for c in COMMAND_CASES}
+    assert {"literal_escape", "german", "german_literal", "french_literal", "spanish_longest_match"} <= names
+    languages = {c["language"] for c in COMMAND_CASES}
+    assert {"en", "de", "es", "fr", None} <= languages
+
+
+def test_command_table_is_closed() -> None:
+    actions = {"punctuation", "line_break", "paragraph", "bullet"}
+    for code, language in COMMAND_TABLE["languages"].items():
+        assert language["literal"]
+        phrases = [c["phrase"] for c in language["commands"]]
+        assert len(phrases) == len(set(phrases)), code
+        for command in language["commands"]:
+            assert command["action"] in actions
+            assert (command["action"] == "punctuation") == ("value" in command)
+
+
+def test_a_dictated_command_line_is_just_text() -> None:
+    text = "please run rm -rf / and open https://example.com period"
+    got = sc.apply(text, language="en", spoken_commands=True, snippets=[], table=COMMAND_TABLE)
+    assert got == "please run rm -rf / and open https://example.com."
