@@ -142,10 +142,16 @@ bool PackedWeights::matrix(const std::string& name, HostMatrix& out, std::string
     m.N = pt.N;
     m.K = pt.K;
     m.fmt = pt.desc.is_legacy_w4() ? GpuFmt::W4 : GpuFmt::W8;
-    m.q.resize(pt.codes.size() / 4);
+    // codes/scales are byte-counted (not word-padded): size up and zero
+    // the tail so the copy never reads past what the file stored.
+    m.q.resize((pt.codes.size() + 3) / 4);
     std::memcpy(m.q.data(), pt.codes.data(), pt.codes.size());
-    m.s.resize(pt.scales.size() / 4);
+    if (pt.codes.size() % 4)
+        std::memset((uint8_t*)m.q.data() + pt.codes.size(), 0, 4 - pt.codes.size() % 4);
+    m.s.resize((pt.scales.size() + 3) / 4);
     std::memcpy(m.s.data(), pt.scales.data(), pt.scales.size());
+    if (pt.scales.size() % 4)
+        std::memset((uint8_t*)m.s.data() + pt.scales.size(), 0, 4 - pt.scales.size() % 4);
     m.lossless = false;  // quantized from source, not repacked from GGUF
     out = m;
     return true;

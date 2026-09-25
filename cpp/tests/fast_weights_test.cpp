@@ -179,9 +179,26 @@ int check_gemv_helper() {
 // Quantize + dequant round trip through a descriptor: the reference dequant
 // of the packed bytes must (a) be reproducible from the stored scale halves
 // through the documented f32 expression and (b) stay a sane approximation.
-// Regression (#323 review): f16 subnormal -> f32 conversion (the quantizer
-// and h2f_ share the formula). ggml is the reference.
+// Regression (#323 review): f16 subnormal round trips through the REAL
+// conversion paths (layout_store_scales -> layout_scale_at uses f2h/h2f_),
+// plus the formula directly. ggml is the reference.
 int check_f16_subnormals() {
+    {   // end-to-end: a tiny scale produces an f16-subnormal stored half;
+        // reading it back must equal ggml's round trip.
+        LayoutDesc d;
+        std::string err;
+        if (!layout_from_string("w4g32sym", &d, &err)) return 1;
+        const float tiny = 1.0e-7f;                 // f16-subnormal when packed
+        const float s[1] = {tiny}, o[1] = {0.0f};
+        std::vector<uint8_t> sb(layout_scale_bytes(d, 32));
+        layout_store_scales(d, s, o, 32, sb.data());
+        const float back = layout_scale_at(d, sb.data(), nullptr, nullptr, 0);
+        const float ref = ggml_fp16_to_fp32(ggml_fp32_to_fp16(tiny));
+        if (back != ref) {
+            std::printf("FAIL f16 subnormal scale round trip: %g vs ggml %g\n", back, ref);
+            return 1;
+        }
+    }
     for (uint32_t m = 1; m < 1024; m += 97) {
         for (uint16_t h16 : {(uint16_t)m, (uint16_t)(0x8000u | m)}) {
             const float ref = ggml_fp16_to_fp32(h16);

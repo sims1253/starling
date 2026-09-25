@@ -15,7 +15,7 @@ namespace starling::fast {
 namespace {
 
 // Round-to-nearest-even f32 -> f16 bit pattern, matching the GPU's f16
-// conversion (and ggml_fp32_to_fp32's RNE). Implemented locally so layout
+// conversion (and ggml_fp32_to_fp16's RNE). Implemented locally so layout
 // code has no ggml dependency.
 uint16_t f2h(float f) {
     uint32_t x;
@@ -29,8 +29,9 @@ uint16_t f2h(float f) {
         // Subnormal f32: renormalize into a normalized f16 candidate.
         int e = -1;
         while (!(mant & 0x800000u)) { mant <<= 1; --e; }
-        // value = 1.mant * 2^(e-127); f16 exponent field = e-127+15.
-        const int f16e = e - 127 + 15;
+        // Renormalized subnormal: value = m * 2^(e-148) with m in
+        // [2^23, 2^24), i.e. (1+frac) * 2^(e-125); f16 field = e - 110.
+        const int f16e = e - 110;
         mant &= 0x7fffffu;
         if (f16e > 0) {
             uint32_t out = ((uint32_t)f16e << 10) | (mant >> 13);
@@ -74,10 +75,12 @@ float h2f_(uint16_t h) {
         if (mant == 0) {
             bits = sign;
         } else {  // f16 subnormal -> normalized f32
+            // value = m*2^-24; after the shift loop e = (leading pos) - 11,
+            // so the f32 exponent field is 127 + (e + 11) - 24 = e + 114.
             int e = -1;
             uint32_t m = mant;
             while (!(m & 0x400u)) { m <<= 1; --e; }
-            bits = sign | ((uint32_t)(e - 1 + 127 - 10 + 1) << 23) | ((m & 0x3ffu) << 13);
+            bits = sign | ((uint32_t)(e + 114) << 23) | ((m & 0x3ffu) << 13);
         }
     } else if (exp == 31) {
         bits = sign | 0x7f800000u | (mant << 13);
@@ -132,9 +135,9 @@ double score_candidate(const ScoreCtx& c, int bits, bool sym, float s, float o, 
             wq = sym ? s * ((float)q - 8.0f) + o /* o==0 for sym */
                      : s * (float)q + o;
         } else {
-            q = (long)std::lround(c.w[i] / s);
+            q = (long)std::lround((c.w[i] - o) / s);
             q = clamp_code(8, q);
-            wq = s * (float)q;
+            wq = s * (float)q + o;
         }
         if (qc) qc[i] = (int16_t)q;
         const double d = (double)c.w[i] - (double)wq;
@@ -164,7 +167,7 @@ bool layout_from_string(const std::string& spec, LayoutDesc* out, std::string* e
     auto num = [&](const char* q) -> long {
         char* end = nullptr;
         const long v = std::strtol(q, &end, 10);
-        if (end == q) { fail("expected a number"); return -1; }
+        if (end == q) { fail("expected a number"); p = q; return -1; }
         p = end;
         return v;
     };

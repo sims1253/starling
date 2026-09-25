@@ -112,8 +112,11 @@ struct Sha256 {
         uint8_t l[8];
         const uint64_t bits = data_bits;
         for (int i = 0; i < 8; ++i) l[i] = (uint8_t)(bits >> (56 - 8 * i));
-        tmp.fill = 56;
-        tmp.block(l);   // l is exactly 8 bytes -> one final block
+        // Pad to a full 56-byte prefix (the old code hashed a 64-byte
+        // block from an 8-byte buffer — 56 bytes of stack garbage).
+        uint8_t tail[64] = {0};
+        std::memcpy(tail, l, 8);
+        tmp.update(tail, 56);
         char out[65];
         for (int i = 0; i < 8; ++i) std::snprintf(out + i * 8, 9, "%08x", tmp.h[i]);
         out[64] = 0;
