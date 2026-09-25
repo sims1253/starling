@@ -363,3 +363,133 @@ def decision_from_resolve(config: dict[str, Any], request: dict[str, Any],
         'conflicts': conflicts_for(config, request, result),
         'context_snapshot_id': context_snapshot_id,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Processing (#293/#294): additive rules for the mode entry's processing
+# fields and the provider choice. They never change resolve(): routing picks
+# the mode, these pick at most one provider for its authoring route.
+# --------------------------------------------------------------------------- #
+
+INSTRUCTION_KINDS = ("rewrite", "translate")
+
+
+def validate_processing(config: dict[str, Any]) -> None:
+    """Cross-field rules for the processing fields a schema cannot express."""
+    for p in config.get('profiles', []):
+        kinds = p['transform_kinds']
+        if len(set(kinds)) != len(kinds) or len(set(p['context_fields'])) != len(p['context_fields']):
+            raise ValueError(f'{p["id"]}: duplicate transform kind or context field')
+        if kinds and p['authoring_route'] is None:
+            raise ValueError(f'{p["id"]}: processing needs an authoring route')
+        if p['behavior'] == 'verbatim' and (kinds or p['spoken_commands']):
+            raise ValueError(f'{p["id"]}: verbatim returns raw text untouched')
+        if p['style'] is not None and not {'clean', 'format'} & set(kinds):
+            raise ValueError(f'{p["id"]}: style applies to clean/format only')
+        if p['delivery'] == 'insert_enter':
+            # Enter is an explicit, per-mode opt-in: never the default,
+            # never on an edit target.
+            if p['id'] == config.get('default_profile'):
+                raise ValueError('insert_enter cannot be the default delivery')
+            if p['selected_text'] == 'edit_target':
+                raise ValueError('insert_enter cannot replace a selection')
+
+
+def validate_provider(provider: dict[str, Any]) -> None:
+    remote_route = provider['route'].startswith('remote-')
+    if remote_route != (provider['locality'] == 'remote'):
+        raise ValueError(f'{provider["id"]}: locality must match the route')
+    if set(INSTRUCTION_KINDS) & set(provider['transform_kinds']) and not provider['instructions']:
+        raise ValueError(f'{provider["id"]}: rewrite/translate need instructions')
+    if provider['locality'] == 'remote' and provider['artifact'] is not None:
+        raise ValueError(f'{provider["id"]}: a remote provider has no local artifact')
+
+
+def _language_ok(language: str | None, accepted: list[str]) -> bool:
+    if '*' in accepted:
+        return True
+    if language is None:
+        return False
+    primary = language.split('-', 1)[0]
+    return language in accepted or primary in accepted
+
+
+def processing_route(profile: dict[str, Any],
+                     providers: list[dict[str, Any]]) -> dict[str, Any]:
+    """The provider for this mode's processing, or why there is none.
+
+    status ``none``: transcribe only. ``ready``: exactly this provider,
+    with the context fields that will actually be sent (the mode's allowed
+    fields the provider accepts). ``blocked``: nothing runs, the raw text
+    stands; there is no fallback to any other provider.
+    """
+    def blocked(reason: str) -> dict[str, Any]:
+        return {'status': 'blocked', 'provider': None, 'reason': reason, 'context_fields': []}
+
+    kinds = profile['transform_kinds']
+    if not kinds:
+        return {'status': 'none', 'provider': None, 'reason': None, 'context_fields': []}
+    candidates = [p for p in providers if p['route'] == profile['authoring_route']]
+    if profile['local_only'] and (
+            str(profile['authoring_route']).startswith('remote-')
+            or any(p['locality'] == 'remote' for p in candidates)):
+        return blocked('remote_forbidden')
+    if not candidates:
+        return blocked('provider_unavailable')
+    if len(candidates) > 1:
+        return blocked('provider_conflict')
+    provider = candidates[0]
+    if not set(kinds) <= set(provider['transform_kinds']):
+        return blocked('unsupported_kind')
+    if not _language_ok(profile['language'], provider['languages']):
+        return blocked('unsupported_language')
+    fields = [f for f in profile['context_fields'] if f in provider['context_fields']]
+    return {'status': 'ready', 'provider': provider['id'], 'reason': None, 'context_fields': fields}
+
+
+def check_request(request: dict[str, Any], profile: dict[str, Any],
+                  provider: dict[str, Any]) -> list[str]:
+    """Cross-field violations of a transform request against the mode it
+    claims and the provider it names (empty when consistent)."""
+    found = []
+    if (request['mode_id'], request['mode_version']) != (profile['id'], profile['version']):
+        found.append('request names a different mode version')
+    if request['kinds'] != profile['transform_kinds']:
+        found.append('request kinds differ from the mode')
+    if request['language'] != profile['language']:
+        found.append('request language differs from the mode')
+    if request['local_only'] != profile['local_only']:
+        found.append('request local_only differs from the mode')
+    if request['local_only'] and request['provider']['locality'] != 'local':
+        found.append('local_only request names a remote provider')
+    ref = request['provider']
+    for key in ('id', 'kind', 'locality', 'route', 'model'):
+        if ref[key] != provider[key]:
+            found.append(f'provider {key} differs from the declaration')
+    expected_sha = provider['artifact']['sha256'] if provider['artifact'] else None
+    if ref['artifact_sha256'] != expected_sha:
+        found.append('provider artifact differs from the declaration')
+    route = processing_route(profile, [provider])
+    if route['status'] != 'ready':
+        found.append(f'mode cannot use this provider: {route["reason"]}')
+    for field in request['context']:
+        if field not in route['context_fields']:
+            found.append(f'context field {field} was not allowed to be sent')
+    if request['instruction'] is not None and not set(INSTRUCTION_KINDS) & set(request['kinds']):
+        found.append('only rewrite/translate may carry an instruction')
+    if request['style'] != profile['style']:
+        found.append('request style differs from the mode')
+    return found
+
+
+def check_result(result: dict[str, Any]) -> list[str]:
+    found = []
+    if result['status'] == 'completed':
+        if result['text'] is None or result['failure'] is not None:
+            found.append('a completed result carries text and no failure')
+    elif result['text'] is not None or result['failure'] is None:
+        found.append('a failed or cancelled result carries a failure and no text')
+    if (result['status'] == 'cancelled' and result['failure'] is not None
+            and result['failure']['reason'] != 'cancelled'):
+        found.append('a cancelled result has the cancelled reason')
+    return found

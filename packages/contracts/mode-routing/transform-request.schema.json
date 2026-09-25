@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:transform-request:v1",
+  "$comment": [
+    "Starling transform request, v1 (#293). One model step of one take's",
+    "processing, pinned to the draft revision it read (base_revision) and",
+    "to the raw attempts it came from (source_attempt_ids).",
+    "input is DATA: the transcript text to transform, never instructions",
+    "to follow. instruction carries an explicit trailing instruction (#298)",
+    "or null; only rewrite/translate may carry one.",
+    "context holds exactly the context fields that were sent to the",
+    "provider, and nothing else; each key must be allowed by the mode's",
+    "context_fields and accepted by the provider (checked by",
+    "tests/mode_routing.py check_request).",
+    "retry_of names the request this one retries; the older one's late",
+    "result then lands as superseded (tests/staging.py).",
+    "local_only is copied from the mode at activation: a local_only",
+    "request with a remote provider is invalid.",
+    "deadline_ms bounds the whole call; max_output_chars caps the output",
+    "(an output over the cap is a truncated_output failure, never a",
+    "silently shortened text)."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "retry_of",
+    "draft_id",
+    "capture_id",
+    "base_revision",
+    "source_attempt_ids",
+    "mode_id",
+    "mode_version",
+    "prompt_version",
+    "kinds",
+    "language",
+    "input",
+    "instruction",
+    "style",
+    "context",
+    "provider",
+    "local_only",
+    "deadline_ms",
+    "max_output_chars"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "request_id": {
+      "$ref": "#/$defs/token"
+    },
+    "retry_of": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/token"
+        }
+      ]
+    },
+    "draft_id": {
+      "$ref": "#/$defs/token"
+    },
+    "capture_id": {
+      "$ref": "#/$defs/token"
+    },
+    "base_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_attempt_ids": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/token"
+      }
+    },
+    "mode_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "mode_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "prompt_version": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/token"
+        }
+      ]
+    },
+    "kinds": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "clean",
+          "format",
+          "rewrite",
+          "translate"
+        ]
+      }
+    },
+    "language": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$"
+        }
+      ]
+    },
+    "input": {
+      "type": "string"
+    },
+    "instruction": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "style": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "formality",
+            "structure",
+            "context"
+          ],
+          "properties": {
+            "formality": {
+              "enum": [
+                "casual",
+                "semi-casual",
+                "semi-formal",
+                "formal"
+              ]
+            },
+            "structure": {
+              "enum": [
+                "prose",
+                "lists"
+              ]
+            },
+            "context": {
+              "enum": [
+                "general",
+                "email"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "personal_context": {
+          "type": "string",
+          "minLength": 1
+        },
+        "vocabulary": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "provider": {
+      "$ref": "#/$defs/providerRef"
+    },
+    "local_only": {
+      "type": "boolean"
+    },
+    "deadline_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_output_chars": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "providerKind": {
+      "enum": [
+        "s1",
+        "openai_compatible",
+        "anthropic",
+        "gemini"
+      ]
+    },
+    "providerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "locality",
+        "route",
+        "model",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "$ref": "#/$defs/providerKind"
+        },
+        "locality": {
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/route"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

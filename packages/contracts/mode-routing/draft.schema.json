@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:draft:v1",
+  "$comment": [
+    "Starling staged draft snapshot, v1 (#293). One take's editable text",
+    "with typed regions over it; tests/staging.py is the executable",
+    "semantics and fixtures/staging.json the shared cases.",
+    "Regions tile the text exactly (every code point in one region), with",
+    "Unicode code-point spans (span_encoding const), never UTF-16 units.",
+    "Kinds: raw (a final attempt's text; attempt_id set), partial (the live",
+    "tail of a streaming segment; replaced by newer partials or the final),",
+    "user (typed text, including a partial the user edited: its segment is",
+    "then pinned), command (a leading mode phrase or trailing instruction,",
+    "kept out of the transform input), processed (an accepted proposal;",
+    "request_id set).",
+    "attempts are the immutable raw recognition attempts; they are never",
+    "rewritten by any edit, proposal or failure, so raw text can always be",
+    "rebuilt byte for byte.",
+    "revision counts text changes. A proposal is current only while its",
+    "base_revision equals revision; otherwise it is stale and only an",
+    "explicit user choice may take it. superseded proposals answered a",
+    "request a retry replaced.",
+    "deliveries record which revision went into which target (digest), so",
+    "a duplicate final callback cannot insert twice and a direct-mode swap",
+    "happens only while the target still holds that delivery."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "draft_id",
+    "capture_id",
+    "revision",
+    "deleted",
+    "text",
+    "span_encoding",
+    "regions",
+    "attempts",
+    "pinned_segments",
+    "requests",
+    "proposals",
+    "deliveries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "draft_id": {
+      "$ref": "#/$defs/token"
+    },
+    "capture_id": {
+      "$ref": "#/$defs/token"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deleted": {
+      "type": "boolean"
+    },
+    "text": {
+      "type": "string"
+    },
+    "span_encoding": {
+      "const": "unicode_codepoints"
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "span",
+          "segment",
+          "attempt_id",
+          "command",
+          "request_id"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "raw",
+              "partial",
+              "user",
+              "command",
+              "processed"
+            ]
+          },
+          "span": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "segment": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "attempt_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/token"
+              }
+            ]
+          },
+          "command": {
+            "enum": [
+              null,
+              "mode_phrase",
+              "trailing_instruction"
+            ]
+          },
+          "request_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/token"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "attempts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt_id",
+          "segment",
+          "text"
+        ],
+        "properties": {
+          "attempt_id": {
+            "$ref": "#/$defs/token"
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "pinned_segments": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request_id",
+          "base_revision",
+          "retry_of",
+          "status"
+        ],
+        "properties": {
+          "request_id": {
+            "$ref": "#/$defs/token"
+          },
+          "base_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retry_of": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/token"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "interrupted",
+              "settled",
+              "superseded",
+              "cancelled"
+            ]
+          }
+        }
+      }
+    },
+    "proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request_id",
+          "base_revision",
+          "text",
+          "status"
+        ],
+        "properties": {
+          "request_id": {
+            "$ref": "#/$defs/token"
+          },
+          "base_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "current",
+              "stale",
+              "superseded",
+              "accepted",
+              "rejected"
+            ]
+          }
+        }
+      }
+    },
+    "deliveries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "delivery_id",
+          "revision",
+          "target_digest"
+        ],
+        "properties": {
+          "delivery_id": {
+            "$ref": "#/$defs/token"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "target_digest": {
+            "$ref": "#/$defs/token"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    }
+  }
+}

@@ -1,0 +1,143 @@
+[
+  {
+    "name": "transcribe_only",
+    "profile": "faithful",
+    "expect": {
+      "status": "none",
+      "provider": null,
+      "reason": null,
+      "context_fields": []
+    }
+  },
+  {
+    "name": "local_clean_english",
+    "profile": "capture",
+    "expect": {
+      "status": "ready",
+      "provider": "local-s1",
+      "reason": null,
+      "context_fields": []
+    }
+  },
+  {
+    "name": "local_only_never_reaches_remote",
+    "profile": "capture",
+    "patch": {
+      "authoring_route": "remote-authoring-openai"
+    },
+    "expect": {
+      "status": "blocked",
+      "provider": null,
+      "reason": "remote_forbidden",
+      "context_fields": []
+    },
+    "note": "validate_config already refuses this profile; processing_route refuses it on its own too, and never tries local-s1 instead"
+  },
+  {
+    "name": "remote_route_when_allowed",
+    "profile": "capture",
+    "patch": {
+      "authoring_route": "remote-authoring-openai",
+      "local_only": false,
+      "context_fields": [
+        "vocabulary"
+      ]
+    },
+    "expect": {
+      "status": "ready",
+      "provider": "remote-openai",
+      "reason": null,
+      "context_fields": [
+        "vocabulary"
+      ]
+    }
+  },
+  {
+    "name": "s1_refuses_other_languages",
+    "profile": "capture",
+    "patch": {
+      "language": "de"
+    },
+    "expect": {
+      "status": "blocked",
+      "provider": null,
+      "reason": "unsupported_language",
+      "context_fields": []
+    }
+  },
+  {
+    "name": "s1_refuses_undeclared_language",
+    "profile": "capture",
+    "patch": {
+      "language": null
+    },
+    "expect": {
+      "status": "blocked",
+      "provider": null,
+      "reason": "unsupported_language",
+      "context_fields": []
+    }
+  },
+  {
+    "name": "s1_accepts_english_region",
+    "profile": "capture",
+    "patch": {
+      "language": "en-GB"
+    },
+    "expect": {
+      "status": "ready",
+      "provider": "local-s1",
+      "reason": null,
+      "context_fields": []
+    }
+  },
+  {
+    "name": "s1_refuses_instructions",
+    "profile": "capture",
+    "patch": {
+      "transform_kinds": [
+        "rewrite"
+      ],
+      "style": null
+    },
+    "expect": {
+      "status": "blocked",
+      "provider": null,
+      "reason": "unsupported_kind",
+      "context_fields": []
+    }
+  },
+  {
+    "name": "missing_provider_is_not_a_fallback",
+    "profile": "capture",
+    "patch": {
+      "authoring_route": "local-authoring-missing"
+    },
+    "expect": {
+      "status": "blocked",
+      "provider": null,
+      "reason": "provider_unavailable",
+      "context_fields": []
+    }
+  },
+  {
+    "name": "context_fields_the_provider_cannot_take_are_not_sent",
+    "profile": "capture",
+    "patch": {
+      "authoring_route": "local-authoring-instruct",
+      "language": "de",
+      "context_fields": [
+        "personal_context",
+        "vocabulary"
+      ]
+    },
+    "expect": {
+      "status": "ready",
+      "provider": "local-llama-server",
+      "reason": null,
+      "context_fields": [
+        "vocabulary"
+      ]
+    }
+  }
+]

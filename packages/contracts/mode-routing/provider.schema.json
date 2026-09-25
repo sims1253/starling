@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:provider:v1",
+  "$comment": [
+    "Starling processing provider declaration, v1 (#293/#294).",
+    "A provider says what it can do: which transform kinds, which",
+    "languages ('*' = any), whether it follows free-form instructions",
+    "(rewrite, trailing instructions), which context fields it may",
+    "receive, and where text goes (locality). It serves exactly one",
+    "authoring route; a mode names the route, never the provider.",
+    "Locality follows the route naming the mode oracle already enforces:",
+    "a 'remote-' route is remote, anything else is local. A local_only",
+    "mode therefore can never reach a remote provider, and",
+    "tests/mode_routing.py processing_route never falls back from one",
+    "provider to another.",
+    "artifact pins a local model file (checksum, tokenizer and chat",
+    "template identity, license/attribution); remote providers have none.",
+    "S1-mini is kind s1: English only, clean/format only, no instructions,",
+    "no context fields, and an empty output on filler-only input is a",
+    "valid result (docs/ggml-engine.md 's1 engine notes')."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "route",
+    "kind",
+    "locality",
+    "transform_kinds",
+    "languages",
+    "instructions",
+    "context_fields",
+    "model",
+    "artifact",
+    "max_input_chars"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "#/$defs/token"
+    },
+    "route": {
+      "$ref": "#/$defs/route"
+    },
+    "kind": {
+      "$ref": "#/$defs/providerKind"
+    },
+    "locality": {
+      "enum": [
+        "local",
+        "remote"
+      ]
+    },
+    "transform_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "enum": [
+          "clean",
+          "format",
+          "rewrite",
+          "translate"
+        ]
+      }
+    },
+    "languages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^(\\*|[a-z]{2,3}(-[A-Za-z0-9]{2,8})*)$"
+      }
+    },
+    "instructions": {
+      "type": "boolean"
+    },
+    "context_fields": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "personal_context",
+          "vocabulary"
+        ]
+      }
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifact": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sha256",
+            "tokenizer",
+            "template",
+            "license",
+            "attribution"
+          ],
+          "properties": {
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "tokenizer": {
+              "$ref": "#/$defs/token"
+            },
+            "template": {
+              "$ref": "#/$defs/token"
+            },
+            "license": {
+              "type": "string",
+              "minLength": 1
+            },
+            "attribution": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "max_input_chars": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "providerKind": {
+      "enum": [
+        "s1",
+        "openai_compatible",
+        "anthropic",
+        "gemini"
+      ]
+    }
+  }
+}

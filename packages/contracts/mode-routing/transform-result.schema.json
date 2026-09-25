@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:transform-result:v1",
+  "$comment": [
+    "Starling transform result, v1 (#293). What a provider returned for one",
+    "request. A result never changes a draft by itself: the draft judges it",
+    "as a proposal against its current revision (tests/staging.py), and the",
+    "raw attempts are never touched by any status here.",
+    "completed carries text (possibly empty: S1-mini returns nothing for a",
+    "filler-only take) and no failure; failed/cancelled carry a typed",
+    "failure and no text.",
+    "failure.reason is the typed vocabulary the pipeline surfaces:",
+    "timeout, cancelled, transport_error, redirect_blocked (3xx refused),",
+    "rate_limited (429), http_error, unknown_model, malformed_response",
+    "(unparseable or missing fields), empty_output (a provider that must",
+    "answer returned nothing), truncated_output (stopped by a length limit",
+    "or over max_output_chars), unsupported_language, unsupported_kind,",
+    "remote_forbidden (a local_only request met a remote provider),",
+    "provider_unavailable, invalid_input.",
+    "timing: queued_ms (submit to dispatch), processing_ms (the provider",
+    "call), stop_to_result_ms (capture stop to this result; null when the",
+    "stop time is unknown). These are the per-job latencies #308 and #226",
+    "read; no text ever goes into them."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "base_revision",
+    "status",
+    "text",
+    "failure",
+    "provider",
+    "timing"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "request_id": {
+      "$ref": "#/$defs/token"
+    },
+    "base_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "retryable",
+            "detail"
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                "timeout",
+                "cancelled",
+                "transport_error",
+                "redirect_blocked",
+                "rate_limited",
+                "http_error",
+                "unknown_model",
+                "malformed_response",
+                "empty_output",
+                "truncated_output",
+                "unsupported_language",
+                "unsupported_kind",
+                "remote_forbidden",
+                "provider_unavailable",
+                "invalid_input"
+              ]
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "provider": {
+      "$ref": "#/$defs/providerRef"
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queued_ms",
+        "processing_ms",
+        "stop_to_result_ms"
+      ],
+      "properties": {
+        "queued_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "processing_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "stop_to_result_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "minLength": 1
+    },
+    "providerKind": {
+      "enum": [
+        "s1",
+        "openai_compatible",
+        "anthropic",
+        "gemini"
+      ]
+    },
+    "providerRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "locality",
+        "route",
+        "model",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/token"
+        },
+        "kind": {
+          "$ref": "#/$defs/providerKind"
+        },
+        "locality": {
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/route"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

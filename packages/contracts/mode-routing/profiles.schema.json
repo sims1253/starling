@@ -74,7 +74,13 @@
           "clipboard",
           "max_context_characters",
           "delivery",
-          "automatic_delivery"
+          "automatic_delivery",
+          "transform_kinds",
+          "language",
+          "style",
+          "spoken_commands",
+          "context_fields",
+          "processing_delivery"
         ],
         "properties": {
           "id": {
@@ -194,11 +200,93 @@
               "insert",
               "replace_selection",
               "preview",
-              "save_note"
+              "save_note",
+              "copy",
+              "insert_enter"
             ]
           },
           "automatic_delivery": {
             "type": "boolean"
+          },
+          "transform_kinds": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "clean",
+                "format",
+                "rewrite",
+                "translate"
+              ]
+            },
+            "description": "Processing kinds this mode asks for, in one model step. Empty means transcribe only: the raw recognition is the output. Providers declare which kinds they support (provider.schema.json); a mode never names a provider."
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$",
+            "description": "Declared dictation language (BCP 47). null means undeclared: only providers that accept any language may process it."
+          },
+          "style": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "formality",
+                  "structure",
+                  "context"
+                ],
+                "properties": {
+                  "formality": {
+                    "enum": [
+                      "casual",
+                      "semi-casual",
+                      "semi-formal",
+                      "formal"
+                    ]
+                  },
+                  "structure": {
+                    "enum": [
+                      "prose",
+                      "lists"
+                    ]
+                  },
+                  "context": {
+                    "enum": [
+                      "general",
+                      "email"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Closed style axes for clean/format. They map one to one onto the S1-mini control line ([Styling] [Structure] [Context]); instruction providers render them into their prompt."
+          },
+          "spoken_commands": {
+            "type": "boolean",
+            "description": "Deterministic spoken punctuation/layout commands (new line, comma, bullet) run before any model step. A leading 'literal' keeps the next command word as text."
+          },
+          "context_fields": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "personal_context",
+                "vocabulary"
+              ]
+            },
+            "description": "Which scoped context fields a transform request may carry to the provider. The request records exactly the fields it sent."
+          },
+          "processing_delivery": {
+            "enum": [
+              "direct",
+              "staged"
+            ],
+            "description": "direct: raw text is delivered immediately and a processed revision may replace it only while the target is unchanged. staged: output waits in the draft until the user accepts a revision."
           }
         }
       }

@@ -1,0 +1,73 @@
+[
+  {
+    "schema_version": 1,
+    "id": "local-s1",
+    "route": "local-authoring-default",
+    "kind": "s1",
+    "locality": "local",
+    "transform_kinds": [
+      "clean",
+      "format"
+    ],
+    "languages": [
+      "en"
+    ],
+    "instructions": false,
+    "context_fields": [],
+    "model": "s1-mini",
+    "artifact": {
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+      "tokenizer": "qwen3-bpe",
+      "template": "s1-chatml-nothink",
+      "license": "apache-2.0",
+      "attribution": "S1-mini by Superwhisper"
+    },
+    "max_input_chars": 4000
+  },
+  {
+    "schema_version": 1,
+    "id": "remote-openai",
+    "route": "remote-authoring-openai",
+    "kind": "openai_compatible",
+    "locality": "remote",
+    "transform_kinds": [
+      "clean",
+      "format",
+      "rewrite",
+      "translate"
+    ],
+    "languages": [
+      "*"
+    ],
+    "instructions": true,
+    "context_fields": [
+      "personal_context",
+      "vocabulary"
+    ],
+    "model": "gpt-4.1-mini",
+    "artifact": null,
+    "max_input_chars": 32000
+  },
+  {
+    "schema_version": 1,
+    "id": "local-llama-server",
+    "route": "local-authoring-instruct",
+    "kind": "openai_compatible",
+    "locality": "local",
+    "transform_kinds": [
+      "clean",
+      "format",
+      "rewrite"
+    ],
+    "languages": [
+      "*"
+    ],
+    "instructions": true,
+    "context_fields": [
+      "vocabulary"
+    ],
+    "model": "qwen3-1.7b",
+    "artifact": null,
+    "max_input_chars": 16000
+  }
+]

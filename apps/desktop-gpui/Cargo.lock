@@ -5619,6 +5619,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-processing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "starling-runtime"
 version = "0.1.0"
 dependencies = [
