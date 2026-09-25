@@ -233,3 +233,23 @@ then one bench invocation per side (`--runs N`, one model load each) with
 `dumpsys battery` charge-counter deltas plus an equal-duration idle
 control, reporting the gauge number with the batterystats model only as a
 cross-check.
+
+## #317 deliverable: energy per transcription (2026-09-26)
+
+Final open deliverable, measured with `.auto/energy.sh` (12 transcriptions
+per engine, screen off, battery discharging, battery-charge-counter gauge
+idle-subtracted over an equal-duration control — **a fuel-gauge estimate,
+not a rail measurement**):
+
+| engine | mWh / transcription (MOSS short) | median wall |
+| --- | --- | --- |
+| fast (this branch, rows=16) | **2.42** | 5.41 s |
+| ggml (6 threads) | 15.32 (gauge today) / 5.2 (batterystats model, #12) | 7.78 s |
+
+The fast-engine number matches the original campaign's 2.2 mWh (#12,
+batterystats model) — two independent methods agreeing on ~2.2–2.4 mWh is
+the trustworthy part. The ggml gauge number (15.3) is 3× the old
+power-model figure: the fuel gauge estimates charge from voltage under
+load, and 6-thread CPU load sags it; the honest statement of the ratio is
+therefore "fast ≈ 2.4 mWh and 2.4–6× less energy than ggml depending on
+measurement method", with fast/ggml latency 5.4 vs 7.8 s.
