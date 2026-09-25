@@ -53,3 +53,56 @@ argument applies to the W8 lm_head (28 % of decode bytes; `unpackSnorm4x8`
 needs a proof that no -128 codes occur) and, larger, to int8-activation
 GEMVs with `OpSDot` (works on this driver; needs a glslc newer than the
 NDK's and a WER run).
+
+## #319 Phase 0: layout descriptors, source quantizer, packed-file override (2026-09-25)
+
+Infrastructure (branch `feat/pixel-layout-quantizer`, on top of master
+`4276631`): `cpp/fast/layout.*` (parameterized descriptor + RTN/imatrix
+scale-search quantizer + bit-exact reference dequant), `cpp/fast/packed_file.*`
+(SFPK file, `STARLING_FAST_PACKED` override in the MOSS engine),
+`cpp/tools/starling_layout_quant` (pack / eval / verify / cmp),
+`benchmarks/fast_engine/layout_eval.py` (desktop weight-only WER, cached),
+`fast_weights_test` descriptor checks, glslc `GL_EXT_integer_dot_product`
+capability probe. Source pinned: MOSS snapshot `c98175cb`, sha256
+`6dce3c8c…`, imatrix `models/moss-full.imx`.
+
+Desktop numbers (this machine, RADV, FLEURS 100 clips/lang; "eval" =
+weight-only protocol: eval GGUF through the ggml engine; baseline =
+ggml on `q4e8-fullimx` raw):
+
+| layout | en | de | ta | note |
+| --- | --- | --- | --- | --- |
+| q4e8 GGUF raw (baseline) | 7.50 | 106.04 | 155.82 | ggml's Q4_0/Q8_0 draw |
+| bf16-exact, unquantized | 8.13* | — | — | *10 clips; q4e8 on the same 10 = 9.09 |
+| rebuild w4g32sym-a + w8g16sym embed | **7.31** | 105.91 | 174.73 | **sanity ✓**; fast engine + pack = 7.31 too |
+| w4g64sym | 8.49 | 104.63 | 129.33 | +1.0 en for −6 % bytes |
+| w4g128symu8s | 8.30 | 102.55 | 153.52 | u8-super works end-to-end |
+| w8g32sym (native Q8_0 blocks) | 7.78 | 101.83 | 146.12 | bf16 store costs W8 ~0.4 pt — use native blocks |
+
+Findings:
+
+- **Free-offset asymmetric W4 loses.** `w4g32asym` beats ggml Q4_0 on the
+  imatrix-weighted MSE (8.0 vs 10.3 on synthetic, −25 % on real tensors) yet
+  costs **+1.9 pt en WER** (9.76 vs 7.87 fast engine, 9.95 vs 7.50 eval).
+  Symmetric with the same search lands at −0.2 to −0.6 pt *better*. The
+  offset freedom overfits the importance-weighted objective; the bulk of the
+  weights (near zero) loses grid resolution to the weighted tails. Q4_1-style
+  layouts are dead for MOSS — symmetric it is.
+- **The rebuild sanity gate passes with the symmetric scheme** (`w4g32sym-a`:
+  Q4_0 values in the legacy W4 pair bytes, engine-identical layout):
+  fast-packed 7.31 vs GGUF-repacked 7.87, transcripts differ on ~60/100
+  clips (expected: a different quantization draw), de 105.91 vs 106.04 ✓.
+  Tamil (ta_in, English-only model, > 100 % WER hallucination regime) moved
+  +19 pt — out-of-distribution hallucination is extremely weight-draw
+  sensitive; treat tail-language gates at this WER level as qualitative.
+- **±0.5 pt en deltas are numerics-draw noise, not quality.** The
+  unquantized bf16 model scores *worse* than the Q4_0-quantized one (8.13 vs
+  9.09 on the same 10 clips; ggml-vulkan, greedy decode). Candidate
+  comparisons should rank by eval deltas ≥ ~1 pt and confirm winners with the
+  fast engine on the full 100.
+- Protocol traps documented in the code: F16/F32 eval weights trip ggml
+  asserts (the MOSS bf16-oracle graph feeds bf16 activations into
+  unquantized-weight muls; quantized weights get F32 — use bf16 or native
+  block types); the eval GGUF must inherit the q4e8 model's F32 1-D tensors
+  (graph-fusion parity — measured no WER effect, kept anyway); a bf16 store
+  costs ~0.4 % per weight, material for W8 candidates only.

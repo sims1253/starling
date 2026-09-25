@@ -4,11 +4,15 @@
 Pipeline per candidate layout spec (a rules file for starling-layout-quant):
 
   1. `pack`   MOSS source safetensors -> .pack (skipped when cached)
-  2. `eval`   .pack + bf16-exact GGUF -> an eval GGUF whose packed tensors are
-              dequantized to bf16 (the engine's bf16-activation graph accepts
-              bf16 weights; f16/f32 weights trip ggml asserts — see the
-              research log). The bf16 round is applied identically to every
-              candidate, so comparisons stay apples-to-apples.
+  2. `eval`   .pack + q4e8 GGUF -> an eval GGUF whose packed tensors are
+              re-encoded into their bit-exact ggml block type when one
+              exists (w4g32sym* -> Q4_0, w4g32asym -> Q4_1, w8g32sym ->
+              Q8_0: same f16 scales and codes, zero store rounding); other
+              layouts dequantize to bf16 (the engine accepts bf16 weights;
+              f16/f32 trip ggml asserts — see the research log). The bf16
+              store costs ~0.4% per weight, material only for 8-bit
+              candidates, so prefer native-typed layouts when comparing
+              W8-family candidates.
   3. `wer`    the ggml engine on the eval GGUF over the FLEURS clip sets
               (en_us 100 + de_de 100 + one tail language).
 
