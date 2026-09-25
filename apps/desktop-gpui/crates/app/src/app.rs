@@ -1409,6 +1409,7 @@ impl StarlingApp {
         };
         // The take's head: the used processed text, or the raw transcript.
         let Some(text) = self.head_text(&id) else {
+            self.note_head_loading(&id, cx);
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1428,6 +1429,8 @@ impl StarlingApp {
             session.created_at.replace([':', '.'], "-")
         );
         let Some(text) = self.head_text(&session.id) else {
+            let id = session.id.clone();
+            self.note_head_loading(&id, cx);
             return;
         };
         // Re-exportable from history, so no fsync (see write_download_exclusive);

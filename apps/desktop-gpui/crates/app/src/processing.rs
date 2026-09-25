@@ -1030,6 +1030,15 @@ impl StarlingApp {
         .detach();
     }
 
+    /// Copy/Export found no head because the take is still loading: say
+    /// so rather than leave a dead click.
+    pub(crate) fn note_head_loading(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.processing_loading.contains(id) {
+            self.error = Some("This take's history is still loading; try again.".to_string());
+            cx.notify();
+        }
+    }
+
     /// The text Copy/Export use: the used processed text when the take's
     /// head is processed, the raw transcript otherwise. `None` while the
     /// take's processing state is still loading: the head is not known

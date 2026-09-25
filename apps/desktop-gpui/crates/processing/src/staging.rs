@@ -307,9 +307,10 @@ impl Draft {
     /// are not durable and do not come back; a stored proposal is judged
     /// against the resumed revision like any other.
     ///
-    /// A raw head is linked to the attempt of the highest segment (the
-    /// latest such attempt when a segment has several), whatever order
-    /// `attempts` come in; with no attempts it carries no link. Each
+    /// A raw head is linked to an attempt of the highest segment, whatever
+    /// order the segments come in; within a segment, attempts are in
+    /// arrival order (as everywhere in this module) and the latest wins.
+    /// With no attempts the head carries no link. Each
     /// stored proposal's request comes back as a settled record with its
     /// id and base revision only: its input, instruction and `retry_of`
     /// are not persisted, so a resumed record's are empty.
