@@ -533,6 +533,56 @@
     }
   },
   {
+    "name": "completed_result_without_text_fails",
+    "description": "A completed result that carries no text is a failure: no proposal, raw text untouched.",
+    "ops": [
+      {
+        "op": "final",
+        "segment": 0,
+        "attempt_id": "att-1",
+        "text": "raw survives",
+        "expect": "applied"
+      },
+      {
+        "op": "request",
+        "request_id": "r1",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r1",
+        "status": "completed",
+        "text": null,
+        "expect": "failed"
+      },
+      {
+        "op": "accept",
+        "request_id": "r1",
+        "expect": "unknown_request"
+      },
+      {
+        "op": "request",
+        "request_id": "r2",
+        "expect": "pending"
+      },
+      {
+        "op": "result",
+        "request_id": "r2",
+        "status": "completed",
+        "expect": "failed"
+      }
+    ],
+    "expect": {
+      "text": "raw survives",
+      "revision": 1,
+      "requests": {
+        "r1": "settled",
+        "r2": "settled"
+      },
+      "proposals": {}
+    }
+  },
+  {
     "name": "crash_reconnect_result_still_current",
     "description": "A request in flight at a crash is interrupted; its result is still judged against its base revision.",
     "ops": [

@@ -306,8 +306,9 @@ class Draft:
             return "discarded"
         if status == "settled" or self._proposal(op["request_id"]) is not None:
             return "duplicate"
-        if op["status"] != "completed":
-            # Raw text is untouched by a failure; the request is done.
+        if op["status"] != "completed" or op.get("text") is None:
+            # Raw text is untouched by a failure (a completed result without
+            # text is one too); the request is done.
             if status in ("pending", "interrupted"):
                 request["status"] = "settled"
             return "failed"

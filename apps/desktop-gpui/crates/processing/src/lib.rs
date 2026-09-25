@@ -1,4 +1,4 @@
-//! `starling-processing` — staged drafts and text processing (#292).
+//! `starling-processing` — staged drafts and text processing (#293).
 //!
 //! - [`contract`]: the #293 records (mode entry, provider declaration,
 //!   transform request/result) and the provider choice, ported from the
