@@ -36,8 +36,15 @@ VARIANTS = {
     # W4 decode GEMVs through unpackUnorm4x8 (the PowerVR default).
     "fast-w4u": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0", "STARLING_FAST_W4U": "1"},
     "fast-w4": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0", "STARLING_FAST_W4U": "0"},
+    # Source-quantized packed weights (#319): STARLING_FAST_PACKED names the
+    # .pack file; being in the variant table means the other variants run
+    # without it.
+    "fast-packed": {"STARLING_ENGINE": "fast", "STARLING_FAST_F16": "0",
+                    "STARLING_FAST_PACKED": ""},
 }
 VARIANT_KEYS = sorted({k for env in VARIANTS.values() for k in env})
+# fast-packed takes the .pack path from this process's environment (empty = unset).
+VARIANTS["fast-packed"]["STARLING_FAST_PACKED"] = os.environ.get("STARLING_FAST_PACKED", "")
 
 
 def edit_distance(a: list[str], b: list[str]) -> int:
@@ -90,7 +97,8 @@ def main() -> int:
         for k in VARIANT_KEYS:
             os.environ.pop(k, None)
         for k, val in VARIANTS[v].items():
-            os.environ[k] = val
+            if val:
+                os.environ[k] = val
         ctx = lib.starling_ggml_load(KINDS[a.model], a.gguf.encode())
         if not ctx:
             print(f"{v}: load failed: {lib.starling_ggml_last_error(None).decode()}")

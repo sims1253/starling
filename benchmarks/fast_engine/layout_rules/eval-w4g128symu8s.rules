@@ -1,0 +1,2 @@
+default w4g128symu8s
+^llm\.embed\.weight$ w8g16sym

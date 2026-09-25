@@ -1,0 +1,4 @@
+# rebuild of today's q4e8 numerics from source: Q4_0-shaped symmetric
+# linears (stored in the legacy W4 pair), Q8_0-shaped embed (scale per 16).
+default w4g32sym-a
+^llm\.embed\.weight$ w8g16sym

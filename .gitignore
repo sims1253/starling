@@ -102,3 +102,4 @@ xcuserdata/
 apps/ios/*.xcodeproj/
 
 apps/mobile/app/.cxx/
+benchmarks/fast_engine/.layout_eval_cache/
