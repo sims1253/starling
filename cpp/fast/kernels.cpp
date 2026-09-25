@@ -163,7 +163,17 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // override either. Other vendors keep the tuner's pick.
     if (ctx.info().vendor_id == 0x1010 && !tune_forced) {
         tile = TileCfg{32, 128, 4, 8};
-        gemv_rows_max = 8;
+        // Decode GEMV rows=16, pinned: measured best-or-tied at every MOSS
+        // decode shape on the Pixel 10 Pro (N 2048..151936, K 2048/6144; the
+        // rows=8 default cost 15-31 % on the small-N shapes, growing to 32
+        // was neutral-to-worse; see RESEARCH_LOG P1-8). The old adaptive
+        // growth (target 384 workgroups) optimizes for workgroup count, but
+        // every workgroup re-reads the whole x vector — at rows=8 the x
+        // traffic rivals the weights on the small-N GEMVs.
+        gemv_rows_max = 16;
+        gemv_tgt_wgs = ~0u;   // no adaptive growth
+        gemv_min_wgs = 0;     // and no shrink-to-256-workgroups floor: rows=16
+                              // measured best at N=2048 with just 128 WGs
     } else if (!autotune(err)) {
         return false;
     }
@@ -560,6 +570,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
     // and the per-token weight rate, against the M=1 gemv_w4u numbers.
     const bool m2 = std::strncmp(mi, "m2", 2) == 0;
     if (m2) mi += 3;
+    const bool sweep = std::strncmp(mi, "s", 1) == 0;
+    if (sweep) mi += 2;
     const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
     if (got < 3) {
         err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
@@ -592,6 +604,18 @@ bool Kernels::micro(const char* mi, std::string& err) {
     const char* name = bits == 4 ? (m2 ? "gemv_w4um" : w4_unpack_ ? "gemv_w4u" : "gemv_w4")
                       : bits == 8 ? "gemv_w8" : "gemv_f16";
     const uint32_t lanes = k / 32;
+    GemvArgs ga;
+    ga.N = n;
+    ga.K = k;
+    if (m2) { ga.x_off2 = k; ga.y_off2 = n; }
+    const uint32_t rows_list[] = {8, 16, 24, 32, 48, 64};
+    const uint32_t rows_n = sweep ? 6u : 1u;
+    vk::Recording* rec_out = nullptr;
+    uint32_t rsplit_out = 1;
+    // (sweep mode: one model load, one rows value per timing recording)
+    std::vector<double> sweep_ms;
+    for (uint32_t ri = 0; ri < rows_n; ++ri) {
+    if (sweep) rows = rows_list[ri];
     uint32_t rsplit = 1;
     {
         const uint32_t target = std::max(32u, ctx_->info().subgroup_size);
@@ -601,10 +625,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
     if (!p) return false;
     vk::Recording rec(*ctx_);
     rec.begin();
-    GemvArgs ga;
-    ga.N = n;
-    ga.K = k;
-    if (m2) { ga.x_off2 = k; ga.y_off2 = n; }
+    rec_out = &rec;
+    rsplit_out = rsplit;
     for (uint32_t i = 0; i < reps; ++i) {
         rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
                           vk::Ref(dummy_), vk::Ref(dummy_)},
@@ -612,6 +634,12 @@ bool Kernels::micro(const char* mi, std::string& err) {
         rec.barrier();
     }
     rec.end();
+    if (sweep) {
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        sweep_ms.push_back(ms / reps);
+        continue;
+    }
     // Correctness: CPU reference dot products for the first rows.
     if (bits == 4 || bits == 8) {
         vk::Recording rc1(*ctx_);
@@ -659,7 +687,20 @@ bool Kernels::micro(const char* mi, std::string& err) {
         std::fprintf(stderr, "[fast-micro] check rsplit=%u: max rel err = %.5f (first %u rows)\n",
                      rsplit, maxerr, nchk);
     }
-    const double ms = time_ms(rec, err);
+    }   // rows loop (sweep)
+    if (sweep) {
+        double best = 1e30;
+        uint32_t best_rows = 0;
+        for (uint32_t ri = 0; ri < sweep_ms.size(); ++ri) {
+            const double gw = (double)n * k / (sweep_ms[ri] * 1e-3) / 1e9;
+            std::fprintf(stderr, "[fast-micro] sweep bits=%u N=%u K=%u rows=%u wg=%ux%u: %.4f ms = %.1f G w/s\n",
+                         bits, n, k, rows_list[ri], lanes, 1u, sweep_ms[ri], gw);
+            if (sweep_ms[ri] < best) { best = sweep_ms[ri]; best_rows = rows_list[ri]; }
+        }
+        std::fprintf(stderr, "[fast-micro] sweep best: rows=%u\n", best_rows);
+        return true;
+    }
+    const double ms = time_ms(*rec_out, err);
     if (ms < 0) return false;
     const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
     if (m2) {
@@ -667,12 +708,12 @@ bool Kernels::micro(const char* mi, std::string& err) {
         std::fprintf(stderr,
                      "[fast-micro] gemv-m2 bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter "
                      "(2 tokens) = %.1f G w/s per token\n",
-                     bits, n, k, rows, lanes, rsplit, ms / reps,
+                     bits, n, k, rows, lanes, rsplit_out, ms / reps,
                      2.0 * n * k / (ms / reps * 1e-3) / 1e9);
     } else {
         std::fprintf(stderr,
                      "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
-                     bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-6);
+                     bits, n, k, rows, lanes, rsplit_out, ms / reps, bytes / ms * 1e-6);
     }
     return true;
 }
