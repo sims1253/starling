@@ -74,13 +74,22 @@ declare -a base_vals cand_vals
 screen_off
 for r in $(seq 1 "$ROUNDS"); do
   screen_off
-  bench starling-bench-base moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_BASE" > "$TMP/b$r" ||
-    { echo "base bench failed (round $r):"; tail -5 "$TMP/b$r"; exit 1; }
-  bench starling-bench-cand moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_CAND" > "$TMP/c$r" ||
-    { echo "cand bench failed (round $r):"; tail -5 "$TMP/c$r"; exit 1; }
+  # Alternate the order each round: the second side of a round runs on a
+  # warmer GPU (measured +3-8% on identical binaries); balancing cancels it.
+  if [ $((r % 2)) = 1 ]; then
+    bench starling-bench-base moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_BASE" > "$TMP/b$r" ||
+      { echo "base bench failed (round $r):"; tail -5 "$TMP/b$r"; exit 1; }
+    bench starling-bench-cand moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_CAND" > "$TMP/c$r" ||
+      { echo "cand bench failed (round $r):"; tail -5 "$TMP/c$r"; exit 1; }
+  else
+    bench starling-bench-cand moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_CAND" > "$TMP/c$r" ||
+      { echo "cand bench failed (round $r):"; tail -5 "$TMP/c$r"; exit 1; }
+    bench starling-bench-base moss "$MOSS_GGUF" short.wav "$EXTRA_ENV_BASE" > "$TMP/b$r" ||
+      { echo "base bench failed (round $r):"; tail -5 "$TMP/b$r"; exit 1; }
+  fi
   base_vals+=("$(decode_mspt "$TMP/b$r" | median)")
   cand_vals+=("$(decode_mspt "$TMP/c$r" | median)")
-  sleep 5   # breathe between rounds
+  sleep 10   # breathe between rounds
 done
 base=$(printf '%s\n' "${base_vals[@]}" | median)
 cand=$(printf '%s\n' "${cand_vals[@]}" | median)
