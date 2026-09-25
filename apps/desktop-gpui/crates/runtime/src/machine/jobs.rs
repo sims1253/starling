@@ -634,7 +634,7 @@ impl JobsActor {
                     self.emit(
                         &job_id,
                         Event::JobsFailed {
-                            reason: "internal dispatch refused".to_string(),
+                            reason: "internal_dispatch_refused".to_string(),
                             retryable: false,
                         },
                     );
@@ -679,16 +679,12 @@ impl JobsActor {
                 // `Queued` jobs, so re-queueing could never pick this one
                 // again — surface the failure and retire the entry instead
                 // of leaking a forever-in-flight snapshot (review on #248).
-                let state = self
-                    .jobs
-                    .get(&job_id)
-                    .map(|job| job.core.state())
-                    .unwrap_or("?")
-                    .to_string();
                 self.emit(
                     &job_id,
                     Event::JobsFailed {
-                        reason: format!("internal dispatch refused in state {state}"),
+                        // A wire token: the events schema's safeToken
+                        // allows no spaces.
+                        reason: "internal_dispatch_refused".to_string(),
                         retryable: false,
                     },
                 );
@@ -811,7 +807,7 @@ impl JobsActor {
             self.emit(
                 &job_id,
                 Event::JobsFailed {
-                    reason: "internal dispatch refused".to_string(),
+                    reason: "internal_dispatch_refused".to_string(),
                     retryable: false,
                 },
             );
