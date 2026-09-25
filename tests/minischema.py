@@ -54,6 +54,18 @@ def _resolve_ref(ref: str, root: dict[str, Any]) -> tuple[Any, str | None]:
     return node, None
 
 
+def _numbers_by_value(value: Any) -> Any:
+    """Integral floats as ints, recursively: JSON Schema compares numbers
+    by value (1 == 1.0), and bools stay bools."""
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, list):
+        return [_numbers_by_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _numbers_by_value(item) for key, item in value.items()}
+    return value
+
+
 def errors(
     instance: Any,
     schema: dict[str, Any],
@@ -129,7 +141,7 @@ def errors(
             # (true vs 1, {"a": true} vs {"a": 1}).
             seen: set[str] = set()
             for i, item in enumerate(instance):
-                key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+                key = json.dumps(_numbers_by_value(item), sort_keys=True, separators=(",", ":"))
                 if key in seen:
                     found.append(f"{path}[{i}]: duplicate of an earlier item")
                 seen.add(key)
