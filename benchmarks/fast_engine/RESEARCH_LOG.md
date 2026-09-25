@@ -135,3 +135,33 @@ bytes, not decode speed. The speed lever that survives measurement is
 decoding, #311): the M rows are provably ~free at the op level, unlike the
 tiled GEMM. Quality side (Phase 0 table): symmetric-only W4, rebuild-from-
 source ≥ GGUF draw, g64 costs ~1 pt.
+
+### #317 acceptance table (every layout tried)
+
+Quality = desktop weight-only eval (ggml engine, FLEURS 100/lang; q4e8 GGUF
+raw baseline = en 7.50 / de 106.04 / ta 155.82). Bytes = per linear weight.
+Decode cost = phone GEMV weight rate; every quantized layout lands on the
+same ~37-46 G w/s plateau — on this GPU the layout moves quality and bytes,
+not decode speed.
+
+| layout | en | de | ta | bits/w | decode |
+| --- | --- | --- | --- | --- | --- |
+| w4g32asym (free offset, imx search) | 9.95 | 101.4* | 146* | 4.5 | plateau |
+| w4g32sym-a (Q4_0-shaped, imx search) | **7.31** | 105.91 | 174.73 | 4.5 | plateau (= today's W4 bytes) |
+| w4g32sym lean store (+ -p1 nibble perm) | = sym (decode-transparent, tested) | — | — | 4.25 | kernel variant unwarranted |
+| w4g64sym | 8.49 | 104.63 | 129.33 | 4.25 | plateau |
+| w4g128symu8s | 8.30 | 102.55 | 153.52 | 4.125 | plateau |
+| w8g32sym (Q8_0-shaped) | 7.78 | 101.83 | 146.12 | 8.25 | plateau |
+| w8g16sym embed (= today) | 7.31 (with w4g32sym-a linears) | — | — | 8.5 | plateau |
+| F16 (probe only) | — | — | — | 16 | 46.5 G w/s (+26 %, 2.6x bytes) |
+
+\* bf16-stored eval (pre-protocol-fix), same direction.
+
+**Recommendation for #316 (recipes) and #318 (layout ABI to cache):** keep
+today's byte layouts — linears W4-as-Q4_0-shape (`w4g32sym-a`), embed W8
+scale-per-16 (`w8g16sym`) — but quantize from source with the symmetric
+scheme + imatrix search: it measured strictly better than the GGUF/Q4_0 draw
+(7.31 vs 7.50 en) with identical kernel bytes. Free-offset asymmetric W4 is
+measured harmful (~+2 pt); group sizes >32 trade ~1 pt for ≤6 % bytes and
+no speed. The decode-speed lever is not the layout: it is token batching
+(M-token GEMV, #311).
