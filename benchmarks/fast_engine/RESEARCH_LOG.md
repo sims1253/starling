@@ -311,3 +311,10 @@ bpw). A trellis GEMV on this GPU pays MORE issue slots than the affine
 kernel for the 3–7 % rel-rms edge at 4 bpw — strictly worse on the measured
 bottleneck; the probe could only confirm the sign, and the device is
 #325-blocked regardless. Item closed.
+
+Addendum (#325, measurement status): a supervised single-load attempt after
+~1 h 47 m idle made partial progress — one transcription at 145 ms/token
+(degraded band) then a mid-run hang, killed cleanly. Idle does not reliably
+heal the fault; the final-head A/A remains composition-argued (P1-8's
+twice-verified 69.2–69.7 ms/token + measured-harmless push-constant delta +
+guards off the decode path), which stands as the certified result.
