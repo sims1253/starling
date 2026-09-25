@@ -37,12 +37,14 @@ adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; du
 adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
 screen_off
 
-bench() {  # engine runs
+bench() {  # engine runs (exported: measure() invokes it through bash -c)
   local engine=$1
   adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$engine STARLING_GGML_THREADS=6 \
     STARLING_FAST_CACHE_DIR=$DEV ./starling-bench-cand --model moss --gguf $DEV/$MOSS_GGUF \
     --warmup --runs $RUNS $DEV/short.wav" 2>&1
 }
+export -f bench
+export DEV RUNS MOSS_GGUF
 
 measure() {  # label command
   local label=$1
