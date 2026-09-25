@@ -79,14 +79,24 @@ override (`STARLING_FAST_W4U` style); the ggml fallback stays untouched.
 
 ## What's Been Tried
 
-Phase 0 (see `benchmarks/fast_engine/RESEARCH_LOG.md`, "#319 Phase 0"
-section): infra landed; **free-offset asymmetric W4 quantization loses ~2 pt
-WER despite better MSE — symmetric only**; bf16-store eval noise biases W8
-candidates (use native ggml blocks); ±0.5 pt en deltas are numerics-draw
-noise (bf16-exact scores worse than Q4_0 through the same protocol).
+Phase 0 (RESEARCH_LOG "#319 Phase 0"): infra landed; free-offset asymmetric
+W4 loses ~2 pt WER despite better MSE — symmetric only; bf16-store eval
+noise biases W8 candidates (use native ggml blocks); ±0.5 pt en deltas are
+numerics-draw noise.
 
-Phase 1 log: appended to RESEARCH_LOG.md per iteration, one hypothesis per
-experiment, stop an idea after two failed variants.
+Phase 1 (RESEARCH_LOG "#317 Phase 1", this branch): **int8 activations via
+OpSDot are dead on PowerVR** — dotPacked4x8EXT costs the same issue slots
+as the f32 dot(vec4) it replaces (3 kernel variants measured, idea stopped);
+f16 dots run at 4 MAC/slot (2.6x f32) but the GEMV plateau (~37-46 G w/s,
+every layout) is latency/occupancy-structural, not op-count; skinny tiled
+GEMM is flat M=1..16 but 6.8x a GEMV pass → **speculative decoding (#311)
+needs a dedicated M-token GEMV kernel** (~1.6-1.8x fewer ops/token at
+M=4-8) — that is the remaining big lever. Layout conclusion + acceptance
+table at the end of the log; notes posted to #311/#316/#318.
+
+Session protocol notes: phone screen OFF (compositor steals the GPU, ±100%
+swings), order-balanced A/B, ±2.5% noise floor, ~8 model loads per boot
+(vkOOM after), absolute numbers drift per boot — same-window deltas only.
 
 ## Ideas backlog
 
