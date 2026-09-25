@@ -242,6 +242,25 @@ if(STARLING_QUANTIZE)
   set_target_properties(starling-quantize PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+  # starling-layout-quant: the Pixel-layout quantizer CLI (#319). Packs MOSS
+  # source weights (safetensors or bf16/f16/f32 GGUF) straight into a
+  # candidate fast-engine layout (.pack file for STARLING_FAST_PACKED) and
+  # builds the desktop weight-only eval GGUF. Only the host-side layout
+  # sources are needed — no Vulkan, so it builds with STARLING_FAST=OFF too.
+  add_executable(starling-layout-quant
+      ${STARLING_REPO_ROOT}/cpp/tools/starling_layout_quant.cpp
+      ${STARLING_REPO_ROOT}/cpp/fast/layout.cpp
+      ${STARLING_REPO_ROOT}/cpp/fast/packed_file.cpp)
+  target_include_directories(starling-layout-quant PRIVATE
+      ${STARLING_REPO_ROOT}/cpp
+      ${STARLING_REPO_ROOT}/cpp/fast
+      ${STARLING_REPO_ROOT}/cpp/runtime
+      ${STARLING_REPO_ROOT}/third_party/ggml/include
+      ${STARLING_REPO_ROOT}/third_party/ggml/src)
+  target_link_libraries(starling-layout-quant PRIVATE ggml)
+  set_target_properties(starling-layout-quant PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
   # mel_dump: debug aid — dump the engine mel features of a wav (see
   # docs/quantization.md and the converter's mel contract).
   add_executable(mel_dump ${STARLING_REPO_ROOT}/cpp/tools/mel_dump.cpp
