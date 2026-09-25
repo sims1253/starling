@@ -28,8 +28,8 @@ screen_off() {
     sleep 2
   fi
 }
-EXTRA_ENV_BASE=${EXTRA_ENV_BASE:-}
-EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-}
+EXTRA_ENV_BASE=${EXTRA_ENV_BASE:-$(cat "$(dirname "$0")/base_env" 2>/dev/null || true)}
+EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-$(cat "$(dirname "$0")/cand_env" 2>/dev/null || true)}
 MOSS_GGUF=${MOSS_GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
 PK_GGUF=${PK_GGUF:-parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf}
 

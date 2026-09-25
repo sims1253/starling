@@ -95,6 +95,7 @@ set(STARLING_FAST_SHADERS
 # "unknown fast-engine shader" at run time).
 set(STARLING_FAST_OPTIONAL_SHADERS
   "idot_probe|idot_probe.comp||2"
+  "f16dot_probe|f16dot_probe.comp||1"
 )
 foreach(_entry IN LISTS STARLING_FAST_OPTIONAL_SHADERS)
   string(REPLACE "|" ";" _parts "${_entry}")

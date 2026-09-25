@@ -409,6 +409,95 @@ bool Kernels::micro(const char* mi, std::string& err) {
                      dots / (ms * 1e-3) / 1e9, ms);
         return true;
     }
+    if (std::strncmp(mi, "gemm", 4) == 0) {
+        // Skinny-GEMM probe (#311 speculative decoding): time the tiled GEMM
+        // at M = 1,2,4,8,16 over a real decode shape.
+        // STARLING_FAST_MICRO=gemm[,K[,N[,reps]]]  (defaults 2048, 6144, 8)
+        uint32_t Kd = 2048, Nd = 6144, reps = 8;
+        std::sscanf(mi, "gemm,%u,%u,%u", &Kd, &Nd, &reps);
+        const uint32_t Mmax = 16;
+        std::mt19937 rng(4242);
+        auto w16 = [&](size_t n) {
+            std::vector<uint32_t> w(n);
+            for (auto& v : w) {
+                const float f[2] = {(float)(rng() % 2001) / 1000.0f - 1.0f,
+                                    (float)(rng() % 2001) / 1000.0f - 1.0f};
+                v = pack_f16(f, 2)[0];
+            }
+            return w;
+        };
+        auto w32 = [&](size_t n) {
+            std::vector<uint32_t> w(n);
+            for (auto& v : w) v = (uint32_t)rng();
+            return w;
+        };
+        vk::Buffer A, wq, ws, C;
+        const bool ok_up = ctx_->create_buffer(A, (size_t)Mmax * Kd * 2, vk::Mem::Device, err) &&
+                           ctx_->upload(A, 0, w16((size_t)Mmax * Kd / 2).data(), (size_t)Mmax * Kd * 2, err);
+        const auto qv = w32((size_t)Nd * Kd / 8), svv = [&] {
+            auto v = w16((size_t)Nd * Kd / 32);
+            for (auto& x : v) x &= 0xbfffbfffu;   // sane f16 scale pairs
+            return v;
+        }();
+        const bool ok_w = ok_up && ctx_->create_buffer(wq, qv.size() * 4, vk::Mem::Device, err) &&
+                          ctx_->upload(wq, 0, qv.data(), qv.size() * 4, err) &&
+                          ctx_->create_buffer(ws, svv.size() * 4, vk::Mem::Device, err) &&
+                          ctx_->upload(ws, 0, svv.data(), svv.size() * 4, err);
+        const bool ok_c = ok_w && ctx_->create_buffer(C, (size_t)Mmax * Nd * 4, vk::Mem::Device, err);
+        if (!ok_c) return false;
+        for (uint32_t M : {1u, 2u, 4u, 8u, 16u}) {
+            GemmCall u;
+            u.b = BKind::W4;
+            u.epi = Epi::F32;
+            u.a.M = M; u.a.N = Nd; u.a.K = Kd; u.a.lda = Kd; u.a.ldb = Kd; u.a.ldc = Nd;
+            u.A = vk::Ref(A); u.Bq = vk::Ref(wq); u.Bs = vk::Ref(ws); u.C = vk::Ref(C);
+            const TileCfg saved_tile = tile;
+            if (M <= 16 && tile.BM > 16) tile = TileCfg{32, 128, 4, 8};   // skinny M: vendor tile already
+            vk::Recording rec(*ctx_);
+            rec.begin();
+            for (uint32_t i = 0; i < reps; ++i) {
+                if (!gemm(rec, u, err)) { tile = saved_tile; return false; }
+                rec.barrier();
+            }
+            rec.end();
+            tile = saved_tile;
+            const double ms = time_ms(rec, err);
+            if (ms < 0) return false;
+            const double wps = (double)reps * M * Nd * Kd / (ms * 1e-3) / 1e9 / reps;
+            static double m1 = 0;
+            if (M == 1) m1 = ms / reps;
+            std::fprintf(stderr, "[fast-micro] gemm W4 M=%u N=%u K=%u: %.3f ms = %.1f G w/s (%.2fx M=1)\n",
+                         M, Nd, Kd, ms / reps, wps, m1 > 0 ? (ms / reps) / m1 : 1.0);
+        }
+        return true;
+    }
+    if (std::strncmp(mi, "f16dot", 6) == 0) {
+        // f16 dot issue-rate probe: STARLING_FAST_MICRO=f16dot[,groups[,iters]]
+        // — prices dot(f16vec4, f16vec4) against the f32 FMA (alu probe) and
+        // the i8 SDot (idot probe); needs shaderFloat16.
+        if (!ctx_->info().f16) { err = "f16dot probe: no shaderFloat16"; return false; }
+        uint32_t groups = 48, iters = 4096;
+        std::sscanf(mi, "f16dot,%u,%u", &groups, &iters);
+        vk::Buffer ob;
+        std::vector<float> zeros(128 * groups, 0.0f);
+        if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
+            !ctx_->upload(ob, 0, zeros.data(), zeros.size() * 4, err))
+            return false;
+        const vk::Pipeline* p = ctx_->pipeline("f16dot_probe", {}, err);
+        if (!p) return false;
+        struct { uint32_t iters; } pc{iters};
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        rec.dispatch(*p, {vk::Ref(ob)}, &pc, sizeof(pc), groups);
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        // 32 chains x (1 dot + 1 add) x 4 MACs per dot per iter per thread.
+        const double macs = (double)groups * 128 * iters * 32 * 4;
+        std::fprintf(stderr, "[fast-micro] f16dot: %.1f G f16-MAC/s (%.3f ms)\n",
+                     macs / (ms * 1e-3) / 1e9, ms);
+        return true;
+    }
     if (std::strncmp(mi, "norm", 4) == 0) {
         // Norm-kernel probe: STARLING_FAST_MICRO=norm,rows,D[,reps[,mode]]
         uint32_t rows = 107, D = 2048, reps = 64, mode = 1;
