@@ -409,6 +409,7 @@ def test_minischema_array_bounds_and_uniqueness_reject() -> None:
     assert not minischema.errors([True, 1], unique), "true and 1 are different values"
     assert not minischema.errors([{"a": True}, {"a": 1}], unique)
     assert minischema.errors([{"a": 1, "b": 2}, {"b": 2, "a": 1}], unique)
+    assert minischema.errors([1, 1.0], unique), "numbers compare by value"
 
 
 def test_minischema_conditionals_and_not_reject() -> None:
