@@ -125,17 +125,10 @@ struct Sha256 {
 };
 
 std::string file_sha256(const std::string& path) {
-    const std::string sidecar = path + ".sha256";
-    if (FILE* f = std::fopen(sidecar.c_str(), "r")) {
-        char buf[80];
-        const char* got = std::fgets(buf, sizeof buf, f);
-        std::fclose(f);
-        if (got) {
-            std::string s(got);
-            while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
-            if (s.size() == 64) return s;
-        }
-    }
+    // No sidecar cache: this hash pins the source in the .pack header
+    // (provenance), and the pre-fix hex() wrote garbage-derived hashes whose
+    // sidecars would otherwise keep poisoning every future re-pack. The
+    // streamed hash costs ~10 s on the 3.9 GB source; correctness wins.
     Sha256 s;
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return "";
@@ -143,12 +136,7 @@ std::string file_sha256(const std::string& path) {
     size_t n;
     while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) s.update(buf.data(), n);
     std::fclose(f);
-    const std::string hex = s.hex();
-    if (FILE* o = std::fopen(sidecar.c_str(), "w")) {
-        std::fputs(hex.c_str(), o);
-        std::fclose(o);
-    }
-    return hex;
+    return s.hex();
 }
 
 // ---------------------------------------------------------------------------
