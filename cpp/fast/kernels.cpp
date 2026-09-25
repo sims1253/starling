@@ -53,6 +53,14 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
         b.off = off;
         sizes.back() = off + b.bytes;
     }
+    // #325 preflight: refuse the load cleanly when the GPU cannot fit the
+    // arena (budget query where the driver exposes it; no-op elsewhere).
+    {
+        uint64_t total = 0;
+        for (const Blob& b : blobs_) total += b.bytes + 4096;
+        std::string berr;
+        if (!ctx.check_memory_budget(total, berr)) { err = berr; return false; }
+    }
     buffers_.clear();
     for (VkDeviceSize sz : sizes) {
         auto buf = std::make_unique<vk::Buffer>();

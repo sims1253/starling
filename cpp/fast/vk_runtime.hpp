@@ -41,6 +41,7 @@ namespace starling::fast::vk {
     X(vkGetPhysicalDeviceFeatures2)            \
     X(vkGetPhysicalDeviceQueueFamilyProperties)\
     X(vkGetPhysicalDeviceMemoryProperties)     \
+    X(vkGetPhysicalDeviceMemoryProperties2)    \
     X(vkEnumerateDeviceExtensionProperties)    \
     X(vkCreateDevice)                          \
     X(vkGetDeviceProcAddr)
@@ -265,6 +266,18 @@ public:
     const Pipeline* pipeline(const char* shader, const std::vector<uint32_t>& spec,
                              std::string& err);
 
+    // #325 driver-degradation guards. wedged(): a previous GPU operation
+    // failed in a way that indicates the driver is in a bad state (OOM at a
+    // fence, device lost, timeout); everything after fails fast with `why`.
+    // A fresh (< 15 min) wedge marker from a previous process also counts,
+    // so a restart loop cannot deepen the wedge. check_memory_budget(): with
+    // VK_EXT_memory_budget, refuse a load cleanly when the device-local
+    // heaps cannot fit `need` (+ margin).
+    bool wedged() const { return wedged_; }
+    const std::string& wedged_why() const { return wedged_why_; }
+    void mark_wedged(const std::string& why);
+    bool check_memory_budget(uint64_t need, std::string& err);
+
     std::mutex& queue_mutex() { return queue_mu_; }
     VkQueue queue() const { return queue_; }
     uint32_t queue_family() const { return qfam_; }
@@ -301,6 +314,10 @@ private:
     VkCommandBuffer xfer_cb_ = VK_NULL_HANDLE;
     VkFence xfer_fence_ = VK_NULL_HANDLE;
     std::string pcache_path_;
+    std::string wedge_path_;
+    bool wedged_ = false;
+    std::string wedged_why_;
+    bool mem_budget_ = false;
 
     friend struct Buffer;
     friend class Recording;
