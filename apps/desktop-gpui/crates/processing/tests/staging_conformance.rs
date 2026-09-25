@@ -178,7 +178,7 @@ fn every_staging_case_replays_like_the_oracle() {
     let cases = cases.as_array().expect("case list");
     assert!(cases.len() >= 20, "the staging corpus is loaded");
     let mut failures = Vec::new();
-    for case in cases {
+    'cases: for case in cases {
         let name = case["name"].as_str().unwrap();
         let ops = case["ops"].as_array().unwrap();
         let mut draft = Draft::new(
@@ -190,8 +190,13 @@ fn every_staging_case_replays_like_the_oracle() {
                 .unwrap_or("cap-1"),
         );
         for (step, raw_op) in ops.iter().enumerate() {
-            let op: Op = serde_json::from_value(raw_op.clone())
-                .unwrap_or_else(|err| panic!("{name} step {step}: {err}"));
+            let op: Op = match serde_json::from_value(raw_op.clone()) {
+                Ok(op) => op,
+                Err(err) => {
+                    failures.push(format!("{name} step {step}: {err}"));
+                    continue 'cases;
+                }
+            };
             let outcome = draft.apply(&op);
             if let Some(want) = raw_op.get("expect").and_then(Value::as_str) {
                 if want != outcome.as_str() {

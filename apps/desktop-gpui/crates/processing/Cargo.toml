@@ -9,6 +9,8 @@ description = "Starling staging and processing: the staged draft, transform requ
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
 serde_json = "1"
 # The cancellation signal the runtime's jobs already use (issue #251).
 starling-dictation = { path = "../dictation" }

@@ -90,6 +90,7 @@
           "span": {
             "type": "array",
             "minItems": 2,
+            "maxItems": 2,
             "items": {
               "type": "integer",
               "minimum": 0
