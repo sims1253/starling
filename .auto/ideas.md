@@ -17,9 +17,12 @@ Data-driven model of the phone (all measured this session):
   (BPE-level divergence without prompt conditioning), self-lookahead
   zero-gain by construction. Needs a learned drafter (#292 gated follow-up)
   or the product cleanup flow (different measurement than moss_decode).
-- Remaining measured-but-unclaimed: lm_head as F16 (-1.4 ms/token kernel
-  level, +350 MB resident, under the A/B noise floor alone); batched
-  attention variants for M>=2 passes (only useful once a drafter exists).
+- ~~lm_head as F16~~ REJECTED (P1-9): +9.4% — doubles per-token table bytes;
+  in-context bandwidth ~43 GB/s (not the micro's 90). The lm_head is at its
+  floor in every format. BACKLOG EXHAUSTED: decode budget fully accounted
+  (linears op-bound ~41 ms + lm_head ~8 ms + dispatch 4-6 ms + attention
+  ~4 ms = the measured 69-70 ms/token); every remaining idea is either
+  measured-dead, gated on #311's learned drafter, or below the noise floor.
 - [1] **lm_head as F16** (+350 MB resident, memory-sensitive): measured
   6.7 vs 8.0 ms per token for the lm_head GEMV (93 GB/s path). ~-2%
   decode. Cheap to test (repack choice at load, no new kernel).
