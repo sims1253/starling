@@ -45,13 +45,19 @@ if ! adb shell "test -f $DEV/starling-bench-base" >/dev/null 2>&1 \
   rm -f "$ROOT/.auto/base_dirty"
 fi
 
+# Session cleanup: a locally-timed-out adb shell leaves the remote bench
+# running (its output pipe is gone; it can hang in poll forever) and every
+# later pidof-wait would block on it.
+adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
+
 median() { sort -n | awk '{a[NR]=$1} END {print (NR % 2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
 
 # bench <binary> <model> <gguf> <wav> <extra> -> raw output of one invocation.
 # Back-to-back model loads (1.6 GB each) need the previous process gone; wait
 # for it, then run with a generous timeout.
 bench() {
-  adb shell 'while pidof starling-bench starling-bench-base starling-bench-cand >/dev/null 2>&1; do sleep 1; done' >/dev/null 2>&1
+  timeout 120 adb shell 'while pidof starling-bench starling-bench-base starling-bench-cand >/dev/null 2>&1; do sleep 1; done' >/dev/null 2>&1 || \
+    adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
   adb shell "cd $DEV && timeout 600 env LD_LIBRARY_PATH=. STARLING_ENGINE=fast STARLING_GGML_THREADS=6 \
     STARLING_FAST_CACHE_DIR=$DEV STARLING_FAST_TIMING=1 $5 \
     ./$1 --model $2 --gguf $DEV/$3 --warmup --runs $RUNS $DEV/$4" 2>&1
