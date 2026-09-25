@@ -11,12 +11,15 @@ Data-driven model of the phone (all measured this session):
   it (unsigned-dot on masked nibbles prices worse; f16 dots need f16 unpacks
   that cancel the win).
 
-- [0] ~~(#311) Skinny-GEMM pricing~~ DONE: tiled GEMM flat-but-6.8x-GEMV;
-  the **gemv_w4um kernel (P1-6, kept) delivers 1.76-2.11x per token at M=2**
-  — next step is the #311 integration itself: drafter (n-gram /
-  Parakeet-partial copy), a verify recording over gemv_w4um for the LLM
-  GEMVs + batched attention, accept/reject on host or in dec_next. Payoff at
-  acceptance >= 0.5: GEMV time per output token ~halves.
+- [0] ~~(#311) CLOSED FOR THIS LOOP~~: gemv_w4um (kept) delivers 1.76-2.11x
+  per token at M=2, but NO deployable drafter exists for standalone MOSS
+  decode: online n-gram 1.000 tokens/pass, Parakeet copy-draft 1.03-1.05
+  (BPE-level divergence without prompt conditioning), self-lookahead
+  zero-gain by construction. Needs a learned drafter (#292 gated follow-up)
+  or the product cleanup flow (different measurement than moss_decode).
+- Remaining measured-but-unclaimed: lm_head as F16 (-1.4 ms/token kernel
+  level, +350 MB resident, under the A/B noise floor alone); batched
+  attention variants for M>=2 passes (only useful once a drafter exists).
 - [1] **lm_head as F16** (+350 MB resident, memory-sensitive): measured
   6.7 vs 8.0 ms per token for the lm_head GEMV (93 GB/s path). ~-2%
   decode. Cheap to test (repack choice at load, no new kernel).
