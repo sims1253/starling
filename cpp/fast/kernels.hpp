@@ -144,7 +144,10 @@ public:
 
     // gemv.comp (decode). `g` non-null fuses RMSNorm(x)·g; `state` non-null
     // makes the dispatch a no-op once generation is done.
-    struct GemvArgs { uint32_t N = 0, K = 0, x_off = 0, y_off = 0; float eps = 0; uint32_t row0 = 0, has_bias = 0; };
+    struct GemvArgs { uint32_t N = 0, K = 0, x_off = 0, y_off = 0; float eps = 0; uint32_t row0 = 0, has_bias = 0;
+                      // M-token variants (GEMV_M): token-1 x/y offsets, in
+                      // floats/elements (x_off2 multiple of 4).
+                      uint32_t x_off2 = 0, y_off2 = 0; };
     bool gemv(vk::Recording& rec, const Arena& ar, const GMat& w, vk::Ref x, vk::Ref y, vk::Ref g,
               vk::Ref state, vk::Ref bias, uint32_t epi, GemvArgs a, std::string& err);
     uint32_t gemv_rows_max = 32, gemv_min_wgs = 256;

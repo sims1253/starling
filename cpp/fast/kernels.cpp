@@ -555,6 +555,11 @@ bool Kernels::micro(const char* mi, std::string& err) {
         return true;
     }
     uint32_t bits = 4, n = 4096, k = 1024, reps = 64, rows = 0;
+    // m2: the GEMV_M (two-token) W4U GEMV — one weight pass, two x vectors,
+    // two y rows. Reports per-iteration time covering BOTH tokens' products
+    // and the per-token weight rate, against the M=1 gemv_w4u numbers.
+    const bool m2 = std::strncmp(mi, "m2", 2) == 0;
+    if (m2) mi += 3;
     const int got = std::sscanf(mi, "%u,%u,%u,%u,%u", &bits, &n, &k, &reps, &rows);
     if (got < 3) {
         err = "STARLING_FAST_MICRO=bits,N,K[,reps[,rows]]";
@@ -571,9 +576,9 @@ bool Kernels::micro(const char* mi, std::string& err) {
                                                                     : (size_t)n * k / 2 + 1;
     const size_t sw = bits == 16 ? 0 : (size_t)n * k / 32 + 1;
     vk::Buffer wq, ws, x, y;
-    std::vector<float> xf(k);
+    std::vector<float> xf(m2 ? 2 * k : k);
     for (auto& f : xf) f = (float)(rng() % 2001) / 1000.0f - 1.0f;
-    std::vector<float> y0(n, 0.0f);
+    std::vector<float> y0(m2 ? 2 * n : n, 0.0f);
     auto up32 = [&](vk::Buffer& b, const void* d, size_t bytes) {
         return ctx_->create_buffer(b, bytes, vk::Mem::Device, err) &&
                ctx_->upload(b, 0, d, bytes, err);
@@ -582,9 +587,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
     auto sv = sw ? rnd(sw) : std::vector<uint32_t>{};
     for (auto& v : sv) v &= 0xbfffbfffu;   // f16 scale pairs: exponent < 16, never inf/NaN
     if (!up32(wq, wv.data(), qw * 4) || (sw && !up32(ws, sv.data(), sw * 4)) ||
-        !up32(x, xf.data(), k * 4) || !up32(y, y0.data(), n * 4))
+        !up32(x, xf.data(), xf.size() * 4) || !up32(y, y0.data(), y0.size() * 4))
         return false;
-    const char* name = bits == 4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : bits == 8 ? "gemv_w8" : "gemv_f16";
+    const char* name = bits == 4 ? (m2 ? "gemv_w4um" : w4_unpack_ ? "gemv_w4u" : "gemv_w4")
+                      : bits == 8 ? "gemv_w8" : "gemv_f16";
     const uint32_t lanes = k / 32;
     uint32_t rsplit = 1;
     {
@@ -598,6 +604,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
     GemvArgs ga;
     ga.N = n;
     ga.K = k;
+    if (m2) { ga.x_off2 = k; ga.y_off2 = n; }
     for (uint32_t i = 0; i < reps; ++i) {
         rec.dispatch(*p, {vk::Ref(x), vk::Ref(wq), sw ? vk::Ref(ws) : vk::Ref(dummy_), vk::Ref(y), vk::Ref(dummy_),
                           vk::Ref(dummy_), vk::Ref(dummy_)},
@@ -614,8 +621,9 @@ bool Kernels::micro(const char* mi, std::string& err) {
                      &ga, sizeof(ga), ceil_div(n, rows));
         rc1.end();
         if (!rc1.submit_and_wait(err)) return false;
-        std::vector<float> got(n, 0.0f);
-        if (!ctx_->download(y, 0, got.data(), n * 4, err)) return false;
+        std::vector<float> got(m2 ? 2 * n : n, 0.0f);
+        if (!ctx_->download(y, 0, got.data(), got.size() * 4, err)) return false;
+        const uint32_t tok_base = m2 ? n : 0;   // token-1 y rows
         auto h2f = [](uint32_t h) {
             const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
             uint32_t b;
@@ -654,9 +662,18 @@ bool Kernels::micro(const char* mi, std::string& err) {
     const double ms = time_ms(rec, err);
     if (ms < 0) return false;
     const double bytes = (double)reps * n * k * (bits == 4 ? 0.625 : bits == 8 ? 1.125 : 2.0);
-    std::fprintf(stderr,
-                 "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
-                 bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-6);
+    if (m2) {
+        // One iteration covers both tokens: per-token weight rate doubles.
+        std::fprintf(stderr,
+                     "[fast-micro] gemv-m2 bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter "
+                     "(2 tokens) = %.1f G w/s per token\n",
+                     bits, n, k, rows, lanes, rsplit, ms / reps,
+                     2.0 * n * k / (ms / reps * 1e-3) / 1e9);
+    } else {
+        std::fprintf(stderr,
+                     "[fast-micro] gemv bits=%u N=%u K=%u rows=%u wg=%ux%u: %.3f ms/iter = %.1f GB/s\n",
+                     bits, n, k, rows, lanes, rsplit, ms / reps, bytes / ms * 1e-6);
+    }
     return true;
 }
 

@@ -52,18 +52,31 @@ layout(push_constant) uniform PC {
     float eps;
     uint row0;        // global index of row 0 (argmax over row-chunked matrices)
     uint has_bias;
+    uint x_off2;      // GEMV_M: token-1 x offset (floats), else 0
+    uint y_off2;      // GEMV_M: token-1 y offset
 } p;
 
 const uint RPP = ROWS / RSPLIT;          // rows per (kg, rs) thread
 shared float red[ROWS * LANES];          // row partials: [row][kg]
 shared float red2[ROWS * 32];            // 32 partials per row, then one
 shared float rowv[ROWS];
+#if defined(GEMV_M)
+shared float redM[ROWS * LANES];         // token-1 row partials
+shared float red2M[ROWS * 32];
+#endif
 
 float row_sum(uint r) {   // staged by the cooperative reduction below
     float s = 0.0;
     for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
     return s;
 }
+#if defined(GEMV_M)
+float row_sum2(uint r) {
+    float s = 0.0;
+    for (uint i = 0; i < 32; ++i) s += red2M[r * 32 + i];
+    return s;
+}
+#endif
 
 void main() {
     if (DONE != 0u && state[2] != 0u) return;
@@ -97,8 +110,24 @@ void main() {
         xo[w] = vec4(xv[2 * w].y, xv[2 * w].w, xv[2 * w + 1].y, xv[2 * w + 1].w);
     }
 #endif
+#if defined(GEMV_M)
+    // Token-1 activations: a second x vector; the weight unpacks below are
+    // shared between both tokens (the whole point — one unpack, two dots).
+    vec4 xv2[8];
+    [[unroll]] for (uint i = 0; i < 8; ++i) xv2[i] = x4[p.x_off2 / 4 + kg * 8 + i];
+    vec4 xe2[4], xo2[4];
+    [[unroll]] for (uint w = 0; w < 4; ++w) {
+        xe2[w] = vec4(xv2[2 * w].x, xv2[2 * w].z, xv2[2 * w + 1].x, xv2[2 * w + 1].z);
+        xo2[w] = vec4(xv2[2 * w].y, xv2[2 * w].w, xv2[2 * w + 1].y, xv2[2 * w + 1].w);
+    }
+#endif
     const uint row_base = gl_WorkGroupID.x * ROWS;
     float acc[RPP];
+#if defined(GEMV_M)
+    float acc2[RPP];
+    float xsum2 = 0.0;
+    [[unroll]] for (uint i = 0; i < 8; ++i) xsum2 += xv2[i].x + xv2[i].y + xv2[i].z + xv2[i].w;
+#endif
     [[unroll]] for (uint q = 0; q < RPP; ++q) {
         const uint r = rs + q * RSPLIT;
         const uint n = min(row_base + r, p.N - 1u);      // clamp: tail rows are discarded
@@ -107,14 +136,30 @@ void main() {
         // Byte-wise unpack: (w & 0x0f0f0f0f) holds nibbles 0,2,4,6 of the
         // word, one per byte; unpackUnorm4x8 turns them into q/255 floats in
         // one instruction. xe/xo hold x in the matching even/odd order.
+        // GEMV_M: the eight unpacks are shared by both tokens; each unpack
+        // feeds one dot per token — per 32 weights per token this is
+        // 8 unpacks + 8 dots + 2 FMAs over two tokens = 12 ops/token
+        // instead of 20 at M=1.
         const uvec4 q4 = wq4[gi];
         const vec2 so = unpackHalf2x16(ws[gi]);
         float a = 0.0;
+#if defined(GEMV_M)
+        float a2 = 0.0;
+#endif
         [[unroll]] for (uint w = 0; w < 4; ++w) {
-            a += dot(unpackUnorm4x8(q4[w] & 0x0f0f0f0fu), xe[w]);
-            a += dot(unpackUnorm4x8((q4[w] >> 4) & 0x0f0f0f0fu), xo[w]);
+            const vec4 e4 = unpackUnorm4x8(q4[w] & 0x0f0f0f0fu);
+            const vec4 o4 = unpackUnorm4x8((q4[w] >> 4) & 0x0f0f0f0fu);
+            a += dot(e4, xe[w]);
+            a += dot(o4, xo[w]);
+#if defined(GEMV_M)
+            a2 += dot(e4, xe2[w]);
+            a2 += dot(o4, xo2[w]);
+#endif
         }
         acc[q] = (so.x * 255.0) * a + so.y * xsum;
+#if defined(GEMV_M)
+        acc2[q] = (so.x * 255.0) * a2 + so.y * xsum2;
+#endif
 #elif defined(W_W4)
         const uvec4 q4 = wq4[gi];
         const vec2 so = unpackHalf2x16(ws[gi]);
@@ -149,11 +194,20 @@ void main() {
     // Stage row partials, then a two-stage reduction: LANES -> 32 partials
     // per row (stride 32) -> one value per row.
     [[unroll]] for (uint q = 0; q < RPP; ++q) red[(rs + q * RSPLIT) * LANES + kg] = acc[q];
+#if defined(GEMV_M)
+    // Token-1 partials go through the same two-stage tree (bit-identical
+    // per-row order); the second buffer doubles shared usage.
+    [[unroll]] for (uint q = 0; q < RPP; ++q) redM[(rs + q * RSPLIT) * LANES + kg] = acc2[q];
+#endif
     barrier();
     for (uint u = t; u < ROWS * 32; u += LANES * RSPLIT) {
         const uint rr = u / 32, part = u % 32;
-        float s = 0.0;
+        float s = 0.0, s2 = 0.0;
         for (uint i = part; i < LANES; i += 32) s += red[rr * LANES + i];
+#if defined(GEMV_M)
+        for (uint i = part; i < LANES; i += 32) s2 += redM[rr * LANES + i];
+        red2M[u] = s2;
+#endif
         red2[u] = s;
     }
     barrier();
