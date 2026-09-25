@@ -686,10 +686,15 @@ ggml_type layout_ggml_type(const starling::fast::LayoutDesc& d) {
     using namespace starling::fast;
     if (d.scale_dtype != ScaleDtype::F16 || d.order != 0) return GGML_TYPE_COUNT;
     if (d.bits == 4 && d.group == 32) {
+        // store_pair rows pack (s, fp16(-8s)); -8*s is exact in f16, so the
+        // packed dequant (s*q + (-8s), two f32 roundings) and Q4_0's d*(q-8)
+        // (one rounding) agree to <= 1 ulp of the product — four orders
+        // below the bf16-store noise this path exists to avoid.
         if (d.symmetric) return GGML_TYPE_Q4_0;   // w = d*(q-8)
         return GGML_TYPE_Q4_1;                    // w = d*q + m
     }
-    if (d.bits == 8 && d.group == 32 && d.symmetric) return GGML_TYPE_Q8_0;
+    if (d.bits == 8 && d.group == 32 && d.symmetric && !d.store_pair)
+        return GGML_TYPE_Q8_0;   // w = s*q; store_pair at 8 bits is rejected by valid()
     return GGML_TYPE_COUNT;
 }
 
@@ -738,6 +743,12 @@ int cmd_eval(const Args& a) {
             const uint64_t cb = starling::fast::layout_code_bytes(pt->desc, pt->K);
             const uint64_t sb = starling::fast::layout_scale_bytes(pt->desc, pt->K);
             const ggml_type native = a.dtype == "auto" ? layout_ggml_type(pt->desc) : GGML_TYPE_COUNT;
+            if (native != GGML_TYPE_COUNT && pt->K % 32) {
+                // load() already rejects K % group != 0 for group-32 layouts;
+                // this guards the native block writer for any future mapping.
+                err = name + ": native eval blocks need K % 32 == 0";
+                return false;
+            }
             size_t dst_bytes = 0;
             if (native != GGML_TYPE_COUNT) {
                 // Exact ggml blocks (same f16 scales, same codes): zero store

@@ -383,10 +383,15 @@ Context::~Context() {
         }
     }
     staging_.release();
-    // Clean exit clears the marker — but never the one this process wrote:
-    // a wedged driver unwinds through this destructor too, and deleting the
-    // marker would hide the failure from the next process.
-    if (!wedged_ && !wedge_path_.empty()) std::remove(wedge_path_.c_str());
+    // A clean exit clears the marker ONLY if this process wrote it: another
+    // (wedged) process may have refreshed it while we ran, and a wedged
+    // process unwinds through this destructor too — deleting a fresh marker
+    // would hide the failure from the next process.
+    if (!wrote_marker_ || wedged_) {
+        // never wrote it, or wedged: leave the file for its 15-min TTL
+    } else if (!wedge_path_.empty()) {
+        std::remove(wedge_path_.c_str());
+    }
     for (auto& kv : pipes_) fn_.vkDestroyPipeline(dev_, kv.second->pipe, nullptr);
     for (auto& kv : layouts_) {
         fn_.vkDestroyPipelineLayout(dev_, kv.second.second, nullptr);
@@ -405,6 +410,7 @@ Context::~Context() {
 void Context::mark_wedged(const std::string& why) {
     if (wedged_) return;
     wedged_ = true;
+    wrote_marker_ = true;   // only the writer may clear the marker on exit
     wedged_why_ = why;
     if (!wedge_path_.empty())
         if (FILE* f = std::fopen(wedge_path_.c_str(), "w")) {
@@ -501,10 +507,12 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     r = fn_.vkAllocateMemory(dev_, &mai, nullptr, &out.mem);
     if (r != VK_SUCCESS) {
         err = vk_err("vkAllocateMemory", r) + " (" + std::to_string(req.size >> 20) + " MiB)";
-        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY)
-            err += " — if this repeats, the GPU driver is wedged; a device restart clears it";
-        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_DEVICE_LOST)
-            mark_wedged(err);
+        err += " — the model may not fit, or the GPU driver is degraded; a device"
+               " restart clears the latter (do not keep retrying)";
+        // Allocation OOM alone must NOT wedge: a model that simply does not
+        // fit would otherwise poison later loads via the 15-min marker.
+        // Device-lost is an unambiguous driver failure.
+        if (r == VK_ERROR_DEVICE_LOST) mark_wedged(err);
         out.release();
         return false;
     }

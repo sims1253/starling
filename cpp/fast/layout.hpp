@@ -71,7 +71,8 @@ struct LayoutDesc {
         if (group == 0 || group % 16 != 0 || group > 1024) return false;
         if (order > 1 || (order == 1 && bits != 4)) return false;
         if (scale_dtype == ScaleDtype::U8Super && !symmetric) return false;  // no offset storage
-        if (store_pair && (!symmetric || scale_dtype != ScaleDtype::F16)) return false;
+        if (store_pair && (!symmetric || bits != 4 || scale_dtype != ScaleDtype::F16))
+            return false;   // the legacy (s, -8s) W4 pair; meaningless at 8 bits
         return true;
     }
 

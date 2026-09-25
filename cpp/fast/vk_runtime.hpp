@@ -316,6 +316,7 @@ private:
     std::string pcache_path_;
     std::string wedge_path_;
     bool wedged_ = false;
+    bool wrote_marker_ = false;
     std::string wedged_why_;
     bool mem_budget_ = false;
 

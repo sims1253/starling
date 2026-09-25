@@ -21,8 +21,11 @@ V_NOM=3.87   # nominal Li-ion voltage for µAh -> µWh; the gauge integrates
 command -v adb >/dev/null || { echo "adb missing" >&2; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 
-counter() {  # µAh
-  adb shell "dumpsys battery | grep -m1 'Charge counter'" | grep -oE '[0-9]+'
+counter() {  # µAh (validated: a failed read aborts before any bench runs)
+  local v
+  v=$(adb shell "dumpsys battery | grep -m1 'Charge counter'" | grep -oE '[0-9]+' | head -1)
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "charge counter read failed (got: '$v')" >&2; exit 1; }
+  echo "$v"
 }
 
 screen_off() {
@@ -63,6 +66,7 @@ echo "== fast engine ($RUNS transcriptions) =="
 measure fast "bench fast"
 echo "== idle control (same duration, screen off) =="
 DUR=$(awk '$1=="fast"{print $3}' /tmp/energy_points.txt)
+[[ "$DUR" =~ ^[0-9]+$ ]] && [ "$DUR" -gt 0 ] || { echo "idle duration invalid (DUR='$DUR') — fast measurement failed?" >&2; exit 1; }
 measure idle "sleep $DUR"
 echo "== ggml engine ($RUNS transcriptions) =="
 measure ggml "bench ggml"

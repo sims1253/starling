@@ -432,7 +432,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
         // at M = 1,2,4,8,16 over a real decode shape.
         // STARLING_FAST_MICRO=gemm[,K[,N[,reps]]]  (defaults 2048, 6144, 8)
         uint32_t Kd = 2048, Nd = 6144, reps = 8;
-        std::sscanf(mi, "gemm,%u,%u,%u", &Kd, &Nd, &reps);
+        if (std::sscanf(mi, "gemm,%u,%u,%u", &Kd, &Nd, &reps) < 1) {
+            err = "STARLING_FAST_MICRO=gemm[,K[,N[,reps]]]";
+            return false;
+        }
         const uint32_t Mmax = 16;
         std::mt19937 rng(4242);
         auto w16 = [&](size_t n) {
@@ -481,8 +484,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
             tile = saved_tile;
             const double ms = time_ms(rec, err);
             if (ms < 0) return false;
-            const double wps = (double)reps * M * Nd * Kd / (ms * 1e-3) / 1e9 / reps;
-            static double m1 = 0;
+            const double wps = (double)M * Nd * Kd / (ms * 1e-3) / 1e9;
+            double m1 = 0;
             if (M == 1) m1 = ms / reps;
             std::fprintf(stderr, "[fast-micro] gemm W4 M=%u N=%u K=%u: %.3f ms = %.1f G w/s (%.2fx M=1)\n",
                          M, Nd, Kd, ms / reps, wps, m1 > 0 ? (ms / reps) / m1 : 1.0);
@@ -495,7 +498,10 @@ bool Kernels::micro(const char* mi, std::string& err) {
         // the i8 SDot (idot probe); needs shaderFloat16.
         if (!ctx_->info().f16) { err = "f16dot probe: no shaderFloat16"; return false; }
         uint32_t groups = 48, iters = 4096;
-        std::sscanf(mi, "f16dot,%u,%u", &groups, &iters);
+        if (std::sscanf(mi, "f16dot,%u,%u", &groups, &iters) < 1) {
+            err = "STARLING_FAST_MICRO=f16dot[,groups[,iters]]";
+            return false;
+        }
         vk::Buffer ob;
         std::vector<float> zeros(128 * groups, 0.0f);
         if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
@@ -576,9 +582,9 @@ bool Kernels::micro(const char* mi, std::string& err) {
     // m2: the GEMV_M (two-token) W4U GEMV — one weight pass, two x vectors,
     // two y rows. Reports per-iteration time covering BOTH tokens' products
     // and the per-token weight rate, against the M=1 gemv_w4u numbers.
-    const bool m2 = std::strncmp(mi, "m2", 2) == 0;
+    const bool m2 = std::strncmp(mi, "m2,", 3) == 0;   // args required
     if (m2) mi += 3;
-    const bool sweep = std::strncmp(mi, "s", 1) == 0;
+    const bool sweep = std::strncmp(mi, "s,", 2) == 0;   // args required
     if (sweep) mi += 2;
     // alt: alternate two pipelines per rep — prices the in-context
     // per-dispatch overhead attribution (pipeline/spec switch cost vs the

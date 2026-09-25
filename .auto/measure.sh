@@ -36,14 +36,19 @@ PK_GGUF=${PK_GGUF:-parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf}
 cmake --build "$ROOT/build-android" --target starling-bench -j >/dev/null
 adb push "$ROOT/build-android/starling-bench" "$DEV/starling-bench-cand" >/dev/null
 
-BASE_COMMIT_FILE="$DEV/starling-bench-base.commit"
-HEAD=$(git -C "$ROOT" rev-parse --short HEAD)
+# Base pinning: the binary's own sha256 (not the commit hash — the working
+# tree may be dirty), plus a loud warning if base == cand (an A/A run).
+BIN_SHA=$(sha256sum "$ROOT/build-android/starling-bench" | cut -d' ' -f1)
+BASE_SHA_FILE="$DEV/starling-bench-base.sha256"
 if ! adb shell "test -f $DEV/starling-bench-base" >/dev/null 2>&1 \
-   || [ "$(adb shell "cat $BASE_COMMIT_FILE 2>/dev/null" | tr -d '\r')" != "$HEAD" ] \
+   || [ "$(adb shell "cat $BASE_SHA_FILE 2>/dev/null" | tr -d '\r')" != "$BIN_SHA" ] \
    || [ -f "$ROOT/.auto/base_dirty" ]; then
   adb push "$ROOT/build-android/starling-bench" "$DEV/starling-bench-base" >/dev/null
-  adb shell "echo $HEAD > $BASE_COMMIT_FILE"
+  adb shell "echo $BIN_SHA > $BASE_SHA_FILE"
   rm -f "$ROOT/.auto/base_dirty"
+fi
+if [ "$(adb shell "sha256sum $DEV/starling-bench-base" 2>/dev/null | cut -d' ' -f1 | tr -d '\r')" = "$BIN_SHA" ]; then
+  echo "WARNING: base and cand are the same binary — delta is an A/A noise measurement, not a comparison" >&2
 fi
 
 # Session cleanup: a locally-timed-out adb shell leaves the remote bench
@@ -111,7 +116,12 @@ fi
 MATCH=1
 if [ -z "${SKIP_G1:-}" ]; then
   last_tr() { sed -n 's/^  //p' "$1" | tail -1; }
-  [ "$(last_tr "$TMP/b$ROUNDS")" = "$(last_tr "$TMP/c$ROUNDS")" ] || MATCH=0
+  ta=$(last_tr "$TMP/b$ROUNDS"); tb=$(last_tr "$TMP/c$ROUNDS")
+  if [ -z "$ta" ] || [ -z "$tb" ]; then
+    echo "G1 INCONCLUSIVE: no transcript line parsed from bench output" >&2
+    MATCH=0
+  fi
+  [ "$ta" = "$tb" ] || MATCH=0
   if [ -n "${G1_FULL:-}" ]; then
     RUNS_SAVED=$RUNS; RUNS=1
     for w in medium long; do
@@ -125,6 +135,9 @@ if [ -z "${SKIP_G1:-}" ]; then
   fi
 fi
 
+for v in "$base" "$cand"; do
+  case "$v" in ''|*[!0-9.]*) echo "ERROR: non-numeric decode metric (base=$base cand=$cand) — bench output unparsed" >&2; exit 1;; esac
+done
 delta=$(awk "BEGIN {printf \"%.2f\", ($cand - $base) / $base * 100}")
 echo "METRIC moss_decode=$cand"
 echo "METRIC moss_decode_base=$base"
