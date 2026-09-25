@@ -214,12 +214,17 @@ pub fn apply(
         match replacement {
             Replacement::Command(command) => match command.action {
                 Action::Punctuation => {
-                    trim_end_ws(&mut out, &WHITESPACE);
+                    // Line breaks a layout command just emitted go back
+                    // after the mark.
+                    let kept = out.trim_end_matches(is_ws).len();
+                    let layout = "\n".repeat(out[kept..].matches('\n').count());
+                    out.truncate(kept);
                     if out.ends_with(|c: char| ATTACHED.contains(&c)) {
                         out.pop();
                     }
                     out.push_str(command.value.as_deref().unwrap_or_default());
-                    skip_ws = false;
+                    out.push_str(&layout);
+                    skip_ws = !layout.is_empty();
                 }
                 Action::LineBreak | Action::Paragraph => {
                     trim_end_ws(&mut out, &[' ', '\t']);

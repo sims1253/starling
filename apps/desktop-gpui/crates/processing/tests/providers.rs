@@ -424,6 +424,8 @@ fn malformed_json_bodies_and_chunks_are_typed() {
     ]);
     let (plain, decl) = openai(&server, false);
     let (streaming, _) = openai(&server, true);
+    // One provider per scripted step, in order: invalid JSON (plain), a cut
+    // stream chunk (streaming), a non-string content and no choices (plain).
     for provider in [&plain as &dyn Provider, &streaming, &plain, &plain] {
         let (result, _) = run(provider, &request(&decl, "hello"), &CancelToken::new());
         assert_eq!(

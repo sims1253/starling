@@ -360,6 +360,8 @@ impl JobsActor {
         let job_id = corr.unwrap_or_else(|| request.request_id.clone());
         // Retry identity: the retried job is superseded. It is stopped only
         // once the retry is admitted, so a rejected retry leaves it running.
+        // A `retry_of` naming no active transform supersedes nothing; the
+        // lineage still travels on the request and its result.
         let superseded: Vec<String> = match request.retry_of.as_deref() {
             Some(retry_of) => self
                 .jobs
@@ -809,7 +811,7 @@ impl JobsActor {
             self.emit(
                 &job_id,
                 Event::JobsFailed {
-                    reason: "internal_dispatch_error".to_string(),
+                    reason: "internal dispatch refused".to_string(),
                     retryable: false,
                 },
             );

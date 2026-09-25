@@ -498,6 +498,7 @@ def check_result(result: dict[str, Any]) -> list[str]:
             found.append('a completed result carries text and no failure')
     elif result['text'] is not None or result['failure'] is None:
         found.append('a failed or cancelled result carries a failure and no text')
-    if result['status'] == 'cancelled' and result['failure']['reason'] != 'cancelled':
+    if (result['status'] == 'cancelled' and result['failure'] is not None
+            and result['failure']['reason'] != 'cancelled'):
         found.append('a cancelled result has the cancelled reason')
     return found
