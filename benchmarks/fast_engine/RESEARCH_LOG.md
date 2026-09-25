@@ -272,3 +272,32 @@ verified twice in cool windows), quality 7.31 % en (GGUF and packed paths
 alike) vs 7.87 % baseline, energy 2.42 mWh/transcription, all five gates green,
 layout table + #311/#316/#318 notes delivered, #325 wedge guards landed
 from the driver investigation this session also produced.
+
+## #317 deliverable: the IQ*_KT trellis quality datapoint (2026-09-26)
+
+The brief's item 7 ("one data point: quality per resident byte of IQ*_KT vs
+the best affine candidate"). Method: ik_llama.cpp @ HEAD built CPU-only; 24
+MOSS tensors (ffn.gate + ffn.down, the largest decode-relevant matrices)
+quantized from the bf16-exact source with **IQ4_KT + our imatrix**
+(converted to llama.cpp format); weight-space rel-rms vs bf16.
+
+| format | bpw | rel-rms (24 tensors) |
+| --- | --- | --- |
+| **IQ4_KT (trellis + imx)** | 4.01 | **0.1027** |
+| affine w4g64sym (+imx search) | 4.25 | 0.1035 |
+| affine w4g128sym (+imx search) | 4.13 | 0.1092 |
+| affine w4g32sym-a (+imx search) | 4.50 | 0.094 |
+
+At matched ~4 bpw the trellis is **3–7 % better in rel-rms** than
+imatrix-searched affine — nowhere near a format-changing margin, and it
+costs trellis decode ALU that the PowerVR op-issue ceiling charges at par
+(P1-1..P1-3). Conclusion for #316: at 4 bpw the cheap affine format stands;
+trellis only matters below 3 bpw (per EXL3's own 2–3 bpw focus), which is a
+memory play (#316's concern), not a speed one.
+
+Method note for anyone touching KT formats standalone: the KT rows carry
+one leading f32 row-scale each, so a bulk `to_float` over N rows misframes
+everything after row 1 — dequant must be per row (cost an hour to find;
+the failure mode is rel-rms ≈ 1.4, i.e. looks like a broken quantizer, not
+a framing bug). IQ4_KT also needs the imatrix or the trellis clustering
+degenerates ("cluster N has no points").
