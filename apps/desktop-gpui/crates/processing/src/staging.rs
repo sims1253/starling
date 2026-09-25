@@ -275,6 +275,7 @@ pub struct Draft {
 
 /// Splits `text` at code point `at` (`at` <= its length).
 fn split_chars(text: &str, at: usize) -> (&str, &str) {
+    debug_assert!(at <= text.chars().count(), "split past the end");
     let byte = text
         .char_indices()
         .nth(at)
@@ -345,21 +346,21 @@ impl Draft {
         (!parts.is_empty()).then(|| parts.concat())
     }
 
+    /// The latest final attempt of each segment, in segment order.
+    fn latest_attempts(&self) -> impl Iterator<Item = &Attempt> {
+        let mut latest: std::collections::BTreeMap<u32, &Attempt> = Default::default();
+        for attempt in &self.attempts {
+            latest.insert(attempt.segment, attempt);
+        }
+        latest.into_values()
+    }
+
     /// The latest final attempt per segment, in segment order: the
     /// recognition exactly as it arrived.
     pub fn raw_text(&self) -> String {
-        let mut latest: Vec<(u32, &str)> = Vec::new();
-        for attempt in &self.attempts {
-            match latest
-                .iter_mut()
-                .find(|(segment, _)| *segment == attempt.segment)
-            {
-                Some(entry) => entry.1 = &attempt.text,
-                None => latest.push((attempt.segment, &attempt.text)),
-            }
-        }
-        latest.sort_by_key(|(segment, _)| *segment);
-        latest.into_iter().map(|(_, text)| text).collect()
+        self.latest_attempts()
+            .map(|attempt| attempt.text.as_str())
+            .collect()
     }
 
     pub fn attempts(&self) -> &[Attempt] {
@@ -369,18 +370,9 @@ impl Draft {
     /// The ids of the final attempts the visible raw text came from: the
     /// latest attempt per segment, in segment order, like [`Self::raw_text`].
     pub fn source_attempt_ids(&self) -> Vec<String> {
-        let mut latest: Vec<(u32, &str)> = Vec::new();
-        for attempt in &self.attempts {
-            match latest
-                .iter_mut()
-                .find(|(segment, _)| *segment == attempt.segment)
-            {
-                Some(entry) => entry.1 = &attempt.attempt_id,
-                None => latest.push((attempt.segment, &attempt.attempt_id)),
-            }
-        }
-        latest.sort_by_key(|(segment, _)| *segment);
-        latest.into_iter().map(|(_, id)| id.to_string()).collect()
+        self.latest_attempts()
+            .map(|attempt| attempt.attempt_id.clone())
+            .collect()
     }
 
     pub fn request(&self, request_id: &str) -> Option<&RequestRecord> {
@@ -785,20 +777,21 @@ impl Draft {
         }
         let base_revision = request.base_revision;
         let superseded = request.status == RequestStatus::Superseded;
-        if status != ResultKind::Completed || text.is_none() {
-            // Raw text is untouched by a failure; the request is done.
+        let Some(text) = text.filter(|_| status == ResultKind::Completed) else {
+            // Raw text is untouched by a failure (a completed result
+            // without text is one too); the request is done.
             if !superseded {
                 request.status = RequestStatus::Settled;
             }
             return Outcome::Failed;
-        }
+        };
         if !superseded {
             request.status = RequestStatus::Settled;
         }
         self.proposals.push(Proposal {
             request_id: request_id.to_string(),
             base_revision,
-            text: text.unwrap_or_default().to_string(),
+            text: text.to_string(),
             state: if superseded {
                 ProposalState::Superseded
             } else {

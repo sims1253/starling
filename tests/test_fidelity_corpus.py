@@ -398,3 +398,33 @@ def test_minischema_applies_ref_sibling_keywords() -> None:
     assert minischema.errors(5, schema) == []
     assert minischema.errors(2, schema) == ["$: 2 below minimum 3"]
     assert minischema.errors("x", schema) == ["$: expected type integer, got str"]
+
+
+def test_minischema_array_bounds_and_uniqueness_reject() -> None:
+    span = {"type": "array", "minItems": 2, "maxItems": 2}
+    assert not minischema.errors([0, 1], span)
+    assert minischema.errors([0, 1, 2], span)
+    unique = {"type": "array", "uniqueItems": True}
+    assert minischema.errors(["clean", "clean"], unique)
+    assert not minischema.errors([True, 1], unique), "true and 1 are different values"
+    assert not minischema.errors([{"a": True}, {"a": 1}], unique)
+    assert minischema.errors([{"a": 1, "b": 2}, {"b": 2, "a": 1}], unique)
+
+
+def test_minischema_conditionals_and_not_reject() -> None:
+    schema = {
+        "type": "object",
+        "allOf": [
+            {
+                "if": {"properties": {"kind": {"const": "builtin"}}, "required": ["kind"]},
+                "then": {"properties": {"kinds": {"maxItems": 0}}},
+                "else": {"properties": {"kinds": {"minItems": 1}}},
+            }
+        ],
+    }
+    assert not minischema.errors({"kind": "builtin", "kinds": []}, schema)
+    assert minischema.errors({"kind": "builtin", "kinds": ["clean"]}, schema)
+    assert minischema.errors({"kind": "s1", "kinds": []}, schema)
+    assert not minischema.errors({"kind": "s1", "kinds": ["clean"]}, schema)
+    assert minischema.errors(3, {"not": {"type": "integer"}})
+    assert not minischema.errors("x", {"not": {"type": "integer"}})

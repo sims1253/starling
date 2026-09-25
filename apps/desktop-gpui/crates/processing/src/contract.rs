@@ -463,10 +463,16 @@ pub fn validate_processing(doc: &ProfilesDocument) -> Result<(), String> {
         }
         if profile.delivery == Delivery::InsertEnter {
             if profile.id == doc.default_profile {
-                return Err("insert_enter cannot be the default delivery".to_string());
+                return Err(format!(
+                    "{}: insert_enter cannot be the default delivery",
+                    profile.id
+                ));
             }
             if profile.selected_text == SelectedText::EditTarget {
-                return Err("insert_enter cannot replace a selection".to_string());
+                return Err(format!(
+                    "{}: insert_enter cannot replace a selection",
+                    profile.id
+                ));
             }
         }
     }
@@ -515,7 +521,7 @@ pub fn language_ok(language: Option<&str>, accepted: &[String]) -> bool {
     let Some(language) = language else {
         return false;
     };
-    let primary = language.split('-').next().unwrap_or(language);
+    let primary = language.split('-').next().unwrap_or_default();
     accepted
         .iter()
         .any(|value| value == language || value == primary)

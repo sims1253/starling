@@ -15,6 +15,7 @@ subset or extend this module; anything else silently passes.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -124,9 +125,14 @@ def errors(
         if "maxItems" in schema and len(instance) > schema["maxItems"]:
             found.append(f"{path}: more than maxItems {schema['maxItems']}")
         if schema.get("uniqueItems"):
+            # Canonical JSON keeps equality type-aware at every depth
+            # (true vs 1, {"a": true} vs {"a": 1}).
+            seen: set[str] = set()
             for i, item in enumerate(instance):
-                if any(_json_equal(item, earlier) for earlier in instance[:i]):
+                key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+                if key in seen:
                     found.append(f"{path}[{i}]: duplicate of an earlier item")
+                seen.add(key)
         if "items" in schema:
             for i, item in enumerate(instance):
                 found.extend(errors(item, schema["items"], root, f"{path}[{i}]"))
