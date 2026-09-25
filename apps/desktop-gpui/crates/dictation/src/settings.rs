@@ -36,6 +36,42 @@ pub struct Settings {
     /// which re-enables that sync instead of guessing from the file's text.
     #[serde(default)]
     pub user_set_model: bool,
+    /// Text processing after transcription (#294/#295). A file without
+    /// the key loads the defaults: raw transcripts, nothing sent anywhere.
+    #[serde(default)]
+    pub processing: ProcessingSettings,
+}
+
+/// Which processing mode runs after a take is transcribed, and where its
+/// providers live. The key itself never goes into this file: only the
+/// name of the environment variable that holds it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProcessingSettings {
+    /// A mode id from the app's built-in modes.
+    pub mode: String,
+    /// The starling-serve instance running S1-mini (its own process: one
+    /// model is resident per server). Must be on this machine.
+    pub s1_endpoint: String,
+    /// An OpenAI-compatible base URL (`https://api.openai.com/v1`,
+    /// OpenRouter, a local llama-server's `/v1`).
+    pub api_endpoint: String,
+    /// The model the API should use; empty means the API mode is not set up.
+    pub api_model: String,
+    /// The environment variable holding the API key.
+    pub api_key_env: String,
+}
+
+impl Default for ProcessingSettings {
+    fn default() -> Self {
+        Self {
+            mode: "verbatim".to_string(),
+            s1_endpoint: "http://127.0.0.1:8182".to_string(),
+            api_endpoint: "https://api.openai.com/v1".to_string(),
+            api_model: String::new(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+        }
+    }
 }
 
 impl Settings {
@@ -47,6 +83,7 @@ impl Settings {
             model: "parakeet".to_string(),
             expected_terms: vec!["auth".to_string()],
             user_set_model: false,
+            processing: ProcessingSettings::default(),
         }
     }
 
@@ -151,6 +188,11 @@ mod tests {
             model: "whisper-large-v3".to_string(),
             expected_terms: vec!["auth".to_string(), "Starling".to_string()],
             user_set_model: true,
+            processing: ProcessingSettings {
+                mode: "clean-local".to_string(),
+                api_model: "gpt-4.1-mini".to_string(),
+                ..ProcessingSettings::default()
+            },
         };
 
         settings.save(&path).expect("save");
@@ -166,6 +208,24 @@ mod tests {
             serde_json::json!(["auth", "Starling"])
         );
         assert_eq!(value["userSetModel"], true);
+        assert_eq!(value["processing"]["mode"], "clean-local");
+        assert_eq!(value["processing"]["apiKeyEnv"], "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn processing_defaults_to_raw_and_sends_nothing() {
+        let settings = Settings::default_settings();
+        assert_eq!(settings.processing.mode, "verbatim");
+        assert!(settings.processing.api_model.is_empty());
+        // A file written before processing existed loads the defaults.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","model":"parakeet","expectedTerms":["auth"]}"#,
+        )
+        .expect("write settings");
+        assert_eq!(Settings::load(&path).processing, ProcessingSettings::default());
     }
 
     #[test]

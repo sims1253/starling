@@ -10,6 +10,7 @@ use gpui::{
 use starling_dictation::storage::SessionStatus;
 
 use crate::app::StarlingApp;
+use crate::processing::ProcessingState;
 use crate::theme;
 use crate::views::{icon, spinner};
 
@@ -213,6 +214,12 @@ pub fn render_drawer(
         }
     }
 
+    if session.transcript.is_some() && !active {
+        if let Some(block) = processing_block(app, &session.id, transcript_scale, cx) {
+            body = body.child(block);
+        }
+    }
+
     let mut drawer = div()
         .id("transcript-drawer")
         .relative()
@@ -303,6 +310,176 @@ pub fn render_drawer(
             Animation::new(Duration::from_millis(250)).with_easing(ease_out_quint()),
             |el, delta| el.opacity(0.3 + 0.7 * delta),
         ))
+}
+
+/// The processed side of a take (#295): a proposal next to the raw text,
+/// never in place of it. "Use processed" makes it the take's head (what
+/// Copy and Export use) only while it is current; "Back to raw" is always
+/// one click away.
+fn processing_block(
+    app: &StarlingApp,
+    id: &str,
+    scale: gpui::Pixels,
+    cx: &mut Context<StarlingApp>,
+) -> Option<gpui::Stateful<Div>> {
+    let take = app.processing.get(id).cloned();
+    let processes = app.mode_processes();
+    if take.is_none() && !processes {
+        return None;
+    }
+    let label = take.as_ref().map(|take| take.label.clone()).unwrap_or_default();
+    let state = take
+        .as_ref()
+        .map(|take| take.state.clone())
+        .unwrap_or(ProcessingState::Idle);
+    let processed_head = take.as_ref().and_then(|take| take.processed_head.clone());
+
+    let eyebrow = if label.is_empty() {
+        "PROCESSED".to_string()
+    } else {
+        format!("PROCESSED · {label}")
+    };
+    let mut block = div()
+        .id("processing-block")
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .mt(px(16.))
+        .pt(px(12.))
+        .border_t_1()
+        .border_color(theme::PAPER_LINE_SOFT)
+        .child(
+            div()
+                .font(theme::mono_font())
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::PAPER_EYEBROW)
+                .child(eyebrow),
+        );
+    let note = |text: String, color| div().text_size(px(11.)).text_color(color).child(text);
+    let mut buttons = div().flex().flex_row().items_center().gap(px(7.));
+    let take_id = id.to_string();
+    let run_label = format!("Run {}", app.active_mode().name);
+
+    match state {
+        ProcessingState::Running => {
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(11.))
+                    .text_color(theme::PROCESSING)
+                    .child(spinner("processing-spinner", 14., theme::PROCESSING))
+                    .child("Processing… the raw transcript above is already saved."),
+            );
+            let cancel_id = take_id.clone();
+            buttons = buttons.child(
+                action_button(
+                    "processing-cancel",
+                    false,
+                    cx.listener(move |this, _, _window, cx| this.cancel_processing(&cancel_id, cx)),
+                )
+                .child("Cancel"),
+            );
+        }
+        ProcessingState::Proposal { row, current } => {
+            if !current {
+                block = block.child(note(
+                    "Stale: the take changed after this was requested, so it is only a \
+                     suggestion."
+                        .to_string(),
+                    theme::AMBER_DEEP,
+                ));
+            }
+            block = block.child(
+                div()
+                    .font(theme::serif_font())
+                    .text_size(scale * 0.85)
+                    .line_height(scale * 0.85 * 1.4)
+                    .text_color(theme::PAPER_INK)
+                    .when(!current, |text| text.opacity(0.6))
+                    .child(if row.text.trim().is_empty() {
+                        "(nothing left after cleanup)".to_string()
+                    } else {
+                        row.text.clone()
+                    }),
+            );
+            let accept_id = take_id.clone();
+            buttons = buttons.child(
+                action_button(
+                    "processing-accept",
+                    false,
+                    cx.listener(move |this, _, _window, cx| this.accept_processed(&accept_id, !current, cx)),
+                )
+                .child(if current { "Use processed" } else { "Use anyway" }),
+            );
+            let dismiss_id = take_id.clone();
+            buttons = buttons.child(
+                action_button(
+                    "processing-dismiss",
+                    false,
+                    cx.listener(move |this, _, _window, cx| this.dismiss_processed(&dismiss_id, cx)),
+                )
+                .child("Dismiss"),
+            );
+        }
+        ProcessingState::Failed { message } => {
+            block = block.child(note(message, theme::FAILED_COPY));
+        }
+        ProcessingState::Cancelled => {
+            block = block.child(note(
+                "Cancelled. The raw transcript is unchanged.".to_string(),
+                theme::PAPER_SUBTLE,
+            ));
+        }
+        ProcessingState::Blocked { message } => {
+            block = block.child(note(message, theme::FAILED_COPY));
+        }
+        ProcessingState::Idle => {}
+    }
+
+    if let Some(head) = processed_head {
+        if !matches!(take.as_ref().map(|t| &t.state), Some(ProcessingState::Proposal { .. })) {
+            block = block
+                .child(note(
+                    "Copy and Export use this processed text.".to_string(),
+                    theme::PAPER_SUBTLE,
+                ))
+                .child(
+                    div()
+                        .font(theme::serif_font())
+                        .text_size(scale * 0.85)
+                        .line_height(scale * 0.85 * 1.4)
+                        .text_color(theme::PAPER_INK)
+                        .child(head),
+                );
+        }
+        let revert_id = take_id.clone();
+        buttons = buttons.child(
+            action_button(
+                "processing-revert",
+                false,
+                cx.listener(move |this, _, _window, cx| this.revert_to_raw(&revert_id, cx)),
+            )
+            .child("Back to raw"),
+        );
+    }
+
+    let running = app.processing_jobs.contains_key(id);
+    if processes && !running {
+        let run_id = take_id.clone();
+        buttons = buttons.child(
+            action_button(
+                "processing-run",
+                false,
+                cx.listener(move |this, _, _window, cx| this.process_take(run_id.clone(), cx)),
+            )
+            .child(run_label),
+        );
+    }
+    Some(block.child(buttons))
 }
 
 fn action_button(

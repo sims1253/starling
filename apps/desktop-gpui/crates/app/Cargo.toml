@@ -11,10 +11,12 @@ description = "Starling desktop dictation app built with gpui"
 gpui = "0.2.2"
 global-hotkey = "0.7"
 starling-dictation = { path = "../dictation" }
+starling-processing = { path = "../processing" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dirs = "6"
 unicode-segmentation = "1"
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

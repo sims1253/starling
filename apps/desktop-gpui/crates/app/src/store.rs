@@ -15,9 +15,165 @@ use starling_dictation::{
     },
     store_v2::{
         self, AttemptRecord, CaptureRecord, CaptureStatus, ListedCapture, RecognitionOutcome,
-        StoreV2, StoreV2Error,
+        RevisionRow, StoreV2, StoreV2Error,
     },
 };
+
+/// The `documents.name` of a take's processing document.
+const PROCESSING_DOC: &str = "processing";
+
+/// A take's durable processing state (#295).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProcessingDoc {
+    pub head_revision: u64,
+    pub head_text: String,
+    pub head_is_raw: bool,
+    pub raw_attempt_id: String,
+    pub raw_text: String,
+    pub proposals: Vec<ProposalRow>,
+}
+
+/// One processing result as stored: a proposal pinned to the head
+/// revision its request read, or the failure it ended in.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProposalRow {
+    pub request_id: String,
+    pub base_revision: u64,
+    pub text: String,
+    pub status: RowStatus,
+    /// Where the text went, for the drawer ("S1-mini · this computer").
+    pub label: String,
+    pub failure: Option<String>,
+    pub stop_to_result_ms: Option<f64>,
+}
+
+/// The disposition of a stored processing result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RowStatus {
+    Proposed,
+    Accepted,
+    Rejected,
+    Superseded,
+    Failed,
+}
+
+impl RowStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RowStatus::Proposed => "proposed",
+            RowStatus::Accepted => "accepted",
+            RowStatus::Rejected => "rejected",
+            RowStatus::Superseded => "superseded",
+            RowStatus::Failed => "failed",
+        }
+    }
+
+    /// `None` for a value this build does not know; such a row is skipped.
+    pub(crate) fn parse(value: &str) -> Option<RowStatus> {
+        [
+            RowStatus::Proposed,
+            RowStatus::Accepted,
+            RowStatus::Rejected,
+            RowStatus::Superseded,
+            RowStatus::Failed,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == value)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProposalProvenance {
+    label: String,
+    failure: Option<String>,
+    stop_to_result_ms: Option<f64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HeadSources {
+    attempt_id: String,
+    request_id: Option<String>,
+}
+
+fn head_rev_id(id: &str, revision: u64) -> String {
+    format!("{id}#h{revision}")
+}
+
+fn head_row(id: &str, revision: u64, text: &str, is_raw: bool, attempt_id: &str, request_id: Option<&str>) -> RevisionRow {
+    RevisionRow {
+        rev_id: head_rev_id(id, revision),
+        doc_id: id.to_string(),
+        base_revision: revision.checked_sub(1).filter(|base| *base > 0),
+        sources_json: serde_json::to_string(&HeadSources {
+            attempt_id: attempt_id.to_string(),
+            request_id: request_id.map(str::to_string),
+        })
+        .ok(),
+        text: text.to_string(),
+        status: if is_raw { "raw" } else { "processed" }.to_string(),
+        provenance: None,
+        disposition: Some("committed".to_string()),
+    }
+}
+
+impl ProposalRow {
+    fn to_row(&self, id: &str) -> RevisionRow {
+        RevisionRow {
+            rev_id: format!("{id}#p:{}", self.request_id),
+            doc_id: id.to_string(),
+            base_revision: Some(self.base_revision),
+            sources_json: serde_json::to_string(&serde_json::json!({ "request_id": self.request_id })).ok(),
+            text: self.text.clone(),
+            status: self.status.as_str().to_string(),
+            provenance: serde_json::to_string(&ProposalProvenance {
+                label: self.label.clone(),
+                failure: self.failure.clone(),
+                stop_to_result_ms: self.stop_to_result_ms,
+            })
+            .ok(),
+            disposition: Some("proposal".to_string()),
+        }
+    }
+}
+
+impl ProcessingDoc {
+    fn from_row(id: &str, document: store_v2::DocumentRow) -> Option<ProcessingDoc> {
+        let head = document
+            .revisions
+            .iter()
+            .find(|row| row.rev_id == head_rev_id(id, document.head_revision))?;
+        let raw = document.revisions.iter().find(|row| row.rev_id == head_rev_id(id, 1))?;
+        let sources: HeadSources = serde_json::from_str(raw.sources_json.as_deref()?).ok()?;
+        let proposals = document
+            .revisions
+            .iter()
+            .filter(|row| row.disposition.as_deref() == Some("proposal"))
+            .filter_map(|row| {
+                let provenance: ProposalProvenance =
+                    serde_json::from_str(row.provenance.as_deref()?).ok()?;
+                let request_id = row.rev_id.split_once("#p:")?.1.to_string();
+                Some(ProposalRow {
+                    request_id,
+                    base_revision: row.base_revision?,
+                    text: row.text.clone(),
+                    status: RowStatus::parse(&row.status)?,
+                    label: provenance.label,
+                    failure: provenance.failure,
+                    stop_to_result_ms: provenance.stop_to_result_ms,
+                })
+            })
+            .collect();
+        Some(ProcessingDoc {
+            head_revision: document.head_revision,
+            head_text: head.text.clone(),
+            head_is_raw: head.status == "raw",
+            raw_attempt_id: sources.attempt_id,
+            raw_text: raw.text.clone(),
+            proposals,
+        })
+    }
+}
 
 /// Map a v2 failure onto the app's existing storage error plumbing.
 /// [`storage::StorageError::NotFound`] stays intact — the transcription
@@ -214,10 +370,168 @@ impl Store {
     }
 
     /// Confirmed deletion (R21): the audio journal is quarantined and the
-    /// row tombstoned — resurrection-proof.
+    /// row tombstoned — resurrection-proof. The take's processing
+    /// document (#295) goes with it; its insight events cascade with the
+    /// capture row.
     pub(crate) fn delete(&self, id: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
+        // The processing document first: it holds transcript-derived text
+        // and has no foreign key to the capture, so a failure between the
+        // two steps must leave a take without its document, never an
+        // orphaned document without its take.
+        store.delete_document(id).map_err(v2_err)?;
         store.delete_capture(id).map_err(v2_err)
+    }
+
+    // ------------------------------------------------------------------
+    // Processing (#295). One `documents` row per take, keyed by the
+    // capture id: head revision 1 is the raw transcript, later heads are
+    // accepted processed text or a return to raw, and every processing
+    // result is a `proposal` revision pinned to the head it read. Raw
+    // recognition stays in `recognition_attempts`, untouched.
+    // ------------------------------------------------------------------
+
+    /// The take's latest final transcript and its attempt id.
+    pub(crate) fn latest_raw(&self, id: &str) -> Result<Option<(String, String)>, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        let attempts = store.attempts_for(id).map_err(v2_err)?;
+        Ok(attempts
+            .into_iter()
+            .rev()
+            .find(AttemptRecord::is_final_transcript)
+            .map(|attempt| (attempt.id, attempt.text)))
+    }
+
+    /// The take's processing document, if processing ran on its current
+    /// raw transcript. A document built on an earlier transcript (the take
+    /// was re-transcribed since) is stale and reads as none: what was used
+    /// or proposed for the old text does not apply to the new one.
+    pub(crate) fn processing_doc(&self, id: &str) -> Result<Option<ProcessingDoc>, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        let latest = store
+            .attempts_for(id)
+            .map_err(v2_err)?
+            .into_iter()
+            .rev()
+            .find(AttemptRecord::is_final_transcript)
+            .map(|attempt| attempt.id);
+        let document = store.get_document(id).map_err(v2_err)?;
+        Ok(document
+            .and_then(|document| ProcessingDoc::from_row(id, document))
+            .filter(|doc| latest.as_deref() == Some(doc.raw_attempt_id.as_str())))
+    }
+
+    /// The processing document for the take's current raw transcript:
+    /// the stored one when it was built on this attempt, otherwise a
+    /// fresh one (head 1 = raw). A re-transcription therefore starts
+    /// processing over; results for an older raw text do not carry over.
+    pub(crate) fn start_processing_doc(
+        &self,
+        id: &str,
+        attempt_id: &str,
+        raw: &str,
+    ) -> Result<ProcessingDoc, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        if store.get_capture(id).map_err(v2_err)?.is_none() {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        if let Some(existing) = store
+            .get_document(id)
+            .map_err(v2_err)?
+            .and_then(|document| ProcessingDoc::from_row(id, document))
+        {
+            if existing.raw_attempt_id == attempt_id {
+                return Ok(existing);
+            }
+            store.delete_document(id).map_err(v2_err)?;
+        }
+        store
+            .commit_document_head(PROCESSING_DOC, 1, 0, &head_row(id, 1, raw, true, attempt_id, None))
+            .map_err(v2_err)?;
+        Ok(ProcessingDoc {
+            head_revision: 1,
+            head_text: raw.to_string(),
+            head_is_raw: true,
+            raw_attempt_id: attempt_id.to_string(),
+            raw_text: raw.to_string(),
+            proposals: Vec::new(),
+        })
+    }
+
+    /// Stores (or updates) one proposal row. A take deleted meanwhile is
+    /// `NotFound`: the result lands nowhere.
+    pub(crate) fn save_proposal(&self, id: &str, proposal: &ProposalRow) -> Result<(), storage::StorageError> {
+        let store = lock_v2(&self.0);
+        if store.get_capture(id).map_err(v2_err)?.is_none() {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        let Some(document) = store.get_document(id).map_err(v2_err)? else {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        };
+        // A settled row (accepted or rejected) is final: a job's late
+        // write of its proposal, or a Dismiss racing an accept, lands
+        // nowhere. (An accept settles its row through
+        // commit_processing_head, not here.)
+        let row = proposal.to_row(id);
+        let settled = document.revisions.iter().any(|stored| {
+            stored.rev_id == row.rev_id
+                && matches!(RowStatus::parse(&stored.status), Some(RowStatus::Accepted | RowStatus::Rejected))
+        });
+        if settled {
+            return Ok(());
+        }
+        store.store_document_revision(&row).map_err(v2_err)
+    }
+
+    /// Commits a new head revision (accepted processed text, or raw
+    /// again), marking the accepted proposal in the same lock.
+    pub(crate) fn commit_processing_head(
+        &self,
+        id: &str,
+        revision: u64,
+        text: &str,
+        is_raw: bool,
+        attempt_id: &str,
+        accepted: Option<&ProposalRow>,
+    ) -> Result<(), storage::StorageError> {
+        let store = lock_v2(&self.0);
+        if store.get_capture(id).map_err(v2_err)?.is_none() {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        // A head chosen for an earlier transcript lands nowhere: a
+        // re-transcription rebuilt the document on a new raw attempt.
+        let current = store
+            .get_document(id)
+            .map_err(v2_err)?
+            .and_then(|document| ProcessingDoc::from_row(id, document));
+        if current.is_none_or(|doc| doc.raw_attempt_id != attempt_id) {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        let request_id = accepted.map(|proposal| proposal.request_id.as_str());
+        // The head and the proposal it accepted land together or not at
+        // all, so a crash cannot leave an accepted head next to a live
+        // proposal.
+        let also: Vec<RevisionRow> = accepted.map(|proposal| proposal.to_row(id)).into_iter().collect();
+        store
+            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, request_id), &also)
+            .map_err(v2_err)
+    }
+
+    /// Records one insight event for the take (idempotent on its id). A
+    /// take deleted meanwhile is `NotFound`, like the other processing
+    /// writes: the event lands nowhere.
+    pub(crate) fn record_insight(
+        &self,
+        id: &str,
+        event_id: &str,
+        kind: &str,
+        occurred_at: &str,
+        payload_json: &str,
+    ) -> Result<(), storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store
+            .record_insight_event(event_id, id, kind, occurred_at, payload_json)
+            .map_err(v2_err)
     }
 
     /// The startup recovery pass: reconcile journals against the metadata
@@ -704,6 +1018,112 @@ mod tests {
     }
 
     // ---- the facade over a real v2 store (daily path) ------------------
+
+    fn transcribed(store: &Store, text: &str) -> String {
+        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        store.mark_attempt(&id, "starling:parakeet").expect("begin");
+        store.save_transcript(&id, transcript(text)).expect("transcript");
+        id
+    }
+
+    fn proposal(request_id: &str, base: u64, text: &str) -> ProposalRow {
+        ProposalRow {
+            request_id: request_id.to_string(),
+            base_revision: base,
+            text: text.to_string(),
+            status: RowStatus::Proposed,
+            label: "S1-mini · this computer".to_string(),
+            failure: None,
+            stop_to_result_ms: Some(1234.5),
+        }
+    }
+
+    /// A re-transcribed take's old processing document is stale: it
+    /// reads as none, so an earlier processed head never comes back over
+    /// the new transcript (not even after a restart).
+    #[test]
+    fn a_retranscribed_take_has_no_processing_document() {
+        let root = scratch_dir("processing-retranscribed");
+        let store = reopen_v2(&root);
+        let id = transcribed(&store, "um first take");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        store
+            .commit_processing_head(&id, 2, "First take.", false, &attempt, None)
+            .expect("accept");
+        assert!(store.processing_doc(&id).expect("load").is_some());
+        store.mark_attempt(&id, "starling:parakeet").expect("retry");
+        store.save_transcript(&id, transcript("second take")).expect("transcript");
+        assert_eq!(store.processing_doc(&id).expect("load"), None);
+        assert_eq!(reopen_v2(&root).processing_doc(&id).expect("load"), None);
+    }
+
+    /// #295: a take's processing document survives a restart with its
+    /// head and proposals, and never touches the raw attempt.
+    #[test]
+    fn processing_documents_round_trip_and_keep_raw_apart() {
+        let root = scratch_dir("processing-doc");
+        let store = reopen_v2(&root);
+        let id = transcribed(&store, "um so hello there");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        assert_eq!(raw, "um so hello there");
+        let doc = store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        assert_eq!((doc.head_revision, doc.head_is_raw), (1, true));
+        // Starting again on the same attempt keeps the document.
+        store.save_proposal(&id, &proposal("p1", 1, "So, hello there.")).expect("proposal");
+        let again = store.start_processing_doc(&id, &attempt, &raw).expect("again");
+        assert_eq!(again.proposals.len(), 1);
+
+        let accepted = ProposalRow { status: RowStatus::Accepted, ..proposal("p1", 1, "So, hello there.") };
+        store
+            .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted))
+            .expect("accept");
+        // A job's late write of the same proposal never demotes it.
+        store.save_proposal(&id, &proposal("p1", 1, "So, hello there.")).expect("late write");
+        let reopened = reopen_v2(&root);
+        let doc = reopened.processing_doc(&id).expect("load").expect("doc");
+        assert_eq!(doc.head_revision, 2);
+        assert_eq!(doc.head_text, "So, hello there.");
+        assert!(!doc.head_is_raw);
+        assert_eq!(doc.raw_text, "um so hello there");
+        assert_eq!(doc.proposals, vec![accepted]);
+        // The recognition attempt is exactly what the recognizer returned.
+        assert_eq!(transcript_text(&reopened, &id).as_deref(), Some("um so hello there"));
+    }
+
+    #[test]
+    fn a_new_transcription_starts_processing_over() {
+        let store = v2_store("processing-retranscribe");
+        let id = transcribed(&store, "first raw");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        store.save_proposal(&id, &proposal("p1", 1, "First.")).expect("proposal");
+        store.mark_attempt(&id, "starling:parakeet").expect("retry");
+        store.save_transcript(&id, transcript("second raw")).expect("transcript");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        let doc = store.start_processing_doc(&id, &attempt, &raw).expect("restart");
+        assert_eq!(doc.raw_text, "second raw");
+        assert!(doc.proposals.is_empty(), "results for the old raw text do not carry over");
+    }
+
+    #[test]
+    fn deleting_a_take_takes_its_processing_and_insight_rows() {
+        let store = v2_store("processing-delete");
+        let id = transcribed(&store, "to be deleted");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        store
+            .record_insight(&id, "proc-p1", "processing_recorded", "2026-09-24T10:00:00Z", "{}")
+            .expect("insight");
+        store.delete(&id).expect("delete");
+        assert!(store.processing_doc(&id).expect("load").is_none());
+        // A late result for the deleted take lands nowhere.
+        assert!(matches!(
+            store.save_proposal(&id, &proposal("p2", 1, "Late.")),
+            Err(storage::StorageError::NotFound(_))
+        ));
+        assert!(lock_v2(&store.0).insight_events_for(&id).expect("events").is_empty());
+    }
 
     #[test]
     fn the_v2_facade_covers_the_daily_path_end_to_end() {

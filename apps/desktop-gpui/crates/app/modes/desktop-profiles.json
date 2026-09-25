@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "default_profile": "verbatim",
+  "profiles": [
+    {
+      "id": "verbatim",
+      "version": 1,
+      "name": "Raw",
+      "description": "The transcript exactly as recognized. Nothing is processed and nothing is sent anywhere else.",
+      "intent": "dictate",
+      "behavior": "verbatim",
+      "prompt_file": null,
+      "aliases": [],
+      "allow_spoken_overrides": false,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": null,
+      "local_only": true,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "transform_kinds": [],
+      "language": null,
+      "style": null,
+      "spoken_commands": false,
+      "context_fields": [],
+      "processing_delivery": "staged",
+      "delivery": "save_note",
+      "automatic_delivery": false
+    },
+    {
+      "id": "clean-local",
+      "version": 1,
+      "name": "Clean up (this computer)",
+      "description": "S1-mini by Superwhisper removes fillers and self-corrections and fixes punctuation, on this computer. English only. The raw transcript stays one click away.",
+      "intent": "dictate",
+      "behavior": "faithful",
+      "prompt_file": null,
+      "aliases": [],
+      "allow_spoken_overrides": false,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": "local-authoring-s1",
+      "local_only": true,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "transform_kinds": [
+        "clean"
+      ],
+      "language": "en",
+      "style": {
+        "formality": "semi-formal",
+        "structure": "prose",
+        "context": "general"
+      },
+      "spoken_commands": true,
+      "context_fields": [],
+      "processing_delivery": "staged",
+      "delivery": "save_note",
+      "automatic_delivery": false
+    },
+    {
+      "id": "clean-api",
+      "version": 1,
+      "name": "Clean up (API)",
+      "description": "An OpenAI-compatible model removes fillers and self-corrections and fixes punctuation. The transcript is sent to the API you configure. The raw transcript stays one click away.",
+      "intent": "dictate",
+      "behavior": "faithful",
+      "prompt_file": null,
+      "aliases": [],
+      "allow_spoken_overrides": false,
+      "vocabulary": [],
+      "snippets": [],
+      "asr_route": "local-default",
+      "authoring_route": "remote-authoring-api",
+      "local_only": false,
+      "selected_text": "off",
+      "selection_required": false,
+      "clipboard": false,
+      "max_context_characters": 0,
+      "transform_kinds": [
+        "clean"
+      ],
+      "language": null,
+      "style": {
+        "formality": "semi-formal",
+        "structure": "prose",
+        "context": "general"
+      },
+      "spoken_commands": true,
+      "context_fields": [],
+      "processing_delivery": "staged",
+      "delivery": "save_note",
+      "automatic_delivery": false
+    }
+  ],
+  "rules": []
+}

@@ -300,6 +300,77 @@ impl Draft {
         }
     }
 
+    /// Resumes a draft from what an embedder persisted, after a restart:
+    /// the head text at its revision (one region, `Raw` or `Processed`),
+    /// the immutable raw attempts, and the proposals it stored. This is
+    /// the contract's crash rule: live partials and requests in flight
+    /// are not durable and do not come back; a stored proposal is judged
+    /// against the resumed revision like any other.
+    ///
+    /// A raw head is linked to an attempt of the highest segment, whatever
+    /// order the segments come in; within a segment, attempts are in
+    /// arrival order (as everywhere in this module) and the latest wins.
+    /// With no attempts the head carries no link. Each
+    /// stored proposal's request comes back as a settled record with its
+    /// id and base revision only: its input, instruction and `retry_of`
+    /// are not persisted, so a resumed record's are empty.
+    pub fn resume(
+        draft_id: impl Into<String>,
+        capture_id: impl Into<String>,
+        revision: u64,
+        head: &str,
+        head_kind: RegionKind,
+        attempts: Vec<Attempt>,
+        proposals: Vec<StoredProposal>,
+    ) -> Draft {
+        let mut draft = Draft::new(draft_id, capture_id);
+        for attempt in &attempts {
+            if !draft.finalized.contains(&attempt.segment) {
+                draft.finalized.push(attempt.segment);
+            }
+        }
+        if !head.is_empty() {
+            // A durable head is raw or processed text; anything else
+            // (a partial never survives a restart) resumes as raw.
+            let head_kind = match head_kind {
+                RegionKind::Processed => RegionKind::Processed,
+                _ => RegionKind::Raw,
+            };
+            let mut region = Region::new(head_kind, head);
+            if head_kind == RegionKind::Raw {
+                if let Some(latest) = attempts.iter().max_by_key(|attempt| attempt.segment) {
+                    region.segment = Some(latest.segment);
+                    region.attempt_id = Some(latest.attempt_id.clone());
+                }
+            }
+            draft.regions.push(region);
+        }
+        draft.attempts = attempts;
+        draft.revision = revision;
+        for proposal in proposals {
+            draft.requests.push(RequestRecord {
+                request_id: proposal.request_id.clone(),
+                base_revision: proposal.base_revision,
+                retry_of: None,
+                input: String::new(),
+                instruction: None,
+                status: RequestStatus::Settled,
+            });
+            draft.proposals.push(Proposal {
+                request_id: proposal.request_id,
+                base_revision: proposal.base_revision,
+                text: proposal.text,
+                state: match proposal.status {
+                    ProposalStatus::Current | ProposalStatus::Stale => ProposalState::Open,
+                    ProposalStatus::Superseded => ProposalState::Superseded,
+                    ProposalStatus::Accepted => ProposalState::Accepted,
+                    ProposalStatus::Rejected => ProposalState::Rejected,
+                },
+            });
+        }
+        draft
+    }
+
     // ------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------
@@ -1033,6 +1104,17 @@ impl Draft {
     }
 }
 
+/// A proposal as an embedder persisted it, for [`Draft::resume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredProposal {
+    pub request_id: String,
+    pub base_revision: u64,
+    pub text: String,
+    /// `Current` and `Stale` both resume as open; the resumed revision
+    /// decides which one it is now.
+    pub status: ProposalStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalStatus {
@@ -1100,6 +1182,55 @@ mod tests {
         assert_eq!(split_chars("a👩‍💻b", 1), ("a", "👩‍💻b"));
         assert_eq!(split_chars("a👩‍💻b", 2), ("a👩", "\u{200d}💻b"));
         assert_eq!(split_chars("abc", 3), ("abc", ""));
+    }
+
+    #[test]
+    fn a_resumed_draft_judges_stored_proposals_against_its_head() {
+        let attempts = vec![Attempt {
+            attempt_id: "att-1".into(),
+            segment: 0,
+            text: "um raw words".into(),
+        }];
+        let proposals = vec![
+            StoredProposal {
+                request_id: "old".into(),
+                base_revision: 1,
+                text: "Raw words.".into(),
+                status: ProposalStatus::Current,
+            },
+            StoredProposal {
+                request_id: "new".into(),
+                base_revision: 2,
+                text: "Raw words!".into(),
+                status: ProposalStatus::Current,
+            },
+        ];
+        let mut draft = Draft::resume(
+            "d",
+            "c",
+            2,
+            "Raw words.",
+            RegionKind::Processed,
+            attempts,
+            proposals,
+        );
+        assert_eq!(draft.text(), "Raw words.");
+        assert_eq!(draft.raw_text(), "um raw words");
+        assert_eq!(draft.proposal_status("old"), Some(ProposalStatus::Stale));
+        assert_eq!(draft.proposal_status("new"), Some(ProposalStatus::Current));
+        assert_eq!(draft.accept("old", false), Outcome::StaleRejected);
+        assert_eq!(
+            draft.result("new", ResultKind::Completed, Some("again")),
+            Outcome::Duplicate
+        );
+        assert_eq!(draft.request_transform("r3", None), Outcome::Pending);
+        assert_eq!(draft.revert_raw(), Outcome::Applied);
+        assert_eq!(draft.text(), "um raw words");
+        assert_eq!(draft.revision(), 3);
+        assert_eq!(
+            draft.result("r3", ResultKind::Completed, Some("late")),
+            Outcome::Stale
+        );
     }
 
     #[test]

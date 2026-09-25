@@ -32,7 +32,7 @@
 //! # Schema
 //!
 //! The §4 "schema direction" tables ([`SCHEMA_SQL`], one place, version
-//! [`V2_SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
+//! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `tombstones`, `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
@@ -46,7 +46,7 @@
 //! object without dropping keys.
 //!
 //! Forward compatibility (§4): a database whose `meta.schema_version` is
-//! **higher** than [`V2_SCHEMA_VERSION`] is refused at open
+//! **higher** than [`SCHEMA_VERSION`] is refused at open
 //! ([`StoreV2Error::SchemaTooNew`]) — this build will neither read nor
 //! write a future format; a lower version is upgraded by applying
 //! [`SCHEMA_SQL`] (idempotent `CREATE TABLE IF NOT EXISTS`).
@@ -100,8 +100,9 @@ use crate::storage::{is_safe_path_component, now_iso};
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
-/// real updated-at source for the summaries).
-pub const V2_SCHEMA_VERSION: u32 = 2;
+/// real updated-at source for the summaries); v3 added `insight_events`
+/// (#294: per-job processing latency, recorded for Insights #308).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -239,6 +240,15 @@ CREATE TABLE IF NOT EXISTS deliveries (
     undo_json     TEXT,
     failure_json  TEXT
 );
+CREATE TABLE IF NOT EXISTS insight_events (
+    event_id     TEXT PRIMARY KEY,
+    capture_id   TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+    type         TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_insight_events_capture
+    ON insight_events(capture_id);
 CREATE TABLE IF NOT EXISTS tombstones (
     id          TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
@@ -557,15 +567,15 @@ impl StoreV2 {
                 tx.execute_batch(SCHEMA_SQL)?;
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-                    params![V2_SCHEMA_VERSION.to_string()],
+                    params![SCHEMA_VERSION.to_string()],
                 )?;
                 tx.commit()?;
             }
-            Some(found) if found == V2_SCHEMA_VERSION => {
+            Some(found) if found == SCHEMA_VERSION => {
                 // Same version: schema is already in place; verify the
                 // version row is sane and touch nothing else.
             }
-            Some(found) if found < V2_SCHEMA_VERSION => {
+            Some(found) if found < SCHEMA_VERSION => {
                 // Lower version: apply the (idempotent) schema, add any
                 // columns introduced since `found` (`CREATE TABLE IF NOT
                 // EXISTS` cannot extend an existing table), and bump.
@@ -593,7 +603,7 @@ impl StoreV2 {
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![V2_SCHEMA_VERSION.to_string()],
+                    params![SCHEMA_VERSION.to_string()],
                 )?;
                 tx.commit()?;
             }
@@ -603,7 +613,7 @@ impl StoreV2 {
                 // reader). Nothing was mutated.
                 return Err(StoreV2Error::SchemaTooNew {
                     found,
-                    supported: V2_SCHEMA_VERSION,
+                    supported: SCHEMA_VERSION,
                 });
             }
         }
@@ -1142,9 +1152,29 @@ impl StoreV2 {
         turn_seq: u32,
         revision: &RevisionRow,
     ) -> Result<(), StoreV2Error> {
+        self.commit_document_head_with(name, head_revision, turn_seq, revision, &[])
+    }
+
+    /// [`Self::commit_document_head`] plus further revision rows of the
+    /// same document (e.g. the proposal the new head accepted), all in one
+    /// transaction: either every row lands or none does.
+    pub fn commit_document_head_with(
+        &self,
+        name: &str,
+        head_revision: u64,
+        turn_seq: u32,
+        revision: &RevisionRow,
+        also: &[RevisionRow],
+    ) -> Result<(), StoreV2Error> {
+        if let Some(row) = also.iter().find(|row| row.doc_id != revision.doc_id) {
+            return Err(StoreV2Error::Invalid(format!(
+                "revision {} belongs to another document",
+                row.rev_id
+            )));
+        }
         let tx = self.conn.unchecked_transaction()?;
         // A refused write returns before `commit`: dropping `tx` rolls
-        // the whole pair back.
+        // the whole set back.
         if !self.upsert_document(&revision.doc_id, name, head_revision, turn_seq)? {
             return Err(StoreV2Error::Invalid(format!(
                 "document {} head {head_revision} is older than the durable head",
@@ -1152,8 +1182,89 @@ impl StoreV2 {
             )));
         }
         self.store_document_revision(revision)?;
+        for row in also {
+            self.store_document_revision(row)?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Deletes one document and, by cascade, its revisions and their
+    /// delivery rows (`revisions` and `deliveries` both declare ON DELETE
+    /// CASCADE), so the document's delivery history goes too. `Ok(false)`
+    /// when there was nothing to delete. Documents carry no foreign key
+    /// to a capture, and deleting a capture does not delete them: an
+    /// embedder that keys a document by capture id must call this
+    /// alongside `delete_capture` itself.
+    pub fn delete_document(&self, doc_id: &str) -> Result<bool, StoreV2Error> {
+        validate_document_id(doc_id)?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM documents WHERE doc_id = ?1", params![doc_id])?;
+        Ok(changed > 0)
+    }
+
+    /// Records one insight event (`packages/contracts/insight-events`)
+    /// for a capture. Idempotent on `event_id` like the contract says: a
+    /// replay identical in every column is a no-op, anything else under a
+    /// known id is an error, never an overwrite. The row cascades away
+    /// with its capture, so deleting a take removes its events; an event
+    /// for a capture that does not exist (deleted meanwhile) is
+    /// `NotFound`. The check, the insert and the comparison run in one
+    /// transaction, so the contract holds without a lock around the store.
+    pub fn record_insight_event(
+        &self,
+        event_id: &str,
+        capture_id: &str,
+        kind: &str,
+        occurred_at: &str,
+        payload_json: &str,
+    ) -> Result<(), StoreV2Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        if self.get_capture(capture_id)?.is_none() {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        let inserted = self.conn.execute(
+            "INSERT INTO insight_events(event_id, capture_id, type, occurred_at, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![event_id, capture_id, kind, occurred_at, payload_json],
+        )?;
+        if inserted == 0 {
+            let known: (String, String, String, String) = self.conn.query_row(
+                "SELECT capture_id, type, occurred_at, payload_json
+                 FROM insight_events WHERE event_id = ?1",
+                params![event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let replay = (
+                capture_id.to_string(),
+                kind.to_string(),
+                occurred_at.to_string(),
+                payload_json.to_string(),
+            );
+            if known != replay {
+                return Err(StoreV2Error::Invalid(format!(
+                    "insight event {event_id} already recorded differently"
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One capture's insight events as `(type, payload_json)`, in
+    /// insertion order.
+    pub fn insight_events_for(&self, capture_id: &str) -> Result<Vec<(String, String)>, StoreV2Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT type, payload_json FROM insight_events WHERE capture_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![capture_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
     }
 
     /// Advances one document's `turn_seq`, creating the row (head 0,
@@ -3784,14 +3895,14 @@ mod tests {
     fn schema_initializes_and_reports_its_version() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
 
         committed_take(&mut store, &ramp(50, 0));
 
         // Reopening a same-version database neither upgrades nor refuses.
         drop(store);
         let store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         assert_eq!(
             store
                 .list_records(0, 10)
@@ -3846,7 +3957,7 @@ mod tests {
         // pre-upgrade attempt reads back with NULL created_utc (readers
         // fall back to the capture's creation time).
         let mut store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let attempts = store.attempts_for(&id).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].created_utc, None);
@@ -3910,7 +4021,7 @@ mod tests {
         match StoreV2::open(dir.path().join("v2")) {
             Err(StoreV2Error::SchemaTooNew { found, supported }) => {
                 assert_eq!(found, 99);
-                assert_eq!(supported, V2_SCHEMA_VERSION);
+                assert_eq!(supported, SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
@@ -6485,5 +6596,71 @@ mod tests {
             revision.rev_id = bad.to_string();
             assert!(store.store_document_revision(&revision).is_err());
         }
+    }
+
+    #[test]
+    fn a_document_is_deleted_with_its_revisions() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = StoreV2::open(dir.path().join("v2")).expect("open");
+        store
+            .commit_document_head("take", 1, 0, &sample_revision("take#h1", "take", 0, "raw"))
+            .expect("head");
+        assert!(store.delete_document("take").expect("delete"));
+        assert!(store.get_document("take").expect("get").is_none());
+        assert!(!store.delete_document("take").expect("second delete"));
+        // The cascade took the revision row: its id is free again.
+        store
+            .commit_document_head("other", 1, 0, &sample_revision("take#h1", "other", 0, "x"))
+            .expect("the rev id no longer belongs to the deleted document");
+    }
+
+    #[test]
+    fn insight_events_are_idempotent_and_die_with_their_capture() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(1600, 0));
+        let id = take.record.id.clone();
+        let payload = r#"{"type":"processing_recorded","job_id":"req-1"}"#;
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload)
+            .expect("record");
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload)
+            .expect("a byte-identical replay is a no-op");
+        store
+            .record_insight_event("proc-req-1", &id, "processing_recorded", "2026-09-24T10:00:00Z", "{}")
+            .expect_err("a different payload under a known id is a conflict");
+        assert_eq!(
+            store.insight_events_for(&id).expect("events"),
+            vec![("processing_recorded".to_string(), payload.to_string())]
+        );
+        store.delete_capture(&id).expect("delete");
+        assert!(store.insight_events_for(&id).expect("events").is_empty());
+        assert!(matches!(
+            store.record_insight_event("proc-req-2", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload),
+            Err(StoreV2Error::NotFound(_))
+        ), "a deleted take's event is NotFound, not a constraint error");
+    }
+
+    #[test]
+    fn a_version_2_database_gains_the_insight_table() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("v2");
+        {
+            let store = StoreV2::open(&root).expect("open");
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE insight_events;
+                     UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+                )
+                .expect("downgrade to the v2 layout");
+        }
+        let mut store = StoreV2::open(&root).expect("reopen upgrades");
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        let take = committed_take(&mut store, &ramp(160, 0));
+        store
+            .record_insight_event("e1", &take.record.id, "processing_recorded", "2026-09-24T10:00:00Z", "{}")
+            .expect("the table exists after the upgrade");
     }
 }

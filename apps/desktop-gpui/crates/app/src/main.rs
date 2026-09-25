@@ -4,6 +4,7 @@ mod app;
 mod assets;
 mod input;
 mod live_stream;
+mod processing;
 mod store;
 mod theme;
 mod upload;
