@@ -106,3 +106,32 @@ Findings:
   block types); the eval GGUF must inherit the q4e8 model's F32 1-D tensors
   (graph-fusion parity — measured no WER effect, kept anyway); a bf16 store
   costs ~0.4 % per weight, material for W8 candidates only.
+
+## #317 Phase 1 loop: int8/OpSDot is dead on PowerVR; the GEMV plateau is structural (2026-09-26)
+
+Branch `autoresearch/pixel-layout-2026-09-25`. Phone protocol learned the
+hard way: screen OFF (the compositor shares the GPU: ±100 % swings), order-
+balanced A/B rounds (the second side of a round runs +3-8 % warm), ±2.5 %
+same-window noise floor on identical binaries, absolute numbers drift per
+boot (68-77 ms/token) — only same-window deltas count. GPU driver health
+degrades after ~8 model loads per boot (vkWaitForFences VkResult 2, then
+startup hangs); reboot between sessions.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P1-1 | int8 activations × W8 lm_head GEMV via `dotPacked4x8EXT` cut the issue-bound op count ~2x | correct (micro rel err 1e-3, transcripts identical) but NO speed change: 42.5 vs 43.4 GB/s isolated at the real lm_head shape; end-to-end +0.65 % (noise). **Root cause: `OpSDot` costs ~2 issue slots on DXT — the same slot budget as the f32 `dot(vec4)` it replaces.** The #30 probe's "2x headroom" was MACs, not slots. |
+| P1-2 | packSnorm4x8 x-quant (1 op per 4 values) + 4-chain ILP unlock it | v2 flat (39.0 vs 38.7 GB/s), v3 (4 chains) WORSE (34.1). Idea stopped after three variants: **dead**. |
+| P1-3 | skinny-GEMM pricing for #311 | tiled GEMM W4 6144x2048: flat 7.1-7.3 ms at M=1,2,4,8,16 — the M rows are free, but M=1 already costs 6.8x a GEMV pass (1.04 ms). Batch verification must use a **dedicated M-token GEMV kernel** (weights unpacked once, M x-vectors: ~1.6-1.8x fewer ops/token at M=4-8, and the unpacks amortize exactly where the plateau hurts). That kernel is #311's enabling work. |
+| P1-4 | f16 `dot(f16vec4)` rate | 377 G f16-MAC/s = 4 MAC/issue-slot (2.6x the f32 FMA's MAC/slot) — the same per-slot efficiency as OpSDot. F16-layout GEMV measured 46.5 G w/s / 93 GB/s: memory has ≥2x headroom over the W4/W8 rates. No f16-dot GEMV rewrite either: the surrounding ops, not the dots, set the ~40 G w/s plateau all GEMV variants share (latency/occupancy class limit). |
+
+Baseline this boot: MOSS decode 73-77 ms/token (matches the #33-era
+per-operand mix; the historical 76.8 sits inside the boot-to-boot band).
+
+Conclusion for the layout question (#317): within affine weight layouts
+(W4/W8/F16 × group sizes × scale dtypes × nibble orders) the decode GEMV on
+this GPU is at a structural plateau — layout changes move quality and
+bytes, not decode speed. The speed lever that survives measurement is
+**token batching in a GEMV-shaped kernel** (M-token GEMV for speculative
+decoding, #311): the M rows are provably ~free at the op level, unlike the
+tiled GEMM. Quality side (Phase 0 table): symmetric-only W4, rebuild-from-
+source ≥ GGUF draw, g64 costs ~1 pt.
