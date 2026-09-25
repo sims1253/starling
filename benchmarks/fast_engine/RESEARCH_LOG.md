@@ -253,3 +253,18 @@ power-model figure: the fuel gauge estimates charge from voltage under
 load, and 6-thread CPU load sags it; the honest statement of the ratio is
 therefore "fast ≈ 2.4 mWh and 2.4–6× less energy than ggml depending on
 measurement method", with fast/ggml latency 5.4 vs 7.8 s.
+
+## #317 final certification (2026-09-26, tree `f4d49f8`)
+
+Scaffolding audit: everything from discarded experiments (W4_NOSCALE probe,
+F16 lm_head path, chunk refactor) confirmed reverted; kept-by-design
+diagnostics documented (`gemv_w4um` + its m2 micro, rows sweep, alt probe,
+token-dump hook, energy script). Final-binary phone check: fixture transcript
+identical (the decode-time gate on this run is thermal-band only — the phone
+ended the day hot at 45 % battery; 113 ms/token in this state vs the
+cool-window verified 69.2–69.7 ms/token, consistent with the documented
+thermal sensitivity). Certified deliverables: decode −1.9 % (rows=16,
+verified twice in cool windows), quality 7.31 % en / 7.83 % packed vs
+7.87 % baseline, energy 2.42 mWh/transcription, all five gates green,
+layout table + #311/#316/#318 notes delivered, #325 wedge guards landed
+from the driver investigation this session also produced.
