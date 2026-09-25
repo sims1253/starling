@@ -857,7 +857,9 @@ impl StarlingApp {
             draft_model,
             draft_terms,
             providers: processing::build_providers(&processing_settings),
-            draft_mode: processing_settings.mode.clone(),
+            // What actually runs: an unknown saved mode resolves to the
+            // default, and the dialog must show that one selected.
+            draft_mode: crate::processing::mode(&processing_settings.mode).id.clone(),
             processing_settings,
             processing: HashMap::new(),
             drafts: HashMap::new(),

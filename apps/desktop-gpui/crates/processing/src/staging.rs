@@ -330,11 +330,11 @@ impl Draft {
             }
         }
         if !head.is_empty() {
-            // A live partial never survives a restart: a persisted partial
-            // head resumes as raw text.
+            // A durable head is raw or processed text; anything else
+            // (a partial never survives a restart) resumes as raw.
             let head_kind = match head_kind {
-                RegionKind::Partial => RegionKind::Raw,
-                kind => kind,
+                RegionKind::Processed => RegionKind::Processed,
+                _ => RegionKind::Raw,
             };
             let mut region = Region::new(head_kind, head);
             if head_kind == RegionKind::Raw {

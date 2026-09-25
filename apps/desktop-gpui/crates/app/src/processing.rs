@@ -271,11 +271,12 @@ fn declared(settings: &ProcessingSettings) -> (Vec<ProviderDecl>, HashMap<&'stat
     if settings.api_model.trim().is_empty() {
         problems.insert(API_ROUTE, "Set the API model in settings.".to_string());
     } else {
-        // The same checks build_providers makes, so the preview agrees.
-        match validate_endpoint(&settings.api_endpoint, Locality::Remote)
-            .map_err(|err| format!("API endpoint: {err}"))
-            .and_then(|_| api_key(settings.api_key_env.trim()))
-        {
+        // The same checks in the same order as build_providers (key,
+        // then endpoint), so the preview reports the same first problem.
+        match api_key(settings.api_key_env.trim()).and_then(|_| {
+            validate_endpoint(&settings.api_endpoint, Locality::Remote)
+                .map_err(|err| format!("API endpoint: {err}"))
+        }) {
             Ok(_) => declarations.push(api_declaration(&settings.api_model)),
             Err(problem) => {
                 problems.insert(API_ROUTE, problem);
@@ -572,6 +573,13 @@ impl StarlingApp {
                 // A load a newer transcript overtook was withdrawn: its
                 // document may be for the old text.
                 let wanted = app.processing_loading.remove(&id);
+                if let (true, Err(err)) = (wanted, &loaded) {
+                    // Copy/Export fall back to raw without the document;
+                    // say it could not be read rather than guess silently.
+                    app.error = Some(format!(
+                        "Could not load this take's processing history ({err}); Copy and Export use the raw transcript."
+                    ));
+                }
                 if let (true, Ok(Some(doc))) = (wanted, loaded) {
                     if !app.processing.contains_key(&id) {
                         app.drafts
@@ -602,6 +610,14 @@ impl StarlingApp {
             match pipeline::plan(mode, &self.providers.registry) {
                 Plan::Nothing => return,
                 Plan::Blocked(block) => {
+                    // A job still running for the take (settings changed
+                    // under it) must not land over what the user is told.
+                    if let Some((request_id, cancel)) = self.processing_jobs.remove(&id) {
+                        cancel.cancel();
+                        if let Some(draft) = self.drafts.get_mut(&id) {
+                            draft.cancel(&request_id);
+                        }
+                    }
                     let message = blocked_text(block, mode, &self.providers.problems);
                     self.set_processing(&id, String::new(), ProcessingState::Blocked { message });
                     cx.notify();

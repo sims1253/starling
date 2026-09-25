@@ -375,8 +375,12 @@ impl Store {
     /// capture row.
     pub(crate) fn delete(&self, id: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
-        store.delete_capture(id).map_err(v2_err)?;
-        store.delete_document(id).map(drop).map_err(v2_err)
+        // The processing document first: it holds transcript-derived text
+        // and has no foreign key to the capture, so a failure between the
+        // two steps must leave a take without its document, never an
+        // orphaned document without its take.
+        store.delete_document(id).map_err(v2_err)?;
+        store.delete_capture(id).map_err(v2_err)
     }
 
     // ------------------------------------------------------------------
@@ -458,12 +462,23 @@ impl Store {
     /// `NotFound`: the result lands nowhere.
     pub(crate) fn save_proposal(&self, id: &str, proposal: &ProposalRow) -> Result<(), storage::StorageError> {
         let store = lock_v2(&self.0);
-        if store.get_capture(id).map_err(v2_err)?.is_none() || store.get_document(id).map_err(v2_err)?.is_none() {
+        let Some(document) = store.get_document(id).map_err(v2_err)?.filter(|_| {
+            store.get_capture(id).is_ok_and(|capture| capture.is_some())
+        }) else {
             return Err(storage::StorageError::NotFound(id.to_string()));
+        };
+        // A settled row (accepted or rejected) is never demoted: a job's
+        // late write of its proposal after the user already used or
+        // dismissed it lands nowhere.
+        let row = proposal.to_row(id);
+        let settled = document.revisions.iter().any(|stored| {
+            stored.rev_id == row.rev_id
+                && matches!(RowStatus::parse(&stored.status), Some(RowStatus::Accepted | RowStatus::Rejected))
+        });
+        if settled && !matches!(proposal.status, RowStatus::Accepted | RowStatus::Rejected) {
+            return Ok(());
         }
-        store
-            .store_document_revision(&proposal.to_row(id))
-            .map_err(v2_err)
+        store.store_document_revision(&row).map_err(v2_err)
     }
 
     /// Commits a new head revision (accepted processed text, or raw
@@ -1052,6 +1067,8 @@ mod tests {
         store
             .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted))
             .expect("accept");
+        // A job's late write of the same proposal never demotes it.
+        store.save_proposal(&id, &proposal("p1", 1, "So, hello there.")).expect("late write");
         let reopened = reopen_v2(&root);
         let doc = reopened.processing_doc(&id).expect("load").expect("doc");
         assert_eq!(doc.head_revision, 2);
