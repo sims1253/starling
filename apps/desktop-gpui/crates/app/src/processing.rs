@@ -888,7 +888,7 @@ impl StarlingApp {
         let Some(draft) = self.drafts.get_mut(id) else {
             // Proposals are shown only once the draft is loaded, so this
             // is not expected; say so instead of dropping the click.
-            self.error = Some("This take's history is still loading; try again.".to_string());
+            self.error = Some(self.missing_draft_message(id));
             cx.notify();
             return;
         };
@@ -946,7 +946,7 @@ impl StarlingApp {
             return;
         };
         let Some(draft) = self.drafts.get_mut(id) else {
-            self.error = Some("This take's history is still loading; try again.".to_string());
+            self.error = Some(self.missing_draft_message(id));
             cx.notify();
             return;
         };
@@ -1002,10 +1002,31 @@ impl StarlingApp {
             status: RowStatus::Rejected,
             ..row
         };
-        cx.background_spawn(async move {
-            let _ = store.save_proposal(&id, &rejected);
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move { store.save_proposal(&id, &rejected) })
+                .await;
+            if let Err(err) = saved {
+                if !matches!(err, storage::StorageError::NotFound(_)) {
+                    this.update(cx, |app, cx| {
+                        app.error = Some(format!("Could not store the change: {err}"));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
+    }
+
+    /// Why a proposal's buttons found no draft: still loading, or the
+    /// take changed under them (a new transcript replaced it).
+    fn missing_draft_message(&self, id: &str) -> String {
+        if self.processing_loading.contains(id) {
+            "This take's history is still loading; try again.".to_string()
+        } else {
+            "This take changed since the result was shown; run the mode again.".to_string()
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

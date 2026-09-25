@@ -1166,6 +1166,12 @@ impl StoreV2 {
         revision: &RevisionRow,
         also: &[RevisionRow],
     ) -> Result<(), StoreV2Error> {
+        if let Some(row) = also.iter().find(|row| row.doc_id != revision.doc_id) {
+            return Err(StoreV2Error::Invalid(format!(
+                "revision {} belongs to another document",
+                row.rev_id
+            )));
+        }
         let tx = self.conn.unchecked_transaction()?;
         // A refused write returns before `commit`: dropping `tx` rolls
         // the whole set back.
@@ -1177,12 +1183,6 @@ impl StoreV2 {
         }
         self.store_document_revision(revision)?;
         for row in also {
-            if row.doc_id != revision.doc_id {
-                return Err(StoreV2Error::Invalid(format!(
-                    "revision {} belongs to another document",
-                    row.rev_id
-                )));
-            }
             self.store_document_revision(row)?;
         }
         tx.commit()?;

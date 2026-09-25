@@ -1067,7 +1067,8 @@ impl StarlingApp {
             field.set_value(&terms, cx);
         });
         let processing = self.processing_settings.clone();
-        self.draft_mode = processing.mode.clone();
+        // The mode that actually runs (an unknown saved id is the default).
+        self.draft_mode = crate::processing::mode(&processing.mode).id.clone();
         self.draft_s1_endpoint.update(cx, |field, cx| {
             field.set_value(&processing.s1_endpoint, cx);
         });

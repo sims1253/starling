@@ -462,9 +462,10 @@ impl Store {
     /// `NotFound`: the result lands nowhere.
     pub(crate) fn save_proposal(&self, id: &str, proposal: &ProposalRow) -> Result<(), storage::StorageError> {
         let store = lock_v2(&self.0);
-        let Some(document) = store.get_document(id).map_err(v2_err)?.filter(|_| {
-            store.get_capture(id).is_ok_and(|capture| capture.is_some())
-        }) else {
+        if store.get_capture(id).map_err(v2_err)?.is_none() {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        let Some(document) = store.get_document(id).map_err(v2_err)? else {
             return Err(storage::StorageError::NotFound(id.to_string()));
         };
         // A settled row (accepted or rejected) is never demoted: a job's
