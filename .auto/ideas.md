@@ -11,11 +11,12 @@ Data-driven model of the phone (all measured this session):
   it (unsigned-dot on masked nibbles prices worse; f16 dots need f16 unpacks
   that cancel the win).
 
-- [0] **(#311) Skinny-GEMM pricing at M = 1,2,4,8,16** for speculative
-  decoding: if the GEMM at M=4 costs < 2.5x the GEMV, token verification
-  halves effective decode — the only lever left that beats the op floor.
-  Probe: time the existing gemm_w4 at M=1..16 (real llm shapes) on the
-  phone. Needs a tiny GEMM micro (Kernels::micro gemm mode) + phone session.
+- [0] ~~(#311) Skinny-GEMM pricing~~ DONE: tiled GEMM flat-but-6.8x-GEMV;
+  the **gemv_w4um kernel (P1-6, kept) delivers 1.76-2.11x per token at M=2**
+  — next step is the #311 integration itself: drafter (n-gram /
+  Parakeet-partial copy), a verify recording over gemv_w4um for the LLM
+  GEMVs + batched attention, accept/reject on host or in dec_next. Payoff at
+  acceptance >= 0.5: GEMV time per output token ~halves.
 - [1] **lm_head as F16** (+350 MB resident, memory-sensitive): measured
   6.7 vs 8.0 ms per token for the lm_head GEMV (93 GB/s path). ~-2%
   decode. Cheap to test (repack choice at load, no new kernel).

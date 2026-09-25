@@ -165,3 +165,6 @@ scheme + imatrix search: it measured strictly better than the GGUF/Q4_0 draw
 measured harmful (~+2 pt); group sizes >32 trade ~1 pt for ≤6 % bytes and
 no speed. The decode-speed lever is not the layout: it is token batching
 (M-token GEMV, #311).
+
+| P1-5 | W4U GEMV plateau comes from the second (scale) load stream | speed-only `W4_NOSCALE` probe: saturated lm_head shape unchanged (25.7 vs 26.5 GB/s) — the scale stream is free at saturation; small N=6144 +28% (unsaturated = load-latency dominated). Scale-interleave layout (#5) not supported. discard |
+| P1-6 | **M-token GEMV**: share the weight unpacks across M tokens — per 32 weights at M=2, ~12 ops/token vs 20 at M=1 | **confirmed, kept (`bb7db62`)**: `gemv_w4um` (GEMV_M) processes two x-vectors per weight pass. Phone per-token rate **1.76–2.11× M=1** (N=151936: 69.7 vs 34.0 G w/s; N=6144: 34.2 vs 16.2; N=12288: 48.7 vs 27.7), second token nearly free; both tokens check rel err ~1e-3; end-to-end unchanged (+0.25 %, noise) with identical transcripts — the GemvArgs push-constant extension breaks nothing. Desktop: second token literally free (bandwidth-bound). This is the enabling kernel for #311 batch verification; at acceptance ≥ 0.5 the GEMV time per output token halves. **keep** |
