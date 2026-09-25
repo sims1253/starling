@@ -305,6 +305,13 @@ impl Draft {
     /// the contract's crash rule: live partials and requests in flight
     /// are not durable and do not come back; a stored proposal is judged
     /// against the resumed revision like any other.
+    ///
+    /// A raw head is linked to the attempt of the highest segment (the
+    /// latest such attempt when a segment has several), whatever order
+    /// `attempts` come in; with no attempts it carries no link. Each
+    /// stored proposal's request comes back as a settled record with its
+    /// id and base revision only: its input, instruction and `retry_of`
+    /// are not persisted, so a resumed record's are empty.
     pub fn resume(
         draft_id: impl Into<String>,
         capture_id: impl Into<String>,
@@ -323,9 +330,9 @@ impl Draft {
         if !head.is_empty() {
             let mut region = Region::new(head_kind, head);
             if head_kind == RegionKind::Raw {
-                if let Some(last) = attempts.last() {
-                    region.segment = Some(last.segment);
-                    region.attempt_id = Some(last.attempt_id.clone());
+                if let Some(latest) = attempts.iter().max_by_key(|attempt| attempt.segment) {
+                    region.segment = Some(latest.segment);
+                    region.attempt_id = Some(latest.attempt_id.clone());
                 }
             }
             draft.regions.push(region);

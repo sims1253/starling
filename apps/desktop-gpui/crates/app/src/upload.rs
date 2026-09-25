@@ -750,6 +750,10 @@ impl StarlingApp {
             let transcribed = job_failure.is_none() && !session_gone;
             this.update(cx, |app, cx| {
                 app.active_ids.remove(&id);
+                if !transcribed {
+                    // No processing will run for this take.
+                    app.stop_instants.remove(&id);
+                }
                 cx.notify();
             })
             .ok();

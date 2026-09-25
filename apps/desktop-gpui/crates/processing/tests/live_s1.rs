@@ -100,7 +100,10 @@ fn s1_mini_cleans_a_take_offline_as_a_proposal() {
     assert_eq!(result.status, ResultStatus::Completed, "{result:?}");
     let text = result.text.clone().unwrap();
     assert!(!text.is_empty());
-    assert!(!text.contains("um "), "fillers removed: {text}");
+    let has_filler = text
+        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .any(|word| word.eq_ignore_ascii_case("um"));
+    assert!(!has_filler, "fillers removed: {text}");
     assert_eq!(
         draft.result("live-1", ResultKind::Completed, Some(&text)),
         Outcome::Current
@@ -110,7 +113,7 @@ fn s1_mini_cleans_a_take_offline_as_a_proposal() {
     assert_eq!(draft.raw_text(), raw);
 
     let filler = pipeline::run(
-        &request("live-2", "um uh hmm", 1),
+        &request("live-2", "um uh hmm", draft.revision()),
         Some(&provider),
         Clock::default(),
         &mut |_| {},

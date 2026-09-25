@@ -354,6 +354,8 @@ pub struct StarlingApp {
     pub(crate) drafts: HashMap<String, Draft>,
     pub(crate) processing_jobs: HashMap<String, (String, CancelToken)>,
     pub(crate) stop_instants: HashMap<String, Instant>,
+    /// Takes whose processing state is being loaded.
+    pub(crate) processing_loading: HashSet<String>,
     /// The settings dialog's processing drafts (committed on save).
     pub draft_mode: String,
     pub draft_s1_endpoint: Entity<TextField>,
@@ -820,6 +822,9 @@ impl StarlingApp {
         let draft_model = cx.new(|cx| TextField::new("parakeet", &model, cx));
         let draft_terms = cx.new(|cx| TextField::new("auth, Starling, GGUF", &terms_input, cx));
         let processing_settings = settings.processing.clone();
+        // A saved mode this build no longer ships falls back to the
+        // default mode; say so rather than change behavior silently.
+        let mode_note = crate::processing::unknown_mode_note(&processing_settings.mode);
         let draft_s1_endpoint = cx.new(|cx| {
             TextField::new("http://127.0.0.1:8182", &processing_settings.s1_endpoint, cx)
         });
@@ -833,7 +838,7 @@ impl StarlingApp {
         });
 
         Self {
-            error: store_error.clone(),
+            error: store_error.clone().or(mode_note),
             capture_warning: None,
             export_notice: None,
             store,
@@ -855,6 +860,7 @@ impl StarlingApp {
             drafts: HashMap::new(),
             processing_jobs: HashMap::new(),
             stop_instants: HashMap::new(),
+            processing_loading: HashSet::new(),
             draft_s1_endpoint,
             draft_api_endpoint,
             draft_api_model,

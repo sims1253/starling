@@ -32,7 +32,7 @@
 //! # Schema
 //!
 //! The §4 "schema direction" tables ([`SCHEMA_SQL`], one place, version
-//! [`V2_SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
+//! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `tombstones`, `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
@@ -46,7 +46,7 @@
 //! object without dropping keys.
 //!
 //! Forward compatibility (§4): a database whose `meta.schema_version` is
-//! **higher** than [`V2_SCHEMA_VERSION`] is refused at open
+//! **higher** than [`SCHEMA_VERSION`] is refused at open
 //! ([`StoreV2Error::SchemaTooNew`]) — this build will neither read nor
 //! write a future format; a lower version is upgraded by applying
 //! [`SCHEMA_SQL`] (idempotent `CREATE TABLE IF NOT EXISTS`).
@@ -102,7 +102,7 @@ use crate::storage::{is_safe_path_component, now_iso};
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308).
-pub const V2_SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -567,15 +567,15 @@ impl StoreV2 {
                 tx.execute_batch(SCHEMA_SQL)?;
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
-                    params![V2_SCHEMA_VERSION.to_string()],
+                    params![SCHEMA_VERSION.to_string()],
                 )?;
                 tx.commit()?;
             }
-            Some(found) if found == V2_SCHEMA_VERSION => {
+            Some(found) if found == SCHEMA_VERSION => {
                 // Same version: schema is already in place; verify the
                 // version row is sane and touch nothing else.
             }
-            Some(found) if found < V2_SCHEMA_VERSION => {
+            Some(found) if found < SCHEMA_VERSION => {
                 // Lower version: apply the (idempotent) schema, add any
                 // columns introduced since `found` (`CREATE TABLE IF NOT
                 // EXISTS` cannot extend an existing table), and bump.
@@ -603,7 +603,7 @@ impl StoreV2 {
                 tx.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![V2_SCHEMA_VERSION.to_string()],
+                    params![SCHEMA_VERSION.to_string()],
                 )?;
                 tx.commit()?;
             }
@@ -613,7 +613,7 @@ impl StoreV2 {
                 // reader). Nothing was mutated.
                 return Err(StoreV2Error::SchemaTooNew {
                     found,
-                    supported: V2_SCHEMA_VERSION,
+                    supported: SCHEMA_VERSION,
                 });
             }
         }
@@ -1166,7 +1166,9 @@ impl StoreV2 {
         Ok(())
     }
 
-    /// Deletes one document and (by cascade) its revisions. `Ok(false)`
+    /// Deletes one document and, by cascade, its revisions and their
+    /// delivery rows (`revisions` and `deliveries` both declare ON DELETE
+    /// CASCADE), so the document's delivery history goes too. `Ok(false)`
     /// when there was nothing to delete. Documents carry no foreign key
     /// to a capture, so an embedder that keys a document by capture id
     /// deletes it alongside the capture.
@@ -1182,7 +1184,10 @@ impl StoreV2 {
     /// for a capture. Idempotent on `event_id` like the contract says: a
     /// byte-identical replay is a no-op, a different payload under a
     /// known id is an error, never an overwrite. The row cascades away
-    /// with its capture, so deleting a take removes its events.
+    /// with its capture, so deleting a take removes its events; an event
+    /// for a capture that does not exist (deleted meanwhile) is
+    /// `NotFound`. The check and the insert are one statement, so the
+    /// contract holds without any lock around the store.
     pub fn record_insight_event(
         &self,
         event_id: &str,
@@ -1191,27 +1196,29 @@ impl StoreV2 {
         occurred_at: &str,
         payload_json: &str,
     ) -> Result<(), StoreV2Error> {
-        let known: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT payload_json FROM insight_events WHERE event_id = ?1",
-                params![event_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match known {
-            Some(payload) if payload == payload_json => Ok(()),
-            Some(_) => Err(StoreV2Error::Invalid(format!(
+        if self.get_capture(capture_id)?.is_none() {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        let inserted = self.conn.execute(
+            "INSERT INTO insight_events(event_id, capture_id, type, occurred_at, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(event_id) DO NOTHING",
+            params![event_id, capture_id, kind, occurred_at, payload_json],
+        )?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        let known: String = self.conn.query_row(
+            "SELECT payload_json FROM insight_events WHERE event_id = ?1",
+            params![event_id],
+            |row| row.get(0),
+        )?;
+        if known == payload_json {
+            Ok(())
+        } else {
+            Err(StoreV2Error::Invalid(format!(
                 "insight event {event_id} already recorded with a different payload"
-            ))),
-            None => {
-                self.conn.execute(
-                    "INSERT INTO insight_events(event_id, capture_id, type, occurred_at, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![event_id, capture_id, kind, occurred_at, payload_json],
-                )?;
-                Ok(())
-            }
+            )))
         }
     }
 
@@ -3857,14 +3864,14 @@ mod tests {
     fn schema_initializes_and_reports_its_version() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
 
         committed_take(&mut store, &ramp(50, 0));
 
         // Reopening a same-version database neither upgrades nor refuses.
         drop(store);
         let store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         assert_eq!(
             store
                 .list_records(0, 10)
@@ -3919,7 +3926,7 @@ mod tests {
         // pre-upgrade attempt reads back with NULL created_utc (readers
         // fall back to the capture's creation time).
         let mut store = store_in(&dir);
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let attempts = store.attempts_for(&id).expect("attempts");
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].created_utc, None);
@@ -3983,7 +3990,7 @@ mod tests {
         match StoreV2::open(dir.path().join("v2")) {
             Err(StoreV2Error::SchemaTooNew { found, supported }) => {
                 assert_eq!(found, 99);
-                assert_eq!(supported, V2_SCHEMA_VERSION);
+                assert_eq!(supported, SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
@@ -6598,6 +6605,10 @@ mod tests {
         );
         store.delete_capture(&id).expect("delete");
         assert!(store.insight_events_for(&id).expect("events").is_empty());
+        assert!(matches!(
+            store.record_insight_event("proc-req-2", &id, "processing_recorded", "2026-09-24T10:00:00Z", payload),
+            Err(StoreV2Error::NotFound(_))
+        ), "a deleted take's event is NotFound, not a constraint error");
     }
 
     #[test]
@@ -6615,7 +6626,7 @@ mod tests {
                 .expect("downgrade to the v2 layout");
         }
         let mut store = StoreV2::open(&root).expect("reopen upgrades");
-        assert_eq!(store.schema_version().expect("version"), V2_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let take = committed_take(&mut store, &ramp(160, 0));
         store
             .record_insight_event("e1", &take.record.id, "processing_recorded", "2026-09-24T10:00:00Z", "{}")

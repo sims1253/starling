@@ -46,7 +46,7 @@ use starling_processing::staging::{
 };
 
 use crate::app::StarlingApp;
-use crate::store::{ProcessingDoc, ProposalRow};
+use crate::store::{ProcessingDoc, ProposalRow, RowStatus};
 
 const MODES_JSON: &str = include_str!("../modes/desktop-profiles.json");
 
@@ -70,6 +70,18 @@ pub(crate) fn mode(id: &str) -> &'static ModeEntry {
         .profile(id)
         .or_else(|| modes.profile(&modes.default_profile))
         .expect("the default mode exists")
+}
+
+/// The notice for a saved mode id no built-in mode has (it runs as the
+/// default mode instead).
+pub(crate) fn unknown_mode_note(id: &str) -> Option<String> {
+    let modes = modes();
+    modes.profile(id).is_none().then(|| {
+        format!(
+            "The processing mode \"{id}\" no longer exists; using \"{}\". Pick a mode in Settings.",
+            modes.default_profile
+        )
+    })
 }
 
 pub(crate) fn s1_declaration() -> ProviderDecl {
@@ -137,19 +149,50 @@ pub(crate) fn build_providers(settings: &ProcessingSettings) -> Providers {
         problems.insert(API_ROUTE, "Set the API model in settings.".to_string());
     } else {
         let mut config = ChatConfig::new(settings.api_endpoint.trim());
-        config.api_key = std::env::var(settings.api_key_env.trim())
-            .ok()
-            .filter(|key| !key.is_empty());
-        match OpenAiProvider::new(api_declaration(&settings.api_model), config) {
-            Ok(provider) => built.push(Arc::new(provider)),
-            Err(err) => {
-                problems.insert(API_ROUTE, format!("API endpoint: {err}"));
+        match api_key(settings.api_key_env.trim()) {
+            Ok(key) => {
+                config.api_key = key;
+                match OpenAiProvider::new(api_declaration(&settings.api_model), config) {
+                    Ok(provider) => built.push(Arc::new(provider)),
+                    Err(err) => {
+                        problems.insert(API_ROUTE, format!("API endpoint: {err}"));
+                    }
+                }
+            }
+            Err(problem) => {
+                problems.insert(API_ROUTE, problem);
             }
         }
     }
     Providers {
         registry: Registry::new(built),
         problems,
+    }
+}
+
+/// The API key from the environment variable the settings name. An unset
+/// or empty variable is no key (keyless local gateways need none); a name
+/// that cannot be a variable, or a value that is not text, is a problem to
+/// show rather than a request that fails later with a vague auth error.
+fn api_key(name: &str) -> Result<Option<String>, String> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let valid = name
+        .chars()
+        .enumerate()
+        .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()));
+    if !valid {
+        return Err(format!(
+            "API key: \"{name}\" is not an environment variable name."
+        ));
+    }
+    match std::env::var(name) {
+        Ok(key) => Ok(Some(key).filter(|key| !key.is_empty())),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("API key: {name} does not hold valid text."))
+        }
     }
 }
 
@@ -309,13 +352,13 @@ impl TakeProcessing {
             .proposals
             .iter()
             .rev()
-            .find(|row| row.status != "superseded");
+            .find(|row| row.status != RowStatus::Superseded);
         let state = match latest {
-            Some(row) if row.status == "proposed" => ProcessingState::Proposal {
+            Some(row) if row.status == RowStatus::Proposed => ProcessingState::Proposal {
                 row: row.clone(),
                 current: row.base_revision == doc.head_revision,
             },
-            Some(row) if row.status == "failed" => ProcessingState::Failed {
+            Some(row) if row.status == RowStatus::Failed => ProcessingState::Failed {
                 message: row.failure.clone().unwrap_or_default(),
             },
             _ => ProcessingState::Idle,
@@ -334,12 +377,12 @@ fn draft_from_doc(id: &str, doc: &ProcessingDoc) -> Draft {
         .proposals
         .iter()
         .filter_map(|row| {
-            let status = match row.status.as_str() {
-                "proposed" => ProposalStatus::Current,
-                "accepted" => ProposalStatus::Accepted,
-                "rejected" => ProposalStatus::Rejected,
-                "superseded" => ProposalStatus::Superseded,
-                _ => return None,
+            let status = match row.status {
+                RowStatus::Proposed => ProposalStatus::Current,
+                RowStatus::Accepted => ProposalStatus::Accepted,
+                RowStatus::Rejected => ProposalStatus::Rejected,
+                RowStatus::Superseded => ProposalStatus::Superseded,
+                RowStatus::Failed => return None,
             };
             Some(StoredProposal {
                 request_id: row.request_id.clone(),
@@ -431,16 +474,16 @@ fn stored_row(
     message: &str,
 ) -> Option<ProposalRow> {
     let status = match (result.status, outcome) {
-        (ResultStatus::Completed, Outcome::Current | Outcome::Stale) => "proposed",
-        (ResultStatus::Completed, Outcome::Superseded) => "superseded",
-        (ResultStatus::Failed, Outcome::Failed) => "failed",
+        (ResultStatus::Completed, Outcome::Current | Outcome::Stale) => RowStatus::Proposed,
+        (ResultStatus::Completed, Outcome::Superseded) => RowStatus::Superseded,
+        (ResultStatus::Failed, Outcome::Failed) => RowStatus::Failed,
         _ => return None,
     };
     Some(ProposalRow {
         request_id: request.request_id.clone(),
         base_revision: request.base_revision,
         text: result.text.clone().unwrap_or_default(),
-        status: status.to_string(),
+        status,
         label: label.to_string(),
         failure: result.failure.as_ref().map(|_| message.to_string()),
         stop_to_result_ms: result.timing.stop_to_result_ms,
@@ -482,20 +525,32 @@ impl StarlingApp {
     }
 
     /// A take just got its transcript: the active mode processes it.
+    /// Whatever was used or proposed for an earlier transcript of the take
+    /// (a re-transcription) no longer applies, whether or not the mode
+    /// processes the new one.
     pub(crate) fn after_transcription(&mut self, id: String, cx: &mut Context<Self>) {
+        self.processing.remove(&id);
+        self.drafts.remove(&id);
+        self.processing_loading.remove(&id);
         if self.mode_processes() {
             self.process_take(id, cx);
         } else {
+            if let Some((_, cancel)) = self.processing_jobs.remove(&id) {
+                cancel.cancel();
+            }
             self.stop_instants.remove(&id);
+            cx.notify();
         }
     }
 
-    /// Loads a take's stored processing state (on selection).
+    /// Loads a take's stored processing state (on selection). While it
+    /// loads, [`Self::head_text`] does not guess.
     pub(crate) fn load_processing(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.processing.contains_key(&id) {
+        if self.processing.contains_key(&id) || !self.processing_loading.insert(id.clone()) {
             return;
         }
         let Some(store) = self.store.clone() else {
+            self.processing_loading.remove(&id);
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -504,19 +559,21 @@ impl StarlingApp {
                 cx.background_spawn(async move { store.processing_doc(&id) })
                     .await
             };
-            if let Ok(Some(doc)) = loaded {
-                this.update(cx, |app, cx| {
-                    if app.processing.contains_key(&id) {
-                        return;
+            this.update(cx, |app, cx| {
+                // A load a newer transcript overtook was withdrawn: its
+                // document may be for the old text.
+                let wanted = app.processing_loading.remove(&id);
+                if let (true, Ok(Some(doc))) = (wanted, loaded) {
+                    if !app.processing.contains_key(&id) {
+                        app.drafts
+                            .entry(id.clone())
+                            .or_insert_with(|| draft_from_doc(&id, &doc));
+                        app.processing.insert(id, TakeProcessing::from_doc(&doc));
                     }
-                    app.drafts
-                        .entry(id.clone())
-                        .or_insert_with(|| draft_from_doc(&id, &doc));
-                    app.processing.insert(id, TakeProcessing::from_doc(&doc));
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -529,6 +586,9 @@ impl StarlingApp {
         };
         let mode = self.active_mode();
         let settings = self.processing_settings.clone();
+        // Taken whatever the plan: a take that is not processed must not
+        // keep its stop instant.
+        let stopped_at: Option<Instant> = self.stop_instants.remove(&id);
         let (decl, provider, fields): (ProviderDecl, Option<Arc<dyn Provider>>, Vec<ContextField>) =
             match pipeline::plan(mode, &self.providers.registry) {
                 Plan::Nothing => return,
@@ -556,7 +616,6 @@ impl StarlingApp {
                 cancel.cancel();
                 request_id
             });
-        let stopped_at: Option<Instant> = self.stop_instants.remove(&id);
         let request_id = new_request_id();
         let cancel = CancelToken::new();
         self.processing_jobs
@@ -685,7 +744,11 @@ impl StarlingApp {
                         app.processing_jobs.remove(&id);
                     }
                     let message = failure_message(&result, &label, &settings);
-                    let row = stored_row(&request, &result, outcome, &label, &message);
+                    // A failure only matters for the job that still owns
+                    // the take; a superseded job's failure is not stored,
+                    // or a restart could resurrect it over a newer result.
+                    let row = stored_row(&request, &result, outcome, &label, &message)
+                        .filter(|row| owned || row.status != RowStatus::Failed);
                     match (&row, outcome) {
                         (Some(row), Outcome::Current | Outcome::Stale) => {
                             app.set_processing(
@@ -779,6 +842,7 @@ impl StarlingApp {
             draft.delete_draft();
         }
         self.processing.remove(id);
+        self.processing_loading.remove(id);
         self.stop_instants.remove(id);
     }
 
@@ -797,6 +861,10 @@ impl StarlingApp {
             return;
         };
         let Some(draft) = self.drafts.get_mut(id) else {
+            // Proposals are shown only once the draft is loaded, so this
+            // is not expected; say so instead of dropping the click.
+            self.error = Some("This take's history is still loading; try again.".to_string());
+            cx.notify();
             return;
         };
         match draft.accept(&row.request_id, force) {
@@ -823,7 +891,7 @@ impl StarlingApp {
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
         let accepted = ProposalRow {
-            status: "accepted".to_string(),
+            status: RowStatus::Accepted,
             ..row
         };
         self.processing.insert(
@@ -853,6 +921,8 @@ impl StarlingApp {
             return;
         };
         let Some(draft) = self.drafts.get_mut(id) else {
+            self.error = Some("This take's history is still loading; try again.".to_string());
+            cx.notify();
             return;
         };
         if draft.revert_raw() != Outcome::Applied {
@@ -904,7 +974,7 @@ impl StarlingApp {
         cx.notify();
         let id = id.to_string();
         let rejected = ProposalRow {
-            status: "rejected".to_string(),
+            status: RowStatus::Rejected,
             ..row
         };
         cx.background_spawn(async move {
@@ -952,8 +1022,13 @@ impl StarlingApp {
     }
 
     /// The text Copy/Export use: the used processed text when the take's
-    /// head is processed, the raw transcript otherwise.
+    /// head is processed, the raw transcript otherwise. `None` while the
+    /// take's processing state is still loading: the head is not known
+    /// yet, and the raw text may not be it.
     pub(crate) fn head_text(&self, id: &str) -> Option<String> {
+        if self.processing_loading.contains(id) {
+            return None;
+        }
         self.processing
             .get(id)
             .and_then(|take| take.processed_head.clone())
@@ -977,6 +1052,27 @@ mod tests {
             api_model: "gpt-4.1-mini".to_string(),
             ..ProcessingSettings::default()
         }
+    }
+
+    #[test]
+    fn an_unknown_saved_mode_is_announced() {
+        assert!(unknown_mode_note("verbatim").is_none());
+        let note = unknown_mode_note("retired-mode").expect("a note");
+        assert!(note.contains("retired-mode") && note.contains("verbatim"), "{note}");
+    }
+
+    #[test]
+    fn a_bad_key_variable_name_is_a_problem_not_a_missing_key() {
+        assert_eq!(api_key(""), Ok(None));
+        assert_eq!(api_key("STARLING_TEST_SURELY_UNSET_KEY"), Ok(None));
+        assert!(api_key("sk-live-abc").is_err(), "a pasted key is not a name");
+        assert!(api_key("1KEY").is_err());
+        let problems = build_providers(&ProcessingSettings {
+            api_key_env: "not a name".to_string(),
+            ..settings()
+        })
+        .problems;
+        assert!(problems[API_ROUTE].contains("environment variable"), "{problems:?}");
     }
 
     #[test]
@@ -1045,7 +1141,7 @@ mod tests {
             request_id: "p1".to_string(),
             base_revision: 1,
             text: "Clean.".to_string(),
-            status: "proposed".to_string(),
+            status: RowStatus::Proposed,
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(900.0),
@@ -1079,7 +1175,7 @@ mod tests {
                 request_id: "late".to_string(),
                 base_revision: 1,
                 text: "Late.".to_string(),
-                status: "proposed".to_string(),
+                status: RowStatus::Proposed,
                 label: String::new(),
                 failure: None,
                 stop_to_result_ms: None,

@@ -40,12 +40,47 @@ pub(crate) struct ProposalRow {
     pub request_id: String,
     pub base_revision: u64,
     pub text: String,
-    /// `proposed`, `accepted`, `rejected`, `superseded` or `failed`.
-    pub status: String,
+    pub status: RowStatus,
     /// Where the text went, for the drawer ("S1-mini · this computer").
     pub label: String,
     pub failure: Option<String>,
     pub stop_to_result_ms: Option<f64>,
+}
+
+/// The disposition of a stored processing result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RowStatus {
+    Proposed,
+    Accepted,
+    Rejected,
+    Superseded,
+    Failed,
+}
+
+impl RowStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RowStatus::Proposed => "proposed",
+            RowStatus::Accepted => "accepted",
+            RowStatus::Rejected => "rejected",
+            RowStatus::Superseded => "superseded",
+            RowStatus::Failed => "failed",
+        }
+    }
+
+    /// `None` for a value this build does not know; such a row is skipped.
+    pub(crate) fn parse(value: &str) -> Option<RowStatus> {
+        [
+            RowStatus::Proposed,
+            RowStatus::Accepted,
+            RowStatus::Rejected,
+            RowStatus::Superseded,
+            RowStatus::Failed,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == value)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -90,7 +125,7 @@ impl ProposalRow {
             base_revision: Some(self.base_revision),
             sources_json: serde_json::to_string(&serde_json::json!({ "request_id": self.request_id })).ok(),
             text: self.text.clone(),
-            status: self.status.clone(),
+            status: self.status.as_str().to_string(),
             provenance: serde_json::to_string(&ProposalProvenance {
                 label: self.label.clone(),
                 failure: self.failure.clone(),
@@ -122,7 +157,7 @@ impl ProcessingDoc {
                     request_id,
                     base_revision: row.base_revision?,
                     text: row.text.clone(),
-                    status: row.status.clone(),
+                    status: RowStatus::parse(&row.status)?,
                     label: provenance.label,
                     failure: provenance.failure,
                     stop_to_result_ms: provenance.stop_to_result_ms,
@@ -363,11 +398,23 @@ impl Store {
             .map(|attempt| (attempt.id, attempt.text)))
     }
 
-    /// The take's processing document, if processing ever ran on it.
+    /// The take's processing document, if processing ran on its current
+    /// raw transcript. A document built on an earlier transcript (the take
+    /// was re-transcribed since) is stale and reads as none: what was used
+    /// or proposed for the old text does not apply to the new one.
     pub(crate) fn processing_doc(&self, id: &str) -> Result<Option<ProcessingDoc>, storage::StorageError> {
         let store = lock_v2(&self.0);
+        let latest = store
+            .attempts_for(id)
+            .map_err(v2_err)?
+            .into_iter()
+            .rev()
+            .find(AttemptRecord::is_final_transcript)
+            .map(|attempt| attempt.id);
         let document = store.get_document(id).map_err(v2_err)?;
-        Ok(document.and_then(|document| ProcessingDoc::from_row(id, document)))
+        Ok(document
+            .and_then(|document| ProcessingDoc::from_row(id, document))
+            .filter(|doc| latest.as_deref() == Some(doc.raw_attempt_id.as_str())))
     }
 
     /// The processing document for the take's current raw transcript:
@@ -446,7 +493,9 @@ impl Store {
         Ok(())
     }
 
-    /// Records one insight event for the take (idempotent on its id).
+    /// Records one insight event for the take (idempotent on its id). A
+    /// take deleted meanwhile is `NotFound`, like the other processing
+    /// writes: the event lands nowhere.
     pub(crate) fn record_insight(
         &self,
         id: &str,
@@ -958,11 +1007,31 @@ mod tests {
             request_id: request_id.to_string(),
             base_revision: base,
             text: text.to_string(),
-            status: "proposed".to_string(),
+            status: RowStatus::Proposed,
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(1234.5),
         }
+    }
+
+    /// A re-transcribed take's old processing document is stale: it
+    /// reads as none, so an earlier processed head never comes back over
+    /// the new transcript (not even after a restart).
+    #[test]
+    fn a_retranscribed_take_has_no_processing_document() {
+        let root = scratch_dir("processing-retranscribed");
+        let store = reopen_v2(&root);
+        let id = transcribed(&store, "um first take");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        store
+            .commit_processing_head(&id, 2, "First take.", false, &attempt, None)
+            .expect("accept");
+        assert!(store.processing_doc(&id).expect("load").is_some());
+        store.mark_attempt(&id, "starling:parakeet").expect("retry");
+        store.save_transcript(&id, transcript("second take")).expect("transcript");
+        assert_eq!(store.processing_doc(&id).expect("load"), None);
+        assert_eq!(reopen_v2(&root).processing_doc(&id).expect("load"), None);
     }
 
     /// #295: a take's processing document survives a restart with its
@@ -981,7 +1050,7 @@ mod tests {
         let again = store.start_processing_doc(&id, &attempt, &raw).expect("again");
         assert_eq!(again.proposals.len(), 1);
 
-        let accepted = ProposalRow { status: "accepted".to_string(), ..proposal("p1", 1, "So, hello there.") };
+        let accepted = ProposalRow { status: RowStatus::Accepted, ..proposal("p1", 1, "So, hello there.") };
         store
             .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted))
             .expect("accept");
