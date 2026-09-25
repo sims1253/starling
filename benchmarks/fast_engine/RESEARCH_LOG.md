@@ -301,3 +301,13 @@ everything after row 1 — dequant must be per row (cost an hour to find;
 the failure mode is rel-rms ≈ 1.4, i.e. looks like a broken quantizer, not
 a framing bug). IQ4_KT also needs the imatrix or the trellis clustering
 degenerates ("cluster N has no points").
+
+Addendum (brief item 7, second half): the *integer-trellis GEMV pricing
+probe* on PowerVR is closed without running it — it is analytically
+superseded by the op-issue-parity measurements (P1-1..P1-3: integer dots
+cost the same issue slots as f32 dots) combined with the quality datapoint
+above (trellis codes cost more decode work per weight than affine at any
+bpw). A trellis GEMV on this GPU pays MORE issue slots than the affine
+kernel for the 3–7 % rel-rms edge at 4 bpw — strictly worse on the measured
+bottleneck; the probe could only confirm the sign, and the device is
+#325-blocked regardless. Item closed.
