@@ -215,3 +215,21 @@ actionable lever ≥1 % remains** — the loop's closure stands with the
 accounting complete. Also fixed: plain GEMV micro runs crashed after the
 rows-sweep refactor (dangling `rec_out`) — latent since P1-8, caught by
 this probe.
+
+## #317 addendum 2: G4 verified; phone offline (2026-09-26)
+
+G4 (desktop RADV ≤ 10 % regression), the last acceptance item not formally
+logged this session — verified against a **fresh clean-master build**
+(4276631 + pinned ggml): MOSS short 1666 vs 1634 ms (+1.9 %), Parakeet
+medium 482.7 vs 479.7 ms (+0.6 %). Note: the main checkout's
+`build-bench-vk` binary is **not** a valid baseline — its build directory
+carries experimental artifacts (e.g. `coop_probe.spv`, not in master's
+shader list) and measured 1864 ms for the same workload.
+
+The energy-per-transcription deliverable remains blocked: the phone left
+the network (no `_adb-tls-connect` mDNS, no ICMP) and stayed offline
+through this iteration. Protocol queued in the session log — reconnect,
+then one bench invocation per side (`--runs N`, one model load each) with
+`dumpsys battery` charge-counter deltas plus an equal-duration idle
+control, reporting the gauge number with the batterystats model only as a
+cross-check.
