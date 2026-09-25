@@ -76,12 +76,18 @@ import sys
 runs, v = int(sys.argv[1]), float(sys.argv[2])
 pts = {l.split()[0]: (int(l.split()[1]), int(l.split()[2])) for l in open("/tmp/energy_points.txt")}
 fast, idle, ggml = pts["fast"][0], pts["idle"][0], pts["ggml"][0]
+# The idle control is duration-matched to the fast window only; scale its
+# drain to each window's duration before subtracting (raw subtraction
+# over-subtracts from any longer-or-shorter window).
+idle_rate = idle / max(pts["idle"][1], 1)          # µAh per second
+idle_at = lambda label: idle_rate * pts[label][1]  # expected idle drain over that window
 mwh = lambda uah: uah * v / 1000.0
-print(f"gauge deltas (uAh): fast={fast} idle={idle} ggml={ggml}")
 if idle:
-    print(f"fast:  {mwh(fast - idle):.2f} mWh / {runs} = {(fast-idle)*v/1000/runs:.3f} mWh/transcription (idle-subtracted)")
-    print(f"ggml:  {mwh(ggml - idle):.2f} mWh / {runs} = {(ggml-idle)*v/1000/runs:.3f} mWh/transcription (idle-subtracted)")
-    print(f"ratio fast/ggml: {(fast-idle)/max(ggml-idle,1):.2f}x")
+    fi, gi = idle_at("fast"), idle_at("ggml")
+    print(f"gauge deltas (uAh): fast={fast} idle={idle} ({pts['idle'][1]}s) ggml={ggml}; idle scaled per window: fast {fi:.0f} ggml {gi:.0f}")
+    print(f"fast:  {mwh(fast - fi):.2f} mWh / {runs} = {(fast-fi)*v/1000/runs:.3f} mWh/transcription (idle-subtracted, duration-scaled)")
+    print(f"ggml:  {mwh(ggml - gi):.2f} mWh / {runs} = {(ggml-gi)*v/1000/runs:.3f} mWh/transcription (idle-subtracted, duration-scaled)")
+    print(f"ratio fast/ggml: {(fast-fi)/max(ggml-gi,1):.2f}x")
 print("method: battery charge counter (coulomb gauge), idle-subtracted, nominal voltage")
 print("assumes idle drain ~ constant; not a rail measurement")
 EOF

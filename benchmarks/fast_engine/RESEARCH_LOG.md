@@ -250,11 +250,13 @@ not a rail measurement**):
 
 The fast-engine number matches the original campaign's 2.2 mWh (#12,
 batterystats model) — two independent methods agreeing on ~2.2–2.4 mWh is
-the trustworthy part. The ggml gauge number (15.3) is 3× the old
-power-model figure: the fuel gauge estimates charge from voltage under
-load, and 6-thread CPU load sags it; the honest statement of the ratio is
-therefore "fast ≈ 2.4 mWh and 2.4–6× less energy than ggml depending on
-measurement method", with fast/ggml latency 5.4 vs 7.8 s.
+the trustworthy part. **Correction (review round)**: the idle control is
+duration-matched to the fast window only; scaling it per window revises
+ggml from 15.3 to **21.9 mWh/transcription** (the raw subtraction had
+over-subtracted idle drain from ggml's shorter window — the error
+understated ggml energy, so the conclusion only strengthens). Honest
+statement: fast ≈ 2.4 mWh, ggml ≈ 5.2 (power model) to 21.9 (duration-scaled
+gauge), i.e. **fast uses 2.2–9× less energy**; latency 5.4 vs 7.8 s.
 
 ## #317 final certification (2026-09-26, tree `f4d49f8`)
 

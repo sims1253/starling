@@ -103,10 +103,23 @@ echo "rounds(cand): ${cand_vals[*]}"
 
 PK_BASE=0 PK_CAND=0
 if [ -n "${DO_PK:-}" ]; then
-  bench starling-bench-base parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_BASE" > "$TMP/pkb"
-  bench starling-bench-cand parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_CAND" > "$TMP/pkc"
-  PK_BASE=$(total_ms "$TMP/pkb" | median)
-  PK_CAND=$(total_ms "$TMP/pkc" | median)
+  # Failure here must not lose the MOSS measurements already collected:
+  # report PK as unavailable and still print the METRIC lines.
+  if bench starling-bench-base parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_BASE" > "$TMP/pkb" 2>&1; then
+    PK_BASE=$(total_ms "$TMP/pkb" | median)
+  else
+    echo "warning: base parakeet bench failed — PK gate unavailable" >&2
+    PK_BASE=0
+  fi
+  if bench starling-bench-cand parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_CAND" > "$TMP/pkc" 2>&1; then
+    PK_CAND=$(total_ms "$TMP/pkc" | median)
+  else
+    echo "warning: cand parakeet bench failed — PK gate unavailable" >&2
+    PK_CAND=0
+  fi
+  for v in "$PK_BASE" "$PK_CAND"; do
+    case "$v" in ''|*[!0-9.]*) PK_BASE=0; PK_CAND=0;; esac
+  done
 fi
 
 # G1 (short fixture): the A/B invocations already transcribe short.wav —
