@@ -14,7 +14,8 @@
 #
 # Env: ROUNDS (default 3), RUNS (timed runs per invocation, default 3),
 # EXTRA_ENV_CAND / EXTRA_ENV_BASE (STARLING_* for that side, default empty),
-# SKIP_PK=1, SKIP_G1=1.
+# SKIP_G1=1, G1_FULL=1 (also medium/long transcripts), DO_PK=1 (Parakeet G5
+# canary — off by default; every model load costs GPU-driver health).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEV=/data/local/tmp/starling
@@ -87,24 +88,32 @@ echo "rounds(base): ${base_vals[*]}"
 echo "rounds(cand): ${cand_vals[*]}"
 
 PK_BASE=0 PK_CAND=0
-if [ -z "${SKIP_PK:-}" ]; then
+if [ -n "${DO_PK:-}" ]; then
   bench starling-bench-base parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_BASE" > "$TMP/pkb"
   bench starling-bench-cand parakeet "$PK_GGUF" medium.wav "$EXTRA_ENV_CAND" > "$TMP/pkc"
   PK_BASE=$(total_ms "$TMP/pkb" | median)
   PK_CAND=$(total_ms "$TMP/pkc" | median)
 fi
 
+# G1 (short fixture): the A/B invocations already transcribe short.wav —
+# compare their last transcript lines, no extra model loads. G1_FULL=1 adds
+# medium/long (2 more loads per side; milestones only: every load on this
+# phone costs GPU-driver health, ~8 loads per boot session is the budget).
 MATCH=1
 if [ -z "${SKIP_G1:-}" ]; then
-  RUNS_SAVED=$RUNS; RUNS=1
-  for w in short medium long; do
-    bench starling-bench-base moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_BASE" \
-      | sed -n 's/^  //p' > "$TMP/ta"
-    bench starling-bench-cand moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_CAND" \
-      | sed -n 's/^  //p' > "$TMP/tb"
-    cmp -s "$TMP/ta" "$TMP/tb" || MATCH=0
-  done
-  RUNS=$RUNS_SAVED
+  last_tr() { sed -n 's/^  //p' "$1" | tail -1; }
+  [ "$(last_tr "$TMP/b$ROUNDS")" = "$(last_tr "$TMP/c$ROUNDS")" ] || MATCH=0
+  if [ -n "${G1_FULL:-}" ]; then
+    RUNS_SAVED=$RUNS; RUNS=1
+    for w in medium long; do
+      bench starling-bench-base moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_BASE" \
+        | sed -n 's/^  //p' > "$TMP/ta"
+      bench starling-bench-cand moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_CAND" \
+        | sed -n 's/^  //p' > "$TMP/tb"
+      cmp -s "$TMP/ta" "$TMP/tb" || MATCH=0
+    done
+    RUNS=$RUNS_SAVED
+  fi
 fi
 
 delta=$(awk "BEGIN {printf \"%.2f\", ($cand - $base) / $base * 100}")
