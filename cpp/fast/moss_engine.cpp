@@ -882,6 +882,19 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     if (!I.ctx->download(I.state, 16 * 4, st.data() + 16, ngen * 4, err)) return false;
     out_ids.assign(st.begin() + 16, st.begin() + 16 + ngen);
     eos = !out_ids.empty() && out_ids.back() == I.cfg.eos_token_id;
+    // Debug dump of the greedy token stream (#311 draft-acceptance studies):
+    // STARLING_FAST_DUMP_TOKENS=path writes the generated ids (comma
+    // separated); a path used repeatedly gets .1, .2 ... suffixes.
+    if (const char* dp = std::getenv("STARLING_FAST_DUMP_TOKENS")) {
+        static std::map<std::string, int> seq;
+        std::string path = dp;
+        if (!seq.emplace(path, 0).second) path += "." + std::to_string(++seq[dp]);
+        if (FILE* f = std::fopen(path.c_str(), "w")) {
+            for (size_t i = 0; i < out_ids.size(); ++i)
+                std::fprintf(f, i ? ",%u" : "%u", out_ids[i]);
+            std::fclose(f);
+        }
+    }
     if (timing)
         std::fprintf(stderr, "[fast-moss] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%u tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
                      n / 16000.0, t_mel, t_pre - t_mel, ms_since(t0) - t_pre, ngen, rounds, ms_since(t0),
