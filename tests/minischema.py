@@ -8,7 +8,8 @@ Deliberately supports only the keyword subset the contract schemas use:
 ``$ref`` (local ``#/$defs/...`` pointers), ``type`` (incl. type lists),
 ``const``, ``enum``, ``properties``, ``required``,
 ``additionalProperties: false``, ``pattern``, ``minLength``, ``minimum``,
-``items``, ``minItems``, ``oneOf``, ``anyOf``. Keep the schemas within this
+``items``, ``minItems``, ``maxItems``, ``uniqueItems``, ``oneOf``, ``anyOf``,
+``allOf``, ``not`` and ``if``/``then``/``else``. Keep the schemas within this
 subset or extend this module; anything else silently passes.
 """
 
@@ -120,9 +121,24 @@ def errors(
     if isinstance(instance, list):
         if "minItems" in schema and len(instance) < schema["minItems"]:
             found.append(f"{path}: fewer than minItems {schema['minItems']}")
+        if "maxItems" in schema and len(instance) > schema["maxItems"]:
+            found.append(f"{path}: more than maxItems {schema['maxItems']}")
+        if schema.get("uniqueItems"):
+            for i, item in enumerate(instance):
+                if any(_json_equal(item, earlier) for earlier in instance[:i]):
+                    found.append(f"{path}[{i}]: duplicate of an earlier item")
         if "items" in schema:
             for i, item in enumerate(instance):
                 found.extend(errors(item, schema["items"], root, f"{path}[{i}]"))
+
+    for branch in schema.get("allOf", []):
+        found.extend(errors(instance, branch, root, path))
+    if "not" in schema and not errors(instance, schema["not"], root, path):
+        found.append(f"{path}: matches a schema it must not match")
+    if "if" in schema:
+        branch = "then" if not errors(instance, schema["if"], root, path) else "else"
+        if branch in schema:
+            found.extend(errors(instance, schema[branch], root, path))
 
     for combiner in ("oneOf", "anyOf"):
         if combiner not in schema:
