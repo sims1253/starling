@@ -174,3 +174,28 @@ no speed. The decode-speed lever is not the layout: it is token batching
 | P1-8 | Dispatch fixed costs + the adaptive GEMV rows heuristic leave decode time on the table: every WG re-reads the whole x vector, so rows=8 on the small-N shapes pays x traffic comparable to the weights | dispatch+barrier priced at **0.024–0.043 ms** (empty-work probes: 1-WG GEMV / 1-row norm ×200) → 144 dispatches ≈ 4–6 ms/token — fusion is a dead end (per-layer 5 dispatches is the dependency floor). Rows sweep (new `STARLING_FAST_MICRO=s,bits,N,K,reps` mode, one load per shape) at the five real decode shapes: **rows=16 best-or-tied everywhere** (qkv +15 %, o +31 %, down +8 % vs rows=8; gateup/lm_head ≥ rows=32). First A/B (+0.19 %) exposed the shrink-to-256-WGs rule silently reverting N=2048 to rows=8; pinning PowerVR to rows=16 (no growth, no shrink): **69.21 vs 70.54 ms/token (−1.88 %, all 3 rounds separated, transcripts identical)**; verification rerun 21+21 runs: **71.13 → 69.70 (−2.0 %)**. In-context gain ≈ 35 % of the isolated micro delta (the micro's barrier-per-rep pattern overstates small-N costs — extrapolate with that factor). **keep (`0c10a1a`)** |
 
 | P1-9 | lm_head embed at F16 (opt-in `STARLING_FAST_LM_F16`): isolated micro 45.0 vs 34.4 G w/s (rows=48 vs 16) promised −2.1 ms/token | **REJECTED: +9.4 %** (76.4 vs 69.8 ms/token, cleanly separated). F16 doubles the table bytes per token (622 vs 350 MB) and **in-context bandwidth for this access pattern is ~43 GB/s, not the micro's 90** — predicted +6.4 ms matches the measured +6.6 exactly. Calibration rule: isolated-kernel rates do not transfer for changes that alter the bytes moved; model in-context GEMV traffic at ~43 GB/s. (G2 had passed: 7.83 vs 7.87 % — the W8→F16 requant is quality-neutral; the 6-chunk `dequant_row` refactor that a 5-chunk F16 table needed works and reverted as dead infrastructure.) Also closed: W8 rows re-check at N=151936 confirms rows=16 (34.4 vs 32.0 at 32) — P1-8's pin had no W8 collateral. With this, the lm_head is at its floor in every format (W4: op-bound ~7.6–9 ms; W8: bandwidth-bound ~8.1 ms; F16: bandwidth-bound ~14.5 ms) and the decode GEMV budget is fully accounted: linears op-bound ~41 ms + lm_head ~8 ms + dispatch 4–6 ms + attention ~4 ms ≈ the measured 69–70 ms/token. discard |
+
+## #317 loop closed (2026-09-26)
+
+Final verification (identical binaries, all gates): **69.64 vs 69.51 ms/token**
+(±0.3 % window noise), transcripts identical, `fast_weights_test` + both build
+configurations green, Parakeet 2064–2195 ms (historical band 1957–2184).
+
+Session outcome (this branch, on top of #323):
+
+- **Kept**: `gemv_w4um` (two-token GEMV, 1.76–2.11× per-token weight rate —
+  the verify primitive for #311's learned drafter); PowerVR decode GEMV rows
+  pinned to 16 (−1.9 % verified, twice); the micro probes (skinny-GEMM,
+  f16-dot, rows-sweep, M2), `STARLING_FAST_DUMP_TOKENS`.
+- **Closed by measurement**: OpSDot/int8 activations (slot-cost equal), f16
+  dots for GEMV (surrounding ops dominate), scale-interleave (free at
+  saturation), F16 lm_head (+9.4 % — in-context bandwidth ~43 GB/s), online
+  n-gram and copy drafters (1.000 / 1.03 tokens/pass), single-draft
+  self-lookahead (zero by construction), dispatch fusion (0.024–0.043 ms ×
+  144, dependency floor), W4 lm_head (quality math, #24).
+- **Micro→context transfer rules** (both directions measured): op-side
+  changes land at ~35 % of the isolated delta; byte-doubling changes don't
+  transfer at all (model in-context GEMV traffic at ~43 GB/s).
+- Decode budget fully accounted: linears op-bound ~41 ms + lm_head ~8 ms +
+  dispatch ~5 ms + attention ~4 ms ≈ 69–70 ms/token. The next decode win is
+  #311's learned drafter on top of `gemv_w4um`, not another layout.
