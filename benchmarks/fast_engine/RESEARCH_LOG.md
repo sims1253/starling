@@ -199,3 +199,19 @@ Session outcome (this branch, on top of #323):
 - Decode budget fully accounted: linears op-bound ~41 ms + lm_head ~8 ms +
   dispatch ~5 ms + attention ~4 ms ≈ 69–70 ms/token. The next decode win is
   #311's learned drafter on top of `gemv_w4um`, not another layout.
+
+## #317 addendum: the 10 ms micro-vs-context gap attributed (2026-09-26)
+
+The final accounting left ~10 ms/token between the isolated-kernel sum
+(59 ms) and in-context decode (69.7). New alternation probe
+(`STARLING_FAST_MICRO=alt/altx`, one dispatch per rep alternating two
+pipelines) on a clean boot: **spec-constant switch +7 %, shader switch
++13–35 % per iteration** (N 2048–4096 shapes). Per layer the decode does 2
+unavoidable gemv↔attn shader switches + down-proj's lanes=192 spec
+divergence → ~1.6–5 ms/token of switch cost (structural: the gemv↔attn
+sandwich cannot share a pipeline); the remaining ~5–8 ms is DRAM-cold
+weights in context vs L2-warm small-matrix micros (physics). **No
+actionable lever ≥1 % remains** — the loop's closure stands with the
+accounting complete. Also fixed: plain GEMV micro runs crashed after the
+rows-sweep refactor (dangling `rec_out`) — latent since P1-8, caught by
+this probe.
